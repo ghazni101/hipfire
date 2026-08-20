@@ -85,7 +85,7 @@ fn gfx1100_awq_norm_direct_enabled(gpu: &Gpu, k: usize) -> bool {
     // direct kernel for all later shapes. The snapshot read below evaluates
     // `k` per call instead; single-model processes (constant K) are
     // unaffected, and mixed-K processes now pick the kernel their K selects.
-    k == 5_120 && hipfire_config::developer_bool("HIPFIRE_GFX1100_AWQ_NORM_DIRECT", true)
+    (k == 5_120 || k == 2_560) && hipfire_config::developer_bool("HIPFIRE_GFX1100_AWQ_NORM_DIRECT", true)
 }
 
 fn awq_norm_kernel(gpu: &Gpu, k: usize) -> (&'static str, &'static str, u32) {
@@ -7133,7 +7133,17 @@ impl Gpu {
         } else {
             None
         };
-        let (src, module, func_name) = if gfx1151_k4096 {
+        static RESIDUAL_DUALROW: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            hipfire_config::developer_var("HIPFIRE_RESIDUAL_DUALROW").as_deref() == Ok("1")
+        });
+        let use_dualrow = self.arch_caps.is_gfx1100() && *RESIDUAL_DUALROW;
+        let (src, module, func_name) = if use_dualrow {
+            (
+                kernels::GEMV_HFQ4G256_RESIDUAL_DUALROW_GFX1100_SRC,
+                "gemv_hfq4g256_residual_dualrow_gfx1100",
+                "gemv_hfq4g256_residual_dualrow_gfx1100",
+            )
+        } else if gfx1151_k4096 {
             (
                 kernels::GEMV_HFQ4G256_RESIDUAL_K4096_GFX1151_SRC,
                 "gemv_hfq4g256_residual_k4096_gfx1151",
