@@ -1811,6 +1811,7 @@ impl Gpu {
                 argmax_host: None,
                 prerotated: None,
                 gdn_pair_counters: None,
+                mq_rmsnorm_awq_wavegrid_scratch: None,
                 gemv_residual_tmp: None,
                 paro_x_scratch: None,
                 paro_fused_scratch: None,
@@ -5990,7 +5991,6 @@ impl Gpu {
     /// between layers in batched prefill when the same activation buffer
     /// (e.g. `pb_tmp`) is reused with different contents each layer —
     /// the cache sees the same GPU pointer and skips the F32→F16
-    /// conversion, silently serving stale F16 data from the previous
     /// layer.
     pub fn invalidate_fp16_cache(&mut self) {
         // bind_thread: skip — nulls a CPU-side cache pointer, no device call.

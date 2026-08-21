@@ -1109,6 +1109,12 @@ pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_G12DEC_SRC: &str = concat!(
     "#define HIPFIRE_RMSNORM_KERNEL fused_rmsnorm_mq_rotate_awq_g12dec\n",
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate.hip")
 );
+/// gfx1100 AWQ wavegrid twin (`HIPFIRE_AWQ_NORM_WAVEGRID`, kept opt-in after a
+/// null result): K/256 workgroups × wave32 spread the FWHT groups across CUs
+/// so the reduction and rotation overlap VRAM latency instead of serializing
+/// on one workgroup.
+pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_WAVEGRID_GFX1100_SRC: &str =
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_awq_wavegrid.gfx1100.hip");
 /// C2 IU4 producer sidecar: RMSNorm/FWHT + in-register `block_i4_128` emit.
 /// Prepends the shared quant recipe; old plain/AWQ symbols stay untouched.
 pub const BLOCK_I4_128_QUANT_SRC: &str =
@@ -1261,6 +1267,7 @@ pub const FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_V2_SRC: &str = concat!(
 );
 pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
+    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
     "#define HIPFIRE_IU4_RTN_RCP 1\n",
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
     "#define HIPFIRE_IU4_SIDECAR 1\n",
@@ -1392,19 +1399,19 @@ pub const FUSED_SILU_MUL_MQ_ROTATE_FP8_INREG_GFX12_SRC: &str = concat!(
 );
 pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_FP8_INREG_GFX12_SRC: &str = concat!(
     include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
-    "#define HIPFIRE_FP8_PROD_INREG 1\n#define HIPFIRE_SILU_FP8_AWQ 1\n",
+    "#define HIPFIRE_FP8_PROD_INREG 1\n#define HIPFIRE_RMSNORM_AWQ 1\n",
     "#define HIPFIRE_SILU_FP8_KERNEL fused_silu_mul_mq_rotate_awq_mq4v2_fp8_inreg_gfx12\n",
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_fp8.gfx12.hip")
 );
 pub const FUSED_SILU_MUL_MQ_ROTATE_HIN_FP8_GFX12_SRC: &str = concat!(
     include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
-    include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_fp8_hin.gfx12.hip"),
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_fp8_hin.gfx12.hip"),
     "#define HIPFIRE_SILU_FP8_KERNEL fused_silu_mul_mq_rotate_hin_fp8_gfx12\n",
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_fp8.gfx12.hip")
 );
 pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_HIN_FP8_GFX12_SRC: &str = concat!(
     include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
-    include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_fp8_hin.gfx12.hip"),
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_fp8_hin.gfx12.hip"),
     "#define HIPFIRE_SILU_FP8_AWQ 1\n",
     "#define HIPFIRE_SILU_FP8_KERNEL fused_silu_mul_mq_rotate_awq_hin_fp8_gfx12\n",
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_fp8.gfx12.hip")
@@ -1413,14 +1420,14 @@ pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_HIN_FP8_GFX12_SRC: &str = concat!(
 /// row-major token order, and the producer widens each h element to f32.
 pub const FUSED_SILU_MUL_MQ_ROTATE_HIN_BF16_FP8_GFX12_SRC: &str = concat!(
     include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
-    include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_fp8_hin.gfx12.hip"),
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_fp8_hin.gfx12.hip"),
     "#define HIPFIRE_SILU_FP8_H_BF16 1\n",
     "#define HIPFIRE_SILU_FP8_KERNEL fused_silu_mul_mq_rotate_hin_bf16_fp8_gfx12\n",
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_fp8.gfx12.hip")
 );
 pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_HIN_BF16_FP8_GFX12_SRC: &str = concat!(
     include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
-    include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_fp8_hin.gfx12.hip"),
+    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_fp8_hin.gfx12.hip"),
     "#define HIPFIRE_SILU_FP8_AWQ 1\n#define HIPFIRE_SILU_FP8_H_BF16 1\n",
     "#define HIPFIRE_SILU_FP8_KERNEL fused_silu_mul_mq_rotate_awq_hin_bf16_fp8_gfx12\n",
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_fp8.gfx12.hip")
