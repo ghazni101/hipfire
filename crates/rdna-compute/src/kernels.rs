@@ -1115,6 +1115,10 @@ pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_G12DEC_SRC: &str = concat!(
 /// on one workgroup.
 pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_WAVEGRID_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_awq_wavegrid.gfx1100.hip");
+pub const FUSED_QKVZA_HFQ4G256_FUSEDNORM_GFX1100_SRC: &str =
+    // Consumer-fold lever (HIPFIRE_QKVZA_FUSEDNORM=1): qkvza GEMV with inline
+    // rmsnorm+AWQ+FWHT prologue, bit-exact vs the direct producer.
+    include_str!("../../../kernels/src/fused_qkvza_hfq4g256_fusednorm.gfx1100.hip");
 /// C2 IU4 producer sidecar: RMSNorm/FWHT + in-register `block_i4_128` emit.
 /// Prepends the shared quant recipe; old plain/AWQ symbols stay untouched.
 pub const BLOCK_I4_128_QUANT_SRC: &str =
