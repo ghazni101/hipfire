@@ -1119,6 +1119,16 @@ pub const FUSED_QKVZA_HFQ4G256_FUSEDNORM_GFX1100_SRC: &str =
     // Consumer-fold lever (HIPFIRE_QKVZA_FUSEDNORM=1): qkvza GEMV with inline
     // rmsnorm+AWQ+FWHT prologue, bit-exact vs the direct producer.
     include_str!("../../../kernels/src/fused_qkvza_hfq4g256_fusednorm.gfx1100.hip");
+pub const FUSED_GATE_UP_HFQ4G256_FUSEDNORM_GFX1100_SRC: &str =
+    // Consumer-fold lever (HIPFIRE_GATE_UP_FUSEDNORM=1): gate_up GEMV with
+    // inline rmsnorm+AWQ+FWHT prologue; see the qkvza fusednorm kernel.
+    include_str!("../../../kernels/src/fused_gate_up_hfq4g256_fusednorm.gfx1100.hip");
+
+pub const FUSED_QKV_HFQ4G256_FUSEDNORM_GFX1100_SRC: &str =
+    // Consumer-fold lever (HIPFIRE_QKV_FUSEDNORM=1): qkv GEMV with inline
+    // rmsnorm+AWQ+FWHT prologue; see the qkvza fusednorm kernel.
+    include_str!("../../../kernels/src/fused_qkv_hfq4g256_fusednorm.gfx1100.hip");
+
 /// C2 IU4 producer sidecar: RMSNorm/FWHT + in-register `block_i4_128` emit.
 /// Prepends the shared quant recipe; old plain/AWQ symbols stay untouched.
 pub const BLOCK_I4_128_QUANT_SRC: &str =
@@ -1610,6 +1620,7 @@ pub const SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GIL_GFX12_SLAB_SRC: &str = concat!(
     "#define HIPFIRE_ROTATE_KERNEL sigmoid_mul_rotate_x_mq_awq_i4_gil_gfx12_slab\n",
     include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
 );
+
 
 pub const RMSNORM_REDUCE_GFX942_SRC: &str =
     include_str!("../../../kernels/src/rmsnorm_reduce.gfx942.hip");
