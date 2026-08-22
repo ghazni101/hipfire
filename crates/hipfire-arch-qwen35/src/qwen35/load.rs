@@ -14,6 +14,8 @@ use super::weights::dtype_from_quant_type;
 use super::weights::hfq_source_fingerprint;
 use super::weights::mixed_expert_tag;
 use super::weights::DeltaNetLayerWeights;
+use super::weights::dtype_from_quant_type;
+use super::weights::mixed_expert_tag;
 use super::weights::ExpertWeights;
 use super::weights::FullAttnLayerWeights;
 use super::weights::LayerWeights;
@@ -45,6 +47,7 @@ use hipfire_runtime::model_load::load_weights as rt_load_weights;
 use hipfire_runtime::model_load::load_weights_with_fault as rt_load_weights_with_fault;
 use hipfire_runtime::model_load::LoadedWeights;
 pub use hipfire_runtime::model_load::StagedLoadFault;
+use hipfire_runtime::model_load::LoadedWeights;
 use hipfire_runtime::model_load::WeightSource;
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::paro::paro_load_norm;
@@ -2957,6 +2960,26 @@ impl WeightSource for HfqSource<'_> {
             output.lloyd_lut_e4m3 = Some(e4m3);
             output.lloyd_lut_f16 = Some(f16);
             output.lloyd_lut_c16 = Some(c16);
+        }
+        // Dev lever: requantize a Q8_0 (typically tied-embedding) output to
+        // HFQ4G256 so the logits GEMV reads ~half the bytes. The embedding
+        // table keeps its original buffer; only this projection switches.
+        static LM_HEAD_HFQ4: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
+            hipfire_config::developer_var("HIPFIRE_LM_HEAD_HFQ4")
+                .ok()
+                .as_deref()
+                == Some("1")
+        });
+        if *LM_HEAD_HFQ4 && output.gpu_dtype == DType::Q8_0 {
+            eprintln!("  requantizing output Q8_0 -> HFQ4G256 (HIPFIRE_LM_HEAD_HFQ4=1)...");
+            let t0 = std::time::Instant::now();
+            let converted =
+                hipfire_runtime::weight_backend::requantize_weight_q8_0_to_hfq4g256(gpu, &output)?;
+            eprintln!(
+                "  output -> HFQ4G256 done in {:.2}s",
+                t0.elapsed().as_secs_f32()
+            );
+            return Ok((converted, false));
         }
         Ok((output, aliases))
     }
