@@ -23738,48 +23738,50 @@ impl Gpu {
         // Host-gated identity; reuses fused_gate_up_hfq4g256 arithmetic template.
         let glimmer_gate_up_k6656_gfx1100 =
             self.arch_caps.is_gfx1100() && gate_m == 19_968 && up_m == 19_968 && k == 6_656;
+        // NOTE: the 4B FFN shape (9216/9216/2560) admission is EXPLICIT OPT-IN ONLY.
+        // The stage_x32 schedule HANGS on that shape (GPU pegged at 100% on an
+        // unfinished kernel; observed twice on gfx1100 2026-08-23). Do not make it
+        // default-on for the 4B shape without fixing the underlying kernel first.
         let dense_gate_up_stage_x32_gfx1100 = self.arch_caps.is_gfx1100()
-            && gate_m == 17_408
-            && up_m == 17_408
-            && k == 5_120
-            && hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_STAGE_X32", true);
+            && ((gate_m == 17_408
+                && up_m == 17_408
+                && k == 5_120
+                && hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_STAGE_X32", true))
+                || (gate_m == 9_216
+                    && up_m == 9_216
+                    && k == 2_560
+                    && hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_STAGE_X32", false)));
         let dense_gate_up_pair_gfx1100 = self.arch_caps.is_gfx1100()
-            && gate_m == 17_408
-            && up_m == 17_408
-            && k == 5_120
+            && ((gate_m == 17_408 && up_m == 17_408 && k == 5_120)
+                || (gate_m == 9_216 && up_m == 9_216 && k == 2_560))
             && hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_PAIR", false);
         let dense_gate_up_pair2_gfx1100 = self.arch_caps.is_gfx1100()
-            && gate_m == 17_408
-            && up_m == 17_408
-            && k == 5_120
+            && ((gate_m == 17_408 && up_m == 17_408 && k == 5_120)
+                || (gate_m == 9_216 && up_m == 9_216 && k == 2_560))
             && hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_PAIR2", false);
         // Qwen3.6-27B MQ4, W7900/gfx1100: two fresh-process alternating
         // campaigns measured +0.42% and +0.49% decode throughput. Keep this
         // explicit because the algebraic rewrite changes FP association even
         // though the screened 65-token greedy trace remained byte-exact.
         let dense_gate_up_dot_reform_gfx1100 = self.arch_caps.is_gfx1100()
-            && gate_m == 17_408
-            && up_m == 17_408
-            && k == 5_120
+            && ((gate_m == 17_408 && up_m == 17_408 && k == 5_120)
+                || (gate_m == 9_216 && up_m == 9_216 && k == 2_560))
             && hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_DOT_REFORM", false);
         // Qwen3.6-27B MQ4, W7900/gfx1100: a fresh-process 128-token
         // A/B/B/A measured +0.42% throughput and -0.42% p50 latency. Keep
         // opt-in: 92 VGPR remains spill-free, but the gain is too small to
         // promote without broader hardware evidence.
         let dense_gate_up_quad_prefetch_gfx1100 = self.arch_caps.is_gfx1100()
-            && gate_m == 17_408
-            && up_m == 17_408
-            && k == 5_120
+            && ((gate_m == 17_408 && up_m == 17_408 && k == 5_120)
+                || (gate_m == 9_216 && up_m == 9_216 && k == 2_560))
             && hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_QUAD_PREFETCH", false);
         let dense_gate_up_setprio_gfx1100 = self.arch_caps.is_gfx1100()
-            && gate_m == 17_408
-            && up_m == 17_408
-            && k == 5_120
+            && ((gate_m == 17_408 && up_m == 17_408 && k == 5_120)
+                || (gate_m == 9_216 && up_m == 9_216 && k == 2_560))
             && hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_SETPRIO", false);
         let dense_gate_up_lane0_headers_gfx1100 = self.arch_caps.is_gfx1100()
-            && gate_m == 17_408
-            && up_m == 17_408
-            && k == 5_120
+            && ((gate_m == 17_408 && up_m == 17_408 && k == 5_120)
+                || (gate_m == 9_216 && up_m == 9_216 && k == 2_560))
             && hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_LANE0_HEADERS", false);
         let dense_gate_up_dot_prefetch_gfx1100 =
             dense_gate_up_dot_reform_gfx1100 && dense_gate_up_quad_prefetch_gfx1100;
@@ -23954,7 +23956,9 @@ impl Gpu {
             &um as *const _ as *mut c_void,
             &kv as *const _ as *mut c_void,
         ];
-        self.launch_maybe_blob(func_name, [grid_x, 1, 1], block, 0, &mut params, || {
+        let gu_bytes = (gate_m + up_m) * (k / 256) * 136 + k * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", func_name, gu_bytes);
+        let r = self.launch_maybe_blob(func_name, [grid_x, 1, 1], block, 0, &mut params, || {
             let mut b = hip_bridge::KernargBlob::new();
             b.push_ptr(ag);
             b.push_ptr(au);
@@ -23965,7 +23969,11 @@ impl Gpu {
             b.push_i32(um);
             b.push_i32(kv);
             b
-        })
+        });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        r
     }
 
     /// Fused gate+up for Q8_0 weights: two Q8 GEMVs in one launch.
