@@ -156,12 +156,42 @@ impl AttentionFamily {
             is_tree: io.tree_bias.is_some(),
         };
         self.resolve(plan.write_key, ctx, Some(&shape))?; // arch-gate check
+<<<<<<< HEAD
         dispatch_kv_write(gpu, plan.write_key, plan, io).map_err(|error| {
             DispatchError::Hip(format!(
                 "KV write {:?} for {:?} at pos={} cap={}: {error}",
                 plan.write_key, plan.attend_key, io.pos, io.physical_cap
             ))
         })?;
+=======
+        dispatch_kv_write(gpu, plan.write_key, plan, io)?;
+        self.run_attend_only(ctx, gpu, plan, io)
+    }
+
+    /// Attend-only twin of [`Self::run_attention`]: identical `ShapeInfo`
+    /// derivation and attend dispatch, but the KV-cache write is SKIPPED.
+    /// Used by the gfx1100 FA-prep KV-fold path, where the write already
+    /// happened as an epilogue of the prep kernel. The caller is responsible
+    /// for guaranteeing the write actually ran (right cache layout, right
+    /// position) before calling this.
+    pub fn run_attend_only(
+        &self,
+        ctx: &DispatchCtx,
+        gpu: &mut Gpu,
+        plan: &crate::families::kv_tier::KvTierPlan,
+        io: &AttnParams,
+    ) -> Result<(), DispatchError> {
+        let shape = ShapeInfo {
+            batch_size: plan.batch_size,
+            head_dim: io.head_dim,
+            m: if plan.batch_size > 1 {
+                io.max_ctx_len
+            } else {
+                io.pos + 1
+            },
+            is_tree: io.tree_bias.is_some(),
+        };
+>>>>>>> f2a706fd2 (fa-kvwrite: fold Q8_0 KV-cache write into FA-prep epilogue, gfx1100 gated (+0.5-1% decode))
         let attend_var = self.resolve(plan.attend_key, ctx, Some(&shape))?;
         dispatch_attend(ctx, gpu, plan.attend_key, attend_var.tile, plan, io).map_err(|error| {
             DispatchError::Hip(format!("attention {:?}: {error}", plan.attend_key))
