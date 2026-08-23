@@ -1419,13 +1419,13 @@ pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_FP8_INREG_GFX12_SRC: &str = concat!(
 );
 pub const FUSED_SILU_MUL_MQ_ROTATE_HIN_FP8_GFX12_SRC: &str = concat!(
     include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
-    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_fp8_hin.gfx12.hip"),
+    include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_fp8_hin.gfx12.hip"),
     "#define HIPFIRE_SILU_FP8_KERNEL fused_silu_mul_mq_rotate_hin_fp8_gfx12\n",
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_fp8.gfx12.hip")
 );
 pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_HIN_FP8_GFX12_SRC: &str = concat!(
     include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
-    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_fp8_hin.gfx12.hip"),
+    include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_fp8_hin.gfx12.hip"),
     "#define HIPFIRE_SILU_FP8_AWQ 1\n",
     "#define HIPFIRE_SILU_FP8_KERNEL fused_silu_mul_mq_rotate_awq_hin_fp8_gfx12\n",
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_fp8.gfx12.hip")
@@ -1434,14 +1434,14 @@ pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_HIN_FP8_GFX12_SRC: &str = concat!(
 /// row-major token order, and the producer widens each h element to f32.
 pub const FUSED_SILU_MUL_MQ_ROTATE_HIN_BF16_FP8_GFX12_SRC: &str = concat!(
     include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
-    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_fp8_hin.gfx12.hip"),
+    include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_fp8_hin.gfx12.hip"),
     "#define HIPFIRE_SILU_FP8_H_BF16 1\n",
     "#define HIPFIRE_SILU_FP8_KERNEL fused_silu_mul_mq_rotate_hin_bf16_fp8_gfx12\n",
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_fp8.gfx12.hip")
 );
 pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_HIN_BF16_FP8_GFX12_SRC: &str = concat!(
     include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
-    include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_fp8_hin.gfx12.hip"),
+    include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_fp8_hin.gfx12.hip"),
     "#define HIPFIRE_SILU_FP8_AWQ 1\n#define HIPFIRE_SILU_FP8_H_BF16 1\n",
     "#define HIPFIRE_SILU_FP8_KERNEL fused_silu_mul_mq_rotate_awq_hin_bf16_fp8_gfx12\n",
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_fp8.gfx12.hip")
