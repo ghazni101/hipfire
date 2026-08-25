@@ -54,6 +54,9 @@ pub const MODEL_TYPE_TO_ARCH_ID: &[(&str, u32)] = &[
     // arch 11 — lfm2 (dense) + lfm2_moe (MoE); both route to hipfire-arch-lfm2moe/11
     ("lfm2", 11),
     ("lfm2_moe", 11),
+    // lfm2_vl is the vision-language variant; it reuses the arch-11 text backbone
+    // (hipfire-arch-lfm2moe) plus an embedded SigLIP-2 vision tower + projector.
+    ("lfm2_vl", 11),
     // arch 12 — cohere2_moe
     ("cohere2_moe", 12),
     // arch 13 — gemma4 family (dense + MoE unified; text decoder only). The

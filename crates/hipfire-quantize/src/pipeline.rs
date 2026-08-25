@@ -1677,10 +1677,48 @@ pub(crate) fn run() {
             || name.starts_with("model.vision_tower.")
             || name.starts_with("model.vision_adapter.")
             || name.starts_with("model.vision_projection.");
+        // LFM2-VL: the vision tower (SigLIP-2 ViT) plus the multi_modal_projector
+        // MLP form the "vision module". Both are embedded as F16 (the engine's
+        // vision kernels consume F16 matrices; bf16 vision is unsupported).
+        let is_vision_module = is_vision
+            || name.starts_with("model.multi_modal_projector.");
         if is_vision && !include_vision {
             let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
             let n: usize = meta.shape.iter().product();
             skipped_params += n as u64;
+            continue;
+        }
+        if is_vision_module && include_vision {
+            // Emit vision-module tensors losslessly as F16. This short-circuits the
+            // generic Q8 / mq4v2 text paths so the ViT weights stay full-precision.
+            let (meta, raw_data) = st_files[*file_idx].tensor_data(name).unwrap();
+            let shape: Vec<u32> = meta.shape.iter().map(|&s| s as u32).collect();
+            let f16_bytes = if meta.dtype == "F16" {
+                raw_data.to_vec()
+            } else {
+                // bf16 (or f32) source → widen/truncate to f16 losslessly enough
+                // for vision (ViT is robust; F16 is the engine contract).
+                tensor_to_f32_with_optional_fp8_scale(
+                    name, raw_data, meta, &fp8_scale_for, &st_files,
+                )
+                .iter()
+                .flat_map(|&v| f32_to_f16(v).to_le_bytes())
+                .collect()
+            };
+            eprintln!(
+                "  {:>8}: {} {:?} (F16 vision-module)",
+                "F16-VL", name, meta.shape
+            );
+            hfq_tensors.push(HfqTensor {
+                name: name.to_string(),
+                quant_type: QuantType::F16,
+                shape,
+                group_size: 0,
+                data: f16_bytes,
+                spilled_len: 0,
+            });
+            total_params += meta.shape.iter().map(|&s| s as u64).product::<u64>();
+            st_files[*file_idx].drop_tensor_pages(name);
             continue;
         }
         // Gemma4 unified (arch 13): text-only bring-up — skip the vision/audio
@@ -3314,12 +3352,14 @@ fn try_handle_lfm2moe(
         if (use_mq4g256 || use_mq4v2 || use_mq4c)
             && meta.shape.len() == 2
             && meta.shape[1] % 256 == 0
-            && !name.ends_with("embed_tokens.weight")
-            && (name.ends_with("_proj.weight")
+            && (name.ends_with("embed_tokens.weight")
+                || name.ends_with("_proj.weight")
                 || name.ends_with(".w1.weight")
                 || name.ends_with(".w2.weight")
                 || name.ends_with(".w3.weight"))
         {
+            // Tied lm_head reuses embed_tokens, so routing embed through mq4v2
+            // also covers the output head (lfm2_vl sets tie_word_embeddings=true).
             let f32_data = tensor_to_f32_with_optional_fp8_scale(
                 name,
                 raw_data,

@@ -235,6 +235,7 @@ fn wt_from_raw(
         19 => DType::MQ2G256Lloyd,
         20 => DType::MQ3G256Lloyd,
         30 => DType::MQ4G256Lloyd,
+        44 => DType::MQ4G256V2,
         1 => DType::F16,
         other => return Err(format!("unsupported quant_type {other}")),
     };
@@ -1052,6 +1053,7 @@ fn wt_from_source_raw(
         19 => DType::MQ2G256Lloyd,
         20 => DType::MQ3G256Lloyd,
         30 => DType::MQ4G256Lloyd,
+        44 => DType::MQ4G256V2,
         1 => DType::F16,
         other => return Err(format!("unsupported quant_type {other}")),
     };
@@ -1636,6 +1638,7 @@ pub fn batch_weight_formats_supported(weights: &Lfm2MoeWeights) -> Result<(), St
         DType::Q8_0
         | DType::HFQ4G256
         | DType::MQ4G256
+        | DType::MQ4G256V2
         | DType::HFQ6G256
         | DType::MQ6G256
         | DType::MQ3G256
@@ -1653,7 +1656,7 @@ pub fn batch_weight_formats_supported(weights: &Lfm2MoeWeights) -> Result<(), St
             crate::lfm2moe::Mixer::Conv(c) => {
                 for w in [&c.in_proj, &c.out_proj] {
                     match w.gpu_dtype {
-                        DType::Q8_0 | DType::HFQ4G256 | DType::MQ4G256 | DType::F32 | DType::BF16 => {}
+                        DType::Q8_0 | DType::HFQ4G256 | DType::MQ4G256 | DType::MQ4G256V2 | DType::F32 | DType::BF16 => {}
                         other => {
                             return Err(format!(
                                 "batched decode: conv projection dtype {other:?} not supported (expected Q8/HFQ4/MQ4/F32/BF16)"
@@ -1668,6 +1671,7 @@ pub fn batch_weight_formats_supported(weights: &Lfm2MoeWeights) -> Result<(), St
                         DType::Q8_0
                         | DType::HFQ4G256
                         | DType::MQ4G256
+                        | DType::MQ4G256V2
                         | DType::F32
                         | DType::BF16 => {}
                         other => {
@@ -1686,6 +1690,7 @@ pub fn batch_weight_formats_supported(weights: &Lfm2MoeWeights) -> Result<(), St
                         DType::Q8_0
                         | DType::HFQ4G256
                         | DType::MQ4G256
+                        | DType::MQ4G256V2
                         | DType::F32
                         | DType::BF16 => {}
                         other => {
