@@ -9,15 +9,26 @@
 //! normalisation, finishing). Groups the deterministic, heavily-tested
 //! transformations that convert daemon events into OpenAI responses.
 
+use crate::serve::http::request_id;
+use crate::serve::slots;
+use crate::serve::{Admission, AdmissionGuard, ServeMeta, ServeShared};
+use crate::{
+    apply_http_reasoning_request, config_bool, config_string, config_u64, insert_optional_f64,
+    insert_optional_u64, request_f64, request_string, request_u64, unix_timestamp, Paths,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use hipfire_client::ClientError;
 use hipfire_runtime::prompt_frame::ToolCall;
 use serde::{Deserialize, Serialize};
-use std::{collections::BTreeSet, sync::{Arc, Mutex, mpsc}, thread, time::{Duration, Instant}};
-use crate::serve::{ServeShared, ServeMeta, Admission, AdmissionGuard};
-use crate::serve::slots;
-use crate::{Paths, config_string, config_u64, config_bool, request_string, request_f64, request_u64, insert_optional_f64, insert_optional_u64, apply_http_reasoning_request, unix_timestamp};
-use crate::serve::http::{request_id};
+use std::{
+    collections::BTreeSet,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc, Arc, Mutex,
+    },
+    thread,
+    time::{Duration, Instant},
+};
 
 #[derive(Debug)]
 pub(crate) struct Completion {
@@ -30,6 +41,7 @@ pub(crate) struct Completion {
     pub(crate) tool_calls: Vec<ToolCall>,
     pub(crate) done: serde_json::Value,
     pub(crate) logprobs: Option<Vec<serde_json::Value>>,
+    pub(crate) reasoning: Option<crate::ReasoningResolution>,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -206,7 +218,9 @@ pub(crate) fn longest_control_prefix_suffix(text: &str) -> usize {
 }
 
 /// Convert a daemon v2 structured tool-call JSON object into canonical [`ToolCall`].
-pub(crate) fn tool_call_from_canonical_value(value: &serde_json::Value) -> Result<ToolCall, String> {
+pub(crate) fn tool_call_from_canonical_value(
+    value: &serde_json::Value,
+) -> Result<ToolCall, String> {
     let obj = value
         .as_object()
         .ok_or_else(|| "tool call must be a JSON object".to_owned())?;
@@ -235,6 +249,374 @@ pub(crate) fn tool_call_from_legacy_value(value: &serde_json::Value) -> Result<T
     // Legacy wire already used `{name, arguments}` objects (same shape as v2).
     // Keep an explicit boundary so legacy retention never reintroduces text scans.
     tool_call_from_canonical_value(value)
+}
+
+/// JSON kind label for diagnostic logging (no values).
+fn json_kind(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Null => "null",
+        serde_json::Value::Bool(_) => "boolean",
+        serde_json::Value::Number(_) => "number",
+        serde_json::Value::String(_) => "string",
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+    }
+}
+
+fn schema_expects(schema: &serde_json::Value, ty: &str) -> bool {
+    if let Some(t) = schema.get("type").and_then(|v| v.as_str()) {
+        return t == ty;
+    }
+    if let Some(arr) = schema.get("type").and_then(|v| v.as_array()) {
+        return arr.iter().any(|v| v.as_str() == Some(ty));
+    }
+    false
+}
+
+fn normalize_value(
+    value: &mut serde_json::Value,
+    schema: &serde_json::Value,
+    tool_name: &str,
+    path: &str,
+) {
+    let before_kind = json_kind(value);
+    let mut repaired = false;
+    let mut expected = String::new();
+    match value {
+        serde_json::Value::String(s) => {
+            let owned = s.clone();
+            if schema_expects(schema, "boolean") {
+                let lower = owned.to_ascii_lowercase();
+                if lower == "true" || lower == "false" {
+                    let new_val = serde_json::Value::Bool(lower == "true");
+                    expected = "boolean".to_owned();
+                    *value = new_val;
+                    repaired = true;
+                }
+            } else if schema_expects(schema, "integer") {
+                if let Ok(n) = owned.parse::<i64>() {
+                    // Ensure the whole string was an integer (parse succeeded implies that,
+                    // but reject strings with whitespace which parse would fail anyway).
+                    expected = "integer".to_owned();
+                    *value = serde_json::Value::Number(serde_json::Number::from(n));
+                    repaired = true;
+                }
+            } else if schema_expects(schema, "number") {
+                if let Ok(n) = owned.parse::<i64>() {
+                    expected = "number".to_owned();
+                    *value = serde_json::Value::Number(serde_json::Number::from(n));
+                    repaired = true;
+                } else if let Ok(f) = owned.parse::<f64>() {
+                    if f.is_finite() {
+                        if let Some(num) = serde_json::Number::from_f64(f) {
+                            expected = "number".to_owned();
+                            *value = serde_json::Value::Number(num);
+                            repaired = true;
+                        }
+                    }
+                }
+            } else if schema_expects(schema, "object") {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&owned) {
+                    if parsed.is_object() {
+                        expected = "object".to_owned();
+                        *value = parsed;
+                        repaired = true;
+                    }
+                }
+            } else if schema_expects(schema, "array") {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(&owned) {
+                    if parsed.is_array() {
+                        expected = "array".to_owned();
+                        *value = parsed;
+                        repaired = true;
+                    }
+                }
+            }
+        }
+        serde_json::Value::Bool(_)
+        | serde_json::Value::Number(_)
+        | serde_json::Value::Object(_)
+        | serde_json::Value::Array(_) => {
+            if schema_expects(schema, "string") {
+                if let Ok(s) = serde_json::to_string(&*value) {
+                    expected = "string".to_owned();
+                    *value = serde_json::Value::String(s);
+                    repaired = true;
+                }
+            }
+        }
+        serde_json::Value::Null => {}
+    }
+    if repaired {
+        let after_kind = json_kind(value);
+        let display_path = if path.is_empty() { "<root>" } else { path };
+        eprintln!(
+            "[hipfire] tool_args_normalize tool={} path={} expected={} {}->{}",
+            tool_name, display_path, expected, before_kind, after_kind
+        );
+    }
+    match value {
+        serde_json::Value::Object(map) => {
+            if let Some(props) = schema.get("properties").and_then(|v| v.as_object()) {
+                let keys: Vec<String> = map.keys().cloned().collect();
+                for k in keys {
+                    if let Some(subschema) = props.get(&k) {
+                        if let Some(child) = map.get_mut(&k) {
+                            let child_path = if path.is_empty() {
+                                k.clone()
+                            } else {
+                                format!("{path}.{k}")
+                            };
+                            normalize_value(child, subschema, tool_name, &child_path);
+                        }
+                    }
+                }
+            }
+        }
+        serde_json::Value::Array(arr) => {
+            if let Some(items_schema) = schema.get("items") {
+                if items_schema.is_object() {
+                    for (idx, elem) in arr.iter_mut().enumerate() {
+                        let child_path = if path.is_empty() {
+                            format!("[{idx}]")
+                        } else {
+                            format!("{path}[{idx}]")
+                        };
+                        normalize_value(elem, items_schema, tool_name, &child_path);
+                    }
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn normalize_tool_calls(calls: &mut [ToolCall], body: &serde_json::Value) {
+    let tools = match body.get("tools").and_then(|v| v.as_array()) {
+        Some(a) => a,
+        None => return,
+    };
+    let mut schema_map: std::collections::HashMap<String, &serde_json::Value> =
+        std::collections::HashMap::new();
+    for t in tools {
+        let func = t.get("function").unwrap_or(t);
+        if let Some(name) = func.get("name").and_then(|v| v.as_str()) {
+            if let Some(params) = func.get("parameters") {
+                schema_map.insert(name.to_owned(), params);
+            }
+        }
+    }
+    if schema_map.is_empty() {
+        return;
+    }
+    for call in calls.iter_mut() {
+        if let Some(schema) = schema_map.get(&call.name) {
+            normalize_value(&mut call.arguments, schema, &call.name, "");
+        }
+    }
+}
+
+/// OpenAI `tool_choice` policy after request validation.
+///
+/// The daemon ignores raw `tool_choice`; the serve gateway projects it into
+/// tools/messages and enforces terminal postconditions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ToolChoicePolicy {
+    /// Absent, JSON null, or `"auto"` — tools unchanged, no extra instruction.
+    Auto,
+    /// `"none"` — do not forward tools or expose structured calls.
+    None,
+    /// `"required"` — tools unchanged; mandate at least one executable call.
+    Required,
+    /// Specific function object — forward only that tool; mandate a matching call.
+    Function(String),
+}
+
+fn tool_schema_name(tool: &serde_json::Value) -> Option<&str> {
+    tool.get("function")
+        .unwrap_or(tool)
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+        .filter(|name| !name.is_empty())
+}
+
+/// Parse OpenAI `tool_choice` against the request `tools` array.
+///
+/// Accepts absent/null/`"auto"`, `"none"`, `"required"`, and
+/// `{"type":"function","function":{"name":...}}`. Rejects unknown strings,
+/// malformed objects, required/specific without tools, and a named function
+/// absent from `tools`.
+fn parse_tool_choice_policy(
+    tool_choice: Option<&serde_json::Value>,
+    tools: Option<&serde_json::Value>,
+) -> Result<ToolChoicePolicy> {
+    let tools_arr = tools.and_then(serde_json::Value::as_array);
+    let has_tools = tools_arr.is_some_and(|arr| !arr.is_empty());
+
+    let Some(choice) = tool_choice else {
+        return Ok(ToolChoicePolicy::Auto);
+    };
+    if choice.is_null() {
+        return Ok(ToolChoicePolicy::Auto);
+    }
+    if let Some(s) = choice.as_str() {
+        return match s {
+            "auto" => Ok(ToolChoicePolicy::Auto),
+            "none" => Ok(ToolChoicePolicy::None),
+            "required" => {
+                if !has_tools {
+                    bail!("tool_choice \"required\" requires a non-empty tools array");
+                }
+                Ok(ToolChoicePolicy::Required)
+            }
+            other => bail!("unsupported tool_choice value: {other}"),
+        };
+    }
+    let Some(obj) = choice.as_object() else {
+        bail!("tool_choice must be a string, null, or function object");
+    };
+    match obj.get("type").and_then(serde_json::Value::as_str) {
+        Some("function") => {}
+        Some(other) => bail!("tool_choice object type must be \"function\", got {other}"),
+        None => bail!("tool_choice object requires type \"function\""),
+    }
+    let name = obj
+        .get("function")
+        .and_then(|f| f.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|n| !n.is_empty())
+        .ok_or_else(|| anyhow!("tool_choice function object requires function.name"))?;
+    if !has_tools {
+        bail!("tool_choice specific function requires a non-empty tools array");
+    }
+    let present = tools_arr
+        .expect("has_tools")
+        .iter()
+        .any(|tool| tool_schema_name(tool) == Some(name));
+    if !present {
+        bail!("tool_choice function `{name}` is not present in tools");
+    }
+    Ok(ToolChoicePolicy::Function(name.to_owned()))
+}
+
+fn filter_tools_to_function(tools: &serde_json::Value, name: &str) -> serde_json::Value {
+    let filtered = tools
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .filter(|tool| tool_schema_name(tool) == Some(name))
+                .cloned()
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    serde_json::Value::Array(filtered)
+}
+
+/// Append a concise mandatory-tool instruction to the leading system message,
+/// creating one when absent. Preserves all existing system text.
+fn inject_tool_choice_requirement(messages: &mut serde_json::Value, specific: Option<&str>) {
+    let instruction = match specific {
+        Some(name) => format!("You must call the `{name}` tool."),
+        None => "You must call a tool.".to_owned(),
+    };
+    let Some(arr) = messages.as_array_mut() else {
+        *messages = serde_json::json!([{ "role": "system", "content": instruction }]);
+        return;
+    };
+    if let Some(system) = arr
+        .iter_mut()
+        .find(|message| message.get("role").and_then(serde_json::Value::as_str) == Some("system"))
+    {
+        let existing = system
+            .get("content")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("")
+            .to_owned();
+        if existing.is_empty() {
+            system["content"] = serde_json::Value::String(instruction);
+        } else {
+            system["content"] = serde_json::Value::String(format!("{existing}\n\n{instruction}"));
+        }
+    } else {
+        arr.insert(
+            0,
+            serde_json::json!({ "role": "system", "content": instruction }),
+        );
+    }
+}
+
+/// Project OpenAI `tool_choice` onto messages and the tools array forwarded to
+/// the daemon. Never forwards raw `tool_choice`.
+///
+/// - `none`: drop tools (no tool parser / template tools section)
+/// - `auto` / absent: preserve tools
+/// - specific function: filter tools to that name
+/// - `required` / specific: inject a short system-level requirement
+fn project_tool_choice(
+    tool_choice: Option<&serde_json::Value>,
+    tools: Option<&serde_json::Value>,
+    messages: &mut serde_json::Value,
+) -> Result<(ToolChoicePolicy, Option<serde_json::Value>)> {
+    let policy = parse_tool_choice_policy(tool_choice, tools)?;
+    let forwarded = match &policy {
+        ToolChoicePolicy::None => None,
+        ToolChoicePolicy::Auto => tools.cloned(),
+        ToolChoicePolicy::Required => {
+            inject_tool_choice_requirement(messages, None);
+            tools.cloned()
+        }
+        ToolChoicePolicy::Function(name) => {
+            inject_tool_choice_requirement(messages, Some(name));
+            Some(filter_tools_to_function(
+                tools.expect("validated non-empty tools"),
+                name,
+            ))
+        }
+    };
+    Ok((policy, forwarded))
+}
+
+/// Normalize argument types, then enforce tool_choice terminal postconditions.
+///
+/// - `none`: strip all structured calls (and coerce a tool_calls finish to stop)
+/// - `required`: fail closed when zero executable calls
+/// - specific: keep only the named tool; fail closed when none remain
+/// - `auto`: identity beyond argument normalization
+fn finalize_tool_calls_for_choice(
+    policy: &ToolChoicePolicy,
+    tool_calls: &mut Vec<ToolCall>,
+    done: &mut serde_json::Value,
+    body: &serde_json::Value,
+) -> Result<()> {
+    normalize_tool_calls(tool_calls, body);
+    match policy {
+        ToolChoicePolicy::Auto => Ok(()),
+        ToolChoicePolicy::None => {
+            tool_calls.clear();
+            if done
+                .get("finish_reason")
+                .and_then(serde_json::Value::as_str)
+                == Some("tool_calls")
+            {
+                done["finish_reason"] = serde_json::Value::String("stop".into());
+            }
+            Ok(())
+        }
+        ToolChoicePolicy::Required => {
+            if tool_calls.is_empty() {
+                bail!("tool_choice \"required\" produced no tool calls");
+            }
+            Ok(())
+        }
+        ToolChoicePolicy::Function(name) => {
+            tool_calls.retain(|call| call.name == *name);
+            if tool_calls.is_empty() {
+                bail!("tool_choice required tool `{name}` but no matching tool call was produced");
+            }
+            Ok(())
+        }
+    }
 }
 
 /// Endpoint adapter kinds known to the serve HTTP surface.
@@ -294,7 +676,9 @@ pub(crate) fn endpoint_adapter_status(kind: EndpointAdapterKind) -> EndpointAdap
 
 /// Gate `/v1/chat/completions` when the request carries a non-empty `tools` array.
 /// Tool-free requests are unchanged. Adapter availability never overrides producer safety.
-pub(crate) fn gate_chat_completions_tools(body: &serde_json::Value) -> Result<(), EndpointAdapterError> {
+pub(crate) fn gate_chat_completions_tools(
+    body: &serde_json::Value,
+) -> Result<(), EndpointAdapterError> {
     let has_tools = body
         .get("tools")
         .and_then(serde_json::Value::as_array)
@@ -447,7 +831,10 @@ impl SemanticEventFold {
     /// Parse canonical `calls` from a staged/final done envelope.
     /// When `finish_reason=tool_calls`, missing/non-array/malformed fails closed.
     /// Other finish reasons ignore `calls` (leave buffer untouched for withhold).
-    pub(crate) fn absorb_terminal_calls(&mut self, done: &serde_json::Value) -> Result<(), SemanticFoldError> {
+    pub(crate) fn absorb_terminal_calls(
+        &mut self,
+        done: &serde_json::Value,
+    ) -> Result<(), SemanticFoldError> {
         let finish = done
             .get("finish_reason")
             .and_then(serde_json::Value::as_str);
@@ -478,7 +865,9 @@ impl SemanticEventFold {
 
     /// Parse attempt_id: JSON numbers only (u64 or non-neg i64). Distinguishes
     /// missing vs malformed (string / null / negative / object).
-    pub(crate) fn parse_event_attempt_id(event: &serde_json::Value) -> Result<Option<u64>, SemanticFoldError> {
+    pub(crate) fn parse_event_attempt_id(
+        event: &serde_json::Value,
+    ) -> Result<Option<u64>, SemanticFoldError> {
         match event.get("attempt_id") {
             None => Ok(None),
             Some(value) => {
@@ -514,7 +903,10 @@ impl SemanticEventFold {
         }
     }
 
-    pub(crate) fn check_correlation(&self, event: &serde_json::Value) -> Result<(), SemanticFoldError> {
+    pub(crate) fn check_correlation(
+        &self,
+        event: &serde_json::Value,
+    ) -> Result<(), SemanticFoldError> {
         let current_attempt = self
             .current_attempt_id
             .ok_or(SemanticFoldError::NoActiveAttempt)?;
@@ -1144,6 +1536,7 @@ pub(crate) fn complete_request_attempt(
     attempt_id: u64,
     force_reset: bool,
     latches: &std::cell::RefCell<AttemptLatches>,
+    cancelled: Option<&AtomicBool>,
     event_callback: &mut dyn FnMut(&serde_json::Value) -> Result<(), hipfire_client::ClientError>,
     terminal_callback: &mut dyn FnMut(&Completion) -> Result<(), hipfire_client::ClientError>,
 ) -> Result<Completion> {
@@ -1153,8 +1546,7 @@ pub(crate) fn complete_request_attempt(
     // interval includes admission queueing, which is exactly the component a
     // serving operator needs when latency rises under load.
     let attempt_started = std::time::Instant::now();
-    let first_token_at: std::cell::Cell<Option<std::time::Duration>> =
-        std::cell::Cell::new(None);
+    let first_token_at: std::cell::Cell<Option<std::time::Duration>> = std::cell::Cell::new(None);
 
     // Latch retry-disabling observations on every event bound for the client.
     let mut event_callback = |event: &serde_json::Value| {
@@ -1175,7 +1567,7 @@ pub(crate) fn complete_request_attempt(
     // Acquire runtime, ensure model, and build the generate request while
     // holding the lock. Clone the engine handle before dropping the lock so
     // concurrent eligible requests can share the multiplexed transport.
-    let (generate, resolved, engine_clone) = {
+    let (generate, resolved, engine_clone, reasoning, tool_choice_policy) = {
         let mut runtime = shared
             .runtime
             .lock()
@@ -1191,6 +1583,10 @@ pub(crate) fn complete_request_attempt(
                     // the next request must full-reload rather than trust it.
                     runtime.current_path = None;
                     runtime.current_arch = None;
+                    runtime.current_reasoning_contract =
+                        saddle_core::caps::ReasoningContract::Unsupported;
+                    runtime.current_reasoning_effort_native = false;
+                    runtime.current_reasoning_efforts = Vec::new();
                     runtime.continuous_batch_capable = false;
                     runtime.current_max_seq = 0;
                     runtime.cache_capable = false;
@@ -1215,6 +1611,11 @@ pub(crate) fn complete_request_attempt(
             normalize_openai_messages(body.get("messages"), include_reasoning_content);
         let default_system = request_string(&resolved, "prompt.system", None)?;
         inject_default_system_message(&mut normalized_messages, default_system.as_deref());
+        let (tool_choice_policy, forwarded_tools) = project_tool_choice(
+            body.get("tool_choice"),
+            body.get("tools"),
+            &mut normalized_messages,
+        )?;
         let mut generate = serde_json::json!({
             "type": "generate",
             "id": request_id(),
@@ -1241,9 +1642,12 @@ pub(crate) fn complete_request_attempt(
         // Validate OpenAI logprobs contract before forwarding; reject rather
         // than silently clamping so callers notice a mismatch.
         validate_logprobs_request(body)?;
+        // Project tools under tool_choice; never forward raw tool_choice (daemon
+        // ignores it). none drops tools so the template/parser stay inactive.
+        if let Some(tools) = forwarded_tools {
+            generate["tools"] = tools;
+        }
         for name in [
-            "tools",
-            "tool_choice",
             "frequency_penalty",
             "stop",
             "reasoning_effort",
@@ -1277,8 +1681,17 @@ pub(crate) fn complete_request_attempt(
                 );
             }
         }
-        let deepseek4_effort_contract = runtime.current_arch.as_deref() == Some("deepseek4");
-        apply_http_reasoning_request(body, &resolved, &mut generate, deepseek4_effort_contract)?;
+        let contract = runtime.current_reasoning_contract;
+        let effort_native = runtime.current_reasoning_effort_native;
+        let supported_efforts = runtime.current_reasoning_efforts.clone();
+        let reasoning = apply_http_reasoning_request(
+            body,
+            &resolved,
+            &mut generate,
+            contract,
+            effort_native,
+            &supported_efforts,
+        )?;
         let (id, created) = identity.clone();
         generate["id"] = serde_json::Value::String(id.clone());
         generate["attempt_id"] = serde_json::json!(attempt_id);
@@ -1286,10 +1699,15 @@ pub(crate) fn complete_request_attempt(
             generate["serve_continuous_batch"] = serde_json::Value::Bool(true);
         }
         let engine_clone = runtime.engine.clone();
-        (generate, resolved, engine_clone)
+        (
+            generate,
+            resolved,
+            engine_clone,
+            reasoning,
+            tool_choice_policy,
+        )
     };
     let (id, created) = identity.clone();
-    // Dual route gated by StreamContractGate:
     // - first event must be gen_start with matching request id + attempt_id
     // - contract_version is read only after correlation succeeds
     // - legacy/v2 latched once; second gen_start and pre-start events rejected
@@ -1318,7 +1736,7 @@ pub(crate) fn complete_request_attempt(
     let logprobs_requested = body.get("logprobs").and_then(|v| v.as_bool()) == Some(true);
     let mut logprobs_entries: Vec<serde_json::Value> = Vec::new();
 
-    let gen_result = engine_clone.generate(&generate, |event| {
+    let mut on_event = |event: &serde_json::Value| -> Result<(), hipfire_client::ClientError> {
         let event_type = event.get("type").and_then(serde_json::Value::as_str);
 
         // Staged terminal: commit_ready carries done fields with type != done.
@@ -1356,6 +1774,15 @@ pub(crate) fn complete_request_attempt(
                     } else {
                         None
                     };
+                    let mut tool_calls = fold.executable_tool_calls().to_vec();
+                    let mut done = fold.done().cloned().unwrap_or(staged);
+                    finalize_tool_calls_for_choice(
+                        &tool_choice_policy,
+                        &mut tool_calls,
+                        &mut done,
+                        body,
+                    )
+                    .map_err(|error| hipfire_client::ClientError::Protocol(error.to_string()))?;
                     Completion {
                         id: id.clone(),
                         created,
@@ -1363,9 +1790,10 @@ pub(crate) fn complete_request_attempt(
                         content: fold.content().to_owned(),
                         reasoning_content: fold.reasoning_content().to_owned(),
                         preserve_thinking,
-                        tool_calls: fold.executable_tool_calls().to_vec(),
-                        done: fold.done().cloned().unwrap_or(staged),
+                        tool_calls,
+                        done,
                         logprobs,
+                        reasoning: Some(reasoning.clone()),
                     }
                 }
                 StreamContract::Legacy => {
@@ -1379,11 +1807,19 @@ pub(crate) fn complete_request_attempt(
                     let finish = staged
                         .get("finish_reason")
                         .and_then(serde_json::Value::as_str);
-                    let tool_calls = if finish == Some("tool_calls") {
+                    let mut tool_calls = if finish == Some("tool_calls") {
                         legacy_tool_calls.clone()
                     } else {
                         Vec::new()
                     };
+                    let mut done = staged;
+                    finalize_tool_calls_for_choice(
+                        &tool_choice_policy,
+                        &mut tool_calls,
+                        &mut done,
+                        body,
+                    )
+                    .map_err(|error| hipfire_client::ClientError::Protocol(error.to_string()))?;
                     let logprobs = if logprobs_requested && !logprobs_entries.is_empty() {
                         Some(logprobs_entries.clone())
                     } else {
@@ -1397,8 +1833,9 @@ pub(crate) fn complete_request_attempt(
                         reasoning_content: legacy_reasoning.clone(),
                         preserve_thinking,
                         tool_calls,
-                        done: staged,
+                        done,
                         logprobs,
+                        reasoning: Some(reasoning.clone()),
                     }
                 }
             };
@@ -1516,7 +1953,11 @@ pub(crate) fn complete_request_attempt(
             }
         }
         Ok(())
-    });
+    };
+    let gen_result = match cancelled {
+        Some(flag) => engine_clone.generate_cancellable(&generate, flag, &mut on_event),
+        None => engine_clone.generate(&generate, &mut on_event),
+    };
     let done = gen_result?;
     let mut meta = shared
         .meta
@@ -1535,12 +1976,14 @@ pub(crate) fn complete_request_attempt(
     meta.last_activity = Instant::now();
 
     if contract_gate.is_v2() {
-        let done = fold.done().cloned().unwrap_or(done);
+        let mut done = fold.done().cloned().unwrap_or(done);
         let logprobs = if logprobs_requested && !logprobs_entries.is_empty() {
             Some(logprobs_entries)
         } else {
             None
         };
+        let mut tool_calls = fold.executable_tool_calls().to_vec();
+        finalize_tool_calls_for_choice(&tool_choice_policy, &mut tool_calls, &mut done, body)?;
         return Ok(Completion {
             id,
             created,
@@ -1548,21 +1991,23 @@ pub(crate) fn complete_request_attempt(
             content: fold.content().to_owned(),
             reasoning_content: fold.reasoning_content().to_owned(),
             preserve_thinking,
-            tool_calls: fold.executable_tool_calls().to_vec(),
+            tool_calls,
             done,
             logprobs,
+            reasoning: Some(reasoning),
         });
     }
 
-    let done = legacy_done.unwrap_or(done);
+    let mut done = legacy_done.unwrap_or(done);
     let finish = done
         .get("finish_reason")
         .and_then(serde_json::Value::as_str);
-    let tool_calls = if finish == Some("tool_calls") {
+    let mut tool_calls = if finish == Some("tool_calls") {
         legacy_tool_calls
     } else {
         Vec::new()
     };
+    finalize_tool_calls_for_choice(&tool_choice_policy, &mut tool_calls, &mut done, body)?;
     let logprobs = if logprobs_requested && !logprobs_entries.is_empty() {
         Some(logprobs_entries)
     } else {
@@ -1578,38 +2023,57 @@ pub(crate) fn complete_request_attempt(
         tool_calls,
         done,
         logprobs,
+        reasoning: Some(reasoning),
     })
 }
-/// Server-owned one-retry driver over [`complete_request_attempt`].
 
-pub(crate) fn complete_request(
+/// Server-owned retry driver with cooperative cancellation.
+///
+/// Daemon requests use [`hipfire_client::Engine::generate_cancellable`].
+/// Multi-slot requests observe the same flag and drop their reply receiver,
+/// which makes the slot engine stop and free the abandoned slot.
+pub(crate) fn complete_request_cancellable(
     shared: &ServeShared,
     body: &serde_json::Value,
     guard: AdmissionGuard,
     request_identity: Option<(String, u64)>,
+    cancelled: &AtomicBool,
     mut event_callback: impl FnMut(&serde_json::Value) -> Result<(), hipfire_client::ClientError>,
     mut terminal_callback: impl FnMut(&Completion) -> Result<(), hipfire_client::ClientError>,
 ) -> Result<Completion> {
     let identity = request_identity.unwrap_or_else(|| (request_id(), unix_timestamp()));
 
-    // Concurrent path. Takes no `shared.runtime` lock, which is the entire
-    // point: that mutex is what makes concurrent callers queue today. The
-    // retry/attempt machinery below is for the daemon Engine's cold-reset
-    // semantics and has no analogue here -- the engine either admits a request
-    // or rejects it with a reason.
-    if let Some(backend) = shared.slot_engine.clone() {
-        return crate::serve::slots::complete_request_slots(
-            &backend,
-            body,
-            &identity,
-            &mut event_callback,
-            &mut terminal_callback,
-        );
+    // Slot path: retain existing non-cancellable behavior (no disconnect token).
+    let slot_capable = {
+        let runtime = shared
+            .runtime
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        runtime.current_path.is_some()
+            && matches!(
+                runtime.current_reasoning_contract,
+                saddle_core::caps::ReasoningContract::Unsupported
+            )
+    };
+    if slot_capable {
+        if let Some(backend) = shared.slot_engine.clone() {
+            return crate::serve::slots::complete_request_slots(
+                &backend,
+                body,
+                &identity,
+                Some(cancelled),
+                &mut event_callback,
+                &mut terminal_callback,
+            );
+        }
     }
 
     let mut attempt_index = 1u32;
     let mut guard = guard;
     loop {
+        if cancelled.load(Ordering::Relaxed) {
+            return Err(anyhow::Error::new(ClientError::Cancelled));
+        }
         let attempt_id = next_attempt_id();
         let latches = std::cell::RefCell::new(AttemptLatches::default());
         let outcome = complete_request_attempt(
@@ -1620,6 +2084,7 @@ pub(crate) fn complete_request(
             attempt_id,
             attempt_index > 1,
             &latches,
+            Some(cancelled),
             &mut event_callback,
             &mut terminal_callback,
         );
@@ -1636,6 +2101,13 @@ pub(crate) fn complete_request(
                 return Ok(completion);
             }
             Err(error) => {
+                let was_cancelled = cancelled.load(Ordering::Relaxed)
+                    || error
+                        .downcast_ref::<ClientError>()
+                        .is_some_and(|err| matches!(err, ClientError::Cancelled));
+                if was_cancelled {
+                    return Err(error);
+                }
                 let eligible = {
                     let runtime = shared
                         .runtime
@@ -1675,6 +2147,9 @@ pub(crate) fn complete_request(
                     hook(shared.retry_backoff);
                 } else {
                     std::thread::sleep(shared.retry_backoff);
+                }
+                if cancelled.load(Ordering::Relaxed) {
+                    return Err(anyhow::Error::new(ClientError::Cancelled));
                 }
                 guard = match shared.admission.acquire() {
                     Ok(guard) => guard,
@@ -1910,7 +2385,10 @@ pub(crate) fn normalize_openai_messages(
     serde_json::Value::Array(normalized)
 }
 
-pub(crate) fn inject_default_system_message(messages: &mut serde_json::Value, system: Option<&str>) {
+pub(crate) fn inject_default_system_message(
+    messages: &mut serde_json::Value,
+    system: Option<&str>,
+) {
     let Some(system) = system.filter(|value| !value.is_empty()) else {
         return;
     };
@@ -1990,7 +2468,9 @@ pub(crate) fn validate_logprobs_request(body: &serde_json::Value) -> Result<()> 
 /// Returns None if the event lacks `logprob` — some paths do not yet compute
 /// it, and the response must omit `logprobs` entirely rather than emit entries
 /// with null logprob values. `bytes` is the UTF-8 bytes of the token text.
-pub(crate) fn logprob_entry_from_token_event(event: &serde_json::Value) -> Option<serde_json::Value> {
+pub(crate) fn logprob_entry_from_token_event(
+    event: &serde_json::Value,
+) -> Option<serde_json::Value> {
     let text = event.get("text")?.as_str()?;
     let logprob = event.get("logprob")?.as_f64()?;
     let bytes: Vec<serde_json::Value> = text
@@ -2143,13 +2623,27 @@ pub(crate) fn completion_timings(completion: &Completion) -> serde_json::Value {
 /// Shared hipfire evidence projection for normal and streaming terminals.
 pub(crate) fn completion_hipfire(completion: &Completion) -> serde_json::Value {
     let done = &completion.done;
-    serde_json::json!({
+    let mut hip = serde_json::json!({
         "tok_s": done.get("tok_s"),
         "prefill_tok_s": done.get("prefill_tok_s"),
         "decode_tok_s": done.get("decode_tok_s"),
         "execution_mode": done.get("execution_mode"),
         "continuous_batch": done.get("continuous_batch"),
-    })
+    });
+    if let Some(reasoning) = &completion.reasoning {
+        hip["reasoning"] = serde_json::json!({
+            "contract": reasoning.contract.wire_name(),
+            "mode": reasoning.effective_mode,
+            "effort": reasoning.effective_effort,
+            "max_think_tokens": reasoning.effective_cap,
+            "cap_source": reasoning.cap_source,
+        });
+        hip["config_warnings"] = serde_json::json!(reasoning.warnings);
+    } else {
+        hip["reasoning"] = serde_json::Value::Null;
+        hip["config_warnings"] = serde_json::json!([]);
+    }
+    hip
 }
 
 /// One OpenAI-lowered tool call from the shared canonical adapter.
@@ -2164,7 +2658,9 @@ pub(crate) struct OpenAiToolCallAdapterResult {
 
 /// Build the single shared OpenAI adapter result vector for a completion.
 /// Deterministic response-scoped ids `call_{index}`; no filtering/dropping.
-pub(crate) fn openai_tool_call_adapter_results(calls: &[ToolCall]) -> Vec<OpenAiToolCallAdapterResult> {
+pub(crate) fn openai_tool_call_adapter_results(
+    calls: &[ToolCall],
+) -> Vec<OpenAiToolCallAdapterResult> {
     calls
         .iter()
         .enumerate()
@@ -2204,7 +2700,9 @@ pub(crate) fn openai_tool_calls(calls: &[ToolCall]) -> Vec<serde_json::Value> {
 /// Map a folded callback event to an OpenAI stream delta.
 /// Only clean content/reasoning are forwarded mid-stream; structured tool
 /// calls release only via [`openai_stream_terminal_chunks`].
-pub(crate) fn openai_stream_delta_for_event(event: &serde_json::Value) -> Option<serde_json::Value> {
+pub(crate) fn openai_stream_delta_for_event(
+    event: &serde_json::Value,
+) -> Option<serde_json::Value> {
     match event.get("type").and_then(serde_json::Value::as_str) {
         Some("token") => event
             .get("text")
@@ -2293,18 +2791,23 @@ pub(crate) fn openai_stream_terminal_chunks(
     chunks
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::serve::complete::{Completion};
-    use hipfire_runtime::prompt_frame::ToolCall;
-    use hipfire_client::ClientError;
+    use crate::serve::complete::Completion;
     use crate::{Paths, ServeArgs, StopArgs};
-    use hipfire_config::{ConfigLayer, ConfigPaths, ConfigSource, NamedLayer, resolve, load_global};
-    use hipfire_registry::{RegistryV1, RegistryPaths};
-    use std::{env, fs, path::{Path, PathBuf}, time::{Duration, Instant}, sync::{Arc, Mutex}};
+    use hipfire_client::ClientError;
+    use hipfire_config::{
+        load_global, resolve, ConfigLayer, ConfigPaths, ConfigSource, NamedLayer,
+    };
+    use hipfire_registry::{RegistryPaths, RegistryV1};
+    use hipfire_runtime::prompt_frame::ToolCall;
+    use std::{
+        env, fs,
+        path::{Path, PathBuf},
+        sync::{Arc, Mutex},
+        time::{Duration, Instant},
+    };
 
     fn test_paths(label: &str) -> Paths {
         let nonce = std::time::SystemTime::now()
@@ -2361,6 +2864,7 @@ mod tests {
                 "tok_s": 10.0,
             }),
             logprobs: None,
+            reasoning: None,
         }
     }
 
@@ -2387,6 +2891,7 @@ mod tests {
             tool_calls,
             done,
             logprobs: None,
+            reasoning: None,
         }
     }
 
@@ -2422,6 +2927,7 @@ mod tests {
             tool_calls: Vec::new(),
             done,
             logprobs: None,
+            reasoning: None,
         };
 
         let dflash = completion_timings(&completion(serde_json::json!({
@@ -2478,6 +2984,7 @@ mod tests {
                 "tok_s": 20.0,
             }),
             logprobs: None,
+            reasoning: None,
         };
         let timings = completion_timings(&completion);
         assert_eq!(timings["latency_ms"], 250.5);
@@ -2493,6 +3000,7 @@ mod tests {
             tool_calls: Vec::new(),
             done: serde_json::json!({"ttft_ms": 1.0}),
             logprobs: None,
+            reasoning: None,
         });
         assert!(no_lat["latency_ms"].is_null());
     }
@@ -2527,6 +3035,7 @@ mod tests {
                 "prefill_tokens": 8,
             }),
             logprobs: None,
+            reasoning: None,
         };
         let hip = completion_hipfire(&completion);
         assert_eq!(hip["execution_mode"], "continuous_batch_independent");
@@ -2572,6 +3081,7 @@ mod tests {
                 "tokens": 2,
             }),
             logprobs: None,
+            reasoning: None,
         };
         let seq_hip = completion_hipfire(&sequential);
         assert!(seq_hip["execution_mode"].is_null());
@@ -2907,55 +3417,372 @@ mod tests {
 
     #[test]
     fn http_reasoning_and_completion_metadata_match_native_contract() {
+        use hipfire_config::{resolve, ConfigLayer, ConfigSource, NamedLayer};
+        use saddle_core::caps::ReasoningContract;
+        use std::path::PathBuf;
         let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
-        let mut request = serde_json::json!({});
-        apply_http_reasoning_request(
-            &serde_json::json!({ "reasoning_effort": "high" }),
+        let qwen_supported = vec!["low".to_string(), "medium".to_string(), "xhigh".to_string()];
+        for effort in ["low", "medium", "xhigh"] {
+            let mut req = serde_json::json!({});
+            let res = apply_http_reasoning_request(
+                &serde_json::json!({ "reasoning_effort": effort }),
+                &resolved,
+                &mut req,
+                ReasoningContract::QwenJinja,
+                true,
+                &qwen_supported,
+            )
+            .unwrap();
+            assert_eq!(req["reasoning_effort"], effort);
+            assert_eq!(req["thinking_enabled"], true);
+            assert_eq!(req["assistant_prefix"], "open_think");
+            assert!(
+                req.get("max_think_tokens").is_none(),
+                "qwen {effort} must not invent max cap"
+            );
+            assert_eq!(res.effective_mode, "enabled");
+            assert_eq!(res.effective_effort.as_deref(), Some(effort));
+            assert_eq!(res.effective_cap, None);
+            assert_eq!(res.cap_source, "none");
+            assert!(res.warnings.is_empty());
+        }
+        let mut qwen_default = serde_json::json!({});
+        let res_default = apply_http_reasoning_request(
+            &serde_json::json!({}),
             &resolved,
-            &mut request,
+            &mut qwen_default,
+            ReasoningContract::QwenJinja,
+            true,
+            &qwen_supported,
+        )
+        .unwrap();
+        assert_eq!(qwen_default["reasoning_effort"], "xhigh");
+        assert_eq!(res_default.effective_effort.as_deref(), Some("xhigh"));
+        let mut qwen_capped = serde_json::json!({});
+        let res_capped = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning_effort": "low", "max_think_tokens": 2048 }),
+            &resolved,
+            &mut qwen_capped,
+            ReasoningContract::QwenJinja,
+            true,
+            &qwen_supported,
+        )
+        .unwrap();
+        assert_eq!(qwen_capped["reasoning_effort"], "low");
+        assert_eq!(qwen_capped["max_think_tokens"], 2048);
+        assert_eq!(res_capped.effective_cap, Some(2048));
+        assert_eq!(res_capped.cap_source, "explicit:body:max_think_tokens");
+        let mut qwen36 = serde_json::json!({});
+        let res36 = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning_effort": "low" }),
+            &resolved,
+            &mut qwen36,
+            ReasoningContract::QwenJinja,
             false,
+            &[],
         )
         .unwrap();
-        assert_eq!(request["reasoning_effort"], "high");
-        assert_eq!(request["max_think_tokens"], 4096);
-
-        let mut deepseek_uncapped = serde_json::json!({});
-        apply_http_reasoning_request(
-            &serde_json::json!({ "reasoning_effort": "max" }),
+        assert!(qwen36.get("reasoning_effort").is_none());
+        assert!(!res36.warnings.is_empty());
+        assert!(res36
+            .warnings
+            .iter()
+            .any(|w| w.contains("does not natively support")));
+        assert_eq!(res36.effective_effort, None);
+        let mut qwen36_cap = serde_json::json!({});
+        let res36cap = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning_effort": "low", "max_think_tokens": 2048 }),
             &resolved,
-            &mut deepseek_uncapped,
-            true,
+            &mut qwen36_cap,
+            ReasoningContract::QwenJinja,
+            false,
+            &[],
         )
         .unwrap();
-        assert_eq!(deepseek_uncapped["reasoning_effort"], "max");
-        assert_eq!(deepseek_uncapped["max_think_tokens"], 0);
-
-        let mut deepseek_explicitly_capped = serde_json::json!({});
-        apply_http_reasoning_request(
+        assert_eq!(qwen36_cap["max_think_tokens"], 2048);
+        assert_eq!(res36cap.effective_cap, Some(2048));
+        let mut budget_layer = ConfigLayer::default();
+        budget_layer.set_cli("reasoning.budget", "low").unwrap();
+        let budget_resolved = resolve([NamedLayer {
+            source: ConfigSource::GlobalUser {
+                path: PathBuf::from("config.toml"),
+            },
+            layer: budget_layer,
+        }])
+        .unwrap();
+        let mut qwen_nat_budget = serde_json::json!({});
+        let res_nat_budget = apply_http_reasoning_request(
+            &serde_json::json!({}),
+            &budget_resolved,
+            &mut qwen_nat_budget,
+            ReasoningContract::QwenJinja,
+            true,
+            &qwen_supported,
+        )
+        .unwrap();
+        assert!(
+            qwen_nat_budget.get("max_think_tokens").is_none(),
+            "native budget must be dropped"
+        );
+        assert!(!res_nat_budget.warnings.is_empty());
+        assert!(res_nat_budget
+            .warnings
+            .iter()
+            .any(|w| w.contains("thinking_budget") && w.contains("ignored")));
+        let mut qwen_non_budget = serde_json::json!({});
+        let res_non_budget = apply_http_reasoning_request(
+            &serde_json::json!({}),
+            &budget_resolved,
+            &mut qwen_non_budget,
+            ReasoningContract::QwenJinja,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(qwen_non_budget["max_think_tokens"], 512);
+        assert_eq!(res_non_budget.effective_cap, Some(512));
+        assert_eq!(res_non_budget.cap_source, "config:reasoning.budget");
+        let mut qwen_native_body_budget = serde_json::json!({});
+        let native_body_budget = apply_http_reasoning_request(
             &serde_json::json!({
-                "reasoning_effort": "max",
-                "max_think_tokens": 1234
+                "reasoning_effort": "xhigh",
+                "thinking_budget": "high"
             }),
             &resolved,
-            &mut deepseek_explicitly_capped,
+            &mut qwen_native_body_budget,
+            ReasoningContract::QwenJinja,
             true,
+            &qwen_supported,
         )
         .unwrap();
-        assert_eq!(deepseek_explicitly_capped["reasoning_effort"], "max");
-        assert_eq!(deepseek_explicitly_capped["max_think_tokens"], 1234);
-
+        assert!(qwen_native_body_budget.get("max_think_tokens").is_none());
+        assert_eq!(
+            native_body_budget.effective_effort.as_deref(),
+            Some("xhigh")
+        );
+        assert!(native_body_budget.effective_cap.is_none());
+        assert!(native_body_budget.warnings.iter().any(|warning| {
+            warning.contains("thinking_budget") && warning.contains("effort-native")
+        }));
+        let mut qwen36_body_budget = serde_json::json!({});
+        let qwen36_budget_resolution = apply_http_reasoning_request(
+            &serde_json::json!({ "thinking_budget": "high" }),
+            &resolved,
+            &mut qwen36_body_budget,
+            ReasoningContract::QwenJinja,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(qwen36_body_budget["max_think_tokens"], 8192);
+        assert_eq!(qwen36_budget_resolution.effective_cap, Some(8192));
+        assert_eq!(
+            qwen36_budget_resolution.cap_source,
+            "explicit:body:thinking_budget"
+        );
+        let mut qwen_max_and_budget = serde_json::json!({});
+        let qwen_max_resolution = apply_http_reasoning_request(
+            &serde_json::json!({
+                "reasoning_effort": "medium",
+                "thinking_budget": "high",
+                "max_think_tokens": 4096
+            }),
+            &resolved,
+            &mut qwen_max_and_budget,
+            ReasoningContract::QwenJinja,
+            true,
+            &qwen_supported,
+        )
+        .unwrap();
+        assert_eq!(qwen_max_and_budget["max_think_tokens"], 4096);
+        assert_eq!(qwen_max_resolution.effective_cap, Some(4096));
+        assert_eq!(
+            qwen_max_resolution.cap_source,
+            "explicit:body:max_think_tokens"
+        );
+        assert!(qwen_max_resolution
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("takes precedence")));
         let mut disabled = serde_json::json!({});
-        apply_http_reasoning_request(
-            &serde_json::json!({
-                "chat_template_kwargs": { "enable_thinking": false }
-            }),
+        let res_dis = apply_http_reasoning_request(
+            &serde_json::json!({ "thinking": { "type": "disabled" }, "reasoning_effort": "low", "max_think_tokens": 100 }),
             &resolved,
             &mut disabled,
-            false,
+            ReasoningContract::QwenJinja,
+            true,
+            &qwen_supported,
         )
         .unwrap();
-        assert_eq!(disabled["reasoning_effort"], "none");
-
+        assert_eq!(disabled["thinking_enabled"], false);
+        assert!(disabled.get("reasoning_effort").is_none());
+        assert!(disabled.get("max_think_tokens").is_none());
+        assert!(!res_dis.warnings.is_empty());
+        assert!(res_dis
+            .warnings
+            .iter()
+            .any(|w| w.contains("thinking disabled")));
+        assert_eq!(res_dis.effective_mode, "disabled");
+        for (input, expected) in [("minimal", "low"), ("medium", "high"), ("xhigh", "high")] {
+            let mut req = serde_json::json!({});
+            let res = apply_http_reasoning_request(
+                &serde_json::json!({ "reasoning_effort": input }),
+                &resolved,
+                &mut req,
+                ReasoningContract::DeepSeek4,
+                true,
+                &vec!["low".to_string(), "high".to_string(), "max".to_string()],
+            )
+            .unwrap();
+            assert_eq!(
+                req["reasoning_effort"], expected,
+                "deepseek {input} -> {expected}"
+            );
+            assert_eq!(res.effective_effort.as_deref(), Some(expected));
+        }
+        let mut ds_default = serde_json::json!({});
+        let res_ds_def = apply_http_reasoning_request(
+            &serde_json::json!({}),
+            &resolved,
+            &mut ds_default,
+            ReasoningContract::DeepSeek4,
+            true,
+            &vec!["low".to_string(), "high".to_string(), "max".to_string()],
+        )
+        .unwrap();
+        assert_eq!(ds_default["reasoning_effort"], "high");
+        assert_eq!(res_ds_def.effective_effort.as_deref(), Some("high"));
+        let mut gemma_effort = serde_json::json!({});
+        let res_gem_eff = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning_effort": "low" }),
+            &resolved,
+            &mut gemma_effort,
+            ReasoningContract::GemmaBoolean,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert!(gemma_effort.get("reasoning_effort").is_none());
+        assert!(!res_gem_eff.warnings.is_empty());
+        assert!(res_gem_eff
+            .warnings
+            .iter()
+            .any(|w| w.contains("gemma_boolean")));
+        let mut gemma_max = serde_json::json!({});
+        let res_gem_max = apply_http_reasoning_request(
+            &serde_json::json!({ "max_think_tokens": 100 }),
+            &resolved,
+            &mut gemma_max,
+            ReasoningContract::GemmaBoolean,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert!(gemma_max.get("max_think_tokens").is_none());
+        assert!(!res_gem_max.warnings.is_empty());
+        let mut glimmer_off = serde_json::json!({});
+        let res_glim_off = apply_http_reasoning_request(
+            &serde_json::json!({ "thinking": { "type": "disabled" } }),
+            &resolved,
+            &mut glimmer_off,
+            ReasoningContract::MuseGlimmer,
+            true,
+            &vec![
+                "low".to_string(),
+                "medium".to_string(),
+                "high".to_string(),
+                "xhigh".to_string(),
+            ],
+        )
+        .unwrap();
+        assert_eq!(glimmer_off["thinking_enabled"], true);
+        assert!(!res_glim_off.warnings.is_empty());
+        assert!(res_glim_off
+            .warnings
+            .iter()
+            .any(|w| w.contains("muse_glimmer")));
+        assert_eq!(res_glim_off.effective_mode, "enabled");
+        let mut unsup = serde_json::json!({});
+        let res_unsup = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning_effort": "low" }),
+            &resolved,
+            &mut unsup,
+            ReasoningContract::Unsupported,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert!(unsup.get("reasoning_effort").is_none());
+        assert!(!res_unsup.warnings.is_empty());
+        assert_eq!(res_unsup.effective_mode, "disabled");
+        let mut unsup_ok = serde_json::json!({});
+        let res_unsup_ok = apply_http_reasoning_request(
+            &serde_json::json!({}),
+            &resolved,
+            &mut unsup_ok,
+            ReasoningContract::Unsupported,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert!(unsup_ok.get("thinking_enabled").is_none());
+        assert!(res_unsup_ok.warnings.is_empty());
+        let mut qwen_unknown = serde_json::json!({});
+        let qwen_unknown_resolution = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning_effort": "ultra" }),
+            &resolved,
+            &mut qwen_unknown,
+            ReasoningContract::QwenJinja,
+            true,
+            &qwen_supported,
+        )
+        .unwrap();
+        assert_eq!(qwen_unknown["reasoning_effort"], "xhigh");
+        assert_eq!(
+            qwen_unknown_resolution.effective_effort.as_deref(),
+            Some("xhigh")
+        );
+        assert!(!qwen_unknown_resolution.warnings.is_empty());
+        assert!(apply_http_reasoning_request(
+            &serde_json::json!({ "max_think_tokens": 999999 }),
+            &resolved,
+            &mut serde_json::json!({}),
+            ReasoningContract::QwenJinja,
+            true,
+            &qwen_supported,
+        )
+        .is_err());
+        let mut maybe_req = serde_json::json!({});
+        let maybe_res = apply_http_reasoning_request(
+            &serde_json::json!({ "thinking": { "type": "maybe" } }),
+            &resolved,
+            &mut maybe_req,
+            ReasoningContract::QwenJinja,
+            true,
+            &qwen_supported,
+        )
+        .unwrap();
+        assert!(
+            maybe_req.get("thinking_enabled").is_none()
+                || maybe_req["thinking_enabled"] == serde_json::json!(true)
+        );
+        assert!(!maybe_res.warnings.is_empty());
+        assert!(maybe_res
+            .warnings
+            .iter()
+            .any(|w| w.contains("thinking.type") && w.contains("dropped")));
+        let mut qwen_high = serde_json::json!({});
+        let res_qhigh = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning_effort": "high" }),
+            &resolved,
+            &mut qwen_high,
+            ReasoningContract::QwenJinja,
+            true,
+            &qwen_supported,
+        )
+        .unwrap();
+        assert_eq!(qwen_high["reasoning_effort"], "xhigh");
+        assert!(!res_qhigh.warnings.is_empty());
         let completion = Completion {
             id: "chatcmpl_test".into(),
             created: 7,
@@ -2971,124 +3798,25 @@ mod tests {
                 "ttft_ms": 8.5,
                 "decode_tok_s": 115.0,
                 "finish_reason": "stop",
-                "mtp_ngram": 3,
-                "ngram_mod_windows": 5,
-                "ngram_mod_drafts": 12,
-                "ngram_mod_accepted": 9,
-                "ngram_mod_accept_rate": 0.75,
-                "mtp_windows": 4,
-                "ar_windows": 2,
-                "mtp_retired": true
             }),
             logprobs: None,
+            reasoning: Some(res_default.clone()),
         };
         let json = completion_json(&completion);
-        assert_eq!(json["usage"]["total_tokens"], 19);
-        assert_eq!(json["usage"]["prompt_tokens_details"]["cached_tokens"], 4);
-        assert_eq!(json["timings"]["decode_tok_s"], 115.0);
-        assert_eq!(json["timings"]["mtp_ngram"], 3);
-        assert_eq!(json["timings"]["ngram_mod_windows"], 5);
-        assert_eq!(json["timings"]["ngram_mod_drafts"], 12);
-        assert_eq!(json["timings"]["ngram_mod_accepted"], 9);
-        assert_eq!(json["timings"]["ngram_mod_accept_rate"], 0.75);
-        assert_eq!(json["timings"]["mtp_windows"], 4);
-        assert_eq!(json["timings"]["ar_windows"], 2);
-        assert_eq!(json["timings"]["mtp_retired"], true);
-        assert_eq!(json["created"], 7);
-
-        let qwen_cached = Completion {
-            id: "chatcmpl_qwen_cached".into(),
-            created: 8,
-            model: "qwen:test".into(),
-            content: "answer".into(),
-            reasoning_content: String::new(),
-            preserve_thinking: false,
-            tool_calls: Vec::new(),
-            done: serde_json::json!({
-                "prefill_tokens": 8,
-                "cached_tokens": 12,
-                "tokens": 7
-            }),
-            logprobs: None,
-        };
-        let qwen_json = completion_json(&qwen_cached);
-        assert_eq!(qwen_json["usage"]["prompt_tokens"], 20);
-        assert_eq!(qwen_json["usage"]["total_tokens"], 27);
+        assert_eq!(json["hipfire"]["reasoning"]["contract"], "qwen_jinja");
+        assert_eq!(json["hipfire"]["reasoning"]["mode"], "enabled");
+        assert_eq!(json["hipfire"]["reasoning"]["effort"], "xhigh");
         assert_eq!(
-            qwen_json["usage"]["prompt_tokens_details"]["cached_tokens"],
-            12
+            json["hipfire"]["config_warnings"],
+            serde_json::json!(res_default.warnings)
         );
-
-        let preserved = Completion {
-            preserve_thinking: true,
-            reasoning_content: "private chain".into(),
-            ..qwen_cached
-        };
-        let preserved_json = completion_json(&preserved);
+        let chunks = openai_stream_terminal_chunks(&completion, false);
+        let terminal = chunks.last().unwrap();
+        assert_eq!(terminal["hipfire"]["reasoning"]["contract"], "qwen_jinja");
         assert_eq!(
-            preserved_json["choices"][0]["message"]["content"],
-            "<think>private chain</think>\nanswer"
+            terminal["hipfire"]["config_warnings"],
+            serde_json::json!(res_default.warnings)
         );
-        assert!(preserved_json["choices"][0]["message"]
-            .get("reasoning_content")
-            .is_none());
-    }
-
-    #[test]
-    fn apply_reasoning_request_accepts_medium_and_xhigh() {
-        use hipfire_config::{resolve, ConfigLayer, ConfigSource, NamedLayer};
-        use std::path::PathBuf;
-        for effort in ["low", "medium", "xhigh", "high", "max"] {
-            let mut layer = ConfigLayer::default();
-            layer.set_cli("reasoning.effort", effort).unwrap();
-            layer.set_cli("reasoning.max_tokens", "0").unwrap();
-            let resolved = resolve([NamedLayer {
-                source: ConfigSource::GlobalUser {
-                    path: PathBuf::from("config.toml"),
-                },
-                layer,
-            }])
-            .unwrap();
-            let mut req = serde_json::json!({});
-            crate::apply_reasoning_request(&resolved, &mut req).unwrap();
-            assert_eq!(
-                req["reasoning_effort"], effort,
-                "effort {effort} must pass through unchanged"
-            );
-        }
-        // auto stays unset (no key), none disables
-        let mut auto_layer = ConfigLayer::default();
-        auto_layer.set_cli("reasoning.effort", "auto").unwrap();
-        auto_layer.set_cli("reasoning.max_tokens", "0").unwrap();
-        let auto_resolved = resolve([NamedLayer {
-            source: ConfigSource::GlobalUser {
-                path: PathBuf::from("config.toml"),
-            },
-            layer: auto_layer,
-        }])
-        .unwrap();
-        let mut auto_req = serde_json::json!({});
-        crate::apply_reasoning_request(&auto_resolved, &mut auto_req).unwrap();
-        assert!(
-            auto_req.get("reasoning_effort").is_none(),
-            "auto must stay undefined"
-        );
-
-        let mut none_layer = ConfigLayer::default();
-        none_layer.set_cli("reasoning.effort", "none").unwrap();
-        none_layer.set_cli("reasoning.max_tokens", "0").unwrap();
-        let none_resolved = resolve([NamedLayer {
-            source: ConfigSource::GlobalUser {
-                path: PathBuf::from("config.toml"),
-            },
-            layer: none_layer,
-        }])
-        .unwrap();
-        let mut none_req = serde_json::json!({});
-        crate::apply_reasoning_request(&none_resolved, &mut none_req).unwrap();
-        assert_eq!(none_req["reasoning_effort"], "none");
-        assert_eq!(none_req["max_think_tokens"], 1);
-        assert_eq!(none_req["assistant_prefix"], "closed_think");
     }
 
     #[test]
@@ -3327,6 +4055,7 @@ mod tests {
             tool_calls: fold.executable_tool_calls().to_vec(),
             done: fold.done().cloned().unwrap(),
             logprobs: None,
+            reasoning: None,
         };
         let nonstream = completion_json(&completion);
         assert!(nonstream["choices"][0]["message"]["content"].is_null());
@@ -3400,6 +4129,7 @@ mod tests {
             tool_calls: fold.executable_tool_calls().to_vec(),
             done: fold.done().cloned().unwrap(),
             logprobs: None,
+            reasoning: None,
         };
 
         let nonstream = completion_json(&completion);
@@ -4870,7 +5600,8 @@ mod tests {
             validate_logprobs_request(&body).unwrap_or_else(|e| panic!("{n} should be valid: {e}"));
         }
         // logprobs true alone without top_logprobs is also valid
-        validate_logprobs_request(&serde_json::json!({ "logprobs": true })).expect("logprobs true alone");
+        validate_logprobs_request(&serde_json::json!({ "logprobs": true }))
+            .expect("logprobs true alone");
         // absent fields are valid
         validate_logprobs_request(&serde_json::json!({})).expect("empty");
         validate_logprobs_request(&serde_json::json!({ "logprobs": false })).expect("false");
@@ -4882,15 +5613,27 @@ mod tests {
         let bad = serde_json::json!({ "logprobs": true, "top_logprobs": 21 });
         assert!(validate_logprobs_request(&bad).is_err(), "21 should fail");
         let bad_neg = serde_json::json!({ "logprobs": true, "top_logprobs": -1 });
-        assert!(validate_logprobs_request(&bad_neg).is_err(), "-1 should fail");
+        assert!(
+            validate_logprobs_request(&bad_neg).is_err(),
+            "-1 should fail"
+        );
         // float must fail even if integral value
         let bad_float = serde_json::json!({ "logprobs": true, "top_logprobs": 5.0 });
-        assert!(validate_logprobs_request(&bad_float).is_err(), "5.0 float should fail");
+        assert!(
+            validate_logprobs_request(&bad_float).is_err(),
+            "5.0 float should fail"
+        );
         let bad_str = serde_json::json!({ "logprobs": true, "top_logprobs": "5" });
-        assert!(validate_logprobs_request(&bad_str).is_err(), "string should fail");
+        assert!(
+            validate_logprobs_request(&bad_str).is_err(),
+            "string should fail"
+        );
         // logprobs must be bool
         let bad_logprob_type = serde_json::json!({ "logprobs": "true" });
-        assert!(validate_logprobs_request(&bad_logprob_type).is_err(), "string logprobs should fail");
+        assert!(
+            validate_logprobs_request(&bad_logprob_type).is_err(),
+            "string logprobs should fail"
+        );
     }
 
     #[test]
@@ -4901,8 +5644,13 @@ mod tests {
             serde_json::json!({ "logprobs": null, "top_logprobs": 0 }),
         ];
         for body in &cases {
-            let err = validate_logprobs_request(body).expect_err("should reject top without logprobs true");
-            assert!(err.to_string().contains("top_logprobs requires logprobs"), "err={}", err);
+            let err = validate_logprobs_request(body)
+                .expect_err("should reject top without logprobs true");
+            assert!(
+                err.to_string().contains("top_logprobs requires logprobs"),
+                "err={}",
+                err
+            );
         }
     }
 
@@ -4918,9 +5666,13 @@ mod tests {
             tool_calls: Vec::new(),
             done: serde_json::json!({ "finish_reason": "stop", "tokens": 1 }),
             logprobs: None,
+            reasoning: None,
         };
         let json = completion_json(&completion);
-        assert!(json["choices"][0].get("logprobs").is_none(), "logprobs must be absent, not null");
+        assert!(
+            json["choices"][0].get("logprobs").is_none(),
+            "logprobs must be absent, not null"
+        );
         // empty vec also absent
         let empty = Completion {
             logprobs: Some(vec![]),
@@ -4934,10 +5686,14 @@ mod tests {
                 tool_calls: Vec::new(),
                 done: serde_json::json!({ "finish_reason": "stop", "tokens": 1 }),
                 logprobs: None,
+                reasoning: None,
             }
         };
         let json2 = completion_json(&empty);
-        assert!(json2["choices"][0].get("logprobs").is_none(), "empty content must also be absent");
+        assert!(
+            json2["choices"][0].get("logprobs").is_none(),
+            "empty content must also be absent"
+        );
     }
 
     #[test]
@@ -4956,7 +5712,10 @@ mod tests {
         assert!((entry["logprob"].as_f64().unwrap() - (-0.31)).abs() < 1e-6);
         assert_eq!(entry["bytes"], serde_json::json!([84, 104, 101]));
         assert_eq!(entry["top_logprobs"][0]["token"], "The");
-        assert_eq!(entry["top_logprobs"][0]["bytes"], serde_json::json!([84, 104, 101]));
+        assert_eq!(
+            entry["top_logprobs"][0]["bytes"],
+            serde_json::json!([84, 104, 101])
+        );
         assert_eq!(entry["top_logprobs"][1]["token"], "A");
         assert_eq!(entry["top_logprobs"][1]["bytes"], serde_json::json!([65]));
         // UTF-8 multi-byte
@@ -4982,6 +5741,7 @@ mod tests {
             tool_calls: Vec::new(),
             done: serde_json::json!({ "finish_reason": "stop" }),
             logprobs: None,
+            reasoning: None,
         };
         let json = completion_json(&completion);
         assert!(json["choices"][0].get("logprobs").is_none());
@@ -5004,10 +5764,643 @@ mod tests {
                 tool_calls: Vec::new(),
                 done: serde_json::json!({ "finish_reason": "stop" }),
                 logprobs: None,
+                reasoning: None,
             }
         };
         let json2 = completion_json(&with);
         assert_eq!(json2["choices"][0]["logprobs"]["content"][0]["token"], "hi");
-        assert_eq!(json2["choices"][0]["logprobs"]["content"][0]["bytes"], serde_json::json!([104, 105]));
+        assert_eq!(
+            json2["choices"][0]["logprobs"]["content"][0]["bytes"],
+            serde_json::json!([104, 105])
+        );
+    }
+
+    fn tool_body(tools: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({ "tools": tools })
+    }
+
+    #[test]
+    fn tool_normalize_boolean_strings_case_insensitive() {
+        let body = tool_body(serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "run",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "background": {"type": "boolean"},
+                        "full": {"type": "boolean"},
+                        "no_agent": {"type": "boolean"},
+                        "replace_all": {"type": "boolean"}
+                    }
+                }
+            }
+        }]));
+        let mut calls = vec![sample_tc(
+            "run",
+            serde_json::json!({
+                "background": "True",
+                "full": "TRUE",
+                "no_agent": "False",
+                "replace_all": "false"
+            }),
+        )];
+        normalize_tool_calls(&mut calls, &body);
+        assert_eq!(calls[0].arguments["background"], serde_json::json!(true));
+        assert_eq!(calls[0].arguments["full"], serde_json::json!(true));
+        assert_eq!(calls[0].arguments["no_agent"], serde_json::json!(false));
+        assert_eq!(calls[0].arguments["replace_all"], serde_json::json!(false));
+    }
+
+    #[test]
+    fn tool_normalize_numeric_strings() {
+        let body = tool_body(serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "calc",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "count": {"type": "integer"},
+                        "ratio": {"type": "number"},
+                        "already": {"type": "integer"}
+                    }
+                }
+            }
+        }]));
+        let mut calls = vec![sample_tc(
+            "calc",
+            serde_json::json!({ "count": "42", "ratio": "3.14", "already": 7 }),
+        )];
+        let before_already = calls[0].arguments["already"].clone();
+        normalize_tool_calls(&mut calls, &body);
+        assert_eq!(calls[0].arguments["count"], serde_json::json!(42));
+        assert!(calls[0].arguments["count"].is_number());
+        assert_eq!(calls[0].arguments["ratio"], serde_json::json!(3.14));
+        assert_eq!(calls[0].arguments["already"], before_already);
+    }
+
+    #[test]
+    fn tool_normalize_json_strings_to_object_array() {
+        let body = tool_body(serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "ingest",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "payload": {"type": "object"},
+                        "tags": {"type": "array"}
+                    }
+                }
+            }
+        }]));
+        let mut calls = vec![sample_tc(
+            "ingest",
+            serde_json::json!({ "payload": "{\"a\":1}", "tags": "[1,2,3]" }),
+        )];
+        normalize_tool_calls(&mut calls, &body);
+        assert_eq!(calls[0].arguments["payload"], serde_json::json!({"a":1}));
+        assert_eq!(calls[0].arguments["tags"], serde_json::json!([1, 2, 3]));
+    }
+
+    #[test]
+    fn tool_normalize_object_to_compact_string() {
+        let body = tool_body(serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "write_file",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "content": {"type": "string"},
+                        "path": {"type": "string"}
+                    }
+                }
+            }
+        }]));
+        let content_obj = serde_json::json!({"text":"hello","x":1});
+        let content_str = serde_json::to_string(&content_obj).unwrap();
+        let mut calls = vec![sample_tc(
+            "write_file",
+            serde_json::json!({ "content": content_obj, "path": "/tmp/a" }),
+        )];
+        normalize_tool_calls(&mut calls, &body);
+        assert_eq!(
+            calls[0].arguments["content"],
+            serde_json::Value::String(content_str)
+        );
+        assert_eq!(calls[0].arguments["path"], serde_json::json!("/tmp/a"));
+        // also scalar bool/number to string
+        let body2 = tool_body(serde_json::json!([{
+            "type": "function",
+            "function": { "name": "patch", "parameters": { "type": "object", "properties": { "new_string": {"type":"string"} } } }
+        }]));
+        let mut calls2 = vec![sample_tc(
+            "patch",
+            serde_json::json!({ "new_string": {"a":1} }),
+        )];
+        let expected = serde_json::to_string(&serde_json::json!({"a":1})).unwrap();
+        normalize_tool_calls(&mut calls2, &body2);
+        assert_eq!(
+            calls2[0].arguments["new_string"],
+            serde_json::Value::String(expected)
+        );
+    }
+
+    #[test]
+    fn tool_normalize_recurses_into_objects_and_arrays() {
+        let body = tool_body(serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "outer",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "inner": {
+                            "type": "object",
+                            "properties": {
+                                "enabled": {"type":"boolean"},
+                                "count": {"type":"integer"}
+                            }
+                        },
+                        "items": {
+                            "type":"array",
+                            "items": {"type":"object","properties":{"flag":{"type":"boolean"}}}
+                        }
+                    }
+                }
+            }
+        }]));
+        let mut calls = vec![sample_tc(
+            "outer",
+            serde_json::json!({
+                "inner": {"enabled":"True","count":"7","extra":"keep"},
+                "items": [{"flag":"false"},{"flag":true}]
+            }),
+        )];
+        normalize_tool_calls(&mut calls, &body);
+        assert_eq!(
+            calls[0].arguments["inner"]["enabled"],
+            serde_json::json!(true)
+        );
+        assert_eq!(calls[0].arguments["inner"]["count"], serde_json::json!(7));
+        assert_eq!(
+            calls[0].arguments["inner"]["extra"],
+            serde_json::json!("keep")
+        );
+        assert_eq!(
+            calls[0].arguments["items"][0]["flag"],
+            serde_json::json!(false)
+        );
+        assert_eq!(
+            calls[0].arguments["items"][1]["flag"],
+            serde_json::json!(true)
+        );
+    }
+
+    #[test]
+    fn tool_normalize_idempotent_and_preserves_valid() {
+        let body = tool_body(serde_json::json!([{
+            "type":"function",
+            "function":{
+                "name":"run",
+                "parameters":{
+                    "type":"object",
+                    "properties":{
+                        "background":{"type":"boolean"},
+                        "count":{"type":"integer"},
+                        "content":{"type":"string"}
+                    }
+                }
+            }
+        }]));
+        let mut calls = vec![sample_tc(
+            "run",
+            serde_json::json!({"background": true, "count": 5, "content": "hello"}),
+        )];
+        let before = calls[0].arguments.clone();
+        normalize_tool_calls(&mut calls, &body);
+        assert_eq!(calls[0].arguments, before);
+        // idempotence after repair
+        let mut calls2 = vec![sample_tc(
+            "run",
+            serde_json::json!({"background":"True","count":"5"}),
+        )];
+        normalize_tool_calls(&mut calls2, &body);
+        let after_first = calls2[0].arguments.clone();
+        normalize_tool_calls(&mut calls2, &body);
+        assert_eq!(calls2[0].arguments, after_first);
+    }
+
+    #[test]
+    fn tool_normalize_preserves_unknown_fields_and_no_schema_match() {
+        let body = tool_body(serde_json::json!([{
+            "type":"function",
+            "function":{
+                "name":"known",
+                "parameters":{"type":"object","properties":{"a":{"type":"boolean"}}}
+            }
+        }]));
+        let mut calls = vec![
+            sample_tc(
+                "known",
+                serde_json::json!({"a":"True","unknown":"True","extra":123}),
+            ),
+            sample_tc("unknown_tool", serde_json::json!({"a":"True"})),
+        ];
+        normalize_tool_calls(&mut calls, &body);
+        assert_eq!(calls[0].arguments["a"], serde_json::json!(true));
+        assert_eq!(calls[0].arguments["unknown"], serde_json::json!("True"));
+        assert_eq!(calls[0].arguments["extra"], serde_json::json!(123));
+        assert_eq!(calls[1].arguments["a"], serde_json::json!("True"));
+    }
+
+    #[test]
+    fn tool_normalize_invalid_numeric_and_json_not_repaired() {
+        let body = tool_body(serde_json::json!([{
+            "type":"function",
+            "function":{
+                "name":"calc",
+                "parameters":{
+                    "type":"object",
+                    "properties":{
+                        "count":{"type":"integer"},
+                        "ratio":{"type":"number"},
+                        "payload":{"type":"object"},
+                        "flag":{"type":"boolean"}
+                    }
+                }
+            }
+        }]));
+        let mut calls = vec![sample_tc(
+            "calc",
+            serde_json::json!({
+                "count":"12.3",
+                "ratio":"not-a-number",
+                "payload":"not json {",
+                "flag":"yes"
+            }),
+        )];
+        let before = calls[0].arguments.clone();
+        normalize_tool_calls(&mut calls, &body);
+        assert_eq!(calls[0].arguments, before);
+        // ambiguous free text for string field must not be parsed
+        let body2 = tool_body(serde_json::json!([{
+            "type":"function",
+            "function":{"name":"write_file","parameters":{"type":"object","properties":{"content":{"type":"string"}}}}
+        }]));
+        let mut calls2 = vec![sample_tc(
+            "write_file",
+            serde_json::json!({"content":"hello world"}),
+        )];
+        let before2 = calls2[0].arguments.clone();
+        normalize_tool_calls(&mut calls2, &body2);
+        assert_eq!(calls2[0].arguments, before2);
+    }
+
+    #[test]
+    fn tool_normalize_parallel_calls_different_schemas() {
+        let body = tool_body(serde_json::json!([
+            {"type":"function","function":{"name":"tool_a","parameters":{"type":"object","properties":{"flag":{"type":"boolean"}}}}},
+            {"type":"function","function":{"name":"tool_b","parameters":{"type":"object","properties":{"flag":{"type":"string"}}}}}
+        ]));
+        let mut calls = vec![
+            sample_tc("tool_a", serde_json::json!({"flag":"True"})),
+            sample_tc("tool_b", serde_json::json!({"flag": true})),
+        ];
+        normalize_tool_calls(&mut calls, &body);
+        assert_eq!(calls[0].arguments["flag"], serde_json::json!(true));
+        // tool_b expects string, true -> "true"
+        assert_eq!(
+            calls[1].arguments["flag"],
+            serde_json::Value::String("true".into())
+        );
+    }
+
+    #[test]
+    fn tool_normalize_preview_final_parity() {
+        // Simulate preview and final both normalizing the same raw calls via same helper.
+        let body = tool_body(serde_json::json!([{
+            "type":"function",
+            "function":{
+                "name":"write_file",
+                "parameters":{
+                    "type":"object",
+                    "properties":{
+                        "content":{"type":"string"},
+                        "background":{"type":"boolean"}
+                    }
+                }
+            }
+        }]));
+        let raw = sample_tc(
+            "write_file",
+            serde_json::json!({"content": {"a":1}, "background":"True"}),
+        );
+        let mut preview_calls = vec![raw.clone()];
+        let mut final_calls = vec![raw.clone()];
+        normalize_tool_calls(&mut preview_calls, &body);
+        normalize_tool_calls(&mut final_calls, &body);
+        assert_eq!(preview_calls[0].arguments, final_calls[0].arguments);
+        let expected_content = serde_json::to_string(&serde_json::json!({"a":1})).unwrap();
+        assert_eq!(
+            preview_calls[0].arguments["content"],
+            serde_json::Value::String(expected_content)
+        );
+        assert_eq!(
+            preview_calls[0].arguments["background"],
+            serde_json::json!(true)
+        );
+        // idempotent second pass on both
+        normalize_tool_calls(&mut preview_calls, &body);
+        normalize_tool_calls(&mut final_calls, &body);
+        assert_eq!(preview_calls[0].arguments, final_calls[0].arguments);
+    }
+
+    fn echo_and_translate_tools() -> serde_json::Value {
+        serde_json::json!([
+            {
+                "type": "function",
+                "function": {
+                    "name": "echo",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "text": { "type": "string" } }
+                    }
+                }
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "translate_text",
+                    "parameters": {
+                        "type": "object",
+                        "properties": { "text": { "type": "string" } }
+                    }
+                }
+            }
+        ])
+    }
+
+    fn calculator_tools() -> serde_json::Value {
+        serde_json::json!([{
+            "type": "function",
+            "function": {
+                "name": "calculator",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "expression": { "type": "string" }
+                    }
+                }
+            }
+        }])
+    }
+
+    #[test]
+    fn tool_choice_absent_and_auto_preserve_tools_identity() {
+        let tools = echo_and_translate_tools();
+        let mut messages = serde_json::json!([
+            { "role": "system", "content": "base system" },
+            { "role": "user", "content": "hi" }
+        ]);
+        let before = messages.clone();
+
+        let (policy, forwarded) =
+            project_tool_choice(None, Some(&tools), &mut messages).expect("absent");
+        assert_eq!(policy, ToolChoicePolicy::Auto);
+        assert_eq!(forwarded.as_ref(), Some(&tools));
+        assert_eq!(messages, before);
+
+        let mut messages_auto = before.clone();
+        let (policy, forwarded) = project_tool_choice(
+            Some(&serde_json::json!("auto")),
+            Some(&tools),
+            &mut messages_auto,
+        )
+        .expect("auto");
+        assert_eq!(policy, ToolChoicePolicy::Auto);
+        assert_eq!(forwarded.as_ref(), Some(&tools));
+        assert_eq!(messages_auto, before);
+
+        let mut messages_null = before.clone();
+        let (policy, forwarded) = project_tool_choice(
+            Some(&serde_json::Value::Null),
+            Some(&tools),
+            &mut messages_null,
+        )
+        .expect("null");
+        assert_eq!(policy, ToolChoicePolicy::Auto);
+        assert_eq!(forwarded.as_ref(), Some(&tools));
+        assert_eq!(messages_null, before);
+    }
+
+    #[test]
+    fn tool_choice_none_strips_tools_and_terminal_calls() {
+        let tools = echo_and_translate_tools();
+        let mut messages = serde_json::json!([{ "role": "user", "content": "hi" }]);
+        let (policy, forwarded) = project_tool_choice(
+            Some(&serde_json::json!("none")),
+            Some(&tools),
+            &mut messages,
+        )
+        .expect("none");
+        assert_eq!(policy, ToolChoicePolicy::None);
+        assert!(forwarded.is_none());
+        // no instruction injection for none
+        assert_eq!(messages.as_array().unwrap().len(), 1);
+
+        let body = tool_body(tools);
+        let mut calls = vec![sample_tc("echo", serde_json::json!({"text": "x"}))];
+        let mut done = serde_json::json!({ "finish_reason": "tool_calls" });
+        finalize_tool_calls_for_choice(&policy, &mut calls, &mut done, &body).expect("finalize");
+        assert!(calls.is_empty());
+        assert_eq!(done["finish_reason"], "stop");
+    }
+
+    #[test]
+    fn tool_choice_required_injects_instruction_and_keeps_tools() {
+        let tools = calculator_tools();
+        let mut messages = serde_json::json!([
+            { "role": "system", "content": "existing policy" },
+            { "role": "user", "content": "2+2" }
+        ]);
+        let (policy, forwarded) = project_tool_choice(
+            Some(&serde_json::json!("required")),
+            Some(&tools),
+            &mut messages,
+        )
+        .expect("required");
+        assert_eq!(policy, ToolChoicePolicy::Required);
+        assert_eq!(forwarded.as_ref(), Some(&tools));
+        let system = messages[0]["content"].as_str().unwrap();
+        assert!(system.starts_with("existing policy"));
+        assert!(system.contains("You must call a tool."));
+    }
+
+    #[test]
+    fn tool_choice_specific_filters_tools_and_names_requirement() {
+        let tools = echo_and_translate_tools();
+        let mut messages = serde_json::json!([{ "role": "user", "content": "echo hi" }]);
+        let choice = serde_json::json!({
+            "type": "function",
+            "function": { "name": "echo" }
+        });
+        let (policy, forwarded) =
+            project_tool_choice(Some(&choice), Some(&tools), &mut messages).expect("specific");
+        assert_eq!(policy, ToolChoicePolicy::Function("echo".into()));
+        let forwarded = forwarded.expect("filtered tools");
+        let arr = forwarded.as_array().unwrap();
+        assert_eq!(arr.len(), 1);
+        assert_eq!(tool_schema_name(&arr[0]), Some("echo"));
+        assert_eq!(messages[0]["role"], "system");
+        assert!(messages[0]["content"]
+            .as_str()
+            .unwrap()
+            .contains("You must call the `echo` tool."));
+        assert_eq!(messages[1]["role"], "user");
+    }
+
+    #[test]
+    fn tool_choice_rejects_malformed_unknown_and_missing_tool() {
+        let tools = echo_and_translate_tools();
+        let mut messages = serde_json::json!([]);
+
+        let err = project_tool_choice(
+            Some(&serde_json::json!("maybe")),
+            Some(&tools),
+            &mut messages,
+        )
+        .expect_err("unknown string");
+        assert!(err.to_string().contains("unsupported tool_choice"));
+
+        let err = project_tool_choice(
+            Some(&serde_json::json!({"type": "tool", "function": {"name": "echo"}})),
+            Some(&tools),
+            &mut messages,
+        )
+        .expect_err("bad type");
+        assert!(err.to_string().contains("function"));
+
+        let err = project_tool_choice(
+            Some(&serde_json::json!({"type": "function", "function": {}})),
+            Some(&tools),
+            &mut messages,
+        )
+        .expect_err("missing name");
+        assert!(err.to_string().contains("function.name"));
+
+        let err = project_tool_choice(Some(&serde_json::json!("required")), None, &mut messages)
+            .expect_err("required without tools");
+        assert!(err.to_string().contains("non-empty tools"));
+
+        let err = project_tool_choice(
+            Some(&serde_json::json!({
+                "type": "function",
+                "function": { "name": "missing_tool" }
+            })),
+            Some(&tools),
+            &mut messages,
+        )
+        .expect_err("absent function");
+        assert!(err.to_string().contains("missing_tool"));
+    }
+
+    #[test]
+    fn tool_choice_required_postcondition_fails_without_calls() {
+        let body = tool_body(calculator_tools());
+        let mut calls = Vec::new();
+        let mut done = serde_json::json!({ "finish_reason": "stop" });
+        let err = finalize_tool_calls_for_choice(
+            &ToolChoicePolicy::Required,
+            &mut calls,
+            &mut done,
+            &body,
+        )
+        .expect_err("no-call");
+        assert!(err.to_string().contains("required"));
+    }
+
+    #[test]
+    fn tool_choice_required_allows_parallel_calls() {
+        let body = tool_body(echo_and_translate_tools());
+        let mut calls = vec![
+            sample_tc("echo", serde_json::json!({"text": "a"})),
+            sample_tc("translate_text", serde_json::json!({"text": "b"})),
+        ];
+        let mut done = serde_json::json!({ "finish_reason": "tool_calls" });
+        finalize_tool_calls_for_choice(&ToolChoicePolicy::Required, &mut calls, &mut done, &body)
+            .expect("parallel ok");
+        assert_eq!(calls.len(), 2);
+        assert_eq!(done["finish_reason"], "tool_calls");
+    }
+
+    #[test]
+    fn tool_choice_specific_postcondition_filters_and_fails_closed() {
+        let body = tool_body(echo_and_translate_tools());
+        let policy = ToolChoicePolicy::Function("echo".into());
+
+        // Wrong-only producer output fails closed.
+        let mut wrong = vec![sample_tc(
+            "translate_text",
+            serde_json::json!({"text": "nope"}),
+        )];
+        let mut done = serde_json::json!({ "finish_reason": "tool_calls" });
+        let err = finalize_tool_calls_for_choice(&policy, &mut wrong, &mut done, &body)
+            .expect_err("wrong tool");
+        assert!(err.to_string().contains("echo"));
+
+        // Mixed calls keep only the named tool.
+        let mut mixed = vec![
+            sample_tc("translate_text", serde_json::json!({"text": "x"})),
+            sample_tc("echo", serde_json::json!({"text": "y"})),
+        ];
+        let mut done = serde_json::json!({ "finish_reason": "tool_calls" });
+        finalize_tool_calls_for_choice(&policy, &mut mixed, &mut done, &body).expect("filter");
+        assert_eq!(mixed.len(), 1);
+        assert_eq!(mixed[0].name, "echo");
+    }
+
+    #[test]
+    fn tool_choice_streaming_final_policy_parity() {
+        // Preview (commit_ready) and final share finalize_tool_calls_for_choice.
+        let body = tool_body(echo_and_translate_tools());
+        let raw = vec![
+            sample_tc("translate_text", serde_json::json!({"text": "x"})),
+            sample_tc("echo", serde_json::json!({"text": "y"})),
+        ];
+        let policy = ToolChoicePolicy::Function("echo".into());
+
+        let mut preview_calls = raw.clone();
+        let mut preview_done = serde_json::json!({ "finish_reason": "tool_calls" });
+        finalize_tool_calls_for_choice(&policy, &mut preview_calls, &mut preview_done, &body)
+            .expect("preview");
+
+        let mut final_calls = raw;
+        let mut final_done = serde_json::json!({ "finish_reason": "tool_calls" });
+        finalize_tool_calls_for_choice(&policy, &mut final_calls, &mut final_done, &body)
+            .expect("final");
+
+        assert_eq!(preview_calls.len(), final_calls.len());
+        assert_eq!(preview_calls[0].name, final_calls[0].name);
+        assert_eq!(preview_calls[0].arguments, final_calls[0].arguments);
+        assert_eq!(preview_done, final_done);
+        assert_eq!(preview_calls.len(), 1);
+        assert_eq!(preview_calls[0].name, "echo");
+
+        // none parity: both strip calls and coerce finish_reason.
+        let mut p_calls = vec![sample_tc("echo", serde_json::json!({"text": "z"}))];
+        let mut f_calls = p_calls.clone();
+        let mut p_done = serde_json::json!({ "finish_reason": "tool_calls" });
+        let mut f_done = p_done.clone();
+        finalize_tool_calls_for_choice(&ToolChoicePolicy::None, &mut p_calls, &mut p_done, &body)
+            .unwrap();
+        finalize_tool_calls_for_choice(&ToolChoicePolicy::None, &mut f_calls, &mut f_done, &body)
+            .unwrap();
+        assert!(p_calls.is_empty());
+        assert!(f_calls.is_empty());
+        assert_eq!(p_done, f_done);
+        assert_eq!(p_done["finish_reason"], "stop");
     }
 }

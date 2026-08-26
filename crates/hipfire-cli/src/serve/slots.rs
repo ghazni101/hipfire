@@ -9,19 +9,26 @@
 //! isolates the only arch-specific crate (`hipfire-arch-qwen35`) so the CLI
 //! can be built arch-free with `--no-default-features`.
 
+use crate::serve::complete::Completion;
 #[cfg(feature = "multi-slot")]
 use anyhow::{anyhow, bail, Context, Result};
 #[cfg(not(feature = "multi-slot"))]
 use anyhow::{bail, Result};
-use std::sync::{Arc, mpsc};
-#[cfg(feature = "multi-slot")]
-use hipfire_runtime::tokenizer::Tokenizer;
 #[cfg(feature = "multi-slot")]
 use hipfire_runtime::prompt_frame::{AssistantPrefix, ChatFrame, Role};
 #[cfg(feature = "multi-slot")]
 use hipfire_runtime::serve::{Event, SubmitRequest};
+#[cfg(feature = "multi-slot")]
+use hipfire_runtime::tokenizer::Tokenizer;
 use serde_json;
-use crate::serve::complete::Completion;
+use std::{
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, RecvTimeoutError},
+        Arc,
+    },
+    time::Duration,
+};
 
 #[cfg(feature = "multi-slot")]
 pub(crate) struct SlotBackend {
@@ -32,12 +39,12 @@ pub(crate) struct SlotBackend {
 #[cfg(not(feature = "multi-slot"))]
 pub(crate) struct SlotBackend;
 
-
 #[cfg(feature = "multi-slot")]
 pub(crate) fn complete_request_slots(
     backend: &SlotBackend,
     body: &serde_json::Value,
     identity: &(String, u64),
+    cancelled: Option<&AtomicBool>,
     event_callback: &mut dyn FnMut(&serde_json::Value) -> Result<(), hipfire_client::ClientError>,
     terminal_callback: &mut dyn FnMut(&Completion) -> Result<(), hipfire_client::ClientError>,
 ) -> Result<Completion> {
@@ -167,27 +174,36 @@ pub(crate) fn complete_request_slots(
     let mut think = ThinkOutputRouter::new(matches!(prefix, AssistantPrefix::OpenThink));
     let mut routed: Vec<ThinkRouteEvent> = Vec::new();
 
-    let mut drain_routed = |routed: &mut Vec<ThinkRouteEvent>,
-                            content: &mut String,
-                            reasoning_content: &mut String,
-                            cb: &mut dyn FnMut(
-        &serde_json::Value,
-    ) -> Result<(), hipfire_client::ClientError>| {
-        for ev in routed.drain(..) {
-            match ev {
-                ThinkRouteEvent::Content(text) => {
-                    content.push_str(&text);
-                    let _ = cb(&serde_json::json!({ "type": "token", "text": text }));
-                }
-                ThinkRouteEvent::Reasoning(text) => {
-                    reasoning_content.push_str(&text);
-                    let _ = cb(&serde_json::json!({ "type": "reasoning", "text": text }));
+    let mut drain_routed =
+        |routed: &mut Vec<ThinkRouteEvent>,
+         content: &mut String,
+         reasoning_content: &mut String,
+         cb: &mut dyn FnMut(&serde_json::Value) -> Result<(), hipfire_client::ClientError>|
+         -> Result<(), hipfire_client::ClientError> {
+            for ev in routed.drain(..) {
+                match ev {
+                    ThinkRouteEvent::Content(text) => {
+                        content.push_str(&text);
+                        cb(&serde_json::json!({ "type": "token", "text": text }))?;
+                    }
+                    ThinkRouteEvent::Reasoning(text) => {
+                        reasoning_content.push_str(&text);
+                        cb(&serde_json::json!({ "type": "reasoning", "text": text }))?;
+                    }
                 }
             }
-        }
-    };
+            Ok(())
+        };
 
-    while let Ok(ev) = rx.recv() {
+    loop {
+        if cancelled.is_some_and(|flag| flag.load(Ordering::Relaxed)) {
+            return Err(anyhow::Error::new(hipfire_client::ClientError::Cancelled));
+        }
+        let ev = match rx.recv_timeout(Duration::from_millis(100)) {
+            Ok(event) => event,
+            Err(RecvTimeoutError::Timeout) => continue,
+            Err(RecvTimeoutError::Disconnected) => break,
+        };
         match ev {
             Event::Accepted { .. } => {}
             Event::Token { id } => {
@@ -199,7 +215,7 @@ pub(crate) fn complete_request_slots(
                         &mut content,
                         &mut reasoning_content,
                         event_callback,
-                    );
+                    )?;
                 }
             }
             Event::Done { reason } => {
@@ -225,7 +241,7 @@ pub(crate) fn complete_request_slots(
         &mut content,
         &mut reasoning_content,
         event_callback,
-    );
+    )?;
 
     let completion = Completion {
         id: identity.0.clone(),
@@ -237,6 +253,14 @@ pub(crate) fn complete_request_slots(
         tool_calls: Vec::new(),
         done: serde_json::json!({ "finish_reason": finish }),
         logprobs: None,
+        reasoning: Some(crate::ReasoningResolution {
+            effective_mode: "disabled".to_string(),
+            effective_effort: None,
+            effective_cap: None,
+            cap_source: "none".to_string(),
+            contract: saddle_core::caps::ReasoningContract::Unsupported,
+            warnings: Vec::new(),
+        }),
     };
     // The terminal callback is what stages the response body and signals the
     // HTTP handler that the request succeeded. Skipping it leaves the handler
@@ -246,12 +270,12 @@ pub(crate) fn complete_request_slots(
     Ok(completion)
 }
 
-
 #[cfg(not(feature = "multi-slot"))]
 pub(crate) fn complete_request_slots(
     _backend: &SlotBackend,
     _body: &serde_json::Value,
     _identity: &(String, u64),
+    _cancelled: Option<&AtomicBool>,
     _event_callback: &mut dyn FnMut(&serde_json::Value) -> Result<(), hipfire_client::ClientError>,
     _terminal_callback: &mut dyn FnMut(&Completion) -> Result<(), hipfire_client::ClientError>,
 ) -> Result<Completion> {

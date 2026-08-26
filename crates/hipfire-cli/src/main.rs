@@ -23,6 +23,7 @@ use hipfire_registry::{
     load as load_registry, LoadedRegistry, ModelEntry, RegistryPaths, RegistrySource, RegistryV1,
 };
 use hipfire_runtime::prompt_frame::ToolCall;
+use saddle_core::caps::ReasoningContract;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 #[cfg(unix)]
@@ -42,14 +43,13 @@ use std::{
     thread,
     time::{Duration, Instant},
 };
-use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 
 mod bench_concurrency;
 mod serve;
 mod setup;
-use crate::serve::{ServePidRecord, parse_pid_record, detach_serve, parse_host_port};
-use crate::serve::http::request_id;
 use crate::serve::complete::next_attempt_id;
+use crate::serve::http::request_id;
+use crate::serve::{detach_serve, parse_host_port, parse_pid_record, ServePidRecord};
 use setup::setup_command;
 
 pub(crate) const MODEL_SUFFIXES: &[&str] = &[
@@ -654,10 +654,12 @@ fn run() -> Result<()> {
         Some(Commands::Stop(args)) => crate::serve::stop_command(&paths, args),
         Some(Commands::Restart(args)) => {
             let port = args.positionals.iter().find_map(|value| {
-                value
-                    .parse::<u16>()
-                    .ok()
-                    .or_else(|| crate::serve::parse_host_port(value).ok().flatten().map(|(_, port)| port))
+                value.parse::<u16>().ok().or_else(|| {
+                    crate::serve::parse_host_port(value)
+                        .ok()
+                        .flatten()
+                        .map(|(_, port)| port)
+                })
             });
             let _ = crate::serve::stop_command(
                 &paths,
@@ -1929,9 +1931,7 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     }
 
     let daemon = find_daemon(paths).ok_or_else(|| {
-        anyhow!(
-            "daemon binary not found; build `cargo build --release -p hipfire-daemon`"
-        )
+        anyhow!("daemon binary not found; build `cargo build --release -p hipfire-daemon`")
     })?;
     let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
     let mut engine = Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config)?;
@@ -2000,7 +2000,6 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     let mut request = serde_json::json!({
         "type": "generate",
         "id": "run",
-        "attempt_id": next_attempt_id(),
         "prompt": prompt,
         "max_tokens": max_tokens,
         // `Engine::generate` rejects a request without `attempt_id`
@@ -2023,7 +2022,33 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     if let Some(image) = args.image {
         request["image"] = serde_json::Value::String(image.display().to_string());
     }
-    apply_reasoning_request(&resolved, &mut request)?;
+    let contract = loaded
+        .get("reasoning_contract")
+        .and_then(serde_json::Value::as_str)
+        .and_then(ReasoningContract::from_wire_name)
+        .unwrap_or(ReasoningContract::Unsupported);
+    let effort_native = loaded
+        .get("reasoning_effort_native")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false);
+    let supported_efforts = loaded
+        .get("reasoning_efforts")
+        .and_then(serde_json::Value::as_array)
+        .map(|array| {
+            array
+                .iter()
+                .filter_map(|value| value.as_str().map(|string| string.to_owned()))
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    let _ = apply_http_reasoning_request(
+        &serde_json::json!({}),
+        &resolved,
+        &mut request,
+        contract,
+        effort_native,
+        &supported_efforts,
+    )?;
 
     let mut content = String::new();
     let stream = !args.no_stream && !args.json;
@@ -2274,7 +2299,6 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
     Ok(())
 }
 
-
 pub(crate) fn resolved_for_model(
     paths: &Paths,
     model_name: &str,
@@ -2326,7 +2350,11 @@ pub(crate) fn resolved_for_model(
     Ok(resolve(layers)?)
 }
 
-pub(crate) fn find_model_path(paths: &Paths, registry: &RegistryV1, model: &str) -> Option<PathBuf> {
+pub(crate) fn find_model_path(
+    paths: &Paths,
+    registry: &RegistryV1,
+    model: &str,
+) -> Option<PathBuf> {
     let direct = PathBuf::from(model);
     if direct.is_file() {
         return fs::canonicalize(direct).ok();
@@ -2540,155 +2568,656 @@ fn apply_speculation_selector(params: &mut serde_json::Value, selector: &str) ->
     Ok(())
 }
 
-pub(crate) fn apply_reasoning_request(
-    resolved: &hipfire_config::ResolvedConfig,
-    request: &mut serde_json::Value,
-) -> Result<()> {
-    if config_string(resolved, "reasoning.mode")? == "off" {
-        request["max_think_tokens"] = serde_json::json!(1);
-        request["assistant_prefix"] = serde_json::json!("closed_think");
-        return Ok(());
-    }
-    let explicit = resolved
-        .get("reasoning.max_tokens")
-        .map(|value| &value.value)
-        .filter(|value| !matches!(value, hipfire_config::ConfigValue::Null));
-    let max_think = if let Some(value) = explicit {
-        match value {
-            hipfire_config::ConfigValue::Integer(value) => *value as u64,
-            _ => bail!("reasoning.max_tokens resolved to a non-integer"),
-        }
-    } else {
-        match config_string(resolved, "reasoning.budget")?.as_str() {
-            // 1 = the engine's "no thinking" sentinel (daemon: `enable_thinking:
-            // max_think_tokens != 1`), matching what the OpenAI
-            // enable_thinking=false / reasoning_effort="none" paths send. Pair it
-            // with the closed-think assistant prefix so the turn starts in answer
-            // mode instead of relying on the template alone.
-            "off" => {
-                request["max_think_tokens"] = serde_json::json!(1);
-                request["assistant_prefix"] = serde_json::json!("closed_think");
-                request["reasoning_effort"] = serde_json::json!("none");
-                return Ok(());
-            }
-            "low" => 512,
-            "med" => 2048,
-            "high" => 8192,
-            "xhigh" => 24576,
-            "max" => 32768,
-            "uncapped" => 0,
-            value => bail!("unknown reasoning budget {value}"),
-        }
-    };
-    request["max_think_tokens"] = serde_json::json!(max_think);
-    match config_string(resolved, "reasoning.effort")?.as_str() {
-        "auto" => {}
-        "none" => {
-            request["max_think_tokens"] = serde_json::json!(1);
-            request["assistant_prefix"] = serde_json::json!("closed_think");
-            request["reasoning_effort"] = serde_json::json!("none");
-        }
-        effort @ ("low" | "medium" | "high" | "max" | "xhigh") => {
-            request["reasoning_effort"] = serde_json::json!(effort);
-        }
-        effort => bail!("unknown reasoning effort '{effort}'"),
-    }
-    Ok(())
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ReasoningResolution {
+    pub effective_mode: String,
+    pub effective_effort: Option<String>,
+    pub effective_cap: Option<u64>,
+    pub cap_source: String,
+    pub contract: ReasoningContract,
+    pub warnings: Vec<String>,
 }
 
 pub(crate) fn apply_http_reasoning_request(
     body: &serde_json::Value,
     resolved: &hipfire_config::ResolvedConfig,
     request: &mut serde_json::Value,
-    deepseek4_effort_contract: bool,
-) -> Result<()> {
-    let thinking_disabled = body
+    contract: ReasoningContract,
+    effort_native: bool,
+    supported_efforts: &[String],
+) -> Result<ReasoningResolution> {
+    let mut warnings: Vec<String> = Vec::new();
+    let mut push_warn = |msg: String| {
+        eprintln!("[WARN: INVALID CONFIG] {}", msg);
+        warnings.push(msg);
+    };
+    if let Some(object) = request.as_object_mut() {
+        for key in [
+            "thinking_enabled",
+            "assistant_prefix",
+            "reasoning_effort",
+            "max_think_tokens",
+        ] {
+            object.remove(key);
+        }
+    }
+    if body.get("enable_thinking").is_some() {
+        if let Some(value) = body.get("enable_thinking") {
+            if !value.is_boolean() && !value.is_null() {
+                bail!("enable_thinking must be a boolean");
+            }
+        }
+    }
+    let top_enable = body
+        .get("enable_thinking")
+        .and_then(serde_json::Value::as_bool);
+    if body
         .pointer("/chat_template_kwargs/enable_thinking")
-        .and_then(serde_json::Value::as_bool)
-        == Some(false);
-    let effort = body
+        .is_some()
+    {
+        if let Some(value) = body.pointer("/chat_template_kwargs/enable_thinking") {
+            if !value.is_boolean() && !value.is_null() {
+                bail!("chat_template_kwargs.enable_thinking must be a boolean");
+            }
+        }
+    }
+    let kwargs_enable = body
+        .pointer("/chat_template_kwargs/enable_thinking")
+        .and_then(serde_json::Value::as_bool);
+    let thinking_type_raw = body
+        .pointer("/thinking/type")
+        .or_else(|| body.get("thinking").and_then(|value| value.get("type")));
+    let mut thinking_type_str: Option<&str> = None;
+    if let Some(raw) = thinking_type_raw {
+        if !raw.is_string() {
+            bail!("thinking.type must be enabled or disabled");
+        } else {
+            let s = raw.as_str().unwrap();
+            if s == "enabled" || s == "disabled" {
+                thinking_type_str = Some(s);
+            } else {
+                push_warn(format!(
+                    "thinking.type '{}' dropped: expected enabled|disabled",
+                    s
+                ));
+                thinking_type_str = None;
+            }
+        }
+    }
+    let effort_raw = body
         .get("reasoning_effort")
         .and_then(serde_json::Value::as_str)
         .or_else(|| {
             body.pointer("/reasoning/effort")
                 .and_then(serde_json::Value::as_str)
+        })
+        .or_else(|| {
+            body.pointer("/chat_template_kwargs/reasoning_effort")
+                .and_then(serde_json::Value::as_str)
         });
-    if thinking_disabled || effort == Some("none") {
-        request["max_think_tokens"] = serde_json::json!(1);
-        request["assistant_prefix"] = serde_json::json!("closed_think");
-        request["reasoning_effort"] = serde_json::json!("none");
-        return Ok(());
+    let effort_present = body.get("reasoning_effort").is_some()
+        || body.pointer("/reasoning/effort").is_some()
+        || body
+            .pointer("/chat_template_kwargs/reasoning_effort")
+            .is_some();
+    if effort_present && effort_raw.is_none() {
+        bail!("reasoning_effort must be a string");
     }
-    // Thinking is ON from here down (config default, or explicit
-    // enable_thinking=true / reasoning effort >= minimal). OPEN the <think>
-    // block so the model actually reasons instead of emitting an empty
-    // <think></think> and answering directly.
-    //
-    // Only the thinking-OFF cases above used to set assistant_prefix; the ON
-    // path set none, so the daemon fell back to plain framing and generic
-    // OpenAI clients -- which never send assistant_prefix -- silently got
-    // no-think behaviour. On Qwen3.6 that reasons in plain prose and derails
-    // (LiveBench reasoning ~0).
-    //
-    // This was fixed in the TypeScript CLI in June 2026 (98c65020) and lost
-    // when the CLI was rewritten in Rust: that commit edits cli/index.ts,
-    // which no longer exists, so the fix cannot be cherry-picked -- only
-    // re-applied here.
-    //
-    // Safe for non-thinking models: the daemon's prompt frame falls back to
-    // Plain when the tokenizer has no `<think>` special token.
-    request["assistant_prefix"] = serde_json::json!("open_think");
-    if let Some(effort) = effort {
-        if !deepseek4_effort_contract {
-            let max_think = match effort {
-                "minimal" => 64,
-                "low" => 256,
-                "medium" | "med" => 1024,
-                "high" => 4096,
-                "xhigh" | "max" | "uncapped" => 0,
-                other => bail!("unknown reasoning effort '{other}'"),
-            };
-            request["max_think_tokens"] = serde_json::json!(max_think);
-            request["reasoning_effort"] = serde_json::json!(effort);
-            return Ok(());
-        }
-        let normalized = match effort {
-            "minimal" | "medium" | "med" | "low" => "low",
-            "high" => "high",
-            "xhigh" | "max" | "uncapped" => "max",
-            other => bail!("unknown reasoning effort '{other}'"),
-        };
-        let explicit_cap = body
-            .get("max_think_tokens")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
-        if explicit_cap > 393_216 {
-            bail!("max_think_tokens must be between 0 and 393216");
-        }
-        // Effort selects the parent model's prompt semantics. It never invents
-        // a hipfire token cap; absent an explicit cap, 0 means uncapped.
-        request["max_think_tokens"] = serde_json::json!(explicit_cap);
-        request["reasoning_effort"] = serde_json::json!(normalized);
-        return Ok(());
+    let body_budget_present = body.get("thinking_budget").is_some();
+    let body_budget_str = body
+        .get("thinking_budget")
+        .and_then(serde_json::Value::as_str);
+    if body_budget_present && body_budget_str.is_none() {
+        bail!("thinking_budget must be a string preset");
     }
-    apply_reasoning_request(resolved, request)?;
-    if deepseek4_effort_contract
-        && request
-            .get("reasoning_effort")
-            .and_then(serde_json::Value::as_str)
-            != Some("none")
-    {
-        if let Some(explicit_cap) = body
-            .get("max_think_tokens")
-            .and_then(serde_json::Value::as_u64)
-        {
-            if explicit_cap > 393_216 {
-                bail!("max_think_tokens must be between 0 and 393216");
+    let body_top_max_present = body.get("max_think_tokens").is_some();
+    let body_nested_max_present = body.pointer("/reasoning/max_tokens").is_some();
+    let parse_body_think_cap = |value: &serde_json::Value, field: &str| -> Result<u64> {
+        match value {
+            serde_json::Value::Number(number) => {
+                if let Some(parsed) = number.as_u64() {
+                    if parsed > 393_216 {
+                        bail!("{field} must be between 0 and 393216");
+                    }
+                    Ok(parsed)
+                } else {
+                    bail!("{field} must be between 0 and 393216");
+                }
             }
-            request["max_think_tokens"] = serde_json::json!(explicit_cap);
+            _ => bail!("{field} must be between 0 and 393216"),
+        }
+    };
+    let top_max_opt = if body_top_max_present {
+        Some(parse_body_think_cap(
+            body.get("max_think_tokens").unwrap(),
+            "max_think_tokens",
+        )?)
+    } else {
+        None
+    };
+    let nested_max_opt = if body_nested_max_present {
+        Some(parse_body_think_cap(
+            body.pointer("/reasoning/max_tokens").unwrap(),
+            "reasoning.max_tokens",
+        )?)
+    } else {
+        None
+    };
+    let (max_opt, body_max_source) = match (top_max_opt, nested_max_opt) {
+        (Some(top), Some(nested)) => {
+            if top != nested {
+                push_warn(
+                    "reasoning.max_tokens dropped because explicit max_think_tokens takes precedence"
+                        .to_string(),
+                );
+            }
+            (Some(top), "explicit:body:max_think_tokens")
+        }
+        (Some(top), None) => (Some(top), "explicit:body:max_think_tokens"),
+        (None, Some(nested)) => (Some(nested), "explicit:body:reasoning.max_tokens"),
+        (None, None) => (None, ""),
+    };
+    let has_explicit_body_max = body_top_max_present || body_nested_max_present;
+    let config_max_entry = resolved.get("reasoning.max_tokens").filter(|value| {
+        !matches!(value.source, hipfire_config::ConfigSource::BuiltIn)
+            && !matches!(value.value, hipfire_config::ConfigValue::Null)
+    });
+    let mut config_max_opt: Option<u64> = None;
+    if let Some(entry) = config_max_entry {
+        match entry.value {
+            hipfire_config::ConfigValue::Integer(value) if value >= 0 => {
+                config_max_opt = Some(value as u64);
+            }
+            _ => bail!("reasoning.max_tokens resolved to a non-negative integer"),
         }
     }
-    Ok(())
+    let has_explicit_config_max = config_max_opt.is_some();
+    let config_budget_entry = resolved
+        .get("reasoning.budget")
+        .filter(|value| !matches!(value.source, hipfire_config::ConfigSource::BuiltIn));
+    let has_explicit_config_budget = config_budget_entry.is_some();
+    let config_budget_str: Option<String> = if has_explicit_config_budget {
+        Some(config_string(resolved, "reasoning.budget")?)
+    } else {
+        None
+    };
+    let has_explicit_effort = effort_raw.is_some();
+    let has_explicit_toggle =
+        top_enable.is_some() || kwargs_enable.is_some() || thinking_type_str.is_some();
+    let is_effort_native = match contract {
+        ReasoningContract::QwenJinja => effort_native,
+        ReasoningContract::DeepSeek4 => true,
+        ReasoningContract::MuseGlimmer => true,
+        _ => false,
+    };
+    if matches!(contract, ReasoningContract::Unsupported) {
+        if has_explicit_toggle {
+            push_warn(
+                "reasoning controls dropped for unsupported contract: thinking toggle ignored"
+                    .to_string(),
+            );
+        }
+        if has_explicit_effort {
+            push_warn(format!(
+                "reasoning_effort '{}' dropped for unsupported contract",
+                effort_raw.unwrap_or("unknown")
+            ));
+        }
+        if has_explicit_body_max
+            || body_budget_present
+            || has_explicit_config_max
+            || has_explicit_config_budget
+        {
+            push_warn("max_think_tokens/budget dropped for unsupported contract".to_string());
+        }
+        let resolution = ReasoningResolution {
+            effective_mode: "disabled".to_string(),
+            effective_effort: None,
+            effective_cap: None,
+            cap_source: "none".to_string(),
+            contract,
+            warnings: warnings.clone(),
+        };
+        return Ok(resolution);
+    }
+    if matches!(contract, ReasoningContract::GemmaBoolean) {
+        if has_explicit_effort {
+            push_warn(format!(
+                "reasoning_effort '{}' dropped for gemma_boolean: use thinking toggle only",
+                effort_raw.unwrap()
+            ));
+        }
+        if body_budget_present {
+            push_warn(format!(
+                "thinking_budget '{}' dropped for gemma_boolean",
+                body_budget_str.unwrap()
+            ));
+        }
+        if has_explicit_body_max {
+            push_warn(format!(
+                "{} {} dropped for gemma_boolean: use thinking toggle only",
+                if body_top_max_present {
+                    "max_think_tokens"
+                } else {
+                    "reasoning.max_tokens"
+                },
+                max_opt.unwrap()
+            ));
+        }
+        if has_explicit_config_max {
+            push_warn(format!(
+                "reasoning.max_tokens {} dropped for gemma_boolean: use thinking toggle only",
+                config_max_opt.unwrap()
+            ));
+        }
+        if has_explicit_config_budget {
+            push_warn(format!(
+                "thinking_budget '{}' dropped for gemma_boolean",
+                config_budget_str.clone().unwrap()
+            ));
+        }
+    }
+    let thinking_type_toggle = thinking_type_str.map(|value| value == "enabled");
+    let toggle_values = [top_enable, kwargs_enable, thinking_type_toggle];
+    let saw_enabled = toggle_values.iter().flatten().any(|value| *value);
+    let saw_disabled = toggle_values.iter().flatten().any(|value| !*value);
+    if saw_enabled && saw_disabled {
+        push_warn("conflicting thinking toggles normalized: disabled wins".to_string());
+    }
+    let mut toggle_opt = toggle_values
+        .into_iter()
+        .flatten()
+        .reduce(|previous, value| previous && value);
+    let is_off_effort = matches!(
+        contract,
+        ReasoningContract::QwenJinja | ReasoningContract::DeepSeek4
+    ) && matches!(effort_raw, Some("none") | Some("off") | Some("chat"));
+    if is_off_effort {
+        if toggle_opt == Some(true) {
+            push_warn(
+                "thinking enabled conflicts with off/none effort; thinking disabled wins"
+                    .to_string(),
+            );
+        }
+        toggle_opt = Some(false);
+    }
+    let is_off_budget = !is_effort_native
+        && !matches!(contract, ReasoningContract::GemmaBoolean)
+        && body_budget_str == Some("off");
+    if is_off_budget {
+        if toggle_opt == Some(true) {
+            push_warn(
+                "thinking enabled conflicts with legacy budget off; thinking disabled wins"
+                    .to_string(),
+            );
+        }
+        toggle_opt = Some(false);
+    }
+    let config_mode = config_string(resolved, "reasoning.mode").unwrap_or_else(|_| "on".into());
+    let config_mode_is_explicit = resolved
+        .get("reasoning.mode")
+        .is_some_and(|value| !matches!(value.source, hipfire_config::ConfigSource::BuiltIn));
+    let config_effort =
+        config_string(resolved, "reasoning.effort").unwrap_or_else(|_| "auto".into());
+    let config_effort_is_explicit = resolved
+        .get("reasoning.effort")
+        .is_some_and(|value| !matches!(value.source, hipfire_config::ConfigSource::BuiltIn));
+    let config_budget =
+        config_string(resolved, "reasoning.budget").unwrap_or_else(|_| "uncapped".into());
+    let config_budget_is_explicit = resolved
+        .get("reasoning.budget")
+        .is_some_and(|value| !matches!(value.source, hipfire_config::ConfigSource::BuiltIn));
+    let configured_off = (config_mode_is_explicit && config_mode == "off")
+        || (config_effort_is_explicit && config_effort == "none")
+        || (!is_effort_native
+            && !matches!(contract, ReasoningContract::GemmaBoolean)
+            && config_budget_is_explicit
+            && config_budget == "off");
+    let family_default = !matches!(contract, ReasoningContract::GemmaBoolean);
+    let mut thinking_enabled = toggle_opt.unwrap_or_else(|| {
+        if configured_off {
+            false
+        } else if config_mode_is_explicit {
+            config_mode != "off"
+        } else {
+            family_default
+        }
+    });
+    if matches!(contract, ReasoningContract::MuseGlimmer) && !thinking_enabled {
+        push_warn("reasoning off dropped for muse_glimmer: always-on reasoning".to_string());
+        thinking_enabled = true;
+    }
+    request["thinking_enabled"] = serde_json::json!(thinking_enabled);
+    let prefix = match contract {
+        ReasoningContract::QwenJinja | ReasoningContract::DeepSeek4 => {
+            if thinking_enabled {
+                "open_think"
+            } else {
+                "closed_think"
+            }
+        }
+        ReasoningContract::GemmaBoolean | ReasoningContract::MuseGlimmer => "plain",
+        ReasoningContract::Unsupported => "plain",
+    };
+    request["assistant_prefix"] = serde_json::json!(prefix);
+    if !thinking_enabled {
+        if has_explicit_effort {
+            push_warn(format!(
+                "reasoning_effort '{}' dropped: thinking disabled",
+                effort_raw.unwrap()
+            ));
+        }
+        if config_effort_is_explicit && config_effort != "auto" && config_effort != "none" {
+            push_warn(format!(
+                "reasoning.effort '{}' dropped: thinking disabled",
+                config_effort
+            ));
+        }
+        let cap_present = has_explicit_body_max
+            || body_budget_present
+            || has_explicit_config_max
+            || has_explicit_config_budget;
+        if cap_present {
+            push_warn("max_think_tokens/budget dropped: thinking disabled".to_string());
+        }
+        let resolution = ReasoningResolution {
+            effective_mode: "disabled".to_string(),
+            effective_effort: None,
+            effective_cap: None,
+            cap_source: "none".to_string(),
+            contract,
+            warnings: warnings.clone(),
+        };
+        return Ok(resolution);
+    }
+    if matches!(contract, ReasoningContract::QwenJinja) && is_effort_native && body_budget_present {
+        push_warn(format!(
+            "thinking_budget '{}' ignored for effort-native contract {}: use explicit max_think_tokens for cap",
+            body_budget_str.unwrap(),
+            contract.wire_name()
+        ));
+    }
+    if matches!(contract, ReasoningContract::QwenJinja)
+        && is_effort_native
+        && has_explicit_config_budget
+    {
+        push_warn(format!(
+            "thinking_budget '{}' ignored for effort-native contract {}: use explicit max_think_tokens for cap",
+            config_budget_str.clone().unwrap(),
+            contract.wire_name()
+        ));
+    }
+
+    let (mut effective_cap, mut cap_source) = if matches!(contract, ReasoningContract::GemmaBoolean)
+    {
+        (None, "none".to_string())
+    } else if matches!(
+        contract,
+        ReasoningContract::DeepSeek4 | ReasoningContract::MuseGlimmer
+    ) && (has_explicit_body_max
+        || has_explicit_config_max
+        || body_budget_present
+        || has_explicit_config_budget)
+    {
+        if has_explicit_body_max {
+            push_warn(format!(
+                "{} {} dropped for {}: use reasoning_effort only",
+                if body_top_max_present {
+                    "max_think_tokens"
+                } else {
+                    "reasoning.max_tokens"
+                },
+                max_opt.unwrap(),
+                contract.wire_name()
+            ));
+        }
+        if has_explicit_config_max {
+            push_warn(format!(
+                "reasoning.max_tokens {} dropped for {}: use reasoning_effort only",
+                config_max_opt.unwrap(),
+                contract.wire_name()
+            ));
+        }
+        if body_budget_present {
+            push_warn(format!(
+                "thinking_budget '{}' dropped for {}: use reasoning_effort only",
+                body_budget_str.unwrap(),
+                contract.wire_name()
+            ));
+        }
+        if has_explicit_config_budget {
+            push_warn(format!(
+                "thinking_budget '{}' dropped for {}: use reasoning_effort only",
+                config_budget_str.clone().unwrap(),
+                contract.wire_name()
+            ));
+        }
+        (None, "none".to_string())
+    } else if has_explicit_body_max {
+        if body_budget_present {
+            push_warn(
+                "thinking_budget dropped because explicit max_think_tokens takes precedence"
+                    .to_string(),
+            );
+        }
+        (max_opt, body_max_source.to_string())
+    } else if !is_effort_native && body_budget_present {
+        let budget_str = body_budget_str.unwrap();
+        let mapped = match budget_str {
+            "off" => None,
+            "low" => Some(512),
+            "med" => Some(2048),
+            "high" => Some(8192),
+            "xhigh" => Some(24576),
+            "max" => Some(32768),
+            "uncapped" => Some(0),
+            other => {
+                push_warn(format!(
+                    "thinking_budget '{}' dropped: unknown preset",
+                    other
+                ));
+                None
+            }
+        };
+        if mapped.is_none() && budget_str != "off" && {
+            let known = ["low", "med", "high", "xhigh", "max", "uncapped"];
+            !known.contains(&budget_str)
+        } {
+            (None, "none".to_string())
+        } else {
+            (mapped, "explicit:body:thinking_budget".to_string())
+        }
+    } else if has_explicit_config_max {
+        (config_max_opt, "config:reasoning.max_tokens".to_string())
+    } else if !is_effort_native && has_explicit_config_budget {
+        let budget_str = config_budget_str.as_deref().unwrap();
+        let mapped = match budget_str {
+            "off" => None,
+            "low" => Some(512),
+            "med" => Some(2048),
+            "high" => Some(8192),
+            "xhigh" => Some(24576),
+            "max" => Some(32768),
+            "uncapped" => Some(0),
+            other => {
+                push_warn(format!(
+                    "thinking_budget '{}' dropped: unknown preset",
+                    other
+                ));
+                None
+            }
+        };
+        if mapped.is_none() && budget_str != "off" && {
+            let known = ["low", "med", "high", "xhigh", "max", "uncapped"];
+            !known.contains(&budget_str)
+        } {
+            (None, "none".to_string())
+        } else {
+            (mapped, "config:reasoning.budget".to_string())
+        }
+    } else {
+        (None, "none".to_string())
+    };
+    if effective_cap == Some(0) {
+        effective_cap = None;
+        cap_source = "none".to_string();
+    }
+    if let Some(value) = effective_cap {
+        request["max_think_tokens"] = serde_json::json!(value);
+    }
+    let mut effective_effort: Option<String> = None;
+    match contract {
+        ReasoningContract::QwenJinja => {
+            if !effort_native {
+                if has_explicit_effort {
+                    push_warn(format!(
+                        "reasoning_effort '{}' dropped: template does not natively support effort (Qwen3.6); use thinking_budget or max_think_tokens for cap",
+                        effort_raw.unwrap()
+                    ));
+                }
+                if config_effort_is_explicit && config_effort != "auto" {
+                    push_warn(format!(
+                        "reasoning.effort '{}' dropped: template does not natively support effort",
+                        config_effort
+                    ));
+                }
+                effective_effort = None;
+            } else if has_explicit_effort || config_effort_is_explicit {
+                let raw = if let Some(value) = effort_raw {
+                    value.to_owned()
+                } else {
+                    config_effort.clone()
+                };
+                if raw == "auto" {
+                    effective_effort = Some("xhigh".to_string());
+                    request["reasoning_effort"] = serde_json::json!("xhigh");
+                } else {
+                    match raw.as_str() {
+                        "low" | "medium" | "xhigh" => {
+                            if !supported_efforts.is_empty() && !supported_efforts.contains(&raw) {
+                                push_warn(format!(
+                                    "reasoning_effort '{}' dropped: not in supported {:?}",
+                                    raw, supported_efforts
+                                ));
+                                effective_effort = Some("xhigh".to_string());
+                                request["reasoning_effort"] = serde_json::json!("xhigh");
+                            } else {
+                                effective_effort = Some(raw.clone());
+                                request["reasoning_effort"] = serde_json::json!(raw);
+                            }
+                        }
+                        "high" | "max" | "minimal" | "med" => {
+                            push_warn(format!(
+                                "reasoning_effort '{}' dropped for qwen_jinja: expected low|medium|xhigh",
+                                raw
+                            ));
+                            effective_effort = Some("xhigh".to_string());
+                            request["reasoning_effort"] = serde_json::json!("xhigh");
+                        }
+                        other => {
+                            push_warn(format!(
+                                "reasoning_effort '{}' normalized to qwen_jinja default xhigh",
+                                other
+                            ));
+                            effective_effort = Some("xhigh".to_string());
+                            request["reasoning_effort"] = serde_json::json!("xhigh");
+                        }
+                    }
+                }
+            } else {
+                let default = "xhigh".to_string();
+                effective_effort = Some(default.clone());
+                request["reasoning_effort"] = serde_json::json!(default);
+            }
+        }
+        ReasoningContract::DeepSeek4 => {
+            let raw = if let Some(value) = effort_raw {
+                value.to_owned()
+            } else {
+                let cfg = config_string(resolved, "reasoning.effort")
+                    .unwrap_or_else(|_| "auto".to_string());
+                if cfg != "auto" {
+                    cfg
+                } else {
+                    "high".to_string()
+                }
+            };
+            let normalized = match raw.as_str() {
+                "minimal" => "low",
+                "low" => "low",
+                "medium" | "med" => "high",
+                "xhigh" => "high",
+                "high" => "high",
+                "max" => "max",
+                other => {
+                    push_warn(format!(
+                        "reasoning_effort '{}' normalized to deepseek4 default high",
+                        other
+                    ));
+                    "high"
+                }
+            };
+            effective_effort = Some(normalized.to_string());
+            request["reasoning_effort"] = serde_json::json!(normalized);
+        }
+        ReasoningContract::MuseGlimmer => {
+            let raw = if let Some(value) = effort_raw {
+                value.to_owned()
+            } else {
+                let cfg = config_string(resolved, "reasoning.effort")
+                    .unwrap_or_else(|_| "auto".to_string());
+                if cfg != "auto" {
+                    match cfg.as_str() {
+                        "low" | "medium" | "high" | "xhigh" | "max" => cfg,
+                        other => {
+                            push_warn(format!(
+                                "reasoning.effort '{}' normalized to muse_glimmer default high",
+                                other
+                            ));
+                            "high".to_string()
+                        }
+                    }
+                } else {
+                    "high".to_string()
+                }
+            };
+            let normalized = match raw.as_str() {
+                "low" => "low",
+                "medium" | "med" => "medium",
+                "high" => "high",
+                "xhigh" => "xhigh",
+                "max" => "xhigh",
+                other => {
+                    push_warn(format!(
+                        "reasoning_effort '{}' normalized to muse_glimmer default high",
+                        other
+                    ));
+                    "high"
+                }
+            };
+            effective_effort = Some(normalized.to_string());
+            request["reasoning_effort"] = serde_json::json!(normalized);
+        }
+        ReasoningContract::GemmaBoolean => {
+            effective_effort = None;
+        }
+        ReasoningContract::Unsupported => {
+            effective_effort = None;
+        }
+    }
+    let resolution = ReasoningResolution {
+        effective_mode: if thinking_enabled {
+            "enabled".to_string()
+        } else {
+            "disabled".to_string()
+        },
+        effective_effort,
+        effective_cap,
+        cap_source,
+        contract,
+        warnings: warnings.clone(),
+    };
+    Ok(resolution)
 }
 
 pub(crate) fn config_value<'a>(
@@ -2701,7 +3230,10 @@ pub(crate) fn config_value<'a>(
         .ok_or_else(|| anyhow!("missing resolved configuration key {key}"))
 }
 
-pub(crate) fn config_string(resolved: &hipfire_config::ResolvedConfig, key: &str) -> Result<String> {
+pub(crate) fn config_string(
+    resolved: &hipfire_config::ResolvedConfig,
+    key: &str,
+) -> Result<String> {
     match config_value(resolved, key)? {
         hipfire_config::ConfigValue::String(value) => Ok(value.clone()),
         value => bail!("{key} resolved as {}, expected string", value.kind()),
@@ -5372,16 +5904,14 @@ fn registry_source(source: RegistrySource) -> &'static str {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::serve::complete::{
-        Completion, ThinkFragment, forward_think_fragments, inject_default_system_message,
-        normalize_openai_messages,
+        forward_think_fragments, inject_default_system_message, normalize_openai_messages,
+        Completion, ThinkFragment,
     };
-    use crate::serve::http::handle_http;
-    use crate::serve::{Admission, ServeMeta, ServeRuntime, ServeShared, serve_instance_token};
+    use crate::serve::{serve_instance_token, Admission, ServeMeta, ServeRuntime, ServeShared};
     use hipfire_config::CONFIG_PROFILE_NAMES;
     fn test_paths(label: &str) -> Paths {
         let nonce = std::time::SystemTime::now()
@@ -5416,8 +5946,6 @@ mod tests {
             last_activity: Instant::now() - Duration::from_secs(600),
         }
     }
-
-
 
     #[test]
     fn model_suffix_filter_covers_current_formats() {
@@ -5601,7 +6129,12 @@ mod tests {
         let registry = RegistryV1::parse(raw, "test").unwrap();
 
         // Exact Qwen families get VMM + 262144 + 81920
-        for tag in ["qwen3.5:4b", "qwen3.6:35b-a3b", "qwen3.8:27b", "qwen3.8:27b-fast"] {
+        for tag in [
+            "qwen3.5:4b",
+            "qwen3.6:35b-a3b",
+            "qwen3.8:27b",
+            "qwen3.8:27b-fast",
+        ] {
             let (_, entry) = registry.model(tag).unwrap();
             let resolved = resolved_for_model(&paths, tag, Some(tag), Some(entry)).unwrap();
             assert_eq!(
@@ -6083,9 +6616,6 @@ mod tests {
             "final off must drop projected developer.dflash_draft"
         );
     }
-
-
-
 
     #[test]
     pub(crate) fn artifact_urls_honor_endpoint_precedence() {
@@ -6925,7 +7455,6 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-
     #[test]
     fn run_options_after_prompt_and_tui_passthrough_parse() {
         let cli =
@@ -6943,9 +7472,6 @@ mod tests {
         };
         assert_eq!(args.arguments, ["--check"]);
     }
-
-
-
 
     #[test]
     fn registry_system_prompt_is_injected_only_when_client_omits_one() {
@@ -6971,7 +7497,6 @@ mod tests {
         assert_eq!(messages[0]["role"], "system");
         assert_eq!(messages[0]["content"], "client policy");
     }
-
 
     #[test]
     fn normalize_reasoning_sources_with_flag_on_and_off() {
@@ -7103,11 +7628,6 @@ mod tests {
         );
     }
 
-
-
-
-
-
     #[test]
     fn positional_model_config_scope_parses_without_stealing_global_actions() {
         let global = Cli::try_parse_from(["hipfire", "config", "list", "--json"]).unwrap();
@@ -7232,18 +7752,6 @@ mod tests {
         assert_eq!(config_rule_json(variant_field.rule)["maximum"], 5);
     }
 
-
-
-
-
-
-
-
-
-
-
-
-
     fn sample_completion(
         content: &str,
         tool_calls: Vec<ToolCall>,
@@ -7265,6 +7773,7 @@ mod tests {
                 "tok_s": 10.0,
             }),
             logprobs: None,
+            reasoning: None,
         }
     }
 
@@ -7276,15 +7785,6 @@ mod tests {
             rendered_body: None,
         }
     }
-
-
-
-
-
-
-
-
-
 
     /// Build a Completion whose done envelope has a non-string/missing finish_reason.
     fn sample_completion_with_done(
@@ -7302,11 +7802,9 @@ mod tests {
             tool_calls,
             done,
             logprobs: None,
+            reasoning: None,
         }
     }
-
-
-
 
     fn sample_tool_call(name: &str) -> serde_json::Value {
         serde_json::json!({
@@ -7314,18 +7812,6 @@ mod tests {
             "arguments": { "path": "README.md" }
         })
     }
-
-
-
-
-
-
-
-
-
-
-
-
 
     fn task15_daemon_err(class: &str, retryable: bool, attempt_id: u64) -> anyhow::Error {
         anyhow::Error::new(hipfire_client::ClientError::Daemon(
@@ -7340,7 +7826,6 @@ mod tests {
         ))
     }
 
-
     #[test]
     fn task15_serve_retry_config_defaults_off() {
         let resolved = resolve(Vec::<NamedLayer>::new()).expect("resolve empty layers");
@@ -7352,28 +7837,7 @@ mod tests {
 
     // --- StreamContractGate / complete_request framing (fix round 2) ---
 
-
-
-
-
     // ── Task 6: canonical OpenAI tool-call adapter + endpoint registry ──
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     #[test]
     fn forward_think_fragments_preserves_cancelled_callback_error() {
@@ -7390,8 +7854,6 @@ mod tests {
         // Fragment still applied before callback failure (accumulation is local).
         assert_eq!(content, "x");
     }
-
-
 
     // =========================================================================
     // Task 11 — no-GPU fake-daemon HTTP acceptance through real serve lowering
@@ -7410,7 +7872,7 @@ mod tests {
         daemon
     }
 
-    /// In-process tiny_http harness: Engine::spawn_configured → handle_http.
+    /// In-process Hyper harness: Engine::spawn_configured → serve_listener_until.
     /// Does not touch HIPFIRE_DAEMON_BIN.
     #[cfg(unix)]
     struct Task11HttpHarness {
@@ -7418,9 +7880,8 @@ mod tests {
         port: u16,
         model_name: String,
         shared: Arc<ServeShared>,
-        _server: Arc<Server>,
+        shutdown: tokio_util::sync::CancellationToken,
         _join: Option<thread::JoinHandle<()>>,
-        stop: Arc<AtomicBool>,
     }
 
     #[cfg(unix)]
@@ -7487,6 +7948,9 @@ mod tests {
                     registry,
                     current_path: None,
                     current_arch: None,
+                    current_reasoning_contract: ReasoningContract::Unsupported,
+                    current_reasoning_effort_native: false,
+                    current_reasoning_efforts: Vec::new(),
                     continuous_batch_capable: false,
                     current_max_seq: 0,
                     cache_capable: false,
@@ -7514,31 +7978,40 @@ mod tests {
                 backoff_hook: Mutex::new(None),
             });
 
-            let server = Arc::new(Server::http("127.0.0.1:0").expect("bind ephemeral serve port"));
-            let port = server.server_addr().to_ip().expect("ip listen addr").port();
+            let std_listener =
+                std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral serve port");
+            std_listener
+                .set_nonblocking(true)
+                .expect("set nonblocking listener");
+            let port = std_listener
+                .local_addr()
+                .expect("listener local addr")
+                .port();
 
-            let stop = Arc::new(AtomicBool::new(false));
-            let stop_flag = Arc::clone(&stop);
+            let shutdown = tokio_util::sync::CancellationToken::new();
+            let shutdown_loop = shutdown.clone();
             let shared_loop = Arc::clone(&shared);
-            let server_loop = Arc::clone(&server);
             let join = thread::spawn(move || {
-                while !stop_flag.load(Ordering::Relaxed) {
-                    match server_loop.recv_timeout(Duration::from_millis(50)) {
-                        Ok(Some(request)) => {
-                            let shared = Arc::clone(&shared_loop);
-                            // handle_http owns the request; keep sequential so the
-                            // single-engine fake daemon never races generate.
-                            if let Err(error) = handle_http(request, shared) {
-                                eprintln!("[task11-harness] HTTP request failed: {error:#}");
-                            }
-                        }
-                        Ok(None) => {}
-                        Err(_) => break,
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("task11 runtime");
+                rt.block_on(async move {
+                    let listener = tokio::net::TcpListener::from_std(std_listener)
+                        .expect("tokio listener from std");
+                    if let Err(error) = crate::serve::http::serve_listener_until(
+                        listener,
+                        shared_loop,
+                        shutdown_loop,
+                    )
+                    .await
+                    {
+                        eprintln!("[task11-harness] serve failed: {error:#}");
                     }
-                }
+                });
             });
 
-            // Health probe — proves handle_http path is live.
+            // Health probe — proves production Hyper service path is live.
             let deadline = Instant::now() + Duration::from_secs(5);
             while Instant::now() < deadline {
                 if hipfire_client::service_ready("127.0.0.1", port, Duration::from_millis(200)) {
@@ -7556,9 +8029,8 @@ mod tests {
                 port,
                 model_name: model_path.display().to_string(),
                 shared,
-                _server: server,
+                shutdown,
                 _join: Some(join),
-                stop,
             }
         }
 
@@ -7642,8 +8114,7 @@ mod tests {
     #[cfg(unix)]
     impl Drop for Task11HttpHarness {
         fn drop(&mut self) {
-            self.stop.store(true, Ordering::Relaxed);
-            self._server.unblock();
+            self.shutdown.cancel();
             if let Some(join) = self._join.take() {
                 let _ = join.join();
             }
@@ -7831,6 +8302,445 @@ mod tests {
         complete_openai_chat("127.0.0.1", port, body, Duration::from_secs(10))
     }
 
+    /// Raw non-stream POST; returns HTTP status and body bytes (no client parse).
+    #[cfg(unix)]
+    fn raw_nonstream_post(port: u16, body: &serde_json::Value) -> (u16, Vec<u8>) {
+        use std::net::TcpStream;
+        let payload = body.to_string();
+        let request = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\n\
+             Host: 127.0.0.1:{port}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {payload}",
+            payload.len(),
+        );
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect serve");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(10)))
+            .expect("read timeout");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("write timeout");
+        stream.write_all(request.as_bytes()).expect("write request");
+        let mut buf = Vec::new();
+        let _ = stream.read_to_end(&mut buf);
+        let text = String::from_utf8_lossy(&buf);
+        let status = text
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .and_then(|code| code.parse::<u16>().ok())
+            .unwrap_or(0);
+        let body_start = text
+            .find("\r\n\r\n")
+            .map(|idx| idx + 4)
+            .or_else(|| text.find("\n\n").map(|idx| idx + 2))
+            .unwrap_or(buf.len());
+        let raw_body = buf.get(body_start..).unwrap_or(&[]);
+        let chunked = text[..body_start]
+            .to_ascii_lowercase()
+            .contains("transfer-encoding: chunked");
+        if !chunked {
+            return (status, raw_body.to_vec());
+        }
+        let mut decoded = Vec::new();
+        let mut remaining = raw_body;
+        loop {
+            let Some(line_end) = remaining.windows(2).position(|bytes| bytes == b"\r\n") else {
+                panic!("malformed chunk header");
+            };
+            let size = usize::from_str_radix(
+                std::str::from_utf8(&remaining[..line_end])
+                    .expect("chunk size utf8")
+                    .split(';')
+                    .next()
+                    .expect("chunk size"),
+                16,
+            )
+            .expect("chunk size hex");
+            remaining = &remaining[line_end + 2..];
+            if size == 0 {
+                break;
+            }
+            assert!(remaining.len() >= size + 2, "truncated chunk body");
+            decoded.extend_from_slice(&remaining[..size]);
+            assert_eq!(&remaining[size..size + 2], b"\r\n");
+            remaining = &remaining[size + 2..];
+        }
+        (status, decoded)
+    }
+
+    /// Write a non-stream request and return the live TCP stream without reading status.
+    #[cfg(unix)]
+    fn open_nonstream_request(port: u16, body: &serde_json::Value) -> std::net::TcpStream {
+        use std::net::TcpStream;
+        let payload = body.to_string();
+        let request = format!(
+            "POST /v1/chat/completions HTTP/1.1\r\n\
+             Host: 127.0.0.1:{port}\r\n\
+             Content-Type: application/json\r\n\
+             Content-Length: {}\r\n\
+             Connection: close\r\n\
+             \r\n\
+             {payload}",
+            payload.len(),
+        );
+        let mut stream = TcpStream::connect(("127.0.0.1", port)).expect("connect serve");
+        stream
+            .set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("write timeout");
+        // Short read timeout so accidental reads fail fast; tests close without status.
+        stream
+            .set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("read timeout");
+        stream.write_all(request.as_bytes()).expect("write request");
+        let _ = stream.flush();
+        stream
+    }
+
+    #[cfg(unix)]
+    fn wait_fixture_ready(harness: &Task11HttpHarness, deadline: Instant) -> serde_json::Value {
+        let ready_path = harness.paths.root.join("fixture-ready.log");
+        while Instant::now() < deadline {
+            if let Ok(raw) = fs::read_to_string(&ready_path) {
+                for line in raw.lines().filter(|l| !l.trim().is_empty()) {
+                    if let Ok(val) = serde_json::from_str::<serde_json::Value>(line) {
+                        if val.get("type").and_then(|v| v.as_str()) == Some("fixture_ready") {
+                            return val;
+                        }
+                    }
+                }
+            }
+            // Fallback: requests.log also records fixture_ready.
+            if let Some(row) = harness
+                .read_requests_log()
+                .into_iter()
+                .find(|row| row.get("type").and_then(|v| v.as_str()) == Some("fixture_ready"))
+            {
+                return row;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+        panic!(
+            "fixture-ready never appeared; log={:?}",
+            harness.read_requests_log()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn oversized_declared_body_is_rejected_before_body_read() {
+        let harness = Task11HttpHarness::spawn("oversized-content-length");
+        let mut stream =
+            std::net::TcpStream::connect(("127.0.0.1", harness.port())).expect("connect serve");
+        stream
+            .set_read_timeout(Some(Duration::from_secs(1)))
+            .unwrap();
+        stream
+            .write_all(
+                b"POST /v1/chat/completions HTTP/1.1\r\n\
+                  Host: localhost\r\n\
+                  Content-Type: application/json\r\n\
+                  Content-Length: 8388609\r\n\
+                  Connection: close\r\n\r\n",
+            )
+            .unwrap();
+        let mut response = String::new();
+        stream.read_to_string(&mut response).unwrap();
+        assert!(
+            response.starts_with("HTTP/1.1 413"),
+            "oversized declaration was not rejected immediately: {response:?}"
+        );
+    }
+
+    /// Silent non-stream client disconnect aborts the correlated daemon txn,
+    /// drains done/aborted before Admission releases, then admits a follow-up.
+    #[cfg(unix)]
+    #[test]
+    fn nonstream_client_disconnect_aborts_and_releases_admission() {
+        let harness = Task11HttpHarness::spawn("ns-disconnect-abort");
+        let port = harness.port();
+        let body = harness.base_body("t11-long-nonstream", false);
+
+        assert_eq!(
+            harness.shared.admission.inflight(),
+            0,
+            "precondition: admission idle"
+        );
+
+        let stream = open_nonstream_request(port, &body);
+        let ready_deadline = Instant::now() + Duration::from_secs(5);
+        let ready = wait_fixture_ready(&harness, ready_deadline);
+        let gen_id = ready
+            .get("id")
+            .cloned()
+            .expect("fixture_ready carries generate id");
+        let gen_aid = ready
+            .get("attempt_id")
+            .and_then(|v| v.as_u64())
+            .expect("fixture_ready carries attempt_id");
+
+        // Confirm generate is in the wire log with the same correlation pair.
+        let request_log = harness.read_requests_log();
+        let generates = Task11HttpHarness::ops_of_type(&request_log, "generate");
+        assert!(
+            generates.iter().any(|g| {
+                g.get("id") == Some(&gen_id)
+                    && g.get("attempt_id").and_then(|v| v.as_u64()) == Some(gen_aid)
+            }),
+            "generate missing for fixture pair: {:?}",
+            harness.read_requests_log()
+        );
+
+        // Client disconnect without ever reading an HTTP status line.
+        drop(stream);
+
+        let poll_deadline = Instant::now() + Duration::from_secs(5);
+        let mut saw_abort = false;
+        let mut saw_done_aborted = false;
+        let mut inflight_hit_zero_before_done = false;
+
+        while Instant::now() < poll_deadline {
+            let log = harness.read_requests_log();
+            if !saw_abort {
+                saw_abort = log.iter().any(|row| {
+                    row.get("type").and_then(|v| v.as_str()) == Some("abort")
+                        && row.get("id") == Some(&gen_id)
+                        && row.get("attempt_id").and_then(|v| v.as_u64()) == Some(gen_aid)
+                });
+            }
+            if !saw_done_aborted {
+                saw_done_aborted = log.iter().any(|row| {
+                    row.get("type").and_then(|v| v.as_str()) == Some("daemon_done_aborted")
+                        && row.get("id") == Some(&gen_id)
+                        && row.get("attempt_id").and_then(|v| v.as_u64()) == Some(gen_aid)
+                });
+            }
+            let inflight = harness.shared.admission.inflight();
+            if inflight == 0 && !saw_done_aborted {
+                inflight_hit_zero_before_done = true;
+            }
+            if saw_abort && saw_done_aborted && inflight == 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+
+        assert!(
+            saw_abort,
+            "correlated abort{{id,attempt_id}} missing within poll bound; log={:?}",
+            harness.read_requests_log()
+        );
+        assert!(
+            saw_done_aborted,
+            "daemon done/aborted marker missing; log={:?}",
+            harness.read_requests_log()
+        );
+        assert!(
+            !inflight_hit_zero_before_done,
+            "Admission inflight reached 0 before done/aborted drained"
+        );
+        assert_eq!(
+            harness.shared.admission.inflight(),
+            0,
+            "admission must be fully released after abort drain"
+        );
+
+        // No commit may have been sent for the cancelled attempt.
+        let log = harness.read_requests_log();
+        let commits = Task11HttpHarness::ops_of_type(&log, "commit");
+        assert!(
+            commits.iter().all(|c| {
+                !(c.get("id") == Some(&gen_id)
+                    && c.get("attempt_id").and_then(|v| v.as_u64()) == Some(gen_aid))
+            }),
+            "cancelled attempt must not commit: {commits:?}"
+        );
+
+        // Immediate follow-up must admit and return a single JSON success.
+        let follow = complete_nonstream(port, harness.base_body("t11-stop-text", false))
+            .expect("follow-up after cancel must return 200 JSON");
+        assert_eq!(follow["choices"][0]["finish_reason"], "stop");
+        assert_eq!(
+            follow["choices"][0]["message"]["content"],
+            "hello from fake daemon"
+        );
+        let release_deadline = Instant::now() + Duration::from_millis(500);
+        while harness.shared.admission.inflight() != 0 && Instant::now() < release_deadline {
+            thread::sleep(Duration::from_millis(5));
+        }
+        assert_eq!(
+            harness.shared.admission.inflight(),
+            0,
+            "follow-up admission guard did not release after flushed response"
+        );
+    }
+
+    /// Connected pre-terminal daemon error keeps non-200 OpenAI error JSON.
+    #[cfg(unix)]
+    #[test]
+    fn nonstream_connected_error_preserves_status() {
+        let harness = Task11HttpHarness::spawn("ns-connected-err");
+        let port = harness.port();
+        let body = harness.base_body("t15-class-validation", false);
+        let (status, raw_body) = raw_nonstream_post(port, &body);
+        assert!(
+            status >= 400 && status != 200,
+            "preterminal error must keep non-200 status, got {status}"
+        );
+        let text = String::from_utf8_lossy(&raw_body);
+        // Strip optional chunked framing / trailing whitespace for JSON parse.
+        let json_start = text.find('{').expect("OpenAI error JSON object");
+        let json_text = &text[json_start..];
+        let err: serde_json::Value =
+            serde_json::from_str(json_text.trim_end()).expect("OpenAI error JSON");
+        let message = err
+            .pointer("/error/message")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            !message.is_empty(),
+            "error.message required in OpenAI error body: {err}"
+        );
+        assert!(
+            err.pointer("/choices").is_none(),
+            "error response must not look like a completion: {err}"
+        );
+        // Exactly one top-level JSON value.
+        let mut it = serde_json::Deserializer::from_str(json_text.trim_end())
+            .into_iter::<serde_json::Value>();
+        let _first = it.next().expect("one value").expect("valid JSON");
+        assert!(
+            it.next().is_none(),
+            "error body must be exactly one JSON value"
+        );
+    }
+
+    /// Connected non-stream success is exactly one JSON value (no SSE/trailer).
+    #[cfg(unix)]
+    #[test]
+    fn nonstream_success_is_exactly_one_json() {
+        let harness = Task11HttpHarness::spawn("ns-one-json");
+        let port = harness.port();
+        let body = harness.base_body("t11-stop-text", false);
+        let (status, raw_body) = raw_nonstream_post(port, &body);
+        assert_eq!(status, 200, "success status");
+        let text = String::from_utf8_lossy(&raw_body);
+        let json_start = text.find('{').expect("JSON object in body");
+        let json_text = text[json_start..].trim_end();
+        let mut it = serde_json::Deserializer::from_str(json_text).into_iter::<serde_json::Value>();
+        let value = it
+            .next()
+            .expect("exactly one JSON value")
+            .expect("valid JSON");
+        assert!(
+            it.next().is_none(),
+            "non-stream success must not append a second JSON/SSE value; body={text:?}"
+        );
+        assert_eq!(value["choices"][0]["finish_reason"], "stop");
+        assert_eq!(
+            value["choices"][0]["message"]["content"],
+            "hello from fake daemon"
+        );
+        assert!(
+            !text.contains("data:"),
+            "non-stream body must not carry SSE framing"
+        );
+    }
+
+    /// Close-before terminal → abort and no commit; close-after full JSON → commit, no abort.
+    #[cfg(unix)]
+    #[test]
+    fn nonstream_close_before_vs_after_terminal_commit_race() {
+        let harness = Task11HttpHarness::spawn("ns-commit-race");
+        let port = harness.port();
+
+        // --- before terminal: disconnect during long silent generation ---
+        {
+            let body = harness.base_body("t11-long-nonstream", false);
+            let stream = open_nonstream_request(port, &body);
+            let ready = wait_fixture_ready(&harness, Instant::now() + Duration::from_secs(5));
+            let gen_id = ready.get("id").cloned().expect("id");
+            let gen_aid = ready
+                .get("attempt_id")
+                .and_then(|v| v.as_u64())
+                .expect("attempt_id");
+            drop(stream);
+
+            let deadline = Instant::now() + Duration::from_secs(5);
+            let mut saw_abort = false;
+            while Instant::now() < deadline {
+                let log = harness.read_requests_log();
+                saw_abort = log.iter().any(|row| {
+                    row.get("type").and_then(|v| v.as_str()) == Some("abort")
+                        && row.get("id") == Some(&gen_id)
+                        && row.get("attempt_id").and_then(|v| v.as_u64()) == Some(gen_aid)
+                });
+                let done = log.iter().any(|row| {
+                    row.get("type").and_then(|v| v.as_str()) == Some("daemon_done_aborted")
+                        && row.get("id") == Some(&gen_id)
+                });
+                if saw_abort && done && harness.shared.admission.inflight() == 0 {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(saw_abort, "close-before-terminal must abort");
+            let log = harness.read_requests_log();
+            assert!(
+                Task11HttpHarness::ops_of_type(&log, "commit")
+                    .iter()
+                    .all(|c| c.get("id") != Some(&gen_id)),
+                "close-before-terminal must not commit: {log:?}"
+            );
+        }
+
+        // --- after terminal: full success response consumed; commit, no abort ---
+        {
+            let before_aborts =
+                Task11HttpHarness::ops_of_type(&harness.read_requests_log(), "abort").len();
+            let body = harness.base_body("t11-stop-text", false);
+            let (status, raw_body) = raw_nonstream_post(port, &body);
+            assert_eq!(status, 200);
+            let text = String::from_utf8_lossy(&raw_body);
+            let json_start = text.find('{').expect("json");
+            let value: serde_json::Value =
+                serde_json::from_str(text[json_start..].trim_end()).expect("json body");
+            assert_eq!(value["choices"][0]["finish_reason"], "stop");
+
+            let deadline = Instant::now() + Duration::from_secs(3);
+            let mut saw_commit = false;
+            while Instant::now() < deadline {
+                let log = harness.read_requests_log();
+                // Latest generate should have a matching commit.
+                let generates = Task11HttpHarness::ops_of_type(&log, "generate");
+                let last_gen = generates.last().expect("generate for success path");
+                let gid = last_gen.get("id").cloned();
+                let gaid = last_gen.get("attempt_id").and_then(|v| v.as_u64());
+                saw_commit = Task11HttpHarness::ops_of_type(&log, "commit")
+                    .iter()
+                    .any(|c| {
+                        c.get("id") == gid.as_ref()
+                            && c.get("attempt_id").and_then(|v| v.as_u64()) == gaid
+                    });
+                if saw_commit {
+                    break;
+                }
+                thread::sleep(Duration::from_millis(20));
+            }
+            assert!(saw_commit, "close-after-terminal must commit");
+            let after_aborts =
+                Task11HttpHarness::ops_of_type(&harness.read_requests_log(), "abort").len();
+            assert_eq!(
+                after_aborts, before_aborts,
+                "close-after full JSON must not emit a new abort"
+            );
+        }
+    }
+
     /// Paired stream/nonstream matrix rows for stop, pure-tool, mixed-tool,
     /// two-tools, length-withhold, and usage ordering.
     ///
@@ -7838,6 +8748,8 @@ mod tests {
     /// structured-argument JSON fragment leaking into content/reasoning.
     /// Invalid-producer dirty-marker diagnostics live in a separate test and
     /// must not weaken these valid-path assertions.
+    /// (Matrix body lives with the broader Task11 suite; streaming helpers above
+    /// remain the stable surface for parity checks.)
     #[cfg(unix)]
 
     /// Invalid-producer diagnostic (authority violation): dirty marker token text
@@ -7850,27 +8762,7 @@ mod tests {
 
     /// Capability denial: daemon typed error on tools request → no completion/tool payload.
     #[cfg(unix)]
-
     // --- Task 15: server-owned one-retry (disabled-by-default) ---
-
-    #[cfg(unix)]
-
-    #[cfg(unix)]
-
-    #[cfg(unix)]
-
-    #[cfg(unix)]
-
-    #[cfg(unix)]
-
-    #[cfg(unix)]
-
-    #[cfg(unix)]
-
-    #[cfg(unix)]
-
-    #[cfg(unix)]
-
     #[test]
     fn bench_generate_request_includes_numeric_first_attempt() {
         let req = bench_generate_request("bench prompt", 37);
@@ -7926,4 +8818,649 @@ mod tests {
         assert_eq!(req.get("max_tokens").and_then(|v| v.as_u64()), Some(128));
     }
 
+    #[test]
+    fn http_reasoning_nested_max_tokens_alias_resolves_cap_source() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let supported = vec!["low".to_string(), "medium".to_string(), "xhigh".to_string()];
+        let mut req = serde_json::json!({});
+        let res = apply_http_reasoning_request(
+            &serde_json::json!({
+                "reasoning_effort": "low",
+                "reasoning": { "max_tokens": 2048 }
+            }),
+            &resolved,
+            &mut req,
+            ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap();
+        assert_eq!(req["max_think_tokens"], 2048);
+        assert_eq!(res.effective_cap, Some(2048));
+        assert_eq!(res.cap_source, "explicit:body:reasoning.max_tokens");
+        assert!(res.warnings.is_empty());
+    }
+
+    #[test]
+    fn http_reasoning_top_level_max_think_tokens_precedes_nested_alias() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let supported = vec!["low".to_string(), "medium".to_string(), "xhigh".to_string()];
+        let mut conflicting = serde_json::json!({});
+        let res_conflict = apply_http_reasoning_request(
+            &serde_json::json!({
+                "max_think_tokens": 4096,
+                "reasoning": { "max_tokens": 2048 }
+            }),
+            &resolved,
+            &mut conflicting,
+            ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap();
+        assert_eq!(conflicting["max_think_tokens"], 4096);
+        assert_eq!(res_conflict.effective_cap, Some(4096));
+        assert_eq!(res_conflict.cap_source, "explicit:body:max_think_tokens");
+        assert!(res_conflict.warnings.iter().any(|warning| {
+            warning.contains("reasoning.max_tokens")
+                && warning.contains("max_think_tokens")
+                && warning.contains("precedence")
+        }));
+
+        let mut equal = serde_json::json!({});
+        let res_equal = apply_http_reasoning_request(
+            &serde_json::json!({
+                "max_think_tokens": 2048,
+                "reasoning": { "max_tokens": 2048 }
+            }),
+            &resolved,
+            &mut equal,
+            ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap();
+        assert_eq!(equal["max_think_tokens"], 2048);
+        assert_eq!(res_equal.effective_cap, Some(2048));
+        assert_eq!(res_equal.cap_source, "explicit:body:max_think_tokens");
+        assert!(
+            res_equal
+                .warnings
+                .iter()
+                .all(|warning| !warning.contains("reasoning.max_tokens")),
+            "equal duplicate caps must not warn"
+        );
+    }
+
+    #[test]
+    fn http_reasoning_malformed_nested_max_tokens_is_hard_error() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let supported = vec!["low".to_string(), "medium".to_string(), "xhigh".to_string()];
+        for bad in [
+            serde_json::json!({ "reasoning": { "max_tokens": -1 } }),
+            serde_json::json!({ "reasoning": { "max_tokens": 1.5 } }),
+            serde_json::json!({ "reasoning": { "max_tokens": "2048" } }),
+            serde_json::json!({ "reasoning": { "max_tokens": 393217 } }),
+        ] {
+            let mut req = serde_json::json!({});
+            let err = apply_http_reasoning_request(
+                &bad,
+                &resolved,
+                &mut req,
+                ReasoningContract::QwenJinja,
+                true,
+                &supported,
+            )
+            .expect_err("malformed nested reasoning.max_tokens must hard-error");
+            let message = format!("{err:#}");
+            assert!(
+                message.contains("reasoning.max_tokens")
+                    && message.contains("must be between 0 and 393216"),
+                "unexpected error wording: {message}"
+            );
+        }
+    }
+
+    #[test]
+    fn http_reasoning_three_toggle_sources_disabled_wins_once() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let supported = vec!["low".to_string(), "medium".to_string(), "xhigh".to_string()];
+        // pairwise: top true vs kwargs false
+        let mut req = serde_json::json!({});
+        let res = apply_http_reasoning_request(
+            &serde_json::json!({
+                "enable_thinking": true,
+                "chat_template_kwargs": { "enable_thinking": false }
+            }),
+            &resolved,
+            &mut req,
+            ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap();
+        assert_eq!(req["thinking_enabled"], false);
+        assert_eq!(res.effective_mode, "disabled");
+        let warns: Vec<_> = res
+            .warnings
+            .iter()
+            .filter(|w| w.contains("conflicting thinking toggles"))
+            .collect();
+        assert_eq!(warns.len(), 1, "pairwise conflict must warn once");
+
+        // pairwise: kwargs true vs thinking.type disabled
+        let mut req2 = serde_json::json!({});
+        let res2 = apply_http_reasoning_request(
+            &serde_json::json!({
+                "chat_template_kwargs": { "enable_thinking": true },
+                "thinking": { "type": "disabled" }
+            }),
+            &resolved,
+            &mut req2,
+            ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap();
+        assert_eq!(req2["thinking_enabled"], false);
+        assert_eq!(res2.effective_mode, "disabled");
+        assert_eq!(
+            res2.warnings
+                .iter()
+                .filter(|w| w.contains("conflicting thinking toggles"))
+                .count(),
+            1
+        );
+
+        // all three: top true, kwargs true, thinking disabled => disabled wins, single warning
+        let mut req3 = serde_json::json!({});
+        let res3 = apply_http_reasoning_request(
+            &serde_json::json!({
+                "enable_thinking": true,
+                "chat_template_kwargs": { "enable_thinking": true },
+                "thinking": { "type": "disabled" }
+            }),
+            &resolved,
+            &mut req3,
+            ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap();
+        assert_eq!(req3["thinking_enabled"], false);
+        assert_eq!(res3.effective_mode, "disabled");
+        assert_eq!(
+            res3.warnings
+                .iter()
+                .filter(|w| w.contains("conflicting thinking toggles"))
+                .count(),
+            1
+        );
+
+        // all three agree true => no conflict warning, enabled
+        let mut req4 = serde_json::json!({});
+        let res4 = apply_http_reasoning_request(
+            &serde_json::json!({
+                "enable_thinking": true,
+                "chat_template_kwargs": { "enable_thinking": true },
+                "thinking": { "type": "enabled" }
+            }),
+            &resolved,
+            &mut req4,
+            ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap();
+        assert_eq!(req4["thinking_enabled"], true);
+        assert_eq!(res4.effective_mode, "enabled");
+        assert_eq!(
+            res4.warnings
+                .iter()
+                .filter(|w| w.contains("conflicting thinking toggles"))
+                .count(),
+            0
+        );
+    }
+
+    #[test]
+    fn http_reasoning_gemma_enabled_with_cap_and_budget_dropped() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        // Gemma explicit enable true must remain enabled and report no cap, even with caps present
+        let mut req = serde_json::json!({});
+        let res = apply_http_reasoning_request(
+            &serde_json::json!({
+                "enable_thinking": true,
+                "max_think_tokens": 1234,
+                "thinking_budget": "high",
+                "reasoning_effort": "low"
+            }),
+            &resolved,
+            &mut req,
+            ReasoningContract::GemmaBoolean,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(req["thinking_enabled"], true);
+        assert_eq!(res.effective_mode, "enabled");
+        assert!(
+            req.get("max_think_tokens").is_none(),
+            "Gemma must not send cap"
+        );
+        assert!(res.effective_cap.is_none());
+        assert_eq!(res.cap_source, "none");
+        assert!(res
+            .warnings
+            .iter()
+            .any(|w| w.contains("gemma_boolean") && w.contains("reasoning_effort")));
+        assert!(res
+            .warnings
+            .iter()
+            .any(|w| w.contains("gemma_boolean") && w.contains("max_think_tokens")));
+        assert!(res
+            .warnings
+            .iter()
+            .any(|w| w.contains("gemma_boolean") && w.contains("thinking_budget")));
+
+        // Config caps also dropped for Gemma when thinking enabled
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("reasoning.max_tokens", "4096").unwrap();
+        layer.set_cli("reasoning.budget", "low").unwrap();
+        let cfg_resolved = resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: "test".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let mut req2 = serde_json::json!({});
+        let res2 = apply_http_reasoning_request(
+            &serde_json::json!({ "enable_thinking": true }),
+            &cfg_resolved,
+            &mut req2,
+            ReasoningContract::GemmaBoolean,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(req2["thinking_enabled"], true);
+        assert!(req2.get("max_think_tokens").is_none());
+        assert!(res2.effective_cap.is_none());
+        assert!(res2
+            .warnings
+            .iter()
+            .any(|w| w.contains("reasoning.max_tokens")));
+    }
+
+    #[test]
+    fn http_reasoning_gemma_budget_off_does_not_disable() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        // Gemma with enable true + budget off must stay enabled (budget off ignored for Gemma)
+        let mut req = serde_json::json!({});
+        let res = apply_http_reasoning_request(
+            &serde_json::json!({
+                "enable_thinking": true,
+                "thinking_budget": "off"
+            }),
+            &resolved,
+            &mut req,
+            ReasoningContract::GemmaBoolean,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(req["thinking_enabled"], true);
+        assert_eq!(res.effective_mode, "enabled");
+        assert!(res
+            .warnings
+            .iter()
+            .any(|w| w.contains("gemma_boolean") && w.contains("thinking_budget")));
+        // Gemma default disabled without explicit enable, budget off should not change that (still disabled via default, not via budget)
+        let mut req2 = serde_json::json!({});
+        let res2 = apply_http_reasoning_request(
+            &serde_json::json!({ "thinking_budget": "off" }),
+            &resolved,
+            &mut req2,
+            ReasoningContract::GemmaBoolean,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(res2.effective_mode, "disabled");
+        // budget off for non-Gemma Qwen should disable
+        let mut req3 = serde_json::json!({});
+        let res3 = apply_http_reasoning_request(
+            &serde_json::json!({
+                "enable_thinking": true,
+                "thinking_budget": "off"
+            }),
+            &resolved,
+            &mut req3,
+            ReasoningContract::QwenJinja,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(req3["thinking_enabled"], false);
+        assert_eq!(res3.effective_mode, "disabled");
+    }
+
+    #[test]
+    fn http_reasoning_invalid_enum_warns_not_hard_error_and_malformed_hard_errors() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let supported = vec!["low".to_string(), "medium".to_string(), "xhigh".to_string()];
+        // unknown thinking.type string -> warn+drop, not error, results in default enabled for Qwen
+        let mut req = serde_json::json!({});
+        let res = apply_http_reasoning_request(
+            &serde_json::json!({ "thinking": { "type": "maybe" } }),
+            &resolved,
+            &mut req,
+            ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap();
+        assert!(!res.warnings.is_empty());
+        assert!(res
+            .warnings
+            .iter()
+            .any(|w| w.contains("thinking.type") && w.contains("dropped")));
+        assert_eq!(res.effective_mode, "enabled"); // default for Qwen
+
+        // unknown non-native thinking_budget -> warn+drop, not error
+        let mut req2 = serde_json::json!({});
+        let res2 = apply_http_reasoning_request(
+            &serde_json::json!({ "thinking_budget": "turbo" }),
+            &resolved,
+            &mut req2,
+            ReasoningContract::QwenJinja,
+            false,
+            &supported,
+        )
+        .unwrap();
+        assert!(req2.get("max_think_tokens").is_none());
+        assert!(res2.effective_cap.is_none());
+        assert!(res2
+            .warnings
+            .iter()
+            .any(|w| w.contains("thinking_budget") && w.contains("dropped")));
+
+        // wrong JSON type for enable_thinking -> hard error
+        let mut req3 = serde_json::json!({});
+        let err = apply_http_reasoning_request(
+            &serde_json::json!({ "enable_thinking": "true" }),
+            &resolved,
+            &mut req3,
+            ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("enable_thinking must be a boolean"));
+
+        // wrong JSON type for thinking.type -> hard error
+        let mut req4 = serde_json::json!({});
+        let err2 = apply_http_reasoning_request(
+            &serde_json::json!({ "thinking": { "type": 123 } }),
+            &resolved,
+            &mut req4,
+            ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap_err();
+        assert!(format!("{err2}").contains("thinking.type must be enabled or disabled"));
+
+        // cap range violation -> hard error (body)
+        let mut req5 = serde_json::json!({});
+        let err3 = apply_http_reasoning_request(
+            &serde_json::json!({ "max_think_tokens": 999999 }),
+            &resolved,
+            &mut req5,
+            ReasoningContract::QwenJinja,
+            true,
+            &supported,
+        )
+        .unwrap_err();
+        assert!(format!("{err3}").contains("must be between 0 and 393216"));
+    }
+
+    #[test]
+    fn http_reasoning_nested_max_tokens_and_qwen_deepseek_glimmer_contracts_intact() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        // Nested reasoning.max_tokens still works
+        let mut req = serde_json::json!({});
+        let res = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning": { "max_tokens": 2048 } }),
+            &resolved,
+            &mut req,
+            ReasoningContract::QwenJinja,
+            true,
+            &["low".to_string(), "medium".to_string(), "xhigh".to_string()],
+        )
+        .unwrap();
+        assert_eq!(req["max_think_tokens"], 2048);
+        assert_eq!(res.effective_cap, Some(2048));
+        assert_eq!(res.cap_source, "explicit:body:reasoning.max_tokens");
+
+        // Qwen non-native still drops effort
+        let mut req2 = serde_json::json!({});
+        let res2 = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning_effort": "low" }),
+            &resolved,
+            &mut req2,
+            ReasoningContract::QwenJinja,
+            false,
+            &[],
+        )
+        .unwrap();
+        assert!(req2.get("reasoning_effort").is_none());
+        assert!(res2
+            .warnings
+            .iter()
+            .any(|w| w.contains("does not natively support effort")));
+
+        // DeepSeek effort mapping intact
+        let mut req3 = serde_json::json!({});
+        let res3 = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning_effort": "medium" }),
+            &resolved,
+            &mut req3,
+            ReasoningContract::DeepSeek4,
+            true,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(req3["reasoning_effort"], "high");
+        assert_eq!(res3.effective_effort.as_deref(), Some("high"));
+
+        // Glimmer always-on intact
+        let mut req4 = serde_json::json!({});
+        let res4 = apply_http_reasoning_request(
+            &serde_json::json!({ "thinking": { "type": "disabled" } }),
+            &resolved,
+            &mut req4,
+            ReasoningContract::MuseGlimmer,
+            true,
+            &[],
+        )
+        .unwrap();
+        assert_eq!(req4["thinking_enabled"], true);
+        assert_eq!(res4.effective_mode, "enabled");
+    }
+
+    #[test]
+    fn http_reasoning_deepseek_explicit_caps_dropped() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let mut req = serde_json::json!({});
+        let res = apply_http_reasoning_request(
+            &serde_json::json!({
+                "reasoning_effort": "high",
+                "max_think_tokens": 4096
+            }),
+            &resolved,
+            &mut req,
+            ReasoningContract::DeepSeek4,
+            true,
+            &[],
+        )
+        .unwrap();
+        assert!(req.get("max_think_tokens").is_none());
+        assert!(res.effective_cap.is_none());
+        assert_eq!(res.cap_source, "none");
+        assert!(res
+            .warnings
+            .iter()
+            .any(|w| w.contains("max_think_tokens") && w.contains("deepseek4")));
+        assert_eq!(req["reasoning_effort"], "high");
+        assert_eq!(req["thinking_enabled"], true);
+        assert_eq!(res.effective_mode, "enabled");
+        let mut req2 = serde_json::json!({});
+        let res2 = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning": { "max_tokens": 2048 } }),
+            &resolved,
+            &mut req2,
+            ReasoningContract::DeepSeek4,
+            true,
+            &[],
+        )
+        .unwrap();
+        assert!(req2.get("max_think_tokens").is_none());
+        assert!(res2.effective_cap.is_none());
+        assert!(res2
+            .warnings
+            .iter()
+            .any(|w| w.contains("reasoning.max_tokens")));
+        let mut req3 = serde_json::json!({});
+        let res3 = apply_http_reasoning_request(
+            &serde_json::json!({ "thinking_budget": "high" }),
+            &resolved,
+            &mut req3,
+            ReasoningContract::DeepSeek4,
+            true,
+            &[],
+        )
+        .unwrap();
+        assert!(req3.get("max_think_tokens").is_none());
+        assert!(res3
+            .warnings
+            .iter()
+            .any(|w| w.contains("thinking_budget") && w.contains("deepseek4")));
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("reasoning.max_tokens", "8192").unwrap();
+        let cfg = resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: "test".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let mut req4 = serde_json::json!({});
+        let res4 = apply_http_reasoning_request(
+            &serde_json::json!({}),
+            &cfg,
+            &mut req4,
+            ReasoningContract::DeepSeek4,
+            true,
+            &[],
+        )
+        .unwrap();
+        assert!(req4.get("max_think_tokens").is_none());
+        assert!(res4.effective_cap.is_none());
+        assert!(res4
+            .warnings
+            .iter()
+            .any(|w| w.contains("reasoning.max_tokens")));
+        let mut bad = serde_json::json!({});
+        let err = apply_http_reasoning_request(
+            &serde_json::json!({ "max_think_tokens": "bad" }),
+            &resolved,
+            &mut bad,
+            ReasoningContract::DeepSeek4,
+            true,
+            &[],
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("must be between 0 and 393216"));
+    }
+
+    #[test]
+    fn http_reasoning_glimmer_explicit_caps_dropped() {
+        let resolved = resolve(Vec::<NamedLayer>::new()).unwrap();
+        let mut req = serde_json::json!({});
+        let res = apply_http_reasoning_request(
+            &serde_json::json!({
+                "reasoning_effort": "low",
+                "max_think_tokens": 512
+            }),
+            &resolved,
+            &mut req,
+            ReasoningContract::MuseGlimmer,
+            true,
+            &[],
+        )
+        .unwrap();
+        assert!(req.get("max_think_tokens").is_none());
+        assert!(res.effective_cap.is_none());
+        assert_eq!(res.cap_source, "none");
+        assert!(res
+            .warnings
+            .iter()
+            .any(|w| w.contains("max_think_tokens") && w.contains("muse_glimmer")));
+        assert_eq!(req["reasoning_effort"], "low");
+        let mut req2 = serde_json::json!({});
+        let res2 = apply_http_reasoning_request(
+            &serde_json::json!({
+                "reasoning": { "max_tokens": 1024 },
+                "thinking_budget": "low"
+            }),
+            &resolved,
+            &mut req2,
+            ReasoningContract::MuseGlimmer,
+            true,
+            &[],
+        )
+        .unwrap();
+        assert!(req2.get("max_think_tokens").is_none());
+        assert!(res2.effective_cap.is_none());
+        assert_eq!(res2.cap_source, "none");
+        assert!(res2.warnings.iter().any(|w| w.contains("muse_glimmer")));
+        let mut layer = ConfigLayer::default();
+        layer.set_cli("reasoning.budget", "high").unwrap();
+        let cfg = resolve([NamedLayer {
+            source: ConfigSource::OneShot {
+                argument: "test".into(),
+            },
+            layer,
+        }])
+        .unwrap();
+        let mut req3 = serde_json::json!({});
+        let res3 = apply_http_reasoning_request(
+            &serde_json::json!({}),
+            &cfg,
+            &mut req3,
+            ReasoningContract::MuseGlimmer,
+            true,
+            &[],
+        )
+        .unwrap();
+        assert!(req3.get("max_think_tokens").is_none());
+        assert!(res3.effective_cap.is_none());
+        assert!(res3
+            .warnings
+            .iter()
+            .any(|w| w.contains("muse_glimmer") || w.contains("thinking_budget")));
+        let mut bad = serde_json::json!({});
+        let err = apply_http_reasoning_request(
+            &serde_json::json!({ "reasoning": { "max_tokens": 500000 } }),
+            &resolved,
+            &mut bad,
+            ReasoningContract::MuseGlimmer,
+            true,
+            &[],
+        )
+        .unwrap_err();
+        assert!(format!("{err}").contains("must be between 0 and 393216"));
+    }
 }
