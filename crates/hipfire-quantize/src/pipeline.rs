@@ -1622,6 +1622,9 @@ pub(crate) fn run() {
     let mut _n_quant_groups = 0u64;
 
     let include_vision = args.include_vision;
+    // Set when a vision-module tensor is actually emitted (loop-level F16
+    // short-circuit) — spill-safe input for the has_vision metadata flag.
+    let mut emitted_vision = false;
     let vision_quant = args.vision_quant.as_str();
     // --include-prefix <prefix>: when set, ONLY tensors whose name starts
     // with this prefix are ingested; everything else is silently skipped.
@@ -1689,6 +1692,7 @@ pub(crate) fn run() {
             continue;
         }
         if is_vision_module && include_vision {
+            emitted_vision = true;
             // Emit vision-module tensors losslessly as F16. This short-circuits the
             // generic Q8 / mq4v2 text paths so the ViT weights stay full-precision.
             let (meta, raw_data) = st_files[*file_idx].tensor_data(name).unwrap();
@@ -2017,6 +2021,8 @@ pub(crate) fn run() {
             &mut spill,
             *file_idx,
             n_elements,
+            &mut total_quant_error,
+            &mut max_quant_error,
         ) {
             {
                 continue;
@@ -2825,6 +2831,66 @@ pub(crate) fn run() {
         }
     }
 
+    // ── VL artifact contract (docs/qwen35-vl-mq4v2-spec.md §4) ──────────────
+    // `has_vision` records that vision-module tensors were emitted into this
+    // artifact; the pixel budget is carried from the source
+    // processor_config.json when present so loaders can honour model-specific
+    // resolution limits instead of only the global engine default.
+    {
+        let mut vision_config = serde_json::Map::new();
+        if let Ok(pc) = std::fs::read_to_string(input_dir.join("processor_config.json")) {
+            if let Ok(pcv) = serde_json::from_str::<serde_json::Value>(&pc) {
+                // Qwen-family processors put pixel fields at the top level;
+                // LFM2/NaFlex nests them under "image_processor". Whitelist
+                // both schemas' budget-relevant keys.
+                const BUDGET_KEYS: [&str; 9] = [
+                    "min_pixels",
+                    "max_pixels",
+                    "patch_size",
+                    "merge_size",
+                    "encoder_patch_size",
+                    "downsample_factor",
+                    "max_tiles",
+                    "max_image_tokens",
+                    "max_num_patches",
+                ];
+                let scopes = [Some(&pcv), pcv.get("image_processor")];
+                for scope in scopes.into_iter().flatten() {
+                    for key in BUDGET_KEYS {
+                        if !vision_config.contains_key(key) {
+                            if let Some(v) = scope.get(key).cloned() {
+                                vision_config.insert(key.to_string(), v);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        if emitted_vision {
+            let has_budget = !vision_config.is_empty();
+            if let Ok(mut meta_val) = serde_json::from_str::<serde_json::Value>(&metadata_json) {
+                if let Some(obj) = meta_val.as_object_mut() {
+                    obj.insert("has_vision".to_string(), true.into());
+                    if has_budget {
+                        obj.insert(
+                            "vision_config".to_string(),
+                            serde_json::Value::Object(vision_config),
+                        );
+                    }
+                    metadata_json = serde_json::to_string(&meta_val).unwrap_or(metadata_json);
+                }
+            }
+            eprintln!(
+                "  has_vision: true{}",
+                if has_budget {
+                    " (+vision_config pixel budget)"
+                } else {
+                    ""
+                }
+            );
+        }
+    }
+
     // ── SP4b: bake prune finalize (rename kept per-expert tensors + patch count) ──
     // kept tensors (ds4 score layers / lfm2 / minimax) recorded during the loop to
     // their compact slots, then patches the output metadata's routed-expert count
@@ -3265,6 +3331,8 @@ fn try_handle_lfm2moe(
     spill: &mut Option<TensorSpill>,
     file_idx: usize,
     n_elements: usize,
+    total_err: &mut f64,
+    max_err: &mut f32,
 ) -> bool {
     // ── LFM2.5 ingest (arch_id 11) ─────────────────────────────────────────
     // Routed experts (A1B only) → MQ4G256; expert_bias → F32; everything else
@@ -3383,6 +3451,9 @@ fn try_handle_lfm2moe(
                 let qq = quantize_mq4g256(&f32_data, &signs1, &signs2);
                 (qq, QuantType::MQ4G256, "MQ4-LFM")
             };
+            if matches!(qt, QuantType::MQ4G256V2) {
+                mq4g256v2_rotated_error(&f32_data, &q, &signs1, &signs2, total_err, max_err);
+            }
             eprintln!(
                 "  {:>8}: {} {:?} ({:.1} KB → {:.1} KB)",
                 label,

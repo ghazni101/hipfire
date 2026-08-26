@@ -270,6 +270,46 @@ pub(crate) fn quantize_mq4g256v2(
     }
     output
 }
+
+/// Encoder-side round-trip error of a `quantize_mq4g256v2` blob vs its f32
+/// source, measured in the FWHT-rotated domain the packer operates in.
+/// Mirrors the kernel decoder (`w = q*scale[h] + zero[h]`, mq4-v2.md §4)
+/// against the same `cpu_fwht_256` rotation the packer applied — the error
+/// the runtime will see, not a proxy.
+pub(crate) fn mq4g256v2_rotated_error(
+    w: &[f32],
+    q: &[u8],
+    signs1: &[f32],
+    signs2: &[f32],
+    total_err: &mut f64,
+    max_err: &mut f32,
+) {
+    let n_blocks = q.len() / MQ4V2_GROUP_BYTES;
+    for b in 0..n_blocks {
+        let start = b * 256;
+        let end = (start + 256).min(w.len());
+        let mut group = [0.0f32; 256];
+        group[..end - start].copy_from_slice(&w[start..end]);
+        cpu_fwht_256(&mut group, signs1, signs2);
+        let base = b * MQ4V2_GROUP_BYTES;
+        let sts = [
+            f16_to_f32(u16::from_le_bytes([q[base], q[base + 1]])),
+            f16_to_f32(u16::from_le_bytes([q[base + 4], q[base + 5]])),
+        ];
+        let zs = [
+            f16_to_f32(u16::from_le_bytes([q[base + 2], q[base + 3]])),
+            f16_to_f32(u16::from_le_bytes([q[base + 6], q[base + 7]])),
+        ];
+        for i in 0..(end - start) {
+            let h = (i / 128) as usize;
+            let byte = q[base + 8 + i / 2];
+            let level = if i % 2 == 0 { byte & 0xF } else { byte >> 4 } as f32;
+            let err = (level * sts[h] + zs[h] - group[i]).abs();
+            *total_err += err as f64;
+            *max_err = (*max_err).max(err);
+        }
+    }
+}
 /// MQ6G256V2 encoder — per-128 asymmetric fp16 header, neutral-size GEMM/GEMV.
 ///
 /// Layout per 256-weight group: `[0..2) fp16 s0,[2..4) fp16 z0,[4..6) fp16 s1,[6..8) fp16 z1,[8..200) 192B packed 6-bit`.
