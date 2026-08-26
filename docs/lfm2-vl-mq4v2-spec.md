@@ -46,6 +46,13 @@ tower is a SigLIP-2 ViT — the *same family* as LFM2.5-VL's encoder (SigLIP2 Na
 > Note: 22 of 30 transformer blocks use the **conv mixer** (`conv.*`); only layers
 > 13–29 add attention. Quantize both mixer variants + FFN to mq4v2.
 
+> **As-built correction (2026-08-26):** the quantizer routes all norms
+> (`embedding_norm`, `ffn_norm`, `operator_norm`, `{q,k}_layernorm`) to
+> **Q8F16**, not F16 as the table above planned — verified in the census of
+> `~/.hipfire/models/lfm2.5-vl-3b.mq4v2.hfq` (99 Q8F16 tensors, 441 F16 =
+> vision+projector only). The table reflects the original plan; the artifact
+> is authoritative.
+
 ## 2. Quantizer changes (`crates/hipfire-quantize`)
 
 ### 2.1 Selection
@@ -142,6 +149,10 @@ MQ4G256V2 for 2D proj/FFN mats **except** `embed_tokens`. Two gaps:
 - Add a `has_vision: bool` + `vision_config` blob to the HFQ `metadata_json` emitted by
   the quantizer for `lfm2_vl` inputs, so the loader knows to instantiate the vision
   tower + projector.
+- The field set, vision dtype policy (F16), embedded layout, and naming rules are the
+  **shared VL artifact contract** — defined once in
+  [`qwen35-vl-mq4v2-spec.md`](qwen35-vl-mq4v2-spec.md) §4 (the arch 5 family spec).
+  Keep the two in sync; that section is authoritative.
 - Add `lfm2_vl` → 11 to `MODEL_TYPE_TO_ARCH_ID` (`arch_mapping.rs:55`) so the
   quantizer/runtime don't need `--arch-id 11` and so `Lfm2Vl` is auto-selected.
 
