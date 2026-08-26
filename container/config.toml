@@ -1,12 +1,12 @@
-# Multi-slot serve config (read via HIPFIRE_HOME=/opt/hipfire/home).
+# Serve config (read via HIPFIRE_HOME=/opt/hipfire/home).
+#
+# Single-slot by default: the multi-slot engine is feat/multislot work and
+# its profile lives on that branch — 2 slots, dynamic KV pool hard-capped at
+# 131072 (flash partials are sized min(pool, 131072); a larger pool overruns
+# the partials sub-view), prefill chunk 2048 (proven value on the ornith
+# box; matches the audit-branch scheduler chunk of min(cap, 2048)). Restore
+# that profile only on builds that include the slot engine, and note the
+# pool preflight keeps an 8 GiB headroom, which refuses on <=16 GB UMA
+# boxes entirely (see the 2026-08-26 VL battery findings).
 [serve]
-multi_slot = true
-multi_slot_slots = 2
-# Dynamic KV pool: shared token address space; each admitted request claims a
-# contiguous range sized to its real need and releases it on session close.
-# HARD CAP 131072: flash partials are sized min(pool, 131072); a larger pool
-# overruns the partials sub-view.
-multi_slot_pool_total = 131072
-# Prefill tokens taken from one slot per engine step (proven value on the
-# ornith box; matches the audit-branch scheduler chunk of min(cap, 2048)).
-multi_slot_prefill_chunk = 2048
+multi_slot = false
