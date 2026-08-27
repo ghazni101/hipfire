@@ -5,17 +5,17 @@
 //! Each carrier owns its full load path (HFQ + safetensors-dir).
 
 use crate::spec_build::Qwen35SlotGuard;
-use hipfire_runtime::llama::KvCacheExt;
 use crate::Carrier;
-use std::any::Any;
 use crate::{
     finish_qwen35_load, resolve_chat_template, resolve_chat_template_overrides, LoadedModel,
 };
 use hipfire_arch_minimax::{config_from_safetensors, load_weights_from_safetensors, MiniMaxState};
 use hipfire_runtime::kv_backend::KvBackend;
+use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
 use hipfire_runtime::model_source::ModelSource as _;
 use hipfire_runtime::spec::{InPlaceGuard, SpecEmit, SpecEmitCtx, SpecTargetGuard};
+use std::any::Any;
 
 // The ChatML/Hermes per-token emitter (`Qwen35Emit`) is shared by every
 // ChatML-family spec arm — qwen35 DFlash AND the llama/qwen2 n-gram paths all
@@ -113,7 +113,9 @@ impl Carrier for Qwen2Carrier {
         state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
         _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
-        match state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen2::Qwen2Bundle>()) {
+        match state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen2::Qwen2Bundle>()
+        }) {
             Some(bundle) => Ok(Box::new(InPlaceGuard { bundle })),
             _ => Err("qwen2: spec target state mismatch".into()),
         }
@@ -140,6 +142,7 @@ impl Carrier for Qwen2Carrier {
             semantic_contract_version: None,
             has_deltanet: false,
             supports_images: false,
+            reasoning_contract: saddle_core::caps::ReasoningContract::Unsupported,
         }
     }
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
@@ -269,6 +272,16 @@ fn load_qwen35_pp(
         None => hipfire_runtime::multi_gpu::Gpus::init_uniform(pp, config.n_layers)
             .map_err(|e| format!("{e}"))?,
     };
+    // Discrete GPUs: keep model pages in the page cache across reads —
+    // fadvise(DONTNEED)-per-tensor forces a full disk re-read on every load.
+    // UMA keeps eviction (default) to avoid OOM vs hipMalloc staging.
+    hfq_file.set_evict_page_cache(
+        std::env::var("HIPFIRE_PAGE_EVICTION")
+            .ok()
+            .map(|v| v != "0")
+            .unwrap_or_else(|| gpus.devices.iter().any(|g| g.is_uma())),
+    );
+    let _hfq_cache_warmer = hfq_file.start_cache_warmup();
     let layout = hipfire_arch_qwen35::qwen35::Layout::from_gpus(&gpus, config.n_layers);
     let mut hfq_source = hipfire_arch_qwen35::qwen35::HfqSource::new(&mut hfq_file, &config);
     let weights =
@@ -319,8 +332,6 @@ fn load_qwen35_pp(
     )
     .map_err(|e| format!("{e}"))?;
     let bundle = hipfire_arch_qwen35::Qwen35Bundle {
-        // Moved off LoadedModel: per-arch state belongs to the arch bundle.
-        qwen35_mtp_head: None,
         config,
         weights,
         scratch: single_scratch,
@@ -387,6 +398,7 @@ impl Carrier for Qwen35Carrier {
             // declares that the arch CAN accept images when that tower is
             // present. Per-instance gating still checks `LoadedModel::vision_config`.
             supports_images: true,
+            reasoning_contract: saddle_core::caps::ReasoningContract::QwenJinja,
         }
     }
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
@@ -493,6 +505,17 @@ impl Carrier for Qwen35Carrier {
                 if ctx.pp > 1 {
                     return load_qwen35_pp(hfq_file, meta, ctx);
                 }
+                // Discrete GPUs: keep model pages in the page cache across
+                // reads — fadvise(DONTNEED)-per-tensor forces a full disk
+                // re-read on every load. UMA keeps eviction (default) to
+                // avoid OOM vs hipMalloc staging.
+                hfq_file.set_evict_page_cache(
+                    std::env::var("HIPFIRE_PAGE_EVICTION")
+                        .ok()
+                        .map(|v| v != "0")
+                        .unwrap_or_else(|| ctx.gpu.is_uma()),
+                );
+                let _hfq_cache_warmer = hfq_file.start_cache_warmup();
 
                 // ── pp=1 path (single-GPU) ────────────────────
                 let physical_cap = ctx.cask.physical_cap(ctx.max_seq)?;
@@ -654,8 +677,6 @@ impl Carrier for Qwen35Carrier {
                     }
                 };
                 let bundle = hipfire_arch_qwen35::Qwen35Bundle {
-        // Moved off LoadedModel: per-arch state belongs to the arch bundle.
-        qwen35_mtp_head: None,
                     config,
                     weights,
                     scratch,
@@ -696,7 +717,9 @@ impl Carrier for LlamaCarrier {
         state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
         _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
-        match state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_llama::LlamaBundle>()) {
+        match state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_llama::LlamaBundle>()
+        }) {
             Some(bundle) => Ok(Box::new(InPlaceGuard { bundle })),
             _ => Err("llama: spec target state mismatch".into()),
         }
@@ -723,6 +746,7 @@ impl Carrier for LlamaCarrier {
             semantic_contract_version: None,
             has_deltanet: false,
             supports_images: false,
+            reasoning_contract: saddle_core::caps::ReasoningContract::Unsupported,
         }
     }
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
@@ -1015,6 +1039,7 @@ impl Carrier for DotsOcrCarrier {
             semantic_contract_version: None,
             has_deltanet: false,
             supports_images: true,
+            reasoning_contract: saddle_core::caps::ReasoningContract::Unsupported,
         }
     }
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
@@ -1034,7 +1059,9 @@ impl Carrier for DotsOcrCarrier {
         let weights = &bundle.weights;
         let mut ok = true;
         for &tok in synthetic {
-            if hipfire_arch_qwen2::qwen2::forward_step(gpu, &weights.text, &config.text, state, tok).is_err() {
+            if hipfire_arch_qwen2::qwen2::forward_step(gpu, &weights.text, &config.text, state, tok)
+                .is_err()
+            {
                 ok = false;
                 break;
             }
@@ -1094,9 +1121,14 @@ impl Carrier for Deepseek4Carrier {
         state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
         _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
-        if state.as_ref().is_some_and(|s| (s.as_ref() as &dyn Any).is::<crate::Deepseek4HeterogeneousBundle>()) {
+        if state
+            .as_ref()
+            .is_some_and(|s| (s.as_ref() as &dyn Any).is::<crate::Deepseek4HeterogeneousBundle>())
+        {
             Err("deepseek4 heterogeneous route is direct-AR only until G6".into())
-        } else if let Some(b) = state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>()) {
+        } else if let Some(b) = state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>()
+        }) {
             Ok(Box::new(InPlaceGuard { bundle: b }))
         } else {
             Err("deepseek4: spec target state mismatch".into())
@@ -1123,6 +1155,7 @@ impl Carrier for Deepseek4Carrier {
             semantic_contract_version: None,
             has_deltanet: false,
             supports_images: false,
+            reasoning_contract: saddle_core::caps::ReasoningContract::DeepSeek4,
         }
     }
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
@@ -1136,8 +1169,18 @@ impl Carrier for Deepseek4Carrier {
         n: usize,
         _prefill_err: &mut Option<String>,
     ) -> Option<bool> {
-        let b = m.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>()).unwrap();
-        let pbs = b.pbs.as_mut().expect("deepseek4_pbs missing on arch_id=9 bench_prefill");
+        let b = m
+            .state
+            .as_mut()
+            .and_then(|s| {
+                (s.as_mut() as &mut dyn Any)
+                    .downcast_mut::<hipfire_arch_deepseek4::Deepseek4Bundle>()
+            })
+            .unwrap();
+        let pbs = b
+            .pbs
+            .as_mut()
+            .expect("deepseek4_pbs missing on arch_id=9 bench_prefill");
         let config = &b.config;
         let weights = &b.weights;
         let state = &mut b.state;
@@ -1175,9 +1218,10 @@ impl Carrier for Deepseek4Carrier {
             let eos_tok = resolve_eos_tok(&meta.tokenizer, &["<｜end▁of▁sentence｜>"]);
             let advertised_context = model.config.max_position_embeddings;
             return Ok(LoadedModel {
-                state: Some(Box::new(
-                    crate::Deepseek4HeterogeneousBundle { model, eos_tok },
-                )),
+                state: Some(Box::new(crate::Deepseek4HeterogeneousBundle {
+                    model,
+                    eos_tok,
+                })),
                 ..LoadedModel::skeleton(
                     meta.arch_id,
                     meta.tokenizer,
@@ -1294,7 +1338,10 @@ impl Carrier for MinimaxCarrier {
         state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
         _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
-        match state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<crate::MiniMaxBundle>()) {
+        match state
+            .as_mut()
+            .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<crate::MiniMaxBundle>())
+        {
             Some(bundle) => Ok(Box::new(InPlaceGuard { bundle })),
             _ => Err("minimax: spec target state mismatch".into()),
         }
@@ -1320,6 +1367,7 @@ impl Carrier for MinimaxCarrier {
             semantic_contract_version: None,
             has_deltanet: false,
             supports_images: false,
+            reasoning_contract: saddle_core::caps::ReasoningContract::Unsupported,
         }
     }
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
@@ -1339,7 +1387,11 @@ impl Carrier for MinimaxCarrier {
         let state = &mut b.state;
         let mut ok = true;
         for (i, &tok) in synthetic.iter().enumerate() {
-            if hipfire_arch_minimax::forward::decode_step(config, weights, state, gpu, tok, i as u32).is_err() {
+            if hipfire_arch_minimax::forward::decode_step(
+                config, weights, state, gpu, tok, i as u32,
+            )
+            .is_err()
+            {
                 ok = false;
                 break;
             }
@@ -1394,7 +1446,10 @@ impl Carrier for Lfm2MoeCarrier {
         state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
         _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
-        match state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<crate::Lfm2MoeBundle>()) {
+        match state
+            .as_mut()
+            .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<crate::Lfm2MoeBundle>())
+        {
             Some(bundle) => Ok(Box::new(InPlaceGuard { bundle })),
             _ => Err("lfm2moe: spec target state mismatch".into()),
         }
@@ -1420,6 +1475,7 @@ impl Carrier for Lfm2MoeCarrier {
             semantic_contract_version: None,
             has_deltanet: false,
             supports_images: false,
+            reasoning_contract: saddle_core::caps::ReasoningContract::Unsupported,
         }
     }
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
@@ -1439,7 +1495,11 @@ impl Carrier for Lfm2MoeCarrier {
         let state = &mut b.state;
         let mut ok = true;
         for (i, &tok) in synthetic.iter().enumerate() {
-            if hipfire_arch_lfm2moe::forward::decode_step(config, weights, state, gpu, tok, i as u32).is_err() {
+            if hipfire_arch_lfm2moe::forward::decode_step(
+                config, weights, state, gpu, tok, i as u32,
+            )
+            .is_err()
+            {
                 ok = false;
                 break;
             }
@@ -1497,7 +1557,10 @@ impl Carrier for Cohere2MoeCarrier {
         state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
         _model_path: &str,
     ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
-        match state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<crate::Cohere2MoeBundle>()) {
+        match state
+            .as_mut()
+            .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<crate::Cohere2MoeBundle>())
+        {
             Some(bundle) => Ok(Box::new(InPlaceGuard { bundle })),
             _ => Err("cohere2moe: spec target state mismatch".into()),
         }
@@ -1525,6 +1588,7 @@ impl Carrier for Cohere2MoeCarrier {
             semantic_contract_version: None,
             has_deltanet: false,
             supports_images: false,
+            reasoning_contract: saddle_core::caps::ReasoningContract::Unsupported,
         }
     }
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
@@ -1545,13 +1609,19 @@ impl Carrier for Cohere2MoeCarrier {
         let weights = &b.weights;
         let state = &mut b.state;
         let mut ok = true;
-        if hipfire_arch_cohere2moe::forward::forward_batch_supported(weights) && synthetic.len() > 1 {
+        if hipfire_arch_cohere2moe::forward::forward_batch_supported(weights) && synthetic.len() > 1
+        {
             let mut i = 0;
             while i < synthetic.len() {
                 let end = (i + 256).min(synthetic.len());
                 let start_pos = state.n_tokens;
                 if hipfire_arch_cohere2moe::forward::forward_batch(
-                    config, weights, state, gpu, &synthetic[i..end], start_pos,
+                    config,
+                    weights,
+                    state,
+                    gpu,
+                    &synthetic[i..end],
+                    start_pos,
                 )
                 .is_err()
                 {
@@ -1562,7 +1632,11 @@ impl Carrier for Cohere2MoeCarrier {
             }
         } else {
             for (i, &tok) in synthetic.iter().enumerate() {
-                if hipfire_arch_cohere2moe::forward::decode_step(config, weights, state, gpu, tok, i as u32).is_err() {
+                if hipfire_arch_cohere2moe::forward::decode_step(
+                    config, weights, state, gpu, tok, i as u32,
+                )
+                .is_err()
+                {
                     ok = false;
                     break;
                 }
@@ -1577,6 +1651,103 @@ impl Carrier for Cohere2MoeCarrier {
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
         let bundle = hipfire_arch_cohere2moe::load_cohere2moe_bundle(src, ctx)?;
+        let speculator = crate::spec_build::build_speculator(
+            meta.arch_id,
+            None,
+            None,
+            true,
+            ctx.max_seq,
+            ctx.spec,
+        );
+        Ok(LoadedModel {
+            state: Some(Box::new(bundle)),
+            speculator,
+            ..LoadedModel::skeleton(
+                meta.arch_id,
+                meta.tokenizer,
+                ctx.max_seq,
+                ctx.max_seq,
+                ctx.path.to_string(),
+                meta.chat_template,
+            )
+        })
+    }
+}
+
+// ─── MapleCarrier ────────────────────────────────────────────────────
+// maple (arch_id 15, HFQ-only). Maple-Preview's weights are natively ternary
+// and are carried losslessly by qt=51 MQ2G256LloydU; there is no
+// safetensors-Dir path, so `claims_arch_id` answers for the HFQ namespace only
+// in practice and the Dir case is refused inside `load_maple_bundle` with a
+// message naming the convert command.
+pub struct MapleCarrier;
+impl Carrier for MapleCarrier {
+    fn name(&self) -> &'static str {
+        "maple"
+    }
+    fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
+        arch_id == 15
+    }
+    fn caps(&self) -> saddle_core::caps::ArchCaps {
+        saddle_core::caps::ArchCaps {
+            reasoning_contract: saddle_core::caps::ReasoningContract::QwenJinja,
+            supports_continuous_batch: false,
+            supports_ep_batch: false,
+            dflash: None,
+            supports_mtp: false,
+            spec_excludes_adaptive: false,
+            semantic_contract_version: None,
+            has_deltanet: false,
+            supports_images: false,
+        }
+    }
+    fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
+        saddle_core::sampling::SamplingDefaults::new(1.0, 0.95, 1.0)
+    }
+    /// Batched prefill over `MAPLE_PREFILL_CHUNK`-sized chunks. `forward_batch`
+    /// ERRORS above `MAPLE_PREFILL_MAX_B` rather than splitting silently, so the
+    /// chunking here is mandatory, not an optimisation.
+    ///
+    /// The failure string is propagated through `prefill_err`, which the daemon
+    /// interpolates into `bench_prefill forward failed: {e}` for every carrier —
+    /// not just Glimmer. Dropping it would reduce an unsupported-tier refusal
+    /// (which names the qt51 and router-mirror requirements) to a bare
+    /// "forward failed".
+    fn bench_prefill(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        synthetic: &[u32],
+        _n: usize,
+        prefill_err: &mut Option<String>,
+    ) -> Option<bool> {
+        let b = (m.state.as_mut()?.as_mut() as &mut dyn Any)
+            .downcast_mut::<hipfire_arch_maple::MapleBundle>()?;
+        for (start, len) in hipfire_arch_maple::batch::prefill_chunks(
+            synthetic.len(),
+            hipfire_arch_maple::batch::MAPLE_PREFILL_CHUNK,
+        ) {
+            if let Err(e) = hipfire_arch_maple::forward::forward_batch(
+                &b.config,
+                &b.weights,
+                &mut b.state,
+                gpu,
+                &synthetic[start..start + len],
+                start,
+            ) {
+                *prefill_err = Some(e);
+                return Some(false);
+            }
+        }
+        Some(true)
+    }
+    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+        if ctx.pp > 1 {
+            return Err("maple: pp>1 unsupported via registry".into());
+        }
+        dir_diag(&src);
+        let meta = resolve_source_meta(&src, ctx.path)?;
+        let bundle = hipfire_arch_maple::load_maple_bundle(src, ctx)?;
         let speculator = crate::spec_build::build_speculator(
             meta.arch_id,
             None,
@@ -1657,6 +1828,7 @@ impl Carrier for Gemma4Carrier {
             semantic_contract_version: None,
             has_deltanet: false,
             supports_images: false,
+            reasoning_contract: saddle_core::caps::ReasoningContract::GemmaBoolean,
         }
     }
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
@@ -1676,7 +1848,9 @@ impl Carrier for Gemma4Carrier {
         let state = &mut bundle.state;
         let mut ok = true;
         for (i, &tok) in synthetic.iter().enumerate() {
-            if hipfire_arch_gemma4::forward::decode_step(config, weights, state, gpu, tok, i as u32).is_err() {
+            if hipfire_arch_gemma4::forward::decode_step(config, weights, state, gpu, tok, i as u32)
+                .is_err()
+            {
                 ok = false;
                 break;
             }
@@ -1896,6 +2070,7 @@ impl Carrier for MuseGlimmerCarrier {
             semantic_contract_version: Some(2),
             has_deltanet: false,
             supports_images: false,
+            reasoning_contract: saddle_core::caps::ReasoningContract::MuseGlimmer,
         }
     }
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
@@ -1994,9 +2169,14 @@ impl Carrier for MuseGlimmerCarrier {
         for i in 0..iterations {
             let token = 101 + (i as u32 % 1000);
             match hipfire_arch_muse_glimmer::forward::decode_step(
-                config, weights, state, gpu, token, (context + i) as u32,
+                config,
+                weights,
+                state,
+                gpu,
+                token,
+                (context + i) as u32,
             ) {
-                Ok(_) => {},
+                Ok(_) => {}
                 Err(e) => {
                     *decode_err = Some(format!("iter {i} pos {}: {e}", context + i));
                     ok = false;

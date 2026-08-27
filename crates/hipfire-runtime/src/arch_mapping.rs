@@ -38,12 +38,21 @@ pub const MODEL_TYPE_TO_ARCH_ID: &[(&str, u32)] = &[
     ("qwen3_5", 5),
     ("qwen3_5_text", 5),
     ("qwen3_6", 5),
+    // arch 5 — ornith 1.5 dense (9B). Same loader as qwen3.5 dense (5); a3b MoE variant is 6.
+    ("ornith", 5),
+    ("ornith-1.5", 5),
+    ("ornith1.5", 5),
+    ("ornith_1.5", 5),
     // arch 6 — qwen3.5 MoE (explicit model_type strings; the safetensors path also
     // derives 6 from has_experts==true for the qwen3.5/3.6 family)
     ("qwen3_5_moe", 6),
     ("qwen3_5_moe_text", 6),
     ("qwen3moe", 6),
-    // arch 7 — qwen2 (Qwen2Carrier, loads attention biases the llama loader drops)
+    // arch 6 — ornith 1.5 MoE (35B-A3B). Mirrors registry_gen arch_id_for ornith-1.5 + a3b.
+    ("ornith_moe", 6),
+    ("ornith-1.5_moe", 6),
+    ("ornith1.5_moe", 6),
+    ("ornith_1.5_moe", 6),
     ("qwen2", 7),
     // arch 8 — dots.ocr
     ("dots_ocr", 8),
@@ -67,6 +76,8 @@ pub const MODEL_TYPE_TO_ARCH_ID: &[(&str, u32)] = &[
     // arch 14 — muse_glimmer dense (52-layer + ViT)
     ("muse_glimmer", 14),
     ("muse_glimmer_text", 14),
+    // arch 15 — maple (Maple-Preview 20B-A1B, natively-ternary 256-expert MoE)
+    ("maple", 15),
     // arch 22 — gemma4 EAGLE drafter (single-block spec-decode head for arch 13)
     ("gemma4_unified_assistant", 22),
     // arch 23 — muse_glimmer DFlash drafter

@@ -100,7 +100,7 @@ fn main() {
         Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 64, cap_tokens).expect("scratch");
     let logits_out = gpu.zeros(&[config.vocab_size], DType::F32).expect("logits");
     let out_tokens = gpu.zeros(&[1], DType::F32).expect("out");
-    let sample_params = vec![SlotSampleParams {
+    let mut sample_params = vec![SlotSampleParams {
         temperature: 0.0,
         top_p: 1.0,
         top_k: 0,
@@ -147,7 +147,7 @@ fn main() {
         scratch: &Qwen35Scratch,
         logits_out: &GpuTensor,
         out_tokens: &GpuTensor,
-        sample_params: &[SlotSampleParams],
+        sample_params: &mut [SlotSampleParams],
         feed: &[u32],
         start_pos: usize,
         n_decode: usize,
@@ -222,7 +222,7 @@ fn main() {
                 &scratch,
                 &logits_out,
                 &out_tokens,
-                &sample_params,
+                &mut sample_params,
                 $feed,
                 $pos,
                 $n,

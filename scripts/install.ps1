@@ -1,4 +1,4 @@
-# hipfire installer for Windows — detects GPU, installs deps, downloads binary + kernels.
+﻿# hipfire installer for Windows — detects GPU, installs deps, downloads binary + kernels.
 # Usage: irm https://raw.githubusercontent.com/warpfront/hipfire/master/scripts/install.ps1 | iex
 param(
     [string]$Ref,
@@ -8,6 +8,21 @@ param(
 )
 
 $ErrorActionPreference = "Stop"
+
+# Windows PowerShell 5.1 turns native stderr into a terminating error under
+# EAP=Stop, and git prints its normal progress (fetch etc.) on stderr. Scope
+# the relaxation to git invocations via this wrapper instead of weakening the
+# whole script; real failures are still caught by explicit $LASTEXITCODE
+# checks and try/catch at every call site.
+function Invoke-Git {
+    $prev = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    try {
+        & git @args
+    } finally {
+        $ErrorActionPreference = $prev
+    }
+}
 
 # ─── Paths ───────────────────────────────────────────────
 $HipfireDir  = "$env:USERPROFILE\.hipfire"
@@ -55,7 +70,7 @@ if ($InstallRefKind -eq "commit" -and $InstallRef -notmatch '^[0-9a-fA-F]{7,40}$
 }
 
 function Test-RemoteRef([string]$Repo, [string]$RemoteRef) {
-    & git -C $Repo ls-remote --exit-code origin $RemoteRef 2>&1 | Out-Null
+    Invoke-Git -C $Repo ls-remote --exit-code origin $RemoteRef 2>&1 | Out-Null
     return $LASTEXITCODE -eq 0
 }
 
@@ -75,24 +90,24 @@ function Checkout-InstallRef([string]$Repo) {
             if (-not (Test-RemoteRef $Repo "refs/heads/$script:InstallRef")) {
                 throw "Origin has no branch '$script:InstallRef'."
             }
-            & git -C $Repo fetch --depth 1 origin "+refs/heads/$script:InstallRef`:refs/remotes/origin/$script:InstallRef"
+            Invoke-Git -C $Repo fetch --depth 1 origin "+refs/heads/$script:InstallRef`:refs/remotes/origin/$script:InstallRef"
             if ($LASTEXITCODE -ne 0) { throw "git fetch branch failed." }
-            & git -C $Repo checkout -B $script:InstallRef "refs/remotes/origin/$script:InstallRef"
+            Invoke-Git -C $Repo checkout -B $script:InstallRef "refs/remotes/origin/$script:InstallRef"
             if ($LASTEXITCODE -ne 0) { throw "git checkout branch failed." }
         }
         "tag" {
             if (-not (Test-RemoteRef $Repo "refs/tags/$script:InstallRef")) {
                 throw "Origin has no tag '$script:InstallRef'."
             }
-            & git -C $Repo fetch --depth 1 origin "refs/tags/$script:InstallRef"
+            Invoke-Git -C $Repo fetch --depth 1 origin "refs/tags/$script:InstallRef"
             if ($LASTEXITCODE -ne 0) { throw "git fetch tag failed." }
-            & git -C $Repo checkout --detach "FETCH_HEAD^{commit}"
+            Invoke-Git -C $Repo checkout --detach "FETCH_HEAD^{commit}"
             if ($LASTEXITCODE -ne 0) { throw "git checkout tag failed." }
         }
         "commit" {
-            & git -C $Repo fetch --depth 1 origin $script:InstallRef
+            Invoke-Git -C $Repo fetch --depth 1 origin $script:InstallRef
             if ($LASTEXITCODE -ne 0) { throw "git fetch commit failed." }
-            & git -C $Repo checkout --detach "FETCH_HEAD^{commit}"
+            Invoke-Git -C $Repo checkout --detach "FETCH_HEAD^{commit}"
             if ($LASTEXITCODE -ne 0) { throw "git checkout commit failed." }
         }
         default { throw "Unsupported revision kind '$kind'." }
@@ -110,7 +125,14 @@ Write-Host "Checking for AMD GPU..." -ForegroundColor Cyan
 $GpuArch = "unknown"
 try {
     $VideoControllers = Get-CimInstance Win32_VideoController -ErrorAction Stop
-    $AmdGpu = $VideoControllers | Where-Object { $_.Name -match "AMD|Radeon" } | Select-Object -First 1
+    # Prefer the most capable AMD adapter: on APU + discrete-GPU systems the
+    # integrated controller enumerates first, and its name often matches no
+    # arch regex below. Largest reported memory is a reliable discrete signal
+    # across RX / AI PRO / embedded naming.
+    $AmdGpu = $VideoControllers |
+        Where-Object { $_.Name -match "AMD|Radeon" } |
+        Sort-Object { if ($null -eq $_.AdapterRAM) { [uint64]0 } else { [uint64]$_.AdapterRAM } } -Descending |
+        Select-Object -First 1
     if ($AmdGpu) {
         $GpuName = $AmdGpu.Name
         Write-Host "  Found: $GpuName"
@@ -297,9 +319,9 @@ if (-not (Test-Path "$SrcDir\.git")) {
             throw "$SrcDir exists but is not a git checkout; move it aside and retry."
         }
         New-Item -ItemType Directory -Force -Path $SrcDir | Out-Null
-        & git -C $SrcDir init --quiet
+        Invoke-Git -C $SrcDir init --quiet
         if ($LASTEXITCODE -ne 0) { throw "git init failed." }
-        & git -C $SrcDir remote add origin "https://github.com/$GithubRepo.git"
+        Invoke-Git -C $SrcDir remote add origin "https://github.com/$GithubRepo.git"
         if ($LASTEXITCODE -ne 0) { throw "git remote add failed." }
         Checkout-InstallRef $SrcDir
         Write-Host "  Checked out $InstallRefKind '$InstallRef' ✓" -ForegroundColor Green
@@ -310,17 +332,17 @@ if (-not (Test-Path "$SrcDir\.git")) {
     }
 } else {
     Write-Host "  Existing clone found at $SrcDir"
-    $PreviousCommit = (& git -C $SrcDir rev-parse --verify HEAD 2>$null | Out-String).Trim()
+    $PreviousCommit = (Invoke-Git -C $SrcDir rev-parse --verify HEAD 2>$null | Out-String).Trim()
     if ($PreviousCommit) {
         $stamp = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH-mm-ssZ")
         $shortCommit = $PreviousCommit.Substring(0, [Math]::Min(12, $PreviousCommit.Length))
         $backupRef = "refs/hipfire/backups/pre-install-$stamp-$shortCommit"
-        & git -C $SrcDir update-ref $backupRef $PreviousCommit
+        Invoke-Git -C $SrcDir update-ref $backupRef $PreviousCommit
         if ($LASTEXITCODE -eq 0) {
             Write-Host "  Previous source retained at $backupRef" -ForegroundColor Yellow
         }
     }
-    $status = & git -C $SrcDir status --porcelain 2>&1 | Out-String
+    $status = Invoke-Git -C $SrcDir status --porcelain 2>&1 | Out-String
     $ProceedWithUpdate = $true
     if ($status.Trim()) {
         Write-Host "  WARNING: local modifications detected." -ForegroundColor Yellow
@@ -328,7 +350,7 @@ if (-not (Test-Path "$SrcDir\.git")) {
         if ($reply -match "^[Yy]$") {
             $stamp = [DateTime]::UtcNow.ToString("yyyy-MM-ddTHH-mm-ssZ")
             $stashMessage = "hipfire-install-$stamp"
-            & git -C $SrcDir stash push --include-untracked -m $stashMessage
+            Invoke-Git -C $SrcDir stash push --include-untracked -m $stashMessage
             if ($LASTEXITCODE -ne 0) {
                 throw "git stash failed; source checkout was not changed."
             }
@@ -352,10 +374,10 @@ if (-not (Test-Path "$SrcDir\.git")) {
 }
 
 $RepoDir = $SrcDir
-$ResolvedCommit = (& git -C $RepoDir rev-parse --verify HEAD 2>$null | Out-String).Trim()
-$ResolvedRef = (& git -C $RepoDir describe --tags --exact-match HEAD 2>$null | Out-String).Trim()
+$ResolvedCommit = (Invoke-Git -C $RepoDir rev-parse --verify HEAD 2>$null | Out-String).Trim()
+$ResolvedRef = (Invoke-Git -C $RepoDir describe --tags --exact-match HEAD 2>$null | Out-String).Trim()
 if (-not $ResolvedRef) {
-    $ResolvedRef = (& git -C $RepoDir symbolic-ref --short HEAD 2>$null | Out-String).Trim()
+    $ResolvedRef = (Invoke-Git -C $RepoDir symbolic-ref --short HEAD 2>$null | Out-String).Trim()
 }
 if (-not $ResolvedRef) { $ResolvedRef = "detached" }
 Write-Host "Source resolved: $ResolvedRef @ $ResolvedCommit" -ForegroundColor Green

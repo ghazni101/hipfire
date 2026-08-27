@@ -160,7 +160,7 @@ failed so the search space narrows.
 
 Phases 0–4 (ROCm-unlock recon → approach bake-off → E2E validation → first
 forward pass) bootstrapped the engine and are complete. For that archaeology see
-`git log` and the `findings/` / `approaches/` history; day-to-day work now lives
+`git log` and the archived `docs/investigations/dispatch/` / `approaches/` history; day-to-day work now lives
 in `crates/` and the gate suite below — there is no setup phase to re-run.
 
 ## Perf benchmarking (kernel perf changes)

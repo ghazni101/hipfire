@@ -37,6 +37,7 @@ hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4", optional = true }
 hipfire-arch-lfm2moe = { path = "../hipfire-arch-lfm2moe" }
 hipfire-arch-minimax = { path = "../hipfire-arch-minimax" }
 hipfire-arch-cohere2moe = { path = "../hipfire-arch-cohere2moe" }
+hipfire-arch-maple = { path = "../hipfire-arch-maple" }
 hipfire-arch-gemma4 = { path = "../hipfire-arch-gemma4" }
 hipfire-arch-muse-glimmer = { path = "../hipfire-arch-muse-glimmer" }
 hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }

@@ -57,6 +57,11 @@ SIZE_TOLERANCE = 0.25
 # error: a new format must be added here deliberately, not silently passed.
 KNOWN_QUANTS = {
     "mq2lloyd",
+    # Maple-Preview's UNROTATED MQ2-Lloyd sibling (qt=51, MQ2G256LloydU). Shares
+    # mq2lloyd's 72 B/group layout byte-for-byte but is NOT FWHT-rotated, so it
+    # is a distinct format and must not be filed as "mq2lloyd": feeding a
+    # rotated activation to unrotated weights is silent garbage, not an error.
+    "mq2lloydu",
     "mq2",
     "mq2r",
     "mq3",
@@ -67,6 +72,11 @@ KNOWN_QUANTS = {
     "mq5",
     "mq6",
     "mfp4",
+    # PrismML Bonsai low-bit: TQ2G128 ternary / BQ1G128 binary. Added with the
+    # filename rename in the same commit -- quant_for() reads the extension and
+    # an unknown one aborts the whole run.
+    "tq2",
+    "bq1",
     "hf4",
     "hf6",
     "q8",
@@ -110,7 +120,32 @@ RECOMMENDED_BOUNDS = {
 # Mirrors hipfire-config's REASONING_EFFORTS. Includes Qwen3.8's ladder
 # (`low|medium|xhigh`) plus generic OpenAI-style values for other parents.
 REASONING_EFFORTS = {"auto", "none", "low", "medium", "high", "xhigh", "max"}
+# Legacy named cap presets for non-effort-native templates (e.g. Qwen3.6).
+# Absence means uncapped. Effort-native families must omit this field.
 THINKING_BUDGETS = {"off", "low", "med", "high", "xhigh", "max", "uncapped"}
+
+
+def _effort_native_tag(tag: str) -> bool:
+    """True for families whose reasoning is effort-semantic with no registry cap.
+
+    Qwen3.8, DeepSeek V4 Flash (+preview/SKU suffixes), and Muse Glimmer product
+    SKUs. Draft/dflash sidecars are excluded. `thinking_budget` is rejected on
+    these tags; absence means uncapped.
+    """
+    # Strip optional "sampling_profiles.<mode>" suffix used by callers.
+    base = tag.split(" sampling_profiles.", 1)[0]
+    family = base.split(":", 1)[0]
+    if "draft" in base or "dflash" in base:
+        return False
+    if family == "qwen3.8":
+        return True
+    if family in {"deepseek-v4-flash", "deepseek-v4-flash-preview"}:
+        return True
+    if family == "muse-glimmer" or base in {"muse-glimmer", "muse-glimmer:fast"}:
+        return True
+    if family in {"ornith-1.5", "ornith1.5", "ornith"}:
+        return True
+    return False
 
 
 def validate_recommended_settings(tag: str, rs: object, errors: list) -> None:
@@ -118,7 +153,12 @@ def validate_recommended_settings(tag: str, rs: object, errors: list) -> None:
 
     Mirrors hipfire-registry's recommended-settings bounds. Adds a
     descriptive error per offending key; does not mutate rs (deepcopy already
-    carries it through)."""
+    carries it through).
+
+    Effort-native tags (Qwen3.8 / DeepSeek4 / Muse Glimmer) must not ship
+    `thinking_budget`; absence means uncapped. Legacy non-native models may
+    still set named budget presets.
+    """
     if rs is None:
         return
     if not isinstance(rs, dict):
@@ -129,6 +169,7 @@ def validate_recommended_settings(tag: str, rs: object, errors: list) -> None:
         "reasoning_effort",
         "thinking_budget",
     }
+    effort_native = _effort_native_tag(tag)
     for key, val in rs.items():
         if key not in allowed:
             errors.append(f"{tag}: recommended_settings has unknown key {key!r} (allowed: {sorted(allowed)})")
@@ -145,6 +186,12 @@ def validate_recommended_settings(tag: str, rs: object, errors: list) -> None:
                 )
             continue
         if key == "thinking_budget":
+            if effort_native:
+                errors.append(
+                    f"{tag}: thinking_budget is unsupported on effort-native models "
+                    f"(omit the field; absence means uncapped), got {val!r}"
+                )
+                continue
             if val not in THINKING_BUDGETS:
                 errors.append(
                     f"{tag}: recommended_settings.thinking_budget must be one of "
@@ -194,10 +241,26 @@ def arch_id_for(tag: str, entry: dict) -> int | None:
         return 23 if "dflash" in file else 14
     if "dflash" in file:
         return 20
+    # Prism ML Bonsai = behaviour-preserving transform of Qwen3.6-27B,
+    # architecture unchanged (dense qwen35).
+    if family == "bonsai":
+        return 5
     if family in ("qwen3.5", "qwen3.6", "qwen3.8", "qwopus3.6", "carnice", "qwopus"):
         return 6 if "a3b" in tag else 5
     if family == "nex-n2":
         return 6  # Nex-N2-mini = Qwen3.5-35B-A3B MoE (a3b not in tag name)
+    # Ornith 1.5 = Qwen3.5-family VL finetune. 35B-A3B is qwen3_5_moe (6), the
+    # 9B is dense qwen3_5 (5). Keyed on "a3b" like the qwen3.5 family above.
+    #
+    # BOTH spellings are mapped on purpose. The canonical tag is the hyphenated
+    # "ornith-1.5"; the artifacts were briefly published as "ornith1.5", which
+    # survives as an alias. Aliases do NOT reach this function (build_registry
+    # calls it over `models` only), so the unhyphenated arm is not load-bearing
+    # today — it is here so that re-adding or reverting to the old tag spelling
+    # cannot fail-close. An unmapped family returns None, which aborts the ENTIRE
+    # daily run, every other model's entry included.
+    if family in ("ornith-1.5", "ornith1.5", "ornith"):
+        return 6 if "a3b" in tag else 5
     if family == "qwen3":
         return 1
     if family in ("deepseek-v4-flash", "deepseek-v4-flash-preview"):
@@ -208,6 +271,9 @@ def arch_id_for(tag: str, entry: dict) -> int | None:
         return 11
     if family == "north-mini-code":
         return 12
+    # Maple-Preview: natively-ternary 256-expert MoE, its own arch crate.
+    if family == "maple-preview":
+        return 15
     if family == "vibethinker":
         return 7   # Qwen2 dense (WeiboAI/VibeThinker-3B base)
     return None
@@ -216,7 +282,11 @@ def arch_id_for(tag: str, entry: dict) -> int | None:
 def quant_for(file: str) -> str | None:
     # DFlash drafts encode their quant in the stem: qwen35-9b-dflash-mq4.hfq
     m = re.search(r"[-.](mq\d)\.hfq$", file)
-    if m:
+    if m and m.group(1) in KNOWN_QUANTS:
+        return m.group(1)
+    # Product ladder files: model.mq4 / model.mq4-xt / model.mq4-pro → quant mq4
+    m = re.search(r"\.(mq\d)(?:-(?:xt|pro))?$", file)
+    if m and m.group(1) in KNOWN_QUANTS:
         return m.group(1)
     ext = file.rsplit(".", 1)[-1]
     if ext in KNOWN_QUANTS:

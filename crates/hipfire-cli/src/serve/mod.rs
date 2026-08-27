@@ -8,21 +8,34 @@
 //! and the `serve` subcommand entrypoints. Centralises all state that must be
 //! shared across HTTP workers so transport changes stay isolated.
 
+use crate::{
+    config_bool, config_f64, config_i64, config_string, config_u64, find_daemon, find_model_path,
+    http_get_json, list_local_models, load_params, probe_host, pull_command, resolved_for_model,
+    resolved_global, ListArgs, Paths, PullArgs, ServeArgs, StopArgs,
+};
 use anyhow::{anyhow, bail, Context, Result};
 use hipfire_client::Engine;
-use hipfire_config::{ConfigLayer, ConfigSource, NamedLayer, resolve, load_global, load_catalog};
+use hipfire_config::{load_catalog, load_global, resolve, ConfigLayer, ConfigSource, NamedLayer};
 use hipfire_registry::{load as load_registry, RegistryV1};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::{collections::{BTreeMap, BTreeSet}, env, fs, io::{Read, Write}, path::{Path, PathBuf}, process::{Child, Command}, sync::{Arc, Condvar, Mutex}, thread, time::{Duration, Instant}};
-use tiny_http::Server;
-use crate::{Paths, ServeArgs, StopArgs, PullArgs, ListArgs, config_bool, config_string, config_u64, config_f64, config_i64, resolved_global, find_model_path, resolved_for_model, load_params, pull_command, list_local_models, http_get_json, find_daemon, probe_host};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    env, fs,
+    io::{Read, Write},
+    path::{Path, PathBuf},
+    process::{Child, Command},
+    sync::{Arc, Condvar, Mutex},
+    thread,
+    time::{Duration, Instant},
+};
+use tokio::sync::Notify;
+use tokio_util::sync::CancellationToken;
 
 pub(crate) mod metrics;
 
 pub mod complete;
 pub mod http;
-pub mod slots;
 
 #[derive(Debug)]
 pub(crate) struct ServeMeta {
@@ -69,6 +82,9 @@ pub(crate) struct ServeRuntime {
     pub(crate) registry: RegistryV1,
     pub(crate) current_path: Option<PathBuf>,
     pub(crate) current_arch: Option<String>,
+    pub(crate) current_reasoning_contract: saddle_core::caps::ReasoningContract,
+    pub(crate) current_reasoning_effort_native: bool,
+    pub(crate) current_reasoning_efforts: Vec<String>,
     pub(crate) continuous_batch_capable: bool,
     pub(crate) current_max_seq: u64,
     pub(crate) cache_capable: bool,
@@ -76,6 +92,12 @@ pub(crate) struct ServeRuntime {
     pub(crate) kv_backend_override: Option<String>,
     pub(crate) tp: Option<u64>,
     pub(crate) continuous_batch_size: u64,
+    /// Experimental daemon multi-slot mode (`serve.multi_slot`). Default off.
+    /// Projects load/generate wire markers only; CLI holds no GPU slot backend.
+    pub(crate) multi_slot_enabled: bool,
+    pub(crate) multi_slot_slots: u64,
+    pub(crate) multi_slot_ctx: u64,
+    pub(crate) multi_slot_prefill_chunk: u64,
 }
 
 pub(crate) struct ServeShared {
@@ -88,14 +110,9 @@ pub(crate) struct ServeShared {
     pub(crate) retry_backoff: Duration,
     /// Test seam: when set, invoked instead of `thread::sleep` during retry backoff.
     pub(crate) backoff_hook: Mutex<Option<Arc<dyn Fn(Duration) + Send + Sync>>>,
-    /// Concurrent multi-slot backend (`serve.multi_slot`). Deliberately NOT
-    /// inside `runtime`: that mutex is exactly what serialises requests today,
-    /// so an engine behind it would serve one caller at a time and change
-    /// nothing.
     /// Prometheus counters and histograms for `/metrics`. Lock-free, so a
     /// scrape never contends with a request.
     pub(crate) metrics: metrics::Metrics,
-    pub(crate) slot_engine: Option<Arc<slots::SlotBackend>>, // feature-gated type is still SlotBackend (stub when disabled)
 }
 
 #[derive(Debug, Default)]
@@ -109,10 +126,10 @@ pub(crate) struct AdmissionState {
     batch_model: Option<String>,
 }
 
-#[derive(Debug)]
 pub(crate) struct Admission {
     state: Mutex<AdmissionState>,
     available: Condvar,
+    notify: Notify,
     max_queue: usize,
     timeout: Duration,
     /// How many batch-eligible requests may be in flight at once. One for the
@@ -120,6 +137,18 @@ pub(crate) struct Admission {
     /// count when the multi-slot engine is active, which has its own admission
     /// behind it.
     capacity: usize,
+}
+
+impl std::fmt::Debug for Admission {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let state = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        f.debug_struct("Admission")
+            .field("state", &*state)
+            .field("max_queue", &self.max_queue)
+            .field("timeout", &self.timeout)
+            .field("capacity", &self.capacity)
+            .finish()
+    }
 }
 
 #[derive(Debug)]
@@ -143,15 +172,43 @@ pub(crate) struct AdmissionGuard {
     model: Option<String>,
 }
 
+struct AdmissionWaiter {
+    admission: Arc<Admission>,
+    active: bool,
+}
+
+impl AdmissionWaiter {
+    fn disarm(&mut self) {
+        self.active = false;
+    }
+}
+
+impl Drop for AdmissionWaiter {
+    fn drop(&mut self) {
+        if !self.active {
+            return;
+        }
+        let mut state = self
+            .admission
+            .state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        state.queued = state.queued.saturating_sub(1);
+        drop(state);
+        self.admission.available.notify_all();
+        self.admission.notify.notify_waiters();
+    }
+}
+
 impl Admission {
     pub(crate) fn new(max_queue: usize, timeout: Duration) -> Self {
         Self::new_with_capacity(max_queue, timeout, 1)
     }
-
     pub(crate) fn new_with_capacity(max_queue: usize, timeout: Duration, capacity: usize) -> Self {
         Self {
             state: Mutex::new(AdmissionState::default()),
             available: Condvar::new(),
+            notify: Notify::new(),
             max_queue,
             timeout,
             capacity: capacity.max(1),
@@ -303,6 +360,135 @@ impl Admission {
             self.timeout.as_secs().max(1)
         }
     }
+    pub(crate) async fn acquire_async(
+        self: &Arc<Self>,
+        cancel: CancellationToken,
+    ) -> std::result::Result<AdmissionGuard, AdmissionError> {
+        self.acquire_for_async(false, None, cancel).await
+    }
+
+    pub(crate) async fn acquire_for_async(
+        self: &Arc<Self>,
+        is_eligible: bool,
+        model: Option<&str>,
+        cancel: CancellationToken,
+    ) -> std::result::Result<AdmissionGuard, AdmissionError> {
+        let model_owned = model.map(str::to_owned);
+        if cancel.is_cancelled() {
+            return Err(AdmissionError {
+                message: "cancelled".to_string(),
+                retry_after_seconds: self.retry_after_seconds(),
+            });
+        }
+        {
+            let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+            let can_acquire = if is_eligible {
+                !state.ineligible_busy
+                    && state.eligible < self.capacity
+                    && state.queued == 0
+                    && Self::is_model_compatible(&state.batch_model, model_owned.as_deref())
+            } else {
+                state.eligible == 0 && !state.ineligible_busy && state.queued == 0
+            };
+            if can_acquire {
+                if is_eligible {
+                    state.eligible += 1;
+                    if state.batch_model.is_none() {
+                        state.batch_model = model_owned.clone();
+                    }
+                    return Ok(AdmissionGuard {
+                        admission: Arc::clone(self),
+                        is_eligible: true,
+                        model: model_owned,
+                    });
+                }
+                state.ineligible_busy = true;
+                return Ok(AdmissionGuard {
+                    admission: Arc::clone(self),
+                    is_eligible: false,
+                    model: None,
+                });
+            }
+            if self.max_queue != 0 && state.queued >= self.max_queue {
+                return Err(AdmissionError {
+                    message: format!(
+                        "serve queue full (depth {}/{})",
+                        state.queued, self.max_queue
+                    ),
+                    retry_after_seconds: self.retry_after_seconds(),
+                });
+            }
+            state.queued = state.queued.saturating_add(1);
+        }
+        let mut queued = AdmissionWaiter {
+            admission: Arc::clone(self),
+            active: true,
+        };
+
+        let started = Instant::now();
+        loop {
+            // Register before inspecting state so a guard drop cannot notify
+            // between the state check and creation of the wait future.
+            let notified = self.notify.notified();
+            if cancel.is_cancelled() {
+                return Err(AdmissionError {
+                    message: "cancelled".to_string(),
+                    retry_after_seconds: self.retry_after_seconds(),
+                });
+            }
+            {
+                let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
+                let can_acquire = if is_eligible {
+                    !state.ineligible_busy
+                        && state.eligible < self.capacity
+                        && Self::is_model_compatible(&state.batch_model, model_owned.as_deref())
+                } else {
+                    state.eligible == 0 && !state.ineligible_busy
+                };
+                if can_acquire {
+                    state.queued = state.queued.saturating_sub(1);
+                    queued.disarm();
+                    if is_eligible {
+                        state.eligible += 1;
+                        if state.batch_model.is_none() {
+                            state.batch_model = model_owned.clone();
+                        }
+                        return Ok(AdmissionGuard {
+                            admission: Arc::clone(self),
+                            is_eligible: true,
+                            model: model_owned.clone(),
+                        });
+                    }
+                    state.ineligible_busy = true;
+                    return Ok(AdmissionGuard {
+                        admission: Arc::clone(self),
+                        is_eligible: false,
+                        model: None,
+                    });
+                }
+            }
+
+            let remaining = self.timeout.saturating_sub(started.elapsed());
+            if !self.timeout.is_zero() && remaining.is_zero() {
+                return Err(AdmissionError {
+                    message: format!("serve queue wait exceeded {}ms", self.timeout.as_millis()),
+                    retry_after_seconds: self.retry_after_seconds(),
+                });
+            }
+            if self.timeout.is_zero() {
+                tokio::select! {
+                    _ = notified => {}
+                    _ = cancel.cancelled() => {}
+                }
+            } else {
+                tokio::select! {
+                    _ = notified => {}
+                    _ = cancel.cancelled() => {}
+                    _ = tokio::time::sleep(remaining) => {}
+                }
+            }
+        }
+    }
 }
 
 impl Drop for AdmissionGuard {
@@ -321,6 +507,7 @@ impl Drop for AdmissionGuard {
             state.ineligible_busy = false;
         }
         self.admission.available.notify_all();
+        self.admission.notify.notify_waiters();
     }
 }
 
@@ -445,7 +632,6 @@ pub(crate) fn batch_messages_are_single_user(body: &serde_json::Value) -> bool {
         Some(_) => false,
     }
 }
-
 
 pub(crate) fn serve_command(paths: &Paths, mut args: ServeArgs) -> Result<()> {
     let (_, resolved) = resolved_global(paths, true)?;
@@ -668,6 +854,16 @@ pub(crate) fn serve_foreground(
     if continuous_batch_size == 0 || continuous_batch_size > 256 {
         bail!("--continuous-batch-size must be between 1 and 256");
     }
+    let multi_slot_enabled = config_bool(&global, "serve.multi_slot")?;
+    let multi_slot_slots = config_u64(&global, "serve.multi_slot_slots").unwrap_or(4);
+    let multi_slot_ctx = config_u64(&global, "serve.multi_slot_ctx").unwrap_or(8192);
+    let multi_slot_prefill_chunk =
+        config_u64(&global, "serve.multi_slot_prefill_chunk").unwrap_or(1024);
+    // Multi-slot is an alternate daemon-owned Qwen35 mode, not continuous batching.
+    // Combining them is rejected until a future integration lands.
+    if let Err(message) = validate_multi_slot_startup(multi_slot_enabled, continuous_batch_size) {
+        bail!("{message}");
+    }
     let retry_enabled = config_bool(&global, "serve.retry_enabled")?;
     let retry_backoff = Duration::from_millis(config_u64(&global, "serve.retry_backoff_ms")?);
     let idle_timeout = Duration::from_secs(
@@ -679,55 +875,31 @@ pub(crate) fn serve_foreground(
         .clone()
         .unwrap_or(config_string(&global, "serve.default_model")?);
     let instance_token = serve_instance_token();
-    // Opt-in concurrent backend. Built before ServeShared so a failure here is
-    // a clean startup error rather than a half-configured server.
-    #[cfg(feature = "multi-slot")]
-    let slot_engine: Option<Arc<slots::SlotBackend>> = match config_bool(&global, "serve.multi_slot") {
-        Ok(true) => {
-            let model_path = find_model_path(paths, &registry, &default_model)
-                .ok_or_else(|| anyhow!("multi_slot: cannot resolve model {default_model}"))?;
-            let n_slots = config_u64(&global, "serve.multi_slot_slots").unwrap_or(4) as usize;
-            let cap_tokens = config_u64(&global, "serve.multi_slot_ctx").unwrap_or(8192) as usize;
-            let mut hfq = hipfire_runtime::hfq::HfqFile::open(&model_path)
-                .with_context(|| format!("multi_slot: open {}", model_path.display()))?;
-            let tokenizer =
-                hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-                    .map_err(|e| anyhow!("multi_slot: tokenizer: {e}"))?;
-            drop(hfq);
-            let engine = hipfire_arch_qwen35::serve_engine::SlotEngine::spawn(
-                hipfire_arch_qwen35::serve_engine::EngineConfig {
-                    model_path: model_path.clone(),
-                    n_slots,
-                    cap_tokens,
-                    host_budget_bytes: 16 * 1024 * 1024 * 1024,
-                    swap_dir: std::env::temp_dir().join("hipfire-serve-swap"),
-                },
-            )
-            .map_err(|e| anyhow!("multi_slot: {e}"))?;
-            eprintln!(
-                "serve: multi-slot backend up ({} slots, {} ctx) - requests run concurrently",
-                n_slots, cap_tokens
-            );
-            Some(Arc::new(slots::SlotBackend { engine, tokenizer }))
-        }
-        _ => None,
-    };
-    #[cfg(not(feature = "multi-slot"))]
-    let slot_engine: Option<Arc<slots::SlotBackend>> = None;
-    let slot_concurrency = if slot_engine.is_some() {
-        config_u64(&global, "serve.multi_slot_slots").unwrap_or(4) as usize
+    // Admission width: experimental multi-slot projects N concurrent daemon
+    // sessions; continuous batch admits up to continuous_batch_size. Take the
+    // larger so the HTTP gate does not serialise what the backend can run.
+    let slot_concurrency = if multi_slot_enabled {
+        multi_slot_slots.max(1) as usize
     } else {
         1
     };
+    if multi_slot_enabled {
+        eprintln!(
+            "serve: experimental multi-slot mode ({} slots, {} ctx) — daemon-owned, continuous batching deferred",
+            multi_slot_slots, multi_slot_ctx
+        );
+    }
     let shared = Arc::new(ServeShared {
         metrics: metrics::Metrics::default(),
-        slot_engine,
         runtime: Mutex::new(ServeRuntime {
             engine,
             paths: paths.clone(),
             registry: registry.clone(),
             current_path: None,
             current_arch: None,
+            current_reasoning_contract: saddle_core::caps::ReasoningContract::Unsupported,
+            current_reasoning_effort_native: false,
+            current_reasoning_efforts: Vec::new(),
             continuous_batch_capable: false,
             current_max_seq: 0,
             cache_capable: false,
@@ -735,6 +907,10 @@ pub(crate) fn serve_foreground(
             kv_backend_override: args.kv_backend.clone(),
             tp: args.tp,
             continuous_batch_size,
+            multi_slot_enabled,
+            multi_slot_slots,
+            multi_slot_ctx,
+            multi_slot_prefill_chunk,
         }),
         meta: Mutex::new(ServeMeta {
             current_model: None,
@@ -748,12 +924,6 @@ pub(crate) fn serve_foreground(
             last_activity: Instant::now(),
         }),
         max_request_bytes,
-        // The HTTP gate must admit as many requests as the live backend can
-        // actually run, or they queue here and never reach it -- the exact
-        // serialisation both batching paths exist to remove. Two independent
-        // mechanisms feed this: the multi-slot engine's slot count (1 when it
-        // is off) and the single-daemon continuous batch width. Take the
-        // larger; each has its own admission behind this gate.
         admission: Arc::new(Admission::new_with_capacity(
             max_queue,
             queue_timeout,
@@ -765,7 +935,13 @@ pub(crate) fn serve_foreground(
         backoff_hook: Mutex::new(None),
     });
     let bind = format_bind(host, port);
-    let server = Server::http(&bind).map_err(|error| anyhow!("failed to bind {bind}: {error}"))?;
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .context("tokio runtime")?;
+    let listener = runtime
+        .block_on(tokio::net::TcpListener::bind(&bind))
+        .map_err(|error| anyhow!("failed to bind {bind}: {error}"))?;
     fs::create_dir_all(&paths.root)?;
     let pid_path = paths.root.join("serve.pid");
     let pid_record = ServePidRecord {
@@ -839,6 +1015,10 @@ pub(crate) fn serve_foreground(
                     if result.is_ok() {
                         runtime.current_path = None;
                         runtime.current_arch = None;
+                        runtime.current_reasoning_contract =
+                            saddle_core::caps::ReasoningContract::Unsupported;
+                        runtime.current_reasoning_effort_native = false;
+                        runtime.current_reasoning_efforts = Vec::new();
                         runtime.current_max_seq = 0;
                         runtime.cache_capable = false;
                     }
@@ -859,14 +1039,10 @@ pub(crate) fn serve_foreground(
             }
         });
     }
-    for request in server.incoming_requests() {
-        let shared = Arc::clone(&shared);
-        thread::spawn(move || {
-            if let Err(error) = crate::serve::http::handle_http(request, shared) {
-                eprintln!("[hipfire] HTTP request failed: {error:#}");
-            }
-        });
-    }
+    runtime.block_on(crate::serve::http::serve_listener(
+        listener,
+        Arc::clone(&shared),
+    ))?;
     let _ = fs::remove_file(pid_path);
     Ok(())
 }
@@ -878,7 +1054,6 @@ pub(crate) fn format_bind(host: &str, port: u16) -> String {
         format!("{host}:{port}")
     }
 }
-
 
 pub(crate) fn should_prewarm_qwen_mq4r_decode(
     path: &Path,
@@ -950,6 +1125,15 @@ impl ServeRuntime {
         }
         let path = path.ok_or_else(|| anyhow!("model not found locally: {model}"))?;
         let resolved = resolved_for_model(&self.paths, model, tag.as_deref(), entry)?;
+        if let Some(minimum) = minimum_max_seq
+            .filter(|minimum| self.multi_slot_enabled && *minimum > self.multi_slot_ctx)
+        {
+            bail!(
+                "experimental multi-slot request requires context {minimum}, \
+                 exceeding serve.multi_slot_ctx={}",
+                self.multi_slot_ctx
+            );
+        }
         let must_reload = self.current_path.as_ref() != Some(&path)
             || minimum_max_seq.is_some_and(|minimum| self.current_max_seq < minimum);
         if must_reload {
@@ -968,12 +1152,26 @@ impl ServeRuntime {
                 params["tp"] = serde_json::json!(tp);
             }
             params["continuous_batch_size"] = serde_json::json!(self.continuous_batch_size);
+            // Experimental multi-slot: daemon owns SlotEngine instead of ordinary
+            // LoadedModel. Future continuous-batch integration is deferred.
+            if self.multi_slot_enabled {
+                params["experimental_multi_slot"] = serde_json::json!(true);
+                params["experimental_multi_slot_slots"] = serde_json::json!(self.multi_slot_slots);
+                params["experimental_multi_slot_ctx"] = serde_json::json!(self.multi_slot_ctx);
+                params["experimental_multi_slot_prefill_chunk"] =
+                    serde_json::json!(self.multi_slot_prefill_chunk);
+                // This alternate backend's allocation cap is authoritative.
+                // Do not advertise the ordinary model's larger max_seq to
+                // request budgeting and then stop early at the slot boundary.
+                params["max_seq"] = serde_json::json!(self.multi_slot_ctx);
+            }
             let loaded_max_seq = params["max_seq"].as_u64().unwrap_or(0);
             if minimum_max_seq.is_some() {
                 eprintln!("[hipfire] bumping load max_seq to {loaded_max_seq} for request budget");
             }
             let loaded = self.engine.load(&path, params)?;
-            if should_prewarm_qwen_mq4r_decode(&path, &loaded, self.tp) {
+            if !self.multi_slot_enabled && should_prewarm_qwen_mq4r_decode(&path, &loaded, self.tp)
+            {
                 prewarm_qwen_mq4r_decode(&mut self.engine)?;
             }
             self.cache_capable = loaded
@@ -985,6 +1183,25 @@ impl ServeRuntime {
                 .get("arch")
                 .and_then(serde_json::Value::as_str)
                 .map(str::to_owned);
+            self.current_reasoning_contract = loaded
+                .get("reasoning_contract")
+                .and_then(serde_json::Value::as_str)
+                .and_then(saddle_core::caps::ReasoningContract::from_wire_name)
+                .unwrap_or(saddle_core::caps::ReasoningContract::Unsupported);
+            self.current_reasoning_effort_native = loaded
+                .get("reasoning_effort_native")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            self.current_reasoning_efforts = loaded
+                .get("reasoning_efforts")
+                .and_then(serde_json::Value::as_array)
+                .map(|array| {
+                    array
+                        .iter()
+                        .filter_map(|value| value.as_str().map(|string| string.to_owned()))
+                        .collect()
+                })
+                .unwrap_or_default();
             self.continuous_batch_capable = loaded
                 .get("continuous_batch_capable")
                 .and_then(serde_json::Value::as_bool)
@@ -996,6 +1213,25 @@ impl ServeRuntime {
         }
         Ok(resolved)
     }
+}
+
+/// Reject experimental multi-slot combined with continuous batching.
+///
+/// Multi-slot is an alternate daemon-owned Qwen35 mode with one weight copy.
+/// Continuous batch integration is deferred; enabling both would imply a
+/// capability the daemon does not implement yet.
+pub(crate) fn validate_multi_slot_startup(
+    multi_slot_enabled: bool,
+    continuous_batch_size: u64,
+) -> Result<(), String> {
+    if multi_slot_enabled && continuous_batch_size > 1 {
+        return Err(
+            "serve.multi_slot cannot be combined with continuous_batch_size > 1; \
+             continuous batching integration is deferred"
+                .to_owned(),
+        );
+    }
+    Ok(())
 }
 
 pub(crate) fn serve_instance_token() -> String {
@@ -1061,7 +1297,11 @@ pub(crate) fn pid_owns_listen_port(pid: u32, port: u16) -> Option<bool> {
     Some(false)
 }
 
-pub(crate) fn validate_serve_pid(record: &ServePidRecord, host: &str, fallback_port: u16) -> Result<()> {
+pub(crate) fn validate_serve_pid(
+    record: &ServePidRecord,
+    host: &str,
+    fallback_port: u16,
+) -> Result<()> {
     let proc_dir = PathBuf::from(format!("/proc/{}", record.pid));
     if !proc_dir.is_dir() {
         bail!("tracked serve PID {} is no longer alive", record.pid);
@@ -1195,9 +1435,17 @@ mod tests {
     use super::*;
     use crate::{Cli, Commands, Paths, ServeArgs, StopArgs};
     use clap::Parser;
-    use hipfire_config::{ConfigLayer, ConfigPaths, ConfigSource, NamedLayer, resolve, load_global};
-    use hipfire_registry::{RegistryV1, RegistryPaths};
-    use std::{env, fs, path::{Path, PathBuf}, thread, time::{Duration, Instant}, sync::{Arc, Mutex, mpsc}};
+    use hipfire_config::{
+        load_global, resolve, ConfigLayer, ConfigPaths, ConfigSource, NamedLayer,
+    };
+    use hipfire_registry::{RegistryPaths, RegistryV1};
+    use std::{
+        env, fs,
+        path::{Path, PathBuf},
+        sync::{mpsc, Arc, Mutex},
+        thread,
+        time::{Duration, Instant},
+    };
     fn test_paths(label: &str) -> Paths {
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1322,6 +1570,97 @@ mod tests {
         let timeout = admission.acquire().unwrap_err();
         assert!(timeout.message.contains("wait exceeded"));
         assert_eq!(admission.inflight(), 1);
+    }
+
+    #[test]
+    fn async_admission_cancellation_removes_waiter() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let admission = Arc::new(Admission::new(1, Duration::from_secs(5)));
+            let holder = admission.acquire().unwrap();
+            let cancel = CancellationToken::new();
+            let waiter_admission = Arc::clone(&admission);
+            let waiter_cancel = cancel.clone();
+            let waiter =
+                tokio::spawn(async move { waiter_admission.acquire_async(waiter_cancel).await });
+            while admission.inflight() != 2 {
+                tokio::task::yield_now().await;
+            }
+            cancel.cancel();
+            let error = tokio::time::timeout(Duration::from_millis(500), waiter)
+                .await
+                .expect("cancelled waiter completes")
+                .expect("waiter task")
+                .expect_err("cancelled admission fails");
+            assert!(error.message.contains("cancelled"));
+            assert_eq!(admission.inflight(), 1);
+            drop(holder);
+            assert_eq!(admission.inflight(), 0);
+        });
+    }
+
+    #[test]
+    fn dropping_async_admission_future_removes_waiter() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let admission = Arc::new(Admission::new(1, Duration::from_secs(5)));
+            let holder = admission.acquire().unwrap();
+            let waiter_admission = Arc::clone(&admission);
+            let waiter = tokio::spawn(async move {
+                waiter_admission
+                    .acquire_async(CancellationToken::new())
+                    .await
+            });
+            while admission.inflight() != 2 {
+                tokio::task::yield_now().await;
+            }
+            waiter.abort();
+            let error = waiter.await.expect_err("aborted waiter task");
+            assert!(error.is_cancelled());
+            assert_eq!(
+                admission.inflight(),
+                1,
+                "dropped admission future left a phantom queued request"
+            );
+            drop(holder);
+            assert_eq!(admission.inflight(), 0);
+        });
+    }
+
+    #[test]
+    fn async_admission_observes_guard_release_without_lost_wake() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let admission = Arc::new(Admission::new(1, Duration::from_secs(5)));
+            let holder = admission.acquire().unwrap();
+            let waiter_admission = Arc::clone(&admission);
+            let waiter = tokio::spawn(async move {
+                waiter_admission
+                    .acquire_async(CancellationToken::new())
+                    .await
+            });
+            while admission.inflight() != 2 {
+                tokio::task::yield_now().await;
+            }
+            drop(holder);
+            let admitted = tokio::time::timeout(Duration::from_millis(500), waiter)
+                .await
+                .expect("notified waiter completes")
+                .expect("waiter task")
+                .expect("waiter admitted");
+            assert_eq!(admission.inflight(), 1);
+            drop(admitted);
+            assert_eq!(admission.inflight(), 0);
+        });
     }
 
     #[test]
@@ -1649,7 +1988,6 @@ mod tests {
         let qwen = serde_json::json!({ "arch": "qwen3_5_moe" });
         let qwen_dense = serde_json::json!({ "arch": "qwen3_5" });
         let deepseek = serde_json::json!({ "arch": "deepseek4" });
-
         assert!(should_prewarm_qwen_mq4r_decode(
             Path::new("qwen3.6-35b-a3b.mq4r"),
             &qwen,
@@ -1675,5 +2013,104 @@ mod tests {
             &qwen,
             Some(2),
         ));
+    }
+
+    #[test]
+    fn reasoning_contract_handshake_parsing() {
+        use saddle_core::caps::ReasoningContract;
+        assert_eq!(
+            ReasoningContract::from_wire_name("qwen_jinja"),
+            Some(ReasoningContract::QwenJinja)
+        );
+        assert_eq!(
+            ReasoningContract::from_wire_name("deepseek4"),
+            Some(ReasoningContract::DeepSeek4)
+        );
+        assert_eq!(
+            ReasoningContract::from_wire_name("gemma_boolean"),
+            Some(ReasoningContract::GemmaBoolean)
+        );
+        assert_eq!(
+            ReasoningContract::from_wire_name("muse_glimmer"),
+            Some(ReasoningContract::MuseGlimmer)
+        );
+        assert_eq!(
+            ReasoningContract::from_wire_name("unsupported"),
+            Some(ReasoningContract::Unsupported)
+        );
+        assert_eq!(ReasoningContract::from_wire_name("unknown"), None);
+        assert_eq!(
+            ReasoningContract::from_wire_name("").unwrap_or(ReasoningContract::Unsupported),
+            ReasoningContract::Unsupported
+        );
+        let parsed =
+            ReasoningContract::from_wire_name("bogus").unwrap_or(ReasoningContract::Unsupported);
+        assert_eq!(parsed, ReasoningContract::Unsupported);
+        for contract in [
+            ReasoningContract::Unsupported,
+            ReasoningContract::QwenJinja,
+            ReasoningContract::DeepSeek4,
+            ReasoningContract::GemmaBoolean,
+            ReasoningContract::MuseGlimmer,
+        ] {
+            let wire = contract.wire_name();
+            assert_eq!(ReasoningContract::from_wire_name(wire), Some(contract));
+        }
+        let runtime_default = ReasoningContract::Unsupported;
+        assert_eq!(runtime_default, ReasoningContract::Unsupported);
+        let loaded = serde_json::json!({
+            "reasoning_effort_native": true,
+            "reasoning_efforts": ["low", "medium", "xhigh"]
+        });
+        assert_eq!(
+            loaded
+                .get("reasoning_effort_native")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            true
+        );
+        let efforts: Vec<String> = loaded
+            .get("reasoning_efforts")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_owned()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert_eq!(
+            efforts,
+            vec!["low".to_string(), "medium".to_string(), "xhigh".to_string()]
+        );
+        let empty_loaded = serde_json::json!({});
+        assert_eq!(
+            empty_loaded
+                .get("reasoning_effort_native")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            false
+        );
+        let empty_efforts: Vec<String> = empty_loaded
+            .get("reasoning_efforts")
+            .and_then(|v| v.as_array())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|x| x.as_str().map(|s| s.to_owned()))
+                    .collect()
+            })
+            .unwrap_or_default();
+        assert!(empty_efforts.is_empty());
+    }
+
+    #[test]
+    fn multi_slot_startup_rejects_continuous_batch_gt_one() {
+        assert!(validate_multi_slot_startup(false, 1).is_ok());
+        assert!(validate_multi_slot_startup(false, 8).is_ok());
+        assert!(validate_multi_slot_startup(true, 1).is_ok());
+        let err = validate_multi_slot_startup(true, 2).unwrap_err();
+        assert!(err.contains("continuous_batch_size > 1"), "{err}");
+        assert!(err.contains("deferred"), "{err}");
+        let err = validate_multi_slot_startup(true, 16).unwrap_err();
+        assert!(err.contains("serve.multi_slot"), "{err}");
     }
 }

@@ -7,7 +7,6 @@
 //! Per-architecture generation bodies lifted verbatim from `crates/hipfire-daemon/src/main.rs`
 //! (wave 5 / D3). See `lib.rs` for layering rationale.
 
-use std::any::Any;
 use base64::Engine;
 use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_qwen2::qwen2;
@@ -24,6 +23,7 @@ use hipfire_engine::terminal::{
 use hipfire_loader::LoadedModel;
 use hipfire_runtime::sampler::{self, SamplerConfig};
 use hipfire_runtime::spec::{PrefillOutcome, Speculator};
+use std::any::Any;
 use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
@@ -73,7 +73,6 @@ fn emit_committed_event(
     let _ = writeln!(stdout, "{}", envelope);
 }
 
-
 pub enum ImageSource<'a> {
     Path(&'a str),
     Base64(&'a str),
@@ -91,6 +90,8 @@ pub struct GenerateVLParams<'a> {
     pub repeat_window: usize,
     pub max_think_tokens: usize,
     pub assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    /// Per-request sampler seed (see `hipfire_engine::request_seed_for`).
+    pub seed: u32,
 }
 
 pub fn vl_no_eviction_kv_cap(physical_cap: usize, max_seq: usize, adaptive_engaged: bool) -> usize {
@@ -318,12 +319,6 @@ pub fn generate_vl(
     stdout: &mut std::io::Stdout,
     params: &GenerateVLParams,
 ) {
-    // hunt3 M-E: seed the process-global CPU sampler RNG with this request's
-    // fixed seed. The VL path samples exclusively via sampler::sample_cpu, which
-    // draws from this global; without the per-request reset it carried RNG state
-    // across requests (and across earlier text-path requests) → cross-request
-    // nondeterminism. Matches the GPU path's u32 (0x13579BDF).
-    hipfire_runtime::llama::reset_cpu_sampler_rng(0x13579BDF);
     // INVARIANT: all early returns before the `vision_forward` call (the
     // first expensive GPU allocation in this function) use `write_error`
     // and return without owning any GPU buffers. If you add a GPU
@@ -342,7 +337,15 @@ pub fn generate_vl(
         repeat_window,
         max_think_tokens,
         assistant_prefix,
+        seed,
     } = *params;
+    // hunt3 M-E: seed the process-global CPU sampler RNG per request. The VL
+    // path samples exclusively via sampler::sample_cpu, which draws from this
+    // global; without the per-request reset it carried RNG state across
+    // requests (and across earlier text-path requests) → cross-request
+    // nondeterminism. Seeded by hipfire-engine::request_seed_for (wire `seed`
+    // wins, else attempt key + counter), matching the sequential text path.
+    hipfire_runtime::llama::reset_cpu_sampler_rng(seed);
     // Adaptive KV poison is sticky until unload/reload. Refuse VL generation so a
     // partial tier transition cannot continue writing into mixed-tier state.
     // Mirror generate() — reset preserves poison, so VL must refuse independently.
@@ -486,11 +489,9 @@ pub fn generate_vl(
         // (ModelState::Qwen35), not the always-None m.dn_state/m.kv_cache.
         // Inlined (disjoint field access) because a `&tokenizer` borrow of `m`
         // is live here.
-        if let Some(b) = m
-            .state
-            .as_mut()
-            .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
-        {
+        if let Some(b) = m.state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+        }) {
             let dn = &b.dn_state;
             for s in &dn.s_matrices {
                 let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
@@ -505,19 +506,15 @@ pub fn generate_vl(
                 let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
             }
         }
-        if let Some(b) = m
-            .state
-            .as_mut()
-            .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
-        {
+        if let Some(b) = m.state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+        }) {
             b.kv_cache.compact_offset = 0;
         }
         if let Some(ad) = m.kv_adaptive.as_mut() {
-            if let Some(b) = m
-                .state
-                .as_mut()
-                .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
-            {
+            if let Some(b) = m.state.as_mut().and_then(|s| {
+                (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+            }) {
                 ad.reset_with_cache(gpu, &mut b.kv_cache);
             } else {
                 ad.reset();
@@ -538,11 +535,9 @@ pub fn generate_vl(
         return;
     }
 
-    let Some(b) = m
-        .state
-        .as_mut()
-        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
-    else {
+    let Some(b) = m.state.as_mut().and_then(|s| {
+        (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+    }) else {
         unreachable!()
     };
     let config = &b.config;
@@ -1381,14 +1376,13 @@ pub fn generate_vl_dots_ocr(
     let text_cfg = config.text.clone();
     let dim = text_cfg.hidden_size;
     // Weights/state via raw pointers to allow owned config while keeping disjoint borrows.
-    let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle = match m
-        .state
-        .as_mut()
-        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>())
-    {
-        Some(b) => b as *mut _,
-        None => unreachable!(),
-    };
+    let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle =
+        match m.state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>()
+        }) {
+            Some(b) => b as *mut _,
+            None => unreachable!(),
+        };
     let weights = unsafe { &(*bundle_ptr).weights };
     let state = unsafe { &mut (*bundle_ptr).state };
     // 3. Build the prompt (HF-exact framing; imgpad count == n_visual by construction).
@@ -1557,14 +1551,13 @@ pub fn generate_vl_dots_ocr(
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let config = m.dots_ocr().unwrap().config.clone();
     let text_cfg = config.text.clone();
-    let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle = match m
-        .state
-        .as_mut()
-        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>())
-    {
-        Some(b) => b as *mut _,
-        None => unreachable!(),
-    };
+    let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle =
+        match m.state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>()
+        }) {
+            Some(b) => b as *mut _,
+            None => unreachable!(),
+        };
     let weights = unsafe { &(*bundle_ptr).weights };
     let state = unsafe { &mut (*bundle_ptr).state };
     // Greedy decode, streaming in the daemon JSONL protocol.
@@ -1674,8 +1667,10 @@ pub fn decode_vl_dots_ocr_ngram(
     prefill_s: f64,
 ) {
     use hipfire_arch_dots_ocr::DotsOcrBundle;
-        // Move the live decoder state into a SpecTarget bundle; restored on return.
-    let mut bundle = * (m.state.take().unwrap() as Box<dyn std::any::Any>).downcast::<DotsOcrBundle>().unwrap();
+    // Move the live decoder state into a SpecTarget bundle; restored on return.
+    let mut bundle = *(m.state.take().unwrap() as Box<dyn std::any::Any>)
+        .downcast::<DotsOcrBundle>()
+        .unwrap();
     let mut spec = m.speculator.take().unwrap();
     // `m.tokenizer` is a disjoint field → coexists with the takes above and the
     // restore below; the loop never touches `m`.
@@ -1896,14 +1891,13 @@ pub fn generate_dots_ocr_text(
     let text_cfg = config.text.clone();
     let dim = text_cfg.hidden_size;
     // Weights/state via raw pointers to allow owned config while keeping disjoint borrows.
-    let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle = match m
-        .state
-        .as_mut()
-        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>())
-    {
-        Some(b) => b as *mut _,
-        None => unreachable!(),
-    };
+    let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle =
+        match m.state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>()
+        }) {
+            Some(b) => b as *mut _,
+            None => unreachable!(),
+        };
     let weights = unsafe { &(*bundle_ptr).weights };
     let state = unsafe { &mut (*bundle_ptr).state };
     // Tokenize the text prompt directly (no image tokens).
@@ -2064,4 +2058,3 @@ pub fn generate_dots_ocr_text(
         ClientTerminalDecision::Abort => {}
     }
 }
-

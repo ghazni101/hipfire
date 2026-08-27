@@ -369,6 +369,81 @@ fn gemm_q8_0_batched_wide_exact_resolves_on_wmma_only() {
 }
 
 #[test]
+fn gemm_mq4v2_mq4c_keys_resolve_gfx12_only() {
+    use crate::families::gemm::GemmFamily;
+    let fam = GemmFamily::new();
+    // All five V2 widths (MQ4V2 qt44 + MQ6/5/3/2V2 qt47-50) are HasWmma: batched prefill/lm_head WMMA sources exist on both gfx11 and gfx12.
+    // MQ4C (qt45) remains HasWmmaGfx12: gfx12-only.
+    let v2_keys = [
+        KernelKey::GemmMq4G256V2,
+        KernelKey::GemmMq4G256V2Residual,
+        KernelKey::GemmMq4G256V2BatchedLmhead,
+        KernelKey::GemmMq6G256V2,
+        KernelKey::GemmMq6G256V2Residual,
+        KernelKey::GemmMq6G256V2BatchedLmhead,
+        KernelKey::GemmMq5G256V2,
+        KernelKey::GemmMq5G256V2Residual,
+        KernelKey::GemmMq5G256V2BatchedLmhead,
+        KernelKey::GemmMq3G256V2,
+        KernelKey::GemmMq3G256V2Residual,
+        KernelKey::GemmMq3G256V2BatchedLmhead,
+        KernelKey::GemmMq2G256V2,
+        KernelKey::GemmMq2G256V2Residual,
+        KernelKey::GemmMq2G256V2BatchedLmhead,
+    ];
+    let mq4c_keys = [
+        KernelKey::GemmMq4CG256,
+        KernelKey::GemmMq4CG256Residual,
+        KernelKey::GemmMq4CG256BatchedLmhead,
+    ];
+    let rdna4 = ctx_rdna4();
+    let rdna1 = ctx_rdna1();
+    let rdna3 = ctx_rdna3();
+    for &key in &v2_keys {
+        assert!(
+            fam.registry().all_keys().contains(&key),
+            "{key:?} must be registered in gemm_table"
+        );
+        assert_eq!(
+            fam.registry().resolve(key, &rdna4, None).unwrap().key,
+            key,
+            "{key:?} must resolve on gfx1200-class (HasWmma)"
+        );
+        assert_eq!(
+            fam.registry().resolve(key, &rdna3, None).unwrap().key,
+            key,
+            "{key:?} must resolve on gfx1100-class (HasWmma)"
+        );
+        let err_rdna1 = fam.registry().resolve(key, &rdna1, None).unwrap_err();
+        assert!(
+            matches!(err_rdna1, DispatchError::MissingImpl { .. }),
+            "{key:?} must MissingImpl on gfx1010, got {err_rdna1:?}"
+        );
+    }
+    for &key in &mq4c_keys {
+        assert!(
+            fam.registry().all_keys().contains(&key),
+            "{key:?} must be registered in gemm_table"
+        );
+        assert_eq!(
+            fam.registry().resolve(key, &rdna4, None).unwrap().key,
+            key,
+            "{key:?} must resolve on gfx1200-class (HasWmmaGfx12)"
+        );
+        let err_rdna1 = fam.registry().resolve(key, &rdna1, None).unwrap_err();
+        assert!(
+            matches!(err_rdna1, DispatchError::MissingImpl { .. }),
+            "{key:?} must MissingImpl on gfx1010, got {err_rdna1:?}"
+        );
+        let err_rdna3 = fam.registry().resolve(key, &rdna3, None).unwrap_err();
+        assert!(
+            matches!(err_rdna3, DispatchError::MissingImpl { .. }),
+            "{key:?} must MissingImpl on gfx1100 (MQ4C gfx12-only), got {err_rdna3:?}"
+        );
+    }
+}
+
+#[test]
 fn registry_resolve_shape_gate_passes_when_shape_matches() {
     let mut reg = KernelRegistry::new();
     reg.register(KernelVariant {
@@ -898,6 +973,99 @@ fn dtypes_all_mq4() -> MoeDtypes {
 }
 
 #[test]
+fn moe_res_mq2_lloyd_u_is_indexable_but_never_rotates() {
+    // MQ2G256LloydU carries UNROTATED weights. It must reach the same indexed
+    // decode arms as its rotated sibling (same kernels, same byte layout) but
+    // must NOT request the x rotation — feeding a FWHT-rotated x to unrotated
+    // weights is silent garbage output, not an error.
+    let mut d = dtypes_all_mq4();
+    d.router = DType::F32;
+    d.experts_all_gate_up_mq4 = false;
+    d.routed_gate_up = DType::MQ2G256LloydU;
+    d.routed_down = DType::MQ2G256LloydU;
+    let r = MoeResolution::resolve(&d, 8);
+    assert!(
+        r.routed_indexable_mq2lloyd_u,
+        "must reach the indexed MoE decode arms"
+    );
+    assert!(r.use_gpu_topk, "k=8 + indexable implies device-side top-K");
+    assert!(
+        !r.needs_x_rot_local,
+        "UNROTATED dtype must never request the FWHT rotation"
+    );
+}
+
+#[test]
+fn unrotated_dtype_skips_both_rotations() {
+    // THE invariant tying the resolver to the executor: a dtype is either
+    // rotated in BOTH places (x before gate_up, and the intermediate before
+    // down) or in NEITHER. A dtype that resolved `needs_x_rot_local == false`
+    // but still took the rotating gate→down step would feed a rotated
+    // activation to unrotated down weights — silent garbage, no error.
+    //
+    // Built as a differential over dtypes so it cannot pass vacuously: the
+    // rotated and unrotated arms must DISAGREE on both flags.
+    for (dt, expect_rotation) in [
+        (DType::MQ2G256LloydU, false),
+        (DType::MQ2G256Lloyd, true),
+        (DType::MQ4G256, true),
+        (DType::MQ6G256, true),
+    ] {
+        let mut d = dtypes_all_mq4();
+        d.router = DType::F32;
+        d.experts_all_gate_up_mq4 = false;
+        d.routed_gate_up = dt;
+        d.routed_down = dt;
+        let r = MoeResolution::resolve(&d, 8);
+        assert_eq!(
+            r.needs_x_rot_local, expect_rotation,
+            "{dt:?}: needs_x_rot_local"
+        );
+        assert_eq!(
+            crate::pipeline::gate_down_skips_rotation(dt),
+            !expect_rotation,
+            "{dt:?}: gate→down rotation must agree with needs_x_rot_local"
+        );
+    }
+}
+
+#[test]
+fn moe_res_mq2_lloyd_rotated_sibling_still_rotates() {
+    // Guard: adding the unrotated arm must not disable rotation for qt19.
+    let mut d = dtypes_all_mq4();
+    d.router = DType::F32;
+    d.experts_all_gate_up_mq4 = false;
+    d.routed_gate_up = DType::MQ2G256Lloyd;
+    d.routed_down = DType::MQ2G256Lloyd;
+    let r = MoeResolution::resolve(&d, 8);
+    assert!(
+        r.needs_x_rot_local,
+        "qt19 is FWHT-rotated and MUST still rotate"
+    );
+}
+
+#[test]
+fn moe_res_mixed_rotated_and_unrotated_experts_is_not_indexable() {
+    // A layer whose gate_up is rotated and whose down is not (or vice versa)
+    // has no coherent single rotation decision. It must fall out of the
+    // indexed path rather than silently picking one and corrupting the other.
+    let mut d = dtypes_all_mq4();
+    d.router = DType::F32;
+    d.experts_all_gate_up_mq4 = false;
+    d.routed_gate_up = DType::MQ2G256LloydU;
+    d.routed_down = DType::MQ2G256Lloyd;
+    let r = MoeResolution::resolve(&d, 8);
+    assert!(
+        !r.routed_indexable_mq2lloyd_u,
+        "rotated/unrotated mix must not resolve to the unrotated indexed arm"
+    );
+    assert!(
+        !r.use_gpu_topk,
+        "no coherent rotation decision, so no indexed decode at all"
+    );
+}
+
+#[test]
 fn moe_res_all_mq4_k8_uses_gpu_topk_and_xrot() {
     let r = MoeResolution::resolve(&dtypes_all_mq4(), 8);
     assert!(r.gate_side_mq4);
@@ -927,6 +1095,73 @@ fn moe_res_k6_disables_gpu_topk_even_when_indexable() {
     let r = MoeResolution::resolve(&dtypes_all_mq4(), 6);
     assert!(r.routed_indexable_mq4);
     assert!(!r.use_gpu_topk);
+}
+
+#[test]
+fn moe_res_mq4v2_routed_indexable() {
+    // qt44 uniform: both projections MQ4G256V2 => indexable, GPU top-K on.
+    let mut d = dtypes_all_mq4();
+    d.routed_gate_up = DType::MQ4G256V2;
+    d.routed_down = DType::MQ4G256V2;
+    d.experts_all_gate_up_mq4 = false;
+    let r = MoeResolution::resolve(&d, 8);
+    assert!(r.routed_indexable_mq4v2);
+    assert!(!r.routed_indexable_mq4, "must not claim the qt13 arm");
+    assert!(r.use_gpu_topk);
+    // qt44 is a FWHT-G256 format: its kernels read ROTATED activations.
+    assert!(r.needs_x_rot_local);
+}
+
+#[test]
+fn moe_res_shipped_ornith15_takes_the_indexed_path() {
+    // The dtype combination of the PUBLISHED artifact
+    // hipfire-models/ornith1.5-35b-a3b (read from its HFQ index: 20,651 of
+    // 21,093 tensors are qt44, including every routed expert).
+    //
+    // Note the router and shared_expert_gate are Q8, not MQ4, so `gate_fusable`
+    // is FALSE here — the fused gate-side GEMV does not apply. That does not
+    // disqualify the routed path: the routed experts are uniform qt44, which is
+    // what drives `use_gpu_topk`. Same coupling `moe_res_q8_router_still_gpu_topk`
+    // pins for qt13.
+    //
+    // Before qt44 had indexed MoE GEMVs this resolved to use_gpu_topk=false and
+    // the shipped model decoded through the resident CPU-fallback path.
+    let mut d = dtypes_all_mq4();
+    d.router = DType::Q8_0;
+    d.shared_gate = DType::Q8_0;
+    d.shared_expert_gate = DType::MQ6G256;
+    d.shared_expert_up = DType::MQ6G256;
+    d.shared_expert_down = DType::MQ6G256;
+    d.routed_gate_up = DType::MQ4G256V2;
+    d.routed_down = DType::MQ4G256V2;
+    d.experts_all_gate_up_mq4 = false;
+    let r = MoeResolution::resolve(&d, 8);
+    assert!(!r.gate_fusable, "Q8 router disqualifies the fused gate side");
+    assert!(r.routed_indexable_mq4v2, "routed experts are uniform qt44");
+    assert!(r.use_gpu_topk, "shipped Ornith must take the indexed decode path");
+    assert!(r.needs_x_rot_local, "qt44 kernels read ROTATED activations");
+}
+
+#[test]
+fn moe_res_mq4v2_mixed_with_qt13_is_not_indexable() {
+    // The hazard this pairing guards: qt13 and qt44 share a 136 B group stride
+    // and identical nibble packing, differing ONLY in the 8-byte header (one
+    // f32 scale+zero vs two f16 scale/zero pairs). A kernel handed the wrong
+    // one reads plausible garbage and emits fluent, wrong text rather than
+    // faulting. So a split pairing must NOT be indexable on either arm.
+    for (gu, dn) in [
+        (DType::MQ4G256V2, DType::MQ4G256),
+        (DType::MQ4G256, DType::MQ4G256V2),
+    ] {
+        let mut d = dtypes_all_mq4();
+        d.routed_gate_up = gu;
+        d.routed_down = dn;
+        d.experts_all_gate_up_mq4 = false;
+        let r = MoeResolution::resolve(&d, 8);
+        assert!(!r.routed_indexable_mq4v2, "{gu:?}/{dn:?}");
+        assert!(!r.routed_indexable_mq4, "{gu:?}/{dn:?}");
+        assert!(!r.use_gpu_topk, "{gu:?}/{dn:?} must fall back, not guess");
+    }
 }
 
 #[test]

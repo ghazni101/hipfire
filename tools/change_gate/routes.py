@@ -1002,7 +1002,7 @@ RULES: tuple[Rule, ...] = (
         reason="Harness script itself.",
     ),
     Rule(
-        surface="scripts/redline_dispatch_profile.py",
+        surface="tools/redline/dispatch_profile.py",
         route_ids=("redline.capture",),
         reason="Attribution-only PM4 profile script shares capture surface.",
     ),
@@ -1195,7 +1195,7 @@ RULES: tuple[Rule, ...] = (
         reason="Core qwen35 forward (pre-commit HOTSPOT qwen35.rs) — dense + MoE + AWQ rows for this arch only.",
     ),
     Rule(
-        surface="crates/hipfire-arch-qwen35/src/pflash.rs",
+        surface="crates/hipfire-pflash/src/pflash.rs",
         route_ids=(
             "unit.arch-qwen35",
             "shell.pflash-gate",
@@ -1238,9 +1238,14 @@ RULES: tuple[Rule, ...] = (
         reason="MTP head/compose/probe/spec modules (pre-commit HOTSPOT mtp_*.rs).",
     ),
     Rule(
-        surface="crates/hipfire-arch-qwen35/src/grammar.rs",
+        surface="crates/hipfire-arch-qwen35/src/grammar_config.rs",
         route_ids=("unit.arch-qwen35", "serve.agentic.a3b-fast", "serve.battery.qwen35-9b"),
-        reason="Grammar / tool-call emission shapes.",
+        reason="Grammar configuration and request controls.",
+    ),
+    Rule(
+        surface="crates/hipfire-arch-qwen35/src/spec_emit.rs",
+        route_ids=("unit.arch-qwen35", "serve.agentic.a3b-fast", "serve.battery.qwen35-9b"),
+        reason="Qwen tool-call and reasoning emission shapes.",
     ),
     Rule(
         surface="crates/hipfire-arch-qwen35-vl/**",
@@ -1425,7 +1430,7 @@ RULES: tuple[Rule, ...] = (
         reason="Agentic system/user prompts → agentic fast cell.",
     ),
     Rule(
-        surface="crates/hipfire-runtime/examples/pflash_niah_bench.rs",
+        surface="crates/hipfire-pflash/examples/pflash_niah_bench.rs",
         route_ids=("shell.pflash-gate", "shell.pflash-niah-128k"),
         reason="PFlash NIAH bench example source.",
     ),

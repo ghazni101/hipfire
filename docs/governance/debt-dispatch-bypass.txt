@@ -41,5 +41,6 @@ hipfire-arch-muse-glimmer  partial    12    17
 hipfire-arch-llama         debt       10     0
 hipfire-arch-dots-ocr      partial     7     4
 hipfire-arch-cohere2moe    debt        6     0
+hipfire-arch-maple         debt        4     0   arch 15; no registry use to reconcile
 hipfire-arch-qwen2         debt        2     0
 hipfire-arch-qwen35-vl     debt        2     0

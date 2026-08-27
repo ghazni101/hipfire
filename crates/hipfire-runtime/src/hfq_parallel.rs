@@ -124,13 +124,17 @@ pub fn read_hfq_jobs_ordered(hfq: &HfqFile, jobs: &[HfqReadJob]) -> io::Result<V
             "parallel HFQ reads do not cross attached overlay files",
         ));
     }
-    read_jobs_from_path(hfq.path(), jobs, HFQ_READER_LANES)
+    // Honor the model's page-cache policy: on discrete GPUs the carrier keeps
+    // pages resident across loads (fadvise(DONTNEED) here would force a full
+    // disk re-read on every restart); UMA / opt-in eviction keeps dropping.
+    read_jobs_from_path(hfq.path(), jobs, HFQ_READER_LANES, hfq.evicts_page_cache())
 }
 
 fn read_jobs_from_path(
     path: &Path,
     jobs: &[HfqReadJob],
     lanes: usize,
+    evict_page_cache: bool,
 ) -> io::Result<Vec<HfqReadResult>> {
     if jobs.is_empty() {
         return Ok(Vec::new());
@@ -173,7 +177,7 @@ fn read_jobs_from_path(
                     if index >= jobs.len() {
                         break;
                     }
-                    let result = read_job(&file, &jobs[index]);
+                    let result = read_job(&file, &jobs[index], evict_page_cache);
                     slots.lock().expect("HFQ result slots poisoned")[index] = Some(result);
                 }
             });
@@ -195,7 +199,7 @@ fn read_jobs_from_path(
     Ok(ordered)
 }
 
-fn read_job(file: &File, job: &HfqReadJob) -> io::Result<HfqReadResult> {
+fn read_job(file: &File, job: &HfqReadJob, evict_page_cache: bool) -> io::Result<HfqReadResult> {
     let mut data = vec![0u8; job.output_len];
     for segment in &job.segments {
         let end = segment
@@ -207,7 +211,9 @@ fn read_job(file: &File, job: &HfqReadJob) -> io::Result<HfqReadResult> {
             &mut data[segment.destination_offset..end],
             segment.source_offset as u64,
         )?;
-        advise_dontneed(file, segment.source_offset, segment.len);
+        if evict_page_cache {
+            advise_dontneed(file, segment.source_offset, segment.len);
+        }
     }
     Ok(HfqReadResult {
         label: job.label.clone(),
@@ -303,7 +309,7 @@ mod tests {
             job("third", &[(40, 3), (60, 5), (120, 8)]),
             job("fourth", &[(8, 8)]),
         ];
-        let results = read_jobs_from_path(source.path(), &jobs, 4).unwrap();
+        let results = read_jobs_from_path(source.path(), &jobs, 4, false).unwrap();
         assert_eq!(results[0].label, "first");
         assert_eq!(results[0].data, [&bytes[16..24], &bytes[0..4]].concat());
         assert_eq!(results[1].label, "second");
@@ -322,7 +328,8 @@ mod tests {
         let mut source = tempfile::NamedTempFile::new().unwrap();
         source.write_all(&[1, 2, 3, 4]).unwrap();
         source.flush().unwrap();
-        let error = read_jobs_from_path(source.path(), &[job("short", &[(2, 8)])], 1).unwrap_err();
+        let error =
+            read_jobs_from_path(source.path(), &[job("short", &[(2, 8)])], 1, false).unwrap_err();
         assert_eq!(error.kind(), io::ErrorKind::UnexpectedEof);
     }
 }

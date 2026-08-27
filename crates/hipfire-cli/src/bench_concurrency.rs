@@ -7,14 +7,12 @@
 //! batching) over a range of concurrent stream counts and reports aggregate
 //! throughput for each.
 //!
-//! The two backends are mutually exclusive in production — `complete_request`
-//! returns into `complete_request_slots` whenever a slot engine is present and
-//! never reaches the daemon — so the only way to choose between them on
-//! evidence is to measure both here, on the same model and the same clock.
+//! The slot backend moved into the daemon and is independent of continuous
+//! batching. The former in-process slot arm is deliberately unavailable until
+//! a daemon-protocol benchmark adapter lands.
 
 use anyhow::{bail, Result};
 use std::path::Path;
-use std::sync::mpsc;
 use std::time::Instant;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -218,96 +216,23 @@ pub fn stream_prompt(run: usize, stream: usize) -> String {
     )
 }
 
-/// FNV-1a over a user turn — the same identity function
-/// `complete_request_slots` uses, so sessions match the production path.
-pub fn turn_hash(s: &str) -> u64 {
-    let mut h = 0xcbf29ce484222325_u64;
-    for b in s.as_bytes() {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x100000001b3);
-    }
-    h
-}
-
-#[cfg(feature = "multi-slot")]
-pub struct SlotDriver {
-    engine: hipfire_arch_qwen35::serve_engine::SlotEngine,
-    tokenizer: hipfire_runtime::tokenizer::Tokenizer,
-    max_concurrency: usize,
-    /// Monotonic run counter, so every prompt in a sweep is unique. See
-    /// `stream_prompt` for why that is load-bearing.
-    seq: usize,
-}
-
-#[cfg(not(feature = "multi-slot"))]
+/// Direct in-process slot benchmarking was removed with CLI GPU ownership.
+/// The experimental backend is daemon-owned; a daemon-protocol benchmark arm
+/// can be added separately without coupling it to continuous batching.
 pub struct SlotDriver {
     max_concurrency: usize,
-    seq: usize,
 }
 
-#[cfg(feature = "multi-slot")]
 impl SlotDriver {
-    pub fn start(model: &Path, max_concurrency: usize, cap_tokens: usize) -> Result<Self> {
-        let hfq = hipfire_runtime::hfq::HfqFile::open(model)
-            .map_err(|e| anyhow::anyhow!("slots: open {}: {e}", model.display()))?;
-        let tokenizer =
-            hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
-                .map_err(|e| anyhow::anyhow!("slots: tokenizer: {e}"))?;
-        drop(hfq);
-        // Host swap budget is deliberately SMALL here, unlike the serve
-        // default of 16 GiB. A sweep opens a fresh session per stream per run
-        // and the engine keeps finished sessions resident for multi-turn
-        // reuse, so evicted snapshots are the one thing that grows without
-        // bound over a long sweep. On a box with no swap, letting that reach
-        // 16 GiB of host RAM is how a benchmark takes the machine down.
-        // Beyond this budget the swap manager spills to disk, which is the
-        // correct trade for a throughput measurement.
-        let engine = hipfire_arch_qwen35::serve_engine::SlotEngine::spawn(
-            hipfire_arch_qwen35::serve_engine::EngineConfig {
-                model_path: model.to_path_buf(),
-                n_slots: max_concurrency,
-                cap_tokens,
-                host_budget_bytes: 2 * 1024 * 1024 * 1024,
-                swap_dir: std::env::temp_dir().join("hipfire-bench-swap"),
-            },
+    pub fn start(_model: &Path, max_concurrency: usize, _cap_tokens: usize) -> Result<Self> {
+        let _ = max_concurrency;
+        bail!(
+            "slots benchmark integration is deferred; exercise experimental slots through \
+             hipfire serve with serve.multi_slot=true"
         )
-        .map_err(|e| anyhow::anyhow!("slots: {e}"))?;
-        Ok(Self {
-            engine,
-            tokenizer,
-            max_concurrency,
-            seq: 0,
-        })
-    }
-
-    /// Render one stream's prompt tokens plus its conversation identity.
-    fn render(&self, run: usize, idx: usize) -> (Vec<u32>, Vec<u64>) {
-        use hipfire_runtime::prompt_frame::{AssistantPrefix, ChatFrame, Role};
-        let owned = stream_prompt(run, idx);
-        let user = owned.as_str();
-        let frame = ChatFrame {
-            tokenizer: &self.tokenizer,
-            system: None,
-            user,
-            // Benchmarks run answer-mode: a reasoning model cannot close a
-            // think span inside a benchmark budget.
-            assistant_prefix: AssistantPrefix::ClosedThink,
-            raw: false,
-        };
-        let history: Vec<(Role, &str)> = Vec::new();
-        let tokens = frame.build_multi_turn(&history);
-        (tokens, vec![turn_hash(user)])
     }
 }
 
-#[cfg(not(feature = "multi-slot"))]
-impl SlotDriver {
-    pub fn start(_model: &Path, _max_concurrency: usize, _cap_tokens: usize) -> Result<Self> {
-        bail!("multi-slot feature disabled: rebuild with --features multi-slot")
-    }
-}
-
-#[cfg(feature = "multi-slot")]
 impl ConcurrencyBackend for SlotDriver {
     fn label(&self) -> &'static str {
         "slots"
@@ -315,108 +240,8 @@ impl ConcurrencyBackend for SlotDriver {
     fn max_concurrency(&self) -> usize {
         self.max_concurrency
     }
-
-    fn run(&mut self, workload: WorkloadSel, k: usize, max_tokens: u64) -> Result<ArmResult> {
-        use hipfire_runtime::serve::{Event, SubmitRequest};
-        check_k(self, k)?;
-
-        let hits_before = self.engine.stats().prefix_hits;
-        self.seq += 1;
-        let run = self.seq;
-        let started = Instant::now();
-        let mut rxs = Vec::with_capacity(k);
-        for i in 0..k {
-            let (tx, rx) = mpsc::channel::<Event>();
-            let (prompt_tokens, convo) = self.render(run, i);
-            self.engine
-                .submit(SubmitRequest {
-                    session: None,
-                    prompt_tokens,
-                    convo,
-                    continuation: Vec::new(),
-                    max_tokens: max_tokens as usize,
-                    reply: tx,
-                })
-                .map_err(|e| anyhow::anyhow!("slots submit: {e}"))?;
-            rxs.push(rx);
-        }
-
-        let mut tokens = 0u64;
-        let mut rejected = 0usize;
-        let mut sessions: Vec<Option<u64>> = vec![None; k];
-        for (i, rx) in rxs.into_iter().enumerate() {
-            while let Ok(ev) = rx.recv() {
-                match ev {
-                    Event::Accepted { session } => sessions[i] = Some(session),
-                    Event::Token { .. } => tokens += 1,
-                    Event::Done { .. } => break,
-                    Event::Rejected { .. } => {
-                        rejected += 1;
-                        break;
-                    }
-                }
-            }
-        }
-
-        // Multi-turn arm: a second turn on each surviving session, which is
-        // what exercises the prefix cache.
-        if matches!(workload, WorkloadSel::Multiturn) {
-            use hipfire_runtime::prompt_frame::{continuation_suffix, AssistantPrefix};
-            let mut rxs2 = Vec::new();
-            for (i, session) in sessions.iter().enumerate() {
-                let Some(session) = session else { continue };
-                let (tx, rx) = mpsc::channel::<Event>();
-                let first = stream_prompt(run, i);
-                let convo = vec![turn_hash(&first), turn_hash(FOLLOWUP_PROMPT)];
-                let continuation = continuation_suffix(
-                    &self.tokenizer,
-                    FOLLOWUP_PROMPT,
-                    AssistantPrefix::ClosedThink,
-                );
-                self.engine
-                    .submit(SubmitRequest {
-                        session: Some(*session),
-                        prompt_tokens: Vec::new(),
-                        convo,
-                        continuation,
-                        max_tokens: max_tokens as usize,
-                        reply: tx,
-                    })
-                    .map_err(|e| anyhow::anyhow!("slots submit turn2: {e}"))?;
-                rxs2.push(rx);
-            }
-            for rx in rxs2 {
-                while let Ok(ev) = rx.recv() {
-                    match ev {
-                        Event::Token { .. } => tokens += 1,
-                        Event::Done { .. } => break,
-                        Event::Rejected { .. } => {
-                            rejected += 1;
-                            break;
-                        }
-                        Event::Accepted { .. } => {}
-                    }
-                }
-            }
-        }
-
-        let wall_ms = started.elapsed().as_secs_f64() * 1000.0;
-        let prefix_hits = self.engine.stats().prefix_hits.saturating_sub(hits_before);
-        Ok(ArmResult {
-            tokens,
-            wall_ms,
-            rejected,
-            prefix_hits,
-        })
-    }
-}
-
-#[cfg(not(feature = "multi-slot"))]
-impl ConcurrencyBackend for SlotDriver {
-    fn label(&self) -> &'static str { "slots" }
-    fn max_concurrency(&self) -> usize { self.max_concurrency }
     fn run(&mut self, _workload: WorkloadSel, _k: usize, _max_tokens: u64) -> Result<ArmResult> {
-        bail!("multi-slot feature disabled")
+        bail!("slots benchmark integration is deferred to the daemon protocol")
     }
 }
 
@@ -806,7 +631,10 @@ mod tests {
         }];
         let table = render_table(&points);
         // median of {200, 100} tok/s = 150; per-stream = 75
-        assert!(table.contains("150.00"), "aggregate median missing: {table}");
+        assert!(
+            table.contains("150.00"),
+            "aggregate median missing: {table}"
+        );
         assert!(table.contains("75.00"), "per-stream missing: {table}");
         assert!(table.contains("slots"), "backend label missing: {table}");
     }

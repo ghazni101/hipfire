@@ -338,7 +338,7 @@ fn main() {
         .zeros(&[pool_capacity], DType::F32)
         .expect("alloc out_tokens");
 
-    let sample_params: Vec<SlotSampleParams> = (0..pool_capacity)
+    let mut sample_params: Vec<SlotSampleParams> = (0..pool_capacity)
         .map(|_| SlotSampleParams {
             temperature: 0.0,
             top_p: 1.0,
@@ -395,7 +395,7 @@ fn main() {
 
         gpu.sample_per_slot(
             &logits_out,
-            &sample_params,
+            &mut sample_params,
             pool_capacity,
             config.vocab_size,
             &out_tokens,

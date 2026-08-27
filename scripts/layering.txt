@@ -35,6 +35,7 @@
  6 hipfire-arch-cohere2moe
  6 hipfire-arch-gemma4
  6 hipfire-arch-llama
+ 6 hipfire-arch-maple
  6 hipfire-arch-muse-glimmer
  6 hipfire-arch-qwen2
  6 hipfire-arch-qwen35-vl
@@ -48,6 +49,7 @@
  7 hipfire-arch-minimax
  7 hipfire-arch-qwen35
  7 hipfire-quantize
+ 7 saddle-quant
  8 hipfire-cli
  8 hipfire-loader
  8 hipfire-pflash

@@ -143,7 +143,7 @@ fn main() {
         .zeros(&[config.vocab_size], DType::F32)
         .expect("logits_out");
     let out_tokens = gpu.zeros(&[1], DType::F32).expect("out_tokens");
-    let sample_params = vec![SlotSampleParams {
+    let mut sample_params = vec![SlotSampleParams {
         temperature: 0.0,
         top_p: 1.0,
         top_k: 0,
@@ -166,7 +166,7 @@ fn main() {
         scratch: &Qwen35Scratch,
         logits_out: &rdna_compute::GpuTensor,
         out_tokens: &rdna_compute::GpuTensor,
-        sample_params: &[SlotSampleParams],
+        sample_params: &mut [SlotSampleParams],
         warm: Option<&[u32]>,
         prompt: &[u32],
         decode_n: usize,

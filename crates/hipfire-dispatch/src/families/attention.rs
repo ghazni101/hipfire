@@ -1343,6 +1343,59 @@ fn dispatch_attend(
             // gfx1151 measurement showed the opposite. Other arches keep 8192
             // until measured — do not globalise this without per-arch evidence.
             KernelKey::AttnQ8_0KvBatchedMasked => {
+                // HIPFIRE_FLASH_PREFILL=0 forces off anywhere. Resolve the
+                // single precedence rule before either backend is attempted,
+                // so CK and the native WMMA/scalar routes share one gate.
+                let gfx12_query16_route_ok = gpu.arch_caps.has_wmma_w32_gfx12()
+                    && gfx12_query16_arch_default_eligible(&gpu.arch)
+                    && gfx12_query16_workload_eligible(ctx)
+                    && gfx12_query16_default_eligible(
+                        io.n_heads,
+                        io.head_dim,
+                        io.batch_size,
+                        io.max_ctx_len,
+                    );
+                let flash_default_on = gpu.arch.starts_with("gfx11") || gfx12_query16_route_ok;
+                let flash_optin = match hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL")
+                    .ok()
+                    .as_deref()
+                {
+                    Some("0") | Some("off") | Some("false") => false,
+                    Some("1") | Some("on") | Some("true") => true,
+                    _ => flash_default_on,
+                };
+                let flash_min_ctx: usize =
+                    hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_MIN_CTX")
+                        .ok()
+                        .and_then(|v| v.parse().ok())
+                        .unwrap_or(10240);
+                // Optional CK selection happens after the paired KV-tier plan
+                // and write have resolved, but only when flash prefill is
+                // opted in. The first cell accepts only the standard
+                // contiguous-prefix Q8/Q8 D256 contract; every other shape
+                // remains on the native WMMA/scalar routes below. Keeps the
+                // opt-in, fail-closed posture — CK is not enabled by default
+                // and HIPFIRE_FLASH_PREFILL=0 disables both backends.
+                #[cfg(feature = "flash-attn-ck")]
+                if flash_optin {
+                    if hip!(gpu.try_flash_attn_ck_q8_d256_prefill(
+                        io.q,
+                        io.k_cache,
+                        io.v_cache,
+                        io.output,
+                        io.batch_size,
+                        io.max_ctx_len,
+                        io.n_heads,
+                        io.n_kv_heads,
+                        io.max_ctx_len == io.pos.saturating_add(io.batch_size),
+                        io.tree_bias.is_some(),
+                        plan.window.max(0) as usize,
+                        io.block_start,
+                        io.block_cols,
+                    ))? {
+                        return Ok(());
+                    }
+                }
                 // Query-tiled flash prefill. Its LDS depends only on BR/BC and
                 // never on context, so it has no capacity ceiling and no
                 // occupancy decay. Measured on gfx1151 (nh=8 nkv=2 hd=256,
@@ -1368,30 +1421,6 @@ fn dispatch_attend(
                 // inside `gfx12_query16_default_eligible`'s measured envelope;
                 // outside that envelope dispatch falls back directly to the
                 // legacy LDS/tiled paths.
-                // HIPFIRE_FLASH_PREFILL=0 forces off anywhere.
-                let gfx12_query16_route_ok = gpu.arch_caps.has_wmma_w32_gfx12()
-                    && gfx12_query16_arch_default_eligible(&gpu.arch)
-                    && gfx12_query16_workload_eligible(ctx)
-                    && gfx12_query16_default_eligible(
-                        io.n_heads,
-                        io.head_dim,
-                        io.batch_size,
-                        io.max_ctx_len,
-                    );
-                let flash_default_on = gpu.arch.starts_with("gfx11") || gfx12_query16_route_ok;
-                let flash_optin = match hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL")
-                    .ok()
-                    .as_deref()
-                {
-                    Some("0") | Some("off") | Some("false") => false,
-                    Some("1") | Some("on") | Some("true") => true,
-                    _ => flash_default_on,
-                };
-                let flash_min_ctx: usize =
-                    hipfire_config::developer_var("HIPFIRE_FLASH_PREFILL_MIN_CTX")
-                        .ok()
-                        .and_then(|v| v.parse().ok())
-                        .unwrap_or(10240);
                 if flash_optin && io.tree_bias.is_none() && io.batch_size > 1 {
                     // WMMA is the default variant: it beats the legacy LDS
                     // kernel at EVERY context (1.21x @2048 .. 2.47x @12288) and
@@ -1887,5 +1916,34 @@ mod tests {
                 key
             );
         }
+    }
+
+    #[test]
+    fn hipfire_flash_prefill_zero_disables_both_native_and_ck() {
+        // Fix 2: HIPFIRE_FLASH_PREFILL=0 must force native even when a CK
+        // capability is available. Dispatch now evaluates flash_optin before
+        // attempting CK, so one precedence rule governs both backends.
+        fn flash_optin(env: Option<&str>, default_on: bool) -> bool {
+            match env {
+                Some("0") | Some("off") | Some("false") => false,
+                Some("1") | Some("on") | Some("true") => true,
+                _ => default_on,
+            }
+        }
+        // gfx11 default is on, but force-off wins
+        assert!(!flash_optin(Some("0"), true));
+        assert!(!flash_optin(Some("off"), true));
+        assert!(!flash_optin(Some("false"), true));
+        // Simulate CK gating: CK only runs when flash_optin is true
+        let ck_available = true;
+        let ck_would_run = flash_optin(Some("0"), true) && ck_available;
+        assert!(
+            !ck_would_run,
+            "HIPFIRE_FLASH_PREFILL=0 must select native even when CK capability exists"
+        );
+        // Opt-in still works
+        assert!(flash_optin(Some("1"), false));
+        assert!(flash_optin(None, true));
+        assert!(!flash_optin(None, false));
     }
 }

@@ -10,10 +10,10 @@
 use std::time::Instant;
 
 use crate::terminal::{
-    batch_apply_terminal_control, batch_announce_terminal, batch_bind_active, batch_check_abort,
-    batch_clear_terminal, batch_mark_ready_with_pending, batch_poll_decision, batch_terminal_control,
-    batch_transition_to_queued, AttemptKey, BatchRegistryState, ClientTerminalDecision, LaneTicket,
-    CLIENT_TERMINAL_COMMIT_TIMEOUT,
+    batch_announce_terminal, batch_apply_terminal_control, batch_bind_active, batch_check_abort,
+    batch_clear_terminal, batch_mark_ready_with_pending, batch_poll_decision,
+    batch_terminal_control, batch_transition_to_queued, AttemptKey, BatchRegistryState,
+    ClientTerminalDecision, LaneTicket, CLIENT_TERMINAL_COMMIT_TIMEOUT,
 };
 
 // ── Batch sampling controls and cohort key ───────────────────────────────
@@ -154,6 +154,10 @@ pub struct BatchPendingRequest {
     pub assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
     pub max_think_tokens: usize,
     pub max_tokens: usize,
+    /// Explicit wire `seed` (OpenAI-compatible), parsed and rejected-loudly by
+    /// the daemon before enqueue. `None` = unseeded: the lane draws fresh
+    /// counter/nonce entropy at assignment time.
+    pub client_seed: Option<u64>,
     pub sampling: BatchSampling,
 }
 
@@ -251,7 +255,7 @@ impl ContinuousBatchScheduler {
             prompt_len: req.prompt_tokens.len(),
             seq_pos: 0,
             next_token: None,
-            rng_state: batch_rng_for_key(&key),
+            rng_state: request_rng_u64(&key, req.client_seed),
             conversation_tokens: Vec::new(),
             streamed_tokens: Vec::new(),
             bytes_fed_to_filter: 0,
@@ -512,6 +516,77 @@ pub fn batch_rng_for_key(key: &AttemptKey) -> u64 {
     }
 }
 
+/// Process-global monotonic request counter, mixed into every unseeded
+/// request's derived RNG so two requests that reuse the same wire key (clients
+/// that always send `id:"r1", attempt_id:1`) still get distinct sampler
+/// streams — on the sequential route AND across continuous-batch cohorts.
+static REQUEST_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Process-start nonce (nanos since UNIX_EPOCH). Mixed into the derived seed so
+/// raw daemon clients that reuse identical `(id, attempt_id)` keys across
+/// daemon restarts do not replay the same unseeded draw sequences; within a
+/// process the counter already guarantees distinctness.
+static BOOT_NONCE: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E3779B97F4A7C15)
+});
+
+/// Fresh unseeded per-request RNG state: [`batch_rng_for_key`] mixed with the
+/// process-global request counter and [`BOOT_NONCE`]. Every call draws new
+/// counter entropy regardless of client keying.
+pub fn fresh_request_rng(key: &AttemptKey) -> u64 {
+    batch_rng_for_key(key)
+        ^ *BOOT_NONCE
+        ^ REQUEST_COUNTER
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .wrapping_mul(0x9E3779B97F4A7C15)
+}
+
+/// Explicit-seed RNG state: splitmix over the wire seed ALONE (attempt
+/// identity deliberately excluded so an explicit seed reproduces its draw
+/// sequence for every request that carries it). `0` maps to the 0x13579BDF
+/// sentinel because xorshift state 0 is stuck.
+pub fn seeded_request_rng(client_seed: u64) -> u64 {
+    let mut z = client_seed.wrapping_add(0x13579BDF);
+    z ^= z >> 30;
+    z = z.wrapping_mul(0xBF58476D1CE4E5B9);
+    z ^= z >> 27;
+    z = z.wrapping_mul(0xFF51AFD7ED558CCD);
+    z ^= z >> 31;
+    let seed = z as u32;
+    if seed == 0 {
+        0x13579BDF as u64
+    } else {
+        seed as u64
+    }
+}
+
+/// Per-request sampler RNG across BOTH sampling routes: explicit wire `seed`
+/// wins via [`seeded_request_rng`], else fresh counter/nonce entropy via
+/// [`fresh_request_rng`]. Consumed as u32 by the sample kernels; returned
+/// widened so callers need no second cast.
+pub fn request_rng_u64(key: &AttemptKey, client_seed: Option<u64>) -> u64 {
+    match client_seed {
+        Some(s) => seeded_request_rng(s),
+        None => fresh_request_rng(key),
+    }
+}
+
+/// Per-request sampler seed (u32) for the sequential AR route, replacing the
+/// historical fixed 0x13579BDF that made same-prompt requests byte-identical
+/// at temp>0. The result is never 0: xorshift32 treats a 0 state as
+/// stuck/degenerate.
+pub fn request_seed_for(key: &AttemptKey, client_seed: Option<u64>) -> u32 {
+    let seed = request_rng_u64(key, client_seed) as u32;
+    if seed == 0 {
+        0x13579BDF
+    } else {
+        seed
+    }
+}
+
 /// Eligibility for continuous batching. Conservative: only single-GPU
 /// exact HIP Qwen 5/6 and dense LFM 11 stateless text without excluded features.
 pub fn is_batch_eligible(
@@ -611,7 +686,10 @@ pub fn parse_serve_continuous_batch(msg: &serde_json::Value) -> bool {
             .unwrap_or(false)
 }
 
-pub fn resolve_batch_sampling(msg: &serde_json::Value, m: &hipfire_loader::LoadedModel) -> BatchSampling {
+pub fn resolve_batch_sampling(
+    msg: &serde_json::Value,
+    m: &hipfire_loader::LoadedModel,
+) -> BatchSampling {
     let defaults = hipfire_loader::carrier_for(m.arch_id)
         .map(|c| c.sampling_defaults())
         .unwrap_or_default();
@@ -672,7 +750,6 @@ pub fn resolve_batch_sampling(msg: &serde_json::Value, m: &hipfire_loader::Loade
         repeat_window,
     }
 }
-
 
 pub fn lfm_fast_path_candidate_len(sched: &ContinuousBatchScheduler) -> usize {
     if sched.active_count() != 0 || sched.awaiting_count() != 0 {
@@ -735,7 +812,11 @@ pub fn lfm_fast_path_candidate_len(sched: &ContinuousBatchScheduler) -> usize {
         }
         if req.prompt_tokens.is_empty()
             || req.prompt_tokens.len() >= sched.lane_capacity
-            || !crate::terminal::batch_lfm_admission_ok(req.prompt_tokens.len(), req.max_tokens, sched.lane_capacity)
+            || !crate::terminal::batch_lfm_admission_ok(
+                req.prompt_tokens.len(),
+                req.max_tokens,
+                sched.lane_capacity,
+            )
         {
             break;
         }
@@ -862,7 +943,11 @@ pub fn batch_finite_rate(count: usize, seconds: f64) -> f64 {
         return 0.0;
     }
     let rate = count as f64 / seconds;
-    if rate.is_finite() { rate } else { 0.0 }
+    if rate.is_finite() {
+        rate
+    } else {
+        0.0
+    }
 }
 
 pub struct BatchLaneDoneMetrics {
@@ -982,5 +1067,87 @@ pub fn block_attractor_unclosed_cpu(
         if let Some(slot) = logits.get_mut(open_id as usize) {
             *slot = f32::NEG_INFINITY;
         }
+    }
+}
+
+#[cfg(test)]
+mod request_seed_tests {
+    use super::*;
+
+    fn key(id: &str, attempt: u64) -> AttemptKey {
+        AttemptKey::new(id, attempt)
+    }
+
+    #[test]
+    fn explicit_seed_is_deterministic_regardless_of_attempt_identity() {
+        let a = request_seed_for(&key("r1", 7), Some(42));
+        assert_eq!(a, request_seed_for(&key("r1", 7), Some(42)));
+        assert_eq!(a, request_seed_for(&key("r1", 8), Some(42)));
+        assert_eq!(a, request_seed_for(&key("r2", 99), Some(42)));
+        assert_ne!(a, request_seed_for(&key("r1", 7), Some(43)));
+        assert_ne!(a, request_seed_for(&key("r1", 8), Some(43)));
+    }
+
+    #[test]
+    fn explicit_seed_boundaries_stay_in_tier1() {
+        // Wire seed 0 and u64::MAX are valid explicit seeds: tier 1 must win
+        // over the attempt-key entropy tiers and be deterministic per seed
+        // alone. request_seed_for never returns 0 (pinned separately below).
+        let z = request_seed_for(&key("b", 1), Some(0));
+        assert_eq!(z, request_seed_for(&key("b", 2), Some(0)));
+        assert_eq!(z, request_seed_for(&key("other", 9), Some(0)));
+        let m = request_seed_for(&key("m", 1), Some(u64::MAX));
+        assert_eq!(m, request_seed_for(&key("m", 2), Some(u64::MAX)));
+        assert_ne!(z, m);
+    }
+
+    #[test]
+    fn derived_seeds_distinct_for_reused_client_keys() {
+        let k = key("r1", 1);
+        let s0 = request_seed_for(&k, None);
+        let s1 = request_seed_for(&k, None);
+        assert_ne!(s0, s1);
+    }
+
+    #[test]
+    fn derived_seed_differs_across_attempt_ids_and_ids() {
+        let base = request_seed_for(&key("a", 1), None);
+        assert_ne!(base, request_seed_for(&key("a", 2), None));
+        assert_ne!(base, request_seed_for(&key("b", 1), None));
+    }
+
+    #[test]
+    fn seed_is_never_zero() {
+        for attempt in 0..4096u64 {
+            for cs in [None, Some(0), Some(u64::MAX)] {
+                assert_ne!(
+                    request_seed_for(&key("zero-probe", attempt), cs),
+                    0,
+                    "attempt={attempt} cs={cs:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn cb_lane_seeded_rng_is_deterministic_per_seed_alone() {
+        // The continuous-batch lane initializer must honor an explicit wire
+        // seed exactly like the sequential route: same seed reproduces the
+        // same lane RNG regardless of attempt identity or how many unseeded
+        // requests advanced REQUEST_COUNTER before it.
+        let _ = request_seed_for(&key("counter-burn", 1), None);
+        let a = request_rng_u64(&key("cb", 7), Some(42));
+        assert_eq!(a, request_rng_u64(&key("cb", 8), Some(42)));
+        assert_eq!(a, request_rng_u64(&key("other", 99), Some(42)));
+        assert_ne!(a, request_rng_u64(&key("cb", 7), Some(43)));
+        assert_ne!(a, 0);
+    }
+
+    #[test]
+    fn cb_lane_unseeded_rng_fresh_for_reused_client_keys() {
+        // Unseeded CB lanes draw fresh counter entropy per assignment, so a
+        // raw client reusing (id, attempt_id) across cohorts never replays.
+        let k = key("cb-reuse", 1);
+        assert_ne!(request_rng_u64(&k, None), request_rng_u64(&k, None));
     }
 }

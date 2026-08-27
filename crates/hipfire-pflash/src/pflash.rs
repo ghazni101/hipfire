@@ -157,7 +157,7 @@ impl DrafterModel {
     /// Used by `compute_scores_batched_gpu` as the source layer for
     /// scoring. Picking the SHALLOWEST FullAttention layer dodges the
     /// long-context RoPE-OOD NaN cascade observed on small drafters
-    /// (MANUAL_REVIEW.md): deep layers accumulate NaN once positions
+    /// (docs/investigations/pflash/2026-05-manual-review.md): deep layers accumulate NaN once positions
     /// exceed the drafter's trained window, but the first FullAttn
     /// layer's K is still finite at 21K source tokens. The shallow
     /// layer carries enough positional + content signal for the cosine
@@ -962,7 +962,7 @@ pub fn compute_scores_batched_gpu(
     // returned by `DrafterModel::score_layer_idx` (layer 0 for plain
     // Qwen3, the first FullAttn slot in the hybrid layer pattern for
     // Qwen3.5/3.6). This dodges the long-context RoPE-OOD NaN cascade
-    // documented in MANUAL_REVIEW.md: deep layers accumulate NaN once
+    // documented in docs/investigations/pflash/2026-05-manual-review.md: deep layers accumulate NaN once
     // positions exceed the small drafter's trained window, but the
     // shallowest FullAttn layer's K is still finite at 21K source.
     //

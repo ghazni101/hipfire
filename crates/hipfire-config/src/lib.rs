@@ -700,6 +700,48 @@ pub static FIELDS: &[ConfigField] = &[
         "Serve requests concurrently on the multi-slot engine instead of one at a time."
     ),
     field!(
+        "serve.multi_slot_slots",
+        "multi_slot_slots",
+        Serve,
+        Process,
+        DefaultValue::Integer(4),
+        ValueRule::Integer { min: 1, max: 64 },
+        false,
+        false,
+        Some("HIPFIRE_SERVE_MULTI_SLOT_SLOTS"),
+        "Concurrent slots for the multi-slot engine."
+    ),
+    field!(
+        "serve.multi_slot_ctx",
+        "multi_slot_ctx",
+        Serve,
+        Process,
+        DefaultValue::Integer(8192),
+        ValueRule::Integer {
+            min: 512,
+            max: 1048576
+        },
+        false,
+        false,
+        Some("HIPFIRE_SERVE_MULTI_SLOT_CTX"),
+        "Per-slot context capacity (tokens) for the multi-slot engine."
+    ),
+    field!(
+        "serve.multi_slot_prefill_chunk",
+        "multi_slot_prefill_chunk",
+        Serve,
+        Process,
+        DefaultValue::Integer(1024),
+        ValueRule::Integer {
+            min: 1,
+            max: 1048576
+        },
+        false,
+        false,
+        Some("HIPFIRE_SERVE_MULTI_SLOT_PREFILL_CHUNK"),
+        "Prefill tokens taken from one slot per multi-slot step; batch scratch is sized n_slots x this."
+    ),
+    field!(
         "generation.temperature",
         "temperature",
         Generation,
@@ -2176,6 +2218,26 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         "HIPFIRE_QKVZA_SPLIT_TAIL",
         "Enable the RDNA3 QKVZA split-tail prefill route."
+    ),
+    process_field!(
+        "attention.ck_runtime_lib",
+        "ck_runtime_lib",
+        Attention,
+        DefaultValue::Null,
+        ValueRule::NullableString,
+        true,
+        "HIPFIRE_FLASH_ATTN_CK_LIB",
+        "Optional exact-architecture CK runtime sidecar path; load or capability failure retains native attention."
+    ),
+    process_field!(
+        "attention.ck_workspace_bytes",
+        "ck_workspace_bytes",
+        Attention,
+        DefaultValue::Integer(0),
+        ValueRule::Integer { min: 0, max: 17_179_869_184 },
+        true,
+        "HIPFIRE_FLASH_ATTN_CK_WORKSPACE_BYTES",
+        "Preallocated caller-owned bytes for the optional CK staged attention path."
     ),
     process_bool_field!(
         "kernel.gfx942_gemv_v3",
@@ -4733,6 +4795,12 @@ mod tests {
         let mut global = ConfigLayer::default();
         global.set_cli("kernel.mw16", "true").unwrap();
         global.set_cli("diagnostic.kernel.gemv_rows", "4").unwrap();
+        global
+            .set_cli("attention.ck_runtime_lib", "/opt/hipfire/ck.so")
+            .unwrap();
+        global
+            .set_cli("attention.ck_workspace_bytes", "536870912")
+            .unwrap();
         let resolved = resolve([NamedLayer {
             source: ConfigSource::GlobalUser {
                 path: PathBuf::from("config.toml"),
@@ -4743,6 +4811,16 @@ mod tests {
         let process = ProcessConfig::from_resolved(&resolved).unwrap();
 
         assert_eq!(process.legacy_value("HIPFIRE_MW16").as_deref(), Some("1"));
+        assert_eq!(
+            process.legacy_value("HIPFIRE_FLASH_ATTN_CK_LIB").as_deref(),
+            Some("/opt/hipfire/ck.so")
+        );
+        assert_eq!(
+            process
+                .legacy_value("HIPFIRE_FLASH_ATTN_CK_WORKSPACE_BYTES")
+                .as_deref(),
+            Some("536870912")
+        );
         assert_eq!(
             process.legacy_value("HIPFIRE_GEMV_ROWS").as_deref(),
             Some("4")

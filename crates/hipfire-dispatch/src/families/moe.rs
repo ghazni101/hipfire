@@ -105,6 +105,7 @@ pub struct MoeResolution {
     /// gate-side is MQ4 (e.g. the redline mq4r).
     pub gate_fusable: bool,
     pub routed_indexable_mq4: bool,
+    pub routed_indexable_mq4v2: bool,
     pub routed_indexable_mq5: bool,
     pub routed_indexable_mq6: bool,
     /// Mixed routed experts: gate_up MQ4, down MQ6 (the "mq6-down" lever —
@@ -154,6 +155,10 @@ pub struct MoeResolution {
     /// the single shared `moe_down_combine_k8_batched` runs (NOT Lloyd atomic
     /// self-combine). silu+rotate is weight-agnostic (unchanged).
     pub routed_indexable_mixed_per_expert: bool,
+    /// Uniform UNROTATED Lloyd routed experts (MQ2G256LloydU, qt=51) on BOTH
+    /// gate_up and down. Binds the same indexed MQ2-Lloyd kernels as qt19 but
+    /// consumes x in the natural basis (`needs_x_rot_local == false`).
+    pub routed_indexable_mq2lloyd_u: bool,
     pub use_gpu_topk: bool,
     pub needs_x_rot_local: bool,
     /// True when a per-expert tier table is `Some` AND contains >1 distinct
@@ -186,17 +191,38 @@ impl MoeResolution {
         let gate_side_mq4 = gate_fusable && d.experts_all_gate_up_mq4;
 
         let routed_gate_up_mq4 = d.routed_gate_up == MQ4G256;
+        // qt44/qt45 are FWHT-G256 formats exactly like qt13 — their kernels read
+        // the ROTATED activations. Omitting them from `needs_x_rot_local` below
+        // feeds unrotated x into rotated weights, which is silent: the model
+        // still emits fluent text. Measured on Ornith 1.5 35B-A3B, prefill KLD
+        // was 0.993 against 0.044 on the per-token path for the SAME artifact.
+        let routed_gate_up_mq4v2 = d.routed_gate_up == MQ4G256V2;
+        let routed_gate_up_mq4c = d.routed_gate_up == MQ4CG256;
         let routed_gate_up_mq5 = d.routed_gate_up == MQ5G256;
         let routed_gate_up_mq6 = d.routed_gate_up == MQ6G256;
         let routed_gate_up_paro = d.routed_gate_up == ParoQ4G128 && d.has_paro_shared;
         let routed_gate_up_mq2lloyd = d.routed_gate_up == MQ2G256Lloyd;
         let routed_gate_up_mq3lloyd = d.routed_gate_up == MQ3G256Lloyd;
+        // UNROTATED Lloyd sibling (qt=51). Same kernels, same byte layout —
+        // the ONLY difference is that it must not rotate x.
+        let routed_gate_up_mq2lloyd_u = d.routed_gate_up == MQ2G256LloydU;
 
         let routed_indexable_mq4 = (d.routed_down == MQ4G256) && routed_gate_up_mq4;
+        // qt44. Gated on BOTH sides being MQ4G256V2, like every other uniform
+        // pairing: the indexed GEMVs decode qt44's dual-f16-grid header, and
+        // handing one a qt13 f32-header row reads the scale/zero as the two
+        // halves of a float — silently wrong output, not a fault.
+        let routed_indexable_mq4v2 = (d.routed_down == MQ4G256V2) && routed_gate_up_mq4v2;
         let routed_indexable_mq5 = (d.routed_down == MQ5G256) && routed_gate_up_mq5;
         let routed_indexable_mq6 = (d.routed_down == MQ6G256) && routed_gate_up_mq6;
         let routed_indexable_mixed_gu4_dn6 = routed_gate_up_mq4 && (d.routed_down == MQ6G256);
         let routed_indexable_mq2lloyd = (d.routed_down == MQ2G256Lloyd) && routed_gate_up_mq2lloyd;
+        // Both sides must be the UNROTATED dtype. A rotated/unrotated mix has
+        // no coherent single rotation decision for the layer, so it must fall
+        // out of the indexed path entirely rather than pick one and silently
+        // corrupt the other projection.
+        let routed_indexable_mq2lloyd_u =
+            (d.routed_down == MQ2G256LloydU) && routed_gate_up_mq2lloyd_u;
         let routed_indexable_mq3lloyd = (d.routed_down == MQ3G256Lloyd) && routed_gate_up_mq3lloyd;
         // gate_up on one of the codebook (Lloyd / GL) formats — needed both for
         // the per-projection mix below and for `needs_x_rot_local` (all four are
@@ -233,11 +259,13 @@ impl MoeResolution {
             && matches!(d.routed_down, MFP4G32E8 | MFP3G32E8 | MFP2G32E8);
 
         let routed_dtype_indexable = routed_indexable_mq4
+            || routed_indexable_mq4v2
             || routed_indexable_mq5
             || routed_indexable_mq6
             || routed_indexable_mixed_gu4_dn6
             || routed_indexable_mixed_per_expert
             || routed_indexable_mq2lloyd
+            || routed_indexable_mq2lloyd_u
             || routed_indexable_mq3lloyd
             || routed_indexable_mixed_lloyd
             || routed_indexable_paro
@@ -247,6 +275,8 @@ impl MoeResolution {
         let needs_x_rot_local = gate_side_mq4
             || routed_indexable_mixed_per_expert
             || routed_gate_up_mq4
+            || routed_gate_up_mq4v2
+            || routed_gate_up_mq4c
             || routed_gate_up_mq5
             || routed_gate_up_mq6
             || routed_gate_up_mq2lloyd
@@ -257,6 +287,15 @@ impl MoeResolution {
             || routed_gate_up_gl
             || routed_gate_up_paro
             || routed_indexable_e8;
+        // NOTE: `routed_gate_up_mq2lloyd_u` is DELIBERATELY ABSENT from the
+        // chain above. MQ2G256LloydU is the unrotated sibling: its weights are
+        // encoded in the natural basis, so producing x_rot and handing it to
+        // the kernel would be the exact "unrotated x into a rotated weight"
+        // failure the comment above warns about, only mirrored — and equally
+        // silent. It is also deliberately NOT in `CODEBOOK_INDEXABLE`, because
+        // membership there would let a rotated/unrotated cross-pair resolve via
+        // `routed_indexable_mixed_lloyd` with no coherent rotation decision.
+        // See docs/design/2026-08-22-maple-preview-20b-a1b.md.
 
         // A per-expert tier table is "mixed" only when it is Some AND spans more
         // than one distinct DType. A Some table that is all-equal collapses to
@@ -274,10 +313,12 @@ impl MoeResolution {
             gate_side_mq4,
             gate_fusable,
             routed_indexable_mq4,
+            routed_indexable_mq4v2,
             routed_indexable_mq5,
             routed_indexable_mq6,
             routed_indexable_mixed_gu4_dn6,
             routed_indexable_mq2lloyd,
+            routed_indexable_mq2lloyd_u,
             routed_indexable_mq3lloyd,
             routed_indexable_mixed_lloyd,
             routed_indexable_mixed_per_expert,
@@ -290,6 +331,7 @@ impl MoeResolution {
 
     pub fn routed_indexable(&self) -> bool {
         self.routed_indexable_mq4
+            || self.routed_indexable_mq4v2
             || self.routed_indexable_mq5
             || self.routed_indexable_mq6
             || self.routed_indexable_mixed_gu4_dn6

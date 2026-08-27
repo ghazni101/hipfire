@@ -98,6 +98,28 @@ fn qwen35_tensor_data_vec<'a>(
     None
 }
 
+/// Borrowed-first variant of [`qwen35_tensor_data_vec`]: returns the mmap
+/// slice directly when the mapping is alive (dGPU loads keep it, so weight
+/// uploads DMA straight out of page-cache pages with no heap staging copy);
+/// falls back to the owned pread Vec on UMA (mmap dropped there). Same
+/// candidate resolution.
+fn qwen35_tensor_data_cow<'a>(
+    hfq: &'a HfqFile,
+    name: &str,
+) -> Option<(&'a HfqTensorInfo, std::borrow::Cow<'a, [u8]>)> {
+    for candidate in qwen35_tensor_name_candidates(name) {
+        if let Some((info, data)) = hfq.tensor_data(&candidate) {
+            return Some((info, std::borrow::Cow::Borrowed(data)));
+        }
+    }
+    for candidate in qwen35_tensor_name_candidates(name) {
+        if let Some((info, data)) = hfq.tensor_data_vec(&candidate) {
+            return Some((info, std::borrow::Cow::Owned(data)));
+        }
+    }
+    None
+}
+
 fn load_norm_weight(
     hfq: &HfqFile,
     gpu: &mut Gpu,
@@ -425,6 +447,206 @@ fn load_weight_tensor_raw(
                 awq_scale: None,
             })
         }
+        44 => {
+            // MQ4-G256 v2 (qt=44): 136 B/group, byte-identical payload to MQ4G256
+            // but per-128 fp16 scale+zero. Validate K%256 and blob length.
+            if k % 256 != 0 {
+                return Err(HipError::new(
+                    0,
+                    &format!("MQ4G256V2 has K={k} but requires K%256==0"),
+                ));
+            }
+            let gpr = k / 256;
+            let expected = m * gpr * 136;
+            if data.len() != expected {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "MQ4G256V2 blob length mismatch: expected {expected}, got {}",
+                        data.len()
+                    ),
+                ));
+            }
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ4G256V2,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        45 => {
+            // MQ4C (qt=45), pad layout: 136 B/group — ONE fp16 scale+zero dword at
+            // +0 governing all 256 weights, 4 B of zero padding at +4, and the
+            // 128 B nibble payload at +8, which is byte-for-byte where qt=13 puts
+            // it. Same total size as qt=13; the padding is the deliberate price of
+            // keeping the payload 8-byte aligned.
+            //
+            // Derive the stride from rdna_compute::MQ4C_GROUP_BYTES rather than a
+            // literal. This site previously hardcoded 132 and rejected every valid
+            // file the moment the format moved to 136 — the check was right, the
+            // duplicated constant was not.
+            if k % 256 != 0 {
+                return Err(HipError::new(
+                    0,
+                    &format!("MQ4CG256 has K={k} but requires K%256==0"),
+                ));
+            }
+            let gpr = k / 256;
+            let expected = m * gpr * rdna_compute::MQ4C_GROUP_BYTES;
+            if data.len() != expected {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "MQ4CG256 blob length mismatch: expected {expected}, got {}",
+                        data.len()
+                    ),
+                ));
+            }
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ4CG256,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        47 => {
+            // MQ6-G256 v2 (qt=47): 200 B/group, neutral Magnum V2.
+            // Header LE `[0..2)` fp16 s0, `[2..4)` fp16 z0, `[4..6)` fp16 s1,
+            // `[6..8)` fp16 z1, `[8..200)` 192 B 6-bit payload (4/3 B).
+            // Half 0 covers q[0..128), half 1 q[128..256); `w = q*f32(s[h])+f32(z[h])`.
+            // Mirror every qt44 guard: K%256 and exact byte count fail closed.
+            if k % 256 != 0 {
+                return Err(HipError::new(
+                    0,
+                    &format!("MQ6G256V2 has K={k} but requires K%256==0"),
+                ));
+            }
+            let gpr = k / 256;
+            let expected = m * gpr * rdna_compute::MQ6G256V2_GROUP_BYTES;
+            if data.len() != expected {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "MQ6G256V2 blob length mismatch: expected {expected}, got {}",
+                        data.len()
+                    ),
+                ));
+            }
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ6G256V2,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        48 => {
+            // MQ5-G256 v2 (qt=48): 168 B/group, neutral Magnum V2.
+            // Header LE `[0..2)` fp16 s0, `[2..4)` fp16 z0, `[4..6)` fp16 s1,
+            // `[6..8)` fp16 z1, `[8..168)` 160 B 5-bit payload (8/5 B).
+            if k % 256 != 0 {
+                return Err(HipError::new(
+                    0,
+                    &format!("MQ5G256V2 has K={k} but requires K%256==0"),
+                ));
+            }
+            let gpr = k / 256;
+            let expected = m * gpr * rdna_compute::MQ5G256V2_GROUP_BYTES;
+            if data.len() != expected {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "MQ5G256V2 blob length mismatch: expected {expected}, got {}",
+                        data.len()
+                    ),
+                ));
+            }
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ5G256V2,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        49 => {
+            // MQ3-G256 v2 (qt=49): 104 B/group, neutral Magnum V2.
+            // Header LE `[0..2)` fp16 s0, `[2..4)` fp16 z0, `[4..6)` fp16 s1,
+            // `[6..8)` fp16 z1, `[8..104)` 96 B 3-bit payload (8/3 B).
+            if k % 256 != 0 {
+                return Err(HipError::new(
+                    0,
+                    &format!("MQ3G256V2 has K={k} but requires K%256==0"),
+                ));
+            }
+            let gpr = k / 256;
+            let expected = m * gpr * rdna_compute::MQ3G256V2_GROUP_BYTES;
+            if data.len() != expected {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "MQ3G256V2 blob length mismatch: expected {expected}, got {}",
+                        data.len()
+                    ),
+                ));
+            }
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ3G256V2,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        50 => {
+            // MQ2-G256 v2 (qt=50): 72 B/group, neutral Magnum V2.
+            // Header LE `[0..2)` fp16 s0, `[2..4)` fp16 z0, `[4..6)` fp16 s1,
+            // `[6..8)` fp16 z1, `[8..72)` 64 B 2-bit payload (4/B).
+            if k % 256 != 0 {
+                return Err(HipError::new(
+                    0,
+                    &format!("MQ2G256V2 has K={k} but requires K%256==0"),
+                ));
+            }
+            let gpr = k / 256;
+            let expected = m * gpr * rdna_compute::MQ2G256V2_GROUP_BYTES;
+            if data.len() != expected {
+                return Err(HipError::new(
+                    0,
+                    &format!(
+                        "MQ2G256V2 blob length mismatch: expected {expected}, got {}",
+                        data.len()
+                    ),
+                ));
+            }
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::MQ2G256V2,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
         38 => {
             // MQ2-G256-GL — 2-bit codes vs the TENSOR-GLOBAL codebook GL_CB2 +
             // per-block fp16 scale. 2.0625 bpw. SoA, TWO regions, no per-group
@@ -465,6 +687,30 @@ fn load_weight_tensor_raw(
             Ok(WeightTensor {
                 buf,
                 gpu_dtype: DType::MQ3G256GL,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        40 => {
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::TQ2G128,
+                m,
+                k,
+                row_stride: 0,
+                paro: None,
+                awq_scale: None,
+            })
+        }
+        41 => {
+            let buf = gpu.upload_raw(data, &[data.len()])?;
+            Ok(WeightTensor {
+                buf,
+                gpu_dtype: DType::BQ1G128,
                 m,
                 k,
                 row_stride: 0,
@@ -589,12 +835,20 @@ pub(crate) fn load_weight_tensor(
     k: usize,
     candidates: fn(&str) -> Vec<String>,
 ) -> HipResult<WeightTensor> {
-    // Use pread path to avoid page cache buildup on unified-memory APUs.
+    // Zero-copy first: when the mmap is alive (dGPU loads keep it), DMA
+    // straight from the page-cache-backed slice — no heap staging copy.
+    // Pread fallback preserves UMA behavior (mmap dropped there).
     #[cfg(unix)]
     {
         let mut wt: Option<WeightTensor> = None;
         let mut matched: Option<String> = None;
         for candidate in candidates(name) {
+            if let Some((info, data)) = hfq.tensor_data(&candidate) {
+                let qt = info.quant_type;
+                wt = Some(load_weight_tensor_raw(gpu, qt, data, m, k)?);
+                matched = Some(candidate);
+                break;
+            }
             if let Some((info, buf)) = hfq.tensor_data_pread(&candidate) {
                 let qt = info.quant_type;
                 wt = Some(load_weight_tensor_raw(gpu, qt, &buf, m, k)?);
@@ -2177,6 +2431,9 @@ pub fn load_weights(
     devices: &mut [Gpu],
     layout: &Layout,
 ) -> HipResult<Qwen35Weights> {
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
+    let t_sweep = Instant::now();
     let LoadedWeights {
         token_embd,
         embd_format,
@@ -2185,6 +2442,12 @@ pub fn load_weights(
         layers,
         lm_head_aliases_embd,
     } = rt_load_weights(source, devices, layout)?;
+    eprintln!(
+        "  weight sweep: {} ms (packed-expert host-read {} ms, H2D {} ms)",
+        t_sweep.elapsed().as_millis(),
+        PACKED_READ_MS.load(Ordering::Relaxed),
+        PACKED_UPLOAD_MS.load(Ordering::Relaxed),
+    );
     Ok(Qwen35Weights {
         token_embd,
         embd_format,
@@ -2215,10 +2478,19 @@ impl WeightSource for HfqSource<'_> {
     fn n_layers(&self) -> usize {
         self.c.n_layers
     }
-
     fn prepare(&mut self, n_devices: usize) -> HipResult<()> {
+        // Keep the mmap alive on discrete GPUs (the carrier cleared
+        // `evict_page_cache` there): weight uploads DMA straight out of
+        // page-cache pages with no heap staging copy — measured 11–16 GB/s
+        // end-to-end vs ~4 GB/s through a pread staging buffer.
+        // UMA keeps the drop — evict=true is exactly the carrier's UMA
+        // signal — so cached model pages can't starve hipMalloc of RAM.
+        //
+        // NOTE: do NOT madvise-populate the mapping here. A blocking
+        // MAP_POPULATE measured identical totals (it relocates the same
+        // soft-fault work out of the upload loop into one serial stall).
         #[cfg(unix)]
-        if n_devices == 1 {
+        if n_devices == 1 && self.hfq.evicts_page_cache() {
             self.hfq.drop_mmap();
         }
         let _ = n_devices;
@@ -2239,7 +2511,7 @@ impl WeightSource for HfqSource<'_> {
                 c.mrope_interleaved, c.mrope_section
             );
         }
-        let (embd_meta, embd_data) = qwen35_tensor_data_vec(self.hfq, "embed_tokens.weight")
+        let (embd_meta, embd_data) = qwen35_tensor_data_cow(self.hfq, "embed_tokens.weight")
             .expect("embed_tokens not found");
         let out = load_embedding(gpu, embd_meta.quant_type, &embd_data, c.vocab_size, c.dim)?;
         drop(embd_data);
@@ -2273,11 +2545,11 @@ impl WeightSource for HfqSource<'_> {
             c.dim,
             |gpu| {
                 let (lm_info, lm_data) =
-                    qwen35_tensor_data_vec(hfq, "lm_head.weight").expect("lm_head present");
+                    qwen35_tensor_data_cow(hfq, "lm_head.weight").expect("lm_head present");
                 load_weight_tensor_raw(gpu, lm_info.quant_type, &lm_data, c.vocab_size, c.dim)
             },
             |gpu| {
-                let (embd_meta, embd_data) = qwen35_tensor_data_vec(hfq, "embed_tokens.weight")
+                let (embd_meta, embd_data) = qwen35_tensor_data_cow(hfq, "embed_tokens.weight")
                     .expect("embed_tokens not found");
                 dequant_weight_raw(gpu, embd_meta.quant_type, &embd_data, c.vocab_size, c.dim)
             },
@@ -2705,6 +2977,46 @@ fn packed_mq4_experts_supported(gpu: &Gpu) -> bool {
 /// preserving one `WeightTensor` view and one device pointer-table entry per
 /// expert. Returns `None` for every non-uniform/non-MQ4 layout so mixed tiers,
 /// ParoQuant, paged experts, and EP streaming retain their literal behavior.
+
+/// Host-side byte source for a packed blob: either a borrowed mmap slice
+enum HostBlob<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Vec<u8>),
+}
+
+impl AsRef<[u8]> for HostBlob<'_> {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(s) => s,
+            Self::Owned(v) => v,
+        }
+    }
+}
+
+/// Cumulative packed-expert sweep timings for the current model load, in ms.
+static PACKED_READ_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PACKED_UPLOAD_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Verify that `names[0..n]` are uniform-`stride` tensors laid out back-to-back
+/// in file order, and return the single borrowed mmap slice covering all of
+/// them. Returns `None` on any gap, overlap, stride mismatch, dropped mmap
+/// (UMA), or attached overlay.
+fn contiguous_tensor_span<'a>(hfq: &'a HfqFile, names: &[&str], stride: usize) -> Option<&'a [u8]> {
+    if names.is_empty() || hfq.has_overlay() {
+        return None;
+    }
+    let first = hfq.find_tensor_info(names[0])?;
+    let mut expect = first.data_offset;
+    for name in names {
+        let info = hfq.find_tensor_info(name)?;
+        if info.data_offset != expect || info.data_size != stride {
+            return None;
+        }
+        expect = info.data_offset.checked_add(info.data_size)?;
+    }
+    hfq.data_range(first.data_offset, expect - first.data_offset)
+}
+
 fn try_load_packed_mq4_experts(
     hfq: &HfqFile,
     gpu: &mut Gpu,
@@ -2713,6 +3025,8 @@ fn try_load_packed_mq4_experts(
     mi: usize,
     dim: usize,
 ) -> HipResult<Option<(Vec<ExpertWeights>, PackedExpertOwners)>> {
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
     if expert_ids.is_empty() {
         return Ok(None);
     }
@@ -2763,12 +3077,34 @@ fn try_load_packed_mq4_experts(
 
     let gate_up_stride = gate_up_stride.expect("non-empty packed MQ4 expert list");
     let down_stride = down_stride.expect("non-empty packed MQ4 expert list");
-    let (gate_up_host, down_host) = if hfq.has_overlay() {
+    // Zero-copy fast path: when every expert's tensor lies contiguous in-file
+    // (expert 0's gate_up ends exactly where expert 1's begins, etc.) and the
+    // mmap is alive (dGPU, no overlay), upload both blobs straight from the
+    // page cache — no pread staging Vec, no heap copy. Measured dominant cost
+    // of A3B MoE loads otherwise: 512 pread segments per blob into a fresh
+    // heap buffer, then a second copy into hipMalloc'd VRAM.
+    let gate_up_names: Vec<&str> = specs.iter().map(|s| s.gate_up_name.as_str()).collect();
+    let down_names: Vec<&str> = specs.iter().map(|s| s.down_name.as_str()).collect();
+    let gate_up_contig = contiguous_tensor_span(hfq, &gate_up_names, gate_up_stride);
+    let down_contig = contiguous_tensor_span(hfq, &down_names, down_stride);
+
+    let t_read = Instant::now();
+    // Zero-copy only pays when pages are resident: a borrowed-slice H2D from
+    // an evicted cache soft-faults serially inside the copy loop (~0.25 GB/s
+    // off disk), while the parallel-pread fallback reads with multiple lanes.
+    let zero_copy_ok = matches!((gate_up_contig, down_contig), (Some(_), Some(_)))
+        && hfq.mostly_page_cached_memo();
+    let (gate_up_host, down_host) = if zero_copy_ok {
+        let (Some(gu), Some(dn)) = (gate_up_contig, down_contig) else {
+            unreachable!("zero_copy_ok implies both spans resolved");
+        };
+        (HostBlob::Borrowed(gu), HostBlob::Borrowed(dn))
+    } else if hfq.has_overlay() {
         // Overlay offsets belong to a second file; retain the overlay-aware
         // serial path exactly rather than crossing files in reader workers.
-        let mut gate_up_host = Vec::with_capacity(gate_up_stride * specs.len());
-        let mut down_host = Vec::with_capacity(down_stride * specs.len());
-        for spec in &specs {
+        let mut gate_up_host = vec![0u8; gate_up_stride * specs.len()];
+        let mut down_host = vec![0u8; down_stride * specs.len()];
+        for (slot, spec) in specs.iter().enumerate() {
             {
                 let (_, bytes) = hfq.tensor_data_pread(&spec.gate_up_name).ok_or_else(|| {
                     HipError::new(
@@ -2789,7 +3125,8 @@ fn try_load_packed_mq4_experts(
                         ),
                     ));
                 }
-                gate_up_host.extend_from_slice(&bytes);
+                gate_up_host[slot * gate_up_stride..(slot + 1) * gate_up_stride]
+                    .copy_from_slice(&bytes);
             }
             {
                 let (_, bytes) = hfq.tensor_data_pread(&spec.down_name).ok_or_else(|| {
@@ -2808,10 +3145,10 @@ fn try_load_packed_mq4_experts(
                         ),
                     ));
                 }
-                down_host.extend_from_slice(&bytes);
+                down_host[slot * down_stride..(slot + 1) * down_stride].copy_from_slice(&bytes);
             }
         }
-        (gate_up_host, down_host)
+        (HostBlob::Owned(gate_up_host), HostBlob::Owned(down_host))
     } else {
         let jobs = [
             HfqReadJob::packed(
@@ -2831,14 +3168,18 @@ fn try_load_packed_mq4_experts(
             .map_err(|e| HipError::new(0, &format!("qwen35: parallel packed expert read: {e}")))?
             .into_iter();
         (
-            results.next().expect("two packed MQ4 jobs").data,
-            results.next().expect("two packed MQ4 jobs").data,
+            HostBlob::Owned(results.next().expect("two packed MQ4 jobs").data),
+            HostBlob::Owned(results.next().expect("two packed MQ4 jobs").data),
         )
     };
+    let trace = std::env::var_os("HIPFIRE_LOAD_TRACE").is_some();
+    let zero_copy =
+        matches!(gate_up_host, HostBlob::Borrowed(_)) && matches!(down_host, HostBlob::Borrowed(_));
+    let t_upload = Instant::now();
 
-    let gate_up_owner = gpu.upload_raw(&gate_up_host, &[specs.len(), gate_up_stride])?;
+    let gate_up_owner = gpu.upload_raw(gate_up_host.as_ref(), &[specs.len(), gate_up_stride])?;
     drop(gate_up_host);
-    let down_owner = match gpu.upload_raw(&down_host, &[specs.len(), down_stride]) {
+    let down_owner = match gpu.upload_raw(down_host.as_ref(), &[specs.len(), down_stride]) {
         Ok(owner) => owner,
         Err(error) => {
             let _ = gpu.free_tensor(gate_up_owner);
@@ -2846,6 +3187,15 @@ fn try_load_packed_mq4_experts(
         }
     };
     drop(down_host);
+    let upload_ms = t_upload.elapsed().as_millis() as u64;
+    let read_ms = t_read.elapsed().as_millis() as u64 - upload_ms;
+    PACKED_READ_MS.fetch_add(read_ms, Ordering::Relaxed);
+    PACKED_UPLOAD_MS.fetch_add(upload_ms, Ordering::Relaxed);
+    if trace {
+        eprintln!(
+            "  [load-trace] packed experts: host-read {read_ms} ms, H2D {upload_ms} ms, zero-copy={zero_copy}"
+        );
+    }
 
     let mut experts = Vec::with_capacity(specs.len());
     for (slot, spec) in specs.iter().enumerate() {

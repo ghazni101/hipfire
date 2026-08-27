@@ -225,6 +225,20 @@ pub fn check_moe_decode_supported(
     Ok(())
 }
 
+/// True when the gate→down step must NOT fuse the FWHT rotation, because the
+/// routed `down` weights were packed in the NATURAL basis.
+///
+/// Every rotated dtype folds the rotation into the silu+mul step so the down
+/// GEMV receives an FWHT-basis activation. `MQ2G256LloydU` is the unrotated
+/// sibling of MQ2-Lloyd: rotating here would feed a rotated activation to
+/// unrotated weights, which produces plausible-looking garbage rather than an
+/// error. Extracted as a predicate so the invariant "unrotated dtype ⇔ no
+/// rotation anywhere in its path" can be pinned by test — see
+/// `unrotated_dtype_skips_both_rotations`.
+pub(crate) fn gate_down_skips_rotation(routed_down: DType) -> bool {
+    matches!(routed_down, DType::MQ2G256LloydU)
+}
+
 /// MoE decode executor. Ports the body of `moe_ffn_decode_impl` verbatim,
 /// substituting `ffn.*`/`config.*`/`s.*` references with `MoeParams` fields.
 /// Resolution is owned here (computed from `MoeDtypes` + k), and `ctx` is
@@ -586,7 +600,25 @@ pub fn run_moe_decode(
     if !res.routed_indexable_paro {
         hip!(gpu.ensure_mq_signs())?;
     }
-    let xr = x_rot_local.expect("use_gpu_topk implies x_rot_local is Some");
+    // The activation the routed-expert GEMVs consume.
+    //
+    // Every rotated dtype gets the FWHT-rotated `x_rot_local`. MQ2G256LloydU is
+    // the unrotated sibling — the resolver leaves `needs_x_rot_local` false for
+    // it, so `x_rot_local` is None and the correct input is the natural-basis
+    // activation. The old unconditional `.expect()` encoded the now-false
+    // invariant "use_gpu_topk implies x_rot_local is Some"; keep it as a
+    // debug_assert on the rotated branch so a dtype that genuinely needs
+    // rotation still trips loudly instead of silently reading unrotated x.
+    let xr = match x_rot_local {
+        Some(xr) => xr,
+        None => {
+            debug_assert!(
+                !res.needs_x_rot_local,
+                "needs_x_rot_local is set but no rotated activation was produced"
+            );
+            p.x_norm
+        }
+    };
     let gate_up_k = p.routed_gate_up_k;
     let down_m = p.routed_down_m;
     let down_k = p.routed_down_k;
@@ -628,7 +660,14 @@ pub fn run_moe_decode(
     let ninepath_mq3l = ninepath_shape_ok
         && p.dtypes.routed_gate_up == DType::MQ2G256Lloyd
         && p.dtypes.routed_down == DType::MQ3G256Lloyd;
-    let ninepath_eligible = ninepath_hfq4 || ninepath_mq3l;
+    // qt44. The published Ornith 1.5 artifact clears `ninepath_shape_ok`
+    // exactly (hidden_size 2048, moe_intermediate_size 512,
+    // num_experts_per_tok 8) but matched neither family above, so it paid the
+    // expanded+combine cost on the shape this path was tuned for.
+    let ninepath_mq4v2 = ninepath_shape_ok
+        && p.dtypes.routed_gate_up == DType::MQ4G256V2
+        && p.dtypes.routed_down == DType::MQ4G256V2;
+    let ninepath_eligible = ninepath_hfq4 || ninepath_mq3l || ninepath_mq4v2;
     // Modes: "0"/off = chain; "d3" = D3 only (RESEARCH: 1-ULP codegen
     // divergence from the baseline gate_up — not byte-exact, and slower);
     // "1"/"on" = D3+D4 (research); anything else incl. unset = D4 only
@@ -660,6 +699,20 @@ pub fn run_moe_decode(
                 p.gate_batch,
                 p.up_batch,
                 p.mi,
+                gate_up_k,
+            ))?;
+        } else if res.routed_indexable_mq4v2 {
+            // qt44. MUST precede the trailing `else`, which dispatches the qt13
+            // kernel: qt13 reads bytes [0..8) as one f32 scale + one f32 zero,
+            // where qt44 stores two f16 scale/zero pairs. Same 136 B stride, so
+            // the misread is silent — fluent text, wrong numbers.
+            hip!(gpu.gemv_mq4g256v2_moe_gate_up_k8_indexed(
+                p.expert_gate_up_ptrs,
+                p.topk_indices,
+                xr,
+                p.gate_batch,
+                p.up_batch,
+                2 * p.mi,
                 gate_up_k,
             ))?;
         } else if res.routed_indexable_paro {
@@ -708,7 +761,10 @@ pub fn run_moe_decode(
                 p.k,
                 1,
             ))?;
-        } else if p.dtypes.routed_gate_up == DType::MQ2G256Lloyd {
+        } else if matches!(
+            p.dtypes.routed_gate_up,
+            DType::MQ2G256Lloyd | DType::MQ2G256LloydU
+        ) {
             // Uniform MQ2-Lloyd routed experts: ds4/minimax indexed Lloyd gate_up
             // GEMV. y_gate/y_up are separate buffers; m = 2*p.mi (kernel splits at
             // M/2 internally); trailing k_top = p.k. X is the FWHT-rotated xr.
@@ -840,6 +896,19 @@ pub fn run_moe_decode(
                 p.mi,
                 p.k,
             ))?;
+        } else if gate_down_skips_rotation(p.dtypes.routed_down) {
+            // UNROTATED down weights: silu+mul with NO FWHT.
+            //
+            // Every other arm here fuses the rotation in because its down
+            // weights were packed in the FWHT basis. MQ2G256LloydU is the
+            // unrotated sibling — rotating the intermediate before an
+            // unrotated down GEMV is exactly the silent-garbage failure this
+            // dtype exists to avoid, and it would not crash or even look
+            // wrong until the model generated text.
+            //
+            // silu_mul is elementwise, so one launch over the whole
+            // [k_top * mi] buffer covers every selected expert.
+            hip!(gpu.silu_mul_f32(p.gate_batch, p.up_batch, p.rot_batch))?;
         } else {
             // MQ4/MQ6, no AWQ on expert down weights (the common case for A3B).
             hip!(gpu.fused_silu_mul_rotate_mq_batched(
@@ -858,6 +927,20 @@ pub fn run_moe_decode(
             // krank order (single owner per row, no atomics), so the shared
             // combine below is skipped exactly as it is for the HFQ4 arm.
             hip!(gpu.gemv_mq3g256_lloyd_moe_ninepath_d4(
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.topk_weights,
+                p.rot_batch,
+                out_target,
+                down_m,
+                down_k,
+            ))?;
+        } else if ninepath_d4 && ninepath_mq4v2 {
+            // MUST precede the bare `ninepath_d4` arm below, which calls the
+            // qt13 kernel. qt13 and qt44 share a 136 B stride and nibble
+            // packing and differ only in the header, so that fallthrough would
+            // misread qt44 silently.
+            hip!(gpu.gemv_mq4g256v2_moe_ninepath_d4(
                 p.expert_down_ptrs,
                 p.topk_indices,
                 p.topk_weights,
@@ -904,7 +987,10 @@ pub fn run_moe_decode(
                 p.k,
                 1,
             ))?;
-        } else if p.dtypes.routed_down == DType::MQ2G256Lloyd {
+        } else if matches!(
+            p.dtypes.routed_down,
+            DType::MQ2G256Lloyd | DType::MQ2G256LloydU
+        ) {
             // MQ2-Lloyd down: atomic, weighted, SELF-COMBINING residual GEMV.
             // silu-output rotate (rot_batch) -> down -> * topk_weight[krank] ->
             // atomicAdd into out_target, all in one launch. NO separate combine
@@ -1056,7 +1142,11 @@ pub fn run_moe_decode(
         || (p.expert_dtype_tags.is_none()
             && matches!(
                 p.dtypes.routed_down,
-                DType::MQ2G256Lloyd | DType::MQ3G256Lloyd | DType::MQ2G256GL | DType::MQ3G256GL
+                DType::MQ2G256Lloyd
+                    | DType::MQ2G256LloydU
+                    | DType::MQ3G256Lloyd
+                    | DType::MQ2G256GL
+                    | DType::MQ3G256GL
             ));
     if !ninepath_d4 && !routed_down_self_combines && !p.defer_routed_combine {
         hip!(gpu.moe_down_combine_k8_batched(
@@ -1111,6 +1201,7 @@ fn dtype_name(d: DType) -> &'static str {
         DType::MQ3G256 => "MQ3G256",
         DType::MQ2G256 => "MQ2G256",
         DType::MQ2G256Lloyd => "MQ2G256Lloyd",
+        DType::MQ2G256LloydU => "MQ2G256LloydU",
         DType::MQ3G256Lloyd => "MQ3G256Lloyd",
         DType::MQ2G256GL => "MQ2G256GL",
         DType::MQ3G256GL => "MQ3G256GL",
@@ -2298,7 +2389,20 @@ fn dispatch_grouped_gemm(
         // recipe: gate_up = MQ2-Lloyd 72 B/group, down = MQ3-Lloyd 112 B/group).
         // Both entries are arch-selecting (gfx11 `_k2` / gfx12 `_gfx12`) — do NOT
         // swap either for the bare `_k2` launcher, which fails the JIT on RDNA4.
-        DType::MQ2G256Lloyd => hip!(gpu.gemm_mq2g256_lloyd_moe_grouped_wmma(
+        DType::MQ2G256Lloyd | DType::MQ2G256LloydU => hip!(gpu
+            .gemm_mq2g256_lloyd_moe_grouped_wmma(
+                ptrs,
+                tile_ids,
+                sorted_slot_index,
+                x,
+                y,
+                m,
+                k,
+                x_row_div,
+                m_total,
+                rows,
+            )),
+        DType::MQ3G256Lloyd => hip!(gpu.gemm_mq3g256_lloyd_moe_grouped_wmma(
             ptrs,
             tile_ids,
             sorted_slot_index,
@@ -2310,7 +2414,12 @@ fn dispatch_grouped_gemm(
             m_total,
             rows,
         )),
-        DType::MQ3G256Lloyd => hip!(gpu.gemm_mq3g256_lloyd_moe_grouped_wmma(
+        // qt44. Routed experts are ~99% of an A3B MoE's tensors, so without
+        // this arm a qt44 MoE model cannot prefill at all — it falls into the
+        // `_other` error below. Arch-selecting (gfx11 `_k2` / gfx12 `_gfx12`)
+        // like the MQ2/MQ3-Lloyd sisters — do NOT swap it for the bare `_k2`
+        // launcher, which fails the JIT on RDNA4.
+        DType::MQ4G256V2 => hip!(gpu.gemm_mq4g256v2_moe_grouped_wmma_k2(
             ptrs,
             tile_ids,
             sorted_slot_index,
@@ -2603,7 +2712,12 @@ pub fn run_moe_prefill(
             // weight bytes. The GL dtypes are deliberately absent: they are not
             // batched-prefill admissible (no grouped GEMM, no batched GEMV), so
             // reaching here with a GL down is a bug and must stay a loud error.
+            // qt44 belongs here for the same reason as every other MQ dtype:
+            // the silu/rotate kernels below consume f32 gate_batch/up_batch
+            // activations and never touch quantized weights, so this match is
+            // selecting a branch, not a decode path.
             DType::MQ4G256
+            | DType::MQ4G256V2
             | DType::MQ5G256
             | DType::MQ6G256
             | DType::MQ2G256Lloyd
@@ -2727,6 +2841,16 @@ pub fn run_moe_prefill(
         // (gfx12 via env override); the Gpu method exists.
         let down_result = match p.dtypes.routed_down {
             DType::MQ4G256 => hip!(gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
+                p.expert_down_ptrs,
+                p.topk_indices,
+                p.rot_batch,
+                p.down_expanded,
+                down_m,
+                down_k,
+                k_top,
+                n,
+            )),
+            DType::MQ4G256V2 => hip!(gpu.gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded(
                 p.expert_down_ptrs,
                 p.topk_indices,
                 p.rot_batch,

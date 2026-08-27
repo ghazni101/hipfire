@@ -22,14 +22,11 @@
 //!   ← {"type":"unloaded"}
 
 use base64::Engine;
-// Used by hipfire_generate::qwen::generate_qwen35_mtp (native-MTP serve path, merged from spec-graph):
-// it manually re-packs the Qwen35 bundle on every exit + re-opens the HFQ mmap.
 use hipfire_runtime::emit_text::{
     currently_in_think, extract_tool_calls_from_text, ThinkOutputRouter, ThinkRouteEvent,
     ToolOutputRouter, ToolRouteError, ToolRouteEvent,
 };
 use hipfire_runtime::eos_filter::{EosFilter, EosFilterConfig, FilterAction};
-use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama;
 use hipfire_runtime::prompt_frame::ThinkMode;
 use hipfire_runtime::sampler::{self, SamplerConfig};
@@ -39,222 +36,78 @@ use std::path::Path;
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
-use hipfire_loader::{AsstTurnCache, EpArch, EpState, Eviction, LoadedModel};
-use hipfire_runtime::spec::{
-    ClientEvent, EmitOutcome, EvictRetain, FinishSummary, PrefillOutcome, SpecAdvance, SpecEmit,
-    SpecTarget, Speculator, StopReason,
-};
 use hipfire_engine::emit::*;
 use hipfire_engine::prompt::*;
 use hipfire_engine::redline::*;
 use hipfire_engine::scheduler::*;
 use hipfire_engine::terminal::*;
-use hipfire_generate::vision::{GenerateVLParams, ImageSource};
-use hipfire_generate::redline::{
-    handle_redline_dispatch_profile,
-    handle_redline_dspark_shadow_pm4,
-    handle_redline_pm4_prefix_profile,
-    handle_redline_prefix_shadow,
-    handle_redline_probe_aql,
-    handle_redline_shadow,
-    RedlineDeepseek4Snapshot,
-    RedlineDsparkArm,
-    RedlineDsparkReplayArm,
-    RedlineDsparkVerifySnapshot,
-    RedlineLfm2MoeSnapshot,
-    RedlineQwenSnapshot,
-    RedlineSnapshot,
-    redline_append_tensor_slice,
-    redline_bench_decode_deepseek4,
-    redline_bench_decode_lfm2moe,
-    redline_deepseek4_snapshot,
-    redline_dspark_shadow_block,
-    redline_dspark_verify_guard,
-    redline_dspark_verify_snapshot,
-    redline_is_dense_lfm,
-    redline_lfm2moe_snapshot,
-    redline_pm4_prefix_profile_deepseek4,
-    redline_prepare_retained_fixture,
-    redline_prime_deepseek4,
-    redline_prime_dspark_shadow_arm,
-    redline_prime_qwen,
-    redline_prime_retained_fixture,
-    redline_qwen_debug_hashes,
-    redline_qwen_snapshot,
-    redline_reset_deepseek4,
-    redline_reset_lfm2moe,
-    redline_reset_qwen,
-    redline_run_deepseek4_decode,
-    redline_run_direct_fixture,
-    redline_run_dspark_capture_arm,
-    redline_run_dspark_direct_arm,
-    redline_run_dspark_replay_arm,
-    redline_shadow_deepseek4,
-    redline_shadow_dspark_verify_pm4,
-    redline_snapshot,
-};
-use hipfire_generate::ar::{
-    reset_core_arch_key,
-    emit_qwen_ar_done,
-    model_retry_reset_eligible,
-    GenerationRoute,
-    GenerationRouteInputs,
-    QwenArCacheAction,
-    QwenArForwardFailAction,
-    QwenArRawCommitDisposition,
-    QwenArRouteFinish,
-    QwenArSemanticProducer,
-    QwenArTerminalCause,
-    ckpt_interval,
-    ckpt_max,
-    ckpt_resume_enabled,
-    deepseek4_spec_requested,
-    deepseek4_spec_requested_from_policy,
-    emit_qwen_ar_open_think_terminal,
-    generate,
-    llama_prefill_sample_seed,
-    llama_qwen3_batched_prefill_eligible,
-    qwen_ar_apply_cache_action,
-    qwen_ar_cache_action,
-    qwen_ar_done_value,
-    qwen_ar_drain_pending_into_router,
-    qwen_ar_eos_filter_config,
-    qwen_ar_eviction_prefill_chunk_limit,
-    qwen_ar_finish_route,
-    qwen_ar_forward_fail_action,
-    qwen_ar_forward_fail_message,
-    qwen_ar_observe_and_route,
-    qwen_ar_raw_commit_token,
-    qwen_ar_route_filter_text,
-    qwen_ar_route_think_events,
-    select_generation_route,
-    truncate_checkpoints,
-    write_error,
-};
-use hipfire_generate::batch::{
-    attach_qwen_ep_batch_receipt_evidence,
-    drive_lfm_continuous_batch,
-    drive_qwen35_ep_continuous_batch,
-    drive_qwen_continuous_batch,
-    emit_uncorrelated_error,
-    is_batch_request_eligible,
-    is_qwen_ep_batch_request_eligible,
-    lfm_prefill_cancellable_or_fallback,
-};
-#[cfg(feature = "serve-fault-inject")]
-use hipfire_generate::ar::take_fault_after_prefill;
+use hipfire_engine::wire_seed::parse_wire_seed;
 #[cfg(feature = "serve-fault-inject")]
 use hipfire_generate::ar::arm_fault_after_prefill;
-
-
-
-
+#[cfg(feature = "serve-fault-inject")]
+use hipfire_generate::ar::take_fault_after_prefill;
+use hipfire_generate::ar::{
+    ckpt_interval, ckpt_max, ckpt_resume_enabled, deepseek4_spec_requested,
+    deepseek4_spec_requested_from_policy, emit_qwen_ar_done, emit_qwen_ar_open_think_terminal,
+    generate, llama_prefill_sample_seed, llama_qwen3_batched_prefill_eligible,
+    model_retry_reset_eligible, qwen_ar_apply_cache_action, qwen_ar_cache_action,
+    qwen_ar_done_value, qwen_ar_drain_pending_into_router, qwen_ar_eos_filter_config,
+    qwen_ar_eviction_prefill_chunk_limit, qwen_ar_finish_route, qwen_ar_forward_fail_action,
+    qwen_ar_forward_fail_message, qwen_ar_observe_and_route, qwen_ar_raw_commit_token,
+    qwen_ar_route_filter_text, qwen_ar_route_think_events, reset_core_arch_key,
+    select_generation_route, truncate_checkpoints, write_error, GenerationRoute,
+    GenerationRouteInputs, QwenArCacheAction, QwenArForwardFailAction, QwenArRawCommitDisposition,
+    QwenArRouteFinish, QwenArSemanticProducer, QwenArTerminalCause,
+};
+use hipfire_generate::batch::{
+    attach_qwen_ep_batch_receipt_evidence, drive_lfm_continuous_batch,
+    drive_qwen35_ep_continuous_batch, drive_qwen_continuous_batch, emit_uncorrelated_error,
+    is_batch_request_eligible, is_qwen_ep_batch_request_eligible,
+    lfm_prefill_cancellable_or_fallback,
+};
+use hipfire_generate::redline::{
+    handle_redline_dflash_verify_shadow_pm4, handle_redline_dispatch_profile,
+    handle_redline_dspark_shadow_pm4, handle_redline_pm4_prefix_profile,
+    handle_redline_prefix_shadow, handle_redline_probe_aql, handle_redline_shadow,
+    redline_append_tensor_slice, redline_bench_decode_deepseek4, redline_bench_decode_lfm2moe,
+    redline_deepseek4_snapshot, redline_dspark_shadow_block, redline_dspark_verify_guard,
+    redline_dspark_verify_snapshot, redline_is_dense_lfm, redline_lfm2moe_snapshot,
+    redline_pm4_prefix_profile_deepseek4, redline_prepare_retained_fixture,
+    redline_prime_deepseek4, redline_prime_dspark_shadow_arm, redline_prime_qwen,
+    redline_prime_retained_fixture, redline_qwen_debug_hashes, redline_qwen_snapshot,
+    redline_reset_deepseek4, redline_reset_lfm2moe, redline_reset_qwen,
+    redline_run_deepseek4_decode, redline_run_direct_fixture, redline_run_dspark_capture_arm,
+    redline_run_dspark_direct_arm, redline_run_dspark_replay_arm, redline_shadow_deepseek4,
+    redline_shadow_dspark_verify_pm4, redline_snapshot, RedlineDeepseek4Snapshot, RedlineDsparkArm,
+    RedlineDsparkReplayArm, RedlineDsparkVerifySnapshot, RedlineLfm2MoeSnapshot,
+    RedlineQwenSnapshot, RedlineSnapshot,
+};
+mod slots;
+use hipfire_generate::vision::{GenerateVLParams, ImageSource};
+use hipfire_loader::{AsstTurnCache, EpArch, EpState, Eviction, LoadedModel};
+use hipfire_runtime::spec::{
+    ClientEvent, EmitOutcome, EvictRetain, FinishSummary, PrefillOutcome, SpecAdvance, SpecEmit,
+    SpecTarget, Speculator, StopReason,
+};
 
 /// Formats the independent Qwen decode-batch path can actually execute.
 /// Must stay aligned with `lm_head_batched` + `prepare_decode_batch_inputs`
 /// in hipfire-arch-qwen35 — unsupported lm_head or F32 embedding must never
 /// advertise `continuous_batch_capable` or enter the batch route.
 
-
-
-
-
-
-
-
-
-
-
-
-
 pub type CaskConfig = hipfire_runtime::loader_api::CaskConfig;
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 #[allow(dead_code)]
 fn emit_error_no_id(stdout: &mut impl std::io::Write, message: impl std::fmt::Display) {
-    hipfire_generate::dense::emit_active_attempt_error(stdout, None, &message.to_string(), "internal", false, false);
+    hipfire_generate::dense::emit_active_attempt_error(
+        stdout,
+        None,
+        &message.to_string(),
+        "internal",
+        false,
+        false,
+    );
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 /// Parse attempt_id from a JSON number only (u64 or non-neg i64).
 /// Decimal strings are rejected — no further coercion.
@@ -279,14 +132,9 @@ fn require_wire_attempt_id(value: Option<&serde_json::Value>) -> Result<u64, &'s
     }
 }
 
-
-
-
 // ── serve-fault-inject (test-only; compiled out of production) ─────────
 // One-shot after-prefill GPU fault arm. Armed from generate parse when the
 // feature is on and the request carries test_fault_after_prefill:true.
-
-
 
 #[cfg(feature = "serve-fault-inject")]
 struct FaultAfterPrefillGuard;
@@ -296,8 +144,6 @@ impl Drop for FaultAfterPrefillGuard {
         arm_fault_after_prefill(false);
     }
 }
-
-
 
 #[cfg(feature = "serve-fault-inject")]
 fn write_test_state_snapshot(
@@ -434,7 +280,6 @@ fn write_test_state_snapshot(
     let _ = stdout.flush();
 }
 
-
 /// Pure `gen_start.contract_version` selection used by the live generate path.
 /// Qwen AR (5/6) and Muse Glimmer (14) advertise v2; DS4 (9) and every other
 /// arch stay unset.
@@ -445,35 +290,6 @@ fn write_test_state_snapshot(
 /// events, which Glimmer does not emit, so on legacy a tool turn arrived with
 /// `finish_reason=tool_calls` and an empty payload.
 const GLIMMER_SEMANTIC_CONTRACT_VERSION: u32 = 2;
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 /// Production Malformed error envelope for Qwen DFlash epilogue + tests.
 fn qwen_dflash_malformed_error_value(
@@ -494,34 +310,6 @@ fn qwen_dflash_malformed_error_value(
         "attempt_id": attempt_id,
     })
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
 #[allow(dead_code)]
 fn gpu_block_attractor_token(
@@ -609,7 +397,6 @@ const MAX_BASE64_ENCODED_LEN: usize = 40 * 1024 * 1024;
 /// can still OOM at allocation; that VRAM validation is out of scope here.
 const MAX_REQUESTED_SEQ: usize = 1024 * 1024;
 
-
 /// Typed active-attempt error writer used by generation failure paths and tests.
 fn write_typed_error(
     stdout: &mut impl std::io::Write,
@@ -619,11 +406,15 @@ fn write_typed_error(
     retryable: bool,
     rolled_back: bool,
 ) {
-    hipfire_generate::dense::emit_active_attempt_error(stdout, Some(id), message, class, retryable, rolled_back);
+    hipfire_generate::dense::emit_active_attempt_error(
+        stdout,
+        Some(id),
+        message,
+        class,
+        retryable,
+        rolled_back,
+    );
 }
-
-
-
 
 /// Pure gate for the deferred EP (tp>1) load handoff.
 ///
@@ -657,11 +448,6 @@ fn ep_deferred_handoff_error_message(prior_err: &str, rollback_err: Option<&str>
 fn ep_deferred_needs_vmm_preflight(load_tp: usize, model_present: bool) -> bool {
     load_tp > 1 && !model_present
 }
-
-
-
-
-
 
 /// Print a friendly, user-actionable message when Gpu::init fails. Matches
 /// the panic shape we used to emit (which dumped a Rust backtrace and the
@@ -932,6 +718,10 @@ fn main() {
     let mut continuous_batch_size: usize = 1;
     let mut batch_scheduler: Option<ContinuousBatchScheduler> = None;
     let mut batch_poisoned: Option<String> = None;
+    // Experimental multi-slot backend: alternate model owner (one SlotEngine/weight set).
+    // None => ordinary LoadedModel path. Continuous-batching integration is deferred.
+    // Arc allows request workers to hold the model alive only while active; reset/unload/swap refuse while active.
+    let mut slot_backend: Option<std::sync::Arc<slots::SlotBackend>> = None;
 
     // Background stdin reader. Drains stdin into an mpsc channel so
     // the main loop can pull non-blockingly between messages. Abort /
@@ -1078,6 +868,229 @@ fn main() {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(1) as usize;
                 let parsed_continuous_batch_size = parse_continuous_batch_size(msg.get("params"));
+                let experimental_multi_slot = msg
+                    .get("params")
+                    .and_then(|p| p.get("experimental_multi_slot"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if experimental_multi_slot {
+                    // Experimental slot backend is an alternate model owner, not a batch-mode switch.
+                    // Validate mutually exclusive knobs before any GPU work.
+                    if let Some(err) = slots::validate_load_caps(&msg) {
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            None,
+                            &err,
+                            "validation",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                    // Refuse model swap while slot requests active; do not keep old Arc alive via workers.
+                    if slot_backend.as_ref().is_some_and(|b| b.active_count() > 0) {
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            None,
+                            "load refused: slot requests active",
+                            "validation",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                    // Unload prior backends safely before loading the slot engine (exactly one weight copy).
+                    // Drop any prior slot backend only after active check.
+                    if let Some(slot) = slot_backend.take() {
+                        match std::sync::Arc::try_unwrap(slot) {
+                            Err(slot) => {
+                                slot_backend = Some(slot);
+                                emit_uncorrelated_error(
+                                    &mut stdout,
+                                    None,
+                                    "load refused: slot requests active (Arc live)",
+                                    "validation",
+                                    false,
+                                    false,
+                                );
+                                let _ = stdout.flush();
+                                continue;
+                            }
+                            Ok(slot) => {
+                                if let Err(reason) = slot.shutdown() {
+                                    emit_uncorrelated_error(
+                                        &mut stdout,
+                                        None,
+                                        &format!("prior slot shutdown failed: {reason}"),
+                                        "internal",
+                                        false,
+                                        false,
+                                    );
+                                    let _ = stdout.flush();
+                                    continue;
+                                }
+                                batch_clear_all_terminals();
+                            }
+                        }
+                    }
+                    // Tear down PFlash / ordinary model (eager; experimental requires pp=tp=1 so no EP deferral).
+                    if let Some(mut pf) = pflash_state.take() {
+                        if let Some(mut dg) = pflash_drafter_gpu.take() {
+                            dg.bind_thread_or_warn();
+                            pf.unload_drafter(&mut dg);
+                            gpu.bind_thread_or_warn();
+                        } else {
+                            pf.unload_drafter(&mut gpu);
+                        }
+                    }
+                    pflash_cfg = None;
+                    if let Some(m) = model.take() {
+                        if let Err(err) = hipfire_loader::unload_model(m, &mut gpu) {
+                            emit_uncorrelated_error(
+                                &mut stdout,
+                                None,
+                                &format!("prior unload failed: {err}"),
+                                "internal",
+                                false,
+                                false,
+                            );
+                            let _ = stdout.flush();
+                            continue;
+                        }
+                    } else if let Err(err) = hipfire_loader::ensure_vmm_ready_for_load(&mut gpu) {
+                        emit_uncorrelated_error(&mut stdout, None, &err, "internal", false, false);
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                    // Continuous-batch state must be cleared — slot backend is not batched.
+                    batch_scheduler = None;
+                    continuous_batch_size = 1;
+                    batch_poisoned = None;
+
+                    let path = msg.get("model").and_then(|v| v.as_str()).unwrap_or("");
+                    if path.is_empty() {
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            None,
+                            "load: missing model path",
+                            "validation",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                    let requested_max_seq = msg
+                        .get("params")
+                        .and_then(|p| p.get("max_seq"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(4096) as usize;
+                    let max_seq = requested_max_seq.min(MAX_REQUESTED_SEQ);
+                    let n_slots = msg
+                        .get("params")
+                        .and_then(|p| p.get("experimental_multi_slot_slots"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(4) as usize;
+                    let cap_tokens = msg
+                        .get("params")
+                        .and_then(|p| p.get("experimental_multi_slot_ctx"))
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as usize)
+                        .unwrap_or(max_seq);
+                    let prefill_chunk = msg
+                        .get("params")
+                        .and_then(|p| p.get("experimental_multi_slot_prefill_chunk"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(1024) as usize;
+                    match slots::SlotBackend::load(path, n_slots, cap_tokens, prefill_chunk) {
+                        Ok(backend) => {
+                            let arch = backend.arch_str().to_string();
+                            let dim = backend.dim();
+                            let layers = backend.layers();
+                            let vocab = backend.vocab();
+                            // Ensure ordinary model stays None — exactly one weight copy.
+                            model = None;
+                            slot_backend = Some(std::sync::Arc::new(backend));
+                            // Per contract: continuous_batch_capable false, cache_capable true, reasoning_contract qwen_jinja, plus experimental flag.
+                            let ack = serde_json::json!({
+                                "type": "loaded",
+                                "arch": arch,
+                                "dim": dim,
+                                "layers": layers,
+                                "vocab": vocab,
+                                "vl": false,
+                                "reasoning_contract": "qwen_jinja",
+                                "reasoning_effort_native": false,
+                                "reasoning_efforts": [],
+                                "cache_capable": true,
+                                "retry_reset_eligible": false,
+                                "continuous_batch_capable": false,
+                                "experimental_multi_slot": true
+                            });
+                            let _ = writeln!(stdout, "{ack}");
+                            let _ = stdout.flush();
+                        }
+                        Err(e) => {
+                            emit_uncorrelated_error(
+                                &mut stdout,
+                                None,
+                                &format!("load failed: {e}"),
+                                "internal",
+                                false,
+                                false,
+                            );
+                            let _ = stdout.flush();
+                        }
+                    }
+                    continue;
+                }
+                // Ordinary load: refuse while slot requests active, otherwise checked shutdown
+                if slot_backend.as_ref().is_some_and(|b| b.active_count() > 0) {
+                    emit_uncorrelated_error(
+                        &mut stdout,
+                        None,
+                        "load refused: slot requests active",
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
+                if let Some(slot) = slot_backend.take() {
+                    match std::sync::Arc::try_unwrap(slot) {
+                        Err(slot) => {
+                            slot_backend = Some(slot);
+                            emit_uncorrelated_error(
+                                &mut stdout,
+                                None,
+                                "load refused: slot requests active (Arc live)",
+                                "validation",
+                                false,
+                                false,
+                            );
+                            let _ = stdout.flush();
+                            continue;
+                        }
+                        Ok(slot) => {
+                            if let Err(reason) = slot.shutdown() {
+                                emit_uncorrelated_error(
+                                    &mut stdout,
+                                    None,
+                                    &format!("prior slot shutdown failed: {reason}"),
+                                    "internal",
+                                    false,
+                                    false,
+                                );
+                                let _ = stdout.flush();
+                                continue;
+                            }
+                            batch_clear_all_terminals();
+                        }
+                    }
+                }
                 // Unload previous if any. PFlash drafter goes first so
                 // its tensors join the pool before unload_model drains
                 // it -- otherwise free_tensor would queue them into the
@@ -1325,6 +1338,12 @@ fn main() {
                         .and_then(|p| p.get("dspark_conf_threshold"))
                         .and_then(|v| v.as_f64())
                         .map(|t| t as f32),
+                    mtp: match mtp_mode.as_str() {
+                        "on" => Some(true),
+                        "off" => Some(false),
+                        _ => None, // "auto" → loader default
+                    },
+                    mtp_k: Some(mtp_k),
                 };
 
                 // 0.1.7-alpha: DFlash tuning knobs forwarded from the CLI.
@@ -1730,7 +1749,8 @@ fn main() {
                         let vl = m.vision_config().is_some() || m.dots_ocr().is_some();
                         let (dim, layers, vocab) = match m.state.as_ref() {
                             Some(st) => {
-                                let arch = st.as_ref() as &dyn hipfire_runtime::arch_model::ArchModel;
+                                let arch =
+                                    st.as_ref() as &dyn hipfire_runtime::arch_model::ArchModel;
                                 (arch.dim(), arch.n_layers(), arch.vocab_size())
                             }
                             None => (0, 0, 0),
@@ -1829,16 +1849,44 @@ fn main() {
                         let cache_capable = matches!(m.arch_id, 5 | 6 | 9 | 10 | 12 | 14);
                         let retry_reset_eligible = model_retry_reset_eligible(m.arch_id);
                         let continuous_batch_capable = staged_batch_capable;
+                        let reasoning_contract = hipfire_loader::carrier_for(m.arch_id)
+                            .map(|c| c.caps().reasoning_contract.wire_name())
+                            .unwrap_or("unsupported");
+                        // Probe reasoning effort capability only for QwenJinja;
+                        // all other contracts emit safe false/[] without probing.
+                        let (reasoning_effort_native, reasoning_efforts): (bool, Vec<&str>) = {
+                            let is_qwen_jinja = reasoning_contract == "qwen_jinja";
+                            if is_qwen_jinja {
+                                if let (Some(tok), Some(tmpl)) =
+                                    (m.tokenizer.as_ref(), m.chat_template.as_ref())
+                                {
+                                    let cap =
+                                        hipfire_runtime::prompt_frame::probe_effort_capability(
+                                            tok, tmpl,
+                                        );
+                                    (cap.native, cap.supported)
+                                } else {
+                                    (false, Vec::new())
+                                }
+                            } else {
+                                (false, Vec::new())
+                            }
+                        };
+                        let reasoning_efforts_json = serde_json::to_string(&reasoning_efforts)
+                            .unwrap_or_else(|_| "[]".to_string());
                         // Load ack exposes batch dimensions/capability; EP adds parallelism metadata but never infers operation from logs.
                         if staged_ep_batch {
                             let _ = writeln!(
                                 stdout,
-                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"continuous_batch_slots":{},"continuous_batch_lane_capacity":{},"continuous_batch_parallelism":"expert_parallel","continuous_batch_rank_count":4,"continuous_batch_reduce":"peer_rooted_f32"}}"#,
+                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"continuous_batch_slots":{},"continuous_batch_lane_capacity":{},"continuous_batch_parallelism":"expert_parallel","continuous_batch_rank_count":4,"continuous_batch_reduce":"peer_rooted_f32"}}"#,
                                 arch,
                                 dim,
                                 layers,
                                 vocab,
                                 vl,
+                                reasoning_contract,
+                                reasoning_effort_native,
+                                reasoning_efforts_json,
                                 cache_capable,
                                 retry_reset_eligible,
                                 continuous_batch_capable,
@@ -1848,12 +1896,15 @@ fn main() {
                         } else {
                             let _ = writeln!(
                                 stdout,
-                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{}}}"#,
+                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{}}}"#,
                                 arch,
                                 dim,
                                 layers,
                                 vocab,
                                 vl,
+                                reasoning_contract,
+                                reasoning_effort_native,
+                                reasoning_efforts_json,
                                 cache_capable,
                                 retry_reset_eligible,
                                 continuous_batch_capable
@@ -2031,6 +2082,29 @@ fn main() {
                     arm_fault_after_prefill(want);
                     FaultAfterPrefillGuard
                 };
+                // Experimental slot backend dispatches before the ordinary model path.
+                // This preserves byte-for-byte default behavior when absent, and in experimental
+                // mode owns exactly one SlotEngine/weight set with no ordinary-model fallback.
+                // Spawn a bounded request worker so the main loop continues accepting independent generates.
+                if let Some(slot) = slot_backend.clone() {
+                    let msg_clone = msg.clone();
+                    let id_owned = id.to_string();
+                    let slot_clone = slot.clone();
+                    // Bounded: refuse if too many active? The backend's active counter bounds concurrency;
+                    // engine itself is the only GPU worker, so workers serialize on engine submit.
+                    std::thread::spawn(move || {
+                        // Each worker uses its own stdout handle; every event is one serde JSON line.
+                        let mut worker_stdout = std::io::stdout();
+                        let _ = slot_clone.handle_generate(
+                            &msg_clone,
+                            &mut worker_stdout,
+                            &id_owned,
+                            gen_attempt_id,
+                        );
+                        let _ = worker_stdout.flush();
+                    });
+                    continue;
+                }
                 let m = match model.as_mut() {
                     Some(m) => m,
                     None => {
@@ -2097,7 +2171,7 @@ fn main() {
                 // request (rather than silently dropping the fields).
                 let tools_json: Option<Vec<serde_json::Value>> = match msg.get("tools") {
                     Some(v) => match serde_json::from_value::<Vec<serde_json::Value>>(v.clone()) {
-                        Ok(t) => Some(t),
+                        Ok(t) => (!t.is_empty()).then_some(t),
                         Err(e) => {
                             hipfire_generate::dense::emit_active_attempt_error(
                                 &mut stdout,
@@ -2292,6 +2366,11 @@ fn main() {
                     .get("reasoning_effort")
                     .or_else(|| msg.get("thinking_mode"))
                     .and_then(|v| v.as_str());
+                // Typed thinking flag: when present it is authoritative for Jinja
+                // enablement. HTTP normalization always sends it; direct JSONL
+                // clients may omit it and fall back to legacy effort/cap inference.
+                let thinking_enabled: Option<bool> =
+                    msg.get("thinking_enabled").and_then(|v| v.as_bool());
                 let repeat_window = msg
                     .get("repeat_window")
                     .and_then(|v| v.as_u64())
@@ -2368,10 +2447,12 @@ fn main() {
                 };
                 // Budget for tokens emitted INSIDE the model's <think>...</think>
                 // block. 0 = uncapped (model thinks until it naturally closes).
-                // Triggered from the CLI by per-model `max_think_tokens` config,
-                // OpenAI `chat_template_kwargs.enable_thinking=false` (cap=1),
-                // and `reasoning.effort` (none=1, minimal=64, low=256, medium=
-                // 1024, high=4096, xhigh=0).
+                // This is an independent explicit cap (never derived from
+                // effort) — 0 means uncapped, 1 means immediately closed.
+                // Legacy direct JSONL without `thinking_enabled` still infers
+                // disable from `max_think==1` via the helper's fallback, but
+                // new clients send `thinking_enabled` as authority and keep
+                // `max_think_tokens` independent.
                 //
                 // When the cap is reached the daemon force-emits "</think>\n"
                 // through the same KV-write + sample path as a normal token,
@@ -2386,9 +2467,11 @@ fn main() {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0) as usize;
                 // Derive Jinja `enable_thinking` and `reasoning_effort` via
-                // pure helper (no lowercasing, no empty-drop).
+                // pure helper. `thinking_enabled` is authoritative when
+                // present; legacy effort/max_think inference is preserved
+                // only for direct old JSONL clients that omit it.
                 let (enable_thinking_jinja, reasoning_effort_jinja) =
-                    qwen_jinja_reasoning(raw_reasoning_effort, max_think_tokens);
+                    qwen_jinja_reasoning(thinking_enabled, raw_reasoning_effort, max_think_tokens);
                 // Controls the ChatML framing after the assistant role header.
                 // Propagated through both text and Qwen3.5-VL paths.
                 let assistant_prefix = match msg
@@ -2425,8 +2508,14 @@ fn main() {
                         eprintln!("[daemon/vl] non-zero seq_pos ({}) at VL dispatch — resetting conversation", m.seq_pos);
                         m.seq_pos = 0;
                         m.conversation_tokens.clear();
-                        hipfire_generate::common::free_checkpoints(&mut m.prefill_checkpoints, &mut gpu);
-                        hipfire_generate::common::free_checkpoints(&mut m.dflash_checkpoints, &mut gpu);
+                        hipfire_generate::common::free_checkpoints(
+                            &mut m.prefill_checkpoints,
+                            &mut gpu,
+                        );
+                        hipfire_generate::common::free_checkpoints(
+                            &mut m.dflash_checkpoints,
+                            &mut gpu,
+                        );
                         // The DFlash checkpoint ring now lives inside the
                         // speculator (m.dflash_checkpoints is vestigial/empty),
                         // so free THAT ring on conversation reset too — else its
@@ -2449,7 +2538,9 @@ fn main() {
                         // `LoadedModel.dn_state` — it was removed as vestigial
                         // (always None); the live DeltaNet state is inside the
                         // bundle. `m.kv_cache` is likewise vestigial on this path.
-                        if let Err(e) = hipfire_generate::common::reset_qwen35_recurrent(m, &mut gpu) {
+                        if let Err(e) =
+                            hipfire_generate::common::reset_qwen35_recurrent(m, &mut gpu)
+                        {
                             hipfire_generate::dense::emit_active_attempt_error(
                                 &mut stdout,
                                 Some(id),
@@ -2520,6 +2611,19 @@ fn main() {
                     } else {
                         max_think_tokens
                     };
+                    // Same tiered derivation as the text path below: explicit
+                    // wire `seed` wins, else attempt key + counter entropy.
+                    // Out-of-domain seeds (negative, fractional, non-numeric)
+                    // are rejected — never silently treated as unseeded.
+                    let client_seed = match parse_wire_seed(msg.get("seed")) {
+                        Ok(s) => s,
+                        Err(reason) => {
+                            write_error(&mut stdout, id, &reason);
+                            continue;
+                        }
+                    };
+                    let vl_request_seed =
+                        request_seed_for(&AttemptKey::new(id, gen_attempt_id), client_seed);
                     let params = GenerateVLParams {
                         id,
                         prompt,
@@ -2532,10 +2636,20 @@ fn main() {
                         repeat_window,
                         max_think_tokens: vl_max_think_tokens,
                         assistant_prefix,
+                        seed: vl_request_seed,
                     };
                     match vision_route {
-                        hipfire_loader::VisionRoute::DotsOcr => hipfire_generate::vision::generate_vl_dots_ocr(m, &mut gpu, &mut stdout, &params),
-                        _ => hipfire_generate::vision::generate_vl(m, &mut gpu, &mut stdout, &params),
+                        hipfire_loader::VisionRoute::DotsOcr => {
+                            hipfire_generate::vision::generate_vl_dots_ocr(
+                                m,
+                                &mut gpu,
+                                &mut stdout,
+                                &params,
+                            )
+                        }
+                        _ => {
+                            hipfire_generate::vision::generate_vl(m, &mut gpu, &mut stdout, &params)
+                        }
                     }
                 } else {
                     // Per-request PflashConfig: clone the load-time cfg
@@ -2704,6 +2818,17 @@ fn main() {
                                 batch_clear_terminal(id, gen_attempt_id);
                                 continue;
                             }
+                            // Explicit wire `seed` must reach the lane RNG on
+                            // the batched route too; out-of-domain values are
+                            // rejected loudly, never silently unseeded.
+                            let client_seed = match parse_wire_seed(msg.get("seed")) {
+                                Ok(s) => s,
+                                Err(reason) => {
+                                    write_error(&mut stdout, id, &reason);
+                                    batch_clear_terminal(id, gen_attempt_id);
+                                    continue;
+                                }
+                            };
                             let pending = BatchPendingRequest {
                                 key: AttemptKey::new(id, gen_attempt_id),
                                 prompt: prompt_owned.clone(),
@@ -2713,6 +2838,7 @@ fn main() {
                                 assistant_prefix,
                                 max_think_tokens,
                                 max_tokens,
+                                client_seed,
                                 sampling: sampling.clone(),
                             };
                             if let Some(sched) = batch_scheduler.as_mut() {
@@ -2850,6 +2976,17 @@ fn main() {
                                 batch_clear_terminal(id, gen_attempt_id);
                                 continue;
                             }
+                            // Explicit wire `seed` must reach the lane RNG on
+                            // the batched route too; out-of-domain values are
+                            // rejected loudly, never silently unseeded.
+                            let client_seed = match parse_wire_seed(msg.get("seed")) {
+                                Ok(s) => s,
+                                Err(reason) => {
+                                    write_error(&mut stdout, id, &reason);
+                                    batch_clear_terminal(id, gen_attempt_id);
+                                    continue;
+                                }
+                            };
                             let pending = BatchPendingRequest {
                                 key: AttemptKey::new(id, gen_attempt_id),
                                 prompt: prompt_owned.clone(),
@@ -2859,6 +2996,7 @@ fn main() {
                                 assistant_prefix,
                                 max_think_tokens,
                                 max_tokens,
+                                client_seed,
                                 sampling: sampling.clone(),
                             };
                             if let Some(sched) = batch_scheduler.as_mut() {
@@ -2986,6 +3124,26 @@ fn main() {
                     ]
                     .iter()
                     .any(|k| msg.get(*k).is_some());
+                    // Per-request sampler entropy (replaces the historical
+                    // fixed 0x13579BDF that made same-prompt requests
+                    // byte-identical at temp>0 on the sequential noslots path).
+                    // Explicit wire `seed` wins (deterministic per seed alone —
+                    // attempt identity is NOT mixed in, so two HTTP requests
+                    // with the same seed reproduce); otherwise hipfire-engine
+                    // mixes the attempt key with a process-global counter and
+                    // boot nonce so reused client keys still get distinct
+                    // streams. Out-of-domain seeds (negative, fractional,
+                    // non-numeric) are rejected — never silently treated as
+                    // unseeded.
+                    let client_seed = match parse_wire_seed(msg.get("seed")) {
+                        Ok(s) => s,
+                        Err(reason) => {
+                            write_error(&mut stdout, id, &reason);
+                            continue;
+                        }
+                    };
+                    let request_seed =
+                        request_seed_for(&AttemptKey::new(id, gen_attempt_id), client_seed);
                     generate(
                         m,
                         &mut gpu,
@@ -3017,8 +3175,8 @@ fn main() {
                         &stop_seqs, // hunt3 M-F
                         reasoning_effort_jinja.as_deref(),
                         enable_thinking_jinja,
-                    
                         logprobs_top_k,
+                        request_seed,
                     );
                 }
                 if let Some(marker) = gpu.replay.replay_observation_marker(id) {
@@ -3044,6 +3202,51 @@ fn main() {
                         continue;
                     }
                 };
+                // Experimental slot backend: alternate owner, reset via engine. Refuse while active, otherwise checked teardown, clear keyed entries, ack only success.
+                if let Some(slot) = slot_backend.as_ref() {
+                    if slot.active_count() > 0 {
+                        hipfire_generate::dense::write_error_envelope(
+                            &mut stdout,
+                            None,
+                            "reset refused: slot requests active",
+                            "validation",
+                            false,
+                            false,
+                            reset_attempt_id,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                    match slot.reset() {
+                        Ok(()) => {
+                            batch_clear_all_terminals();
+                            state_epoch = state_epoch.saturating_add(1);
+                            let ack = serde_json::json!({
+                                "type": "reset",
+                                "rolled_back": true,
+                                "state_epoch": state_epoch,
+                                "seq_pos": 0,
+                                "conversation_len": 0,
+                                "attempt_id": reset_attempt_id,
+                                "retry_reset_eligible": false,
+                            });
+                            let _ = writeln!(stdout, "{ack}");
+                        }
+                        Err(e) => {
+                            hipfire_generate::dense::write_error_envelope(
+                                &mut stdout,
+                                None,
+                                &format!("reset failed: {e}"),
+                                "transient",
+                                true,
+                                false,
+                                reset_attempt_id,
+                            );
+                        }
+                    }
+                    let _ = stdout.flush();
+                    continue;
+                }
                 // Reset conversation state without unloading the model.
                 // Single production epilogue owns ordering + graph/replay
                 // invalidate + sync attestation (same path as fail-closed turns).
@@ -3068,7 +3271,9 @@ fn main() {
                     if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
                         eprintln!("[qwen-cache RESET] daemon received reset — clearing conversation_tokens (was {})", m.conversation_tokens.len());
                     }
-                    let ep = hipfire_generate::common::production_fail_closed_rollback(m, &mut gpu, None, None);
+                    let ep = hipfire_generate::common::production_fail_closed_rollback(
+                        m, &mut gpu, None, None,
+                    );
                     if !ep.rolled_back {
                         let detail = ep
                             .context
@@ -3118,6 +3323,70 @@ fn main() {
             }
 
             "unload" => {
+                // Experimental slot backend owns its own weight copy; unload it exclusively. Refuse while active, otherwise checked teardown, clear keyed entries, ack only success. Do not allow old Arc workers to keep prior model alive.
+                if slot_backend.is_some() {
+                    if slot_backend.as_ref().is_some_and(|b| b.active_count() > 0) {
+                        let attempt = msg.get("attempt_id").and_then(|v| v.as_u64()).unwrap_or(0);
+                        hipfire_generate::dense::write_error_envelope(
+                            &mut stdout,
+                            None,
+                            "unload refused: slot requests active",
+                            "validation",
+                            false,
+                            false,
+                            attempt,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                    if let Some(slot) = slot_backend.take() {
+                        match std::sync::Arc::try_unwrap(slot) {
+                            Err(slot) => {
+                                slot_backend = Some(slot);
+                                let attempt =
+                                    msg.get("attempt_id").and_then(|v| v.as_u64()).unwrap_or(0);
+                                hipfire_generate::dense::write_error_envelope(
+                                    &mut stdout,
+                                    None,
+                                    "unload refused: slot requests active (Arc live)",
+                                    "validation",
+                                    false,
+                                    false,
+                                    attempt,
+                                );
+                                let _ = stdout.flush();
+                            }
+                            Ok(slot) => match slot.shutdown() {
+                                Ok(()) => {
+                                    batch_scheduler = None;
+                                    continuous_batch_size = 1;
+                                    batch_poisoned = None;
+                                    batch_clear_all_terminals();
+                                    let _ = writeln!(stdout, "{}", r#"{"type":"unloaded"}"#);
+                                    let _ = stdout.flush();
+                                }
+                                Err(reason) => {
+                                    let attempt =
+                                        msg.get("attempt_id").and_then(|v| v.as_u64()).unwrap_or(0);
+                                    hipfire_generate::dense::write_error_envelope(
+                                        &mut stdout,
+                                        None,
+                                        &format!("unload failed: {reason}"),
+                                        "internal",
+                                        false,
+                                        false,
+                                        attempt,
+                                    );
+                                    let _ = stdout.flush();
+                                }
+                            },
+                        }
+                    } else {
+                        let _ = writeln!(stdout, "{}", r#"{"type":"unloaded"}"#);
+                        let _ = stdout.flush();
+                    }
+                    continue;
+                }
                 // Batch guard: unload is forbidden while lanes active.
                 if batch_scheduler
                     .as_ref()
@@ -3299,6 +3568,14 @@ fn main() {
                     continue;
                 }
                 let n = msg.get("tokens").and_then(|v| v.as_u64()).unwrap_or(128) as usize;
+                let capture = msg
+                    .get("redline_capture")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let capture_detail = msg
+                    .get("redline_detail")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
                 // Guard physical_cap — reserve 32 slots of headroom so a subsequent
                 // generate request against the loaded model still has room. We guard
                 // on the *physical* buffer (not the advertised max_seq) because this
@@ -3344,6 +3621,20 @@ fn main() {
                 // measured interval, then time forward_prefill_batch + a
                 // trailing device_synchronize so we capture actual GPU
                 // completion (kernel launches are async by default).
+                if capture {
+                    if let Err(reason) = gpu.replay.begin_capture() {
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            None,
+                            &format!("redline prefill capture refused: {reason}"),
+                            "unsupported",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                }
                 let _ = gpu.hip.device_synchronize();
                 let t0 = Instant::now();
                 let mut prefill_err: Option<String> = None;
@@ -3356,10 +3647,17 @@ fn main() {
                         .expect("bench_prefill: unknown arch_id");
                     carrier
                         .bench_prefill(m, &mut gpu, &synthetic, n, &mut prefill_err)
-                        .expect("bench_prefill: carrier does not implement bench_prefill for this arch")
+                        .expect(
+                            "bench_prefill: carrier does not implement bench_prefill for this arch",
+                        )
                 };
                 let _ = gpu.hip.device_synchronize();
                 let elapsed = t0.elapsed().as_secs_f64();
+                let capture_summary = if capture {
+                    gpu.replay.finish_capture().map(Some)
+                } else {
+                    Ok(None)
+                };
 
                 // Reset state AFTER measurement — we've written N KV slots and a
                 // DeltaNet state that the next real request must not inherit.
@@ -3376,6 +3674,21 @@ fn main() {
                         gpu.invalidate_graph_state();
                     }
                 }
+                let capture_summary = match capture_summary {
+                    Ok(summary) => summary,
+                    Err(reason) => {
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            None,
+                            &format!("redline prefill capture failed: {reason}"),
+                            "internal",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
 
                 if run_ok {
                     let tok_s = if elapsed > 0.0 {
@@ -3383,13 +3696,28 @@ fn main() {
                     } else {
                         0.0
                     };
-                    let _ = writeln!(
-                        stdout,
-                        r#"{{"type":"prefill_result","tokens":{},"ms":{:.2},"tok_s":{:.1}}}"#,
-                        n,
-                        elapsed * 1000.0,
-                        tok_s
-                    );
+                    if let Some(summary) = capture_summary {
+                        let response = serde_json::json!({
+                            "type": "prefill_result",
+                            "tokens": n,
+                            "ms": elapsed * 1000.0,
+                            "tok_s": tok_s,
+                            "redline_capture": redline_capture_json(
+                                &gpu,
+                                summary,
+                                capture_detail,
+                            ),
+                        });
+                        let _ = writeln!(stdout, "{response}");
+                    } else {
+                        let _ = writeln!(
+                            stdout,
+                            r#"{{"type":"prefill_result","tokens":{},"ms":{:.2},"tok_s":{:.1}}}"#,
+                            n,
+                            elapsed * 1000.0,
+                            tok_s
+                        );
+                    }
                 } else {
                     emit_uncorrelated_error(
                         &mut stdout,
@@ -3542,13 +3870,28 @@ fn main() {
                 m.conversation_tokens.clear();
                 let _ = hipfire_generate::common::reset_qwen35_recurrent(m, &mut gpu);
                 let synthetic: Vec<u32> = (0..context as u32).map(|i| 10 + (i % 1000)).collect();
-                let prime_error: Option<String> = match hipfire_loader::bench_decode_route(m.arch_id) {
-                    hipfire_loader::BenchDecodeRoute::Qwen35 | hipfire_loader::BenchDecodeRoute::MuseGlimmer => hipfire_loader::carrier_for(m.arch_id)
-                        .and_then(|c| c.bench_decode_prime(m, &mut gpu, &synthetic))
-                        .unwrap_or_else(|| Some(format!("bench_decode_prime: carrier missing or unimplemented for arch_id={}", m.arch_id))),
-                    hipfire_loader::BenchDecodeRoute::Unsupported => Some(format!("bench_decode unsupported for arch_id={}", m.arch_id)),
-                    _ => Some(format!("bench_decode unsupported for arch_id={}", m.arch_id)),
-                };
+                let prime_error: Option<String> =
+                    match hipfire_loader::bench_decode_route(m.arch_id) {
+                        hipfire_loader::BenchDecodeRoute::Qwen35
+                        | hipfire_loader::BenchDecodeRoute::MuseGlimmer => {
+                            hipfire_loader::carrier_for(m.arch_id)
+                                .and_then(|c| c.bench_decode_prime(m, &mut gpu, &synthetic))
+                                .unwrap_or_else(|| {
+                                    Some(format!(
+                            "bench_decode_prime: carrier missing or unimplemented for arch_id={}",
+                            m.arch_id
+                        ))
+                                })
+                        }
+                        hipfire_loader::BenchDecodeRoute::Unsupported => Some(format!(
+                            "bench_decode unsupported for arch_id={}",
+                            m.arch_id
+                        )),
+                        _ => Some(format!(
+                            "bench_decode unsupported for arch_id={}",
+                            m.arch_id
+                        )),
+                    };
                 let _ = gpu.hip.device_synchronize();
                 if let Some(error) = prime_error {
                     emit_uncorrelated_error(
@@ -3587,15 +3930,32 @@ fn main() {
                 let t0 = Instant::now();
                 let mut decode_err: Option<String> = None;
                 let run_ok = match hipfire_loader::bench_decode_route(m.arch_id) {
-                    hipfire_loader::BenchDecodeRoute::Qwen35 | hipfire_loader::BenchDecodeRoute::MuseGlimmer => hipfire_loader::carrier_for(m.arch_id)
-                        .and_then(|c| c.bench_decode_run(m, &mut gpu, context, iterations, &mut decode_err))
-                        .unwrap_or(false),
+                    hipfire_loader::BenchDecodeRoute::Qwen35
+                    | hipfire_loader::BenchDecodeRoute::MuseGlimmer => {
+                        hipfire_loader::carrier_for(m.arch_id)
+                            .and_then(|c| {
+                                c.bench_decode_run(
+                                    m,
+                                    &mut gpu,
+                                    context,
+                                    iterations,
+                                    &mut decode_err,
+                                )
+                            })
+                            .unwrap_or(false)
+                    }
                     hipfire_loader::BenchDecodeRoute::Unsupported => {
-                        decode_err = Some(format!("bench_decode unsupported for arch_id={}", m.arch_id));
+                        decode_err = Some(format!(
+                            "bench_decode unsupported for arch_id={}",
+                            m.arch_id
+                        ));
                         false
                     }
                     _ => {
-                        decode_err = Some(format!("bench_decode unsupported for arch_id={}", m.arch_id));
+                        decode_err = Some(format!(
+                            "bench_decode unsupported for arch_id={}",
+                            m.arch_id
+                        ));
                         false
                     }
                 };
@@ -3700,6 +4060,10 @@ fn main() {
                 handle_redline_dspark_shadow_pm4(&msg, &mut model, &mut gpu, &mut stdout);
             }
 
+            "redline_dflash_verify_shadow_pm4" => {
+                handle_redline_dflash_verify_shadow_pm4(&msg, &mut model, &mut gpu, &mut stdout);
+            }
+
             "redline_shadow_aql" | "redline_shadow_pm4" => {
                 handle_redline_shadow(&msg, &mut model, &mut gpu, &mut stdout);
             }
@@ -3759,90 +4123,3 @@ fn main() {
         }
     }
 }
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-

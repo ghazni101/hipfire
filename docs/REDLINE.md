@@ -416,7 +416,7 @@ evidence.
 
 ### Steady-state dispatch profiler (attribution-only diagnostic)
 
-`scripts/redline_dispatch_profile.py` is a **named manual diagnostic** for
+`python3 -m tools.redline.dispatch_profile` is a **named manual diagnostic** for
 steady-state, exactly-once retained-PM4 per-dispatch span attribution on an
 instrumented GFX12 tape. It is **not** route proof, **not** Section 7
 certification or registry admission, and **not** absolute or pure kernel timing.

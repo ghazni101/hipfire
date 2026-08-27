@@ -18,6 +18,7 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 use serde::Deserialize;
 use std::collections::HashMap;
 use std::fs::File;
+use std::io::Write;
 use std::path::Path;
 
 /// Drop page cache for a file byte range via posix_fadvise(FADV_DONTNEED).
@@ -40,6 +41,202 @@ fn fadvise_dontneed(fd: std::os::unix::io::RawFd, offset: usize, len: usize) {
 
 #[cfg(not(unix))]
 fn fadvise_dontneed(_fd: i32, _offset: usize, _len: usize) {}
+
+impl HfqFile {
+    /// Start a background parallel cache warmer: N worker threads pread the
+    /// data region chunk-sequentially into the page cache while the loader
+    /// uploads tensors. Rationale (measured 2026-08-22, gfx1100 + btrfs md0):
+    /// a single `FADV_WILLNEED` does not saturate the array (~1.7 GB/s
+    /// effective serial reads), while 6 concurrent readers reach ~4.5 GB/s;
+    /// overlapping those reads with H2D uploads hides most of the disk time.
+    /// No-op when page-cache eviction is enabled (UMA — warming would double
+    /// RAM pressure). The returned guard stops the workers on drop.
+    #[cfg(unix)]
+    pub fn start_cache_warmup(&self) -> CacheWarmerGuard {
+        if self.evict_page_cache || self.mostly_page_cached() {
+            return CacheWarmerGuard::empty();
+        }
+        let end = self
+            .tensors
+            .last()
+            .map(|t| t.data_offset + t.data_size)
+            .unwrap_or(0);
+        if end == 0 {
+            return CacheWarmerGuard::empty();
+        }
+        const CHUNK: usize = 16 << 20;
+        // Measured 2026-08-23 on gfx1100 + btrfs md0, time-to-99%-resident for
+        // a 5.3 GB mq4 after drop_caches: 4 threads 3.69 GB/s, 8 threads
+        // 4.58 GB/s, 12 threads 5.00 GB/s (plateau = array sequential
+        // ceiling). 8 captures most of the win without a small army of
+        // threads competing with the upload thread.
+        const THREADS: usize = 8;
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let next = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let path = self.path.clone();
+        let mut handles = Vec::with_capacity(THREADS);
+        for _ in 0..THREADS {
+            let stop = stop.clone();
+            let next = next.clone();
+            let path = path.clone();
+            // Fallible spawn: under thread exhaustion (RLIMIT_NPROC, cgroup
+            // pids.max) `thread::spawn` would panic mid-load and kill the
+            // daemon. Degrade instead — fewer warmers only costs disk
+            // bandwidth; zero means the upload proceeds unwarmed.
+            match std::thread::Builder::new()
+                .name("hfq-cache-warmer".into())
+                .spawn(move || {
+                    let Ok(file) = std::fs::File::open(&path) else {
+                        return;
+                    };
+                    use std::os::unix::io::AsRawFd;
+                    let fd = file.as_raw_fd();
+                    let mut buf = vec![0u8; CHUNK];
+                    loop {
+                        if stop.load(std::sync::atomic::Ordering::Relaxed) {
+                            return;
+                        }
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        let off = i * CHUNK;
+                        if off >= end {
+                            return;
+                        }
+                        let len = CHUNK.min(end - off);
+                        let mut got = 0usize;
+                        while got < len {
+                            let n = unsafe {
+                                libc::pread(
+                                    fd,
+                                    buf[got..].as_mut_ptr() as *mut libc::c_void,
+                                    len - got,
+                                    (off + got) as libc::off_t,
+                                )
+                            };
+                            if n <= 0 {
+                                return;
+                            }
+                            got += n as usize;
+                        }
+                    }
+                }) {
+                Ok(handle) => handles.push(handle),
+                Err(_) => break,
+            }
+        }
+        if handles.is_empty() {
+            return CacheWarmerGuard::empty();
+        }
+        CacheWarmerGuard {
+            stop,
+            handles: Some(handles),
+        }
+    }
+
+    /// Fraction of data pages already resident in the page cache, via
+    /// `mincore` over an untouched shared mapping (mapping does not fault
+    /// pages in, so this is free). Used to skip the warmer when a repeat
+    /// load would only re-copy an already-resident file.
+    #[cfg(unix)]
+    pub fn mostly_page_cached(&self) -> bool {
+        let end = self
+            .tensors
+            .last()
+            .map(|t| t.data_offset + t.data_size)
+            .unwrap_or(0);
+        if end == 0 {
+            return false;
+        }
+        let Ok(file) = std::fs::File::open(&self.path) else {
+            return false;
+        };
+        let Ok(mmap) = (unsafe { memmap2::Mmap::map(&file) }) else {
+            return false;
+        };
+        let page = 4096usize;
+        let n_pages = mmap.len().div_ceil(page);
+        let mut vec = vec![0u8; n_pages];
+        let rc = unsafe {
+            libc::mincore(
+                mmap.as_ptr() as *mut libc::c_void,
+                mmap.len(),
+                vec.as_mut_ptr(),
+            )
+        };
+        if rc != 0 {
+            return false;
+        }
+        let resident = vec.iter().filter(|b| *b & 1 != 0).count();
+        resident * 100 >= n_pages * 90
+    }
+
+    /// [`Self::mostly_page_cached`] memoized per file instance. The probe
+    /// maps + mincores the whole multi-GB file (~0.4 s on an 18.8 GB model),
+    /// so callers inside a layer sweep must not re-run it per layer — but the
+    /// answer belongs to THIS file: a process-global memo goes stale when the
+    /// daemon swaps models (a warm model A would make a cold model B take the
+    /// zero-copy path and soft-fault serially at ~0.25 GB/s).
+    #[cfg(unix)]
+    pub fn mostly_page_cached_memo(&self) -> bool {
+        match self.pages_resident_memo.get() {
+            1 => true,
+            2 => false,
+            _ => {
+                let resident = self.mostly_page_cached();
+                self.pages_resident_memo.set(if resident { 1 } else { 2 });
+                resident
+            }
+        }
+    }
+
+    /// Non-unix fallback: no mincore probe available; never pre-detected as
+    /// cached (callers fall back to the pread path).
+    #[cfg(not(unix))]
+    pub fn mostly_page_cached_memo(&self) -> bool {
+        false
+    }
+
+    /// Non-unix fallback: never pre-detected as cached.
+    #[cfg(not(unix))]
+    fn mostly_page_cached(&self) -> bool {
+        false
+    }
+
+    /// Non-unix fallback: nothing to warm.
+    #[cfg(not(unix))]
+    pub fn start_cache_warmup(&self) -> CacheWarmerGuard {
+        CacheWarmerGuard::empty()
+    }
+}
+
+/// Stops the cache-warmup workers when dropped (load finished or abandoned).
+pub struct CacheWarmerGuard {
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    #[cfg(unix)]
+    handles: Option<Vec<std::thread::JoinHandle<()>>>,
+    #[cfg(not(unix))]
+    handles: Option<()>,
+}
+
+impl CacheWarmerGuard {
+    fn empty() -> Self {
+        Self {
+            stop: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+            handles: None,
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for CacheWarmerGuard {
+    fn drop(&mut self) {
+        self.stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        if let Some(handles) = self.handles.take() {
+            for h in handles {
+                let _ = h.join();
+            }
+        }
+    }
+}
 
 #[derive(Clone)]
 pub struct HfqTensorInfo {
@@ -118,6 +315,20 @@ pub struct HfqFile {
     /// can't be evicted while the mapping exists (FADV_DONTNEED is ignored
     /// for mmap'd regions per Linux kernel docs).
     pread_buf: std::cell::RefCell<Vec<u8>>,
+    /// Whether tensor reads evict their pages after reading
+    /// (`posix_fadvise(DONTNEED)`). Defaults to `true` — the historical
+    /// behavior, required on unified-memory APUs where cached model pages
+    /// compete 1:1 with hipMalloc'd VRAM staging in system RAM. Discrete-GPU
+    /// loaders should disable this via [`Self::set_evict_page_cache`] so
+    /// repeat loads hit the page cache and kernel readahead works; measured
+    /// 2026-08-22 on gfx1100: fadvise-per-tensor forces a full disk re-read
+    /// of the model on every load (~1.3 GB/s effective vs multi-GB/s cache).
+    evict_page_cache: bool,
+    /// Memoized result of [`Self::mostly_page_cached`] for THIS file:
+    /// 0 = not probed, 1 = resident, 2 = not resident. Per-instance (not a
+    /// process global) so loading a second model in the same daemon probes
+    /// its own file instead of inheriting the previous model's answer.
+    pages_resident_memo: std::cell::Cell<u8>,
     /// Optional overlay HFQ whose tensors shadow this file's by name (the
     /// REAP load-time splice, SP3). When `Some`, every tensor read method
     /// consults the overlay first and falls back to the base. When `None`
@@ -134,7 +345,14 @@ impl HfqFile {
         Self::open_with_reap_plan(path, reap_plan.as_deref())
     }
 
-    fn open_with_reap_plan(path: &Path, reap_plan: Option<&Path>) -> std::io::Result<Self> {
+    /// `open` with the REAP plan injected instead of taken from process config.
+    ///
+    /// Public because the process config is a START-TIME SNAPSHOT
+    /// (`hipfire_config::active_or_local_process_config` is a `OnceLock`), so a
+    /// test that does `set_var("HIPFIRE_REAP_PLAN")` then `open()` only works if
+    /// it happens to be the first thing in the process to read config — an
+    /// order-dependent coin flip. Inject the plan here instead.
+    pub fn open_with_reap_plan(path: &Path, reap_plan: Option<&Path>) -> std::io::Result<Self> {
         let mut f = Self::open_at_offset(path, 0)?;
         // REAP load-time overlay splice (SP3): when the process policy points
         // at a dir containing `overlay.hfq`, attach it so its re-quantized
@@ -403,7 +621,6 @@ impl HfqFile {
             });
             cumulative_offset += data_size;
         }
-
         let me = Self {
             _file: file,
             path: path.to_path_buf(),
@@ -413,6 +630,8 @@ impl HfqFile {
             tensors,
             tensor_map,
             pread_buf: std::cell::RefCell::new(Vec::new()),
+            evict_page_cache: true,
+            pages_resident_memo: std::cell::Cell::new(0),
             overlay: None,
         };
 
@@ -450,6 +669,18 @@ impl HfqFile {
     /// so callers should only invoke this when UMA is detected.
     pub fn drop_mmap(&mut self) {
         self.mmap = None;
+    }
+
+    /// Enable/disable post-read page-cache eviction for this file. See the
+    /// `evict_page_cache` field docs. Discrete-GPU loaders call this with
+    /// `false` before loading; UMA paths keep the default (`true`).
+    pub fn set_evict_page_cache(&mut self, evict: bool) {
+        self.evict_page_cache = evict;
+    }
+
+    /// Whether reads on this file evict pages after reading.
+    pub fn evicts_page_cache(&self) -> bool {
+        self.evict_page_cache
     }
 
     /// Release the pread reuse buffer back to the allocator. After a
@@ -680,10 +911,10 @@ impl HfqFile {
         }
         let idx = self.resolve_idx(name)?;
         let info = &self.tensors[idx];
-        debug_assert!(
-            self.mmap.is_some(),
-            "tensor_data() called after drop_mmap() — use tensor_data_vec() or tensor_data_pread() instead (tensor: {name})"
-        );
+        // NOTE: `self.mmap` may legitimately be None here — UMA loads drop the
+        // mapping in prepare() and callers probe tensor_data() first, falling
+        // back to tensor_data_vec()/tensor_data_pread() on None. Do NOT
+        // assert-fail debug builds on that expected path.
         let mmap = self.mmap.as_ref()?;
         Some((
             info,
@@ -734,8 +965,12 @@ impl HfqFile {
                 }
                 total_read += n as usize;
             }
-            // Evict these pages from cache — works because pread doesn't hold a mapping.
-            fadvise_dontneed(fd, info.data_offset, info.data_size);
+            // Evict these pages from cache — works because pread doesn't hold a
+            // mapping. Skipped when the loader disabled eviction (discrete-GPU
+            // loads want the page cache warm for repeat loads).
+            if self.evict_page_cache {
+                fadvise_dontneed(fd, info.data_offset, info.data_size);
+            }
         }
         Some((info, self.pread_buf.borrow()))
     }
@@ -794,7 +1029,9 @@ impl HfqFile {
                 }
                 total_read += n as usize;
             }
-            fadvise_dontneed(fd, info.data_offset, info.data_size);
+            if self.evict_page_cache {
+                fadvise_dontneed(fd, info.data_offset, info.data_size);
+            }
             return Some((info, buf));
         }
 
@@ -808,13 +1045,34 @@ impl HfqFile {
         }
     }
 
+    /// Borrowed mmap byte range `[offset, offset+len)`. Zero-copy accessor for
+    /// callers that verified a set of tensors is contiguous in-file (via
+    /// `find_tensor_info` offsets) and want one slice covering all of them —
+    /// e.g. packed-expert blob uploads straight from the page cache.
+    ///
+    /// Returns `None` when the mapping was dropped (UMA / post-`drop_mmap`) or
+    /// when an overlay is attached (a range may span two files). Bounds-checked.
+    pub fn data_range(&self, offset: usize, len: usize) -> Option<&[u8]> {
+        if self.overlay.is_some() {
+            return None;
+        }
+        let mmap = self.mmap.as_ref()?;
+        let end = offset.checked_add(len)?;
+        if end > mmap.len() {
+            return None;
+        }
+        Some(&mmap[offset..end])
+    }
+
     /// Release page cache for a byte range. Only works if the range is NOT mmap'd.
     #[allow(dead_code)]
     pub fn drop_pages_range(&self, offset: usize, len: usize) {
         #[cfg(unix)]
         {
             use std::os::unix::io::AsRawFd;
-            fadvise_dontneed(self._file.as_raw_fd(), offset, len);
+            if self.evict_page_cache {
+                fadvise_dontneed(self._file.as_raw_fd(), offset, len);
+            }
         }
         #[cfg(not(unix))]
         {
@@ -1750,6 +2008,183 @@ pub fn load_weights_paroquant_llama(
         layers,
         lm_head_aliases_embd,
     })
+}
+// ─── HFQM streaming writer (calibration collector) ──────────────────────────
+
+/// One in-memory tensor for [`write_hfqm_package_mem`].
+pub struct HfqMemTensor {
+    pub name: String,
+    pub quant_type: u8,
+    pub shape: Vec<u32>,
+    pub group_size: u32,
+    pub data: Vec<u8>,
+}
+
+/// Descriptor for one tensor in a streaming HFQM write. `data_len` is the exact
+/// payload byte count (deterministic from `shape` + `quant_type`), so the index
+/// can be written before any payload is materialized — that is what lets the
+/// collector stream multi-GB Hessians one tensor at a time instead of holding
+/// them all in RAM.
+pub struct HfqStreamEntry {
+    pub name: String,
+    pub quant_type: u8,
+    pub shape: Vec<u32>,
+    pub group_size: u32,
+    pub data_len: u64,
+}
+
+/// Streaming HFQM writer: write the header + metadata + index up front (payload
+/// sizes come from `entries`), then call `write_nth(i, w)` once per entry, in
+/// index order, to stream that tensor's `data_len` bytes directly to the file.
+/// Only one tensor's payload need exist in memory at a time. `write_nth` MUST
+/// write exactly `entries[i].data_len` bytes. This is the canonical HFQM layout
+/// impl (the in-memory [`write_hfqm_package_mem`] is a thin wrapper over it).
+pub fn write_hfqm_package_streaming(
+    path: &Path,
+    arch_id: u32,
+    metadata_json: &str,
+    entries: &[HfqStreamEntry],
+    mut write_nth: impl FnMut(usize, &mut dyn Write) -> std::io::Result<()>,
+) -> std::io::Result<()> {
+    let meta = metadata_json.as_bytes();
+    let metadata_offset = 32u64;
+    let index_offset = metadata_offset + meta.len() as u64;
+    let mut index = Vec::new();
+    index.extend_from_slice(&(entries.len() as u32).to_le_bytes());
+    for e in entries {
+        let nb = e.name.as_bytes();
+        if nb.len() > u16::MAX as usize {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!("HFQM entry name too long: {}", e.name),
+            ));
+        }
+        index.extend_from_slice(&(nb.len() as u16).to_le_bytes());
+        index.extend_from_slice(nb);
+        index.push(e.quant_type);
+        index.push(e.shape.len() as u8);
+        for &d in &e.shape {
+            index.extend_from_slice(&d.to_le_bytes());
+        }
+        index.extend_from_slice(&e.group_size.to_le_bytes());
+        index.extend_from_slice(&e.data_len.to_le_bytes());
+    }
+    let data_start = index_offset + index.len() as u64;
+    let data_offset = (data_start + 4095) & !4095;
+    let mut f = std::io::BufWriter::new(File::create(path)?);
+    f.write_all(b"HFQM")?;
+    f.write_all(&1u32.to_le_bytes())?;
+    f.write_all(&arch_id.to_le_bytes())?;
+    f.write_all(&(entries.len() as u32).to_le_bytes())?;
+    f.write_all(&metadata_offset.to_le_bytes())?;
+    f.write_all(&data_offset.to_le_bytes())?;
+    f.write_all(meta)?;
+    f.write_all(&index)?;
+    f.write_all(&vec![0u8; (data_offset - data_start) as usize])?;
+    for (i, e) in entries.iter().enumerate() {
+        let mut counter = CountingWriter {
+            inner: &mut f,
+            written: 0,
+        };
+        write_nth(i, &mut counter)?;
+        if counter.written != e.data_len {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                format!(
+                    "HFQM entry {}: wrote {} bytes, index declared {}",
+                    e.name, counter.written, e.data_len
+                ),
+            ));
+        }
+    }
+    f.flush()?;
+    Ok(())
+}
+
+struct CountingWriter<'a, W: Write> {
+    inner: &'a mut W,
+    written: u64,
+}
+
+impl<W: Write> Write for CountingWriter<'_, W> {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let n = self.inner.write(buf)?;
+        self.written += n as u64;
+        Ok(n)
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.inner.flush()
+    }
+}
+
+/// Write an HFQM container from in-memory tensors. Thin wrapper over
+/// [`write_hfqm_package_streaming`] for callers that already hold every payload
+/// in RAM (e.g. small sidecars, tests). Large producers (the calibration
+/// collector) should stream instead.
+pub fn write_hfqm_package_mem(
+    path: &Path,
+    arch_id: u32,
+    metadata_json: &str,
+    tensors: &[HfqMemTensor],
+) -> std::io::Result<()> {
+    let entries: Vec<HfqStreamEntry> = tensors
+        .iter()
+        .map(|t| HfqStreamEntry {
+            name: t.name.clone(),
+            quant_type: t.quant_type,
+            shape: t.shape.clone(),
+            group_size: t.group_size,
+            data_len: t.data.len() as u64,
+        })
+        .collect();
+    write_hfqm_package_streaming(path, arch_id, metadata_json, &entries, |i, w| {
+        w.write_all(&tensors[i].data)
+    })
+}
+
+/// HFQM package reader for calibration part files. Thin wrapper over
+/// [`HfqFile`] that exposes the collector's `combine_calib_parts` API
+/// (`entries()` + `blob_data(name)`) without duplicating index parsing.
+pub struct HfqPackage {
+    inner: HfqFile,
+}
+
+impl HfqPackage {
+    pub fn open(path: &Path) -> std::io::Result<Self> {
+        Ok(Self {
+            inner: HfqFile::open(path)?,
+        })
+    }
+    pub fn entries(&self) -> Vec<HfqPackageEntry> {
+        self.inner
+            .tensors()
+            .iter()
+            .map(|t| HfqPackageEntry {
+                name: t.name.clone(),
+                quant_type: t.quant_type,
+                shape: t.shape.clone(),
+                group_size: t.group_size,
+                data_offset: t.data_offset,
+                data_size: t.data_size,
+            })
+            .collect()
+    }
+    pub fn blob_data(&self, name: &str) -> Option<&[u8]> {
+        let info = self.inner.tensors().iter().find(|t| t.name == name)?;
+        self.inner
+            .mmap
+            .as_ref()
+            .map(|m| &m[info.data_offset..info.data_offset + info.data_size] as &[u8])
+    }
+}
+#[derive(Debug, Clone)]
+pub struct HfqPackageEntry {
+    pub name: String,
+    pub quant_type: u8,
+    pub shape: Vec<u32>,
+    pub group_size: u32,
+    pub data_offset: usize,
+    pub data_size: usize,
 }
 
 #[cfg(test)]
