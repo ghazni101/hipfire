@@ -777,6 +777,7 @@ impl KvCache {
             KvMode::Fwht2 => (false, false, false, true, true),
             KvMode::Fwht3 => (false, false, true, false, true),
             KvMode::Fwht4 => (false, true, false, false, true),
+
             // Bf16 is NOT representable in this 5-flag VMM bundle — all-false
             // here would decode as KTier::F32 and hand a bf16 buffer to the
             // F32 kernels, which read it at twice the stride. It can never
@@ -4204,6 +4205,7 @@ mod vmm_layout_tests {
             KvMode::Asym2 | KvMode::Fwht2 => 4 + head_dim / 4,
             KvMode::Asym3 | KvMode::Fwht3 => 4 + (head_dim * 3) / 8,
             KvMode::Asym4 | KvMode::Fwht4 => 4 + head_dim / 2,
+
             KvMode::Bf16 => panic!("bf16 is not a VMM layout mode"),
         }
     }
