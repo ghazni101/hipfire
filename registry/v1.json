@@ -358,6 +358,7 @@
       "file": "maple-preview.mq2lloydu",
       "size_gb": 6.5,
       "min_vram_gb": 12,
+      "default_kv_mode": "bf16",
       "sampling": {
         "temperature": 1.0,
         "top_p": 0.95
