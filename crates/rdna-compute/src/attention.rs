@@ -1922,7 +1922,6 @@ impl Gpu {
             },
         )
     }
-
     /// Flat BF16 KV write for single-token decode. Launched twice by the
     /// caller (once for K, once for V), exactly like `kv_cache_write_q8_0`.
     ///

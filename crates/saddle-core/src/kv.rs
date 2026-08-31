@@ -1352,6 +1352,7 @@ impl KvCache {
     ///
     /// Sized by `physical_cap` like `new_gpu_q8_capped`, so eviction-bounded
     /// callers get the buffer they asked for.
+
     pub fn new_gpu_bf16(
         gpu: &mut Gpu,
         n_layers: usize,
