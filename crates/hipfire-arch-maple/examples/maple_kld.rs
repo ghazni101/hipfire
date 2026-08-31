@@ -195,8 +195,12 @@ fn main() {
 
     eprintln!("Loading weights from {}...", args.model);
     let t_load = Instant::now();
+<<<<<<< HEAD
     let mut b =
         load_maple_from_hfq(&mut hfq, &mut gpu, n, &args.kv_mode).expect("load maple bundle");
+=======
+    let mut b = load_maple_from_hfq(&mut hfq, &mut gpu, n, "").expect("load maple bundle");
+>>>>>>> f98ee50a4 (feat(maple): make --kv-mode functional for arch 15, with a bf16 option)
     eprintln!("Loaded in {:.1}s", t_load.elapsed().as_secs_f64());
     eprintln!(
         "maple: hidden={} layers={} experts={}/{} vocab={}",
