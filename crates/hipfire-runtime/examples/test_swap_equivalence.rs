@@ -157,6 +157,7 @@ fn main() {
             remaining_prompt: feed.to_vec(),
             next_pos: start_pos,
             decoding: false,
+            vl_prefill: None,
         }];
         let mut sched = Scheduler {
             chunk_size: feed.len().max(1),

@@ -1686,6 +1686,55 @@ mod tests {
     }
 
     #[test]
+    fn build_slot_mrope_rejects_degenerate_and_mismatched_inputs() {
+        let pad = 9u32;
+        let ids = vec![1, pad, pad, pad, pad, 3];
+        // Merged grid ((8/2)*(8/2)=16) disagrees with the spliced token count (4).
+        assert!(build_slot_mrope(&ids, pad, 4, 8, 8, 2).is_err());
+        // Zero visual tokens.
+        assert!(build_slot_mrope(&ids, pad, 0, 4, 4, 2).is_err());
+        // Degenerate spatial merge size.
+        assert!(build_slot_mrope(&ids, pad, 4, 4, 4, 0).is_err());
+        // A second pad run after the first — multi-image is not wired.
+        let split = vec![pad, pad, 5, pad, pad];
+        assert!(build_slot_mrope(&split, pad, 4, 4, 4, 2).is_err());
+        // A prompt with no pad at all.
+        let no_pad = vec![1, 2, 3];
+        assert!(build_slot_mrope(&no_pad, pad, 4, 4, 4, 2).is_err());
+    }
+
+    #[test]
+    fn extract_slot_image_wraps_top_level_image_url_as_base64() {
+        let msg = json!({"image_url": "data:image/png;base64,aGVsbG8="});
+        match extract_slot_image(&msg).unwrap() {
+            Some(SlotImage::Base64(s)) => assert_eq!(s, "data:image/png;base64,aGVsbG8="),
+            other => panic!("expected base64, got {other:?}"),
+        }
+        let none = json!({"prompt": "hi"});
+        assert!(extract_slot_image(&none).unwrap().is_none());
+    }
+
+    #[test]
+    fn extract_slot_image_rejects_oversized_base64() {
+        let big = "A".repeat(MAX_BASE64_ENCODED_LEN + 1);
+        let msg = json!({ "image_base64": big });
+        let err = extract_slot_image(&msg).unwrap_err();
+        assert!(err.contains("maximum encoded size"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn decode_image_base64_strips_data_urls_and_rejects_garbage() {
+        assert_eq!(
+            decode_image_base64("data:image/png;base64,aGVsbG8=").unwrap(),
+            b"hello"
+        );
+        assert_eq!(decode_image_base64("aGVsbG8=").unwrap(), b"hello");
+        // A data URL without the ',' separator fails closed.
+        assert!(decode_image_base64("data:image/png;base64").is_err());
+        assert!(decode_image_base64("not base64 !!!").is_err());
+    }
+
+    #[test]
     fn generate_caps_rejects_tools_and_stop_and_logprobs() {
         let m = json!({"tools": [{"type":"function"}], "experimental_multi_slot": true});
         assert!(validate_generate_caps(&m).is_some());

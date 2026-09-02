@@ -286,8 +286,7 @@ impl Rig {
             .as_deref()
         {
             Some("1") | Some("on") | Some("true") if !cfg.is_vl => {
-                let legacy_equivalent =
-                    cfg.n_slots * cfg.cap_tokens.div_ceil(PAGE_TOKENS);
+                let legacy_equivalent = cfg.n_slots * cfg.cap_tokens.div_ceil(PAGE_TOKENS);
                 Some(
                     hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED_PAGES")
                         .ok()
@@ -495,9 +494,13 @@ impl Rig {
         } else {
             0
         };
-        let desc_staging =
-            SlotDescStaging::new(g.gpu.as_mut().unwrap(), cfg.n_slots, max_batch, max_pages_per_slot)
-                .map_err(|e| format!("staging: {e}"))?;
+        let desc_staging = SlotDescStaging::new(
+            g.gpu.as_mut().unwrap(),
+            cfg.n_slots,
+            max_batch,
+            max_pages_per_slot,
+        )
+        .map_err(|e| format!("staging: {e}"))?;
         g.desc_staging = Some(desc_staging);
         // Slots do plain prefill only — never tree-verify — so skip the GDN
         // S-tape: at max_batch=cap_tokens it is tens of GB (16k → ~21 GB).

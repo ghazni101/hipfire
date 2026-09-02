@@ -1627,4 +1627,35 @@ mod tests {
         let cfg4 = from_config_value(&inner4).unwrap();
         assert!(dense_tp_rank_layouts(&cfg4, &shard).is_err());
     }
+
+    #[test]
+    fn mrope_ctx_pos3_falls_back_to_decode_formula_past_the_prompt() {
+        // 7 prompt tokens at base 2: text(0,1), image 4x4 grid merged 2x2 (4
+        // tokens), trailing text. Un-offset phases are [0,0,0], [1,1,1],
+        // [2,2,2], [2,2,3], [2,3,2], [2,3,3], then the cursor jumps by
+        // max(lh,lw)=2 → [4,4,4]; everything is offset by base=2 here.
+        // rope_delta = (max 6 + 1) - (base 2 + len 7) = -2.
+        let positions = vec![
+            [2, 2, 2],
+            [3, 3, 3],
+            [4, 4, 4],
+            [4, 4, 5],
+            [4, 5, 4],
+            [4, 5, 5],
+            [6, 6, 6],
+        ];
+        let ctx = MropeCtx {
+            base: 2,
+            positions,
+            rope_delta: -2,
+            section: [11, 11, 10],
+        };
+        // Inside the prompt: the precomputed grid coordinate.
+        assert_eq!(ctx.pos3(4), [4, 4, 4]);
+        assert_eq!(ctx.pos3(8), [6, 6, 6]);
+        // Past the prompt (generated tokens): all three axes collapse to
+        // pos + rope_delta — the cursor resumes at max(image positions)+1 = 7.
+        assert_eq!(ctx.pos3(9), [7, 7, 7]);
+        assert_eq!(ctx.pos3(10), [8, 8, 8]);
+    }
 }
