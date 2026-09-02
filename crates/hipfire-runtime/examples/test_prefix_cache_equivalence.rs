@@ -135,7 +135,7 @@ fn main() {
     }
     let mut dn_states: Vec<DeltaNetState> =
         vec![DeltaNetState::new(&mut gpu, &config).expect("DeltaNetState::new")];
-    let mut desc_staging = SlotDescStaging::new(&mut gpu, 1, max_batch).expect("SlotDescStaging");
+    let mut desc_staging = SlotDescStaging::new(&mut gpu, 1, max_batch, 0).expect("SlotDescStaging");
     let pbs = PrefillBatchScratch::new(&mut gpu, &config, max_batch).expect("PrefillBatchScratch");
     let scratch =
         Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 64, cap_tokens).expect("Qwen35Scratch");
