@@ -43,6 +43,30 @@ struct SourceMeta {
     arch_id: u32,
 }
 
+/// Discover a `.vl` sidecar file for the given trunk model path.
+/// Mirrors the daemon's `discover_vl_sidecar`: `HIPFIRE_VL_FILE` env,
+/// then `<stem>.vl` sibling.
+fn discover_vl_path(model_path: &str) -> Option<std::path::PathBuf> {
+    if let Ok(v) = std::env::var("HIPFIRE_VL_FILE") {
+        let p = std::path::PathBuf::from(v);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let base = std::path::Path::new(model_path);
+    match (base.parent(), base.file_stem()) {
+        (Some(parent), Some(stem)) => {
+            let vl = parent.join(format!("{}.vl", stem.to_string_lossy()));
+            if vl.exists() {
+                Some(vl)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 fn resolve_source_meta(src: &ModelSource, path: &str) -> Result<SourceMeta, String> {
     match src {
         ModelSource::Hfq(hfq) => Ok(SourceMeta {
@@ -541,7 +565,10 @@ impl Carrier for Qwen35Carrier {
                 let (vision_config, vision_weights) = {
                     use hipfire_arch_qwen35_vl::Qwen35Vl;
                     use hipfire_runtime::arch::Architecture;
-                    let has_vision = hfq_file
+
+                    // .vl sidecar discovery: HIPFIRE_VL_FILE env, then <stem>.vl sibling.
+                    let vl_path = discover_vl_path(ctx.path);
+                    let has_inline_vision = hfq_file
                         .tensor_data("model.visual.patch_embed.proj.weight")
                         .is_some();
                     if has_vision {
