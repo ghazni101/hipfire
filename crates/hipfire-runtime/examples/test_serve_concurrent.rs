@@ -68,6 +68,7 @@ fn main() {
         prefill_chunk: 1024,
         host_budget_bytes: 4 * 1024 * 1024 * 1024,
         swap_dir: std::env::temp_dir().join("hipfire-sp7-swap"),
+        is_vl: false,
     })
     .expect("SlotEngine::spawn");
     println!("engine up: {N_SLOTS} slots, {n_clients} clients, {MAX_TOKENS} tokens each");
@@ -90,6 +91,7 @@ fn main() {
                 top_p: 1.0,
                 top_k: 0,
                 seed: 0,
+                visual_data: None,
                 reply: tx,
             })
             .expect("submit");
