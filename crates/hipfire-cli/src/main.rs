@@ -1508,7 +1508,16 @@ fn list_command(paths: &Paths, args: ListArgs) -> Result<()> {
 
 pub(crate) fn list_local_models(paths: &Paths, registry: &RegistryV1) -> Result<Vec<LocalModel>> {
     let mut candidates = local_model_paths(paths)?;
+    let mut catalog_tags: std::collections::HashMap<PathBuf, String> =
+        std::collections::HashMap::new();
     if let Ok(catalog) = load_catalog(&paths.config) {
+        for model in catalog.catalog.models.values() {
+            if let (Some(path), Some(tag)) = (&model.path, &model.registry_tag) {
+                if let Ok(canonical) = fs::canonicalize(path) {
+                    catalog_tags.insert(canonical, tag.clone());
+                }
+            }
+        }
         candidates.extend(
             catalog
                 .catalog
@@ -1537,7 +1546,8 @@ pub(crate) fn list_local_models(paths: &Paths, registry: &RegistryV1) -> Result<
         let registry_tag = registry
             .models
             .iter()
-            .find_map(|(tag, model)| (model.file == name).then(|| tag.clone()));
+            .find_map(|(tag, model)| (model.file == name).then(|| tag.clone()))
+            .or_else(|| catalog_tags.get(&canonical).cloned());
         models.push(LocalModel {
             name,
             path: canonical,

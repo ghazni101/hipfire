@@ -919,6 +919,17 @@ fn cpu_preflight(model_path: &str) -> Result<Preflight, String> {
     let hfq =
         HfqFile::open(std::path::Path::new(model_path)).map_err(|e| format!("open model: {e}"))?;
     validate_arch_id(hfq.arch_id)?;
+    if is_vision_hfq(&hfq) {
+        // Vision-tower artifacts are served TEXT-ONLY here: the qwen35 loader
+        // pulls tensors by name, so the vision tower is never read and never
+        // allocated — the text tower is a standard dense qwen3.5 model.
+        // Verified on ornith-1.5-9b-v1 (2026-09-02): text serving matches the
+        // same artifact on the ordinary (non-slot) path.
+        eprintln!(
+            "[hipfire] multi-slot: vision tensors present in artifact; serving \
+             the text tower only (vision tower ignored)"
+        );
+    }
     let is_vl = is_vision_hfq(&hfq);
     let vision_config = if is_vl {
         Some(

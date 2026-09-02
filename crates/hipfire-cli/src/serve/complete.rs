@@ -1751,8 +1751,31 @@ pub(crate) fn complete_request_attempt(
         }
         if runtime.multi_slot_enabled {
             generate["experimental_multi_slot"] = serde_json::Value::Bool(true);
+            // The slot sampler implements temperature/top_p/top_k only.
+            // Penalty knobs are dropped here rather than forwarded: config
+            // defaults insert them when the client omits them, and a
+            // non-neutral forwarded value makes the daemon refuse the whole
+            // request. The sampler cannot apply penalties either way, so
+            // dropping them changes nothing numerically.
+            for key in [
+                "presence_penalty",
+                "frequency_penalty",
+                "repeat_penalty",
+                "min_p",
+            ] {
+                let dropped = generate
+                    .as_object_mut()
+                    .and_then(|obj| obj.remove(key))
+                    .is_some();
+                if dropped {
+                    eprintln!(
+                        "[hipfire] multi-slot: dropping {key} (slot sampler does \
+                         not implement it)"
+                    );
+                }
+            }
             // Re-check the fully projected wire request, not only the raw HTTP
-            // body: registry/config defaults may have inserted a penalty or
+            // body: registry/config defaults may have inserted a
             // reasoning control the slot sampler cannot honor.
             if let Err(reason) = multi_slot_request_supported(&generate) {
                 bail!("experimental multi-slot does not support this request: {reason}");
@@ -2131,20 +2154,19 @@ pub(crate) fn multi_slot_request_supported(body: &serde_json::Value) -> Result<(
     {
         return Err("logprobs are not supported".to_owned());
     }
-    if let Some(value) = body
-        .get("presence_penalty")
-        .and_then(serde_json::Value::as_f64)
-    {
-        if value != 0.0 {
-            return Err("non-neutral presence_penalty is not supported".to_owned());
-        }
-    }
-    if let Some(value) = body
-        .get("frequency_penalty")
-        .and_then(serde_json::Value::as_f64)
-    {
-        if value != 0.0 {
-            return Err("non-neutral frequency_penalty is not supported".to_owned());
+    // Penalties: the slot sampler does not implement them. Rather than
+    // refusing every standard client that carries a non-neutral penalty
+    // (which made the endpoint unusable), they are accepted and IGNORED —
+    // logged once per request so the divergence is visible in server logs.
+    for key in ["presence_penalty", "frequency_penalty"] {
+        if let Some(value) = body.get(key).and_then(serde_json::Value::as_f64) {
+            let neutral = if key == "repeat_penalty" { 1.0 } else { 0.0 };
+            if value != neutral {
+                eprintln!(
+                    "[hipfire] multi-slot: ignoring non-neutral {key}={value} \
+                     (not implemented by the slot sampler)"
+                );
+            }
         }
     }
     if let Some(value) = body
@@ -2152,7 +2174,10 @@ pub(crate) fn multi_slot_request_supported(body: &serde_json::Value) -> Result<(
         .and_then(serde_json::Value::as_f64)
     {
         if value != 1.0 {
-            return Err("non-neutral repeat_penalty is not supported".to_owned());
+            eprintln!(
+                "[hipfire] multi-slot: ignoring non-neutral repeat_penalty={value} \
+                 (not implemented by the slot sampler)"
+            );
         }
     }
     if let Some(value) = body.get("min_p").and_then(serde_json::Value::as_f64) {
@@ -6683,7 +6708,9 @@ mod tests {
 
     /// Experimental multi-slot accepts sampling that the daemon slot engine
     /// implements (temperature/top_p/top_k) and rejects every other listed
-    /// capability before the generate is sent.
+    /// capability before the generate is sent. Penalty knobs are the one
+    /// exception: the slot sampler cannot apply them, so they are accepted
+    /// and ignored (logged) rather than refusing standard clients.
     #[test]
     fn multi_slot_request_supported_accepts_sampling_rejects_unsupported() {
         let ok = |v: serde_json::Value| multi_slot_request_supported(&v).is_ok();
@@ -6728,18 +6755,12 @@ mod tests {
         err_contains(serde_json::json!({ "stop": "END" }), "stop");
         err_contains(serde_json::json!({ "logprobs": true }), "logprobs");
         err_contains(serde_json::json!({ "top_logprobs": 5 }), "logprobs");
-        err_contains(
-            serde_json::json!({ "presence_penalty": 0.5 }),
-            "presence_penalty",
-        );
-        err_contains(
-            serde_json::json!({ "frequency_penalty": 0.1 }),
-            "frequency_penalty",
-        );
-        err_contains(
-            serde_json::json!({ "repeat_penalty": 1.05 }),
-            "repeat_penalty",
-        );
+        // Non-neutral penalties are ACCEPTED since the slot sampler cannot
+        // apply them — refusing them made the endpoint unusable for standard
+        // clients. They are ignored (logged server-side), so no error here.
+        assert!(ok(serde_json::json!({ "presence_penalty": 0.5 })));
+        assert!(ok(serde_json::json!({ "frequency_penalty": 0.1 })));
+        assert!(ok(serde_json::json!({ "repeat_penalty": 1.05 })));
         err_contains(serde_json::json!({ "min_p": 0.05 }), "min_p");
         err_contains(
             serde_json::json!({ "max_think_tokens": 2 }),
