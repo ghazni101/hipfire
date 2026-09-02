@@ -69,8 +69,7 @@ impl BlockTable {
         &self.pages
     }
 
-    /// Append a physical page to the end of the block table.
-    fn push_page(&mut self, page: u32) {
+    pub(crate) fn push_page(&mut self, page: u32) {
         self.pages.push(page);
     }
 
@@ -220,6 +219,12 @@ impl PagePool {
             dst.push_page(phys);
         }
         Ok(())
+    }
+
+    /// Increment the refcount for physical page `phys`. Used when sharing
+    /// pages between sessions (prefix sharing).
+    pub fn refcount_inc(&mut self, phys: u32) {
+        self.refcounts[phys as usize] = self.refcounts[phys as usize].saturating_add(1);
     }
 
     /// Free all pages in `table`, decrementing refcounts. Pages with
