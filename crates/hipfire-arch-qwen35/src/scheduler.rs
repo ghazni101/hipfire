@@ -35,9 +35,20 @@ pub struct PendingWork {
     /// M-RoPE path (vision_forward + per-token prefill/decode) and MUST
     /// be skipped by the batched 1D-RoPE scheduler.
     pub vl_prefill: Option<VlPrefill>,
-    /// MTP state. When true, this slot is served by the sequential MTP
-    /// spec-decode path and MUST be skipped by the batched scheduler.
+    /// MTP state. When true and still prefilling, this slot's prompt chunks
+    /// flow through the batched scheduler (the MTP head's KV is filled
+    /// post-forward). Once decoding, the slot is owned by the MTP
+    /// draft/verify cycle and MUST be skipped by the batched scheduler.
     pub mtp_active: bool,
+    /// Rolling adaptive-retire window: decode cycles spent under MTP and
+    /// tokens committed across them. When the window's mean advance stays
+    /// below `MTP_RETIRE_MIN_ADVANCE`, the engine retires the slot to plain
+    /// AR decode (a spec cycle costs ~2x an AR step, so a head that cannot
+    /// beat that loses wall-clock — the genre-conditional trap).
+    pub mtp_cycles: usize,
+    pub mtp_committed: usize,
+    /// Consecutive retire-windows whose mean advance fell below the line.
+    pub mtp_retire_fails: usize,
 }
 
 /// Visual + M-RoPE data for one slot's sequential VL path.
@@ -72,8 +83,11 @@ impl Scheduler {
         for w in work.iter_mut() {
             // Sequential VL path owns these slots: 1D batched RoPE would
             // disagree with M-RoPE on image and post-image tokens.
-            // MTP slots are also sequential — skip them here.
-            if w.vl_prefill.is_some() || w.mtp_active {
+            // MTP slots prefill through this batched path like any other
+            // slot (their head-KV fill runs post-forward from x_batch);
+            // once decoding, the MTP verify rows are injected by the caller
+            // instead, so skip them here.
+            if w.vl_prefill.is_some() || (w.mtp_active && w.decoding) {
                 b.m_per_slot.push(0);
                 continue;
             }
@@ -113,7 +127,7 @@ mod tests {
             remaining_prompt: prompt(1000),
             next_pos: 0,
             decoding: false,
-            vl_prefill: None, mtp_active: false,
+            vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0,
         }];
         let b = s.next_batch(&mut work);
         assert_eq!(
@@ -134,14 +148,14 @@ mod tests {
                 remaining_prompt: prompt(300),
                 next_pos: 0,
                 decoding: false,
-                vl_prefill: None, mtp_active: false,
+                vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0,
             },
             PendingWork {
                 slot: SlotId(1),
                 remaining_prompt: vec![42],
                 next_pos: 10,
                 decoding: true,
-                vl_prefill: None, mtp_active: false,
+                vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0,
             },
         ];
         let b = s.next_batch(&mut work);
@@ -160,7 +174,7 @@ mod tests {
             remaining_prompt: prompt(10),
             next_pos: 0,
             decoding: false,
-            vl_prefill: None, mtp_active: false,
+            vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0,
         }];
         let b = s.next_batch(&mut work);
         assert_eq!(b.total_rows(), 10);
@@ -175,7 +189,7 @@ mod tests {
             remaining_prompt: vec![],
             next_pos: 0,
             decoding: false,
-            vl_prefill: None, mtp_active: false,
+            vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0,
         }];
         let b = s.next_batch(&mut work);
         assert!(b.is_empty());
@@ -202,14 +216,14 @@ mod tests {
                     rope_delta: 0,
                     base: 0,
                 }),
-                mtp_active: false,
+                mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0,
             },
             PendingWork {
                 slot: SlotId(1),
                 remaining_prompt: vec![7],
                 next_pos: 3,
                 decoding: true,
-                vl_prefill: None, mtp_active: false,
+                vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0,
             },
         ];
         let b = s.next_batch(&mut work);
@@ -221,5 +235,48 @@ mod tests {
         assert_eq!(work[0].remaining_prompt.len(), 10);
         assert_eq!(work[0].next_pos, 0);
         assert!(work[1].remaining_prompt.is_empty());
+    }
+
+    #[test]
+    fn mtp_prefill_slots_batch_but_decoding_mtp_slots_are_skipped() {
+        let mut s = Scheduler { chunk_size: 256 };
+        let mut work = vec![
+            PendingWork {
+                // MTP slot still prefilling: its prompt chunk flows through
+                // the batched path (the head-KV fill runs post-forward).
+                slot: SlotId(0),
+                remaining_prompt: prompt(10),
+                next_pos: 0,
+                decoding: false,
+                vl_prefill: None,
+                mtp_active: true,
+                mtp_cycles: 0,
+                mtp_committed: 0,
+                mtp_retire_fails: 0,
+            },
+            PendingWork {
+                // MTP slot decoding: owned by the draft/verify cycle; its
+                // verify rows are injected by the engine, not the scheduler.
+                slot: SlotId(1),
+                remaining_prompt: vec![7],
+                next_pos: 3,
+                decoding: true,
+                vl_prefill: None,
+                mtp_active: true,
+                mtp_cycles: 0,
+                mtp_committed: 0,
+                mtp_retire_fails: 0,
+            },
+        ];
+        let b = s.next_batch(&mut work);
+        assert_eq!(
+            b.m_per_slot,
+            vec![10, 0],
+            "prefilling MTP slots batch; decoding MTP slots are injected separately"
+        );
+        assert!(work[0].remaining_prompt.is_empty());
+        assert_eq!(work[0].next_pos, 10);
+        assert_eq!(work[1].remaining_prompt, vec![7], "seed stays put");
+        assert_eq!(work[1].next_pos, 3);
     }
 }
