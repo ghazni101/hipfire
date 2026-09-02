@@ -25,6 +25,7 @@ pub mod gemv;
 pub mod graph;
 mod kernels;
 pub mod kv_slots;
+pub mod page_pool;
 pub mod moe;
 pub mod mq_f16_producers;
 pub mod mq_f16_residual_producers;
