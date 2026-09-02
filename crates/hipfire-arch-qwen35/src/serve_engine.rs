@@ -385,7 +385,25 @@ impl Rig {
         // ── MTP head loading ──────────────────────────────────────────────
         // Mirrors finish_qwen35_load: try bundled trailer first, then .mtp sidecar.
         // The head is shared across all slots (small ~216 MB for 27B).
-        let mtp_k = cfg.mtp_k;
+        //
+        // MTP is incompatible with a paged pool: the sequential MTP path
+        // (prompt prefill and the post-accept KV/DN replay) writes through the
+        // flat per-slot slab view (`slot_kv_view`), whose `legacy_k_base` is 0
+        // for every slot in paged mode — prefill would land in the arena
+        // prefix instead of the slot's own pages, while the batched verify
+        // (paged-aware) reads the slot's real pages. Silent garbage + cross-
+        // slot corruption. The batching itself has no paged fix yet, so the
+        // combination is refused at load: paged wins, MTP stays off (mirror
+        // of the VL gate above). Zeroing mtp_k also skips the head load.
+        let mtp_k = if paged_pages.is_some() && cfg.mtp_k > 0 {
+            eprintln!(
+                "  [hipfire] MTP disabled: paged KV pool is incompatible with \
+                 the sequential MTP path (flat slab view)"
+            );
+            0
+        } else {
+            cfg.mtp_k
+        };
         let mtp_head: Option<crate::mtp_head::Qwen35MtpHead> = if mtp_k > 0 {
             let trunk_path = &cfg.model_path;
             let mut head_opt: Option<crate::mtp_head::Qwen35MtpHead> = None;
@@ -458,6 +476,18 @@ impl Rig {
         } else {
             None
         };
+        if mtp_k > 0 && mtp_head.is_none() {
+            // The sidecar probe replaces the trunk's final extension
+            // (foo.mq4v2.hfq → foo.mq4v2.mtp). A sidecar named after a
+            // different trunk spelling — or any miss — must not silently
+            // degrade to AR: that is the "draft pulled but DFlash off" trap.
+            eprintln!(
+                "  [hipfire] MTP requested (mtp_k={mtp_k}) but no head was found: \
+                 no bundled .mq4-mtp trailer and no sidecar at {} — \
+                 serving without MTP",
+                cfg.model_path.with_extension("mtp").display()
+            );
+        }
 
         // ── Transactional post-weight guard ────────────────────────────────
         // Every allocation after weights is owned here. On any error, Drop
@@ -776,6 +806,15 @@ impl Rig {
     /// the same bytes via `legacy_base`. Views are `DeviceBuffer::Borrowed`
     /// — dropping the KvCache does not free the arenas.
     fn slot_kv_view(&self, slot: SlotId) -> KvCache {
+        // Paged slots have no contiguous slab: every legacy base is 0, so this
+        // view would alias the arena prefix for ALL slots. Sequential writers
+        // (VL, MTP prefill/replay) must be gated off under paged KV at
+        // activation — if one reaches here, fail loudly rather than corrupt.
+        assert!(
+            !self.pool.is_paged(),
+            "slot_kv_view: flat slab view requested under a paged pool — a \
+             sequential KV writer would alias every slot onto the arena prefix"
+        );
         let cap = self.pool.cap_tokens();
         let per_pos_bytes = self.config.n_kv_heads * (self.config.head_dim / 32) * 34;
         let base = self.pool.descriptors()[slot.0].legacy_k_base as usize;
@@ -941,8 +980,18 @@ fn vl_forward_remaining(
 
 /// MTP prefill: run trunk + MTP head KV prefill, sample seed token.
 ///
-/// Called when `!work.decoding` (first MTP step for this request).
-/// Sets `work.decoding = true` and returns `vec![seed]`.
+/// Called when `!work.decoding` (first MTP steps for this request). Drains at
+/// most `rig.prefill_chunk` prompt tokens per engine step — the same budget a
+/// regular prefilling slot gets from the scheduler — so a long MTP prompt
+/// interleaves with other slots' decode instead of stalling the engine for its
+/// whole duration. `prefill_trunk_and_mtp_cache_inner` is resumable by
+/// construction: trunk KV, DeltaNet state and MTP-head KV accumulate across
+/// calls in chunk order, and `prev_hidden` is re-captured from the last row of
+/// the final call, so chunked calls are byte-identical to one whole-prompt
+/// call.
+///
+/// Returns `vec![]` while prefill is still draining, `vec![seed]` on the
+/// final chunk (which also sets `work.decoding = true`).
 fn mtp_prefill_step(
     rig: &mut Rig,
     slot: SlotId,
@@ -977,7 +1026,8 @@ fn mtp_prefill_step(
         }
     }
 
-    let prompt_tokens = std::mem::take(&mut work.remaining_prompt);
+    let take = work.remaining_prompt.len().min(rig.prefill_chunk.max(1));
+    let chunk: Vec<u32> = work.remaining_prompt.drain(..take).collect();
     let pos = work.next_pos;
     let mut kv_cache = rig.slot_kv_view(slot);
 
@@ -991,17 +1041,22 @@ fn mtp_prefill_step(
             &mut rig.scratch,
             head,
             &mut state,
-            &prompt_tokens,
+            &chunk,
             pos,
             |_gpu, _w, _c, _kv, _dn, _s, _committed_pos| Ok(()),
         )
         .map_err(|e| format!("mtp prefill: {e}"))?;
 
-        let new_pos = pos + prompt_tokens.len();
+        let new_pos = pos + chunk.len();
         work.next_pos = new_pos;
         rig.pool
             .set_seq_len(slot, new_pos)
             .map_err(|e| format!("mtp set_seq_len: {e}"))?;
+
+        if !work.remaining_prompt.is_empty() {
+            // More prompt left: yield the engine step so other slots run.
+            return Ok(Vec::new());
+        }
 
         let mut logits = rig
             .gpu
@@ -1202,6 +1257,15 @@ fn clear_work_slot(work: &mut PendingWork) {
     work.next_pos = 0;
     work.vl_prefill = None;
     work.mtp_active = false;
+}
+
+/// True when an MTP verify batch — `mtp_k + 1` rows at positions
+/// `next_pos..next_pos + mtp_k` — fits inside the slot's token cap. The
+/// batched forward provisions `set_seq_len(max_pos + 1)` before its KV write
+/// and fails the whole step closed when that exceeds the cap, which rejects
+/// every active slot; MTP must retire before drafting instead.
+fn mtp_verify_fits_cap(next_pos: usize, mtp_k: usize, cap_tokens: usize) -> bool {
+    mtp_k + 1 <= cap_tokens.saturating_sub(next_pos)
 }
 
 fn commit_sampled_token(
@@ -1405,6 +1469,19 @@ fn run_loop(
                             }
                             clear_work_slot(&mut work[s]);
                         }
+                    }
+                } else if !mtp_verify_fits_cap(work[s].next_pos, rig.mtp_k, rig.cap_tokens) {
+                    // Context-cap guard: the batched verify writes mtp_k+1 rows
+                    // at next_pos..next_pos+mtp_k; a frontier past the cap
+                    // fails the forward's provision CLOSED, which rejects every
+                    // active slot, not just this one. Retire MTP for this slot
+                    // and let regular decode finish under its per-token guard.
+                    // Of the committed tokens only the newest is not yet in
+                    // KV — the rest are dead seed copies — so keep just it.
+                    work[s].mtp_active = false;
+                    if let Some(last) = work[s].remaining_prompt.last().copied() {
+                        work[s].remaining_prompt.clear();
+                        work[s].remaining_prompt.push(last);
                     }
                 } else {
                     // Draft phase: K serial head-forward steps.
@@ -2200,5 +2277,21 @@ mod tests {
         apply_terminal(&mut tokens, 1, DoneReason::Eos);
         apply_terminal(&mut tokens, 2, DoneReason::ClientGone);
         assert_eq!(tokens, vec![10, 20]);
+    }
+
+    #[test]
+    fn mtp_verify_frontier_must_land_inside_the_cap() {
+        // cap 100, k 3: verify writes rows at next_pos..next_pos+3, frontier
+        // next_pos+4. next_pos 96 is the last position that fits (frontier 100).
+        assert!(mtp_verify_fits_cap(96, 3, 100));
+        assert!(!mtp_verify_fits_cap(97, 3, 100));
+        // A full verify batch is exactly k+1 rows.
+        assert!(mtp_verify_fits_cap(0, 3, 4));
+        assert!(!mtp_verify_fits_cap(0, 3, 3));
+        // k = 0 degenerates to plain decode: one row, frontier next_pos+1.
+        assert!(mtp_verify_fits_cap(99, 0, 100));
+        assert!(!mtp_verify_fits_cap(100, 0, 100));
+        // next_pos at or past the cap never fits, whatever k is.
+        assert!(!mtp_verify_fits_cap(100, 3, 100));
     }
 }
