@@ -82,7 +82,7 @@ impl BlockTable {
     }
 
     /// Set the live token count. Must be <= num_pages * PAGE_TOKENS.
-    fn set_live_tokens(&mut self, tokens: usize) {
+    pub(crate) fn set_live_tokens(&mut self, tokens: usize) {
         debug_assert!(
             tokens <= self.pages.len() * PAGE_TOKENS,
             "live_tokens {} exceeds capacity {} ({} pages * {} tokens)",
@@ -92,6 +92,16 @@ impl BlockTable {
             PAGE_TOKENS
         );
         self.live_tokens = tokens;
+    }
+
+    /// Host-side copy of the table (pages + live_tokens). Used by
+    /// `SlotPool::share_prefix` to hand `PagePool::share_prefix` a stable
+    /// snapshot of the source without overlapping field borrows.
+    pub(crate) fn snapshot(&self) -> Self {
+        Self {
+            pages: self.pages.clone(),
+            live_tokens: self.live_tokens,
+        }
     }
 }
 
@@ -193,10 +203,29 @@ impl PagePool {
         can_alloc
     }
 
-    /// Share `n_pages` pages from `src` table into `dst` table by
-    /// incrementing refcounts. Both tables now reference the same physical
-    /// pages. Used for prefix sharing: the shared prefix pages are
-    /// refcounted so they persist until the last session releases them.
+    /// Share the first `n_pages` pages of `src` with `dst` by pushing the
+    /// same physical indices into `dst` and incrementing their refcounts.
+    /// Used for prefix sharing: the shared prefix pages persist until the
+    /// last session releases them.
+    ///
+    /// # The copy-on-write-free contract (must hold or KV corrupts silently)
+    ///
+    /// There is NO copy-on-write in this pool. Sharing is only safe at a
+    /// page-aligned fork point, which this method enforces on both sides:
+    ///
+    /// - **Every shared page must be FULL in `src`** (`n_pages *
+    ///   PAGE_TOKENS <= src.live_tokens()`). A full page is never written
+    ///   again by append-only growth — src's next token goes to a fresh
+    ///   page — so src cannot mutate bytes dst is reading.
+    /// - **`dst` must have an empty table.** The shared pages BECOME dst's
+    ///   prefix; the caller then sets dst's live length to the fork point
+    ///   (`n_pages * PAGE_TOKENS`), so dst's own writes also land in fresh
+    ///   pages only. Sharing into a non-empty table would interleave two
+    ///   unrelated mappings.
+    ///
+    /// Sharing a partially-filled page, or letting either session's write
+    /// frontier sit inside a shared page, lets one session's tokens land in
+    /// the other's cache with no error raised.
     ///
     /// Panics if `src` has fewer than `n_pages` pages.
     pub fn share_prefix(
@@ -210,6 +239,24 @@ impl PagePool {
                 "share_prefix: src has {} pages but {} requested",
                 src.num_pages(),
                 n_pages
+            ));
+        }
+        if n_pages * PAGE_TOKENS > src.live_tokens() {
+            return Err(format!(
+                "share_prefix: sharing {} pages covers {} tokens but src has \
+                 only {} live — refusing to share a partially-filled page \
+                 without copy-on-write (would corrupt src on its next append)",
+                n_pages,
+                n_pages * PAGE_TOKENS,
+                src.live_tokens()
+            ));
+        }
+        if dst.num_pages() != 0 {
+            return Err(format!(
+                "share_prefix: dst already holds {} pages — sharing is only \
+                 defined into an empty table (fork point must be the start \
+                 of dst's KV)",
+                dst.num_pages()
             ));
         }
         for lp in 0..n_pages {
@@ -293,7 +340,8 @@ impl PagePool {
     pub fn make_desc(&self, table: &BlockTable, block_table_dev_addr: u64) -> KvSlotDesc {
         KvSlotDesc {
             block_table: block_table_dev_addr,
-            legacy_base: 0,
+            legacy_k_base: 0,
+            legacy_v_base: 0,
             seq_len: table.live_tokens() as i32,
             page_tokens: PAGE_TOKENS as i32,
         }
@@ -304,7 +352,10 @@ impl PagePool {
     pub fn make_legacy_desc(base: u64, seq_len: usize) -> KvSlotDesc {
         KvSlotDesc {
             block_table: 0,
-            legacy_base: base,
+            // Equal K/V bases: this constructor is for equal-stride legacy
+            // arenas (Q8_0 / BF16), where one slab offset serves both.
+            legacy_k_base: base,
+            legacy_v_base: base,
             seq_len: seq_len as i32,
             page_tokens: 0,
         }
@@ -419,6 +470,65 @@ mod tests {
     }
 
     #[test]
+    fn share_prefix_refuses_partially_filled_tail_page() {
+        // 3 pages held, but only 300 tokens live: page 2 is 44/128 full.
+        // Sharing it without copy-on-write lets src's next append corrupt
+        // dst's view of the prefix — must refuse.
+        let mut pool = PagePool::new(16, 1088).unwrap();
+        let mut src = BlockTable::new();
+        pool.alloc_pages(&mut src, 3);
+        src.set_live_tokens(300);
+
+        let mut dst = BlockTable::new();
+        let err = pool.share_prefix(&src, &mut dst, 3).unwrap_err();
+        assert!(err.contains("partially-filled"), "unexpected: {err}");
+        assert_eq!(dst.num_pages(), 0, "refused share must not touch dst");
+        for lp in 0..3 {
+            let phys = src.physical(lp).unwrap();
+            assert_eq!(pool.refcounts[phys as usize], 1, "refcounts untouched");
+        }
+        // Sharing only the full pages is fine.
+        pool.share_prefix(&src, &mut dst, 2).unwrap();
+        assert_eq!(dst.num_pages(), 2);
+    }
+
+    #[test]
+    fn share_prefix_refuses_nonempty_dst() {
+        let mut pool = PagePool::new(16, 1088).unwrap();
+        let mut src = BlockTable::new();
+        pool.alloc_pages(&mut src, 2);
+        src.set_live_tokens(256);
+
+        let mut dst = BlockTable::new();
+        pool.alloc_pages(&mut dst, 1);
+        let err = pool.share_prefix(&src, &mut dst, 2).unwrap_err();
+        assert!(err.contains("empty table"), "unexpected: {err}");
+        assert_eq!(dst.num_pages(), 1, "refused share must not touch dst");
+        // And the refused attempt must not have bumped refcounts.
+        for lp in 0..2 {
+            let phys = src.physical(lp).unwrap();
+            assert_eq!(pool.refcounts[phys as usize], 1);
+        }
+    }
+
+    #[test]
+    fn release_table_after_failed_share_is_balanced() {
+        // Edge case: a failed share must leave the pool so that full
+        // alloc/release cycles still return every page.
+        let mut pool = PagePool::new(8, 1088).unwrap();
+        let mut src = BlockTable::new();
+        pool.alloc_pages(&mut src, 2);
+        src.set_live_tokens(100); // partial tail page
+        let mut dst = BlockTable::new();
+        assert!(pool.share_prefix(&src, &mut dst, 2).is_err());
+
+        pool.release_table(&mut src);
+        assert_eq!(pool.free_pages(), 8);
+        pool.release_table(&mut dst); // empty — no-op
+        assert_eq!(pool.free_pages(), 8);
+    }
+
+    #[test]
     fn make_desc_paged_mode() {
         let pool = PagePool::new(16, 1088).unwrap();
         let mut table = BlockTable::new();
@@ -429,7 +539,8 @@ mod tests {
 
         let desc = pool.make_desc(&table, 0xDEAD_BEEF);
         assert_eq!(desc.block_table, 0xDEAD_BEEF);
-        assert_eq!(desc.legacy_base, 0);
+        assert_eq!(desc.legacy_k_base, 0);
+        assert_eq!(desc.legacy_v_base, 0);
         assert_eq!(desc.seq_len, 200);
         assert_eq!(desc.page_tokens, PAGE_TOKENS as i32);
     }
@@ -438,7 +549,8 @@ mod tests {
     fn make_legacy_desc() {
         let desc = PagePool::make_legacy_desc(0x1000, 42);
         assert_eq!(desc.block_table, 0);
-        assert_eq!(desc.legacy_base, 0x1000);
+        assert_eq!(desc.legacy_k_base, 0x1000);
+        assert_eq!(desc.legacy_v_base, 0x1000);
         assert_eq!(desc.seq_len, 42);
         assert_eq!(desc.page_tokens, 0);
     }

@@ -221,7 +221,18 @@ pub fn capture_slot(
     stamp: SnapshotStamp,
 ) -> Result<SlotSnapshot, SwapError> {
     let desc = pool.descriptors()[slot.0];
-    let seq_len = desc.seq_len as usize;
+    let mut seq_len = desc.seq_len as usize;
+    if pool.is_paged() {
+        // The block table is the paged source of truth for the live length;
+        // desc.seq_len is kept in sync with it, but read it from here so a
+        // stale descriptor can never widen or shrink the capture. This must
+        // happen before `span`/`payload` are sized so the copy loop and the
+        // buffer agree by construction.
+        let bt = pool
+            .block_table(slot)
+            .ok_or_else(|| SwapError::Gpu("capture: slot has no block table".into()))?;
+        seq_len = bt.live_tokens();
+    }
     let per_pos = stamp.per_pos_bytes as usize;
     let span = seq_len * per_pos;
     let dn_total: usize = extra.iter().map(|t| t.buf.size()).sum();
@@ -238,12 +249,20 @@ pub fn capture_slot(
         let page_bytes = page_tokens * per_pos;
         let n_full_pages = seq_len / page_tokens;
         let last_page_tokens = seq_len % page_tokens;
+        let needed_pages = n_full_pages + usize::from(last_page_tokens > 0);
+        if bt.num_pages() < needed_pages {
+            return Err(SwapError::Corrupt(format!(
+                "capture: block table holds {} pages but seq_len {seq_len} \
+                 needs {needed_pages} — refusing to read past the table",
+                bt.num_pages()
+            )));
+        }
 
         for (k, v) in k_arenas.iter().zip(v_arenas.iter()) {
             for arena in [k, v] {
                 // Copy full pages.
                 for lp in 0..n_full_pages {
-                    let phys = bt.physical(lp).unwrap() as usize;
+                    let phys = bt.physical(lp).expect("page count pre-validated") as usize;
                     let arena_off = phys * page_bytes;
                     let view = arena.sub_offset(arena_off, page_bytes);
                     gpu.hip
@@ -253,7 +272,8 @@ pub fn capture_slot(
                 }
                 // Copy partial last page.
                 if last_page_tokens > 0 {
-                    let phys = bt.physical(n_full_pages).unwrap() as usize;
+                    let phys =
+                        bt.physical(n_full_pages).expect("page count pre-validated") as usize;
                     let arena_off = phys * page_bytes;
                     let last_bytes = last_page_tokens * per_pos;
                     let view = arena.sub_offset(arena_off, last_bytes);
@@ -265,9 +285,9 @@ pub fn capture_slot(
             }
         }
     } else {
-        // Legacy mode: contiguous slab at legacy_base.
+        // Legacy mode: contiguous slab at the slot's per-arena base.
         for (k, v) in k_arenas.iter().zip(v_arenas.iter()) {
-            for (arena, base) in [(k, desc.legacy_base), (v, desc.legacy_base)] {
+            for (arena, base) in [(k, desc.legacy_k_base), (v, desc.legacy_v_base)] {
                 if span > 0 {
                     let view = arena.sub_offset(base as usize, span);
                     gpu.hip
@@ -337,12 +357,21 @@ pub fn restore_slot(
         let page_bytes = page_tokens * per_pos;
         let n_full_pages = snap.seq_len / page_tokens;
         let last_page_tokens = snap.seq_len % page_tokens;
+        let needed_pages = n_full_pages + usize::from(last_page_tokens > 0);
+        if bt.num_pages() < needed_pages {
+            return Err(SwapError::Corrupt(format!(
+                "restore: block table holds {} pages but seq_len {} needs \
+                 {needed_pages} — refusing to write past the table",
+                bt.num_pages(),
+                snap.seq_len
+            )));
+        }
 
         for (k, v) in k_arenas.iter().zip(v_arenas.iter()) {
             for arena in [k, v] {
                 // Copy full pages.
                 for lp in 0..n_full_pages {
-                    let phys = bt.physical(lp).unwrap() as usize;
+                    let phys = bt.physical(lp).expect("page count pre-validated") as usize;
                     let arena_off = phys * page_bytes;
                     let view = arena.sub_offset(arena_off, page_bytes);
                     gpu.hip
@@ -352,7 +381,8 @@ pub fn restore_slot(
                 }
                 // Copy partial last page.
                 if last_page_tokens > 0 {
-                    let phys = bt.physical(n_full_pages).unwrap() as usize;
+                    let phys =
+                        bt.physical(n_full_pages).expect("page count pre-validated") as usize;
                     let arena_off = phys * page_bytes;
                     let last_bytes = last_page_tokens * per_pos;
                     let view = arena.sub_offset(arena_off, last_bytes);
@@ -364,9 +394,9 @@ pub fn restore_slot(
             }
         }
     } else {
-        // Legacy mode: contiguous slab at legacy_base.
+        // Legacy mode: contiguous slab at the slot's per-arena base.
         for (k, v) in k_arenas.iter().zip(v_arenas.iter()) {
-            for (arena, base) in [(k, desc.legacy_base), (v, desc.legacy_base)] {
+            for (arena, base) in [(k, desc.legacy_k_base), (v, desc.legacy_v_base)] {
                 if span > 0 {
                     let view = arena.sub_offset(base as usize, span);
                     gpu.hip

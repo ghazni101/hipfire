@@ -10,7 +10,7 @@
 // slot's KV, so a straddling tile would read the wrong sequence's cache.
 
 /// Byte-identical mirror of `struct KvSlotDesc` in `kernels/src/kv_slot_desc.h`.
-/// 24 bytes, 8-byte aligned. Changing either side without the other silently
+/// 32 bytes, 8-byte aligned. Changing either side without the other silently
 /// corrupts every KV address.
 ///
 /// # Paged KV cache
@@ -20,17 +20,21 @@
 /// is:
 ///   `phys_page * page_tokens * per_pos_bytes + page_off * per_pos_bytes`
 /// where `phys_page = block_table[pos / page_tokens]` and
-/// `page_off = pos % page_tokens`.
+/// `page_off = pos % page_tokens`, with `per_pos_bytes` passed per call —
+/// K and V may (and for asym3 DO) differ, but the physical page a logical
+/// page maps to is shared, so both arenas resolve through the one table.
 ///
 /// When `block_table` is null, the descriptor is in **legacy contiguous mode**
-/// and translation degenerates to `legacy_base + pos * per_pos_bytes`,
+/// and translation degenerates to `legacy_{k,v}_base + pos * per_pos_bytes`,
 /// byte-identical to the pre-paged kernel. This keeps every kernel on one
 /// code path.
 ///
-/// **Q8_0 ABI constraint**: in legacy mode `legacy_base` serves as both k_base
-/// and v_base (the flash-prefill kernel stages K and V in one pass with a
-/// single shared slab offset). In paged mode K and V share the same block
-/// table (same page layout), so the constraint is free to honour.
+/// **Legacy K/V bases are separate.** They differ whenever the K and V
+/// per-position strides differ — asym3 (3-bit rotated K against Q8_0 V) is
+/// the standing case and its arena builders pack K and V slabs at different
+/// offsets. Q8_0 / BF16 keep them equal: their strides match, and the Q8
+/// flash-prefill kernel stages K and V through ONE shared slab offset (it
+/// reads only `legacy_k_base`, so carrying the second base costs it nothing).
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KvSlotDesc {
@@ -38,9 +42,11 @@ pub struct KvSlotDesc {
     /// contiguous mode. Stored as a raw 64-bit device address so the struct
     /// can be built on the host and uploaded as a flat byte buffer.
     pub block_table: u64,
-    /// Byte offset for legacy mode (block_table == 0). Serves as both k_base
-    /// and v_base for Q8_0. Unused in paged mode.
-    pub legacy_base: u64,
+    /// Byte offset of this slot's K slab in the K arena (legacy mode only).
+    pub legacy_k_base: u64,
+    /// Byte offset of this slot's V slab in the V arena (legacy mode only).
+    /// Equal to `legacy_k_base` whenever K and V share a per-position stride.
+    pub legacy_v_base: u64,
     /// Logical KV length. The kernel reads positions `[0, seq_len)`.
     pub seq_len: i32,
     /// Page size in tokens (e.g. 128). 0 = legacy contiguous mode.
@@ -135,7 +141,10 @@ pub fn build_arena(
         }
         descs.push(KvSlotDesc {
             block_table: 0, // legacy contiguous mode
-            legacy_base: base,
+            // Q8_0 strides: K and V slabs sit at the same offset in their
+            // separate arenas.
+            legacy_k_base: base,
+            legacy_v_base: base,
             seq_len: sl as i32,
             page_tokens: 0, // 0 = legacy mode
         });
@@ -206,7 +215,12 @@ pub fn build_asym3_k_arena(
         }
         descs.push(KvSlotDesc {
             block_table: 0, // legacy contiguous mode
-            legacy_base: base,
+            // K-ONLY arena: this builder packs the asym3 K slabs, whose
+            // offsets are meaningless in the (Q8_0-strided) V arena. Callers
+            // that need a full descriptor table must take `legacy_v_base`
+            // from the V arena's own builder — see the harnesses' `merge_descs`.
+            legacy_k_base: base,
+            legacy_v_base: base,
             seq_len: sl as i32,
             page_tokens: 0, // 0 = legacy mode
         });
@@ -378,8 +392,8 @@ mod tests {
     }
 
     #[test]
-    fn desc_is_24_bytes() {
-        assert_eq!(std::mem::size_of::<KvSlotDesc>(), 24);
+    fn desc_is_32_bytes() {
+        assert_eq!(std::mem::size_of::<KvSlotDesc>(), 32);
         assert_eq!(std::mem::align_of::<KvSlotDesc>(), 8);
     }
 

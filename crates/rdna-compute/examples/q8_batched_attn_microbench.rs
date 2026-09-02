@@ -520,7 +520,7 @@ fn bench_slots(gpu: &mut Gpu, seq_lens: &[usize], m_per_slot: &[usize]) -> Optio
         .iter()
         .enumerate()
         .map(|(slot, &sl)| {
-            let off = descs[slot].legacy_base as usize;
+            let off = descs[slot].legacy_k_base as usize;
             let len = rdna_compute::kv_slots::legacy_cap(descs[slot].seq_len as usize) * per_pos_bytes;
             let slab_k = gpu
                 .upload_raw(&arena[off..off + len], &[len])

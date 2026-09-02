@@ -7,7 +7,7 @@
 //
 // Two modes:
 // - **Legacy** (default): fixed-size per-slot slabs in a contiguous arena.
-//   `KvSlotDesc.block_table = 0`, `page_tokens = 0`, `legacy_base` = slab offset.
+//   `KvSlotDesc.block_table = 0`, `page_tokens = 0`, `legacy_{k,v}_base` = slab offset.
 // - **Paged**: pages allocated on demand from a shared `PagePool`. Each slot
 //   owns a `BlockTable` (logical→physical page mapping). `KvSlotDesc.block_table`
 //   points to the GPU-uploaded page index array, `page_tokens = PAGE_TOKENS`.
@@ -72,9 +72,11 @@ impl SlotPool {
                 let base = i as u64 * slab_bytes;
                 KvSlotDesc {
                     // Legacy contiguous mode: block_table = 0, page_tokens = 0.
-                    // Q8_0 ABI: legacy_base serves as both k_base and v_base.
+                    // Q8_0 pool: K and V slabs share one offset in their
+                    // separate arenas.
                     block_table: 0,
-                    legacy_base: base,
+                    legacy_k_base: base,
+                    legacy_v_base: base,
                     seq_len: 0,
                     page_tokens: 0,
                 }
@@ -118,7 +120,8 @@ impl SlotPool {
         let descs = (0..n_slots)
             .map(|_| KvSlotDesc {
                 block_table: 0,
-                legacy_base: 0,
+                legacy_k_base: 0,
+                legacy_v_base: 0,
                 seq_len: 0,
                 page_tokens: 0,
             })
@@ -189,7 +192,8 @@ impl SlotPool {
             // Reset descriptor to legacy mode until pages are allocated.
             self.descs[id.0].block_table = 0;
             self.descs[id.0].page_tokens = 0;
-            self.descs[id.0].legacy_base = 0;
+            self.descs[id.0].legacy_k_base = 0;
+            self.descs[id.0].legacy_v_base = 0;
         }
     }
 
@@ -200,7 +204,8 @@ impl SlotPool {
     /// In paged mode, this ensures the block table has enough pages to hold
     /// `seq_len` tokens, allocating new pages from the `PagePool` as needed.
     /// The descriptor's `seq_len` is updated; the block table GPU upload and
-    /// descriptor paged-mode activation happen in `mark_block_table_uploaded`.
+    /// descriptor paged-mode activation happen in the forward path's
+    /// `upload_block_tables`.
     pub fn set_seq_len(&mut self, id: SlotId, seq_len: usize) -> Result<(), String> {
         if seq_len > self.cap_tokens {
             return Err(format!(
@@ -288,50 +293,48 @@ impl SlotPool {
             .expect("activate_paged_desc: slot has no block table");
         self.descs[slot.0].block_table = block_table_dev_addr;
         self.descs[slot.0].page_tokens = PAGE_TOKENS as i32;
-        self.descs[slot.0].legacy_base = 0;
+        self.descs[slot.0].legacy_k_base = 0;
+        self.descs[slot.0].legacy_v_base = 0;
         self.descs[slot.0].seq_len = bt.live_tokens() as i32;
         self.dirty = true;
     }
 
     /// Share a prefix of `n_pages` pages from `src` slot into `dst` slot's
     /// block table. Used for prefix sharing across sessions.
+    ///
+    /// Delegates the refcounting AND the safety contract to
+    /// [`PagePool::share_prefix`]: sharing is only defined at a page-aligned
+    /// fork point into an EMPTY dst whose shared pages are all full in src —
+    /// there is no copy-on-write, so violating that lets two sessions append
+    /// into the same physical page with no error raised. After sharing, set
+    /// dst's live length to `n_pages * PAGE_TOKENS` (its fork point); further
+    /// growth allocates fresh pages only.
     pub fn share_prefix(
         &mut self,
         src: SlotId,
         dst: SlotId,
         n_pages: usize,
     ) -> Result<(), String> {
-        // Extract src page indices first to avoid overlapping borrows.
-        let src_pages: Vec<u32> = {
-            let src_bt = self
-                .block_tables
-                .get(src.0)
-                .and_then(|bt| bt.as_ref())
-                .ok_or_else(|| "share_prefix: src slot has no block table".to_string())?;
-            if n_pages > src_bt.num_pages() {
-                return Err(format!(
-                    "share_prefix: src has {} pages but {} requested",
-                    src_bt.num_pages(),
-                    n_pages
-                ));
-            }
-            src_bt.page_indices()[..n_pages].to_vec()
-        };
-        // Now do the mutable work.
-        let pool = self
-            .page_pool
-            .as_mut()
-            .ok_or_else(|| "share_prefix: pool is not in paged mode".to_string())?;
+        // Snapshot src's table (a small Vec<u32>) so the PagePool call sees a
+        // stable copy instead of fighting the field borrows.
+        let src_snap = self
+            .block_tables
+            .get(src.0)
+            .and_then(|bt| bt.as_ref())
+            .ok_or_else(|| "share_prefix: src slot has no block table".to_string())?
+            .snapshot();
         let dst_bt = self
             .block_tables
             .get_mut(dst.0)
             .and_then(|bt| bt.as_mut())
             .ok_or_else(|| "share_prefix: dst slot has no block table".to_string())?;
-        for &phys in &src_pages {
-            pool.refcount_inc(phys);
-            dst_bt.push_page(phys);
-        }
+        let pool = self
+            .page_pool
+            .as_mut()
+            .ok_or_else(|| "share_prefix: pool is not in paged mode".to_string())?;
+        pool.share_prefix(&src_snap, dst_bt, n_pages)?;
         self.block_tables_dirty[dst.0] = true;
+        self.dirty = true;
         Ok(())
     }
 
@@ -355,9 +358,10 @@ mod tests {
         // cap rounds up to a multiple of PAGE_TOKENS (128) so a future page size divides it
         assert_eq!(p.cap_tokens(), 384);
         for i in 1..4 {
-            let prev_end = d[i - 1].legacy_base + (p.cap_tokens() as u64) * PPB as u64;
+            assert_eq!(d[i - 1].legacy_k_base, d[i - 1].legacy_v_base);
+            let prev_end = d[i - 1].legacy_k_base + (p.cap_tokens() as u64) * PPB as u64;
             assert_eq!(
-                d[i].legacy_base,
+                d[i].legacy_k_base,
                 prev_end,
                 "slab {i} must start where {} ended",
                 i - 1
@@ -368,7 +372,7 @@ mod tests {
     #[test]
     fn q8_abi_uses_shared_legacy_base() {
         // Q8_0 ABI: the flash-prefill kernel uses ONE shared slab offset.
-        // In the new paged layout, legacy_base serves as both k_base and v_base.
+        // The Q8 pool honours it by keeping legacy_k_base == legacy_v_base.
         let p = SlotPool::new(3, 256, PPB).unwrap();
         for d in p.descriptors() {
             assert_eq!(d.block_table, 0, "SlotPool must use legacy mode");
@@ -537,7 +541,8 @@ mod tests {
         let desc = p.descriptors()[slot.0];
         assert_eq!(desc.block_table, 0xCAFE_BABE);
         assert_eq!(desc.page_tokens, PAGE_TOKENS as i32);
-        assert_eq!(desc.legacy_base, 0);
+        assert_eq!(desc.legacy_k_base, 0);
+        assert_eq!(desc.legacy_v_base, 0);
         assert_eq!(desc.seq_len, 128);
     }
 
@@ -574,5 +579,115 @@ mod tests {
         let p = SlotPool::new_paged(2, 256, PPB, 16).unwrap();
         // 16 pages * 128 tokens * 1088 bytes = 2,228,224 bytes per arena
         assert_eq!(p.arena_bytes(), 16 * 128 * PPB);
+    }
+
+    // ── Paged-mode regression tests (branch bug fixes) ─────────────────
+
+    #[test]
+    fn paged_share_prefix_refuses_partially_filled_page() {
+        // 300 live tokens = 3 pages, but page 2 holds only 44 tokens.
+        // Sharing all 3 would let src's next append land inside a page dst
+        // is also reading — the missing-copy-on-write corruption. Must err.
+        let mut p = SlotPool::new_paged(2, 512, PPB, 16).unwrap();
+        let a = p.acquire().unwrap();
+        let b = p.acquire().unwrap();
+        p.set_seq_len(a, 300).unwrap();
+        let err = p.share_prefix(a, b, 3).unwrap_err();
+        assert!(
+            err.contains("partially-filled"),
+            "unexpected: {err}"
+        );
+        // The refused share must not have mutated dst or the refcounts.
+        assert_eq!(p.block_table(b).unwrap().num_pages(), 0);
+        assert_eq!(p.free_pages(), 13);
+    }
+
+    #[test]
+    fn paged_share_prefix_at_exact_page_boundary_is_allowed() {
+        // 256 live tokens = exactly 2 full pages: the one safe fork point.
+        let mut p = SlotPool::new_paged(2, 512, PPB, 16).unwrap();
+        let a = p.acquire().unwrap();
+        let b = p.acquire().unwrap();
+        p.set_seq_len(a, 256).unwrap();
+        p.share_prefix(a, b, 2).unwrap();
+        assert_eq!(p.block_table(b).unwrap().num_pages(), 2);
+        // Fork dst's live length to the fork point, as the caller must.
+        p.set_seq_len(b, 256).unwrap();
+        // Both sessions append; shared full pages are immutable so neither
+        // can corrupt the other.
+        p.set_seq_len(a, 300).unwrap();
+        p.set_seq_len(b, 400).unwrap();
+        let a_pages = p.block_table(a).unwrap().page_indices().to_vec();
+        let b_pages = p.block_table(b).unwrap().page_indices().to_vec();
+        assert_eq!(&a_pages[..2], &b_pages[..2], "prefix stays shared");
+        assert_ne!(a_pages[2], b_pages[2], "growth must be private");
+        assert_eq!(a_pages.len(), 3);
+        assert_eq!(b_pages.len(), 4);
+    }
+
+    #[test]
+    fn paged_share_prefix_refuses_nonempty_dst() {
+        let mut p = SlotPool::new_paged(2, 512, PPB, 16).unwrap();
+        let a = p.acquire().unwrap();
+        let b = p.acquire().unwrap();
+        p.set_seq_len(a, 256).unwrap();
+        p.set_seq_len(b, 128).unwrap();
+        let err = p.share_prefix(a, b, 2).unwrap_err();
+        assert!(err.contains("empty table"), "unexpected: {err}");
+        // Refused share must not touch dst's mapping.
+        assert_eq!(p.block_table(b).unwrap().num_pages(), 1);
+    }
+
+    #[test]
+    fn paged_write_frontier_provisioning_keeps_table_covered() {
+        // The forward path provisions set_seq_len(last_pos + 1) BEFORE the
+        // step's KV write; advance_slot_seq_lens then sets the same value.
+        // Simulate the engine loop across page boundaries and verify every
+        // position the "kernel" would translate is inside the allocated
+        // table — before provisioning existed, a step writing at pos 128
+        // indexed block_table[1] of a one-entry table.
+        let mut p = SlotPool::new_paged(1, 4096, PPB, 8).unwrap();
+        let slot = p.acquire().unwrap();
+        let mut kv_len = 0usize;
+        for m in [1usize, 127, 1, 5, 128, 3] {
+            let last_pos = kv_len + m - 1;
+            // Provision (what forward now does before its kernels).
+            p.set_seq_len(slot, last_pos + 1).unwrap();
+            let bt = p.block_table(slot).unwrap();
+            let needed_pages = (last_pos + 1).div_ceil(PAGE_TOKENS);
+            assert!(
+                bt.num_pages() >= needed_pages,
+                "step writing positions [{}, {}] needs {needed_pages} pages, \
+                 table holds {}",
+                kv_len,
+                last_pos,
+                bt.num_pages()
+            );
+            for lp in 0..=last_pos / PAGE_TOKENS {
+                assert!(
+                    bt.physical(lp).is_some(),
+                    "position {lp:?} page {lp} missing from table"
+                );
+            }
+            // Post-step advance: same value, must stay idempotent.
+            p.set_seq_len(slot, last_pos + 1).unwrap();
+            assert_eq!(p.block_table(slot).unwrap().num_pages(), needed_pages);
+            kv_len = last_pos + 1;
+        }
+    }
+
+    #[test]
+    fn paged_provision_oom_fails_before_any_write() {
+        // 2 pages = 256 tokens. A step whose write frontier reaches token
+        // 256 must fail AT PROVISION TIME — before any KV is written — not
+        // corrupt a neighbour page.
+        let mut p = SlotPool::new_paged(1, 4096, PPB, 2).unwrap();
+        let slot = p.acquire().unwrap();
+        p.set_seq_len(slot, 128).unwrap(); // page 0 live
+        let err = p.set_seq_len(slot, 257).unwrap_err();
+        assert!(err.contains("free"), "unexpected: {err}");
+        // The refused provision leaves the table and length untouched.
+        assert_eq!(p.block_table(slot).unwrap().num_pages(), 1);
+        assert_eq!(p.descriptors()[slot.0].seq_len, 128);
     }
 }
