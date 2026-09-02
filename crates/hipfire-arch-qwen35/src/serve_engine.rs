@@ -26,6 +26,7 @@ use hipfire_runtime::serve::{
 use hipfire_runtime::session_table::{SessionId, SessionTable};
 use hipfire_runtime::swap::snapshot::{capture_slot, restore_slot, SnapshotStamp};
 use hipfire_runtime::swap::SwapManager;
+use rdna_compute::page_pool::PAGE_TOKENS;
 use rdna_compute::sampling::SlotSampleParams;
 use rdna_compute::slot_pool::{SlotId, SlotPool};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -260,14 +261,44 @@ impl Rig {
         let prefill_chunk = cfg.prefill_chunk.max(1).min(cfg.cap_tokens.max(1));
         let max_batch = (prefill_chunk * cfg.n_slots).max(cfg.n_slots);
 
+        // ── Paged KV opt-in ────────────────────────────────────────────────
+        // Default OFF: the pool stays legacy (fixed per-slot slabs). With
+        // HIPFIRE_SLOTS_PAGED=1 the pool becomes a PagePool: slots draw
+        // physical pages on demand, so short sessions don't pre-reserve
+        // their full cap. HIPFIRE_SLOTS_PAGED_PAGES overrides the physical
+        // page count; the default matches legacy total capacity
+        // (n_slots × ceil(cap/128) pages), so admission behaviour is
+        // unchanged and only the allocation pattern is paged. A smaller
+        // count under-subscribes (pool exhaustion fails the step CLOSED —
+        // set_seq_len errors before any kernel writes through the missing
+        // page); a larger count over-subscribes physical VRAM and is the
+        // operator's call.
+        let paged_pages = match hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED")
+            .ok()
+            .as_deref()
+        {
+            Some("1") | Some("on") | Some("true") => {
+                let legacy_equivalent =
+                    cfg.n_slots * cfg.cap_tokens.div_ceil(PAGE_TOKENS);
+                Some(
+                    hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED_PAGES")
+                        .ok()
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(legacy_equivalent),
+                )
+            }
+            _ => None,
+        };
+
         let weight_bytes = std::fs::metadata(&cfg.model_path)
             .map_err(|e| format!("stat model: {e}"))?
             .len();
         let cap_rounded = cfg.cap_tokens.div_ceil(128) * 128;
+        let kv_pages = paged_pages.unwrap_or(cfg.n_slots * cap_rounded / 128);
         let kv_bytes = (n_fa_layers as u64)
             * 2
-            * (cfg.n_slots as u64)
-            * (cap_rounded as u64)
+            * (kv_pages as u64)
+            * (PAGE_TOKENS as u64)
             * (per_pos_bytes as u64);
         let planned = weight_bytes + kv_bytes + 768 * 1024 * 1024;
 
@@ -382,8 +413,22 @@ impl Rig {
             out_tokens: None,
             committed: false,
         };
-        let pool = SlotPool::new(cfg.n_slots, cfg.cap_tokens, per_pos_bytes)
-            .map_err(|e| format!("SlotPool: {e}"))?;
+        let pool = if let Some(pages) = paged_pages {
+            SlotPool::new_paged(cfg.n_slots, cfg.cap_tokens, per_pos_bytes, pages)
+        } else {
+            SlotPool::new(cfg.n_slots, cfg.cap_tokens, per_pos_bytes)
+        }
+        .map_err(|e| format!("SlotPool: {e}"))?;
+        if pool.is_paged() {
+            eprintln!(
+                "[hipfire] paged KV pool: {} slots x cap {} tokens over {} physical pages \
+                 ({} tokens/page)",
+                cfg.n_slots,
+                pool.cap_tokens(),
+                pool.free_pages(),
+                PAGE_TOKENS
+            );
+        }
         let arena_bytes = pool.arena_bytes();
         for _ in 0..n_fa_layers {
             let k = g
@@ -406,8 +451,16 @@ impl Rig {
                 .map_err(|e| format!("dn: {e}"))?;
             g.dn_states.push(dn);
         }
-        let desc_staging = SlotDescStaging::new(g.gpu.as_mut().unwrap(), cfg.n_slots, max_batch, 0)
-            .map_err(|e| format!("staging: {e}"))?;
+        // Paged mode needs per-slot block-table staging sized to the slot
+        // cap; legacy mode passes 0 and the staging stays empty.
+        let max_pages_per_slot = if pool.is_paged() {
+            pool.cap_tokens().div_ceil(PAGE_TOKENS)
+        } else {
+            0
+        };
+        let desc_staging =
+            SlotDescStaging::new(g.gpu.as_mut().unwrap(), cfg.n_slots, max_batch, max_pages_per_slot)
+                .map_err(|e| format!("staging: {e}"))?;
         g.desc_staging = Some(desc_staging);
         // Slots do plain prefill only — never tree-verify — so skip the GDN
         // S-tape: at max_batch=cap_tokens it is tens of GB (16k → ~21 GB).
