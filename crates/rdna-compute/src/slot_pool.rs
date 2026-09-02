@@ -55,13 +55,12 @@ impl SlotPool {
             .map(|i| {
                 let base = i as u64 * slab_bytes;
                 KvSlotDesc {
-                    // Q8_0 ABI: the flash-prefill kernel uses ONE shared slab
-                    // offset, so K and V must sit at the same offset in their
-                    // respective arenas. asym3 is exempt and needs its own pool.
-                    k_base: base,
-                    v_base: base,
+                    // Legacy contiguous mode: block_table = 0, page_tokens = 0.
+                    // Q8_0 ABI: legacy_base serves as both k_base and v_base.
+                    block_table: 0,
+                    legacy_base: base,
                     seq_len: 0,
-                    cap: cap as i32,
+                    page_tokens: 0,
                 }
             })
             .collect();
@@ -131,6 +130,16 @@ impl SlotPool {
         self.dirty = false;
     }
 
+    /// Per-slot token capacity (uniform across all slots).
+    pub fn cap_tokens(&self) -> usize {
+        self.cap_tokens
+    }
+
+    /// Per-position stride in bytes.
+    pub fn per_pos_bytes(&self) -> usize {
+        self.per_pos_bytes
+    }
+
     /// Bytes in ONE arena (K or V). The pool holds two of these.
     pub fn arena_bytes(&self) -> usize {
         self.descs.len() * self.cap_tokens * self.per_pos_bytes
@@ -149,11 +158,11 @@ mod tests {
         let d = p.descriptors();
         assert_eq!(d.len(), 4);
         // cap rounds up to a multiple of PAGE_TOKENS (128) so a future page size divides it
-        assert_eq!(d[0].cap, 384);
+        assert_eq!(p.cap_tokens(), 384);
         for i in 1..4 {
-            let prev_end = d[i - 1].k_base + (d[i - 1].cap as u64) * PPB as u64;
+            let prev_end = d[i - 1].legacy_base + (p.cap_tokens() as u64) * PPB as u64;
             assert_eq!(
-                d[i].k_base,
+                d[i].legacy_base,
                 prev_end,
                 "slab {i} must start where {} ended",
                 i - 1
@@ -162,11 +171,13 @@ mod tests {
     }
 
     #[test]
-    fn q8_abi_requires_v_base_equals_k_base() {
-        // SP1 ABI: the Q8 flash-prefill kernel uses ONE shared slab offset.
+    fn q8_abi_uses_shared_legacy_base() {
+        // Q8_0 ABI: the flash-prefill kernel uses ONE shared slab offset.
+        // In the new paged layout, legacy_base serves as both k_base and v_base.
         let p = SlotPool::new(3, 256, PPB).unwrap();
         for d in p.descriptors() {
-            assert_eq!(d.k_base, d.v_base, "Q8 arenas must share slab offsets");
+            assert_eq!(d.block_table, 0, "SlotPool must use legacy mode");
+            assert_eq!(d.page_tokens, 0, "SlotPool must use legacy mode");
         }
     }
 

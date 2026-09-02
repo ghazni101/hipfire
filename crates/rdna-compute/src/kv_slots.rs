@@ -12,31 +12,50 @@
 /// Byte-identical mirror of `struct KvSlotDesc` in `kernels/src/kv_slot_desc.h`.
 /// 24 bytes, 8-byte aligned. Changing either side without the other silently
 /// corrupts every KV address.
-/// **ABI constraint for the Q8_0 flash-prefill kernel: `v_base` MUST equal
-/// `k_base`.** That kernel stages K and V in one pass and uses a single shared
-/// slab offset; keeping a second runtime-unknown 64-bit base live across the
-/// loop costs 23 VGPRs and 25% of its occupancy (16 -> 12 waves/SIMD), measured
-/// on gfx1151 and gfx1201. Q8_0 K and V share a stride, so a slot sits at the
-/// same offset in both arenas and the constraint is free to honour.
 ///
-/// asym3 is exempt and must keep both bases: its K and V strides genuinely
-/// differ (3-bit rotated K against Q8_0 V).
+/// # Paged KV cache
+///
+/// `block_table` is a GPU pointer to an array of physical page indices. When
+/// non-null, the descriptor is in **paged mode** and KV address translation
+/// is:
+///   `phys_page * page_tokens * per_pos_bytes + page_off * per_pos_bytes`
+/// where `phys_page = block_table[pos / page_tokens]` and
+/// `page_off = pos % page_tokens`.
+///
+/// When `block_table` is null, the descriptor is in **legacy contiguous mode**
+/// and translation degenerates to `legacy_base + pos * per_pos_bytes`,
+/// byte-identical to the pre-paged kernel. This keeps every kernel on one
+/// code path.
+///
+/// **Q8_0 ABI constraint**: in legacy mode `legacy_base` serves as both k_base
+/// and v_base (the flash-prefill kernel stages K and V in one pass with a
+/// single shared slab offset). In paged mode K and V share the same block
+/// table (same page layout), so the constraint is free to honour.
 #[repr(C)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct KvSlotDesc {
-    /// Byte offset of this slot's K slab within the layer's K arena.
-    pub k_base: u64,
-    /// Byte offset of this slot's V slab within the layer's V arena.
-    pub v_base: u64,
+    /// GPU pointer to array of physical page indices, or null for legacy
+    /// contiguous mode. Stored as a raw 64-bit device address so the struct
+    /// can be built on the host and uploaded as a flat byte buffer.
+    pub block_table: u64,
+    /// Byte offset for legacy mode (block_table == 0). Serves as both k_base
+    /// and v_base for Q8_0. Unused in paged mode.
+    pub legacy_base: u64,
     /// Logical KV length. The kernel reads positions `[0, seq_len)`.
     pub seq_len: i32,
-    /// Physical slab capacity in tokens. Invariant: `seq_len <= cap`.
-    ///
-    /// Both invariants (`seq_len <= cap`, and `positions[row] + 1 <= seq_len`)
-    /// are checked host-side by the builders. They are deliberately NOT asserted
-    /// device-side: `compiler.rs` never passes `-DNDEBUG`, so a device `assert`
-    /// ships in release and cost 64 bytes/lane of scratch on all four kernels.
-    pub cap: i32,
+    /// Page size in tokens (e.g. 128). 0 = legacy contiguous mode.
+    pub page_tokens: i32,
+}
+
+/// Compute the legacy contiguous-mode slab capacity for a slot with
+/// `seq_len` live tokens. Mirrors the rounding `build_arena` and
+/// `SlotPool::new` apply: `seq_len` rounded up to a multiple of
+/// `PAGE_TOKENS` (128). In paged mode this value is not meaningful —
+/// each page is exactly `PAGE_TOKENS` and the block table tracks how
+/// many are live.
+pub fn legacy_cap(seq_len: usize) -> usize {
+    const PAGE_TOKENS: usize = 128;
+    seq_len.div_ceil(PAGE_TOKENS) * PAGE_TOKENS
 }
 
 /// Total query rows across all slots.
@@ -115,10 +134,10 @@ pub fn build_arena(
             }
         }
         descs.push(KvSlotDesc {
-            k_base: base,
-            v_base: base, // K and V arenas are separate buffers, same offsets
+            block_table: 0, // legacy contiguous mode
+            legacy_base: base,
             seq_len: sl as i32,
-            cap: cap as i32,
+            page_tokens: 0, // 0 = legacy mode
         });
     }
     (arena, descs)
@@ -186,10 +205,10 @@ pub fn build_asym3_k_arena(
             }
         }
         descs.push(KvSlotDesc {
-            k_base: base,
-            v_base: base,
+            block_table: 0, // legacy contiguous mode
+            legacy_base: base,
             seq_len: sl as i32,
-            cap: cap as i32,
+            page_tokens: 0, // 0 = legacy mode
         });
     }
     (arena, descs)
