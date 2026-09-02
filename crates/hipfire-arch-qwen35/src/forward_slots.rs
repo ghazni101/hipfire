@@ -146,12 +146,23 @@ pub struct SlotDescStaging {
     pub tile_slot_dev: GpuTensor,
     pub tile_row0_dev: GpuTensor,
     pub tile_qbase_dev: GpuTensor,
+    /// Per-slot GPU buffers for paged block tables (page index arrays).
+    /// Each buffer holds `max_pages_per_slot` u32 entries. Only used in
+    /// paged mode; empty in legacy mode. Re-uploaded when the slot's
+    pub block_table_devs: Vec<GpuTensor>,
     n_slots: usize,
     max_rows: usize,
 }
 
 impl SlotDescStaging {
-    pub fn new(gpu: &mut Gpu, n_slots: usize, max_rows: usize) -> HipResult<Self> {
+    /// `max_pages_per_slot` is the maximum number of pages a slot's block
+    /// table can hold. 0 = legacy mode (no block table buffers allocated).
+    pub fn new(
+        gpu: &mut Gpu,
+        n_slots: usize,
+        max_rows: usize,
+        max_pages_per_slot: usize,
+    ) -> HipResult<Self> {
         // Allocate all five staging buffers, freeing whatever already
         // succeeded if a later allocation fails partway through.
         let mut allocated: Vec<GpuTensor> = Vec::new();
@@ -174,12 +185,39 @@ impl SlotDescStaging {
             }
         }
         let mut it = allocated.into_iter();
+        // Allocate per-slot block table buffers (paged mode only).
+        let mut block_table_devs: Vec<GpuTensor> = Vec::new();
+        if max_pages_per_slot > 0 {
+            for _ in 0..n_slots {
+                match gpu.alloc_tensor(&[max_pages_per_slot * 4], DType::Raw) {
+                    Ok(t) => block_table_devs.push(t),
+                    Err(e) => {
+                        // Free everything allocated so far.
+                        for t in block_table_devs.drain(..) {
+                            let _ = gpu.free_tensor(t);
+                        }
+                        let descs = it.next().unwrap();
+                        let row_slot = it.next().unwrap();
+                        let tile_slot = it.next().unwrap();
+                        let tile_row0 = it.next().unwrap();
+                        let tile_qbase = it.next().unwrap();
+                        let _ = gpu.free_tensor(descs);
+                        let _ = gpu.free_tensor(row_slot);
+                        let _ = gpu.free_tensor(tile_slot);
+                        let _ = gpu.free_tensor(tile_row0);
+                        let _ = gpu.free_tensor(tile_qbase);
+                        return Err(e);
+                    }
+                }
+            }
+        }
         Ok(Self {
             descs_dev: it.next().unwrap(),
             row_slot_dev: it.next().unwrap(),
             tile_slot_dev: it.next().unwrap(),
             tile_row0_dev: it.next().unwrap(),
             tile_qbase_dev: it.next().unwrap(),
+            block_table_devs,
             n_slots,
             max_rows,
         })
@@ -191,6 +229,9 @@ impl SlotDescStaging {
         let _ = gpu.free_tensor(self.tile_slot_dev);
         let _ = gpu.free_tensor(self.tile_row0_dev);
         let _ = gpu.free_tensor(self.tile_qbase_dev);
+        for t in self.block_table_devs {
+            let _ = gpu.free_tensor(t);
+        }
     }
 }
 

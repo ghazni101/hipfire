@@ -141,7 +141,7 @@ fn main() {
         let mut dn_states =
             vec![DeltaNetState::new(&mut gpu, &config).expect("cand DeltaNetState")];
         let mut desc_staging =
-            SlotDescStaging::new(&mut gpu, 1, PROMPT_LEN).expect("SlotDescStaging");
+            SlotDescStaging::new(&mut gpu, 1, PROMPT_LEN, 0).expect("SlotDescStaging");
         let cand_pbs = PrefillBatchScratch::new(&mut gpu, &config, PROMPT_LEN)
             .expect("cand PrefillBatchScratch");
         let cand_scratch = Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 64, CAP_TOKENS)

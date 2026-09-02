@@ -376,7 +376,7 @@ impl Rig {
                 .map_err(|e| format!("dn: {e}"))?;
             g.dn_states.push(dn);
         }
-        let desc_staging = SlotDescStaging::new(g.gpu.as_mut().unwrap(), cfg.n_slots, max_batch)
+        let desc_staging = SlotDescStaging::new(g.gpu.as_mut().unwrap(), cfg.n_slots, max_batch, 0)
             .map_err(|e| format!("staging: {e}"))?;
         g.desc_staging = Some(desc_staging);
         // Slots do plain prefill only — never tree-verify — so skip the GDN

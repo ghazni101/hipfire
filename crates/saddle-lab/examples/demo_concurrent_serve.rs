@@ -326,7 +326,7 @@ fn main() {
         .map(|_| DeltaNetState::new(&mut gpu, &config).expect("DeltaNetState::new"))
         .collect();
     let mut desc_staging =
-        SlotDescStaging::new(&mut gpu, pool_capacity, max_batch).expect("SlotDescStaging::new");
+        SlotDescStaging::new(&mut gpu, pool_capacity, max_batch, 0).expect("SlotDescStaging::new");
     let pbs =
         PrefillBatchScratch::new(&mut gpu, &config, max_batch).expect("PrefillBatchScratch::new");
     let scratch = Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 64, cap_tokens)
