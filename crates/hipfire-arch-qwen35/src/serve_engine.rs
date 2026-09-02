@@ -31,7 +31,7 @@ use rdna_compute::sampling::SlotSampleParams;
 use rdna_compute::slot_pool::{SlotId, SlotPool};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
-use crate::forward_slots::{forward_batch_slots_graphed, SlotDecodeGraph, SlotDescStaging};
+use crate::forward_slots::{forward_batch_slots_graphed_opts, SlotDecodeGraph, SlotDescStaging};
 use crate::slot_batch::SlotBatch;
 use crate::qwen35::{
     self, DeltaNetState, LayerType, PrefillBatchScratch, Qwen35Scratch, Qwen35Weights,
@@ -223,6 +223,19 @@ struct Rig {
     /// Per-slot MTP spec state. None for slots that haven't started MTP yet
     /// or when MTP is off. Allocated lazily on first MTP prefill.
     mtp_states: Vec<Option<crate::mtp_spec::MtpSpecState>>,
+    /// Batched scratch (+ per-row FWHT-rot buffer) for MTP head-KV prefill
+    /// from the scheduler's batched prompt chunks. None when MTP is off.
+    mtp_prefill_batched: Option<(
+        crate::mtp_head::Qwen35MtpHeadBatchedScratch,
+        GpuTensor,
+    )>,
+    /// Per-layer (qkv, alpha, beta) tape of MTP verify rows, captured during
+    /// the verify forward and replayed by the partial-accept DN repair.
+    /// Row stride per slot = mtp_k + 1.
+    mtp_verify_tape: Option<crate::speculative::GdnTape>,
+    /// Staging for the POST-output-norm hidden rows fed to the MTP head
+    /// during prompt prefill (x_batch holds the pre-norm residual).
+    mtp_prefill_hidden: GpuTensor,
     /// MTP chain depth (K candidates per cycle). 0 = MTP off.
     mtp_k: usize,
     vision_config: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionConfig>,
@@ -683,7 +696,7 @@ impl Rig {
 
         // Commit guard — prevent Drop cleanup, move out owned GPU state.
         g.committed = true;
-        let gpu = g.gpu.take().unwrap();
+        let mut gpu = g.gpu.take().unwrap();
         let weights = g.weights.take().unwrap();
         let vision_weights = g.vision_weights.take();
         let mtp_head = g.mtp_head.take();
@@ -695,6 +708,43 @@ impl Rig {
         let scratch = g.scratch.take().unwrap();
         let logits_out = g.logits_out.take().unwrap();
         let out_tokens = g.out_tokens.take().unwrap();
+        // MTP head-KV prefill scratch, sized for one scheduler prompt chunk.
+        // Allocated after the guard commit (transactional ownership is no
+        // longer needed past this point: everything above already committed).
+        let mtp_prefill_batched = mtp_head
+            .as_ref()
+            .map(|head| -> Result<(crate::mtp_head::Qwen35MtpHeadBatchedScratch, GpuTensor), String> {
+                let scratch = crate::mtp_head::Qwen35MtpHeadBatchedScratch::new(
+                    &mut gpu,
+                    &head.config,
+                    prefill_chunk.max(1),
+                )
+                .map_err(|e| format!("mtp prefill scratch: {e}"))?;
+                let widest_k = (2 * config.dim)
+                    .max(head.config.n_ff)
+                    .max(config.dim)
+                    .max(head.config.n_head * head.config.head_dim);
+                let rot = gpu
+                    .zeros(&[prefill_chunk.max(1) * widest_k], DType::F32)
+                    .map_err(|e| format!("mtp prefill rot: {e}"))?;
+                Ok((scratch, rot))
+            })
+            .transpose()?;
+        let mtp_verify_tape = if mtp_head.is_some() && mtp_k > 0 {
+            Some(
+                crate::speculative::GdnTape::new_for_config(
+                    &mut gpu,
+                    &config,
+                    cfg.n_slots * (mtp_k + 1),
+                )
+                .map_err(|e| format!("mtp verify tape: {e}"))?,
+            )
+        } else {
+            None
+        };
+        let mtp_prefill_hidden = gpu
+            .zeros(&[prefill_chunk.max(1) * config.dim], DType::F32)
+            .map_err(|e| format!("mtp prefill hidden staging: {e}"))?;
         // g now committed and empty; Drop is no-op.
 
         Ok(Rig {
@@ -713,6 +763,9 @@ impl Rig {
             vision_config,
             mtp_head,
             mtp_states: (0..cfg.n_slots).map(|_| None).collect(),
+            mtp_prefill_batched,
+            mtp_verify_tape,
+            mtp_prefill_hidden,
             mtp_k,
             logits_out,
             out_tokens,
@@ -738,6 +791,9 @@ impl Rig {
             vision_weights,
             mtp_head,
             mtp_states,
+            mtp_prefill_batched,
+            mtp_verify_tape,
+            mtp_prefill_hidden,
             k_arenas,
             v_arenas,
             dn_states,
@@ -788,6 +844,14 @@ impl Rig {
         for mtp_state in mtp_states.into_iter().flatten() {
             mtp_state.free_gpu(&mut gpu);
         }
+        if let Some((scratch, rot)) = mtp_prefill_batched {
+            scratch.free_gpu(&mut gpu);
+            note_hip(gpu.free_tensor(rot));
+        }
+        if let Some(tape) = mtp_verify_tape {
+            tape.free_gpu(&mut gpu);
+        }
+        note_hip(gpu.free_tensor(mtp_prefill_hidden));
         if let Some(vw) = vision_weights {
             vw.free_gpu(&mut gpu);
         }
@@ -978,30 +1042,33 @@ fn vl_forward_remaining(
     Ok(hipfire_runtime::sampler::sample_cpu(&mut logits, &[], &cfg))
 }
 
-/// MTP prefill: run trunk + MTP head KV prefill, sample seed token.
+/// MTP head-KV fill for one scheduler prefill chunk, post-forward.
 ///
-/// Called when `!work.decoding` (first MTP steps for this request). Drains at
-/// most `rig.prefill_chunk` prompt tokens per engine step — the same budget a
-/// regular prefilling slot gets from the scheduler — so a long MTP prompt
-/// interleaves with other slots' decode instead of stalling the engine for its
-/// whole duration. `prefill_trunk_and_mtp_cache_inner` is resumable by
-/// construction: trunk KV, DeltaNet state and MTP-head KV accumulate across
-/// calls in chunk order, and `prev_hidden` is re-captured from the last row of
-/// the final call, so chunked calls are byte-identical to one whole-prompt
-/// call.
+/// The trunk side of an MTP slot's prompt flows through the scheduler's
+/// batched chunk path like any other prefill (1D RoPE, shared forward with
+/// other slots). This runs right AFTER that forward: the chunk's hidden
+/// rows sit in `pbs.x_batch`, and the head consumes exactly
+/// `(embed(token_i), trunk_hidden(token_i))` per row, so one
+/// `mtp_head_forward_block_batched(kv_only = true)` call fills the head's
+/// private KV for the chunk. `state.prev_hidden` is left pointing at the
+/// chunk's last row — the correct draft seed hidden once the prompt drains.
 ///
-/// Returns `vec![]` while prefill is still draining, `vec![seed]` on the
-/// final chunk (which also sets `work.decoding = true`).
-fn mtp_prefill_step(
+/// `row_off` is the slot's first row in the step batch; `m` its row count.
+fn mtp_head_prefill_chunk(
     rig: &mut Rig,
     slot: SlotId,
-    work: &mut PendingWork,
-) -> Result<Vec<u32>, String> {
+    chunk_tokens: &[u32],
+    chunk_positions: &[i32],
+    row_off: usize,
+    m: usize,
+) -> Result<(), String> {
     let head = rig
         .mtp_head
         .as_ref()
-        .ok_or_else(|| "mtp_prefill_step: MTP head not loaded".to_string())?;
-
+        .ok_or_else(|| "mtp_head_prefill_chunk: MTP head not loaded".to_string())?;
+    let Some((scratch, rot)) = rig.mtp_prefill_batched.as_mut() else {
+        return Err("mtp_head_prefill_chunk: batched head scratch missing".to_string());
+    };
     if rig.mtp_states[slot.0].is_none() {
         let state = crate::mtp_spec::MtpSpecState::new_for_components(
             &mut rig.gpu,
@@ -1014,79 +1081,71 @@ fn mtp_prefill_step(
         .map_err(|e| format!("mtp state alloc: {e}"))?;
         rig.mtp_states[slot.0] = Some(state);
     }
+    if let Some(cvs) = head.weights.compressed_vocab_size {
+        let state = rig.mtp_states[slot.0].as_mut().unwrap();
+        state
+            .ensure_compressed_lm_logits(&mut rig.gpu, cvs)
+            .map_err(|e| format!("ensure compressed logits: {e}"))?;
+    }
+
+    let dim = rig.config.dim;
     let mut state = rig
         .mtp_states[slot.0]
         .take()
         .expect("just ensured it exists");
 
-    if let Some(cvs) = head.weights.compressed_vocab_size {
-        if let Err(e) = state.ensure_compressed_lm_logits(&mut rig.gpu, cvs) {
-            rig.mtp_states[slot.0] = Some(state);
-            return Err(format!("ensure compressed logits: {e}"));
-        }
-    }
-
-    let take = work.remaining_prompt.len().min(rig.prefill_chunk.max(1));
-    let chunk: Vec<u32> = work.remaining_prompt.drain(..take).collect();
-    let pos = work.next_pos;
-    let mut kv_cache = rig.slot_kv_view(slot);
-
-    let outcome: Result<Vec<u32>, String> = (|| {
-        crate::mtp_spec::prefill_trunk_and_mtp_cache_inner(
-            &mut rig.gpu,
-            &rig.weights,
-            &rig.config,
-            &mut kv_cache,
-            &mut rig.dn_states[slot.0],
-            &mut rig.scratch,
-            head,
-            &mut state,
-            &chunk,
-            pos,
-            |_gpu, _w, _c, _kv, _dn, _s, _committed_pos| Ok(()),
+    // The head consumes POST-output-norm trunk hidden (the convention it was
+    // exported with and the one the sequential path feeds it); pbs.x_batch
+    // holds the PRE-norm residual, so norm the chunk's rows into staging.
+    let hidden_rows = rig.pbs.x_batch.sub_offset(row_off * dim, m * dim);
+    let staged = rig.mtp_prefill_hidden.sub_offset(0, m * dim);
+    let norm_outcome = rig
+        .gpu
+        .rmsnorm_batched(
+            &hidden_rows,
+            &rig.weights.output_norm,
+            &staged,
+            m,
+            dim,
+            rig.config.norm_eps,
         )
-        .map_err(|e| format!("mtp prefill: {e}"))?;
+        .map_err(|e| format!("mtp prefill hidden norm: {e}"));
 
-        let new_pos = pos + chunk.len();
-        work.next_pos = new_pos;
-        rig.pool
-            .set_seq_len(slot, new_pos)
-            .map_err(|e| format!("mtp set_seq_len: {e}"))?;
-
-        if !work.remaining_prompt.is_empty() {
-            // More prompt left: yield the engine step so other slots run.
-            return Ok(Vec::new());
-        }
-
-        let mut logits = rig
-            .gpu
-            .download_f32(&rig.scratch.logits)
-            .map_err(|e| format!("mtp download seed logits: {e}"))?;
-        let sp = &rig.sample_params[slot.0];
-        let cfg = hipfire_runtime::sampler::SamplerConfig {
-            temperature: sp.temperature,
-            top_p: sp.top_p,
-            repeat_penalty: 1.0,
-            repeat_window: 0,
-            presence_penalty: 0.0,
-            frequency_penalty: 0.0,
-            blocked_tokens: Vec::new(),
-            top_k: if sp.top_k > 0 {
-                Some(sp.top_k as u32)
-            } else {
-                None
-            },
-            min_p: None,
-        };
-        let seed = hipfire_runtime::sampler::sample_cpu(&mut logits, &[], &cfg);
-
-        work.decoding = true;
-        work.mtp_active = true;
-        Ok(vec![seed])
-    })();
-
+    // Disjoint field borrows: `scratch`/`rot` from mtp_prefill_batched,
+    // `gpu`/`weights`/head separately. No closure — it would capture all of
+    // `rig` and collide with the scratch borrow.
+    let mtp_outcome = norm_outcome.and_then(|()| {
+        crate::mtp_head::mtp_head_forward_block_batched(
+            &mut rig.gpu,
+            head,
+            scratch,
+            &mut state.mtp_kv,
+            chunk_tokens,
+            &staged,
+            chunk_positions,
+            m,
+            &rig.weights,
+            Some(rot),
+            /* kv_only */ true,
+        )
+        .map_err(|e| format!("mtp head prefill: {e}"))
+    });
+    // Seed hidden for the first draft cycle: the (normed) trunk hidden of
+    // the chunk's last token — same convention as the verify-path capture.
+    let hidden_outcome = mtp_outcome.and_then(|()| {
+        rig.gpu
+            .hip
+            .memcpy_dtod_at(
+                &state.prev_hidden.buf,
+                0,
+                &rig.mtp_prefill_hidden.buf,
+                (m - 1) * dim * 4,
+                dim * 4,
+            )
+            .map_err(|e| format!("mtp prev_hidden capture: {e:?}"))
+    });
     rig.mtp_states[slot.0] = Some(state);
-    outcome
+    hidden_outcome
 }
 
 /// MTP draft phase: run K serial head-forward steps, save DN snapshot.
@@ -1144,7 +1203,7 @@ fn mtp_draft_step(
             .save_from(&mut rig.dn_states[slot.0], &mut rig.gpu)
             .map_err(|e| format!("mtp dn snapshot: {e}"))?;
 
-        crate::mtp_spec::mtp_draft_phase_inner(
+        let draft_outcome = crate::mtp_spec::mtp_draft_phase_inner(
             &mut rig.gpu,
             &rig.weights,
             &rig.config,
@@ -1155,18 +1214,23 @@ fn mtp_draft_step(
             rig.mtp_k,
             /* skip_proposal_graph */ true,
         )
-        .map_err(|e| format!("mtp draft: {e}"))
+        .map_err(|e| format!("mtp draft: {e}"));
+        if crate::mtp_spec::mtp_trace_enabled() {
+            eprintln!("[mtp-trace] draft done pos={pos} seed={seed}");
+        }
+        draft_outcome
     })();
 
     rig.mtp_states[slot.0] = Some(state);
     outcome
 }
 
-/// MTP verify/accept phase: after batched forward, extract hidden states
-/// from `pbs.x_batch`, run accept/rollback, update seq_len.
+/// MTP verify/accept phase: after the batched forward, run the trunk lm_head
+/// over the slot's verify rows (a view of `pbs.x_batch`), greedy-accept, and
+/// repair the DeltaNet state on partial accepts.
 ///
 /// `hidden_row_offset` is the flat row index where this slot's verify rows
-/// begin in `pbs.x_batch` (computed from `batch.m_per_slot` by the caller).
+/// begin in the step batch (computed from `batch.m_per_slot` by the caller).
 /// Returns committed tokens (excludes seed, includes bonus).
 fn mtp_verify_accept_step(
     rig: &mut Rig,
@@ -1181,25 +1245,29 @@ fn mtp_verify_accept_step(
         .expect("mtp state must exist from draft phase");
 
     let pos = work.next_pos;
-    let mut kv_cache = rig.slot_kv_view(slot);
 
     let outcome: Result<Vec<u32>, String> = (|| {
-        let result = crate::mtp_spec::mtp_batched_verify_accept_inner(
+        let result = crate::mtp_spec::mtp_batched_verify_accept_from_batch(
             &mut rig.gpu,
             &rig.weights,
             &rig.config,
-            &mut kv_cache,
             &mut rig.dn_states[slot.0],
-            &mut rig.scratch,
+            &rig.pbs,
             &mut state,
             &draft,
-            &rig.pbs.x_batch,
             hidden_row_offset,
+            rig.mtp_verify_tape
+                .as_ref()
+                .expect("MTP drafts require the verify tape"),
+            rig.mtp_k + 1,
+            slot.0,
             rig.tokenizer.eos_id,
         )
         .map_err(|e| format!("mtp verify: {e}"))?;
 
-        // Update position and seq_len.
+        // Update position and seq_len. Stale KV rows past the new frontier
+        // (rejected drafts) are overwritten before any later forward reads
+        // them: every subsequent write is position-ordered.
         let new_pos = pos + result.advance;
         work.next_pos = new_pos;
         rig.pool
@@ -1264,6 +1332,20 @@ fn clear_work_slot(work: &mut PendingWork) {
 /// batched forward provisions `set_seq_len(max_pos + 1)` before its KV write
 /// and fails the whole step closed when that exceeds the cap, which rejects
 /// every active slot; MTP must retire before drafting instead.
+/// Rolling adaptive-retire window (cycles) before MTP may retire a slot for
+/// low acceptance, and the minimum mean advance (committed tokens per cycle)
+/// the head must sustain to stay on the spec path. An MTP cycle costs roughly
+/// twice an AR step (draft + verify over k+1 rows), so a mean advance below
+/// ~2.2 loses wall-clock (measured MTP cycle ≈ 2.3x an AR step on
+/// gfx1101/ornith-1.5-9b); code sustains ~2.8 (stays on MTP) while prose
+/// sits at ~1.9 and retires to AR.
+pub const MTP_RETIRE_WINDOW: usize = 32;
+pub const MTP_RETIRE_MIN_ADVANCE: f64 = 2.2;
+/// Consecutive failed windows required before retiring. One bad window is
+/// normal even on high-acceptance workloads (a template-y or low-confidence
+/// opening); two in a row means the head genuinely cannot pay for the cycle.
+pub const MTP_RETIRE_WINDOWS: usize = 2;
+
 fn mtp_verify_fits_cap(next_pos: usize, mtp_k: usize, cap_tokens: usize) -> bool {
     mtp_k + 1 <= cap_tokens.saturating_sub(next_pos)
 }
@@ -1350,6 +1432,9 @@ fn run_loop(
             decoding: false,
             vl_prefill: None,
             mtp_active: false,
+            mtp_cycles: 0,
+            mtp_committed: 0,
+            mtp_retire_fails: 0,
         })
         .collect();
     let mut sched = Scheduler {
@@ -1431,46 +1516,23 @@ fn run_loop(
             }
         }
 
-        // ── MTP phase 1: prefill + draft ──────────────────────────────────
-        // MTP prefill runs sequentially (trunk + head KV prefill). MTP draft
-        // runs K serial head-forward steps per slot. The trunk verify is
-        // batched with regular decode in the forward_batch_slots_graphed
-        // call below — the vLLM-style batched-verify design.
+        // ── MTP phase 1: draft ────────────────────────────────────────────
+        // MTP slots prefill through the scheduler's batched chunk path like
+        // any other slot (their head-KV fill runs post-forward from x_batch,
+        // below). This phase only drafts: K serial head-forward steps per
+        // decoding MTP slot. The trunk verify is batched with regular decode
+        // in the forward_batch_slots_graphed_opts call below — the vLLM-style
+        // batched-verify design, now graph-captured like pure decode.
         let mut mtp_drafts: Vec<Option<crate::mtp_spec::MtpDraftOutput>> = (0..n).map(|_| None).collect();
         if rig.mtp_head.is_some() && rig.mtp_k > 0 {
             for s in 0..n {
-                if !work[s].mtp_active || slots[s].is_none() {
+                if !work[s].mtp_active || slots[s].is_none() || !work[s].decoding {
                     continue;
                 }
-                if work[s].remaining_prompt.is_empty() && !work[s].decoding {
+                if work[s].remaining_prompt.is_empty() {
                     continue;
                 }
-                if !work[s].decoding {
-                    // Prefill phase: trunk + MTP head KV prefill, sample seed.
-                    match mtp_prefill_step(&mut rig, SlotId(s), &mut work[s]) {
-                        Ok(tokens) => {
-                            for tok in &tokens {
-                                commit_sampled_token(&mut rig, &mut slots, &mut work, s, *tok);
-                                if slots[s].is_none() {
-                                    break;
-                                }
-                            }
-                        }
-                        Err(reason) => {
-                            if let Some(f) = slots[s].take() {
-                                let _ = send_event(
-                                    &f.reply,
-                                    Event::Rejected {
-                                        reason: reason.clone(),
-                                    },
-                                );
-                                rig.swap.forget(f.session.0);
-                                rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
-                            }
-                            clear_work_slot(&mut work[s]);
-                        }
-                    }
-                } else if !mtp_verify_fits_cap(work[s].next_pos, rig.mtp_k, rig.cap_tokens) {
+                if !mtp_verify_fits_cap(work[s].next_pos, rig.mtp_k, rig.cap_tokens) {
                     // Context-cap guard: the batched verify writes mtp_k+1 rows
                     // at next_pos..next_pos+mtp_k; a frontier past the cap
                     // fails the forward's provision CLOSED, which rejects every
@@ -1507,8 +1569,9 @@ fn run_loop(
             }
         }
 
-        // Build the batch: scheduler handles regular slots, then inject MTP
-        // verify tokens for slots that produced draft outputs.
+        // Build the batch: scheduler handles regular slots (including MTP
+        // prefill chunks), then inject MTP verify tokens for slots that
+        // produced draft outputs.
         let sched_batch = sched.next_batch(&mut work);
         let batch = if mtp_drafts.iter().any(|d| d.is_some()) {
             inject_mtp_verify_tokens(&sched_batch, &mtp_drafts, n)
@@ -1518,21 +1581,43 @@ fn run_loop(
         if batch.is_empty() {
             continue;
         }
-        let fwd = forward_batch_slots_graphed(
-            &mut rig.gpu,
-            &rig.weights,
-            &rig.config,
-            &batch,
-            &mut rig.pool,
-            &mut rig.dn_states,
-            &rig.k_arenas,
-            &rig.v_arenas,
-            &mut rig.desc_staging,
-            &rig.pbs,
-            &rig.scratch,
-            &rig.logits_out,
-            &mut graph,
-        );
+        // Slots with verify drafts skip the per-slot last-row lm_head GEMV
+        // inside the forward: their logits come from the batched verify
+        // lm_head over all k+1 rows instead, so the single-row GEMV (a full
+        // lm_head weight re-read) would be discarded work.
+        let lm_head_skip: Vec<bool> = (0..n).map(|s| mtp_drafts[s].is_some()).collect();
+        let any_verify = lm_head_skip.iter().any(|&b| b);
+        let fwd = (|| {
+            let mut capture = any_verify.then(|| {
+                let tape = rig
+                    .mtp_verify_tape
+                    .as_mut()
+                    .expect("MTP drafts require the verify tape");
+                crate::forward_slots::MtpVerifyCapture {
+                    tape,
+                    verify_slots: &lm_head_skip,
+                    stride: rig.mtp_k + 1,
+                }
+            });
+            forward_batch_slots_graphed_opts(
+                &mut rig.gpu,
+                &rig.weights,
+                &rig.config,
+                &batch,
+                &mut rig.pool,
+                &mut rig.dn_states,
+                &rig.k_arenas,
+                &rig.v_arenas,
+                &mut rig.desc_staging,
+                &rig.pbs,
+                &rig.scratch,
+                &rig.logits_out,
+                &mut graph,
+                rig.mtp_k,
+                &lm_head_skip,
+                capture.as_mut(),
+            )
+        })();
         if let Err(e) = fwd {
             // A forward failure is not recoverable per-request. Report it as a
             // REJECTION carrying the reason, not as a normal Done: an
@@ -1620,6 +1705,103 @@ fn run_loop(
                             if slots[s].is_none() {
                                 break;
                             }
+                        }
+                        // Adaptive retire: a head that cannot sustain the
+                        // minimum mean advance loses wall-clock on the spec
+                        // cycle (~2x an AR step). Fall back to plain AR for
+                        // the rest of this request. The last committed token
+                        // is already in remaining_prompt; the scheduler picks
+                        // the slot up as a regular decode row next step.
+                        if slots[s].is_some() && work[s].mtp_active {
+                            work[s].mtp_cycles += 1;
+                            work[s].mtp_committed += tokens.len();
+                            if work[s].mtp_cycles >= MTP_RETIRE_WINDOW {
+                                let mean = work[s].mtp_committed as f64
+                                    / work[s].mtp_cycles as f64;
+                                // Reset the window each time it fills; only a
+                                // SECOND consecutive failure retires.
+                                work[s].mtp_cycles = 0;
+                                work[s].mtp_committed = 0;
+                                if mean < MTP_RETIRE_MIN_ADVANCE {
+                                    work[s].mtp_retire_fails += 1;
+                                } else {
+                                    work[s].mtp_retire_fails = 0;
+                                }
+                                if work[s].mtp_retire_fails >= MTP_RETIRE_WINDOWS {
+                                    if rig.gpu.slot_trace() {
+                                        eprintln!(
+                                            "[slot-trace] MTP retired for slot {s}: mean advance {mean:.2} over {} consecutive windows",
+                                            MTP_RETIRE_WINDOWS
+                                        );
+                                    }
+                                    work[s].mtp_active = false;
+                                    work[s].mtp_retire_fails = 0;
+                                    // Of the committed tokens only the newest
+                                    // lacks a KV row (the rest were written by
+                                    // verify) — keep just it, like the cap
+                                    // retire. The scheduler decodes it as a
+                                    // regular row next step.
+                                    if let Some(last) =
+                                        work[s].remaining_prompt.last().copied()
+                                    {
+                                        work[s].remaining_prompt.clear();
+                                        work[s].remaining_prompt.push(last);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    Err(reason) => {
+                        if let Some(f) = slots[s].take() {
+                            let _ = send_event(
+                                &f.reply,
+                                Event::Rejected {
+                                    reason: reason.clone(),
+                                },
+                            );
+                            rig.swap.forget(f.session.0);
+                            rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
+                        }
+                        clear_work_slot(&mut work[s]);
+                    }
+                }
+                continue;
+            }
+            // MTP prefill: fill the head's private KV from this chunk's
+            // x_batch rows; when the prompt has drained, the sampled
+            // out_token becomes the draft seed and decode begins.
+            if work[s].mtp_active
+                && !work[s].decoding
+                && slots[s].is_some()
+                && batch.m_per_slot.get(s).copied().unwrap_or(0) > 0
+            {
+                let m = batch.m_per_slot[s];
+                let row_off: usize = (0..s)
+                    .map(|i| batch.m_per_slot.get(i).copied().unwrap_or(0))
+                    .sum();
+                let chunk_tokens: Vec<u32> =
+                    batch.tokens[row_off..row_off + m].to_vec();
+                let chunk_positions: Vec<i32> =
+                    batch.positions[row_off..row_off + m].to_vec();
+                match mtp_head_prefill_chunk(
+                    &mut rig,
+                    SlotId(s),
+                    &chunk_tokens,
+                    &chunk_positions,
+                    row_off,
+                    m,
+                ) {
+                    Ok(()) => {
+                        if work[s].remaining_prompt.is_empty() && slots[s].is_some() {
+                            // Prompt fully prefilled (trunk KV by the
+                            // scheduler path, head KV above): the sampled
+                            // token is the first draft seed.
+                            let seed = ids[s] as u32;
+                            work[s].decoding = true;
+                            if crate::mtp_spec::mtp_trace_enabled() {
+                                eprintln!("[mtp-trace] prefill done seed={seed}");
+                            }
+                            commit_sampled_token(&mut rig, &mut slots, &mut work, s, seed);
                         }
                     }
                     Err(reason) => {
@@ -1882,6 +2064,12 @@ fn admit(
             // without it evicted snapshots accumulate and their sessions are
             // never seen again.
             let mut slot = rig.sessions.get(existing).and_then(|s| s.slot);
+            // Resident = this session never left the slot, so the slot's
+            // trunk KV/DN state AND the MTP head's private KV (filled through
+            // this session's tokens) are still exactly right. Only a
+            // swap-restore loses the head KV — the swap snapshot does not
+            // carry it — and must reset before the suffix re-fills.
+            let mtp_head_kv_valid = slot.is_some();
             if slot.is_none() {
                 let free = rig.pool.acquire().or_else(|| {
                     rig.sessions
@@ -1946,9 +2134,19 @@ fn admit(
                     work[slot.0].remaining_prompt = extended[plan.reused..].to_vec();
                     work[slot.0].next_pos = plan.reused;
                     work[slot.0].decoding = false;
-                    // MTP: reset head KV for the new turn and activate if enabled.
-                    work[slot.0].mtp_active = rig.mtp_head.is_some() && rig.mtp_k > 0;
-                    if work[slot.0].mtp_active {
+                    // MTP: activate if enabled. Vision continuations stay on
+                    // the sequential M-RoPE path (no MTP), matching cold
+                    // admits. The head KV reset is only needed when the head
+                    // KV was lost (swap-restore) or holds another session's
+                    // rows: a session resident on this slot since its last
+                    // turn keeps a head KV that matches its committed prefix,
+                    // so the suffix's head-fill extends it in place.
+                    work[slot.0].mtp_active = rig.mtp_head.is_some()
+                        && rig.mtp_k > 0
+                        && req.visual_data.is_none();
+                    if work[slot.0].mtp_active
+                        && !(mtp_head_kv_valid && rig.mtp_states[slot.0].is_some())
+                    {
                         if let Some(state) = rig.mtp_states[slot.0].as_mut() {
                             let _ = state.reset(&mut rig.gpu);
                         }
