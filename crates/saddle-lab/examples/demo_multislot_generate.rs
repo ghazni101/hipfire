@@ -337,6 +337,7 @@ fn main() {
             remaining_prompt: prompt_tokens[s].clone(),
             next_pos: 0,
             decoding: false,
+            vl_prefill: None,
         })
         .collect();
 
