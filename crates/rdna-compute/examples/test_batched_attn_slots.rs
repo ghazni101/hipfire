@@ -68,10 +68,11 @@ fn i32_bytes(v: &[i32]) -> Vec<u8> {
 
 /// Pack KvSlotDesc records byte-identically to kernels/src/kv_slot_desc.h.
 fn pack_descs(descs: &[KvSlotDesc]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(descs.len() * 24);
+    let mut out = Vec::with_capacity(descs.len() * 32);
     for d in descs {
         out.extend_from_slice(&d.block_table.to_ne_bytes());
-        out.extend_from_slice(&d.legacy_base.to_ne_bytes());
+        out.extend_from_slice(&d.legacy_k_base.to_ne_bytes());
+        out.extend_from_slice(&d.legacy_v_base.to_ne_bytes());
         out.extend_from_slice(&d.seq_len.to_ne_bytes());
         out.extend_from_slice(&d.page_tokens.to_ne_bytes());
     }
@@ -79,17 +80,19 @@ fn pack_descs(descs: &[KvSlotDesc]) -> Vec<u8> {
 }
 
 /// build_arena is called once for K and once for V (different strides);
-/// each call independently numbers its own base offsets starting from 0
-/// (since build_arena sets `legacy_base == base` within one call).
-/// Merge the two so the final descriptor's legacy_base points into the K
-/// arena (Q8_0 ABI: legacy_base serves as both k_base and v_base).
+/// each call independently numbers its own base offsets starting from 0.
+/// Merge the two so the final descriptor's legacy_k_base points into the K
+/// arena and legacy_v_base into the V arena — for asym3 the K and V
+/// per-position strides differ, so the slab offsets genuinely differ and
+/// MUST NOT be collapsed into one field.
 fn merge_descs(k_descs: &[KvSlotDesc], v_descs: &[KvSlotDesc]) -> Vec<KvSlotDesc> {
     k_descs
         .iter()
         .zip(v_descs)
         .map(|(k, v)| KvSlotDesc {
             block_table: 0,
-            legacy_base: k.legacy_base,
+            legacy_k_base: k.legacy_k_base,
+            legacy_v_base: v.legacy_k_base,
             seq_len: k.seq_len,
             page_tokens: 0,
         })
@@ -720,10 +723,10 @@ fn run_general_reference(
         let sl = shape.seq_lens[s];
         let k_view = batch
             .k_arena
-            .sub_offset(desc.legacy_base as usize, cap * k_per_pos);
+            .sub_offset(desc.legacy_k_base as usize, cap * k_per_pos);
         let v_view = batch
             .v_arena
-            .sub_offset(desc.legacy_base as usize, cap * v_per_pos);
+            .sub_offset(desc.legacy_v_base as usize, cap * v_per_pos);
         let q_slice = batch.q.sub_offset(row0 * q_dim, m * q_dim);
         let pos_dev = gpu
             .upload_raw(&i32_bytes(&positions_per_slot[s]), &[m])
@@ -1109,10 +1112,10 @@ fn run_lds_reference(gpu: &mut Gpu, shape: &Shape, batch: &LdsBatch) -> Vec<f32>
         let sl = shape.seq_lens[s];
         let k_view = batch
             .k_arena
-            .sub_offset(desc.legacy_base as usize, cap * per_pos);
+            .sub_offset(desc.legacy_k_base as usize, cap * per_pos);
         let v_view = batch
             .v_arena
-            .sub_offset(desc.legacy_base as usize, cap * per_pos);
+            .sub_offset(desc.legacy_v_base as usize, cap * per_pos);
         let q_slice = batch.q.sub_offset(row0 * q_dim, m * q_dim);
         let pos_dev = gpu
             .upload_raw(&i32_bytes(&positions_per_slot[s]), &[m])
@@ -1355,10 +1358,10 @@ fn run_prefill_reference(
         let cap = rdna_compute::kv_slots::legacy_cap(desc.seq_len as usize);
         let k_view = batch
             .k_arena
-            .sub_offset(desc.legacy_base as usize, cap * per_pos);
+            .sub_offset(desc.legacy_k_base as usize, cap * per_pos);
         let v_view = batch
             .v_arena
-            .sub_offset(desc.legacy_base as usize, cap * per_pos);
+            .sub_offset(desc.legacy_v_base as usize, cap * per_pos);
         let q_slice = batch.q.sub_offset(row0 * q_dim, m * q_dim);
         let pos_dev = gpu
             .upload_raw(&i32_bytes(&positions_per_slot[s]), &[m])

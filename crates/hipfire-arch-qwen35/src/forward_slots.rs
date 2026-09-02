@@ -100,17 +100,18 @@ use rdna_compute::slot_pool::{SlotId, SlotPool};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Pack a `KvSlotDesc` table byte-identically to `kernels/src/kv_slot_desc.h`
-/// (`block_table: u64, legacy_base: u64, seq_len: i32, page_tokens: i32`,
-/// 24 bytes, no padding between fields on this target). Mirrors the packer
-/// SP1's Task 7 harness uses
+/// (`block_table: u64, legacy_k_base: u64, legacy_v_base: u64, seq_len: i32,
+/// page_tokens: i32`, 32 bytes, no padding between fields on this target).
+/// Mirrors the packer SP1's Task 7 harness uses
 /// (`rdna-compute/examples/test_batched_attn_slots.rs::pack_descs`) —
 /// duplicated rather than shared because that packer lives in `examples/`
 /// (test-only) and this is production `src/`.
 fn pack_descs(descs: &[KvSlotDesc]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(descs.len() * 24);
+    let mut out = Vec::with_capacity(descs.len() * 32);
     for d in descs {
         out.extend_from_slice(&d.block_table.to_ne_bytes());
-        out.extend_from_slice(&d.legacy_base.to_ne_bytes());
+        out.extend_from_slice(&d.legacy_k_base.to_ne_bytes());
+        out.extend_from_slice(&d.legacy_v_base.to_ne_bytes());
         out.extend_from_slice(&d.seq_len.to_ne_bytes());
         out.extend_from_slice(&d.page_tokens.to_ne_bytes());
     }
@@ -148,8 +149,14 @@ pub struct SlotDescStaging {
     pub tile_qbase_dev: GpuTensor,
     /// Per-slot GPU buffers for paged block tables (page index arrays).
     /// Each buffer holds `max_pages_per_slot` u32 entries. Only used in
-    /// paged mode; empty in legacy mode. Re-uploaded when the slot's
+    /// paged mode; empty in legacy mode. Re-uploaded whenever a slot's
+    /// block table is dirty; the descriptor's `block_table` pointer is
+    /// stable for the lifetime of the staging buffers.
     pub block_table_devs: Vec<GpuTensor>,
+    /// Capacity of each `block_table_devs` entry, in pages. 0 = legacy
+    /// mode. Uploads are bounded by this — a slot whose table grows past
+    /// it must fail the step, never write past the buffer.
+    max_pages_per_slot: usize,
     n_slots: usize,
     max_rows: usize,
 }
@@ -218,6 +225,7 @@ impl SlotDescStaging {
             tile_row0_dev: it.next().unwrap(),
             tile_qbase_dev: it.next().unwrap(),
             block_table_devs,
+            max_pages_per_slot,
             n_slots,
             max_rows,
         })
@@ -1462,7 +1470,11 @@ fn q8_flash_prefill_wmma_eligible(gpu: &Gpu, head_dim: usize, batch_size: usize)
 /// that slot's byte offset into the shared arena (`SlotPool` guarantees
 /// `v_base == k_base`); slot 0 of a fresh pool always has `k_base == 0`, so
 /// this reduces byte-for-byte to the reference's own `k_cache`/`v_cache`
-/// addressing when `n_slots == 1`. This path is kept (rather than folded into
+/// addressing when `n_slots == 1`. Never `Some` for a paged pool — a paged
+/// slot's KV is scattered across physical pages, which this reduction's
+/// pointer-shifted contiguous view cannot express; the caller gates it off
+/// and every paged step takes the descriptor-driven paths below. This path
+/// is kept (rather than folded into
 /// the general multi-slot path below) because it is strictly cheaper: no
 /// tile-array build/upload, no descriptor indirection, no extra kernarg
 /// pointers or per-tile table lookups — just the plain legacy kernel against
@@ -2683,6 +2695,59 @@ pub struct SlotStepOpts {
     pub ctx_override: Option<usize>,
 }
 
+/// Upload every dirty slot's paged block table and activate its descriptor.
+///
+/// Shared by the plain step path and [`upload_step_inputs`] (the graph
+/// path's hoisted uploads) so the two can never drift: whichever runs, a
+/// dirty table is uploaded, bounded by the staging capacity, and the
+/// descriptor table is left needing exactly one upload afterwards (the
+/// caller uploads descs once this returns — activation mutates them).
+///
+/// Slots with an EMPTY table are skipped rather than activated: their
+/// `seq_len` is 0, so no kernel can read their mapping, and activating
+/// would point the descriptor at stale staging contents for no benefit.
+pub fn upload_block_tables(
+    gpu: &mut Gpu,
+    pool: &mut SlotPool,
+    desc_staging: &mut SlotDescStaging,
+) -> HipResult<()> {
+    if !pool.is_paged() || desc_staging.block_table_devs.is_empty() {
+        return Ok(());
+    }
+    for slot_idx in 0..pool.descriptors().len() {
+        if !pool.block_table_dirty(SlotId(slot_idx)) {
+            continue;
+        }
+        let Some(bt) = pool.block_table(SlotId(slot_idx)) else {
+            continue;
+        };
+        let indices = bt.page_indices();
+        if indices.len() > desc_staging.max_pages_per_slot {
+            let page_tokens = rdna_compute::page_pool::PAGE_TOKENS;
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "block table for slot {slot_idx} holds {} pages but staging \
+                     was sized for {} — rebuild SlotDescStaging with \
+                     max_pages_per_slot >= ceil(cap_tokens / {page_tokens})",
+                    indices.len(),
+                    desc_staging.max_pages_per_slot
+                ),
+            ));
+        }
+        if !indices.is_empty() {
+            let bt_bytes: Vec<u8> = indices.iter().flat_map(|x| x.to_ne_bytes()).collect();
+            gpu.hip
+                .memcpy_htod(&desc_staging.block_table_devs[slot_idx].buf, &bt_bytes)?;
+            // Activate paged mode: point the descriptor at the uploaded
+            // page index array.
+            let dev_addr = desc_staging.block_table_devs[slot_idx].buf.as_ptr() as u64;
+            pool.activate_paged_desc(SlotId(slot_idx), dev_addr);
+        }
+    }
+    Ok(())
+}
+
 /// The per-step H2D uploads, hoisted so the graph path can run them outside
 /// the captured region. Must run before every step, captured or not.
 pub fn upload_step_inputs(
@@ -2710,6 +2775,12 @@ pub fn upload_step_inputs(
         .collect();
     gpu.hip
         .memcpy_htod(&desc_staging.row_slot_dev.buf, &row_slot_bytes)?;
+    // Block tables BEFORE descs: activating a paged descriptor mutates the
+    // descriptor table, so it must be uploaded after this. Skipping this in
+    // paged mode would let `mark_uploaded` below clear the block-table dirty
+    // flags without their contents ever reaching the device — stale page
+    // mappings, i.e. silent cross-session corruption.
+    upload_block_tables(gpu, pool, desc_staging)?;
     if pool.descriptors_dirty() {
         let desc_bytes = pack_descs(pool.descriptors());
         gpu.hip
@@ -2832,6 +2903,14 @@ pub fn forward_batch_slots_opts(
         "forward_batch_slots: k_arenas.len() must equal the model's FullAttention layer count"
     );
     assert_eq!(v_arenas.len(), k_arenas.len());
+    // A paged pool has nowhere to put KV without per-slot block-table staging.
+    // Silent degradation here would read legacy_k_base = 0 in every kernel —
+    // fail loudly instead.
+    assert!(
+        !pool.is_paged() || !desc_staging.block_table_devs.is_empty(),
+        "forward_batch_slots: paged pool requires SlotDescStaging::new with \
+         max_pages_per_slot > 0"
+    );
 
     let dim = config.dim;
 
@@ -2863,8 +2942,37 @@ pub fn forward_batch_slots_opts(
         gpu.hip.memcpy_htod(&pbs.positions.buf, positions_bytes)?;
     }
 
-    // ── 3. Upload row_slot (every step) and the descriptor table (only
-    // when dirty) — once per step, not once per layer. ──────────────────
+    // ── 2b. Provision pages for the write frontier (paged mode only) ────
+    // The KV-write kernel resolves `block_table[pos / PAGE_TOKENS]` for
+    // pos = positions[row], so every page this step will write through must
+    // exist BEFORE the kernel runs. `advance_slot_seq_lens` only grows the
+    // slot's length after the step; without provisioning here, a step that
+    // crosses into a fresh page reads one entry past the uploaded table —
+    // stale staging memory, i.e. silent cross-session corruption. Setting
+    // seq_len to the step's last position+1 is exactly what
+    // `advance_slot_seq_lens` will set it to, so the post-step call is
+    // capacity-idempotent. OOM fails closed here, before any GPU write.
+    if pool.is_paged() {
+        for (slot_ix, &m) in batch.m_per_slot.iter().enumerate() {
+            if m == 0 {
+                continue;
+            }
+            let max_pos = batch
+                .positions
+                .iter()
+                .zip(batch.row_slot.iter())
+                .filter(|&(_, &s)| s as usize == slot_ix)
+                .map(|(&p, _)| p as usize)
+                .max()
+                .expect("m_per_slot > 0 implies at least one row for this slot");
+            pool.set_seq_len(rdna_compute::slot_pool::SlotId(slot_ix), max_pos + 1)
+                .map_err(|e| HipError::new(0, &format!("forward_batch_slots: {e}")))?;
+        }
+    }
+
+    // ── 3. Upload row_slot (every step); block tables (paged, before descs
+    // — activation mutates them); then the descriptor table (only when
+    // dirty) — once per step, not once per layer. ────────────────────────
     if !opts.skip_uploads {
         let row_slot_bytes: Vec<u8> = batch
             .row_slot
@@ -2873,40 +2981,8 @@ pub fn forward_batch_slots_opts(
             .collect();
         gpu.hip
             .memcpy_htod(&desc_staging.row_slot_dev.buf, &row_slot_bytes)?;
+        upload_block_tables(gpu, pool, desc_staging)?;
         if pool.descriptors_dirty() {
-            let desc_bytes = pack_descs(pool.descriptors());
-            gpu.hip
-                .memcpy_htod(&desc_staging.descs_dev.buf, &desc_bytes)?;
-            pool.mark_uploaded();
-        }
-        // ── 3b. Upload block tables (paged mode only) ───────────────────
-        // For each active slot with a dirty block table, upload its page
-        // indices to the slot's GPU buffer and activate the paged descriptor.
-        if pool.is_paged() && !desc_staging.block_table_devs.is_empty() {
-            for slot_idx in 0..pool.descriptors().len() {
-                if !pool.block_table_dirty(SlotId(slot_idx)) {
-                    continue;
-                }
-                if let Some(bt) = pool.block_table(SlotId(slot_idx)) {
-                    let indices = bt.page_indices();
-                    if !indices.is_empty() {
-                        let bt_bytes: Vec<u8> = indices
-                            .iter()
-                            .flat_map(|x| x.to_ne_bytes())
-                            .collect();
-                        gpu.hip.memcpy_htod(
-                            &desc_staging.block_table_devs[slot_idx].buf,
-                            &bt_bytes,
-                        )?;
-                    }
-                    // Activate paged mode: set descriptor's block_table to
-                    // the GPU address of the uploaded page index array.
-                    let dev_addr = desc_staging.block_table_devs[slot_idx].buf.as_ptr() as u64;
-                    pool.activate_paged_desc(SlotId(slot_idx), dev_addr);
-                }
-            }
-            // Re-upload the descriptor table since activate_paged_desc
-            // modified it.
             let desc_bytes = pack_descs(pool.descriptors());
             gpu.hip
                 .memcpy_htod(&desc_staging.descs_dev.buf, &desc_bytes)?;
@@ -2929,13 +3005,18 @@ pub fn forward_batch_slots_opts(
     // that kernel has no slot-descriptor concept, so it is unsafe to use
     // whenever more than one slot has live rows in the same call.
     let active_slots = batch.m_per_slot.iter().filter(|&&m| m > 0).count();
-    let single_slot = if active_slots == 1 {
+    // The single-slot reduction shifts raw pointers by the slot's legacy
+    // slab base and hands them to a kernel with NO descriptor concept. A
+    // paged slot's KV does not live at a contiguous slab at all, so this
+    // reduction must never fire in paged mode — the descriptor-driven
+    // kernels below are the only correct attend path there.
+    let single_slot = if active_slots == 1 && !pool.is_paged() {
         let slot_idx = batch
             .m_per_slot
             .iter()
             .position(|&m| m > 0)
             .expect("active_slots == 1 implies exactly one m_per_slot entry > 0");
-        let k_base = pool.descriptors()[slot_idx].legacy_base;
+        let k_base = pool.descriptors()[slot_idx].legacy_k_base;
         let slab_bytes = pool.arena_bytes() / n_slots;
         Some((k_base, slab_bytes))
     } else {
