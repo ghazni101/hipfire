@@ -119,15 +119,14 @@ mod dn {
     }
 
     /// Pack KvSlotDesc records byte-identically to kernels/src/kv_slot_desc.h
-    /// (k_base u64, v_base u64, seq_len i32, cap i32 = 24 bytes). Copied from
-    /// `test_batched_attn_slots.rs` (SP1 Task 7) — same struct, same ABI.
+    /// (block_table u64, legacy_base u64, seq_len i32, page_tokens i32 = 24 bytes).
     fn pack_descs(descs: &[KvSlotDesc]) -> Vec<u8> {
         let mut out = Vec::with_capacity(descs.len() * 24);
         for d in descs {
-            out.extend_from_slice(&d.k_base.to_ne_bytes());
-            out.extend_from_slice(&d.v_base.to_ne_bytes());
+            out.extend_from_slice(&d.block_table.to_ne_bytes());
+            out.extend_from_slice(&d.legacy_base.to_ne_bytes());
             out.extend_from_slice(&d.seq_len.to_ne_bytes());
-            out.extend_from_slice(&d.cap.to_ne_bytes());
+            out.extend_from_slice(&d.page_tokens.to_ne_bytes());
         }
         out
     }
@@ -478,9 +477,9 @@ mod dn {
 
         for (s, positions) in positions_per_slot.iter().enumerate() {
             let desc = descs[s];
-            let cap = desc.cap as usize;
+            let cap = rdna_compute::kv_slots::legacy_cap(desc.seq_len as usize);
             let region =
-                &arena[desc.k_base as usize..desc.k_base as usize + cap * KV_PER_POS_BYTES];
+                &arena[desc.legacy_base as usize..desc.legacy_base as usize + cap * KV_PER_POS_BYTES];
             let decoded = decode_q8_0(region);
             let mut candidate = Vec::with_capacity(positions.len() * KV_DIM);
             for &p in positions {
@@ -569,9 +568,9 @@ mod dn {
             gpu.free_tensor(descs_dev).expect("free descs_dev");
 
             for (s, &desc) in descs.iter().enumerate() {
-                let cap = desc.cap as usize;
+                let cap = rdna_compute::kv_slots::legacy_cap(desc.seq_len as usize);
                 let region =
-                    &arena[desc.k_base as usize..desc.k_base as usize + cap * KV_PER_POS_BYTES];
+                    &arena[desc.legacy_base as usize..desc.legacy_base as usize + cap * KV_PER_POS_BYTES];
                 let decoded = decode_q8_0(region);
                 if s == target {
                     let mut candidate = Vec::with_capacity(positions.len() * KV_DIM);
@@ -640,9 +639,9 @@ mod dn {
             gpu.free_tensor(descs_dev).expect("free descs_dev");
 
             let desc_b = descs[bystander];
-            let cap_b = desc_b.cap as usize;
+            let cap_b = rdna_compute::kv_slots::legacy_cap(desc_b.seq_len as usize);
             let region_b =
-                &arena[desc_b.k_base as usize..desc_b.k_base as usize + cap_b * KV_PER_POS_BYTES];
+                &arena[desc_b.legacy_base as usize..desc_b.legacy_base as usize + cap_b * KV_PER_POS_BYTES];
             let decoded_b = decode_q8_0(region_b);
             let n_finite = decoded_b.iter().filter(|v| v.is_finite()).count();
             assert!(
@@ -654,9 +653,9 @@ mod dn {
             );
 
             let desc_t = descs[target];
-            let cap_t = desc_t.cap as usize;
+            let cap_t = rdna_compute::kv_slots::legacy_cap(desc_t.seq_len as usize);
             let region_t =
-                &arena[desc_t.k_base as usize..desc_t.k_base as usize + cap_t * KV_PER_POS_BYTES];
+                &arena[desc_t.legacy_base as usize..desc_t.legacy_base as usize + cap_t * KV_PER_POS_BYTES];
             let decoded_t = decode_q8_0(region_t);
             assert!(
                 decoded_t.iter().all(|v| !v.is_finite()),
@@ -736,9 +735,9 @@ mod dn {
         // launch actually wrote to slot 0's offset instead, so this region
         // never got touched and still reads the zero fill.
         let desc_t = descs[target];
-        let cap_t = desc_t.cap as usize;
+        let cap_t = rdna_compute::kv_slots::legacy_cap(desc_t.seq_len as usize);
         let region_t =
-            &arena[desc_t.k_base as usize..desc_t.k_base as usize + cap_t * KV_PER_POS_BYTES];
+            &arena[desc_t.legacy_base as usize..desc_t.legacy_base as usize + cap_t * KV_PER_POS_BYTES];
         let decoded_t = decode_q8_0(region_t);
         let mut candidate = Vec::with_capacity(positions.len() * KV_DIM);
         for &p in &positions {

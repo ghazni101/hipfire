@@ -229,7 +229,7 @@ pub fn capture_slot(
 
     // Only the LIVE prefix: seq_len, not cap.
     for (k, v) in k_arenas.iter().zip(v_arenas.iter()) {
-        for (arena, base) in [(k, desc.k_base), (v, desc.v_base)] {
+        for (arena, base) in [(k, desc.legacy_base), (v, desc.legacy_base)] {
             if span > 0 {
                 let view = arena.sub_offset(base as usize, span);
                 gpu.hip
@@ -286,7 +286,7 @@ pub fn restore_slot(
     }
     let mut off = 0usize;
     for (k, v) in k_arenas.iter().zip(v_arenas.iter()) {
-        for (arena, base) in [(k, desc.k_base), (v, desc.v_base)] {
+        for (arena, base) in [(k, desc.legacy_base), (v, desc.legacy_base)] {
             if span > 0 {
                 let view = arena.sub_offset(base as usize, span);
                 gpu.hip

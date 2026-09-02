@@ -100,18 +100,19 @@ use rdna_compute::slot_pool::SlotPool;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Pack a `KvSlotDesc` table byte-identically to `kernels/src/kv_slot_desc.h`
-/// (`k_base: u64, v_base: u64, seq_len: i32, cap: i32`, 24 bytes, no padding
-/// between fields on this target). Mirrors the packer SP1's Task 7 harness
-/// uses (`rdna-compute/examples/test_batched_attn_slots.rs::pack_descs`) —
+/// (`block_table: u64, legacy_base: u64, seq_len: i32, page_tokens: i32`,
+/// 24 bytes, no padding between fields on this target). Mirrors the packer
+/// SP1's Task 7 harness uses
+/// (`rdna-compute/examples/test_batched_attn_slots.rs::pack_descs`) —
 /// duplicated rather than shared because that packer lives in `examples/`
 /// (test-only) and this is production `src/`.
 fn pack_descs(descs: &[KvSlotDesc]) -> Vec<u8> {
     let mut out = Vec::with_capacity(descs.len() * 24);
     for d in descs {
-        out.extend_from_slice(&d.k_base.to_ne_bytes());
-        out.extend_from_slice(&d.v_base.to_ne_bytes());
+        out.extend_from_slice(&d.block_table.to_ne_bytes());
+        out.extend_from_slice(&d.legacy_base.to_ne_bytes());
         out.extend_from_slice(&d.seq_len.to_ne_bytes());
-        out.extend_from_slice(&d.cap.to_ne_bytes());
+        out.extend_from_slice(&d.page_tokens.to_ne_bytes());
     }
     out
 }
@@ -2503,7 +2504,7 @@ pub fn forward_batch_slots_graphed(
         );
     }
 
-    let physical_cap = pool.descriptors()[0].cap as usize;
+    let physical_cap = pool.cap_tokens();
     let true_ctx = (batch.positions.iter().copied().max().unwrap_or(0) as usize + 1)
         .min(physical_cap)
         .max(1);
@@ -2836,7 +2837,7 @@ pub fn forward_batch_slots_opts(
         }
     }
 
-    let physical_cap = pool.descriptors()[0].cap as usize;
+    let physical_cap = pool.cap_tokens();
     let max_ctx_len = opts.ctx_override.unwrap_or(
         (batch.positions.iter().copied().max().unwrap_or(0) as usize + 1)
             .min(physical_cap)
@@ -2857,7 +2858,7 @@ pub fn forward_batch_slots_opts(
             .iter()
             .position(|&m| m > 0)
             .expect("active_slots == 1 implies exactly one m_per_slot entry > 0");
-        let k_base = pool.descriptors()[slot_idx].k_base;
+        let k_base = pool.descriptors()[slot_idx].legacy_base;
         let slab_bytes = pool.arena_bytes() / n_slots;
         Some((k_base, slab_bytes))
     } else {
