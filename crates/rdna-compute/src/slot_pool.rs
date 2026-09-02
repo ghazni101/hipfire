@@ -2,14 +2,19 @@
 // Copyright (c) 2026 Nick Woolmer
 // hipfire — see LICENSE and NOTICE in the project root.
 //
-// SlotPool — owns the per-slot KV slabs and the descriptor table that SP1's
-// batched attention kernels read.
+// SlotPool — owns the per-slot KV descriptors that SP1's batched attention
+// kernels read.
 //
-// Fixed-size slabs, deliberately. Variable-size slabs would fragment and buy
-// nothing at 2-8 slots, and the paged upgrade (SP4) replaces this addressing
-// wholesale rather than extending it.
+// Two modes:
+// - **Legacy** (default): fixed-size per-slot slabs in a contiguous arena.
+//   `KvSlotDesc.block_table = 0`, `page_tokens = 0`, `legacy_base` = slab offset.
+// - **Paged**: pages allocated on demand from a shared `PagePool`. Each slot
+//   owns a `BlockTable` (logical→physical page mapping). `KvSlotDesc.block_table`
+//   points to the GPU-uploaded page index array, `page_tokens = PAGE_TOKENS`.
+//   Enables dynamic allocation, prefix sharing, and over-subscription.
 
 use crate::kv_slots::{preflight_alloc, KvSlotDesc, R9700_VRAM_BYTES};
+use crate::page_pool::{BlockTable, PagePool, PAGE_TOKENS as POOL_PAGE_TOKENS};
 
 /// Slab capacities round up to this, so a future page size divides them.
 /// Matches the tile size the flash path walks KV in.
@@ -29,6 +34,17 @@ pub struct SlotPool {
     cap_tokens: usize,
     per_pos_bytes: usize,
     dirty: bool,
+    // ── Paged mode (None = legacy) ──────────────────────────────────────
+    page_pool: Option<PagePool>,
+    block_tables: Vec<Option<BlockTable>>,
+    /// Per-slot dirty flag: block table changed since last upload.
+    block_tables_dirty: Vec<bool>,
+}
+
+/// True when this pool is operating in paged mode.
+fn _assert_page_tokens_match() {
+    // Compile-time check that both constants agree.
+    const _: () = assert!(POOL_PAGE_TOKENS == PAGE_TOKENS);
 }
 
 impl SlotPool {
@@ -71,43 +87,134 @@ impl SlotPool {
             cap_tokens: cap,
             per_pos_bytes,
             dirty: true,
+            page_pool: None,
+            block_tables: vec![None; n_slots],
+            block_tables_dirty: vec![false; n_slots],
+        })
+    }
+
+    /// Build a paged pool with `n_slots` slots drawing from a shared arena
+    /// of `n_pages` physical pages. Each slot's KV is allocated on demand
+    /// via the `PagePool`, enabling dynamic allocation, prefix sharing,
+    /// and over-subscription.
+    ///
+    /// `cap_tokens` is the per-slot maximum (admission limit), not a
+    /// pre-allocation. The actual arena is `n_pages * PAGE_TOKENS *
+    /// per_pos_bytes` bytes per layer (K or V).
+    pub fn new_paged(
+        n_slots: usize,
+        cap_tokens: usize,
+        per_pos_bytes: usize,
+        n_pages: usize,
+    ) -> Result<Self, String> {
+        assert!(n_slots > 0, "n_slots must be positive");
+        assert!(per_pos_bytes > 0, "per_pos_bytes must be positive");
+        let cap = cap_tokens.div_ceil(PAGE_TOKENS) * PAGE_TOKENS;
+        let page_pool = PagePool::new(n_pages, per_pos_bytes)?;
+
+        // In paged mode, descriptors start in legacy mode (block_table = 0).
+        // They switch to paged mode when the slot acquires pages and the
+        // block table is uploaded to the GPU.
+        let descs = (0..n_slots)
+            .map(|_| KvSlotDesc {
+                block_table: 0,
+                legacy_base: 0,
+                seq_len: 0,
+                page_tokens: 0,
+            })
+            .collect();
+
+        Ok(Self {
+            descs,
+            in_use: vec![false; n_slots],
+            cap_tokens: cap,
+            per_pos_bytes,
+            dirty: true,
+            page_pool: Some(page_pool),
+            block_tables: vec![None; n_slots],
+            block_tables_dirty: vec![false; n_slots],
         })
     }
 
     /// Take a free slot, or `None` when the pool is full. Admission control
     /// lives in SP4; this only reports capacity.
+    ///
+    /// In paged mode, a fresh `BlockTable` is created for the slot.
     pub fn acquire(&mut self) -> Option<SlotId> {
         let i = self.in_use.iter().position(|&u| !u)?;
         self.in_use[i] = true;
         self.reset(SlotId(i));
+        // In paged mode, give the slot a fresh block table.
+        if self.page_pool.is_some() {
+            self.block_tables[i] = Some(BlockTable::new());
+            self.block_tables_dirty[i] = true;
+        }
         Some(SlotId(i))
     }
 
     /// Return a slot to the pool. Resets its length so a later `acquire`
     /// cannot inherit the previous occupant's history.
+    ///
+    /// In paged mode, the slot's pages are freed back to the `PagePool`.
     pub fn release(&mut self, id: SlotId) {
         self.reset(id);
+        // In paged mode, free the block table's pages.
+        if let Some(pool) = self.page_pool.as_mut() {
+            if let Some(bt) = self.block_tables[id.0].as_mut() {
+                pool.release_table(bt);
+            }
+            self.block_tables[id.0] = None;
+            self.block_tables_dirty[id.0] = false;
+        }
         self.in_use[id.0] = false;
     }
 
     /// Zero a slot's logical length. The slab bytes are left alone — every
     /// read is bounded by `seq_len`, so stale bytes are unreachable.
+    ///
+    /// In paged mode, this truncates the block table to 0 pages (freeing
+    /// all pages) and resets the descriptor to legacy mode.
     pub fn reset(&mut self, id: SlotId) {
         if self.descs[id.0].seq_len != 0 {
             self.descs[id.0].seq_len = 0;
             self.dirty = true;
+        }
+        if let Some(pool) = self.page_pool.as_mut() {
+            if let Some(bt) = self.block_tables[id.0].as_mut() {
+                if bt.num_pages() > 0 {
+                    pool.release_table(bt);
+                    self.block_tables_dirty[id.0] = true;
+                }
+            }
+            // Reset descriptor to legacy mode until pages are allocated.
+            self.descs[id.0].block_table = 0;
+            self.descs[id.0].page_tokens = 0;
+            self.descs[id.0].legacy_base = 0;
         }
     }
 
     /// Set a slot's logical KV length. Enforces `seq_len <= cap` host-side,
     /// because SP1 removed the device asserts (they shipped in release and
     /// cost 64 B/lane of scratch).
+    ///
+    /// In paged mode, this ensures the block table has enough pages to hold
+    /// `seq_len` tokens, allocating new pages from the `PagePool` as needed.
+    /// The descriptor's `seq_len` is updated; the block table GPU upload and
+    /// descriptor paged-mode activation happen in `mark_block_table_uploaded`.
     pub fn set_seq_len(&mut self, id: SlotId, seq_len: usize) -> Result<(), String> {
         if seq_len > self.cap_tokens {
             return Err(format!(
                 "SlotPool: slot {} seq_len {} exceeds cap {}",
                 id.0, seq_len, self.cap_tokens
             ));
+        }
+        if let Some(pool) = self.page_pool.as_mut() {
+            let bt = self
+                .block_tables[id.0]
+                .as_mut()
+                .ok_or_else(|| format!("SlotPool: slot {} has no block table", id.0))?;
+            pool.ensure_capacity(bt, seq_len)?;
+            self.block_tables_dirty[id.0] = true;
         }
         if self.descs[id.0].seq_len != seq_len as i32 {
             self.descs[id.0].seq_len = seq_len as i32;
@@ -120,14 +227,15 @@ impl SlotPool {
         &self.descs
     }
 
-    /// True when the table has changed since the last `mark_uploaded`.
-    /// Callers skip the device upload when clean, following the ds4 precedent.
+    /// True when the descriptor table or any block table has changed since
+    /// the last `mark_uploaded`. Callers skip the device upload when clean.
     pub fn descriptors_dirty(&self) -> bool {
-        self.dirty
+        self.dirty || self.block_tables_dirty.iter().any(|&d| d)
     }
 
     pub fn mark_uploaded(&mut self) {
         self.dirty = false;
+        self.block_tables_dirty.iter_mut().for_each(|d| *d = false);
     }
 
     /// Per-slot token capacity (uniform across all slots).
@@ -141,8 +249,95 @@ impl SlotPool {
     }
 
     /// Bytes in ONE arena (K or V). The pool holds two of these.
+    /// In legacy mode: `n_slots * cap_tokens * per_pos_bytes`.
+    /// In paged mode: `n_pages * PAGE_TOKENS * per_pos_bytes`.
     pub fn arena_bytes(&self) -> usize {
-        self.descs.len() * self.cap_tokens * self.per_pos_bytes
+        if let Some(pool) = &self.page_pool {
+            pool.arena_bytes()
+        } else {
+            self.descs.len() * self.cap_tokens * self.per_pos_bytes
+        }
+    }
+
+    // ── Paged-mode accessors ───────────────────────────────────────────
+
+    /// True when this pool is operating in paged mode.
+    pub fn is_paged(&self) -> bool {
+        self.page_pool.is_some()
+    }
+
+    /// Get the block table for `slot`, if in paged mode.
+    pub fn block_table(&self, slot: SlotId) -> Option<&BlockTable> {
+        self.block_tables.get(slot.0).and_then(|bt| bt.as_ref())
+    }
+
+    /// True when `slot`'s block table has changed since last upload.
+    pub fn block_table_dirty(&self, slot: SlotId) -> bool {
+        self.block_tables_dirty.get(slot.0).copied().unwrap_or(false)
+    }
+
+    /// Activate paged mode for `slot`: set the descriptor's `block_table`
+    /// to the GPU device address of the uploaded page index array, and
+    /// `page_tokens` to `PAGE_TOKENS`. Called by `forward_batch_slots`
+    /// after uploading the block table to the GPU.
+    pub fn activate_paged_desc(&mut self, slot: SlotId, block_table_dev_addr: u64) {
+        let bt = self
+            .block_tables
+            .get(slot.0)
+            .and_then(|bt| bt.as_ref())
+            .expect("activate_paged_desc: slot has no block table");
+        self.descs[slot.0].block_table = block_table_dev_addr;
+        self.descs[slot.0].page_tokens = PAGE_TOKENS as i32;
+        self.descs[slot.0].legacy_base = 0;
+        self.descs[slot.0].seq_len = bt.live_tokens() as i32;
+        self.dirty = true;
+    }
+
+    /// Share a prefix of `n_pages` pages from `src` slot into `dst` slot's
+    /// block table. Used for prefix sharing across sessions.
+    pub fn share_prefix(
+        &mut self,
+        src: SlotId,
+        dst: SlotId,
+        n_pages: usize,
+    ) -> Result<(), String> {
+        // Extract src page indices first to avoid overlapping borrows.
+        let src_pages: Vec<u32> = {
+            let src_bt = self
+                .block_tables
+                .get(src.0)
+                .and_then(|bt| bt.as_ref())
+                .ok_or_else(|| "share_prefix: src slot has no block table".to_string())?;
+            if n_pages > src_bt.num_pages() {
+                return Err(format!(
+                    "share_prefix: src has {} pages but {} requested",
+                    src_bt.num_pages(),
+                    n_pages
+                ));
+            }
+            src_bt.page_indices()[..n_pages].to_vec()
+        };
+        // Now do the mutable work.
+        let pool = self
+            .page_pool
+            .as_mut()
+            .ok_or_else(|| "share_prefix: pool is not in paged mode".to_string())?;
+        let dst_bt = self
+            .block_tables
+            .get_mut(dst.0)
+            .and_then(|bt| bt.as_mut())
+            .ok_or_else(|| "share_prefix: dst slot has no block table".to_string())?;
+        for &phys in &src_pages {
+            pool.refcount_inc(phys);
+            dst_bt.push_page(phys);
+        }
+        self.block_tables_dirty[dst.0] = true;
+        Ok(())
+    }
+
+    /// Number of free pages in the page pool (paged mode only).
+    pub fn free_pages(&self) -> usize {
+        self.page_pool.as_ref().map(|p| p.free_pages()).unwrap_or(0)
     }
 }
 
