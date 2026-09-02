@@ -1399,6 +1399,7 @@ dependencies = [
  "base64",
  "hip-bridge",
  "hipfire-arch-qwen35",
+ "hipfire-arch-qwen35-vl",
  "hipfire-config",
  "hipfire-engine",
  "hipfire-generate",
