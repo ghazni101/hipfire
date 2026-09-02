@@ -1004,7 +1004,22 @@ fn main() {
                         .and_then(|p| p.get("experimental_multi_slot_prefill_chunk"))
                         .and_then(|v| v.as_u64())
                         .unwrap_or(1024) as usize;
-                    match slots::SlotBackend::load(path, n_slots, cap_tokens, prefill_chunk) {
+                    // MTP: parse mtp_mode and mtp_k from load params.
+                    // mtp_mode "on"/"auto" enables MTP; mtp_k sets depth (default 4).
+                    let mtp_mode = msg
+                        .get("params")
+                        .and_then(|p| p.get("mtp_mode"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("off");
+                    let mtp_k = if mtp_mode.is_empty() || mtp_mode == "off" {
+                        0
+                    } else {
+                        msg.get("params")
+                            .and_then(|p| p.get("mtp_k"))
+                            .and_then(|v| v.as_u64())
+                            .unwrap_or(4) as usize
+                    };
+                    match slots::SlotBackend::load(path, n_slots, cap_tokens, prefill_chunk, mtp_k) {
                         Ok(backend) => {
                             let arch = backend.arch_str().to_string();
                             let dim = backend.dim();

@@ -35,6 +35,9 @@ pub struct PendingWork {
     /// M-RoPE path (vision_forward + per-token prefill/decode) and MUST
     /// be skipped by the batched 1D-RoPE scheduler.
     pub vl_prefill: Option<VlPrefill>,
+    /// MTP state. When true, this slot is served by the sequential MTP
+    /// spec-decode path and MUST be skipped by the batched scheduler.
+    pub mtp_active: bool,
 }
 
 /// Visual + M-RoPE data for one slot's sequential VL path.
@@ -69,7 +72,8 @@ impl Scheduler {
         for w in work.iter_mut() {
             // Sequential VL path owns these slots: 1D batched RoPE would
             // disagree with M-RoPE on image and post-image tokens.
-            if w.vl_prefill.is_some() {
+            // MTP slots are also sequential — skip them here.
+            if w.vl_prefill.is_some() || w.mtp_active {
                 b.m_per_slot.push(0);
                 continue;
             }
@@ -109,7 +113,7 @@ mod tests {
             remaining_prompt: prompt(1000),
             next_pos: 0,
             decoding: false,
-            vl_prefill: None,
+            vl_prefill: None, mtp_active: false,
         }];
         let b = s.next_batch(&mut work);
         assert_eq!(
@@ -130,14 +134,14 @@ mod tests {
                 remaining_prompt: prompt(300),
                 next_pos: 0,
                 decoding: false,
-                vl_prefill: None,
+                vl_prefill: None, mtp_active: false,
             },
             PendingWork {
                 slot: SlotId(1),
                 remaining_prompt: vec![42],
                 next_pos: 10,
                 decoding: true,
-                vl_prefill: None,
+                vl_prefill: None, mtp_active: false,
             },
         ];
         let b = s.next_batch(&mut work);
@@ -156,7 +160,7 @@ mod tests {
             remaining_prompt: prompt(10),
             next_pos: 0,
             decoding: false,
-            vl_prefill: None,
+            vl_prefill: None, mtp_active: false,
         }];
         let b = s.next_batch(&mut work);
         assert_eq!(b.total_rows(), 10);
@@ -171,7 +175,7 @@ mod tests {
             remaining_prompt: vec![],
             next_pos: 0,
             decoding: false,
-            vl_prefill: None,
+            vl_prefill: None, mtp_active: false,
         }];
         let b = s.next_batch(&mut work);
         assert!(b.is_empty());
@@ -198,13 +202,14 @@ mod tests {
                     rope_delta: 0,
                     base: 0,
                 }),
+                mtp_active: false,
             },
             PendingWork {
                 slot: SlotId(1),
                 remaining_prompt: vec![7],
                 next_pos: 3,
                 decoding: true,
-                vl_prefill: None,
+                vl_prefill: None, mtp_active: false,
             },
         ];
         let b = s.next_batch(&mut work);

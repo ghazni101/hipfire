@@ -69,6 +69,7 @@ impl SlotBackend {
         n_slots: usize,
         cap_tokens: usize,
         prefill_chunk: usize,
+        mtp_k: usize,
     ) -> Result<Self, String> {
         // CPU preflight: open HFQ, arch, VL, config, tokenizer.
         let preflight = cpu_preflight(model_path)?;
@@ -96,6 +97,7 @@ impl SlotBackend {
                 swap_dir: std::env::temp_dir().join("hipfire-serve-swap"),
                 is_vl,
                 vl_path,
+                mtp_k,
             },
         )
         .map_err(|e| format!("SlotEngine spawn: {e}"))?;
@@ -1091,7 +1093,6 @@ pub fn validate_load_caps(msg: &serde_json::Value) -> Option<String> {
     }
     for (key, label) in [
         ("dflash_mode", "DFlash"),
-        ("mtp_mode", "MTP"),
         ("prefill_compression", "PFlash"),
     ] {
         if params
@@ -1873,7 +1874,6 @@ mod tests {
             json!({"kv_mode": "asym3"}),
             json!({"kv_backend": "vmm"}),
             json!({"dflash_mode": "auto"}),
-            json!({"mtp_mode": "on"}),
             json!({"ngram_draft": true}),
             json!({"cask": true}),
         ] {
@@ -1882,6 +1882,12 @@ mod tests {
                 "unsupported params passed: {params}"
             );
         }
+        // MTP is now accepted in multi-slot (sequential per-slot path).
+        assert_eq!(
+            validate_load_caps(&json!({"params": {"mtp_mode": "on"}})),
+            None,
+            "mtp_mode on should be accepted in multi-slot"
+        );
     }
 
     #[test]
