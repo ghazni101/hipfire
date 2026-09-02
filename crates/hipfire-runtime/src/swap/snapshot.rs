@@ -222,21 +222,60 @@ pub fn capture_slot(
 ) -> Result<SlotSnapshot, SwapError> {
     let desc = pool.descriptors()[slot.0];
     let seq_len = desc.seq_len as usize;
-    let span = seq_len * stamp.per_pos_bytes as usize;
+    let per_pos = stamp.per_pos_bytes as usize;
+    let span = seq_len * per_pos;
     let dn_total: usize = extra.iter().map(|t| t.buf.size()).sum();
     let mut payload = vec![0u8; k_arenas.len() * 2 * span + dn_total];
     let mut off = 0usize;
 
-    // Only the LIVE prefix: seq_len, not cap.
-    for (k, v) in k_arenas.iter().zip(v_arenas.iter()) {
-        for (arena, base) in [(k, desc.legacy_base), (v, desc.legacy_base)] {
-            if span > 0 {
-                let view = arena.sub_offset(base as usize, span);
-                gpu.hip
-                    .memcpy_dtoh(&mut payload[off..off + span], &view.buf)
-                    .map_err(|e| SwapError::Gpu(e.to_string()))?;
+    if pool.is_paged() {
+        // Paged mode: KV is scattered across physical pages. Copy each
+        // page's worth of data from the arena into the contiguous payload.
+        let bt = pool
+            .block_table(slot)
+            .ok_or_else(|| SwapError::Gpu("capture: slot has no block table".into()))?;
+        let page_tokens = rdna_compute::page_pool::PAGE_TOKENS;
+        let page_bytes = page_tokens * per_pos;
+        let n_full_pages = seq_len / page_tokens;
+        let last_page_tokens = seq_len % page_tokens;
+
+        for (k, v) in k_arenas.iter().zip(v_arenas.iter()) {
+            for arena in [k, v] {
+                // Copy full pages.
+                for lp in 0..n_full_pages {
+                    let phys = bt.physical(lp).unwrap() as usize;
+                    let arena_off = phys * page_bytes;
+                    let view = arena.sub_offset(arena_off, page_bytes);
+                    gpu.hip
+                        .memcpy_dtoh(&mut payload[off..off + page_bytes], &view.buf)
+                        .map_err(|e| SwapError::Gpu(e.to_string()))?;
+                    off += page_bytes;
+                }
+                // Copy partial last page.
+                if last_page_tokens > 0 {
+                    let phys = bt.physical(n_full_pages).unwrap() as usize;
+                    let arena_off = phys * page_bytes;
+                    let last_bytes = last_page_tokens * per_pos;
+                    let view = arena.sub_offset(arena_off, last_bytes);
+                    gpu.hip
+                        .memcpy_dtoh(&mut payload[off..off + last_bytes], &view.buf)
+                        .map_err(|e| SwapError::Gpu(e.to_string()))?;
+                    off += last_bytes;
+                }
             }
-            off += span;
+        }
+    } else {
+        // Legacy mode: contiguous slab at legacy_base.
+        for (k, v) in k_arenas.iter().zip(v_arenas.iter()) {
+            for (arena, base) in [(k, desc.legacy_base), (v, desc.legacy_base)] {
+                if span > 0 {
+                    let view = arena.sub_offset(base as usize, span);
+                    gpu.hip
+                        .memcpy_dtoh(&mut payload[off..off + span], &view.buf)
+                        .map_err(|e| SwapError::Gpu(e.to_string()))?;
+                }
+                off += span;
+            }
         }
     }
     for t in extra {
@@ -277,7 +316,8 @@ pub fn restore_slot(
     snap.validate(expect)?;
 
     let desc = pool.descriptors()[slot.0];
-    let span = snap.seq_len * snap.stamp.per_pos_bytes as usize;
+    let per_pos = snap.stamp.per_pos_bytes as usize;
+    let span = snap.seq_len * per_pos;
     let dn_total: usize = extra.iter().map(|t| t.buf.size()).sum();
     if k_arenas.len() * 2 * span + dn_total != snap.payload.len() {
         return Err(SwapError::Corrupt(
@@ -285,15 +325,56 @@ pub fn restore_slot(
         ));
     }
     let mut off = 0usize;
-    for (k, v) in k_arenas.iter().zip(v_arenas.iter()) {
-        for (arena, base) in [(k, desc.legacy_base), (v, desc.legacy_base)] {
-            if span > 0 {
-                let view = arena.sub_offset(base as usize, span);
-                gpu.hip
-                    .memcpy_htod(&view.buf, &snap.payload[off..off + span])
-                    .map_err(|e| SwapError::Gpu(e.to_string()))?;
+    if pool.is_paged() {
+        // Paged mode: ensure the slot has enough pages, then scatter the
+        // contiguous payload back into the physical pages.
+        pool.set_seq_len(slot, snap.seq_len)
+            .map_err(|e| SwapError::Gpu(e))?;
+        let bt = pool
+            .block_table(slot)
+            .ok_or_else(|| SwapError::Gpu("restore: slot has no block table".into()))?;
+        let page_tokens = rdna_compute::page_pool::PAGE_TOKENS;
+        let page_bytes = page_tokens * per_pos;
+        let n_full_pages = snap.seq_len / page_tokens;
+        let last_page_tokens = snap.seq_len % page_tokens;
+
+        for (k, v) in k_arenas.iter().zip(v_arenas.iter()) {
+            for arena in [k, v] {
+                // Copy full pages.
+                for lp in 0..n_full_pages {
+                    let phys = bt.physical(lp).unwrap() as usize;
+                    let arena_off = phys * page_bytes;
+                    let view = arena.sub_offset(arena_off, page_bytes);
+                    gpu.hip
+                        .memcpy_htod(&view.buf, &snap.payload[off..off + page_bytes])
+                        .map_err(|e| SwapError::Gpu(e.to_string()))?;
+                    off += page_bytes;
+                }
+                // Copy partial last page.
+                if last_page_tokens > 0 {
+                    let phys = bt.physical(n_full_pages).unwrap() as usize;
+                    let arena_off = phys * page_bytes;
+                    let last_bytes = last_page_tokens * per_pos;
+                    let view = arena.sub_offset(arena_off, last_bytes);
+                    gpu.hip
+                        .memcpy_htod(&view.buf, &snap.payload[off..off + last_bytes])
+                        .map_err(|e| SwapError::Gpu(e.to_string()))?;
+                    off += last_bytes;
+                }
             }
-            off += span;
+        }
+    } else {
+        // Legacy mode: contiguous slab at legacy_base.
+        for (k, v) in k_arenas.iter().zip(v_arenas.iter()) {
+            for (arena, base) in [(k, desc.legacy_base), (v, desc.legacy_base)] {
+                if span > 0 {
+                    let view = arena.sub_offset(base as usize, span);
+                    gpu.hip
+                        .memcpy_htod(&view.buf, &snap.payload[off..off + span])
+                        .map_err(|e| SwapError::Gpu(e.to_string()))?;
+                }
+                off += span;
+            }
         }
     }
     for t in extra {
@@ -303,8 +384,10 @@ pub fn restore_slot(
             .map_err(|e| SwapError::Gpu(e.to_string()))?;
         off += n;
     }
-    pool.set_seq_len(slot, snap.seq_len)
-        .map_err(|e| SwapError::Gpu(e))?;
+    if !pool.is_paged() {
+        pool.set_seq_len(slot, snap.seq_len)
+            .map_err(|e| SwapError::Gpu(e))?;
+    }
     Ok(())
 }
 

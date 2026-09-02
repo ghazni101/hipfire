@@ -96,7 +96,7 @@ use hipfire_runtime::llama::{
     rotate_x_mq_batched_for, EmbeddingFormat, WeightTensor,
 };
 use rdna_compute::kv_slots::{build_tiles, KvSlotDesc};
-use rdna_compute::slot_pool::SlotPool;
+use rdna_compute::slot_pool::{SlotId, SlotPool};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Pack a `KvSlotDesc` table byte-identically to `kernels/src/kv_slot_desc.h`
@@ -2528,7 +2528,10 @@ pub fn forward_batch_slots_graphed(
     cache: &mut SlotDecodeGraph,
 ) -> HipResult<()> {
     let pure_decode = !batch.is_empty() && batch.m_per_slot.iter().all(|&m| m == 1);
-    if !gpu.slots_decode_graph() || !pure_decode {
+    // Paged mode disables graph capture: block table uploads and descriptor
+    // activation happen per-step and are not captured by the graph. The plain
+    // path handles paged mode correctly.
+    if !gpu.slots_decode_graph() || !pure_decode || pool.is_paged() {
         return forward_batch_slots(
             gpu,
             weights,
@@ -2871,6 +2874,39 @@ pub fn forward_batch_slots_opts(
         gpu.hip
             .memcpy_htod(&desc_staging.row_slot_dev.buf, &row_slot_bytes)?;
         if pool.descriptors_dirty() {
+            let desc_bytes = pack_descs(pool.descriptors());
+            gpu.hip
+                .memcpy_htod(&desc_staging.descs_dev.buf, &desc_bytes)?;
+            pool.mark_uploaded();
+        }
+        // ── 3b. Upload block tables (paged mode only) ───────────────────
+        // For each active slot with a dirty block table, upload its page
+        // indices to the slot's GPU buffer and activate the paged descriptor.
+        if pool.is_paged() && !desc_staging.block_table_devs.is_empty() {
+            for slot_idx in 0..pool.descriptors().len() {
+                if !pool.block_table_dirty(SlotId(slot_idx)) {
+                    continue;
+                }
+                if let Some(bt) = pool.block_table(SlotId(slot_idx)) {
+                    let indices = bt.page_indices();
+                    if !indices.is_empty() {
+                        let bt_bytes: Vec<u8> = indices
+                            .iter()
+                            .flat_map(|x| x.to_ne_bytes())
+                            .collect();
+                        gpu.hip.memcpy_htod(
+                            &desc_staging.block_table_devs[slot_idx].buf,
+                            &bt_bytes,
+                        )?;
+                    }
+                    // Activate paged mode: set descriptor's block_table to
+                    // the GPU address of the uploaded page index array.
+                    let dev_addr = desc_staging.block_table_devs[slot_idx].buf.as_ptr() as u64;
+                    pool.activate_paged_desc(SlotId(slot_idx), dev_addr);
+                }
+            }
+            // Re-upload the descriptor table since activate_paged_desc
+            // modified it.
             let desc_bytes = pack_descs(pool.descriptors());
             gpu.hip
                 .memcpy_htod(&desc_staging.descs_dev.buf, &desc_bytes)?;
