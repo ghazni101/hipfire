@@ -69,7 +69,15 @@ pub struct EngineConfig {
     pub swap_dir: PathBuf,
     /// True when the HFQ has vision tensors. Rig::build loads VisionWeights
     /// and VisionConfig when set.
+    /// True when the model has vision support (either inline in the trunk
+    /// HFQ or in a separate `.vl` sidecar). Rig::build loads VisionWeights
+    /// and VisionConfig when set.
     pub is_vl: bool,
+    /// Path to a standalone `.vl` file containing only vision tower tensors.
+    /// When set, vision weights are loaded from this file instead of the
+    /// trunk HFQ. When `None`, falls back to inline vision tensors in the
+    /// trunk (backward compat with pre-separation artifacts).
+    pub vl_path: Option<PathBuf>,
 }
 
 pub struct SlotEngine {
@@ -312,6 +320,17 @@ impl Rig {
             .map_err(|e| format!("vram info: {e}"))?;
         preflight_alloc(planned, vram_free as u64, "SlotEngine")
             .map_err(|e| format!("preflight refused: {e}"))?;
+        // Discrete GPUs: keep model pages in page cache (fadvise-per-tensor
+        // forces a full re-read on every load). UMA keeps eviction to avoid
+        // OOM vs hipMalloc staging. Mirrors carriers.rs — without this, the
+        // default `evict_page_cache=true` drops the mmap in prepare(), and
+        // post-weight tensor reads (e.g. vision weights) panic on None.
+        hfq.set_evict_page_cache(
+            std::env::var("HIPFIRE_PAGE_EVICTION")
+                .ok()
+                .map(|v| v != "0")
+                .unwrap_or_else(|| gpu.is_uma()),
+        );
         let weights: Qwen35Weights = {
             let mut src = qwen35::HfqSource::new(&mut hfq, &config);
             let layout = qwen35::Layout::single(config.n_layers);
@@ -319,21 +338,32 @@ impl Rig {
         }
         .map_err(|e| format!("load weights: {e}"))?;
 
-        let vision_config = if cfg.is_vl {
-            Some(
-                hipfire_arch_qwen35_vl::qwen35_vl::vision_config_from_hfq(&hfq)
-                    .ok_or_else(|| "VL model missing vision_config in metadata".to_string())?,
-            )
+        // ── Vision tower loading ──────────────────────────────────────────
+        // When `vl_path` is set, vision weights load from the standalone .vl
+        // sidecar (a standard HFQM container with only model.visual.* tensors
+        // and config.vision_config in its metadata). Otherwise, fall back to
+        // inline vision tensors in the trunk HFQ (backward compat).
+        let (vision_config, vision_weights) = if cfg.is_vl {
+            if let Some(vl) = &cfg.vl_path {
+                eprintln!("  loading vision weights from .vl sidecar: {}", vl.display());
+                let mut vl_hfq = HfqFile::open(vl)
+                    .map_err(|e| format!("open .vl file {}: {e}", vl.display()))?;
+                let vc = hipfire_arch_qwen35_vl::qwen35_vl::vision_config_from_hfq(&vl_hfq)
+                    .ok_or_else(|| ".vl file missing vision_config in metadata".to_string())?;
+                let vw = hipfire_arch_qwen35_vl::qwen35_vl::load_vision_weights(
+                    &mut vl_hfq, &vc, &mut gpu,
+                )
+                .map_err(|e| format!("load vision weights from .vl: {e}"))?;
+                (Some(vc), Some(vw))
+            } else {
+                let vc = hipfire_arch_qwen35_vl::qwen35_vl::vision_config_from_hfq(&hfq)
+                    .ok_or_else(|| "VL model missing vision_config in metadata".to_string())?;
+                let vw = hipfire_arch_qwen35_vl::qwen35_vl::load_vision_weights(&hfq, &vc, &mut gpu)
+                    .map_err(|e| format!("load vision weights: {e}"))?;
+                (Some(vc), Some(vw))
+            }
         } else {
-            None
-        };
-        let vision_weights = if let Some(vc) = &vision_config {
-            Some(
-                hipfire_arch_qwen35_vl::qwen35_vl::load_vision_weights(&hfq, vc, &mut gpu)
-                    .map_err(|e| format!("load vision weights: {e}"))?,
-            )
-        } else {
-            None
+            (None, None)
         };
 
         // ── Transactional post-weight guard ────────────────────────────────
