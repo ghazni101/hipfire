@@ -439,4 +439,140 @@ mod tests {
         let e = SlotPool::new(8, 4_000_000, PPB).unwrap_err();
         assert!(e.contains("budget") || e.contains("GiB"), "unexpected: {e}");
     }
+
+    // ── Paged mode tests ──────────────────────────────────────────────
+
+    #[test]
+    fn paged_pool_acquires_with_fresh_block_table() {
+        let mut p = SlotPool::new_paged(2, 256, PPB, 16).unwrap();
+        assert!(p.is_paged());
+        let slot = p.acquire().unwrap();
+        assert!(p.block_table(slot).is_some(), "acquired slot must have a block table");
+        assert_eq!(p.block_table(slot).unwrap().num_pages(), 0);
+        assert_eq!(p.block_table(slot).unwrap().live_tokens(), 0);
+    }
+
+    #[test]
+    fn paged_set_seq_len_allocates_pages() {
+        let mut p = SlotPool::new_paged(2, 512, PPB, 16).unwrap();
+        let slot = p.acquire().unwrap();
+        // 300 tokens needs 3 pages (ceil(300/128) = 3)
+        p.set_seq_len(slot, 300).unwrap();
+        let bt = p.block_table(slot).unwrap();
+        assert_eq!(bt.num_pages(), 3);
+        assert_eq!(bt.live_tokens(), 300);
+        assert_eq!(p.descriptors()[slot.0].seq_len, 300);
+        // Free pages should be 16 - 3 = 13
+        assert_eq!(p.free_pages(), 13);
+    }
+
+    #[test]
+    fn paged_set_seq_len_grows_and_shrinks() {
+        let mut p = SlotPool::new_paged(1, 1024, PPB, 32).unwrap();
+        let slot = p.acquire().unwrap();
+        // Grow to 500 tokens (4 pages)
+        p.set_seq_len(slot, 500).unwrap();
+        assert_eq!(p.block_table(slot).unwrap().num_pages(), 4);
+        // Grow to 800 tokens (7 pages)
+        p.set_seq_len(slot, 800).unwrap();
+        assert_eq!(p.block_table(slot).unwrap().num_pages(), 7);
+        // Shrink to 200 tokens — pages stay allocated, live_tokens reduced
+        p.set_seq_len(slot, 200).unwrap();
+        assert_eq!(p.block_table(slot).unwrap().num_pages(), 7);
+        assert_eq!(p.block_table(slot).unwrap().live_tokens(), 200);
+    }
+    #[test]
+    fn paged_release_frees_pages() {
+        let mut p = SlotPool::new_paged(2, 512, PPB, 16).unwrap();
+        let slot = p.acquire().unwrap();
+        p.set_seq_len(slot, 300).unwrap();
+        assert_eq!(p.free_pages(), 13);
+        p.release(slot);
+        assert_eq!(p.free_pages(), 16, "release must free all pages");
+        assert!(p.block_table(slot).is_none(), "release must clear block table");
+    }
+
+    #[test]
+    fn paged_oom_when_pages_exhausted() {
+        let mut p = SlotPool::new_paged(1, 4096, PPB, 4).unwrap();
+        let slot = p.acquire().unwrap();
+        // 4 pages * 128 = 512 tokens max
+        p.set_seq_len(slot, 512).unwrap();
+        // 513 tokens needs 5 pages — only 4 available
+        let err = p.set_seq_len(slot, 513).unwrap_err();
+        assert!(err.contains("free"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn paged_share_prefix_between_slots() {
+        let mut p = SlotPool::new_paged(2, 512, PPB, 16).unwrap();
+        let slot_a = p.acquire().unwrap();
+        p.set_seq_len(slot_a, 300).unwrap(); // 3 pages
+        let slot_b = p.acquire().unwrap();
+        // Share first 2 pages from A to B
+        p.share_prefix(slot_a, slot_b, 2).unwrap();
+        let bt_b = p.block_table(slot_b).unwrap();
+        assert_eq!(bt_b.num_pages(), 2);
+        // Shared pages should have the same physical indices
+        let bt_a = p.block_table(slot_a).unwrap();
+        assert_eq!(bt_a.physical(0), bt_b.physical(0));
+        assert_eq!(bt_a.physical(1), bt_b.physical(1));
+        // Free pages: 16 - 3 (A) - 0 (B new) = 13 (B shares A's pages)
+        assert_eq!(p.free_pages(), 13);
+        // Release A — shared pages should survive
+        p.release(slot_a);
+        assert_eq!(p.free_pages(), 16 - 2, "only non-shared page freed");
+        // Release B — now all pages freed
+        p.release(slot_b);
+        assert_eq!(p.free_pages(), 16);
+    }
+
+    #[test]
+    fn paged_activate_paged_desc_sets_block_table_addr() {
+        let mut p = SlotPool::new_paged(1, 256, PPB, 8).unwrap();
+        let slot = p.acquire().unwrap();
+        p.set_seq_len(slot, 128).unwrap();
+        // Simulate GPU upload: activate paged descriptor with a fake address
+        p.activate_paged_desc(slot, 0xCAFE_BABE);
+        let desc = p.descriptors()[slot.0];
+        assert_eq!(desc.block_table, 0xCAFE_BABE);
+        assert_eq!(desc.page_tokens, PAGE_TOKENS as i32);
+        assert_eq!(desc.legacy_base, 0);
+        assert_eq!(desc.seq_len, 128);
+    }
+
+    #[test]
+    fn paged_release_resets_to_legacy_mode() {
+        let mut p = SlotPool::new_paged(1, 256, PPB, 8).unwrap();
+        let slot = p.acquire().unwrap();
+        p.set_seq_len(slot, 128).unwrap();
+        p.activate_paged_desc(slot, 0xCAFE_BABE);
+        p.release(slot);
+        // After release, descriptor should be back in legacy mode
+        let desc = p.descriptors()[slot.0];
+        assert_eq!(desc.block_table, 0);
+        assert_eq!(desc.page_tokens, 0);
+        assert_eq!(desc.seq_len, 0);
+    }
+
+    #[test]
+    fn paged_dirty_flag_tracks_block_table_changes() {
+        let mut p = SlotPool::new_paged(1, 256, PPB, 8).unwrap();
+        let slot = p.acquire().unwrap();
+        p.mark_uploaded();
+        // set_seq_len should dirty the block table
+        p.set_seq_len(slot, 128).unwrap();
+        assert!(p.descriptors_dirty(), "block table change must dirty");
+        assert!(p.block_table_dirty(slot), "slot block table must be dirty");
+        p.mark_uploaded();
+        assert!(!p.descriptors_dirty());
+        assert!(!p.block_table_dirty(slot));
+    }
+
+    #[test]
+    fn paged_arena_bytes_uses_page_pool() {
+        let p = SlotPool::new_paged(2, 256, PPB, 16).unwrap();
+        // 16 pages * 128 tokens * 1088 bytes = 2,228,224 bytes per arena
+        assert_eq!(p.arena_bytes(), 16 * 128 * PPB);
+    }
 }
