@@ -102,7 +102,7 @@ fn main() {
         v_arenas.push(gpu.zeros(&[arena_bytes], DType::Raw).expect("v arena"));
     }
     let mut dn_states = vec![DeltaNetState::new(&mut gpu, &config).expect("dn state")];
-    let mut desc_staging = SlotDescStaging::new(&mut gpu, 1, max_batch).expect("staging");
+    let mut desc_staging = SlotDescStaging::new(&mut gpu, 1, max_batch, 0).expect("staging");
     let pbs = PrefillBatchScratch::new(&mut gpu, &config, max_batch).expect("pbs");
     let scratch =
         Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 64, cap_tokens).expect("scratch");
