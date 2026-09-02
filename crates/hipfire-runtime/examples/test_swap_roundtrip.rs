@@ -162,7 +162,7 @@ fn main() {
         per_pos_bytes: per_pos_bytes as u32,
         n_fa_layers: n_fa_layers as u32,
         dn_layout_version: 1,
-        cap: pool.descriptors()[0].cap as u32,
+        cap: pool.cap_tokens() as u32,
         dn_bytes,
     };
     println!(
