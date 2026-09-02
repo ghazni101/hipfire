@@ -43,6 +43,30 @@ struct SourceMeta {
     arch_id: u32,
 }
 
+/// Discover a `.vl` sidecar file for the given trunk model path.
+/// Mirrors the daemon's `discover_vl_sidecar`: `HIPFIRE_VL_FILE` env,
+/// then `<stem>.vl` sibling.
+fn discover_vl_path(model_path: &str) -> Option<std::path::PathBuf> {
+    if let Ok(v) = std::env::var("HIPFIRE_VL_FILE") {
+        let p = std::path::PathBuf::from(v);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let base = std::path::Path::new(model_path);
+    match (base.parent(), base.file_stem()) {
+        (Some(parent), Some(stem)) => {
+            let vl = parent.join(format!("{}.vl", stem.to_string_lossy()));
+            if vl.exists() {
+                Some(vl)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
+}
+
 fn resolve_source_meta(src: &ModelSource, path: &str) -> Result<SourceMeta, String> {
     match src {
         ModelSource::Hfq(hfq) => Ok(SourceMeta {
@@ -520,26 +544,48 @@ impl Carrier for Qwen35Carrier {
                 // ── pp=1 path (single-GPU) ────────────────────
                 let physical_cap = ctx.cask.physical_cap(ctx.max_seq)?;
 
-                // VL detection — loads weights from hfq_file in-place
+                // VL detection — loads weights from .vl sidecar if present,
+                // otherwise from hfq_file in-place (backward compat).
                 let (vision_config, vision_weights) = {
                     use hipfire_arch_qwen35_vl::Qwen35Vl;
                     use hipfire_runtime::arch::Architecture;
-                    let has_vision = hfq_file
+
+                    // .vl sidecar discovery: HIPFIRE_VL_FILE env, then <stem>.vl sibling.
+                    let vl_path = discover_vl_path(ctx.path);
+                    let has_inline_vision = hfq_file
                         .tensor_data("model.visual.patch_embed.proj.weight")
                         .is_some();
-                    let vc = Qwen35Vl::config_from_hfq(&hfq_file).ok();
-                    match vc {
-                        Some(vc) if has_vision => {
-                            let vw = Qwen35Vl::load_weights(&mut hfq_file, &vc, ctx.gpu)
-                                .map_err(|e| eprintln!("  VL weight load failed: {e}"))
-                                .ok();
-                            eprintln!(
-                                "  VL model: vision encoder (hidden={}, layers={})",
-                                vc.hidden_size, vc.num_layers
-                            );
-                            (Some(vc), vw)
+
+                    if let Some(vl) = &vl_path {
+                        eprintln!("  loading vision weights from .vl sidecar: {}", vl.display());
+                        let mut vl_hfq = hipfire_runtime::hfq::HfqFile::open(vl)
+                            .map_err(|e| format!("open .vl file {}: {e}", vl.display()))?;
+                        let vc = Qwen35Vl::config_from_hfq(&vl_hfq)
+                            .map_err(|e| format!(".vl vision_config: {e}"))?;
+                        let vw = Qwen35Vl::load_weights(&mut vl_hfq, &vc, ctx.gpu)
+                            .map_err(|e| format!("VL weight load from .vl: {e:?}"))
+                            .ok();
+                        eprintln!(
+                            "  VL model: vision encoder (hidden={}, layers={})",
+                            vc.hidden_size, vc.num_layers
+                        );
+                        (Some(vc), vw)
+                    } else {
+                        let has_vision = has_inline_vision;
+                        let vc = Qwen35Vl::config_from_hfq(&hfq_file).ok();
+                        match vc {
+                            Some(vc) if has_vision => {
+                                let vw = Qwen35Vl::load_weights(&mut hfq_file, &vc, ctx.gpu)
+                                    .map_err(|e| eprintln!("  VL weight load failed: {e}"))
+                                    .ok();
+                                eprintln!(
+                                    "  VL model: vision encoder (hidden={}, layers={})",
+                                    vc.hidden_size, vc.num_layers
+                                );
+                                (Some(vc), vw)
+                            }
+                            _ => (None, None),
                         }
-                        _ => (None, None),
                     }
                 };
 

@@ -80,6 +80,7 @@ impl SlotBackend {
         let tokenizer = preflight.tokenizer;
         let is_vl = preflight.is_vl;
         let vision_config = preflight.vision_config;
+        let vl_path = preflight.vl_path;
 
         let n_slots = n_slots.max(1);
         let cap_tokens = cap_tokens.max(1);
@@ -94,6 +95,7 @@ impl SlotBackend {
                 host_budget_bytes: 16 * 1024 * 1024 * 1024,
                 swap_dir: std::env::temp_dir().join("hipfire-serve-swap"),
                 is_vl,
+                vl_path,
             },
         )
         .map_err(|e| format!("SlotEngine spawn: {e}"))?;
@@ -913,29 +915,42 @@ struct Preflight {
     chat_template: Option<String>,
     is_vl: bool,
     vision_config: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionConfig>,
+    /// Discovered .vl sidecar path. When set, the slot engine loads vision
+    /// weights from this file instead of the trunk HFQ.
+    vl_path: Option<PathBuf>,
 }
 
 fn cpu_preflight(model_path: &str) -> Result<Preflight, String> {
     let hfq =
         HfqFile::open(std::path::Path::new(model_path)).map_err(|e| format!("open model: {e}"))?;
     validate_arch_id(hfq.arch_id)?;
-    if is_vision_hfq(&hfq) {
-        // Vision-tower artifacts are served TEXT-ONLY here: the qwen35 loader
-        // pulls tensors by name, so the vision tower is never read and never
-        // allocated — the text tower is a standard dense qwen3.5 model.
-        // Verified on ornith-1.5-9b-v1 (2026-09-02): text serving matches the
-        // same artifact on the ordinary (non-slot) path.
-        eprintln!(
-            "[hipfire] multi-slot: vision tensors present in artifact; serving \
-             the text tower only (vision tower ignored)"
-        );
-    }
-    let is_vl = is_vision_hfq(&hfq);
+
+    // ── .vl sidecar discovery ──────────────────────────────────────────
+    // A .vl file is a standalone HFQM container with only vision tower
+    // tensors + config.vision_config metadata. Discovery order:
+    //   1. HIPFIRE_VL_FILE env var (explicit override)
+    //   2. <stem>.vl sibling next to the trunk model
+    // When a .vl file is found, it takes precedence over inline vision
+    // tensors. If no .vl file exists, fall back to inline (backward compat).
+    let vl_path = discover_vl_sidecar(model_path);
+    let has_inline_vision = is_vision_hfq(&hfq);
+    let is_vl = vl_path.is_some() || has_inline_vision;
+
+    // Read vision_config from the .vl file when present, else from the trunk.
     let vision_config = if is_vl {
-        Some(
-            hipfire_arch_qwen35_vl::qwen35_vl::vision_config_from_hfq(&hfq)
-                .ok_or_else(|| "VL model missing vision_config in metadata".to_string())?,
-        )
+        if let Some(vl) = &vl_path {
+            let vl_hfq = HfqFile::open(vl)
+                .map_err(|e| format!("open .vl file {}: {e}", vl.display()))?;
+            Some(
+                hipfire_arch_qwen35_vl::qwen35_vl::vision_config_from_hfq(&vl_hfq)
+                    .ok_or_else(|| ".vl file missing vision_config in metadata".to_string())?,
+            )
+        } else {
+            Some(
+                hipfire_arch_qwen35_vl::qwen35_vl::vision_config_from_hfq(&hfq)
+                    .ok_or_else(|| "VL model missing vision_config in metadata".to_string())?,
+            )
+        }
     } else {
         None
     };
@@ -971,6 +986,7 @@ fn cpu_preflight(model_path: &str) -> Result<Preflight, String> {
         chat_template,
         is_vl,
         vision_config,
+        vl_path,
     })
 }
 
@@ -989,6 +1005,35 @@ pub fn validate_arch_id(arch_id: u32) -> Result<(), String> {
 pub fn is_vision_hfq(hfq: &HfqFile) -> bool {
     hfq.tensor_data("model.visual.patch_embed.proj.weight")
         .is_some()
+}
+
+/// Discover a `.vl` sidecar file for the given trunk model path.
+///
+/// Discovery order:
+/// 1. `HIPFIRE_VL_FILE` env var — explicit override (any path)
+/// 2. `<stem>.vl` sibling next to the trunk model
+///
+/// Returns `None` when no .vl file is found (caller falls back to inline
+/// vision tensors in the trunk for backward compat).
+fn discover_vl_sidecar(model_path: &str) -> Option<PathBuf> {
+    if let Ok(v) = std::env::var("HIPFIRE_VL_FILE") {
+        let p = PathBuf::from(v);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+    let base = std::path::Path::new(model_path);
+    match (base.parent(), base.file_stem()) {
+        (Some(parent), Some(stem)) => {
+            let vl = parent.join(format!("{}.vl", stem.to_string_lossy()));
+            if vl.exists() {
+                Some(vl)
+            } else {
+                None
+            }
+        }
+        _ => None,
+    }
 }
 
 pub fn validate_load_caps(msg: &serde_json::Value) -> Option<String> {
