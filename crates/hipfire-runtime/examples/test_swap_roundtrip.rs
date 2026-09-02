@@ -126,6 +126,7 @@ fn main() {
         remaining_prompt: prompt.clone(),
         next_pos: 0,
         decoding: false,
+        vl_prefill: None,
     }];
     let mut sched = Scheduler {
         chunk_size: prompt.len(),

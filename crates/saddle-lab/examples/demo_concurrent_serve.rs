@@ -359,6 +359,7 @@ fn main() {
                 .unwrap_or_default(),
             next_pos: 0,
             decoding: false,
+            vl_prefill: None,
         })
         .collect();
 
