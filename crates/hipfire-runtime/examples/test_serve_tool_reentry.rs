@@ -52,6 +52,7 @@ fn main() {
         prefill_chunk: 512,
         host_budget_bytes: 8 * 1024 * 1024 * 1024,
         swap_dir: std::env::temp_dir().join("hipfire-tool-reentry-swap"),
+        is_vl: false,
     })
     .expect("engine");
 
@@ -92,6 +93,7 @@ fn main() {
                 top_p: 1.0,
                 top_k: 0,
                 seed: 0,
+                visual_data: None,
                 reply: tx,
             })
             .expect("submit");

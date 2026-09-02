@@ -18,10 +18,12 @@
 //! invariant: ordinary/default daemon load/generate remains byte-for-byte on the
 //! existing daemon path when `experimental_multi_slot` is absent.
 //!
-//! Load-time CPU preflight opens the HFQ, requires arch_id 5|6, rejects vision
-//! tensors/model, parses Qwen config/tokenizer/chat template, then spawns
-//! `SlotEngine`. Generate validates text-only supported wire fields and builds
-//! prompt/convo/continuation with the CLI `slots.rs` semantics.
+//! Load-time CPU preflight opens the HFQ, requires arch_id 5|6, records whether
+//! the HFQ has a vision tower, parses Qwen config/tokenizer/chat template, then
+//! spawns `SlotEngine`. Generate validates supported wire fields and builds
+//! prompt/convo/continuation with the CLI `slots.rs` semantics. Image turns
+//! are CPU-preprocessed here and submitted with `VisualData` for the engine's
+//! sequential M-RoPE path.
 
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -42,7 +44,7 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::prompt_frame::{
     AssistantPrefix, ChatFrame, JinjaChatFrame, Message, Role, ThinkMode,
 };
-use hipfire_runtime::serve::{Continuation, DoneReason, Event, SubmitRequest};
+use hipfire_runtime::serve::{Continuation, DoneReason, Event, SubmitRequest, VisualData};
 use hipfire_runtime::spec::{ClientEvent, SpecEmitCtx};
 use hipfire_runtime::tokenizer::Tokenizer;
 
@@ -55,6 +57,8 @@ pub struct SlotBackend {
     dim: usize,
     layers: usize,
     vocab: usize,
+    is_vl: bool,
+    vision_config: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionConfig>,
     active: AtomicUsize,
 }
 
@@ -74,6 +78,8 @@ impl SlotBackend {
         let chat_template = preflight.chat_template;
         let vocab = preflight.vocab;
         let tokenizer = preflight.tokenizer;
+        let is_vl = preflight.is_vl;
+        let vision_config = preflight.vision_config;
 
         let n_slots = n_slots.max(1);
         let cap_tokens = cap_tokens.max(1);
@@ -87,6 +93,7 @@ impl SlotBackend {
                 prefill_chunk,
                 host_budget_bytes: 16 * 1024 * 1024 * 1024,
                 swap_dir: std::env::temp_dir().join("hipfire-serve-swap"),
+                is_vl,
             },
         )
         .map_err(|e| format!("SlotEngine spawn: {e}"))?;
@@ -99,6 +106,8 @@ impl SlotBackend {
             chat_template,
             layers,
             vocab,
+            is_vl,
+            vision_config,
             active: AtomicUsize::new(0),
         })
     }
@@ -114,6 +123,9 @@ impl SlotBackend {
     }
     pub fn vocab(&self) -> usize {
         self.vocab
+    }
+    pub fn is_vl(&self) -> bool {
+        self.is_vl
     }
 
     pub fn active_count(&self) -> usize {
@@ -153,7 +165,8 @@ impl SlotBackend {
     /// Generate handler for experimental slot mode.
     ///
     /// Requires `experimental_multi_slot=true` on the wire, validates
-    /// text-only fields, builds prompt/convo/continuation, submits with
+    /// supported wire fields (images allowed when the loaded model has a
+    /// vision encoder), builds prompt/convo/continuation, submits with
     /// sampling, streams token/reasoning, handles abort via keyed registry +
     /// close, and performs two-phase terminal commit with byte-identical done.
     pub fn handle_generate<W: std::io::Write>(
@@ -466,67 +479,118 @@ impl SlotBackend {
             c
         };
 
-        let (prompt_tokens, started_in_think) =
-            if let Some(template) = self.chat_template.as_deref() {
-                let messages = match project_jinja_messages(msg) {
-                    Ok(messages) => messages,
-                    Err(reason) => {
-                        hipfire_engine::emit::emit_active_attempt_error(
-                            stdout,
-                            Some(id),
-                            &reason,
-                            "validation",
-                            false,
-                            false,
-                        );
-                        let _ = stdout.flush();
-                        return Ok(());
-                    }
-                };
-                let frame = JinjaChatFrame {
-                    tokenizer: &self.tokenizer,
-                    template,
-                    system: None,
-                    user: "",
-                    enable_thinking,
-                    bos_token: None,
-                    reasoning_strength: None,
-                    reasoning_effort: None,
-                };
-                let rendered = match frame.render_messages(&messages, None, None) {
-                    Ok(rendered) => rendered,
-                    Err(reason) => {
-                        hipfire_engine::emit::emit_active_attempt_error(
-                            stdout,
-                            Some(id),
-                            &format!("multi_slot Jinja render failed: {reason}"),
-                            "validation",
-                            false,
-                            false,
-                        );
-                        let _ = stdout.flush();
-                        return Ok(());
-                    }
-                };
-                let started = rendered.trim_end().ends_with("<think>");
-                (self.tokenizer.encode(&rendered), started)
-            } else {
-                let history: Vec<(Role, &str)> = turns
-                    .iter()
-                    .map(|(role, text)| (*role, text.as_str()))
-                    .collect();
-                let frame = ChatFrame {
-                    tokenizer: &self.tokenizer,
-                    system: system.as_deref(),
-                    user: &last_user,
-                    assistant_prefix: expected_prefix,
-                    raw: false,
-                };
-                (
-                    frame.build_multi_turn(&history),
-                    matches!(expected_prefix, AssistantPrefix::OpenThink),
-                )
+        let slot_image = match extract_slot_image(msg) {
+            Ok(image) => image,
+            Err(reason) => {
+                hipfire_engine::emit::emit_active_attempt_error(
+                    stdout,
+                    Some(id),
+                    &reason,
+                    "validation",
+                    false,
+                    false,
+                );
+                let _ = stdout.flush();
+                return Ok(());
+            }
+        };
+        if slot_image.is_some() && !self.is_vl() {
+            hipfire_engine::emit::emit_active_attempt_error(
+                stdout,
+                Some(id),
+                "model has no vision encoder",
+                "validation",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return Ok(());
+        }
+
+        let mut visual_data = None;
+        let (prompt_tokens, started_in_think) = if let Some(image) = slot_image {
+            match build_slot_vl_prompt(self, &image, system.as_deref(), &last_user, expected_prefix)
+            {
+                Ok((tokens, vd)) => {
+                    visual_data = Some(vd);
+                    (
+                        tokens,
+                        matches!(expected_prefix, AssistantPrefix::OpenThink),
+                    )
+                }
+                Err(reason) => {
+                    hipfire_engine::emit::emit_active_attempt_error(
+                        stdout,
+                        Some(id),
+                        &reason,
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    return Ok(());
+                }
+            }
+        } else if let Some(template) = self.chat_template.as_deref() {
+            let messages = match project_jinja_messages(msg) {
+                Ok(messages) => messages,
+                Err(reason) => {
+                    hipfire_engine::emit::emit_active_attempt_error(
+                        stdout,
+                        Some(id),
+                        &reason,
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    return Ok(());
+                }
             };
+            let frame = JinjaChatFrame {
+                tokenizer: &self.tokenizer,
+                template,
+                system: None,
+                user: "",
+                enable_thinking,
+                bos_token: None,
+                reasoning_strength: None,
+                reasoning_effort: None,
+            };
+            let rendered = match frame.render_messages(&messages, None, None) {
+                Ok(rendered) => rendered,
+                Err(reason) => {
+                    hipfire_engine::emit::emit_active_attempt_error(
+                        stdout,
+                        Some(id),
+                        &format!("multi_slot Jinja render failed: {reason}"),
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    return Ok(());
+                }
+            };
+            let started = rendered.trim_end().ends_with("<think>");
+            (self.tokenizer.encode(&rendered), started)
+        } else {
+            let history: Vec<(Role, &str)> = turns
+                .iter()
+                .map(|(role, text)| (*role, text.as_str()))
+                .collect();
+            let frame = ChatFrame {
+                tokenizer: &self.tokenizer,
+                system: system.as_deref(),
+                user: &last_user,
+                assistant_prefix: expected_prefix,
+                raw: false,
+            };
+            (
+                frame.build_multi_turn(&history),
+                matches!(expected_prefix, AssistantPrefix::OpenThink),
+            )
+        };
         // Now prefix for continuation is expected_prefix but also must agree with started_in_think
         let prefix = if started_in_think {
             AssistantPrefix::OpenThink
@@ -552,7 +616,9 @@ impl SlotBackend {
             return Ok(());
         }
         let prompt_len = prompt_tokens.len();
-        let continuation = if convo.len() >= 3 {
+        let continuation = if visual_data.is_some() {
+            Continuation::Cold
+        } else if convo.len() >= 3 {
             Continuation::UserTurn(hipfire_runtime::prompt_frame::continuation_suffix(
                 &self.tokenizer,
                 &last_user,
@@ -587,6 +653,7 @@ impl SlotBackend {
             top_p,
             top_k: top_k as i32,
             seed,
+            visual_data,
             reply: tx,
         };
         if let Err(e) = self.engine.submit(req) {
@@ -844,19 +911,34 @@ struct Preflight {
     vocab: usize,
     tokenizer: Tokenizer,
     chat_template: Option<String>,
+    is_vl: bool,
+    vision_config: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionConfig>,
 }
 
 fn cpu_preflight(model_path: &str) -> Result<Preflight, String> {
     let hfq =
         HfqFile::open(std::path::Path::new(model_path)).map_err(|e| format!("open model: {e}"))?;
     validate_arch_id(hfq.arch_id)?;
-    if is_vision_hfq(&hfq) {
-        return Err("vision model not supported in experimental multi-slot".to_string());
-    }
+    let is_vl = is_vision_hfq(&hfq);
+    let vision_config = if is_vl {
+        Some(
+            hipfire_arch_qwen35_vl::qwen35_vl::vision_config_from_hfq(&hfq)
+                .ok_or_else(|| "VL model missing vision_config in metadata".to_string())?,
+        )
+    } else {
+        None
+    };
     let config = hipfire_arch_qwen35::qwen35::config_from_hfq(&hfq)
         .map_err(|e| format!("qwen config: {e}"))?;
     let tokenizer =
         Tokenizer::from_hfq_metadata(&hfq.metadata_json).map_err(|e| format!("tokenizer: {e}"))?;
+    if is_vl {
+        for name in ["<|image_pad|>", "<|vision_start|>", "<|vision_end|>"] {
+            if tokenizer.special_token_id(name).is_none() {
+                return Err(format!("VL tokenizer missing {name} special token"));
+            }
+        }
+    }
     let chat_template = hfq.chat_template();
     if chat_template
         .as_deref()
@@ -876,6 +958,8 @@ fn cpu_preflight(model_path: &str) -> Result<Preflight, String> {
         vocab: config.vocab_size,
         tokenizer,
         chat_template,
+        is_vl,
+        vision_config,
     })
 }
 
@@ -1020,31 +1104,25 @@ pub fn is_experimental_generate(msg: &serde_json::Value) -> bool {
 }
 
 pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
-    if msg.get("image").is_some_and(|v| !v.is_null())
-        || msg.get("image_base64").is_some_and(|v| !v.is_null())
-        || msg
-            .get("messages")
-            .and_then(|v| v.as_array())
-            .is_some_and(|messages| {
-                messages.iter().any(|message| {
-                    message.get("role").and_then(|v| v.as_str()) == Some("tool")
-                        || message
-                            .get("tool_calls")
-                            .and_then(|v| v.as_array())
-                            .is_some_and(|calls| !calls.is_empty())
-                        || message
-                            .get("content")
-                            .and_then(|v| v.as_array())
-                            .is_some_and(|parts| {
-                                parts.iter().any(|part| {
-                                    part.get("type").and_then(|v| v.as_str()) == Some("image_url")
-                                })
-                            })
-                })
+    // Images are supported in experimental multi-slot when the loaded model
+    // has a vision encoder. `handle_generate` still refuses them on a
+    // text-only HFQ.
+    if msg
+        .get("messages")
+        .and_then(|v| v.as_array())
+        .is_some_and(|messages| {
+            messages.iter().any(|message| {
+                message.get("role").and_then(|v| v.as_str()) == Some("tool")
+                    || message
+                        .get("tool_calls")
+                        .and_then(|v| v.as_array())
+                        .is_some_and(|calls| !calls.is_empty())
             })
+        })
     {
         return Some(
-            "images and tool-result roles are not supported in experimental multi-slot".to_string(),
+            "tool-result roles and tool_calls are not supported in experimental multi-slot"
+                .to_string(),
         );
     }
     if msg
@@ -1278,6 +1356,219 @@ pub fn build_convo_from_messages(messages: &[Message]) -> Vec<u64> {
     convo
 }
 
+/// Encoded base64 cap matching the sequential daemon (~40 MiB → ~30 MiB raw).
+const MAX_BASE64_ENCODED_LEN: usize = 40 * 1024 * 1024;
+
+#[derive(Debug)]
+enum SlotImage {
+    Path(String),
+    Base64(String),
+}
+
+fn extract_slot_image(msg: &serde_json::Value) -> Result<Option<SlotImage>, String> {
+    let image = msg.get("image").and_then(|v| v.as_str());
+    let image_base64 = msg.get("image_base64").and_then(|v| v.as_str());
+    let image_url = msg.get("image_url").and_then(|v| v.as_str());
+    if image_base64.is_some() && image.is_some() {
+        eprintln!("[daemon/vl] both image and image_base64 provided — using image_base64");
+    }
+    if let Some(b64) = image_base64 {
+        if b64.len() > MAX_BASE64_ENCODED_LEN {
+            return Err(format!(
+                "image payload exceeds maximum encoded size ({} bytes)",
+                MAX_BASE64_ENCODED_LEN
+            ));
+        }
+        return Ok(Some(SlotImage::Base64(b64.to_string())));
+    }
+    if let Some(path) = image {
+        return Ok(Some(SlotImage::Path(path.to_string())));
+    }
+    if let Some(url) = image_url {
+        return Ok(Some(SlotImage::Base64(url.to_string())));
+    }
+    Ok(None)
+}
+
+fn splice_vl_user_body(
+    vision_start_id: u32,
+    image_pad_id: u32,
+    vision_end_id: u32,
+    n_visual_tokens: usize,
+    nl: &[u32],
+    q_tokens: &[u32],
+) -> Vec<u32> {
+    let mut user_body = Vec::with_capacity(n_visual_tokens + q_tokens.len() + nl.len() + 2);
+    user_body.push(vision_start_id);
+    user_body.extend(std::iter::repeat(image_pad_id).take(n_visual_tokens));
+    user_body.push(vision_end_id);
+    user_body.extend_from_slice(nl);
+    user_body.extend_from_slice(q_tokens);
+    user_body
+}
+
+fn build_slot_mrope(
+    prompt_ids: &[u32],
+    image_pad_id: u32,
+    n_visual: usize,
+    grid_h: usize,
+    grid_w: usize,
+    spatial_merge_size: usize,
+) -> Result<(Vec<[i32; 3]>, i32), String> {
+    if n_visual == 0 || spatial_merge_size == 0 {
+        return Err("VL request has no visual tokens".to_string());
+    }
+    let start = prompt_ids
+        .iter()
+        .position(|&t| t == image_pad_id)
+        .ok_or_else(|| "no <|image_pad|> in the prompt despite n_visual > 0".to_string())?;
+    if start + n_visual > prompt_ids.len() {
+        return Err("image span runs past the prompt".to_string());
+    }
+    if !prompt_ids[start..start + n_visual]
+        .iter()
+        .all(|&t| t == image_pad_id)
+    {
+        return Err("image-pad run is not contiguous".to_string());
+    }
+    if prompt_ids[start + n_visual..].contains(&image_pad_id) {
+        return Err("more than one image-pad run (multi-image not wired)".to_string());
+    }
+    let merged = (grid_h / spatial_merge_size) * (grid_w / spatial_merge_size);
+    if merged != n_visual {
+        return Err(format!(
+            "merged grid {merged} != spliced visual tokens {n_visual}"
+        ));
+    }
+    let spans = [hipfire_arch_qwen35_vl::mrope::ImageSpan {
+        start,
+        len: n_visual,
+        grid_h,
+        grid_w,
+    }];
+    let built = hipfire_arch_qwen35_vl::mrope::build_mrope_positions(
+        prompt_ids.len(),
+        &spans,
+        spatial_merge_size,
+    );
+    if built.positions.len() != prompt_ids.len() {
+        return Err(format!(
+            "build_mrope_positions returned {} positions for {} tokens",
+            built.positions.len(),
+            prompt_ids.len()
+        ));
+    }
+    Ok((built.positions, built.rope_delta))
+}
+
+fn decode_image_base64(b64: &str) -> Result<Vec<u8>, String> {
+    use base64::Engine;
+    let raw_b64 = if let Some(rest) = b64.strip_prefix("data:") {
+        match rest.split_once(',') {
+            Some((_, after)) => after,
+            None => return Err("malformed data URL: missing ',' separator".to_string()),
+        }
+    } else {
+        b64
+    };
+    Engine::decode(&base64::engine::general_purpose::STANDARD, raw_b64)
+        .map_err(|e| format!("failed to decode base64 image data: {e}"))
+}
+
+fn build_slot_vl_prompt(
+    backend: &SlotBackend,
+    image: &SlotImage,
+    system: Option<&str>,
+    prompt: &str,
+    assistant_prefix: AssistantPrefix,
+) -> Result<(Vec<u32>, VisualData), String> {
+    let vc = backend
+        .vision_config
+        .as_ref()
+        .ok_or_else(|| "VL model missing vision_config".to_string())?;
+    let tokenizer = &backend.tokenizer;
+    let image_pad_id = tokenizer
+        .special_token_id("<|image_pad|>")
+        .ok_or_else(|| "VL tokenizer missing <|image_pad|>".to_string())?;
+    let vision_start_id = tokenizer
+        .special_token_id("<|vision_start|>")
+        .ok_or_else(|| "VL tokenizer missing <|vision_start|>".to_string())?;
+    let vision_end_id = tokenizer
+        .special_token_id("<|vision_end|>")
+        .ok_or_else(|| "VL tokenizer missing <|vision_end|>".to_string())?;
+
+    let (pixels, img_h, img_w) = match image {
+        SlotImage::Path(path) => hipfire_arch_qwen35_vl::image::load_and_preprocess(
+            std::path::Path::new(path),
+            vc.patch_size,
+            vc.spatial_merge_size,
+        )?,
+        SlotImage::Base64(b64) => {
+            let bytes = decode_image_base64(b64)?;
+            hipfire_arch_qwen35_vl::image::load_and_preprocess_from_bytes(
+                &bytes,
+                vc.patch_size,
+                vc.spatial_merge_size,
+            )?
+        }
+    };
+    let grid_h = img_h / vc.patch_size;
+    let grid_w = img_w / vc.patch_size;
+    let n_patches = grid_h * grid_w;
+    let n_visual_tokens = n_patches / (vc.spatial_merge_size * vc.spatial_merge_size);
+    if n_visual_tokens == 0 {
+        return Err("image produced no visual tokens".to_string());
+    }
+
+    let nl = tokenizer.encode("\n");
+    let q_tokens = tokenizer.encode(prompt);
+    let user_body = splice_vl_user_body(
+        vision_start_id,
+        image_pad_id,
+        vision_end_id,
+        n_visual_tokens,
+        &nl,
+        &q_tokens,
+    );
+    let prompt_tokens = ChatFrame {
+        tokenizer,
+        system,
+        user: "",
+        assistant_prefix,
+        raw: false,
+    }
+    .build_with_user_tokens(&user_body);
+
+    let (mrope_positions, rope_delta) = build_slot_mrope(
+        &prompt_tokens,
+        image_pad_id,
+        n_visual_tokens,
+        grid_h,
+        grid_w,
+        vc.spatial_merge_size,
+    )?;
+    let patches = hipfire_arch_qwen35_vl::image::extract_patches(
+        &pixels,
+        3,
+        img_h,
+        img_w,
+        vc.patch_size,
+        vc.temporal_patch_size,
+        vc.spatial_merge_size,
+    );
+    Ok((
+        prompt_tokens,
+        VisualData {
+            patches,
+            grid_h,
+            grid_w,
+            n_visual_tokens,
+            mrope_positions,
+            rope_delta,
+        },
+    ))
+}
+
 // ── Tests (pure, no GPU) ───────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1295,11 +1586,47 @@ mod tests {
     }
 
     #[test]
-    fn generate_caps_rejects_images() {
+    fn generate_caps_allows_images() {
         let m = json!({"image": "/tmp/a.png", "experimental_multi_slot": true});
-        assert!(validate_generate_caps(&m).is_some());
+        assert!(validate_generate_caps(&m).is_none());
         let m2 = json!({"image_base64": "abcd", "experimental_multi_slot": true});
+        assert!(validate_generate_caps(&m2).is_none());
+    }
+
+    #[test]
+    fn generate_caps_rejects_tool_results() {
+        let m = json!({"messages": [{"role": "tool", "content": "result"}], "experimental_multi_slot": true});
+        assert!(validate_generate_caps(&m).is_some());
+        let m2 = json!({"messages": [{"role": "assistant", "tool_calls": [{"id": "1", "type": "function", "function": {"name": "f"}}]}], "experimental_multi_slot": true});
         assert!(validate_generate_caps(&m2).is_some());
+    }
+
+    #[test]
+    fn extract_slot_image_prefers_base64() {
+        let msg = json!({"image": "/tmp/a.png", "image_base64": "abcd"});
+        match extract_slot_image(&msg).unwrap() {
+            Some(SlotImage::Base64(s)) => assert_eq!(s, "abcd"),
+            other => panic!("expected base64, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn splice_vl_user_body_wraps_pads() {
+        let body = splice_vl_user_body(1, 2, 3, 4, &[10], &[20, 21]);
+        assert_eq!(body, vec![1, 2, 2, 2, 2, 3, 10, 20, 21]);
+    }
+
+    #[test]
+    fn build_slot_mrope_marks_image_span() {
+        let pad = 9u32;
+        let mut ids = vec![1, 2, pad, pad, pad, pad, 3, 4];
+        let (pos, delta) = build_slot_mrope(&ids, pad, 4, 4, 4, 2).unwrap();
+        assert_eq!(pos.len(), ids.len());
+        assert_eq!(pos[0], [0, 0, 0]);
+        assert_eq!(pos[2], [2, 2, 2]); // first visual: t=cursor, h=cursor+0, w=cursor+0
+        assert_ne!(delta, 0);
+        ids.push(pad);
+        assert!(build_slot_mrope(&ids, pad, 4, 4, 4, 2).is_err());
     }
 
     #[test]

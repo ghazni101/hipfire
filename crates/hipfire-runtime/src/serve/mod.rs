@@ -18,6 +18,29 @@
 
 use std::sync::mpsc::Sender;
 
+/// Visual payload for a VL request.
+///
+/// Image decode is CPU-side (daemon). `vision_forward` runs on the slot
+/// engine thread, which exclusively owns the GPU and VisionWeights.
+/// The engine splices the resulting embeddings at `<|image_pad|>` positions
+/// during a per-token prefill that uses `forward_scratch_embed_mrope`.
+///
+/// `mrope_positions` carries the 3D (t, h, w) position for every prompt token,
+/// already offset by `base` so values are absolute rope phases. `rope_delta`
+/// is added to the running sequence length for decode-step positions.
+pub struct VisualData {
+    /// Vision-tower patch tensor from `extract_patches` (CPU).
+    pub patches: Vec<f32>,
+    pub grid_h: usize,
+    pub grid_w: usize,
+    /// Number of post-merge visual tokens to splice at image_pad positions.
+    pub n_visual_tokens: usize,
+    /// 3D M-RoPE positions for every prompt token, offset by base.
+    pub mrope_positions: Vec<[i32; 3]>,
+    /// rope_delta for decode positions past the prompt.
+    pub rope_delta: i32,
+}
+
 /// One request handed to the engine.
 ///
 /// `reply` is the client's own channel: the engine streams this request's
@@ -37,6 +60,8 @@ pub struct SubmitRequest {
     /// 0 disables top-k.
     pub top_k: i32,
     pub seed: u32,
+    /// Visual embeddings + M-RoPE for VL requests. None for text-only.
+    pub visual_data: Option<VisualData>,
     pub reply: Sender<Event>,
 }
 

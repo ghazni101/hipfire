@@ -34,7 +34,9 @@ use crate::forward_slots::{forward_batch_slots_graphed, SlotDecodeGraph, SlotDes
 use crate::qwen35::{
     self, DeltaNetState, LayerType, PrefillBatchScratch, Qwen35Scratch, Qwen35Weights,
 };
-use crate::scheduler::{PendingWork, Scheduler};
+use crate::scheduler::{PendingWork, Scheduler, VlPrefill};
+use hipfire_runtime::llama::KvCache;
+use hipfire_runtime::llama::VMode;
 
 /// Internal control plane for the engine thread. Public methods map onto these
 /// messages; the GPU rig stays exclusively on that thread.
@@ -64,6 +66,9 @@ pub struct EngineConfig {
     pub prefill_chunk: usize,
     pub host_budget_bytes: u64,
     pub swap_dir: PathBuf,
+    /// True when the HFQ has vision tensors. Rig::build loads VisionWeights
+    /// and VisionConfig when set.
+    pub is_vl: bool,
 }
 
 pub struct SlotEngine {
@@ -199,6 +204,9 @@ struct Rig {
     desc_staging: SlotDescStaging,
     pbs: PrefillBatchScratch,
     scratch: Qwen35Scratch,
+    /// Vision encoder weights + config. None for text-only models.
+    vision_weights: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionWeights>,
+    vision_config: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionConfig>,
     logits_out: GpuTensor,
     out_tokens: GpuTensor,
     sample_params: Vec<SlotSampleParams>,
@@ -224,11 +232,11 @@ impl Rig {
     /// Build the GPU rig.
     ///
     /// CPU arch/tensor preflight precedes this loader — `SlotBackend::cpu_preflight`
-    /// opens the HFQ, validates `arch_id` 5|6, rejects vision tensors/models and
-    /// parses config/tokenizer before this GPU path. This function assumes that
-    /// preflight has passed; its `get_vram_info` + `preflight_alloc` is the
-    /// actual-device VRAM admission. Keep that preflight on the live device
-    /// (not a hardcoded budget).
+    /// opens the HFQ, validates `arch_id` 5|6, records whether the HFQ has a
+    /// vision tower, and parses config/tokenizer before this GPU path. This
+    /// function assumes that preflight has passed; its `get_vram_info` +
+    /// `preflight_alloc` is the actual-device VRAM admission. Keep that
+    /// preflight on the live device (not a hardcoded budget).
     ///
     /// Post-weight allocation is transactional: K/V arenas, DN states, desc
     /// staging, PBS, scratch, logits/out are all owned after `Qwen35Weights`.
@@ -280,6 +288,23 @@ impl Rig {
         }
         .map_err(|e| format!("load weights: {e}"))?;
 
+        let vision_config = if cfg.is_vl {
+            Some(
+                hipfire_arch_qwen35_vl::qwen35_vl::vision_config_from_hfq(&hfq)
+                    .ok_or_else(|| "VL model missing vision_config in metadata".to_string())?,
+            )
+        } else {
+            None
+        };
+        let vision_weights = if let Some(vc) = &vision_config {
+            Some(
+                hipfire_arch_qwen35_vl::qwen35_vl::load_vision_weights(&hfq, vc, &mut gpu)
+                    .map_err(|e| format!("load vision weights: {e}"))?,
+            )
+        } else {
+            None
+        };
+
         // ── Transactional post-weight guard ────────────────────────────────
         // Every allocation after weights is owned here. On any error, Drop
         // frees all completed stages in reverse construction order
@@ -290,6 +315,7 @@ impl Rig {
         struct Guard {
             gpu: Option<Gpu>,
             weights: Option<Qwen35Weights>,
+            vision_weights: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionWeights>,
             k_arenas: Vec<GpuTensor>,
             v_arenas: Vec<GpuTensor>,
             dn_states: Vec<DeltaNetState>,
@@ -333,6 +359,9 @@ impl Rig {
                     if let Some(w) = self.weights.take() {
                         w.free_gpu(&mut gpu);
                     }
+                    if let Some(vw) = self.vision_weights.take() {
+                        vw.free_gpu(&mut gpu);
+                    }
                     gpu.invalidate_weight_caches();
                     gpu.invalidate_graph_state();
                     gpu.drain_pool();
@@ -342,6 +371,7 @@ impl Rig {
         let mut g = Guard {
             gpu: Some(gpu),
             weights: Some(weights),
+            vision_weights,
             k_arenas: Vec::with_capacity(n_fa_layers),
             v_arenas: Vec::with_capacity(n_fa_layers),
             dn_states: Vec::with_capacity(cfg.n_slots),
@@ -440,6 +470,7 @@ impl Rig {
         g.committed = true;
         let gpu = g.gpu.take().unwrap();
         let weights = g.weights.take().unwrap();
+        let vision_weights = g.vision_weights.take();
         let k_arenas = std::mem::take(&mut g.k_arenas);
         let v_arenas = std::mem::take(&mut g.v_arenas);
         let dn_states = std::mem::take(&mut g.dn_states);
@@ -462,6 +493,8 @@ impl Rig {
             desc_staging,
             pbs,
             scratch,
+            vision_weights,
+            vision_config,
             logits_out,
             out_tokens,
             sample_params,
@@ -483,6 +516,7 @@ impl Rig {
         let Rig {
             mut gpu,
             weights,
+            vision_weights,
             k_arenas,
             v_arenas,
             dn_states,
@@ -527,6 +561,9 @@ impl Rig {
             }
         }
         weights.free_gpu(&mut gpu);
+        if let Some(vw) = vision_weights {
+            vw.free_gpu(&mut gpu);
+        }
         gpu.invalidate_weight_caches();
         gpu.invalidate_graph_state();
         gpu.drain_pool();
@@ -535,6 +572,239 @@ impl Rig {
             Some(e) => Err(e),
             None => Ok(()),
         }
+    }
+
+    /// Borrowed Q8 KvCache viewing this slot's contiguous K/V slabs.
+    /// Sequential `forward_scratch_*` writes here; the batched path reads
+    /// the same bytes via `legacy_base`. Views are `DeviceBuffer::Borrowed`
+    /// — dropping the KvCache does not free the arenas.
+    fn slot_kv_view(&self, slot: SlotId) -> KvCache {
+        let cap = self.pool.cap_tokens();
+        let per_pos_bytes = self.config.n_kv_heads * (self.config.head_dim / 32) * 34;
+        let base = self.pool.descriptors()[slot.0].legacy_base as usize;
+        let span = cap * per_pos_bytes;
+        let mut k_gpu = Vec::with_capacity(self.config.n_layers);
+        let mut v_gpu = Vec::with_capacity(self.config.n_layers);
+        let mut fa = 0usize;
+        for t in &self.config.layer_types {
+            if *t == LayerType::FullAttention {
+                k_gpu.push(self.k_arenas[fa].sub_offset(base, span));
+                v_gpu.push(self.v_arenas[fa].sub_offset(base, span));
+                fa += 1;
+            } else {
+                k_gpu.push(GpuTensor::null_for_test());
+                v_gpu.push(GpuTensor::null_for_test());
+            }
+        }
+        KvCache {
+            k_gpu,
+            v_gpu,
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim: self.config.n_kv_heads * self.config.head_dim,
+            max_seq: cap,
+            physical_cap: cap,
+            n_kv_heads: self.config.n_kv_heads,
+            head_dim: self.config.head_dim,
+            quantized: true,
+            quant_q8: true,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: false,
+            quant_asym3: false,
+            quant_asym2: false,
+            quant_fwht: false,
+            quant_bf16: false,
+            boundary_layers: 0,
+            givens_cos: None,
+            givens_sin: None,
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            v_mode: VMode::Q8,
+        }
+    }
+}
+
+/// Sequential VL step: encode the image if needed, prefill/decode every
+/// remaining token with M-RoPE, then sample the next token from scratch.logits.
+///
+/// VL slots stay on this path for the whole request because batched 1D RoPE
+/// disagrees with M-RoPE on image tokens and on decode (`t=h=w = pos+delta`).
+fn vl_forward_remaining(
+    rig: &mut Rig,
+    slot: SlotId,
+    work: &mut PendingWork,
+    image_pad_id: u32,
+) -> Result<u32, String> {
+    let mut vl = work
+        .vl_prefill
+        .take()
+        .ok_or_else(|| "vl_forward_remaining: slot has no VL state".to_string())?;
+    let first_step = vl.embeddings.is_empty();
+    if first_step {
+        let weights = rig
+            .vision_weights
+            .as_ref()
+            .ok_or_else(|| "VL request but model has no vision encoder".to_string())?;
+        let config = rig
+            .vision_config
+            .as_ref()
+            .ok_or_else(|| "VL request but model has no vision config".to_string())?;
+        let emb = hipfire_arch_qwen35_vl::qwen35_vl::vision_forward(
+            &mut rig.gpu,
+            weights,
+            config,
+            &vl.patches,
+            vl.grid_h,
+            vl.grid_w,
+        )
+        .map_err(|e| format!("vision_forward: {e}"))?;
+        vl.embeddings = emb;
+        vl.dim = rig.config.dim;
+        vl.patches.clear();
+        hipfire_runtime::llama::reset_cpu_sampler_rng(rig.sample_params[slot.0].seed);
+    }
+
+    let prompt_tokens = std::mem::take(&mut work.remaining_prompt);
+    let mut pos = work.next_pos;
+    let mut kv_cache = rig.slot_kv_view(slot);
+    let mrope_ctx = qwen35::MropeCtx::new(
+        &rig.config,
+        vl.base,
+        vl.mrope_positions.clone(),
+        vl.rope_delta,
+    );
+    let mut visual_idx = vl.visual_idx;
+    for &token in &prompt_tokens {
+        if token == image_pad_id && visual_idx < vl.n_visual_tokens {
+            let dim = vl.dim;
+            let start = visual_idx * dim;
+            let emb = vl
+                .embeddings
+                .get(start..start + dim)
+                .ok_or_else(|| "VL embedding slice out of range".to_string())?;
+            qwen35::forward_scratch_embed_mrope(
+                &mut rig.gpu,
+                &rig.weights,
+                &rig.config,
+                emb,
+                pos,
+                &mut kv_cache,
+                &mut rig.dn_states[slot.0],
+                &rig.scratch,
+                Some(&mrope_ctx),
+            )
+            .map_err(|e| format!("VL prefill embed: {e}"))?;
+            visual_idx += 1;
+        } else {
+            qwen35::forward_scratch_mrope(
+                &mut rig.gpu,
+                &rig.weights,
+                &rig.config,
+                token,
+                pos,
+                &mut kv_cache,
+                &mut rig.dn_states[slot.0],
+                &rig.scratch,
+                Some(&mrope_ctx),
+            )
+            .map_err(|e| format!("VL forward: {e}"))?;
+        }
+        pos += 1;
+    }
+    vl.visual_idx = visual_idx;
+    work.next_pos = pos;
+    rig.pool
+        .set_seq_len(slot, pos)
+        .map_err(|e| format!("VL set_seq_len: {e}"))?;
+    work.vl_prefill = Some(vl);
+
+    let mut logits = rig
+        .gpu
+        .download_f32(&rig.scratch.logits)
+        .map_err(|e| format!("VL download logits: {e}"))?;
+    let sp = &rig.sample_params[slot.0];
+    let cfg = hipfire_runtime::sampler::SamplerConfig {
+        temperature: sp.temperature,
+        top_p: sp.top_p,
+        repeat_penalty: 1.0,
+        repeat_window: 0,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        blocked_tokens: Vec::new(),
+        top_k: if sp.top_k > 0 {
+            Some(sp.top_k as u32)
+        } else {
+            None
+        },
+        min_p: None,
+    };
+    Ok(hipfire_runtime::sampler::sample_cpu(&mut logits, &[], &cfg))
+}
+
+fn clear_work_slot(work: &mut PendingWork) {
+    work.remaining_prompt.clear();
+    work.decoding = false;
+    work.next_pos = 0;
+    work.vl_prefill = None;
+}
+
+fn commit_sampled_token(
+    rig: &mut Rig,
+    slots: &mut [Option<InFlight>],
+    work: &mut [PendingWork],
+    s: usize,
+    tok: u32,
+) {
+    let Some(f) = slots[s].as_mut() else { return };
+    let session = f.session;
+    let hit_eos = rig.tokenizer.is_terminator(tok);
+    let gone = if hit_eos {
+        false
+    } else {
+        send_event(&f.reply, Event::Token { id: tok }).is_err()
+    };
+    f.produced += 1;
+    let hit_max = f.produced >= f.max_tokens;
+    let hit_ctx_cap = rig
+        .sessions
+        .get(session)
+        .map(|sess| sess.tokens.len() + 1 >= rig.cap_tokens)
+        .unwrap_or(false);
+
+    if gone || hit_eos || hit_max || hit_ctx_cap {
+        let reason = if gone {
+            DoneReason::ClientGone
+        } else if hit_eos {
+            DoneReason::Eos
+        } else {
+            DoneReason::MaxTokens
+        };
+        if should_retain_terminal_tok(reason) {
+            if let Some(sess) = rig.sessions.get_mut(session) {
+                sess.tokens.push(tok);
+            }
+        }
+        let generated = if hit_eos || gone {
+            f.produced - 1
+        } else {
+            f.produced
+        };
+        let _ = send_event(&f.reply, Event::Done { reason, generated });
+        slots[s] = None;
+        clear_work_slot(&mut work[s]);
+        if matches!(reason, DoneReason::ClientGone) {
+            rig.swap.forget(session.0);
+            rig.sessions.close(&mut rig.pool, &mut rig.adm, session);
+        } else {
+            rig.sessions.touch(session);
+        }
+    } else {
+        work[s].remaining_prompt.push(tok);
+        if let Some(sess) = rig.sessions.get_mut(session) {
+            sess.tokens.push(tok);
+        }
+        rig.sessions.touch(session);
     }
 }
 
@@ -559,6 +829,7 @@ fn run_loop(
             remaining_prompt: Vec::new(),
             next_pos: 0,
             decoding: false,
+            vl_prefill: None,
         })
         .collect();
     let mut sched = Scheduler {
@@ -583,9 +854,7 @@ fn run_loop(
                 );
                 rig.swap.forget(f.session.0);
                 rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
-                work[s].remaining_prompt.clear();
-                work[s].decoding = false;
-                work[s].next_pos = 0;
+                clear_work_slot(&mut work[s]);
             }
         }
     };
@@ -613,6 +882,33 @@ fn run_loop(
         }
         if slots.iter().all(|s| s.is_none()) {
             continue;
+        }
+
+        let image_pad_id = rig.tokenizer.special_token_id("<|image_pad|>");
+        for s in 0..n {
+            if work[s].vl_prefill.is_none() || slots[s].is_none() {
+                continue;
+            }
+            if work[s].remaining_prompt.is_empty() {
+                continue;
+            }
+            let pad = image_pad_id.unwrap_or(u32::MAX);
+            match vl_forward_remaining(&mut rig, SlotId(s), &mut work[s], pad) {
+                Ok(tok) => commit_sampled_token(&mut rig, &mut slots, &mut work, s, tok),
+                Err(reason) => {
+                    if let Some(f) = slots[s].take() {
+                        let _ = send_event(
+                            &f.reply,
+                            Event::Rejected {
+                                reason: reason.clone(),
+                            },
+                        );
+                        rig.swap.forget(f.session.0);
+                        rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
+                    }
+                    clear_work_slot(&mut work[s]);
+                }
+            }
         }
 
         let batch = sched.next_batch(&mut work);
@@ -699,6 +995,9 @@ fn run_loop(
         }
 
         for s in 0..n {
+            if work[s].vl_prefill.is_some() {
+                continue;
+            }
             let Some(f) = slots[s].as_mut() else { continue };
             // Still prefilling: these logits belong to a mid-prompt token.
             if !work[s].remaining_prompt.is_empty() {
@@ -751,9 +1050,7 @@ fn run_loop(
                 };
                 let _ = send_event(&f.reply, Event::Done { reason, generated });
                 slots[s] = None;
-                work[s].remaining_prompt.clear();
-                work[s].decoding = false;
-                work[s].next_pos = 0;
+                clear_work_slot(&mut work[s]);
                 if matches!(reason, DoneReason::ClientGone) {
                     // Nobody will follow up on a vanished client, so hand the
                     // slot back at once.
@@ -824,9 +1121,7 @@ fn handle_command(
                 if let Some(inflight) = slots[idx].take() {
                     drop(inflight.reply);
                 }
-                work[idx].remaining_prompt.clear();
-                work[idx].decoding = false;
-                work[idx].next_pos = 0;
+                clear_work_slot(&mut work[idx]);
             }
             rig.swap.forget(session);
             rig.sessions.close(&mut rig.pool, &mut rig.adm, sid);
@@ -858,6 +1153,37 @@ fn admit(
 ) {
     let busy: Vec<SessionId> = slots.iter().flatten().map(|f| f.session).collect();
 
+    if let Some(vd) = req.visual_data.as_ref() {
+        let reject = |reason: String| {
+            let _ = send_event(&req.reply, Event::Rejected { reason });
+            stats.lock().expect("stats").note_rejected();
+        };
+        if rig.vision_weights.is_none() {
+            reject("VL request but model has no vision encoder".to_string());
+            return;
+        }
+        if rig.pool.is_paged() {
+            reject("VL sequential path requires contiguous KV slots".to_string());
+            return;
+        }
+        if rig.tokenizer.special_token_id("<|image_pad|>").is_none() {
+            reject("VL tokenizer missing <|image_pad|>".to_string());
+            return;
+        }
+        if vd.n_visual_tokens == 0 {
+            reject("VL request has no visual tokens".to_string());
+            return;
+        }
+        if vd.mrope_positions.len() != req.prompt_tokens.len() {
+            reject(format!(
+                "VL mrope_positions length {} != prompt_tokens {}",
+                vd.mrope_positions.len(),
+                req.prompt_tokens.len()
+            ));
+            return;
+        }
+    }
+
     // Multi-turn continuation. The client resends the whole conversation, so a
     // follow-up turn is matched by its USER turns and then built by APPENDING
     // `continuation` to the session's exact stored tokens. Appending rather
@@ -865,7 +1191,7 @@ fn admit(
     // turn began after an OpenThink opener that history rendering does not
     // replay, and re-encoding the decoded reply is not guaranteed to round
     // trip. Reuse also keeps the DeltaNet state, which is the point.
-    if !req.continuation.tokens().is_empty() {
+    if req.visual_data.is_none() && !req.continuation.tokens().is_empty() {
         if rig.gpu.slot_trace() {
             let shape = match &req.continuation {
                 Continuation::ToolResults { session, .. } => {
@@ -1141,9 +1467,27 @@ fn admit(
         return;
     }
 
-    work[slot.0].remaining_prompt = req.prompt_tokens[plan.reused..].to_vec();
-    work[slot.0].next_pos = plan.reused;
     work[slot.0].decoding = false;
+    if let Some(vd) = req.visual_data {
+        work[slot.0].remaining_prompt = req.prompt_tokens.clone();
+        work[slot.0].next_pos = 0;
+        work[slot.0].vl_prefill = Some(VlPrefill {
+            patches: vd.patches,
+            grid_h: vd.grid_h,
+            grid_w: vd.grid_w,
+            n_visual_tokens: vd.n_visual_tokens,
+            embeddings: Vec::new(),
+            dim: rig.config.dim,
+            visual_idx: 0,
+            mrope_positions: vd.mrope_positions,
+            rope_delta: vd.rope_delta,
+            base: 0,
+        });
+    } else {
+        work[slot.0].remaining_prompt = req.prompt_tokens[plan.reused..].to_vec();
+        work[slot.0].next_pos = plan.reused;
+        work[slot.0].vl_prefill = None;
+    }
     rig.sample_params[slot.0] = SlotSampleParams {
         temperature: req.temperature,
         top_p: req.top_p,

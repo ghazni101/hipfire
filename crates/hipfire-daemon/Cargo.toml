@@ -16,6 +16,7 @@ deltanet = [
     "rdna-compute/deltanet",
     "hipfire-dispatch/deltanet",
     "hipfire-pflash/deltanet",
+    "hipfire-arch-qwen35-vl/deltanet",
 ]
 flash-attn-ck = [
     "rdna-compute/flash-attn-ck",
@@ -39,6 +40,7 @@ hipfire-engine = { path = "../hipfire-engine" }
 hipfire-generate = { path = "../hipfire-generate" }
 hipfire-pflash = { path = "../hipfire-pflash" }
 hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
+hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
 
 # All arch crates — unconditional, no features.
 
