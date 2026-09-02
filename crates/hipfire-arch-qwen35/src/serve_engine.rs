@@ -285,7 +285,7 @@ impl Rig {
             .ok()
             .as_deref()
         {
-            Some("1") | Some("on") | Some("true") => {
+            Some("1") | Some("on") | Some("true") if !cfg.is_vl => {
                 let legacy_equivalent =
                     cfg.n_slots * cfg.cap_tokens.div_ceil(PAGE_TOKENS);
                 Some(
@@ -294,6 +294,13 @@ impl Rig {
                         .and_then(|v| v.trim().parse::<usize>().ok())
                         .unwrap_or(legacy_equivalent),
                 )
+            }
+            Some("1") | Some("on") | Some("true") if cfg.is_vl => {
+                eprintln!(
+                    "  [hipfire] paged KV disabled for VL model \
+                     (vision sequential path requires contiguous KV slots)"
+                );
+                None
             }
             _ => None,
         };

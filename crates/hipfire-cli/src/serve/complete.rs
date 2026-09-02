@@ -2112,20 +2112,13 @@ pub(crate) fn complete_request_attempt(
 
 /// Whether the experimental multi-slot daemon path can honour this request.
 ///
-/// Pure pre-send gate. Temperature / top_p / top_k remain supported. Rejects
-/// images, tools, non-null stop, logprobs, non-neutral repeat/frequency/
-/// presence penalties, min_p, reasoning caps >= 2, and named thinking budgets
-/// other than `"off"`. Callers with `serve.multi_slot` enabled must surface the
-/// error — there is no ordinary-model fallback in that mode.
+/// Pure pre-send gate. Temperature / top_p / top_k remain supported. Images
+/// are supported when the loaded model has a vision encoder (the daemon slot
+/// backend gates on is_vl). Rejects tools, non-null stop, logprobs, non-neutral
+/// repeat/frequency/presence penalties, min_p, reasoning caps >= 2, and named
+/// thinking budgets other than `"off"`. Callers with `serve.multi_slot` enabled
+/// must surface the error — there is no ordinary-model fallback in that mode.
 pub(crate) fn multi_slot_request_supported(body: &serde_json::Value) -> Result<(), String> {
-    if multi_slot_request_has_image(body)
-        || body.get("image").is_some_and(|value| !value.is_null())
-        || body
-            .get("image_base64")
-            .is_some_and(|value| !value.is_null())
-    {
-        return Err("images are not supported".to_owned());
-    }
     if body
         .get("tools")
         .and_then(serde_json::Value::as_array)
@@ -2212,23 +2205,6 @@ pub(crate) fn multi_slot_request_supported(body: &serde_json::Value) -> Result<(
     Ok(())
 }
 
-fn multi_slot_request_has_image(body: &serde_json::Value) -> bool {
-    let Some(messages) = body.get("messages").and_then(serde_json::Value::as_array) else {
-        return false;
-    };
-    for message in messages {
-        let Some(parts) = message.get("content").and_then(serde_json::Value::as_array) else {
-            continue;
-        };
-        if parts
-            .iter()
-            .any(|part| part.get("type").and_then(serde_json::Value::as_str) == Some("image_url"))
-        {
-            return true;
-        }
-    }
-    false
-}
 
 /// Server-owned retry driver with cooperative cancellation.
 ///
@@ -6735,18 +6711,19 @@ mod tests {
         assert!(ok(serde_json::json!({ "min_p": 0.0 })));
         assert!(ok(serde_json::json!({ "tools": [] })));
 
-        err_contains(
-            serde_json::json!({
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "hi"},
-                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,aa"}}
-                    ]
-                }]
-            }),
-            "images",
-        );
+        // Images are now supported in multi-slot when the model has a vision
+        // encoder. The daemon slot backend gates on is_vl() and returns a
+        // validation error if the model lacks one; the CLI gate no longer
+        // rejects them upfront.
+        assert!(ok(serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hi"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,aa"}}
+                ]
+            }]
+        })));
         err_contains(
             serde_json::json!({ "tools": [{"type": "function", "function": {"name": "x"}}] }),
             "tools",
