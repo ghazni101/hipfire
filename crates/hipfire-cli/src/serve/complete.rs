@@ -2122,19 +2122,36 @@ pub(crate) fn complete_request_attempt(
 
 /// Whether the experimental multi-slot daemon path can honour this request.
 ///
-/// Pure pre-send gate. Temperature / top_p / top_k remain supported. Rejects
-/// images, non-null stop, logprobs, non-neutral repeat/frequency/
-/// presence penalties, min_p, reasoning caps >= 2, and named thinking budgets
-/// other than `"off"`. Callers with `serve.multi_slot` enabled must surface the
-/// error — there is no ordinary-model fallback in that mode.
+/// Pure pre-send gate. Temperature / top_p / top_k remain supported. Images
+/// are supported when the loaded model has a vision encoder (the daemon slot
+/// backend gates on is_vl). Images and tools are each supported but not
+/// together — the VL prompt path cannot render a tool contract. Rejects
+/// non-null stop, logprobs, non-neutral repeat/frequency/presence penalties,
+/// min_p, reasoning caps >= 2, and named thinking budgets other than `"off"`.
+/// Callers with `serve.multi_slot` enabled must surface the error — there is
+/// no ordinary-model fallback in that mode.
 pub(crate) fn multi_slot_request_supported(body: &serde_json::Value) -> Result<(), String> {
-    if multi_slot_request_has_image(body)
+    let has_image = multi_slot_request_has_image(body)
         || body.get("image").is_some_and(|value| !value.is_null())
         || body
             .get("image_base64")
-            .is_some_and(|value| !value.is_null())
-    {
-        return Err("images are not supported".to_owned());
+            .is_some_and(|value| !value.is_null());
+    let has_tools = body
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tools| !tools.is_empty())
+        || body
+            .get("messages")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message.get("role").and_then(serde_json::Value::as_str) == Some("tool")
+                })
+            });
+    if has_image && has_tools {
+        return Err(
+            "images and tools together are not supported in experimental multi-slot".to_owned(),
+        );
     }
     if body.get("stop").is_some_and(|value| !value.is_null()) {
         return Err("stop sequences are not supported".to_owned());
@@ -2204,23 +2221,6 @@ pub(crate) fn multi_slot_request_supported(body: &serde_json::Value) -> Result<(
     Ok(())
 }
 
-fn multi_slot_request_has_image(body: &serde_json::Value) -> bool {
-    let Some(messages) = body.get("messages").and_then(serde_json::Value::as_array) else {
-        return false;
-    };
-    for message in messages {
-        let Some(parts) = message.get("content").and_then(serde_json::Value::as_array) else {
-            continue;
-        };
-        if parts
-            .iter()
-            .any(|part| part.get("type").and_then(serde_json::Value::as_str) == Some("image_url"))
-        {
-            return true;
-        }
-    }
-    false
-}
 
 /// Server-owned retry driver with cooperative cancellation.
 ///
@@ -6780,17 +6780,27 @@ mod tests {
             "messages": [{"role":"tool","tool_call_id":"call_x","content":"ok"}]
         })));
 
+        // Images are supported in multi-slot when the model has a vision
+        // encoder. The daemon slot backend gates on is_vl() and returns a
+        // validation error if the model lacks one; the CLI gate no longer
+        // rejects them upfront.
+        assert!(ok(serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hi"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,aa"}}
+                ]
+            }]
+        })));
+        // Images + tools together are still refused — the VL prompt path
+        // cannot render a tool contract.
         err_contains(
             serde_json::json!({
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "hi"},
-                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,aa"}}
-                    ]
-                }]
+                "image_base64": "aa",
+                "tools": [{"type": "function", "function": {"name": "x"}}]
             }),
-            "images",
+            "images and tools",
         );
         err_contains(serde_json::json!({ "stop": ["\n\n"] }), "stop");
         err_contains(serde_json::json!({ "stop": "END" }), "stop");
