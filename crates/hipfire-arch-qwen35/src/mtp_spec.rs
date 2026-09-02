@@ -35,6 +35,18 @@ use crate::mtp_head::{
     Qwen35MtpHeadScratch,
 };
 use crate::qwen35::{self, DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
+use crate::qwen35::{LayerType, LayerWeights, PrefillBatchScratch, StateQuant};
+
+/// Debug tracing for the slot-engine MTP cycle (`HIPFIRE_MTP_TRACE=1`).
+/// Prints seed/candidates/argmax/advance per cycle to stderr.
+pub(crate) fn mtp_trace_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        hipfire_config::developer_var("HIPFIRE_MTP_TRACE")
+            .map(|v| v == "1")
+            .unwrap_or(false)
+    })
+}
 use crate::speculative::{apply_topp_trunc, sample_categorical, sample_residual};
 use crate::speculative::{DeltaNetSnapshot, GdnTape, ModelSlot};
 use hipfire_runtime::llama::KvCache;
@@ -132,18 +144,20 @@ fn mtp_q8_verify_wmma_enabled_from_env() -> bool {
     )
 }
 
-/// Default draft-confidence cutoff (adaptive-K) per arch. p_min=0.6 truncates
-/// the low-confidence tail of the K-chain — a win measured on the gfx1100 dGPU
-/// (2026-06-16 sweep: lifts every domain, even high-τ code +11%; 0.6 is the
-/// sweet spot, >0.7 over-truncates). DEFAULT-ON for the RDNA3 dGPU
-/// (gfx1100/1101/1102), the ONLY validated arch class. ANTIBLEED: the prior
-/// `starts_with("gfx11")` test also defaulted the RDNA3.5 iGPUs (gfx1150/1151/
-/// 1152) and the gfx1103 APU to 0.6, but p_min was NEVER validated there — they
-/// inherited a dGPU-tuned cutoff. They now default 0.0 (off) until validated in
-/// their own serve path (same as gfx12, whose W3v durability was measured at
-/// p_min=0). Override on any arch via HIPFIRE_MTP_P_MIN (e.g. =0.6 to enable
-/// elsewhere, =0 to disable). An explicit `set_p_min` call still overrides this.
+/// Default draft-confidence cutoff (adaptive-K) per arch.
+///
+/// p_min=0.6 was measured as a win on gfx1100 (2026-06-16 sweep: +11% on
+/// high-τ code) — but that sweep predates the POST-OUTPUT-NORM hidden fix
+/// for the slot-engine head inputs (2026-09-02): with correctly-scaled head
+/// inputs the draft chain's confidence distribution shifted upward, and the
+/// 0.6 gate now mostly truncates chains that would have verified. Measured
+/// on ornith-1.5-9b (gfx1101): slot engine 69.4 → 78.1 tok/s with p_min=0
+/// (also keeps the verify width stable at mtp_k+1 rows, which the verify
+/// graph key needs), sequential path τ 1.20 → 1.47 / 67.0 → 69.0 tok/s.
+/// Default is therefore 0.0 (off) everywhere; re-enable per arch via
+/// HIPFIRE_MTP_P_MIN (e.g. =0.6) if a future head wants it.
 fn default_mtp_p_min(arch: &str) -> f32 {
+    let _ = arch;
     if let Some(v) = hipfire_config::developer_var("HIPFIRE_MTP_P_MIN").ok() {
         return v
             .trim()
@@ -152,13 +166,7 @@ fn default_mtp_p_min(arch: &str) -> f32 {
             .filter(|x| (0.0..=1.0).contains(x))
             .unwrap_or(0.0);
     }
-    // is_rdna3_dgpu arch set (wide-BW GDDR6 dGPU); the iGPUs + gfx1103 APU are
-    // deliberately excluded — p_min there is unvalidated.
-    if matches!(arch, "gfx1100" | "gfx1101" | "gfx1102") {
-        0.6
-    } else {
-        0.0
-    }
+    0.0
 }
 
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
@@ -1556,7 +1564,7 @@ fn mtp_trunk_verify_lm_head(
 
 /// Output of the MTP draft phase — K serial head-forward steps.
 /// Consumed by either `mtp_shared_verify_accept_rollback_inner` (single-slot
-/// path) or `mtp_batched_verify_accept_inner` (slot engine batched path).
+/// path) or `mtp_batched_verify_accept_from_batch` (slot engine batched path).
 pub struct MtpDraftOutput {
     pub candidates: Vec<u32>,
     pub drafts_generated: usize,
@@ -1584,7 +1592,7 @@ impl MtpDraftOutput {
 
 /// Core accept-and-rollback logic shared between the single-slot path
 /// (`mtp_shared_verify_accept_rollback_inner`) and the batched slot-engine
-/// path (`mtp_batched_verify_accept_inner`).
+/// path (`mtp_batched_verify_accept_from_batch`).
 ///
 /// Caller responsibilities BEFORE calling this:
 /// - Populate `state.verify_hidden` with the trunk's hidden states for all
@@ -1870,72 +1878,288 @@ fn mtp_shared_verify_accept_rollback_inner(
     )
 }
 
-/// Batched verify-accept-rollback for the slot engine path.
+/// DeltaNet state repair after a partial MTP accept, replaying conv1d +
+/// qk-norm + GDN from the verify step's per-layer `(qkv, alpha, beta)` tape.
 ///
-/// After `forward_batch_slots_graphed` processes MTP verify rows alongside
-/// regular decode rows, the hidden states for all rows reside in
-/// `pbs.x_batch`. This function:
-/// 1. Copies the MTP slot's hidden states from `pbs.x_batch` to
-///    `state.verify_hidden`.
-/// 2. Delegates to `mtp_accept_and_rollback` for lm_head + accept + rollback.
+/// A batched verify forward advances the slot's `DeltaNetState` through all
+/// `m = k + 1` rows in place. On a partial accept the state must instead
+/// reflect only the committed prefix. The old repair re-ran the ENTIRE trunk
+/// as a prefill over the accepted tokens — attention, FFN, norms and all —
+/// even though the KV rows for the accepted prefix were already correct.
 ///
-/// `hidden_row_offset` is the flat row index where this slot's verify rows
-/// begin in `pbs.x_batch` (computed from `batch.m_per_slot` by the caller).
-/// `tape_captured` is always `false` for the batched path (the batched
-/// forward does not use GDN tape).
+/// The DeltaNet layers' per-row inputs cannot be re-read from `pbs` after
+/// the forward: those batch buffers are per-LAYER scratch, overwritten by
+/// each subsequent layer. Verify steps therefore TAPE their rows per layer
+/// as they compute (see `MtpVerifyCapture` in forward_slots); this replay
+/// mirrors `GdnTape::replay_gdn_inner` with a row offset — conv1d (advances
+/// the ring), fused QK norm (+ repeat-interleave), then the GDN recurrence —
+/// over the first `advance` taped rows. ~5 launches per DeltaNet layer
+/// instead of a full trunk pass; the KV cache is untouched.
+///
+/// `tape_row_off` is the slot's first row in the tape (`slot * (mtp_k + 1)`).
+/// `advance >= 1` (greedy accept always commits at least one row).
 #[allow(clippy::too_many_arguments)]
-pub fn mtp_batched_verify_accept_inner(
+pub fn mtp_dn_repair_from_tape(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
     config: &Qwen35Config,
-    kv_cache: &mut KvCache,
     dn_state: &mut DeltaNetState,
-    scratch: &mut Qwen35Scratch,
+    tape: &crate::speculative::GdnTape,
+    tape_row_off: usize,
+    advance: usize,
+) -> HipResult<()> {
+    assert!(advance >= 1, "mtp_dn_repair_from_tape: advance must be >= 1");
+    assert!(
+        tape_row_off + advance <= tape.max_n,
+        "mtp_dn_repair_from_tape: rows {}..{} exceed tape max_n {}",
+        tape_row_off,
+        tape_row_off + advance,
+        tape.max_n
+    );
+    if !matches!(dn_state.quant, StateQuant::Q8) {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "mtp_dn_repair_from_tape: DeltaNetState must be StateQuant::Q8 \
+             (the multi-slot batched path is Q8-only)",
+        ));
+    }
+
+    let n_v_heads = tape.n_v_heads;
+    let n_key_heads = tape.n_key_heads;
+    let hd = tape.key_head_dim;
+    let v_dim = tape.v_dim;
+    let k_dim = tape.k_dim;
+    let value_head_dim = tape.value_head_dim;
+
+    let mut la_idx = 0usize;
+    for (layer_idx, lt) in config.layer_types.iter().enumerate() {
+        if *lt != LayerType::LinearAttention {
+            continue;
+        }
+        let conv_weight = match &weights.layers[layer_idx] {
+            LayerWeights::DeltaNet(l) => &l.conv_weight,
+            LayerWeights::DeltaNetMoe(l) => &l.conv_weight,
+            _ => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "mtp_dn_repair_from_tape: LA layer type/weights mismatch",
+                ));
+            }
+        };
+
+        // Taped rows for this slot, at the slot's stride offset.
+        let qkv_rows = tape.qkv_bufs[la_idx].sub_offset(tape_row_off * tape.qkv_dim, advance * tape.qkv_dim);
+        let alpha_rows = tape.alpha_bufs[la_idx].sub_offset(tape_row_off * n_v_heads, advance * n_v_heads);
+        let beta_rows = tape.beta_bufs[la_idx].sub_offset(tape_row_off * n_v_heads, advance * n_v_heads);
+
+        // 1. conv1d + SiLU + split — advances the conv ring state.
+        gpu.conv1d_silu_split_f32_n(
+            &tape.q_raw_scratch,
+            &tape.k_raw_scratch,
+            &tape.v_scratch,
+            &qkv_rows,
+            conv_weight,
+            &dn_state.conv_states[la_idx],
+            k_dim,
+            v_dim,
+            advance,
+        )?;
+
+        // 2. L2 norm(Q) + L2 norm(K) + scale(Q).
+        gpu.fused_qk_l2_norm_scale_f32_batched(
+            &tape.q_raw_scratch,
+            &tape.k_raw_scratch,
+            n_key_heads,
+            hd,
+            1.0 / (hd as f32).sqrt(),
+            config.norm_eps,
+            advance,
+        )?;
+
+        // 3. Repeat-interleave if GQA.
+        if n_key_heads < n_v_heads {
+            let ratio = n_v_heads / n_key_heads;
+            gpu.repeat_interleave_qk_f32_batched(
+                &tape.q_raw_scratch,
+                &tape.k_raw_scratch,
+                &tape.q_scratch,
+                &tape.k_scratch,
+                n_key_heads,
+                ratio,
+                hd,
+                advance,
+            )?;
+        } else {
+            let bytes = advance * k_dim * 4;
+            gpu.hip.memcpy_dtod_at(&tape.q_scratch.buf, 0, &tape.q_raw_scratch.buf, 0, bytes)?;
+            gpu.hip.memcpy_dtod_at(&tape.k_scratch.buf, 0, &tape.k_raw_scratch.buf, 0, bytes)?;
+        }
+
+        // 4. GDN recurrence — advances S/scales/EF residual.
+        gpu.gated_delta_net_q8_batch_seq(
+            &tape.q_scratch,
+            &tape.k_scratch,
+            &tape.v_scratch,
+            &alpha_rows,
+            &beta_rows,
+            &dn_state.s_matrices[la_idx],
+            &dn_state.s_scales[la_idx],
+            &tape.attn_scratch,
+            advance,
+            n_v_heads,
+            value_head_dim,
+            dn_state.ef_residual(la_idx),
+        )?;
+        la_idx += 1;
+    }
+    Ok(())
+}
+
+/// Batched verify/accept for the vLLM-style slot-engine MTP path.
+///
+/// Differences vs the previous implementation:
+///
+///
+/// * the trunk lm_head runs directly over a VIEW of `pbs.x_batch` at the
+///   slot's row offset — no `verify_hidden` staging copy, and no separate
+///   per-slot last-row GEMV upstream (the caller passes `lm_head_skip` to
+///   `forward_batch_slots_graphed_opts` so the batched forward skips it);
+/// * greedy accept reads one packed `n_verify`-int D2H instead of routing
+///   through the GPU device-token-chain accept;
+/// * a partial accept repairs the DeltaNet state with
+///   [`mtp_dn_repair_from_pbs`] (two launches per DN layer) instead of
+///   re-running a full trunk `forward_prefill_batch` replay;
+/// * `prev_hidden` for the next draft cycle is captured from the same
+///   `x_batch` view.
+///
+/// The KV cache is not touched: the verify forward already wrote the
+/// accepted prefix's rows at the right positions, and rows past the new
+/// frontier are overwritten before any later forward can read them.
+#[allow(clippy::too_many_arguments)]
+pub fn mtp_batched_verify_accept_from_batch(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    dn_state: &mut DeltaNetState,
+    pbs: &PrefillBatchScratch,
     state: &mut MtpSpecState,
     draft: &MtpDraftOutput,
-    hidden_src: &GpuTensor,
     hidden_row_offset: usize,
+    verify_tape: &crate::speculative::GdnTape,
+    tape_stride: usize,
+    slot: usize,
     eos_token_id: u32,
 ) -> HipResult<MtpSpecResult> {
     let dim = config.dim;
+    let vocab = config.vocab_size;
     let n_verify = draft.n_verify();
-    let verify_tokens = draft.verify_tokens();
+    let drafts_generated = draft.drafts_generated;
 
-    // Copy hidden states from pbs.x_batch to state.verify_hidden.
-    let dim_bytes = dim * 4;
-    let src_offset = hidden_row_offset * dim_bytes;
-    let copy_bytes = n_verify * dim_bytes;
-    gpu.memcpy_dtod_at_auto(
-        &state.verify_hidden.buf,
-        0,
-        &hidden_src.buf,
-        src_offset,
-        copy_bytes,
+    // View of this slot's verify rows inside the batched forward's hidden
+    // buffer — no staging copy.
+    let verify_hidden = pbs.x_batch.sub_offset(hidden_row_offset * dim, n_verify * dim);
+
+    // Trunk lm_head over all verify rows (batched GEMM; handles every
+    // admissible lm_head dtype incl. the FWHT-rotate for MQ-family).
+    let w_out = &weights.output;
+    let logits_view = state.verify_logits.sub_offset(0, n_verify * vocab);
+    mtp_trunk_verify_lm_head(
+        gpu,
+        w_out,
+        &verify_hidden,
+        &state.verify_rot,
+        &logits_view,
+        n_verify,
+        dim,
+        vocab,
     )?;
 
-    mtp_accept_and_rollback(
-        gpu,
-        weights,
-        config,
-        kv_cache,
-        dn_state,
-        scratch,
-        state,
-        n_verify,
-        &verify_tokens,
-        &draft.candidates,
-        draft.drafts_generated,
-        draft.chain_truncated,
-        draft.use_sampling,
-        draft.sampling,
-        &draft.draft_probs,
-        &draft.draft_softmaxes,
-        /* is_external */ true,
-        draft.use_device_token_chain,
-        /* tape_captured */ false,
-        draft.cur_pos,
-        eos_token_id,
-    )
+    // Greedy accept: argmax per verify row on GPU, one packed D2H, host-side
+    // prefix rule. (The slot-engine MTP path is greedy-only, matching the
+    // retired `is_external = true` behaviour.)
+    let argmax_v = state.verify_argmax.sub_offset(0, n_verify);
+    gpu.argmax_f32_batched(&logits_view, &argmax_v, vocab, n_verify)?;
+    let mut argmax_host: Vec<i32> = vec![0; n_verify];
+    {
+        let bytes: &mut [u8] = unsafe {
+            std::slice::from_raw_parts_mut(argmax_host.as_mut_ptr() as *mut u8, n_verify * 4)
+        };
+        gpu.hip.memcpy_dtoh(bytes, &argmax_v.buf)?;
+    }
+    let argmax_per_pos: Vec<u32> = argmax_host.into_iter().map(|x| x as u32).collect();
+    if mtp_trace_enabled() {
+        eprintln!(
+            "[mtp-trace] accept cur_pos={} n_verify={} drafts={} candidates={:?} argmax={:?}",
+            draft.cur_pos,
+            n_verify,
+            drafts_generated,
+            &draft.candidates[..drafts_generated.min(draft.candidates.len())],
+            argmax_per_pos
+        );
+    }
+    let accepted = greedy_trunk_spine_accept(&draft.candidates, &argmax_per_pos, eos_token_id);
+
+    let committed = accepted.committed;
+    let accept_count = accepted.accept_count;
+    let hit_eos = accepted.hit_eos;
+    let advance = committed.len();
+    debug_assert!(advance >= 1 && advance <= drafts_generated + 1);
+    if mtp_trace_enabled() {
+        eprintln!(
+            "[mtp-trace] result advance={} accept_count={} committed={:?} hit_eos={}",
+            advance, accept_count, committed, hit_eos
+        );
+    }
+
+    // Next cycle's MTP head input: the trunk hidden at the last committed
+    // row. The head consumes POST-output-norm hidden (the same convention
+    // the sequential path gets from forward_prefill_batch's
+    // per_token_hidden_out capture); pbs.x_batch holds the PRE-norm residual,
+    // so copy the row and norm it explicitly.
+    let prev_hidden_row = advance - 1;
+    gpu.hip.memcpy_dtod_at(
+        &state.mtp_lm_tmp.buf,
+        0,
+        &verify_hidden.buf,
+        prev_hidden_row * dim * 4,
+        dim * 4,
+    )?;
+    // rmsnorm_f32 derives n from the tensor's last dim, so hand it a
+    // dim-sized view of the staging row (the staging buffer is max_n*dim).
+    let tmp_row = state.mtp_lm_tmp.sub_offset(0, dim);
+    gpu.rmsnorm_f32(
+        &tmp_row,
+        &weights.output_norm,
+        &state.prev_hidden,
+        config.norm_eps,
+    )?;
+
+    // State repair: full accept leaves the verify-advanced state exactly
+    // right; anything less rewinds the DN snapshot and replays only the
+    // DeltaNet recurrence over the accepted rows.
+    let full_accept_no_eos = advance == drafts_generated + 1 && !hit_eos;
+    if !full_accept_no_eos {
+        state.trunk_snap.restore_to(dn_state, gpu)?;
+        mtp_dn_repair_from_tape(
+            gpu,
+            weights,
+            config,
+            dn_state,
+            verify_tape,
+            slot * tape_stride,
+            advance,
+        )?;
+    }
+
+    Ok(MtpSpecResult {
+        committed,
+        accept_count,
+        hit_eos,
+        advance,
+        drafts_generated,
+        chain_truncated: draft.chain_truncated,
+        replay_skipped: full_accept_no_eos,
+    })
 }
 
 /// [`ModelSlot`]-based wrapper for [`mtp_shared_verify_accept_rollback_inner`].
@@ -3351,7 +3575,7 @@ pub fn spec_step_mtp_compressed_serial(
 /// slot engine can batch trunk verify across slots. The single-slot path
 /// calls this then `mtp_shared_verify_accept_rollback_inner`; the slot engine
 /// calls this per-slot, then does a batched `forward_batch_slots_graphed`,
-/// then `mtp_batched_verify_accept_inner` per-slot.
+/// then `mtp_batched_verify_accept_from_batch` per-slot.
 #[allow(clippy::too_many_arguments)]
 pub fn mtp_draft_phase_inner(
     gpu: &mut Gpu,

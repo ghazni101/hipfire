@@ -781,6 +781,75 @@ fn dense_ffn_body_slots(
     }
 }
 
+/// Per-layer `(qkv, alpha, beta)` capture of a step's DeltaNet activations
+/// for a slot's MTP verify rows — the tape the post-accept DN repair
+/// (`mtp_dn_repair_from_tape`) replays conv+GDN from.
+///
+/// The `pbs.dn_*` batch buffers are per-LAYER scratch: each DeltaNet layer
+/// overwrites them, so after the forward finishes they hold only the LAST
+/// layer's activations. A partial accept needs per-layer activations to
+/// rewind the recurrent state over the accepted prefix, so verify steps tape
+/// their rows as the layers compute. The tape is indexed per slot at
+/// `slot * stride` rows (stride = mtp_k + 1), independent of the batch row
+/// layout, so at most `n_slots * stride` rows are ever taped — a few MB.
+pub struct MtpVerifyCapture<'a> {
+    pub tape: &'a mut crate::speculative::GdnTape,
+    /// `verify_slots[s]`: slot s's rows this step are MTP verify rows.
+    pub verify_slots: &'a [bool],
+    /// Rows taped per flagged slot (= mtp_k + 1).
+    pub stride: usize,
+}
+
+impl MtpVerifyCapture<'_> {
+    #[inline]
+    pub fn is_verify_slot(&self, slot: usize) -> bool {
+        self.verify_slots.get(slot).copied().unwrap_or(false)
+    }
+}
+
+/// Tape one slot's `(qkv, alpha, beta)` rows for `delta_layer_idx` into
+/// `cap` at the slot's stride offset. Three small D2D copies; the taped
+/// values are exactly what `replay_gdn`-style repair needs to re-run
+/// conv1d + qk-norm + GDN for those rows.
+#[allow(clippy::too_many_arguments)]
+fn mtp_tape_layer_rows(
+    gpu: &mut Gpu,
+    cap: &mut MtpVerifyCapture,
+    pbs: &PrefillBatchScratch,
+    delta_layer_idx: usize,
+    row_off: usize,
+    m: usize,
+    slot: usize,
+    qkv_dim: usize,
+    n_v_heads: usize,
+) -> HipResult<()> {
+    debug_assert!(m <= cap.stride, "verify rows {m} exceed tape stride {}", cap.stride);
+    let tape_off = slot * cap.stride;
+    let tape = &mut *cap.tape;
+    gpu.memcpy_dtod_at_auto(
+        &tape.qkv_bufs[delta_layer_idx].buf,
+        tape_off * qkv_dim * 4,
+        &pbs.dn_qkv_batch.buf,
+        row_off * qkv_dim * 4,
+        m * qkv_dim * 4,
+    )?;
+    gpu.memcpy_dtod_at_auto(
+        &tape.alpha_bufs[delta_layer_idx].buf,
+        tape_off * n_v_heads * 4,
+        &pbs.dn_alpha_batch.buf,
+        row_off * n_v_heads * 4,
+        m * n_v_heads * 4,
+    )?;
+    gpu.memcpy_dtod_at_auto(
+        &tape.beta_bufs[delta_layer_idx].buf,
+        tape_off * n_v_heads * 4,
+        &pbs.dn_beta_batch.buf,
+        row_off * n_v_heads * 4,
+        m * n_v_heads * 4,
+    )?;
+    Ok(())
+}
+
 /// Run one `LinearAttention` (DeltaNet) layer across the whole step.
 ///
 /// The stateless pieces (rmsnorm, the 4-way QKVZA projection,
@@ -798,6 +867,7 @@ fn run_deltanet_layer_slots(
     q8_wmma_arch: bool,
     n: usize,
     delta_layer_idx: usize,
+    mut mtp_capture: Option<&mut MtpVerifyCapture>,
 ) -> HipResult<()> {
     let attn_dtype = require_batchable_deltanet_layer(layer, gpu.arch.as_str())?;
 
@@ -934,6 +1004,21 @@ fn run_deltanet_layer_slots(
     let mut row_off = 0usize;
     for (s, &m) in batch.m_per_slot.iter().enumerate() {
         if m > 0 {
+            if let Some(cap) = mtp_capture.as_deref_mut() {
+                if cap.is_verify_slot(s) {
+                    mtp_tape_layer_rows(
+                        gpu,
+                        cap,
+                        pbs,
+                        delta_layer_idx,
+                        row_off,
+                        m,
+                        s,
+                        qkv_dim,
+                        n_v_heads,
+                    )?;
+                }
+            }
             let q_out = pbs.dn_q_raw_batch.sub_offset(row_off * k_dim, m * k_dim);
             let k_out = pbs.dn_k_raw_batch.sub_offset(row_off * k_dim, m * k_dim);
             let v_out = pbs.dn_v_batch.sub_offset(row_off * v_dim, m * v_dim);
@@ -1101,6 +1186,7 @@ fn run_deltanet_moe_layer_slots(
     q8_wmma_arch: bool,
     n: usize,
     delta_layer_idx: usize,
+    mut mtp_capture: Option<&mut MtpVerifyCapture>,
     // Whole-MODEL flag (not per-layer): true when ANY MoE layer anywhere in
     // the model has an MQ6 FFN projection. Threaded straight through to
     // `prefill_moe_ffn_body_batched`'s `model_has_mq6_moe` — see that
@@ -1250,6 +1336,21 @@ fn run_deltanet_moe_layer_slots(
     let mut row_off = 0usize;
     for (s, &m) in batch.m_per_slot.iter().enumerate() {
         if m > 0 {
+            if let Some(cap) = mtp_capture.as_deref_mut() {
+                if cap.is_verify_slot(s) {
+                    mtp_tape_layer_rows(
+                        gpu,
+                        cap,
+                        pbs,
+                        delta_layer_idx,
+                        row_off,
+                        m,
+                        s,
+                        qkv_dim,
+                        n_v_heads,
+                    )?;
+                }
+            }
             let q_out = pbs.dn_q_raw_batch.sub_offset(row_off * k_dim, m * k_dim);
             let k_out = pbs.dn_k_raw_batch.sub_offset(row_off * k_dim, m * k_dim);
             let v_out = pbs.dn_v_batch.sub_offset(row_off * v_dim, m * v_dim);
@@ -2222,6 +2323,7 @@ fn final_logits_per_slot(
     pbs: &PrefillBatchScratch,
     s: &Qwen35Scratch,
     logits_out: &GpuTensor,
+    lm_head_skip: &[bool],
 ) -> HipResult<()> {
     // The lm_head goes through `Step::Gemv` + `weights.output.dispatch_ref()`
     // below, which is exactly what the reference does (qwen35.rs, the
@@ -2311,6 +2413,7 @@ fn final_logits_per_slot(
     let all_active = batch.m_per_slot.iter().all(|&m| m > 0);
     if matches!(weights.output.gpu_dtype, DType::MQ4G256)
         && all_active
+        && lm_head_skip.iter().all(|&skip| !skip)
         && (2..=Gpu::HFQ4G256_XBATCH_MAX).contains(&n_slots)
         && pbs.x_rot_batch.numel() >= n_slots * dim
     {
@@ -2360,6 +2463,14 @@ fn final_logits_per_slot(
     let mut row_off = 0usize;
     for (slot, &m) in batch.m_per_slot.iter().enumerate() {
         if m > 0 {
+            // MTP verify slots: the caller derives its own logits for every
+            // verify row (batched trunk lm_head over all k+1 rows), so the
+            // single-row GEMV here would be discarded work that still
+            // re-reads the whole lm_head weight matrix.
+            if lm_head_skip.get(slot).copied().unwrap_or(false) {
+                row_off += m;
+                continue;
+            }
             let last_row = row_off + m - 1;
             let dim_row_bytes = dim * 4;
             gpu.memcpy_dtod_at_auto(
@@ -2471,6 +2582,34 @@ struct DecodeGraphKey {
     n_rows: usize,
     ctx_bucket: usize,
     max_layer: Option<usize>,
+    /// FNV-1a over the per-slot row counts and the per-slot lm_head-skip mask.
+    /// Pure-decode steps all hash the same (every slot 1 row, no skips); an
+    /// MTP verify step hashes its stable `(m, skip)` pattern so the mix of
+    /// verify/decode/prefill slots selects its own graph. The pattern only
+    /// changes when requests start or finish, so re-captures stay rare.
+    m_hash: u64,
+}
+
+fn decode_graph_m_hash(m_per_slot: &[usize], lm_head_skip: &[bool]) -> u64 {
+    let mut h: u64 = 0xcbf29ce484222325;
+    for &m in m_per_slot {
+        h ^= m as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    for &skip in lm_head_skip {
+        h ^= skip as u64;
+        h = h.wrapping_mul(0x100000001b3);
+    }
+    h
+}
+
+/// Pure predicate: is this per-slot row-count pattern a capturable MTP verify
+/// step at the given `mtp_k`? Every slot must be idle (0), a regular decode
+/// row (1), or exactly one verify window (`mtp_k + 1`). Prefill chunks (any
+/// other m) keep the plain path — their shapes vary step to step and would
+/// thrash the capture cache.
+pub fn mtp_verify_graph_shape(m_per_slot: &[usize], mtp_k: usize) -> bool {
+    mtp_k > 0 && m_per_slot.iter().all(|&m| m == 0 || m == 1 || m == mtp_k + 1)
 }
 
 /// A hipGraph of one pure-decode step, reused across steps.
@@ -2518,7 +2657,7 @@ impl SlotDecodeGraph {
     }
 }
 
-/// `forward_batch_slots` with hipGraph capture/replay for pure-decode steps.
+/// `forward_batch_slots` with hipGraph capture/replay for decode-shaped steps.
 ///
 /// Falls back to the plain path whenever the step is not pure decode, the
 /// feature is off, or capture fails -- so this is never load-bearing for
@@ -2539,12 +2678,69 @@ pub fn forward_batch_slots_graphed(
     logits_out: &GpuTensor,
     cache: &mut SlotDecodeGraph,
 ) -> HipResult<()> {
+    forward_batch_slots_graphed_opts(
+        gpu,
+        weights,
+        config,
+        batch,
+        pool,
+        dn_states,
+        k_arenas,
+        v_arenas,
+        desc_staging,
+        pbs,
+        s,
+        logits_out,
+        cache,
+        /* mtp_k */ 0,
+        /* lm_head_skip */ &[],
+        /* mtp_capture */ None,
+    )
+}
+
+/// [`forward_batch_slots_graphed`] with MTP-verify awareness.
+///
+/// `mtp_k > 0` additionally admits steps whose per-slot row counts are all in
+/// `{0, 1, mtp_k + 1}` — the vLLM-style batched-verify shape, where an MTP
+/// slot contributes its `k + 1` draft rows next to regular single-row decode
+/// slots. Those steps get their own graph (keyed by the `(m, skip)` pattern),
+/// so an engine in steady MTP decode replays one graph launch per step
+/// exactly like pure AR decode does.
+///
+/// `lm_head_skip[s]` suppresses the per-slot last-row lm_head GEMV inside
+/// [`final_logits_per_slot`] — set for slots whose verify logits the caller
+/// computes itself (MTP verify rows read the trunk lm_head over all `k + 1`
+/// rows via a batched GEMM instead; the single-row GEMV would be discarded
+/// work that re-reads the whole lm_head weight). The mask is part of the
+/// graph key: a captured graph bakes which GEMVs exist.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_batch_slots_graphed_opts(
+    gpu: &mut Gpu,
+    weights: &Qwen35Weights,
+    config: &Qwen35Config,
+    batch: &SlotBatch,
+    pool: &mut SlotPool,
+    dn_states: &mut [DeltaNetState],
+    k_arenas: &[GpuTensor],
+    v_arenas: &[GpuTensor],
+    desc_staging: &mut SlotDescStaging,
+    pbs: &PrefillBatchScratch,
+    s: &Qwen35Scratch,
+    logits_out: &GpuTensor,
+    cache: &mut SlotDecodeGraph,
+    mtp_k: usize,
+    lm_head_skip: &[bool],
+    mut mtp_capture: Option<&mut MtpVerifyCapture>,
+) -> HipResult<()> {
     let pure_decode = !batch.is_empty() && batch.m_per_slot.iter().all(|&m| m == 1);
-    // Paged mode disables graph capture: block table uploads and descriptor
-    // activation happen per-step and are not captured by the graph. The plain
-    // path handles paged mode correctly.
-    if !gpu.slots_decode_graph() || !pure_decode || pool.is_paged() {
-        return forward_batch_slots(
+    // An MTP verify step is graphable when every slot's row count is a decode
+    // row (0/1) or exactly one verify window (mtp_k + 1). Anything else — a
+    // scheduler prefill chunk mixed in — keeps the plain path: prefill shapes
+    // vary step to step and would thrash the capture cache.
+    let mtp_verify_shape =
+        !batch.is_empty() && mtp_verify_graph_shape(&batch.m_per_slot, mtp_k);
+    if !gpu.slots_decode_graph() || !(pure_decode || mtp_verify_shape) || pool.is_paged() {
+        return forward_batch_slots_opts(
             gpu,
             weights,
             config,
@@ -2557,6 +2753,10 @@ pub fn forward_batch_slots_graphed(
             pbs,
             s,
             logits_out,
+            None,
+            SlotStepOpts::default(),
+            lm_head_skip,
+            mtp_capture,
         );
     }
 
@@ -2574,6 +2774,7 @@ pub fn forward_batch_slots_graphed(
         n_rows: batch.total_rows(),
         ctx_bucket,
         max_layer: None,
+        m_hash: decode_graph_m_hash(&batch.m_per_slot, lm_head_skip),
     };
 
     // The per-step inputs always go up outside the graph: their host source
@@ -2606,6 +2807,8 @@ pub fn forward_batch_slots_graphed(
                 skip_uploads: true,
                 ctx_override: Some(ctx_bucket),
             },
+            lm_head_skip,
+            mtp_capture.as_deref_mut(),
         )?;
         // The warm-up step above already advanced the slot lengths; re-running
         // the capture body would advance them a second time, so roll back to
@@ -2631,6 +2834,8 @@ pub fn forward_batch_slots_graphed(
                 skip_uploads: true,
                 ctx_override: Some(ctx_bucket),
             },
+            lm_head_skip,
+            mtp_capture,
         );
         let graph = gpu.end_stream_capture()?;
         captured?;
@@ -2840,6 +3045,8 @@ pub fn forward_batch_slots_with_max_layer(
         logits_out,
         max_layer,
         SlotStepOpts::default(),
+        &[],
+        None,
     )
 }
 
@@ -2859,6 +3066,8 @@ pub fn forward_batch_slots_opts(
     logits_out: &GpuTensor,
     max_layer: Option<usize>,
     opts: SlotStepOpts,
+    lm_head_skip: &[bool],
+    mut mtp_capture: Option<&mut MtpVerifyCapture>,
 ) -> HipResult<()> {
     if batch.is_empty() {
         return Ok(());
@@ -3105,6 +3314,7 @@ pub fn forward_batch_slots_opts(
                     q8_wmma_arch,
                     n,
                     delta_layer_idx,
+                    mtp_capture.as_deref_mut(),
                 )?;
                 delta_layer_idx += 1;
             }
@@ -3138,6 +3348,7 @@ pub fn forward_batch_slots_opts(
                     q8_wmma_arch,
                     n,
                     delta_layer_idx,
+                    mtp_capture.as_deref_mut(),
                     weights.moe_has_mq6,
                 )?;
                 delta_layer_idx += 1;
@@ -3183,7 +3394,7 @@ pub fn forward_batch_slots_opts(
     }
 
     // ── 5. Final norm + per-slot last-token logits ──────────────────────
-    final_logits_per_slot(gpu, weights, config, batch, pbs, s, logits_out)?;
+    final_logits_per_slot(gpu, weights, config, batch, pbs, s, logits_out, lm_head_skip)?;
 
     // ── 6. Advance each slot's logical KV length ────────────────────────
     //
@@ -3309,5 +3520,50 @@ mod tests {
         assert!(!lm_head_slots_admissible(DType::MQ2G256V2));
         assert!(!lm_head_slots_admissible(DType::MQ4CG256));
         assert!(!lm_head_slots_admissible(DType::HFQ4G256));
+    }
+
+    #[test]
+    fn mtp_verify_graph_shape_admits_only_verify_patterns() {
+        // Pure decode / mixed verify+decode+idle: graphable at k=3 (verify
+        // rows are exactly k+1).
+        assert!(mtp_verify_graph_shape(&[1, 1, 1, 1], 3));
+        assert!(mtp_verify_graph_shape(&[4, 1, 0, 4], 3));
+        assert!(mtp_verify_graph_shape(&[4, 0], 3));
+        // A prefill chunk (any m not in {0,1,k+1}) must keep the plain path.
+        assert!(!mtp_verify_graph_shape(&[4, 1, 7, 4], 3));
+        assert!(!mtp_verify_graph_shape(&[256], 3));
+        // Verify rows that don't match mtp_k (k drift / partial window).
+        assert!(!mtp_verify_graph_shape(&[4, 1], 2));
+        // MTP off: nothing but pure decode (handled separately) graph captures.
+        assert!(!mtp_verify_graph_shape(&[4, 1], 0));
+    }
+
+    #[test]
+    fn decode_graph_m_hash_separates_patterns() {
+        // Same total rows, different patterns → different graphs.
+        assert_ne!(
+            decode_graph_m_hash(&[4, 1], &[true, false]),
+            decode_graph_m_hash(&[1, 4], &[false, true])
+        );
+        // The lm_head-skip mask participates: same m-pattern with different
+        // skips must not share a captured graph (the recorded GEMV set
+        // differs).
+        assert_ne!(
+            decode_graph_m_hash(&[4, 1], &[true, false]),
+            decode_graph_m_hash(&[4, 1], &[false, false])
+        );
+        // Stable across calls.
+        assert_eq!(
+            decode_graph_m_hash(&[4, 1, 0], &[true, false, false]),
+            decode_graph_m_hash(&[4, 1, 0], &[true, false, false])
+        );
+        // An absent mask and an all-false mask hash differently. That is
+        // acceptable, not a defect: at worst it costs one extra capture when
+        // the engine toggles between MTP-on and MTP-off batches — a key
+        // mismatch can never alias a wrong graph.
+        assert_ne!(
+            decode_graph_m_hash(&[1, 1], &[]),
+            decode_graph_m_hash(&[1, 1], &[false, false])
+        );
     }
 }
