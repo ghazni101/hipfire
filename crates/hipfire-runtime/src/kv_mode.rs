@@ -215,7 +215,17 @@ pub fn resolve(raw: &str, policy: &KvModePolicy) -> ResolveResult {
             let warning = if raw.is_empty() {
                 None
             } else {
-                Some("unrecognized or unsupported HIPFIRE_KV_MODE; using site default")
+                // Once-per-load diagnostic: leak the formatted string to
+                // satisfy the `&'static str` warning type.
+                let leaked: &'static str = Box::leak(
+                    format!(
+                        "unrecognized or unsupported kv mode {raw:?} for site {}; \
+                         using site default {:?}",
+                        policy.site, policy.default
+                    )
+                    .into_boxed_str(),
+                );
+                Some(leaked)
             };
             (policy.default, warning)
         }
