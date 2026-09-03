@@ -78,6 +78,13 @@ pub struct PrefillBatchScratch {
     // tree-verify mode; FA RoPE reads it instead of `positions` while KV
     // writes and attention seq_len keep the flat physical slots.
     pub rope_positions: GpuTensor,
+    // VL M-RoPE phases: [max_batch × 3] i32-in-F32 per-row absolute (t,h,w).
+    // Read by the FA RoPE branch only on steps whose SlotBatch carries pos3.
+    pub pos3: GpuTensor,
+    // VL external-embedding scatter inputs (i32-in-F32 index, and per-row
+    // matrix pointer as 64-bit payload). See the alloc-site comment.
+    pub ext_emb_index: GpuTensor,
+    pub ext_emb_row_ptr: GpuTensor,
     // Token-ids buffer feeding the batched embedding kernel. [max_batch] i32
     // stored as F32 (same dtype-cosmetic pattern as `positions`). Uploaded
     // once per batched forward and read by `embedding_lookup_hfq4g256_batched`.
@@ -276,6 +283,19 @@ impl PrefillBatchScratch {
             // when `tree_verify.is_some()`. Same i32-in-F32 cosmetic dtype
             // pattern as `positions`.
             rope_positions: alloc!(&[max_batch], DType::F32),
+            // VL M-RoPE phases: [max_batch × 3] i32-in-F32, per-row absolute
+            // (t, h, w). Uploaded only on steps whose SlotBatch carries
+            // `pos3`; the FA RoPE branch dispatches the batched M-RoPE
+            // kernel instead of the 1D one. Same cosmetic-dtype pattern as
+            // `positions`.
+            pos3: alloc!(&[max_batch * 3], DType::F32),
+            // VL external-embedding scatter inputs: per-row index into that
+            // row's slot's vision-embedding matrix (-1 = token table), and
+            // per-row device pointer to that matrix (null when the slot has
+            // none). Uploaded on VL steps; the scatter kernel runs right
+            // after the token-embedding lookup and overwrites image-pad rows.
+            ext_emb_index: alloc!(&[max_batch], DType::F32),
+            ext_emb_row_ptr: alloc!(&[max_batch], DType::F32),
             tokens: alloc!(&[max_batch], DType::F32),
             fa_q_full_batch: alloc!(&[max_batch * q_dim * 2], DType::F32),
             fa_q_batch: alloc!(&[max_batch * q_dim], DType::F32),

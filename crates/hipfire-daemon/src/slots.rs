@@ -279,6 +279,41 @@ impl SlotBackend {
             client_seed,
         );
 
+        // Token penalties, mirroring the sequential path's request parsing
+        // (main.rs): HF-style `repetition_penalty` is accepted as an alias,
+        // the window defaults to 128 like the sequential daemon, and the
+        // window is clamped to the engine's buffer capacity. min_p rides
+        // along — the slot sampler's kernel supports it.
+        let presence_penalty = msg
+            .get("presence_penalty")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0)
+            .max(0.0) as f32;
+        let frequency_penalty = msg
+            .get("frequency_penalty")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0)
+            .max(0.0) as f32;
+        let repeat_penalty = msg
+            .get("repeat_penalty")
+            .or_else(|| msg.get("repetition_penalty"))
+            .and_then(|v| v.as_f64())
+            .unwrap_or(1.0)
+            .max(1.0) as f32;
+        let repeat_window = msg
+            .get("repeat_window")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(128)
+            // Mirror of the engine's REPEAT_WINDOW_MAX (the engine clamps
+            // again on admit; this keeps the emitted accepted-request view
+            // honest about the window that will actually apply).
+            .min(2048) as usize;
+        let min_p = msg
+            .get("min_p")
+            .and_then(|v| v.as_f64())
+            .unwrap_or(0.0)
+            .max(0.0) as f32;
+
         let max_tokens = msg
             .get("max_tokens")
             .and_then(|v| v.as_u64())
@@ -657,6 +692,11 @@ impl SlotBackend {
             top_p,
             top_k: top_k as i32,
             seed,
+            repeat_window,
+            repeat_penalty,
+            presence_penalty,
+            frequency_penalty,
+            min_p,
             visual_data,
             reply: tx,
         };
@@ -1197,20 +1237,20 @@ pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
     {
         return Some("logprobs not supported in experimental multi-slot".to_string());
     }
-    for (key, neutral) in [
-        ("repeat_penalty", 1.0),
-        ("presence_penalty", 0.0),
-        ("frequency_penalty", 0.0),
-        ("min_p", 0.0),
+    // Token penalties and min_p are implemented by the slot sampler (in-kernel
+    // repeat/presence/frequency over a per-slot recent-token window; min_p in
+    // the top-p tail), so non-neutral values are honored, not refused. Only
+    // out-of-range values are rejected here.
+    for (key, lo, hi) in [
+        ("repeat_penalty", 1.0, 2.0),
+        ("presence_penalty", 0.0, 2.0),
+        ("frequency_penalty", 0.0, 2.0),
+        ("min_p", 0.0, 1.0),
     ] {
-        if msg
-            .get(key)
-            .and_then(|v| v.as_f64())
-            .is_some_and(|v| v != neutral)
-        {
-            return Some(format!(
-                "non-neutral {key} not supported in experimental multi-slot"
-            ));
+        if let Some(v) = msg.get(key).and_then(|v| v.as_f64()) {
+            if !(lo..=hi).contains(&v) {
+                return Some(format!("{key} must be within [{lo}, {hi}]"));
+            }
         }
     }
     if msg
@@ -1893,10 +1933,22 @@ mod tests {
     #[test]
     fn generate_caps_rejects_silently_ignored_controls() {
         assert!(validate_generate_caps(&json!({"temperature": 0.7, "top_p": 0.9})).is_none());
+        // Penalties are honored by the slot sampler now: in-range values pass,
+        // out-of-range values are rejected.
         for request in [
             json!({"repeat_penalty": 1.05}),
-            json!({"presence_penalty": 0.1}),
+            json!({"presence_penalty": 1.5}),
             json!({"min_p": 0.05}),
+        ] {
+            assert!(
+                validate_generate_caps(&request).is_none(),
+                "supported request refused: {request}"
+            );
+        }
+        for request in [
+            json!({"repeat_penalty": 2.5}),
+            json!({"presence_penalty": -0.1}),
+            json!({"min_p": 1.5}),
             json!({"reasoning_effort": "high"}),
             json!({"messages": [{"role": "tool", "content": "result"}]}),
             json!({"messages": [{

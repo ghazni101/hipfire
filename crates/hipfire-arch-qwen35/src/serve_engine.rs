@@ -204,6 +204,12 @@ impl Drop for SlotEngine {
 }
 
 /// Everything the engine thread owns.
+/// Upper bound on a request's token-penalty window (`repeat_window`). The
+/// penalty prepass is O(window²) per launch on device, and the per-slot
+/// window buffer is sized by this; the daemon clamps requests to the same
+/// bound so a client cannot ask for an unbounded scan.
+const REPEAT_WINDOW_MAX: usize = 2048;
+
 struct Rig {
     gpu: Gpu,
     weights: Qwen35Weights,
@@ -242,6 +248,18 @@ struct Rig {
     logits_out: GpuTensor,
     out_tokens: GpuTensor,
     sample_params: Vec<SlotSampleParams>,
+    /// Per-slot penalty windows (see `REPEAT_WINDOW_MAX`); uploaded from each
+    /// penalized slot's session token tail before every sampling step.
+    repeat_windows: Vec<GpuTensor>,
+    /// Per-slot vision-embedding matrices (n_visual × dim, F32) for batched
+    /// VL requests; the scatter kernel dereferences them through per-row
+    /// pointers uploaded into `pbs.ext_emb_row_ptr`. None until the slot's
+    /// request has run vision_forward; also cleared when the slot is.
+    vl_ext_devs: Vec<Option<GpuTensor>>,
+    /// Serve VL requests on the legacy sequential per-token path instead of
+    /// the batched one (HIPFIRE_VL_SEQUENTIAL=1; batched is the default and
+    /// the only paged-compatible mode).
+    vl_sequential: bool,
     sessions: SessionTable,
     adm: AdmissionController,
     swap: SwapManager,
@@ -308,21 +326,31 @@ impl Rig {
             .ok()
             .as_deref()
         {
-            Some("1") | Some("on") | Some("true") if !cfg.is_vl => {
-                let legacy_equivalent = cfg.n_slots * cfg.cap_tokens.div_ceil(PAGE_TOKENS);
-                Some(
-                    hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED_PAGES")
-                        .ok()
-                        .and_then(|v| v.trim().parse::<usize>().ok())
-                        .unwrap_or(legacy_equivalent),
-                )
-            }
-            Some("1") | Some("on") | Some("true") if cfg.is_vl => {
-                eprintln!(
-                    "  [hipfire] paged KV disabled for VL model \
-                     (vision sequential path requires contiguous KV slots)"
-                );
-                None
+            Some("1") | Some("on") | Some("true") => {
+                // Batched VL is paged-capable (block-table indirection all
+                // the way down), so paged is refused only when the operator
+                // forced the legacy sequential VL path — that path writes
+                // through a flat contiguous slab view which aliases every
+                // slot onto the arena prefix in paged mode.
+                let sequential_vl = hipfire_config::developer_var("HIPFIRE_VL_SEQUENTIAL")
+                    .ok()
+                    .is_some_and(|v| v == "1" || v == "on" || v == "true");
+                if cfg.is_vl && sequential_vl {
+                    eprintln!(
+                        "  [hipfire] paged KV disabled: HIPFIRE_VL_SEQUENTIAL=1 \
+                         requires contiguous KV slots"
+                    );
+                    None
+                } else {
+                    let legacy_equivalent =
+                        cfg.n_slots * cfg.cap_tokens.div_ceil(PAGE_TOKENS);
+                    Some(
+                        hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED_PAGES")
+                            .ok()
+                            .and_then(|v| v.trim().parse::<usize>().ok())
+                            .unwrap_or(legacy_equivalent),
+                    )
+                }
             }
             _ => None,
         };
@@ -666,8 +694,32 @@ impl Rig {
                 top_p: 1.0,
                 top_k: 0,
                 seed: 0,
+                repeat_window: 0,
+                repeat_penalty: 1.0,
+                presence_penalty: 0.0,
+                frequency_penalty: 0.0,
+                min_p: 0.0,
             })
             .collect::<Vec<_>>();
+        // Per-slot penalty windows: u32 token ids, most recent last, uploaded
+        // from the session's token tail before each sampling step. Capacity
+        // bounds the window a request may request (the daemon clamps harder).
+        let repeat_windows = (0..cfg.n_slots)
+            .map(|_| {
+                g.gpu
+                    .as_mut()
+                    .unwrap()
+                    .zeros(&[REPEAT_WINDOW_MAX], DType::F32)
+                    .map_err(|e| format!("repeat window: {e}"))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        // Per-slot vision-embedding matrices, populated lazily when a batched
+        // VL request runs vision_forward. Replaced (leaking the old matrix to
+        // the allocator) on each new request — bounded by n_slots images.
+        let vl_ext_devs: Vec<Option<GpuTensor>> = (0..cfg.n_slots).map(|_| None).collect();
+        let vl_sequential = hipfire_config::developer_var("HIPFIRE_VL_SEQUENTIAL")
+            .ok()
+            .is_some_and(|v| v == "1" || v == "on" || v == "true");
 
         let dn_bytes: u64 = dn_buffers(&g.dn_states[0])
             .iter()
@@ -770,6 +822,9 @@ impl Rig {
             logits_out,
             out_tokens,
             sample_params,
+            repeat_windows,
+            vl_ext_devs,
+            vl_sequential,
             sessions: SessionTable::default(),
             adm,
             swap,
@@ -1288,6 +1343,11 @@ fn inject_mtp_verify_tokens(
     mtp_drafts: &[Option<crate::mtp_spec::MtpDraftOutput>],
     n_slots: usize,
 ) -> SlotBatch {
+    // A VL row anywhere in the step keeps the batch on the M-RoPE/scatter
+    // path, so the side arrays must survive the rebuild: verify rows are
+    // text rows of text slots and take [p, p, p] / -1; VL rows are copied
+    // through untouched.
+    let vl_step = batch.pos3.len() == batch.positions.len() && !batch.pos3.is_empty();
     let mut new_batch = SlotBatch::default();
     let mut old_row_off = 0usize;
     for s in 0..n_slots {
@@ -1295,9 +1355,14 @@ fn inject_mtp_verify_tokens(
             let verify_tokens = draft.verify_tokens();
             new_batch.m_per_slot.push(verify_tokens.len());
             for (i, t) in verify_tokens.iter().enumerate() {
+                let pos = draft.cur_pos + i;
                 new_batch.tokens.push(*t);
-                new_batch.positions.push((draft.cur_pos + i) as i32);
+                new_batch.positions.push(pos as i32);
                 new_batch.row_slot.push(s as i32);
+                if vl_step {
+                    new_batch.pos3.push([pos as i32; 3]);
+                    new_batch.ext_emb.push(-1);
+                }
             }
         } else {
             let m = batch.m_per_slot.get(s).copied().unwrap_or(0);
@@ -1312,6 +1377,14 @@ fn inject_mtp_verify_tokens(
                 new_batch
                     .row_slot
                     .extend_from_slice(&batch.row_slot[old_row_off..old_row_off + m]);
+                if vl_step {
+                    new_batch
+                        .pos3
+                        .extend_from_slice(&batch.pos3[old_row_off..old_row_off + m]);
+                    new_batch
+                        .ext_emb
+                        .extend_from_slice(&batch.ext_emb[old_row_off..old_row_off + m]);
+                }
             }
             old_row_off += m;
         }
@@ -1348,6 +1421,33 @@ pub const MTP_RETIRE_WINDOWS: usize = 2;
 
 fn mtp_verify_fits_cap(next_pos: usize, mtp_k: usize, cap_tokens: usize) -> bool {
     mtp_k + 1 <= cap_tokens.saturating_sub(next_pos)
+}
+
+/// True when the request carries a non-neutral token penalty. Such requests
+/// decode as plain AR when MTP would otherwise be available: the verify accept
+/// compares draft tokens against a bare greedy argmax over unpenalized logits,
+/// which cannot reproduce penalize-then-argmax.
+fn request_penalized(req: &SubmitRequest) -> bool {
+    req.repeat_window > 0
+        && (req.repeat_penalty > 1.0
+            || req.presence_penalty > 0.0
+            || req.frequency_penalty > 0.0)
+}
+
+/// Install a request's sampling parameters (including token penalties and
+/// min_p) on its slot's sampler state.
+fn install_sample_params(rig: &mut Rig, slot: SlotId, req: &SubmitRequest) {
+    rig.sample_params[slot.0] = SlotSampleParams {
+        temperature: req.temperature,
+        top_p: req.top_p,
+        top_k: req.top_k,
+        seed: req.seed,
+        repeat_window: req.repeat_window.min(REPEAT_WINDOW_MAX) as i32,
+        repeat_penalty: req.repeat_penalty,
+        presence_penalty: req.presence_penalty,
+        frequency_penalty: req.frequency_penalty,
+        min_p: req.min_p,
+    };
 }
 
 fn commit_sampled_token(
@@ -1439,6 +1539,7 @@ fn run_loop(
         .collect();
     let mut sched = Scheduler {
         chunk_size: rig.prefill_chunk,
+        vl_sequential: rig.vl_sequential,
     };
     let mut graph = SlotDecodeGraph::new();
     let mut poison: Option<String> = None;
@@ -1491,7 +1592,12 @@ fn run_loop(
 
         let image_pad_id = rig.tokenizer.special_token_id("<|image_pad|>");
         for s in 0..n {
-            if work[s].vl_prefill.is_none() || slots[s].is_none() {
+            // Sequential fallback ONLY (HIPFIRE_VL_SEQUENTIAL=1): this per-token
+            // M-RoPE path writes KV through a flat slab view. The default
+            // batched VL path must NEVER enter here — it runs through the
+            // scheduler below, and under a paged pool the slot_kv_view assert
+            // would (correctly) kill the engine.
+            if !rig.vl_sequential || work[s].vl_prefill.is_none() || slots[s].is_none() {
                 continue;
             }
             if work[s].remaining_prompt.is_empty() {
@@ -1569,6 +1675,72 @@ fn run_loop(
             }
         }
 
+        // ── VL phase: run the vision tower for batched VL slots ────────────
+        // Runs once per request, on this thread (the GPU's exclusive owner),
+        // before the slot's first batched chunk. The output matrix becomes
+        // the slot's external-embedding source; until it exists the
+        // scheduler holds the slot's rows back (image pads would otherwise
+        // embed as the raw pad token).
+        if !rig.vl_sequential {
+            for s in 0..n {
+                if slots[s].is_none() {
+                    continue;
+                }
+                let Some(vl) = work[s].vl_prefill.as_mut() else {
+                    continue;
+                };
+                if !vl.embeddings.is_empty() || vl.n_visual_tokens == 0 {
+                    continue;
+                }
+                let prepared = (|| -> Result<(), String> {
+                    let weights = rig
+                        .vision_weights
+                        .as_ref()
+                        .ok_or("VL request but model has no vision encoder")?;
+                    let vconfig = rig
+                        .vision_config
+                        .as_ref()
+                        .ok_or("VL request but model has no vision config")?;
+                    let emb = hipfire_arch_qwen35_vl::qwen35_vl::vision_forward(
+                        &mut rig.gpu,
+                        weights,
+                        vconfig,
+                        &vl.patches,
+                        vl.grid_h,
+                        vl.grid_w,
+                    )
+                    .map_err(|e| format!("vision_forward: {e}"))?;
+                    let mut dev = rig
+                        .gpu
+                        .zeros(&[emb.len()], DType::F32)
+                        .map_err(|e| format!("vl ext alloc: {e}"))?;
+                    let bytes: &[u8] = unsafe {
+                        std::slice::from_raw_parts(emb.as_ptr() as *const u8, emb.len() * 4)
+                    };
+                    rig.gpu
+                        .hip
+                        .memcpy_htod(&dev.buf, bytes)
+                        .map_err(|e| format!("vl ext upload: {e}"))?;
+                    rig.vl_ext_devs[s] = Some(dev);
+                    vl.embeddings = emb;
+                    vl.dim = rig.config.dim;
+                    vl.patches.clear();
+                    Ok(())
+                })();
+                if let Err(reason) = prepared {
+                    if let Some(f) = slots[s].take() {
+                        let _ = send_event(&f.reply, Event::Rejected {
+                            reason: reason.clone(),
+                        });
+                        rig.swap.forget(f.session.0);
+                        rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
+                    }
+                    clear_work_slot(&mut work[s]);
+                    rig.vl_ext_devs[s] = None;
+                }
+            }
+        }
+
         // Build the batch: scheduler handles regular slots (including MTP
         // prefill chunks), then inject MTP verify tokens for slots that
         // produced draft outputs.
@@ -1580,6 +1752,31 @@ fn run_loop(
         };
         if batch.is_empty() {
             continue;
+        }
+        // VL rows: refresh the per-row vision-matrix base pointers the
+        // scatter kernel dereferences. Engine-side upload, every step
+        // (including graph replays), so the captured kernel always reads
+        // current pointers. Rows with a negative index never dereference.
+        if batch.ext_emb.len() == batch.positions.len()
+            && batch.ext_emb.iter().any(|&e| e >= 0)
+        {
+            let ptrs: Vec<u64> = batch
+                .row_slot
+                .iter()
+                .map(|&sl| {
+                    rig.vl_ext_devs[sl as usize]
+                        .as_ref()
+                        .map(|t| t.buf.as_ptr() as u64)
+                        .unwrap_or(0)
+                })
+                .collect();
+            let bytes: Vec<u8> = ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
+            if let Err(e) = rig.gpu.hip.memcpy_htod(&rig.pbs.ext_emb_row_ptr.buf, &bytes) {
+                let reason = format!("vl ext ptr upload failed: {e:?}");
+                fail_all_active(&mut rig, &mut slots, &mut work, reason.clone());
+                poison = Some(reason);
+                break 'serve;
+            }
         }
         // Slots with verify drafts skip the per-slot last-row lm_head GEMV
         // inside the forward: their logits come from the batched verify
@@ -1642,6 +1839,7 @@ fn run_loop(
                     work[s].remaining_prompt.clear();
                     work[s].decoding = false;
                     work[s].next_pos = 0;
+                    work[s].mtp_active = false;
                 }
             }
             continue;
@@ -1652,9 +1850,41 @@ fn run_loop(
             poison = Some(reason);
             break 'serve;
         }
+        // Penalty windows: for each slot whose request carries non-neutral
+        // token penalties, clamp the requested window to what the session
+        // actually holds and upload that tail (most recent last). The kernel
+        // scans exactly `repeat_window` entries, so the param must equal the
+        // uploaded count — early in a generation that is fewer than the
+        // request's window.
+        for s in 0..n {
+            let penalized = rig.sample_params[s].penalized();
+            if !penalized || slots[s].is_none() {
+                continue;
+            }
+            let session = slots[s].as_ref().unwrap().session;
+            let Some(sess) = rig.sessions.get(session) else {
+                continue;
+            };
+            let requested = rig.sample_params[s].repeat_window.max(0) as usize;
+            let effective = requested.min(sess.tokens.len());
+            rig.sample_params[s].repeat_window = effective as i32;
+            if effective == 0 {
+                continue;
+            }
+            let tail = &sess.tokens[sess.tokens.len() - effective..];
+            let tail_bytes: &[u8] =
+                unsafe { std::slice::from_raw_parts(tail.as_ptr() as *const u8, effective * 4) };
+            if let Err(e) = rig.gpu.hip.memcpy_htod(&rig.repeat_windows[s].buf, tail_bytes) {
+                let reason = format!("repeat window upload failed: {e:?}");
+                fail_all_active(&mut rig, &mut slots, &mut work, reason.clone());
+                poison = Some(reason);
+                break 'serve;
+            }
+        }
         if let Err(e) = rig.gpu.sample_per_slot(
             &rig.logits_out,
             &mut rig.sample_params,
+            &rig.repeat_windows,
             n,
             rig.config.vocab_size,
             &rig.out_tokens,
@@ -1820,7 +2050,10 @@ fn run_loop(
                 }
                 continue;
             }
-            if work[s].vl_prefill.is_some() || work[s].mtp_active {
+            // Batched VL slots sample and commit like any regular slot (the
+            // last prompt row's logits seed the first token); only
+            // MTP-decoding slots skip — their tokens come from the verify.
+            if work[s].mtp_active {
                 continue;
             }
             let Some(f) = slots[s].as_mut() else { continue };
@@ -1987,7 +2220,9 @@ fn admit(
             reject("VL request but model has no vision encoder".to_string());
             return;
         }
-        if rig.pool.is_paged() {
+        // Batched VL runs the paged block-table path like any slot; only the
+        // legacy sequential fallback needs a contiguous slab view.
+        if rig.pool.is_paged() && rig.vl_sequential {
             reject("VL sequential path requires contiguous KV slots".to_string());
             return;
         }
@@ -2098,13 +2333,24 @@ fn admit(
                 // A prompt/extension already at the KV cap overflows set_seq_len
                 // during prefill before any decode step can stop it.
                 if extended.len() >= rig.cap_tokens {
-                    let _ = send_event(
-                        &req.reply,
-                        Event::Done {
-                            reason: DoneReason::MaxTokens,
-                            generated: 0,
-                        },
+                    // A session at the KV cap can never grow: report the
+                    // condition as a REJECTION, not a Done — a successful
+                    // empty completion here made every subsequent turn on
+                    // the session a silent no-op (it would re-enter this
+                    // guard forever while the resident session pinned its
+                    // slot). The session is closed so the slot is released;
+                    // a follow-up on the same conversation re-attempts cold
+                    // and receives the same actionable rejection.
+                    let reason = format!(
+                        "context window full: the conversation holds {} of \
+                         {} tokens and cannot extend — start a new \
+                         conversation",
+                        extended.len(),
+                        rig.cap_tokens
                     );
+                    let _ = send_event(&req.reply, Event::Rejected { reason });
+                    rig.swap.forget(existing.0);
+                    rig.sessions.close(&mut rig.pool, &mut rig.adm, existing);
                     return;
                 }
                 if let Ok(plan) = rig.sessions.begin_turn(&mut rig.pool, existing, &extended) {
@@ -2136,14 +2382,17 @@ fn admit(
                     work[slot.0].decoding = false;
                     // MTP: activate if enabled. Vision continuations stay on
                     // the sequential M-RoPE path (no MTP), matching cold
-                    // admits. The head KV reset is only needed when the head
-                    // KV was lost (swap-restore) or holds another session's
-                    // rows: a session resident on this slot since its last
-                    // turn keeps a head KV that matches its committed prefix,
-                    // so the suffix's head-fill extends it in place.
+                    // admits; penalized requests stay on AR (see
+                    // `request_penalized`). The head KV reset is only needed
+                    // when the head KV was lost (swap-restore) or holds
+                    // another session's rows: a session resident on this slot
+                    // since its last turn keeps a head KV that matches its
+                    // committed prefix, so the suffix's head-fill extends it
+                    // in place.
                     work[slot.0].mtp_active = rig.mtp_head.is_some()
                         && rig.mtp_k > 0
-                        && req.visual_data.is_none();
+                        && req.visual_data.is_none()
+                        && !request_penalized(&req);
                     if work[slot.0].mtp_active
                         && !(mtp_head_kv_valid && rig.mtp_states[slot.0].is_some())
                     {
@@ -2151,12 +2400,7 @@ fn admit(
                             let _ = state.reset(&mut rig.gpu);
                         }
                     }
-                    rig.sample_params[slot.0] = SlotSampleParams {
-                        temperature: req.temperature,
-                        top_p: req.top_p,
-                        top_k: req.top_k,
-                        seed: req.seed,
-                    };
+                    install_sample_params(rig, slot, &req);
                     slots[slot.0] = Some(InFlight {
                         session: existing,
                         reply: req.reply,
@@ -2184,16 +2428,17 @@ fn admit(
         }
     }
 
-    // Prefill-side context-cap guard for cold admits. Same wire reporting as
-    // the decode path (DoneReason::MaxTokens → finish_reason "length").
+    // Prefill-side context-cap guard for cold admits. Rejected, not Done: a
+    // successful empty completion would read as the model choosing silence;
+    // the prompt physically cannot fit the slot's KV.
     if req.prompt_tokens.len() >= rig.cap_tokens {
-        let _ = send_event(
-            &req.reply,
-            Event::Done {
-                reason: DoneReason::MaxTokens,
-                generated: 0,
-            },
+        let reason = format!(
+            "prompt of {} tokens exceeds the slot context cap of {} tokens",
+            req.prompt_tokens.len(),
+            rig.cap_tokens
         );
+        let _ = send_event(&req.reply, Event::Rejected { reason });
+        stats.lock().expect("stats").note_rejected();
         return;
     }
 
@@ -2322,9 +2567,27 @@ fn admit(
     }
 
     work[slot.0].decoding = false;
+    // Built before `req.visual_data` is moved out below; SlotSampleParams is
+    // Copy so this is a plain host-side struct build.
+    let penalized = request_penalized(&req);
+    let sample_params = SlotSampleParams {
+        temperature: req.temperature,
+        top_p: req.top_p,
+        top_k: req.top_k,
+        seed: req.seed,
+        repeat_window: req.repeat_window.min(REPEAT_WINDOW_MAX) as i32,
+        repeat_penalty: req.repeat_penalty,
+        presence_penalty: req.presence_penalty,
+        frequency_penalty: req.frequency_penalty,
+        min_p: req.min_p,
+    };
     if let Some(vd) = req.visual_data {
         work[slot.0].remaining_prompt = req.prompt_tokens.clone();
         work[slot.0].next_pos = 0;
+        // Drop any previous request's vision matrix: the new request's
+        // embeddings are not produced until its first batched chunk, and the
+        // scheduler holds the slot's rows until then.
+        rig.vl_ext_devs[slot.0] = None;
         work[slot.0].vl_prefill = Some(VlPrefill {
             patches: vd.patches,
             grid_h: vd.grid_h,
@@ -2333,6 +2596,10 @@ fn admit(
             embeddings: Vec::new(),
             dim: rig.config.dim,
             visual_idx: 0,
+            image_pad_id: rig
+                .tokenizer
+                .special_token_id("<|image_pad|>")
+                .unwrap_or(u32::MAX),
             mrope_positions: vd.mrope_positions,
             rope_delta: vd.rope_delta,
             base: 0,
@@ -2343,14 +2610,12 @@ fn admit(
         work[slot.0].next_pos = plan.reused;
         work[slot.0].vl_prefill = None;
         // Activate MTP for text-only requests when the head is loaded.
-        work[slot.0].mtp_active = rig.mtp_head.is_some() && rig.mtp_k > 0;
+        // Penalized requests stay on AR: the verify accept is a bare greedy
+        // argmax and cannot reproduce penalize-then-argmax.
+        work[slot.0].mtp_active =
+            rig.mtp_head.is_some() && rig.mtp_k > 0 && !penalized;
     }
-    rig.sample_params[slot.0] = SlotSampleParams {
-        temperature: req.temperature,
-        top_p: req.top_p,
-        top_k: req.top_k,
-        seed: req.seed,
-    };
+    rig.sample_params[slot.0] = sample_params;
     slots[slot.0] = Some(InFlight {
         session: id,
         reply: req.reply,

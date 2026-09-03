@@ -6132,6 +6132,12 @@ pub const EMBEDDING_HFQ4G256_BATCHED_SRC: &str =
 pub const EMBEDDING_Q8_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/embedding_q8_batched.hip");
 
+/// VL batched prefill: overwrite image-pad rows of the token-embedding batch
+/// with per-row vision-embedding matrix rows. Consumed by
+/// `Gpu::embedding_scatter_ext_batched` on the multi-slot VL path.
+pub const EMBEDDING_SCATTER_EXT_SRC: &str =
+    include_str!("../../../kernels/src/embedding_scatter_ext.hip");
+
 /// Batched F16 embedding: copies N rows of an F16 table into `[N × dim]` F32,
 /// reading token ids from a device buffer. Keeps the DSpark markov head chain
 /// GPU-resident (no per-slot D2H+H2D). The F16→F32 widening is exact, so this
