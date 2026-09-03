@@ -295,7 +295,14 @@ impl PrefillBatchScratch {
             // none). Uploaded on VL steps; the scatter kernel runs right
             // after the token-embedding lookup and overwrites image-pad rows.
             ext_emb_index: alloc!(&[max_batch], DType::F32),
-            ext_emb_row_ptr: alloc!(&[max_batch], DType::F32),
+            // One u64 device pointer per row (the scatter kernel reads
+            // `unsigned long long*`), so 8 bytes/row — NOT 4 like the
+            // i32-in-F32 side arrays. Sized `[max_batch] F32` this buffer
+            // only held batches up to max_batch/2 rows; a merged step past
+            // that (e.g. a full 512-row prefill chunk plus one row from a
+            // second slot) tripped the memcpy_htod bound assert and killed
+            // the engine thread.
+            ext_emb_row_ptr: alloc!(&[max_batch * 8], DType::Raw),
             tokens: alloc!(&[max_batch], DType::F32),
             fa_q_full_batch: alloc!(&[max_batch * q_dim * 2], DType::F32),
             fa_q_batch: alloc!(&[max_batch * q_dim], DType::F32),

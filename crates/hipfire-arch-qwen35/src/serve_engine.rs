@@ -1917,6 +1917,25 @@ fn run_loop(
                 })
                 .collect();
             let bytes: Vec<u8> = ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
+            // Bound-check here, not in memcpy_htod: its overflow path is an
+            // assert, and a panic in this thread kills the engine loop while
+            // the HTTP front end keeps accepting — the serve-hang failure
+            // mode. This upload runs before forward_batch_slots' own
+            // n <= pbs.max_batch assert, so an oversized batch would only
+            // surface here.
+            if bytes.len() > rig.pbs.ext_emb_row_ptr.buf.size() {
+                let reason = format!(
+                    "vl ext ptr upload of {} bytes exceeds staging capacity {} \
+                     (batch of {} rows vs max_batch {})",
+                    bytes.len(),
+                    rig.pbs.ext_emb_row_ptr.buf.size(),
+                    batch.total_rows(),
+                    rig.pbs.max_batch
+                );
+                fail_all_active(&mut rig, &mut slots, &mut work, reason.clone());
+                poison = Some(reason);
+                break 'serve;
+            }
             if let Err(e) = rig.gpu.hip.memcpy_htod(&rig.pbs.ext_emb_row_ptr.buf, &bytes) {
                 let reason = format!("vl ext ptr upload failed: {e:?}");
                 fail_all_active(&mut rig, &mut slots, &mut work, reason.clone());
