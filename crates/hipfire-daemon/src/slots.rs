@@ -48,10 +48,92 @@ use hipfire_runtime::serve::{Continuation, DoneReason, Event, SubmitRequest, Vis
 use hipfire_runtime::spec::{ClientEvent, SpecEmitCtx};
 use hipfire_runtime::tokenizer::Tokenizer;
 
+/// Family-neutral spawn parameters. Each per-arch arm of [`AnySlotEngine::spawn`]
+/// turns these into its own engine's config; policy constants that are genuinely
+/// engine-shaped (host budget, swap dir) stay in the arms until a second family
+/// says otherwise.
+struct EngineSpawnParams {
+    model_path: PathBuf,
+    n_slots: usize,
+    cap_tokens: usize,
+    prefill_chunk: usize,
+    mtp_k: usize,
+    is_vl: bool,
+    vl_path: Option<PathBuf>,
+}
+
+/// The per-arch multi-slot engine behind the four-method surface
+/// `handle_generate` drives (`submit` / `close` / `reset` / `shutdown`).
+///
+/// This enum is THE daemon-side arch dispatch point for slot mode. A new
+/// model family with a slot engine adds a variant here and a spawn arm —
+/// nothing else in this file may name a concrete engine type. The wire
+/// types (`SubmitRequest`, `Event`, `Continuation`, `VisualData`) already
+/// live family-neutral in `hipfire_runtime::serve`, so the variant only
+/// binds the engine itself.
+///
+/// Deliberately an enum, not a trait: with one implementation a trait would
+/// guess at the abstraction boundary. When a second family exists and the
+/// variants want behavior beyond these four calls, graduate this into a
+/// trait shaped by that port (the same driver-style rule the run-loop
+/// extraction follows — see `hipfire-arch-qwen35::serve_engine`).
+enum AnySlotEngine {
+    /// Qwen3.5 / Qwen3.5-VL / Qwen3.5-MoE (arch_id 5 | 6).
+    Qwen35(hipfire_arch_qwen35::serve_engine::SlotEngine),
+}
+
+impl AnySlotEngine {
+    fn spawn(arch_id: u32, p: EngineSpawnParams) -> Result<Self, String> {
+        match arch_id {
+            5 | 6 => Ok(Self::Qwen35(
+                hipfire_arch_qwen35::serve_engine::SlotEngine::spawn(
+                    hipfire_arch_qwen35::serve_engine::EngineConfig {
+                        model_path: p.model_path,
+                        n_slots: p.n_slots,
+                        cap_tokens: p.cap_tokens,
+                        prefill_chunk: p.prefill_chunk,
+                        host_budget_bytes: 16 * 1024 * 1024 * 1024,
+                        swap_dir: std::env::temp_dir().join("hipfire-serve-swap"),
+                        is_vl: p.is_vl,
+                        vl_path: p.vl_path,
+                        mtp_k: p.mtp_k,
+                    },
+                )
+                .map_err(|e| format!("SlotEngine spawn: {e}"))?,
+            )),
+            other => Err(format!(
+                "no multi-slot engine for arch_id {other} — slot mode currently \
+                 ships for qwen3_5 only (arch_id 5|6); wire the family in \
+                 AnySlotEngine::spawn"
+            )),
+        }
+    }
+    fn submit(&self, req: SubmitRequest) -> Result<(), String> {
+        match self {
+            Self::Qwen35(e) => e.submit(req),
+        }
+    }
+    fn close(&self, session: u64) -> Result<(), String> {
+        match self {
+            Self::Qwen35(e) => e.close(session),
+        }
+    }
+    fn reset(&self) -> Result<(), String> {
+        match self {
+            Self::Qwen35(e) => e.reset(),
+        }
+    }
+    fn shutdown(self) -> Result<(), String> {
+        match self {
+            Self::Qwen35(e) => e.shutdown(),
+        }
+    }
+}
+
 /// Daemon-owned slot backend. Owns one weight copy via SlotEngine.
 pub struct SlotBackend {
     chat_template: Option<String>,
-    engine: hipfire_arch_qwen35::serve_engine::SlotEngine,
+    engine: AnySlotEngine,
     tokenizer: Tokenizer,
     arch_str: String,
     dim: usize,
@@ -78,6 +160,7 @@ impl SlotBackend {
     ) -> Result<Self, String> {
         // CPU preflight: open HFQ, arch, VL, config, tokenizer.
         let preflight = cpu_preflight(model_path)?;
+        let arch_id = preflight.arch_id;
         let arch_str = preflight.arch_str.clone();
         let dim = preflight.dim;
         let layers = preflight.layers;
@@ -92,20 +175,20 @@ impl SlotBackend {
         let cap_tokens = cap_tokens.max(1);
         let prefill_chunk = prefill_chunk.max(1).min(cap_tokens);
 
-        let engine = hipfire_arch_qwen35::serve_engine::SlotEngine::spawn(
-            hipfire_arch_qwen35::serve_engine::EngineConfig {
+        // Arch dispatch point: pick the family's engine here. Everything
+        // downstream drives the family-neutral four-method surface only.
+        let engine = AnySlotEngine::spawn(
+            arch_id,
+            EngineSpawnParams {
                 model_path: PathBuf::from(model_path),
                 n_slots,
                 cap_tokens,
                 prefill_chunk,
-                host_budget_bytes: 16 * 1024 * 1024 * 1024,
-                swap_dir: std::env::temp_dir().join("hipfire-serve-swap"),
+                mtp_k,
                 is_vl,
                 vl_path,
-                mtp_k,
             },
-        )
-        .map_err(|e| format!("SlotEngine spawn: {e}"))?;
+        )?;
 
         Ok(Self {
             engine,
@@ -977,6 +1060,8 @@ impl Drop for SlotGuard<'_> {
 // ── CPU preflight ────────────────────────────────────────────────────────────
 
 struct Preflight {
+    /// Raw HFQ arch id — the factory's dispatch key (5|6 = qwen3_5 today).
+    arch_id: u32,
     arch_str: String,
     dim: usize,
     layers: usize,
@@ -1048,6 +1133,7 @@ fn cpu_preflight(model_path: &str) -> Result<Preflight, String> {
         _ => unreachable!(),
     };
     Ok(Preflight {
+        arch_id: hfq.arch_id,
         arch_str,
         dim: config.dim,
         layers: config.n_layers,
