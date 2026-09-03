@@ -9309,6 +9309,77 @@ impl Gpu {
         }
     }
 
+    /// Q-tiled flash-style ViT self-attention: same packed-QKV contract as
+    /// [`Gpu::vit_attention_f32`], but QB=16 queries per block share each
+    /// K/V tile pulled through LDS (online softmax, no full-row score
+    /// buffer), cutting the DRAM re-read traffic by ~16×. This is the
+    /// production path for the vision tower — the naive kernel measured
+    /// 1.02 s/layer at N=4624 on gfx1101 (25.5 s per 68x68-grid image);
+    /// this variant should land two orders under it. Requires
+    /// head_dim % 16 == 0 and head_dim <= 128.
+    pub fn vit_attention_qtiled_f32(
+        &mut self,
+        qkv: &GpuTensor,
+        out: &GpuTensor,
+        n: usize,
+        hidden: usize,
+        num_heads: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "vit_attention_qtiled_f32",
+            kernels::VIT_ATTENTION_QTILED_SRC,
+            "vit_attention_qtiled_f32",
+        )?;
+        assert!(
+            head_dim % 16 == 0 && head_dim <= 128,
+            "vit_attention_qtiled_f32: head_dim={head_dim} must be a multiple of 16 \
+             and <= 128 (per-lane accumulator arrays are sized A_MAX=8); \
+             fall back to vit_attention_f32 for exotic towers",
+        );
+        let func = &self.functions["vit_attention_qtiled_f32"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        let mut qp = qkv.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut ni = n as i32;
+        let mut hi = hidden as i32;
+        let mut nh = num_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut sc = scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut hi as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+        ];
+        // Layout must mirror the kernel's smem carve-up (QB=16, K_TILE=64):
+        // k_tile + q_tile + s_tile + ws_max + ws_sum + m_l + out_run. (V is
+        // deliberately NOT staged in LDS — each (j, d) element is read by
+        // exactly one lane, so there is no intra-block reuse to pay for.)
+        const QB: usize = 16;
+        const K_TILE: usize = 64;
+        let shared_mem = ((K_TILE * head_dim
+            + 2 * QB * head_dim
+            + QB * K_TILE
+            + 2 * QB * 16
+            + QB * 2)
+            * 4) as u32;
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [num_heads as u32, (n as u32).div_ceil(QB as u32), 1],
+                [256, 1, 1],
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// DFlash draft cross-attention: `B` queries attend to `L` keys/values
     /// with NO causal mask (bidirectional). Supports GQA; `n_heads` must be
     /// a multiple of `n_kv_heads`. See `kernels/src/attention_dflash.hip`

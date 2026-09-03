@@ -1272,6 +1272,7 @@ name = "hipfire-arch-qwen35-vl"
 version = "0.3.0"
 dependencies = [
  "hip-bridge",
+ "hipfire-config",
  "hipfire-runtime",
  "image",
  "rdna-compute",

@@ -1091,6 +1091,16 @@ pub fn vision_forward(
     // vision path (e.g., async memcpy on a side stream), this pattern must
     // be revisited — either add per-layer syncs or attach kernels to the
     // freeing buffer's stream. See review notes in `vision_rev_claude.md`.
+    // Attention dispatch: the Q-tiled kernel is the production path (the
+    // per-(head, query) kernel was 1.02 s/layer at a 68x68 grid on gfx1101
+    // — the whole 25 s image-request stall). HIPFIRE_VIT_ATTN=naive forces
+    // the old kernel for rollback/A-B; head shapes outside the Q-tiled
+    // kernel's contract fall back to naive instead of asserting.
+    let vit_attn_naive = matches!(
+        hipfire_config::developer_var("HIPFIRE_VIT_ATTN").as_deref(),
+        Ok("naive")
+    ) || config.head_dim % 16 != 0
+        || config.head_dim > 128;
     for li in 0..config.num_layers {
         let lw = &weights.layers[li];
 
@@ -1115,7 +1125,11 @@ pub fn vision_forward(
 
         // Self-attention on GPU: qkv[n, 3h] → attn_out[n, h]
         let attn_out = gpu.alloc_tensor(&[n * h], DType::F32)?;
-        gpu.vit_attention_f32(&qkv, &attn_out, n, h, config.num_heads, config.head_dim)?;
+        if vit_attn_naive {
+            gpu.vit_attention_f32(&qkv, &attn_out, n, h, config.num_heads, config.head_dim)?;
+        } else {
+            gpu.vit_attention_qtiled_f32(&qkv, &attn_out, n, h, config.num_heads, config.head_dim)?;
+        }
         gpu.free_tensor(qkv)?;
 
         // Output projection → [n, h]

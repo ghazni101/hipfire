@@ -16,6 +16,7 @@ deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet"]
 
 [dependencies]
 hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-config = { path = "../hipfire-config" }
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
 serde = { version = "1", features = ["derive"] }
