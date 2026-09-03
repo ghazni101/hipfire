@@ -81,6 +81,10 @@ pub struct EngineConfig {
     pub vl_path: Option<PathBuf>,
     /// MTP speculative decode depth (K candidates per cycle). 0 = MTP off.
     pub mtp_k: usize,
+    /// Raw KV-mode string from the load request (`--kv-mode`). Empty = fall
+    /// back to `HIPFIRE_KV_MODE` / config, resolved through the slots site
+    /// policy (full static ladder; q8 default).
+    pub kv_mode_raw: String,
 }
 
 pub struct SlotEngine {
@@ -216,6 +220,10 @@ struct Rig {
     config: qwen35::Qwen35Config,
     tokenizer: hipfire_runtime::tokenizer::Tokenizer,
     pool: SlotPool,
+    /// The engine's resolved KV tier + model-global rotation tables. Passed
+    /// to every forward step; the tier selects the KV-write and attend
+    /// kernels (see `forward_slots::kv_write_slots` / `tier_attend_slots`).
+    kv_tier: crate::forward_slots::SlotKvTier,
     k_arenas: Vec<GpuTensor>,
     v_arenas: Vec<GpuTensor>,
     dn_states: Vec<DeltaNetState>,
@@ -306,7 +314,41 @@ impl Rig {
             .iter()
             .filter(|t| **t == LayerType::FullAttention)
             .count();
-        let per_pos_bytes = config.n_kv_heads * (config.head_dim / 32) * 34;
+        // Resolve the KV tier through the slots site policy — same config
+        // source and alias table as the sequential carrier, but with q8 as
+        // the slots engine's own default (the longest-validated slots path;
+        // a rotated tier is an explicit operator choice). The full static
+        // ladder is wired — q8, asym{2,3,4}, fwht{2,3,4} — each under both
+        // the legacy slab pool and the paged pool.
+        let kv_mode_raw = if cfg.kv_mode_raw.is_empty() {
+            hipfire_runtime::config::get().kv_mode.clone()
+        } else {
+            cfg.kv_mode_raw.clone()
+        };
+        let hipfire_runtime::kv_mode::ResolveResult { mode: kv_mode, warning: kv_warning } =
+            hipfire_runtime::kv_mode::resolve(
+                &kv_mode_raw,
+                &hipfire_runtime::kv_mode::QWEN35_SLOTS_POLICY,
+                config.head_dim,
+            );
+        if let Some(w) = kv_warning {
+            eprintln!(
+                "  KV cache (slots): {w} (site {})",
+                hipfire_runtime::kv_mode::QWEN35_SLOTS_POLICY.site
+            );
+        }
+        // The tier's arena geometry: the K and V per-position strides DIFFER
+        // on every rotated-K tier (packed K with a 4-byte per-head norm
+        // header against Q8_0 V), and the pool, arenas, preflight math, and
+        // snapshot stamp all follow them.
+        let kv_plan = hipfire_runtime::kv_mode::SlotKvTierPlan::resolve(
+            kv_mode,
+            config.n_kv_heads,
+            config.head_dim,
+        )
+        .map_err(|e| format!("kv mode {kv_mode:?}: {e}"))?;
+        let per_pos_bytes = kv_plan.k_bytes_per_pos;
+        let per_pos_v_bytes = kv_plan.v_bytes_per_pos;
         let prefill_chunk = cfg.prefill_chunk.max(1).min(cfg.cap_tokens.max(1));
         let max_batch = (prefill_chunk * cfg.n_slots).max(cfg.n_slots);
 
@@ -361,10 +403,9 @@ impl Rig {
         let cap_rounded = cfg.cap_tokens.div_ceil(128) * 128;
         let kv_pages = paged_pages.unwrap_or(cfg.n_slots * cap_rounded / 128);
         let kv_bytes = (n_fa_layers as u64)
-            * 2
             * (kv_pages as u64)
             * (PAGE_TOKENS as u64)
-            * (per_pos_bytes as u64);
+            * (per_pos_bytes as u64 + per_pos_v_bytes as u64);
         let planned = weight_bytes + kv_bytes + 768 * 1024 * 1024;
 
         // GPU context only before preflight — no device allocations yet. Free/
@@ -540,6 +581,7 @@ impl Rig {
             mtp_head: Option<crate::mtp_head::Qwen35MtpHead>,
             k_arenas: Vec<GpuTensor>,
             v_arenas: Vec<GpuTensor>,
+            kv_tier: Option<crate::forward_slots::SlotKvTier>,
             dn_states: Vec<DeltaNetState>,
             desc_staging: Option<SlotDescStaging>,
             pbs: Option<PrefillBatchScratch>,
@@ -578,6 +620,9 @@ impl Rig {
                     while let Some(k) = self.k_arenas.pop() {
                         let _ = gpu.free_tensor(k);
                     }
+                    if let Some(tier) = self.kv_tier.take() {
+                        tier.free_gpu(&mut gpu);
+                    }
                     if let Some(w) = self.weights.take() {
                         w.free_gpu(&mut gpu);
                     }
@@ -600,6 +645,7 @@ impl Rig {
             mtp_head,
             k_arenas: Vec::with_capacity(n_fa_layers),
             v_arenas: Vec::with_capacity(n_fa_layers),
+            kv_tier: None,
             dn_states: Vec::with_capacity(cfg.n_slots),
             desc_staging: None,
             pbs: None,
@@ -609,11 +655,26 @@ impl Rig {
             committed: false,
         };
         let pool = if let Some(pages) = paged_pages {
-            SlotPool::new_paged(cfg.n_slots, cfg.cap_tokens, per_pos_bytes, pages)
+            SlotPool::new_paged_with_strides(
+                cfg.n_slots,
+                cfg.cap_tokens,
+                per_pos_bytes,
+                per_pos_v_bytes,
+                pages,
+            )
         } else {
-            SlotPool::new(cfg.n_slots, cfg.cap_tokens, per_pos_bytes)
+            SlotPool::new_with_strides(cfg.n_slots, cfg.cap_tokens, per_pos_bytes, per_pos_v_bytes)
         }
         .map_err(|e| format!("SlotPool: {e}"))?;
+        if !kv_plan.kv_strides_differ() {
+            // q8/bf16: nothing else to log; the tier banner below covers it.
+        } else {
+            eprintln!(
+                "[hipfire] slot KV tier {kv_mode:?}: K {per_pos_bytes} B/pos, \
+                 V {per_pos_v_bytes} B/pos (strides differ; descriptors carry \
+                 separate K/V slab bases)"
+            );
+        }
         if pool.is_paged() {
             eprintln!(
                 "[hipfire] paged KV pool: {} slots x cap {} tokens over {} physical pages \
@@ -624,22 +685,64 @@ impl Rig {
                 PAGE_TOKENS
             );
         }
-        let arena_bytes = pool.arena_bytes();
+        let k_arena_bytes = pool.k_arena_bytes();
+        let v_arena_bytes = pool.v_arena_bytes();
         for _ in 0..n_fa_layers {
             let k = g
                 .gpu
                 .as_mut()
                 .unwrap()
-                .zeros(&[arena_bytes], DType::Raw)
+                .zeros(&[k_arena_bytes], DType::Raw)
                 .map_err(|e| format!("k arena: {e}"))?;
             g.k_arenas.push(k);
             let v = g
                 .gpu
                 .as_mut()
                 .unwrap()
-                .zeros(&[arena_bytes], DType::Raw)
+                .zeros(&[v_arena_bytes], DType::Raw)
                 .map_err(|e| format!("v arena: {e}"))?;
             g.v_arenas.push(v);
+        }
+        // Rotation tables for the resolved tier: Givens angles (asym) or
+        // FWHT sign vectors (fwht), model-global and shared by every slot
+        // and layer. Seeds match the sequential path's cache constructors
+        // exactly, so slot-pool cache bytes are bit-identical to the
+        // sequential engine's for the same tier.
+        {
+            let gpu = g.gpu.as_mut().unwrap();
+            let upload_f32 = |gpu: &mut Gpu, vals: &[f32]| -> Result<GpuTensor, String> {
+                let t = gpu.alloc_tensor(&[vals.len()], DType::F32).map_err(|e| format!("kv rotation table: {e}"))?;
+                let bytes: Vec<u8> = vals.iter().flat_map(|v| v.to_ne_bytes()).collect();
+                gpu.hip.memcpy_htod(&t.buf, &bytes).map_err(|e| format!("kv rotation table upload: {e}"))?;
+                Ok(t)
+            };
+            let (cos, sin, s1, s2) = match kv_plan.givens_len {
+                Some(len) => {
+                    let (c, si) = KvCache::gen_givens_angles(42, len);
+                    (
+                        Some(upload_f32(gpu, &c)?),
+                        Some(upload_f32(gpu, &si)?),
+                        None,
+                        None,
+                    )
+                }
+                None => match kv_plan.fwht_len {
+                    Some(len) => (
+                        None,
+                        None,
+                        Some(upload_f32(gpu, &KvCache::gen_fwht_signs(42, len))?),
+                        Some(upload_f32(gpu, &KvCache::gen_fwht_signs(1042, len))?),
+                    ),
+                    None => (None, None, None, None),
+                },
+            };
+            g.kv_tier = Some(crate::forward_slots::SlotKvTier {
+                mode: kv_mode,
+                givens_cos: cos,
+                givens_sin: sin,
+                fwht_signs1: s1,
+                fwht_signs2: s2,
+            });
         }
         for _ in 0..cfg.n_slots {
             let dn = DeltaNetState::new(g.gpu.as_mut().unwrap(), &config)
@@ -716,15 +819,41 @@ impl Rig {
         let vl_sequential = hipfire_config::developer_var("HIPFIRE_VL_SEQUENTIAL")
             .ok()
             .is_some_and(|v| v == "1" || v == "on" || v == "true");
+        if vl_sequential && !matches!(kv_mode, hipfire_runtime::kv_mode::KvMode::Q8) {
+            return Err(
+                "HIPFIRE_VL_SEQUENTIAL=1 writes KV through the q8-only flat slab \
+                 view; it is not supported under a rotated KV tier. Drop the knob \
+                 (the default batched VL path is tier-generic) or use q8 KV."
+                    .to_string(),
+            );
+        }
 
         let dn_bytes: u64 = dn_buffers(&g.dn_states[0])
             .iter()
             .map(|t| t.buf.size() as u64)
             .sum();
+        // kv_dtype_tag: a per-tier discriminant so a snapshot captured under
+        // one KV tier can never be restored into a rig running another — the
+        // payload's K/V spans are stride-shaped, and a mismatched restore
+        // would be silent corruption. q8 keeps tag 1 (historical).
+        let kv_dtype_tag: u32 = match kv_mode {
+            hipfire_runtime::kv_mode::KvMode::Q8 => 1,
+            hipfire_runtime::kv_mode::KvMode::Asym2 => 21,
+            hipfire_runtime::kv_mode::KvMode::Asym3 => 31,
+            hipfire_runtime::kv_mode::KvMode::Asym4 => 41,
+            hipfire_runtime::kv_mode::KvMode::Fwht2 => 22,
+            hipfire_runtime::kv_mode::KvMode::Fwht3 => 32,
+            hipfire_runtime::kv_mode::KvMode::Fwht4 => 42,
+            hipfire_runtime::kv_mode::KvMode::Bf16 => 12,
+            hipfire_runtime::kv_mode::KvMode::Asym3Auto => {
+                return Err("Asym3Auto sentinel reached Rig::build".to_string());
+            }
+        };
         let stamp = SnapshotStamp {
             model_hash: weight_bytes,
-            kv_dtype_tag: 1,
+            kv_dtype_tag,
             per_pos_bytes: per_pos_bytes as u32,
+            per_pos_v_bytes: per_pos_v_bytes as u32,
             n_fa_layers: n_fa_layers as u32,
             dn_layout_version: 1,
             cap: pool.cap_tokens() as u32,
@@ -734,7 +863,7 @@ impl Rig {
         let mut adm = AdmissionController::new(
             ModelFootprint {
                 weights_bytes: weight_bytes,
-                kv_bytes_per_token: (n_fa_layers * 2 * per_pos_bytes) as u64,
+                kv_bytes_per_token: (n_fa_layers * (per_pos_bytes + per_pos_v_bytes)) as u64,
             },
             vram_total as u64,
         );
@@ -750,6 +879,7 @@ impl Rig {
         let mtp_head = g.mtp_head.take();
         let k_arenas = std::mem::take(&mut g.k_arenas);
         let v_arenas = std::mem::take(&mut g.v_arenas);
+        let kv_tier = g.kv_tier.take().expect("kv tier built");
         let dn_states = std::mem::take(&mut g.dn_states);
         let desc_staging = g.desc_staging.take().unwrap();
         let pbs = g.pbs.take().unwrap();
@@ -801,6 +931,7 @@ impl Rig {
             config,
             tokenizer,
             pool,
+            kv_tier,
             k_arenas,
             v_arenas,
             dn_states,
@@ -845,6 +976,7 @@ impl Rig {
             mtp_prefill_batched,
             mtp_verify_tape,
             mtp_prefill_hidden,
+            kv_tier,
             k_arenas,
             v_arenas,
             dn_states,
@@ -873,6 +1005,7 @@ impl Rig {
         note_hip(scratch.free_gpu(&mut gpu));
         note_hip(pbs.free_gpu(&mut gpu));
         desc_staging.free_gpu(&mut gpu);
+        kv_tier.free_gpu(&mut gpu);
         for dn in dn_states.into_iter().rev() {
             dn.free_gpu(&mut gpu);
         }
@@ -929,6 +1062,13 @@ impl Rig {
             !self.pool.is_paged(),
             "slot_kv_view: flat slab view requested under a paged pool — a \
              sequential KV writer would alias every slot onto the arena prefix"
+        );
+        assert!(
+            self.kv_tier.is_q8(),
+            "slot_kv_view: this view hardwires the q8 layout, but the engine \
+             runs the {:?} KV tier — a sequential write here would corrupt the \
+             rotated-K arena",
+            self.kv_tier.mode
         );
         let cap = self.pool.cap_tokens();
         let per_pos_bytes = self.config.n_kv_heads * (self.config.head_dim / 32) * 34;
@@ -1812,6 +1952,7 @@ fn run_loop(
                 &rig.k_arenas,
                 &rig.v_arenas,
                 &mut rig.desc_staging,
+                &rig.kv_tier,
                 &rig.pbs,
                 &rig.scratch,
                 &rig.logits_out,
