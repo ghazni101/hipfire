@@ -52,6 +52,21 @@ pub struct Session {
     /// message. Matching on the user turns and then replaying our own tokens
     /// keeps the prompt aligned with the KV we actually hold.
     pub convo: Vec<u64>,
+    /// M-RoPE phase offset carried by this conversation's KV, set by the
+    /// image turn that produced it (`VisualData::rope_delta`; 0 for
+    /// text-only conversations).
+    ///
+    /// A text follow-up to an image turn must keep addressing KV rows by
+    /// token index (that is what block tables and `positions[]` use) while
+    /// taking its rope phases from `pos + rope_delta` — the image turn's
+    /// stored keys carry compressed-grid phases, and after a merged image
+    /// grid the phase space trails the token index by exactly this delta.
+    /// Dropping it re-rotates every follow-up query against every image-turn
+    /// key by `|rope_delta|` positions and degrades cross-turn attention to
+    /// near-garbage (the "image follow-up echoes the previous answer"
+    /// symptom). Lives on the session, not the slot: it must survive
+    /// eviction/restore and apply wherever the session is resumed.
+    pub rope_delta: i32,
     /// Monotonic stamp for LRU. Bumped by `touch`.
     pub last_used: u64,
 }
@@ -98,6 +113,7 @@ impl SessionTable {
                 next_pos: 0,
                 residency: Residency::Resident,
                 convo: Vec::new(),
+                rope_delta: 0,
                 last_used: {
                     self.clock += 1;
                     self.clock

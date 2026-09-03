@@ -99,6 +99,9 @@ use rdna_compute::kv_slots::{build_tiles, KvSlotDesc};
 use rdna_compute::slot_pool::{SlotId, SlotPool};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
+/// Packed size of one `KvSlotDesc` (`kernels/src/kv_slot_desc.h`): 8+8+8+4+4.
+pub const DESC_BYTES: usize = 32;
+
 /// Pack a `KvSlotDesc` table byte-identically to `kernels/src/kv_slot_desc.h`
 /// (`block_table: u64, legacy_k_base: u64, legacy_v_base: u64, seq_len: i32,
 /// page_tokens: i32`, 32 bytes, no padding between fields on this target).
@@ -107,7 +110,12 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 /// duplicated rather than shared because that packer lives in `examples/`
 /// (test-only) and this is production `src/`.
 fn pack_descs(descs: &[KvSlotDesc]) -> Vec<u8> {
-    let mut out = Vec::with_capacity(descs.len() * 32);
+    debug_assert_eq!(
+        std::mem::size_of::<KvSlotDesc>(),
+        DESC_BYTES,
+        "KvSlotDesc ABI drifted away from the packed 32-byte layout"
+    );
+    let mut out = Vec::with_capacity(descs.len() * DESC_BYTES);
     for d in descs {
         out.extend_from_slice(&d.block_table.to_ne_bytes());
         out.extend_from_slice(&d.legacy_k_base.to_ne_bytes());
@@ -174,11 +182,19 @@ impl SlotDescStaging {
         // succeeded if a later allocation fails partway through.
         let mut allocated: Vec<GpuTensor> = Vec::new();
         let shapes: [&[usize]; 5] = [
-            &[n_slots * 24], // descs_dev
-            &[max_rows * 4], // row_slot_dev
-            &[max_rows * 4], // tile_slot_dev
-            &[max_rows * 4], // tile_row0_dev
-            &[max_rows * 4], // tile_qbase_dev
+            // One packed KvSlotDesc is 32 bytes (8+8+8+4+4, see pack_descs
+            // and the size assert in rdna_compute::kv_slots) — size the
+            // staging table from the ABI, not from a stale field count.
+            // The 24-byte sizing predated the separate `legacy_v_base`
+            // field (c949fa5c2) and only ran unharmed because the device
+            // pool rounds sub-256-byte allocations up to 256 B: the
+            // overflow was silently absorbed up to 8 slots and would trip
+            // the memcpy_htod bound assert at 9+.
+            &[n_slots * DESC_BYTES], // descs_dev
+            &[max_rows * 4],         // row_slot_dev
+            &[max_rows * 4],         // tile_slot_dev
+            &[max_rows * 4],         // tile_row0_dev
+            &[max_rows * 4],         // tile_qbase_dev
         ];
         for shape in shapes {
             match gpu.alloc_tensor(shape, DType::Raw) {
