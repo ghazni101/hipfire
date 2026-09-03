@@ -1019,7 +1019,24 @@ fn main() {
                             .and_then(|v| v.as_u64())
                             .unwrap_or(4) as usize
                     };
-                    match slots::SlotBackend::load(path, n_slots, cap_tokens, prefill_chunk, mtp_k) {
+                    // The sequential loader parses its own kv_mode_override
+                    // further down this arm; the slot engine takes the same
+                    // precedence (load param > env/config, resolved engine-side
+                    // through the slots policy).
+                    let slot_kv_mode_raw = msg
+                        .get("params")
+                        .and_then(|p| p.get("kv_mode"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    match slots::SlotBackend::load(
+                        path,
+                        n_slots,
+                        cap_tokens,
+                        prefill_chunk,
+                        mtp_k,
+                        &slot_kv_mode_raw,
+                    ) {
                         Ok(backend) => {
                             let arch = backend.arch_str().to_string();
                             let dim = backend.dim();

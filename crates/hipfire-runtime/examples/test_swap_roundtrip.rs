@@ -127,10 +127,17 @@ fn main() {
         next_pos: 0,
         decoding: false,
         vl_prefill: None,
+        mtp_active: false,
+        mtp_committed: 0,
+        mtp_cycles: 0,
+        mtp_retire_fails: 0,
+        pos3_delta: 0,
     }];
     let mut sched = Scheduler {
         chunk_size: prompt.len(),
+        vl_sequential: false,
     };
+    let kv_tier = hipfire_arch_qwen35::forward_slots::SlotKvTier::q8();
     let mut graph = SlotDecodeGraph::new();
     let batch = sched.next_batch(&mut work);
     forward_batch_slots_graphed(
@@ -143,6 +150,7 @@ fn main() {
         &k_arenas,
         &v_arenas,
         &mut desc_staging,
+        &kv_tier,
         &pbs,
         &scratch,
         &logits_out,
@@ -161,6 +169,7 @@ fn main() {
         model_hash: 0xDEAD_BEEF,
         kv_dtype_tag: 1,
         per_pos_bytes: per_pos_bytes as u32,
+        per_pos_v_bytes: per_pos_bytes as u32,
         n_fa_layers: n_fa_layers as u32,
         dn_layout_version: 1,
         cap: pool.cap_tokens() as u32,

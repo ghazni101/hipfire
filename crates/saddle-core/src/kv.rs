@@ -335,6 +335,148 @@ pub struct KvCache {
     pub compact_offset: usize,
 }
 
+/// Per-tier arena plan for a flat multi-slot KV pool (the `SlotEngine`
+/// addressing scheme): byte strides for one position of K and of V, plus the
+/// rotation-table geometry the tier's write/attend kernels need.
+///
+/// This is the multi-slot sibling of [`KvCache::vmm_k_bytes_per_head`] — the
+/// same packed layouts, addressed per position instead of per VMM head. The
+/// two stride facts that matter to a slot pool live here:
+///
+/// * K and V strides DIFFER on every rotated-K tier (asym{2,3,4} /
+///   fwht{2,3,4} store K packed + a 4-byte norm/sign header per head, V at
+///   Q8_0), so a pool must track them separately and the 32-byte
+///   `KvSlotDesc` carries separate `legacy_k_base`/`legacy_v_base`.
+/// * The rotation tables are MODEL-global (shared by every slot and layer):
+///   Givens angles for asym tiers, ±1 sign vectors for fwht tiers, nothing
+///   for q8/bf16. Seeds match the `new_gpu_*_filtered` constructors exactly
+///   (42 for the primary table, 1042 for the secondary FWHT signs) so a slot
+///   pool writes bit-identical cache bytes to the sequential path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotKvTierPlan {
+    pub k_bytes_per_pos: usize,
+    pub v_bytes_per_pos: usize,
+    /// Givens cos/sin table length (asym tiers): `head_dim / 2`.
+    pub givens_len: Option<usize>,
+    /// FWHT sign-vector length (fwht tiers): 128 (Q8-V sign width).
+    pub fwht_len: Option<usize>,
+}
+
+impl SlotKvTierPlan {
+    /// Resolve the plan for `mode` (+ static Q8 V, the multi-slot ladder).
+    /// Geometry gates mirror the contiguous `new_gpu_*_filtered`
+    /// constructors: asym3/fwht3 need head_dim 256, the other rotated tiers
+    /// need 128 or 256, every packed tier needs head_dim divisible by 32.
+    pub fn resolve(mode: KvMode, n_kv_heads: usize, head_dim: usize) -> HipResult<Self> {
+        if n_kv_heads == 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "slot KV plan requires n_kv_heads > 0",
+            ));
+        }
+        let quant_gate = |name: &str, ok_hd: bool| -> HipResult<()> {
+            if !head_dim.is_multiple_of(32) {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!("{name} slot KV requires head_dim divisible by 32 (got {head_dim})"),
+                ));
+            }
+            if !ok_hd {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    &format!(
+                        "{name} slot KV requires head_dim {} (got {head_dim})",
+                        if matches!(mode, KvMode::Asym3 | KvMode::Fwht3) {
+                            "256"
+                        } else {
+                            "128 or 256"
+                        }
+                    ),
+                ));
+            }
+            Ok(())
+        };
+        let k_bph = match mode {
+            KvMode::Q8 => {
+                if head_dim == 0 || !head_dim.is_multiple_of(32) {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        &format!("q8 slot KV requires head_dim divisible by 32 (got {head_dim})"),
+                    ));
+                }
+                (head_dim / 32) * 34
+            }
+            // Bf16 is flat 2 bytes/element with no per-head blocks and no
+            // rotation table. It is allocatable by the maple site only —
+            // whether a given engine ACCEPTS the tier is its policy's call
+            // (see kv_mode.rs); this helper just describes the layout.
+            KvMode::Bf16 => {
+                let kv_dim = n_kv_heads
+                    .checked_mul(head_dim)
+                    .ok_or_else(|| hip_bridge::HipError::new(0, "slot KV kv_dim overflowed"))?;
+                kv_dim * 2
+            }
+            KvMode::Asym2 | KvMode::Fwht2 => {
+                quant_gate("asym2", head_dim == 128 || head_dim == 256)?;
+                4 + head_dim / 4
+            }
+            KvMode::Asym3 | KvMode::Fwht3 => {
+                quant_gate("asym3", head_dim == 256)?;
+                4 + (head_dim * 3) / 8
+            }
+            KvMode::Asym4 | KvMode::Fwht4 => {
+                quant_gate("asym4", head_dim == 128 || head_dim == 256)?;
+                4 + head_dim / 2
+            }
+            KvMode::Asym3Auto => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "KV mode Asym3Auto must be resolved before the slot KV plan",
+                ));
+            }
+        };
+        let k_bytes_per_pos = match mode {
+            // bf16's stride is already per-position (kv_dim flat elements, no
+            // per-head blocks) — it must NOT be scaled by n_kv_heads again.
+            KvMode::Bf16 => k_bph,
+            _ => n_kv_heads
+                .checked_mul(k_bph)
+                .ok_or_else(|| hip_bridge::HipError::new(0, "slot KV K stride overflowed"))?,
+        };
+        let v_bytes_per_pos = match mode {
+            // bf16 V is flat like its K.
+            KvMode::Bf16 => k_bytes_per_pos,
+            _ => {
+                // Static multi-slot ladder stores V at Q8_0 — the same
+                // per-head layout the asym/fwht constructors allocate.
+                if head_dim == 0 || !head_dim.is_multiple_of(32) {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        &format!("Q8_0 V slot KV requires head_dim divisible by 32 (got {head_dim})"),
+                    ));
+                }
+                n_kv_heads * (head_dim / 32) * 34
+            }
+        };
+        Ok(Self {
+            k_bytes_per_pos,
+            v_bytes_per_pos,
+            givens_len: matches!(mode, KvMode::Asym2 | KvMode::Asym3 | KvMode::Asym4)
+                .then_some(head_dim / 2),
+            fwht_len: matches!(mode, KvMode::Fwht2 | KvMode::Fwht3 | KvMode::Fwht4)
+                .then_some(128),
+        })
+    }
+
+    /// True when the K and V per-position strides differ (the rotated-K
+    /// tiers). Drives whether a pool's descriptors carry distinct
+    /// `legacy_k_base`/`legacy_v_base` and whether the V-side write must
+    /// resolve the V base instead of the shared K base.
+    pub fn kv_strides_differ(&self) -> bool {
+        self.k_bytes_per_pos != self.v_bytes_per_pos
+    }
+}
+
 /// Layer addressing for [`KvCache::from_mode`]: a per-layer "is this a
 /// full-attention layer" mask (→ `_filtered` family) OR a flat layer count
 /// (→ plain / flat-`_capped` family).
@@ -4474,5 +4616,98 @@ mod vmm_layout_tests {
                 );
             }
         }
+    }
+}
+
+/// Slot-pool tier-plan truth table: strides must equal the constructor
+/// formulas (`expected_k_bph` above) and the Q8_0 V stride, the rotation
+/// metadata must match the tier family, and the geometry gates must refuse
+/// what the constructors refuse.
+#[cfg(test)]
+mod slot_kv_plan_tests {
+    use super::*;
+
+    #[test]
+    fn strides_match_constructor_formulas() {
+        let n_kv_heads = 8usize;
+        for (mode, hd, k_bph) in [
+            (KvMode::Q8, 256usize, 8 * 34usize),
+            (KvMode::Asym2, 128, 4 + 128 / 4),
+            (KvMode::Asym2, 256, 4 + 256 / 4),
+            (KvMode::Asym3, 256, 4 + (256 * 3) / 8),
+            (KvMode::Asym4, 128, 4 + 128 / 2),
+            (KvMode::Asym4, 256, 4 + 256 / 2),
+            (KvMode::Fwht2, 256, 4 + 256 / 4),
+            (KvMode::Fwht3, 256, 4 + (256 * 3) / 8),
+            (KvMode::Fwht4, 256, 4 + 256 / 2),
+        ] {
+            let p = SlotKvTierPlan::resolve(mode, n_kv_heads, hd)
+                .unwrap_or_else(|e| panic!("{mode:?} hd={hd}: {e}"));
+            assert_eq!(p.k_bytes_per_pos, n_kv_heads * k_bph, "{mode:?} hd={hd}");
+            assert_eq!(
+                p.v_bytes_per_pos,
+                n_kv_heads * (hd / 32) * 34,
+                "{mode:?} hd={hd} V must be Q8_0 stride"
+            );
+            assert_eq!(
+                p.kv_strides_differ(),
+                !matches!(mode, KvMode::Q8),
+                "{mode:?}: only q8 shares the K/V stride"
+            );
+        }
+    }
+
+    #[test]
+    fn q8_shares_strides_and_has_no_tables() {
+        let p = SlotKvTierPlan::resolve(KvMode::Q8, 4, 256).unwrap();
+        assert_eq!(p.k_bytes_per_pos, p.v_bytes_per_pos);
+        assert!(!p.kv_strides_differ());
+        assert!(p.givens_len.is_none());
+        assert!(p.fwht_len.is_none());
+    }
+
+    #[test]
+    fn bf16_is_flat_and_table_free() {
+        let p = SlotKvTierPlan::resolve(KvMode::Bf16, 4, 256).unwrap();
+        assert_eq!(p.k_bytes_per_pos, 4 * 256 * 2);
+        assert_eq!(p.v_bytes_per_pos, p.k_bytes_per_pos);
+        assert!(!p.kv_strides_differ());
+        assert!(p.givens_len.is_none());
+        assert!(p.fwht_len.is_none());
+    }
+
+    #[test]
+    fn rotation_tables_match_tier_family() {
+        for m in [KvMode::Asym2, KvMode::Asym3, KvMode::Asym4] {
+            let p = SlotKvTierPlan::resolve(m, 2, 256).unwrap();
+            assert_eq!(p.givens_len, Some(128), "{m:?}: head_dim/2 givens angles");
+            assert!(p.fwht_len.is_none(), "{m:?} must not carry fwht signs");
+        }
+        for m in [KvMode::Fwht2, KvMode::Fwht3, KvMode::Fwht4] {
+            let p = SlotKvTierPlan::resolve(m, 2, 256).unwrap();
+            assert_eq!(p.fwht_len, Some(128), "{m:?}: 128-wide sign vectors");
+            assert!(p.givens_len.is_none(), "{m:?} must not carry givens angles");
+        }
+    }
+
+    #[test]
+    fn geometry_gates_refuse_what_constructors_refuse() {
+        // asym3/fwht3 are 256-only (Qwen 3.5 geometry).
+        for m in [KvMode::Asym3, KvMode::Fwht3] {
+            assert!(SlotKvTierPlan::resolve(m, 2, 128).is_err(), "{m:?} @128");
+        }
+        // asym2/asym4 accept 128 or 256, nothing else in between.
+        for m in [KvMode::Asym2, KvMode::Asym4] {
+            assert!(SlotKvTierPlan::resolve(m, 2, 256).is_ok(), "{m:?} @256");
+            assert!(SlotKvTierPlan::resolve(m, 2, 64).is_err(), "{m:?} @64");
+        }
+        // Packed tiers need head_dim % 32.
+        for m in [KvMode::Q8, KvMode::Asym3, KvMode::Fwht4] {
+            assert!(SlotKvTierPlan::resolve(m, 2, 100).is_err(), "{m:?} @100");
+        }
+        // The sentinel never resolves.
+        assert!(SlotKvTierPlan::resolve(KvMode::Asym3Auto, 2, 256).is_err());
+        // Zero heads refused.
+        assert!(SlotKvTierPlan::resolve(KvMode::Q8, 0, 256).is_err());
     }
 }

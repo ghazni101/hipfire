@@ -467,6 +467,7 @@ mod dn {
             positions_flat.len(),
             Some(&descs_dev),
             Some(&row_slot_dev),
+            /*use_v_base=*/ false,
         )
         .expect("multi-slot kv write");
         gpu.hip.device_synchronize().expect("sync");

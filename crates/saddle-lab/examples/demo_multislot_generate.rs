@@ -322,12 +322,23 @@ fn main() {
     // Greedy for every slot: deterministic output, and it takes
     // `sample_per_slot`'s `argmax_f32_batched` fast path for the whole
     // batch every step rather than one kernel launch per slot.
+    // q8 slot KV tier: this demo exercises batching/decoding, not a KV tier.
+    let kv_tier = hipfire_arch_qwen35::forward_slots::SlotKvTier::q8();
+    let repeat_windows: Vec<rdna_compute::GpuTensor> = (0..n_slots)
+        .map(|_| gpu.zeros(&[2048usize], DType::F32))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("repeat windows");
     let mut sample_params: Vec<SlotSampleParams> = (0..n_slots)
         .map(|_| SlotSampleParams {
             temperature: 0.0,
             top_p: 1.0,
             top_k: 0,
             seed: 0,
+            repeat_window: 0,
+            repeat_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            min_p: 0.0,
         })
         .collect();
 
@@ -338,10 +349,18 @@ fn main() {
             next_pos: 0,
             decoding: false,
             vl_prefill: None,
+            mtp_active: false,
+            mtp_committed: 0,
+            mtp_cycles: 0,
+            mtp_retire_fails: 0,
+            pos3_delta: 0,
         })
         .collect();
 
-    let mut scheduler = Scheduler { chunk_size };
+    let mut scheduler = Scheduler {
+        chunk_size,
+        vl_sequential: false,
+    };
     let mut n_generated = vec![0usize; n_slots];
     let mut finished = vec![false; n_slots];
     let mut generated_tokens: Vec<Vec<u32>> = vec![Vec::new(); n_slots];
@@ -391,6 +410,7 @@ fn main() {
             &k_arenas,
             &v_arenas,
             &mut desc_staging,
+            &kv_tier,
             &pbs,
             &scratch,
             &logits_out,
@@ -402,6 +422,7 @@ fn main() {
         gpu.sample_per_slot(
             &logits_out,
             &mut sample_params,
+            &repeat_windows,
             n_slots,
             config.vocab_size,
             &out_tokens,

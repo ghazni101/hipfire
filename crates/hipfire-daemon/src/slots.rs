@@ -60,6 +60,9 @@ struct EngineSpawnParams {
     mtp_k: usize,
     is_vl: bool,
     vl_path: Option<PathBuf>,
+    /// Raw KV-mode string from the load request (empty = resolve from env /
+    /// config in the engine, via the slots policy).
+    kv_mode_raw: String,
 }
 
 /// The per-arch multi-slot engine behind the four-method surface
@@ -97,6 +100,7 @@ impl AnySlotEngine {
                         is_vl: p.is_vl,
                         vl_path: p.vl_path,
                         mtp_k: p.mtp_k,
+                        kv_mode_raw: p.kv_mode_raw,
                     },
                 )
                 .map_err(|e| format!("SlotEngine spawn: {e}"))?,
@@ -157,6 +161,7 @@ impl SlotBackend {
         cap_tokens: usize,
         prefill_chunk: usize,
         mtp_k: usize,
+        kv_mode_raw: &str,
     ) -> Result<Self, String> {
         // CPU preflight: open HFQ, arch, VL, config, tokenizer.
         let preflight = cpu_preflight(model_path)?;
@@ -187,6 +192,7 @@ impl SlotBackend {
                 mtp_k,
                 is_vl,
                 vl_path,
+                kv_mode_raw: kv_mode_raw.to_string(),
             },
         )?;
 
@@ -1279,12 +1285,27 @@ pub fn validate_load_caps(msg: &serde_json::Value) -> Option<String> {
     {
         return Some("adaptive KV not supported in experimental multi-slot".to_string());
     }
-    if params
+    // The slot engine resolves the full static KV ladder (q8, asym{2,3,4},
+    // fwht{2,3,4}); the per-load string must be one the slots policy accepts.
+    // Rejected here — loudly, before any GPU work — rather than silently
+    // downgraded to the q8 default by the engine-side resolve.
+    if let Some(raw) = params
         .and_then(|p| p.get("kv_mode"))
         .and_then(|v| v.as_str())
-        .is_some_and(|v| !v.is_empty() && v != "q8")
+        .filter(|v| !v.is_empty())
     {
-        return Some("experimental multi-slot currently requires kv_mode=q8".to_string());
+        let resolved = hipfire_runtime::kv_mode::resolve(
+            raw,
+            &hipfire_runtime::kv_mode::QWEN35_SLOTS_POLICY,
+            256, // head_dim gate runs later in Rig::build with the real value
+        );
+        if resolved.warning.is_some() {
+            return Some(format!(
+                "experimental multi-slot does not support kv_mode='{raw}' \
+                 (accepted: q8|asym2|asym3|asym4|fwht2|fwht3|fwht4; 'auto'/unset \
+                 = q8)"
+            ));
+        }
     }
     if params
         .and_then(|p| p.get("kv_backend"))
@@ -2024,8 +2045,19 @@ mod tests {
             "cask": false
         }});
         assert_eq!(validate_load_caps(&supported), None);
+        // The full static KV ladder is accepted (engine resolves it through
+        // the slots site policy); only strings the policy rejects — bf16,
+        // garbage — are refused here, loudly, before any GPU work.
+        for kv in ["asym3", "asym2", "asym4", "fwht2", "fwht3", "fwht4", "auto"] {
+            assert_eq!(
+                validate_load_caps(&json!({"params": {"kv_mode": kv}})),
+                None,
+                "ladder tier {kv} must be accepted"
+            );
+        }
         for params in [
-            json!({"kv_mode": "asym3"}),
+            json!({"kv_mode": "bf16"}),
+            json!({"kv_mode": "garbage"}),
             json!({"kv_backend": "vmm"}),
             json!({"dflash_mode": "auto"}),
             json!({"ngram_draft": true}),

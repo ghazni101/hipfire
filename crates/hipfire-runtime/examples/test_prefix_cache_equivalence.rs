@@ -149,6 +149,11 @@ fn main() {
         top_p: 1.0,
         top_k: 0,
         seed: 0,
+        repeat_window: 0,
+        repeat_penalty: 1.0,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        min_p: 0.0,
     }];
 
     // One arm: optionally warm the slot with `warm`, then begin_turn against
@@ -163,11 +168,13 @@ fn main() {
         k_arenas: &[rdna_compute::GpuTensor],
         v_arenas: &[rdna_compute::GpuTensor],
         desc_staging: &mut SlotDescStaging,
+        kv_tier: &hipfire_arch_qwen35::forward_slots::SlotKvTier,
         pbs: &PrefillBatchScratch,
         scratch: &Qwen35Scratch,
         logits_out: &rdna_compute::GpuTensor,
         out_tokens: &rdna_compute::GpuTensor,
         sample_params: &mut [SlotSampleParams],
+        repeat_windows: &[rdna_compute::GpuTensor],
         warm: Option<&[u32]>,
         prompt: &[u32],
         decode_n: usize,
@@ -206,6 +213,7 @@ fn main() {
         // this turn or the previous one.
         let mut sched = Scheduler {
             chunk_size: chunk.max(1),
+            vl_sequential: false,
         };
 
         // Prefill + decode driver shared by the warm turn and the real turn.
@@ -224,6 +232,11 @@ fn main() {
                 next_pos: start_pos,
                 decoding: false,
                 vl_prefill: None,
+                mtp_active: false,
+                mtp_committed: 0,
+                mtp_cycles: 0,
+                mtp_retire_fails: 0,
+                pos3_delta: 0,
             }];
             let mut produced = Vec::new();
             // Prefill may take several chunks. Sampling is only valid once the
@@ -246,6 +259,7 @@ fn main() {
                     k_arenas,
                     v_arenas,
                     desc_staging,
+                    kv_tier,
                     pbs,
                     scratch,
                     logits_out,
@@ -253,8 +267,15 @@ fn main() {
                 )
                 .expect("forward_batch_slots_graphed");
                 gpu.hip.device_synchronize().expect("sync");
-                gpu.sample_per_slot(logits_out, sample_params, 1, config.vocab_size, out_tokens)
-                    .expect("sample_per_slot");
+                gpu.sample_per_slot(
+                    logits_out,
+                    sample_params,
+                    repeat_windows,
+                    1,
+                    config.vocab_size,
+                    out_tokens,
+                )
+                .expect("sample_per_slot");
                 gpu.hip.device_synchronize().expect("sync");
                 let mut tok = [0i32; 1];
                 {
@@ -310,6 +331,11 @@ fn main() {
         )
     }
 
+    let kv_tier = hipfire_arch_qwen35::forward_slots::SlotKvTier::q8();
+    let repeat_windows: Vec<rdna_compute::GpuTensor> = (0..1)
+        .map(|_| gpu.zeros(&[2048usize], DType::F32))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("repeat windows");
     let reference = run_arm(
         &mut gpu,
         &weights,
@@ -319,11 +345,13 @@ fn main() {
         &k_arenas,
         &v_arenas,
         &mut desc_staging,
+        &kv_tier,
         &pbs,
         &scratch,
         &logits_out,
         &out_tokens,
-        &sample_params,
+        &mut sample_params,
+        &repeat_windows,
         None,
         &turn2,
         DECODE_N,
@@ -339,11 +367,13 @@ fn main() {
         &k_arenas,
         &v_arenas,
         &mut desc_staging,
+        &kv_tier,
         &pbs,
         &scratch,
         &logits_out,
         &out_tokens,
-        &sample_params,
+        &mut sample_params,
+        &repeat_windows,
         Some(&turn1),
         &turn2,
         DECODE_N,

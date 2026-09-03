@@ -6,7 +6,7 @@
 //! dispatcher [`crate::llama::KvCache::from_mode`] turns the resolved mode into
 //! the actual allocating constructor call.
 
-pub use saddle_core::kv::KvMode;
+pub use saddle_core::kv::{KvMode, SlotKvTierPlan};
 
 /// Per-site alias table + accepted set + default. One const per load site.
 pub struct KvModePolicy {
@@ -169,6 +169,34 @@ pub const MAPLE_POLICY: KvModePolicy = KvModePolicy {
     normalize_alias: normalize_maple,
     accepted: &[Q8, Bf16],
     default: Bf16,
+};
+
+/// Site 8 — the multi-slot serve engine (qwen35). The slots engine ran
+/// Q8_0-only for its whole life; the full static ladder is now wired
+/// end-to-end (descriptor-aware K writers + flash tile kernels, legacy and
+/// paged pools), so every tier the sequential path accepts is accepted here
+/// too. The DEFAULT stays q8 — deliberately NOT the sequential site's
+/// asym3: the slots q8 path has production mileage on every fixture, and
+/// an operator who wants a rotated tier on the slots engine says so
+/// explicitly (`HIPFIRE_KV_MODE=asym3` / config). "auto" therefore means
+/// q8 HERE (mirroring the qwen35-pp site's convention, not the hfq site's).
+fn normalize_slots(raw: &str) -> Option<KvMode> {
+    match raw {
+        "q8" | "auto" | "" => Some(Q8),
+        "asym2" | "turbo2" => Some(Asym2),
+        "asym3" | "turbo3" | "turbo" => Some(Asym3),
+        "asym4" | "turbo4" => Some(Asym4),
+        "fwht2" => Some(Fwht2),
+        "fwht3" => Some(Fwht3),
+        "fwht4" => Some(Fwht4),
+        _ => None, // garbage → default (+warn); bf16 not allocatable here
+    }
+}
+pub const QWEN35_SLOTS_POLICY: KvModePolicy = KvModePolicy {
+    site: "qwen35-slots",
+    normalize_alias: normalize_slots,
+    accepted: FULL_LADDER,
+    default: Q8,
 };
 
 /// Pure: `&str + &'static policy + usize → ResolveResult`. No GPU, no env read.
@@ -338,6 +366,42 @@ mod tests {
         assert!(resolve("asym2", p, 256).warning.is_some());
         assert_eq!(resolve("asym4", p, 256).mode, KvMode::Q8); // not accepted → default
         assert!(resolve("asym4", p, 256).warning.is_some());
+    }
+
+    #[test]
+    fn truth_table_qwen35_slots_default_is_q8() {
+        let p = &QWEN35_SLOTS_POLICY;
+        // Unset and "auto" both mean q8, SILENTLY — q8 is the slots
+        // engine's shipped default and its longest-validated path.
+        assert_eq!(resolve("", p, 256).mode, KvMode::Q8);
+        assert!(resolve("", p, 256).warning.is_none());
+        assert_eq!(resolve("auto", p, 256).mode, KvMode::Q8);
+        assert!(resolve("auto", p, 256).warning.is_none());
+        assert_eq!(resolve("q8", p, 256).mode, KvMode::Q8);
+        assert!(resolve("q8", p, 256).warning.is_none());
+        // Every rotated tier is HONORED (the ladder is fully wired) and
+        // must not warn — an explicit tier is an intentional choice.
+        for (raw, mode) in [
+            ("asym2", KvMode::Asym2),
+            ("asym3", KvMode::Asym3),
+            ("turbo", KvMode::Asym3),
+            ("asym4", KvMode::Asym4),
+            ("fwht2", KvMode::Fwht2),
+            ("fwht3", KvMode::Fwht3),
+            ("fwht4", KvMode::Fwht4),
+        ] {
+            let r = resolve(raw, p, 256);
+            assert_eq!(r.mode, mode, "{raw} must be honored on the slots site");
+            assert!(r.warning.is_none(), "{raw} must not warn");
+        }
+        // bf16 is not allocatable on this site: refuse to the default WITH
+        // a warning (never a silent downgrade).
+        let r = resolve("bf16", p, 256);
+        assert_eq!(r.mode, KvMode::Q8);
+        assert!(r.warning.is_some());
+        let garbage = resolve("garbage", p, 256);
+        assert_eq!(garbage.mode, KvMode::Q8);
+        assert!(garbage.warning.is_some());
     }
 
     #[test]

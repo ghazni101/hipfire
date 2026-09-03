@@ -32,7 +32,13 @@ pub struct SlotPool {
     descs: Vec<KvSlotDesc>,
     in_use: Vec<bool>,
     cap_tokens: usize,
-    per_pos_bytes: usize,
+    /// Per-position strides in bytes. These DIFFER on the rotated-K tiers
+    /// (asym{2,3,4}/fwht{2,3,4} store K packed per head + a 4-byte header,
+    /// V at Q8_0) and are equal on q8/bf16. Every slab offset in the K
+    /// arena scales by the K stride, the V arena by the V stride; the
+    /// descriptors carry the two separately (`legacy_k_base`/`legacy_v_base`).
+    k_per_pos_bytes: usize,
+    v_per_pos_bytes: usize,
     dirty: bool,
     // ── Paged mode (None = legacy) ──────────────────────────────────────
     page_pool: Option<PagePool>,
@@ -51,32 +57,49 @@ impl SlotPool {
     /// Build a pool of `n_slots` fixed-size slabs.
     ///
     /// `per_pos_bytes` is the per-position stride, uniform across slots
-    /// (`n_kv_heads * (head_dim/32) * 34` for Q8_0).
+    /// (`n_kv_heads * (head_dim/32) * 34` for Q8_0) and shared by the K and
+    /// V arenas. For the rotated-K tiers call [`SlotPool::new_with_strides`]
+    /// instead — their K and V strides differ.
     ///
     /// Refuses rather than allocates when the arena would exceed the
     /// deployment-target budget — see `kv_slots::preflight_alloc`.
     pub fn new(n_slots: usize, cap_tokens: usize, per_pos_bytes: usize) -> Result<Self, String> {
+        Self::new_with_strides(n_slots, cap_tokens, per_pos_bytes, per_pos_bytes)
+    }
+
+    /// [`SlotPool::new`] with independent K/V strides — the form the
+    /// rotated-K tiers need. The K arena holds `n_slots` slabs of
+    /// `cap × k_per_pos_bytes`; the V arena the same at `v_per_pos_bytes`.
+    /// Descriptors carry matching `legacy_k_base`/`legacy_v_base` so every
+    /// kernel resolves each arena through its own stride.
+    pub fn new_with_strides(
+        n_slots: usize,
+        cap_tokens: usize,
+        k_per_pos_bytes: usize,
+        v_per_pos_bytes: usize,
+    ) -> Result<Self, String> {
         assert!(n_slots > 0, "n_slots must be positive");
-        assert!(per_pos_bytes > 0, "per_pos_bytes must be positive");
+        assert!(k_per_pos_bytes > 0, "k_per_pos_bytes must be positive");
+        assert!(v_per_pos_bytes > 0, "v_per_pos_bytes must be positive");
         let cap = cap_tokens.div_ceil(PAGE_TOKENS) * PAGE_TOKENS;
-        let slab_bytes = (cap * per_pos_bytes) as u64;
-        // K and V are separate arenas of identical layout, hence x2.
-        let total = slab_bytes
+        let k_slab_bytes = (cap * k_per_pos_bytes) as u64;
+        let v_slab_bytes = (cap * v_per_pos_bytes) as u64;
+        let total = k_slab_bytes
+            .checked_add(v_slab_bytes)
+            .ok_or_else(|| "SlotPool: arena size overflows u64".to_string())?
             .checked_mul(n_slots as u64)
-            .and_then(|b| b.checked_mul(2))
             .ok_or_else(|| "SlotPool: arena size overflows u64".to_string())?;
         preflight_alloc(total, R9700_VRAM_BYTES, "SlotPool arena")?;
 
         let descs = (0..n_slots)
             .map(|i| {
-                let base = i as u64 * slab_bytes;
+                let k_base = i as u64 * k_slab_bytes;
+                let v_base = i as u64 * v_slab_bytes;
                 KvSlotDesc {
                     // Legacy contiguous mode: block_table = 0, page_tokens = 0.
-                    // Q8_0 pool: K and V slabs share one offset in their
-                    // separate arenas.
                     block_table: 0,
-                    legacy_k_base: base,
-                    legacy_v_base: base,
+                    legacy_k_base: k_base,
+                    legacy_v_base: v_base,
                     seq_len: 0,
                     page_tokens: 0,
                 }
@@ -87,7 +110,8 @@ impl SlotPool {
             descs,
             in_use: vec![false; n_slots],
             cap_tokens: cap,
-            per_pos_bytes,
+            k_per_pos_bytes,
+            v_per_pos_bytes,
             dirty: true,
             page_pool: None,
             block_tables: vec![None; n_slots],
@@ -102,17 +126,32 @@ impl SlotPool {
     ///
     /// `cap_tokens` is the per-slot maximum (admission limit), not a
     /// pre-allocation. The actual arena is `n_pages * PAGE_TOKENS *
-    /// per_pos_bytes` bytes per layer (K or V).
+    /// per_pos_bytes` bytes per layer (K or V). K and V share the stride.
     pub fn new_paged(
         n_slots: usize,
         cap_tokens: usize,
         per_pos_bytes: usize,
         n_pages: usize,
     ) -> Result<Self, String> {
+        Self::new_paged_with_strides(n_slots, cap_tokens, per_pos_bytes, per_pos_bytes, n_pages)
+    }
+
+    /// [`SlotPool::new_paged`] with independent K/V strides — one block
+    /// table still maps both arenas (a logical page resolves to the same
+    /// physical page for K and V), but each arena's page is
+    /// `PAGE_TOKENS ×` its own stride.
+    pub fn new_paged_with_strides(
+        n_slots: usize,
+        cap_tokens: usize,
+        k_per_pos_bytes: usize,
+        v_per_pos_bytes: usize,
+        n_pages: usize,
+    ) -> Result<Self, String> {
         assert!(n_slots > 0, "n_slots must be positive");
-        assert!(per_pos_bytes > 0, "per_pos_bytes must be positive");
+        assert!(k_per_pos_bytes > 0, "k_per_pos_bytes must be positive");
+        assert!(v_per_pos_bytes > 0, "v_per_pos_bytes must be positive");
         let cap = cap_tokens.div_ceil(PAGE_TOKENS) * PAGE_TOKENS;
-        let page_pool = PagePool::new(n_pages, per_pos_bytes)?;
+        let page_pool = PagePool::new_with_strides(n_pages, k_per_pos_bytes, v_per_pos_bytes)?;
 
         // In paged mode, descriptors start in legacy mode (block_table = 0).
         // They switch to paged mode when the slot acquires pages and the
@@ -131,7 +170,8 @@ impl SlotPool {
             descs,
             in_use: vec![false; n_slots],
             cap_tokens: cap,
-            per_pos_bytes,
+            k_per_pos_bytes,
+            v_per_pos_bytes,
             dirty: true,
             page_pool: Some(page_pool),
             block_tables: vec![None; n_slots],
@@ -248,19 +288,53 @@ impl SlotPool {
         self.cap_tokens
     }
 
-    /// Per-position stride in bytes.
+    /// Per-position stride in bytes. Equal-stride pools (q8/bf16) only —
+    /// returns the shared stride. On rotated-K tiers use
+    /// [`SlotPool::k_per_pos_bytes`] / [`SlotPool::v_per_pos_bytes`].
     pub fn per_pos_bytes(&self) -> usize {
-        self.per_pos_bytes
+        debug_assert_eq!(
+            self.k_per_pos_bytes, self.v_per_pos_bytes,
+            "per_pos_bytes() is the EQUAL-stride accessor; this pool carries \
+             distinct K/V strides — use k_/v_per_pos_bytes()"
+        );
+        self.k_per_pos_bytes
     }
 
-    /// Bytes in ONE arena (K or V). The pool holds two of these.
+    /// K-arena per-position stride in bytes.
+    pub fn k_per_pos_bytes(&self) -> usize {
+        self.k_per_pos_bytes
+    }
+
+    /// V-arena per-position stride in bytes.
+    pub fn v_per_pos_bytes(&self) -> usize {
+        self.v_per_pos_bytes
+    }
+
+    /// Bytes in ONE arena (K or V) for an equal-stride pool. The pool holds
+    /// two of these. Rotated-K tiers must use [`SlotPool::k_arena_bytes`] /
+    /// [`SlotPool::v_arena_bytes`] instead.
+    ///
     /// In legacy mode: `n_slots * cap_tokens * per_pos_bytes`.
     /// In paged mode: `n_pages * PAGE_TOKENS * per_pos_bytes`.
     pub fn arena_bytes(&self) -> usize {
+        self.k_arena_bytes()
+    }
+
+    /// Bytes of the K arena.
+    pub fn k_arena_bytes(&self) -> usize {
         if let Some(pool) = &self.page_pool {
-            pool.arena_bytes()
+            pool.k_arena_bytes()
         } else {
-            self.descs.len() * self.cap_tokens * self.per_pos_bytes
+            self.descs.len() * self.cap_tokens * self.k_per_pos_bytes
+        }
+    }
+
+    /// Bytes of the V arena.
+    pub fn v_arena_bytes(&self) -> usize {
+        if let Some(pool) = &self.page_pool {
+            pool.v_arena_bytes()
+        } else {
+            self.descs.len() * self.cap_tokens * self.v_per_pos_bytes
         }
     }
 
@@ -442,6 +516,52 @@ mod tests {
         // refusal it is checking was never actually being exercised.
         let e = SlotPool::new(8, 4_000_000, PPB).unwrap_err();
         assert!(e.contains("budget") || e.contains("GiB"), "unexpected: {e}");
+    }
+
+    // ── Rotated-K tier stride tests (asym3 is the standing case) ──────
+
+    const K_PPB_ASYM3: usize = 400; // n_kv_heads=1, head_dim=256: 4 + 256*3/8
+    const V_PPB_Q8: usize = 1088; // n_kv_heads=1, head_dim=256: 8 * 34
+
+    #[test]
+    fn stride_split_legacy_desc_bases_follow_each_arena() {
+        // Slot 1's K slab starts where slot 0's K slab ENDED (400 B/pos),
+        // likewise V (1088 B/pos) — the bases must NOT share one stride.
+        let p = SlotPool::new_with_strides(3, 128, K_PPB_ASYM3, V_PPB_Q8).unwrap();
+        let d = p.descriptors();
+        assert_eq!(d[0].legacy_k_base, 0);
+        assert_eq!(d[1].legacy_k_base, (128 * K_PPB_ASYM3) as u64);
+        assert_eq!(d[2].legacy_k_base, 2 * (128 * K_PPB_ASYM3) as u64);
+        assert_eq!(d[0].legacy_v_base, 0);
+        assert_eq!(d[1].legacy_v_base, (128 * V_PPB_Q8) as u64);
+        assert_eq!(d[2].legacy_v_base, 2 * (128 * V_PPB_Q8) as u64);
+        assert_ne!(d[1].legacy_k_base, d[1].legacy_v_base);
+        assert_eq!(p.k_arena_bytes(), 3 * 128 * K_PPB_ASYM3);
+        assert_eq!(p.v_arena_bytes(), 3 * 128 * V_PPB_Q8);
+        assert_eq!(p.k_per_pos_bytes(), K_PPB_ASYM3);
+        assert_eq!(p.v_per_pos_bytes(), V_PPB_Q8);
+    }
+
+    #[test]
+    fn stride_split_equal_strides_match_legacy_ctor() {
+        // Equal strides must produce exactly what `new` always produced.
+        let a = SlotPool::new(2, 256, PPB).unwrap();
+        let b = SlotPool::new_with_strides(2, 256, PPB, PPB).unwrap();
+        assert_eq!(a.descriptors(), b.descriptors());
+        assert_eq!(a.arena_bytes(), b.arena_bytes());
+    }
+
+    #[test]
+    fn stride_split_paged_sized_per_arena() {
+        let p = SlotPool::new_paged_with_strides(2, 256, K_PPB_ASYM3, V_PPB_Q8, 8).unwrap();
+        // 8 pages * 128 tokens * stride, per arena.
+        assert_eq!(p.k_arena_bytes(), 8 * 128 * K_PPB_ASYM3);
+        assert_eq!(p.v_arena_bytes(), 8 * 128 * V_PPB_Q8);
+        // Provisioning is stride-agnostic.
+        let mut p = p;
+        let slot = p.acquire().unwrap();
+        p.set_seq_len(slot, 256).unwrap();
+        assert_eq!(p.block_table(slot).unwrap().num_pages(), 2);
     }
 
     // ── Paged mode tests ──────────────────────────────────────────────

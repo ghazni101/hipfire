@@ -105,6 +105,11 @@ fn main() {
         top_p: 1.0,
         top_k: 0,
         seed: 0,
+        repeat_window: 0,
+        repeat_penalty: 1.0,
+        presence_penalty: 0.0,
+        frequency_penalty: 0.0,
+        min_p: 0.0,
     }];
 
     fn dn_buffers(dn: &DeltaNetState) -> Vec<&GpuTensor> {
@@ -123,6 +128,7 @@ fn main() {
         model_hash: 0xFEED_FACE,
         kv_dtype_tag: 1,
         per_pos_bytes: per_pos_bytes as u32,
+        per_pos_v_bytes: per_pos_bytes as u32,
         n_fa_layers: n_fa_layers as u32,
         dn_layout_version: 1,
         cap: pool.cap_tokens() as u32,
@@ -148,6 +154,8 @@ fn main() {
         logits_out: &GpuTensor,
         out_tokens: &GpuTensor,
         sample_params: &mut [SlotSampleParams],
+        repeat_windows: &[GpuTensor],
+        kv_tier: &hipfire_arch_qwen35::forward_slots::SlotKvTier,
         feed: &[u32],
         start_pos: usize,
         n_decode: usize,
@@ -158,9 +166,15 @@ fn main() {
             next_pos: start_pos,
             decoding: false,
             vl_prefill: None,
+            mtp_active: false,
+            mtp_committed: 0,
+            mtp_cycles: 0,
+            mtp_retire_fails: 0,
+            pos3_delta: 0,
         }];
         let mut sched = Scheduler {
             chunk_size: feed.len().max(1),
+            vl_sequential: false,
         };
         let mut graph = SlotDecodeGraph::new();
         let mut produced = Vec::new();
@@ -179,6 +193,7 @@ fn main() {
                 k_arenas,
                 v_arenas,
                 desc_staging,
+                kv_tier,
                 pbs,
                 scratch,
                 logits_out,
@@ -186,8 +201,15 @@ fn main() {
             )
             .expect("forward");
             gpu.hip.device_synchronize().expect("sync");
-            gpu.sample_per_slot(logits_out, sample_params, 1, config.vocab_size, out_tokens)
-                .expect("sample");
+            gpu.sample_per_slot(
+                logits_out,
+                sample_params,
+                repeat_windows,
+                1,
+                config.vocab_size,
+                out_tokens,
+            )
+            .expect("sample");
             gpu.hip.device_synchronize().expect("sync");
             let mut tok = [0i32; 1];
             {
@@ -208,6 +230,13 @@ fn main() {
         produced
     }
 
+    let kv_tier = hipfire_arch_qwen35::forward_slots::SlotKvTier::q8();
+    let repeat_windows: Vec<GpuTensor> = (0..1)
+        .map(|_| gpu.zeros(&[2048usize], DType::F32))
+        .collect::<Result<Vec<_>, _>>()
+        .expect("repeat windows");
+
+    // ---- CONTROL: session A, never disturbed ----
     macro_rules! run_step {
         ($feed:expr, $pos:expr, $n:expr) => {
             step(
@@ -224,6 +253,8 @@ fn main() {
                 &logits_out,
                 &out_tokens,
                 &mut sample_params,
+                &repeat_windows,
+                &kv_tier,
                 $feed,
                 $pos,
                 $n,

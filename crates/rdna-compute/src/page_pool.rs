@@ -124,8 +124,13 @@ impl Default for BlockTable {
 pub struct PagePool {
     /// Total number of physical pages in the arena.
     n_pages: usize,
-    /// Per-position stride in bytes (n_kv_heads * (head_dim/32) * 34 for Q8_0).
-    per_pos_bytes: usize,
+    /// Per-position strides in bytes (n_kv_heads * (head_dim/32) * 34 for
+    /// Q8_0). Equal on q8/bf16; DIFFERENT on the rotated-K tiers, where the
+    /// K page is `PAGE_TOKENS × k_per_pos_bytes` and the V page
+    /// `PAGE_TOKENS × v_per_pos_bytes`. One block table maps both arenas —
+    /// a logical page resolves to the same physical index for K and V.
+    k_per_pos_bytes: usize,
+    v_per_pos_bytes: usize,
     /// Free list of physical page indices. Pages are popped from the end.
     free_pages: Vec<u32>,
     /// Reference count per physical page. 0 = free, >0 = allocated.
@@ -140,21 +145,32 @@ impl PagePool {
     /// Refuses rather than allocates when the arena would exceed the
     /// deployment-target budget — see `kv_slots::preflight_alloc`.
     pub fn new(n_pages: usize, per_pos_bytes: usize) -> Result<Self, String> {
-        assert!(n_pages > 0, "n_pages must be positive");
-        assert!(per_pos_bytes > 0, "per_pos_bytes must be positive");
+        Self::new_with_strides(n_pages, per_pos_bytes, per_pos_bytes)
+    }
 
-        let page_bytes = PAGE_TOKENS * per_pos_bytes;
-        // K and V are separate arenas of identical layout, hence x2.
+    /// [`PagePool::new`] with independent K/V strides (the rotated-K tiers).
+    pub fn new_with_strides(
+        n_pages: usize,
+        k_per_pos_bytes: usize,
+        v_per_pos_bytes: usize,
+    ) -> Result<Self, String> {
+        assert!(n_pages > 0, "n_pages must be positive");
+        assert!(k_per_pos_bytes > 0, "k_per_pos_bytes must be positive");
+        assert!(v_per_pos_bytes > 0, "v_per_pos_bytes must be positive");
+
+        let page_bytes = (PAGE_TOKENS * k_per_pos_bytes)
+            .checked_add(PAGE_TOKENS * v_per_pos_bytes)
+            .ok_or_else(|| "PagePool: arena size overflows u64".to_string())?;
         let total = (page_bytes as u64)
             .checked_mul(n_pages as u64)
-            .and_then(|b| b.checked_mul(2))
             .ok_or_else(|| "PagePool: arena size overflows u64".to_string())?;
         preflight_alloc(total, R9700_VRAM_BYTES, "PagePool arena")?;
 
         let free_pages: Vec<u32> = (0..n_pages as u32).rev().collect();
         Ok(Self {
             n_pages,
-            per_pos_bytes,
+            k_per_pos_bytes,
+            v_per_pos_bytes,
             free_pages,
             refcounts: vec![0; n_pages],
         })
@@ -165,19 +181,56 @@ impl PagePool {
         self.n_pages
     }
 
-    /// Per-position stride in bytes.
+    /// Per-position stride in bytes. Equal-stride pools only — see
+    /// [`PagePool::k_per_pos_bytes`] / [`PagePool::v_per_pos_bytes`].
     pub fn per_pos_bytes(&self) -> usize {
-        self.per_pos_bytes
+        debug_assert_eq!(
+            self.k_per_pos_bytes, self.v_per_pos_bytes,
+            "per_pos_bytes() is the EQUAL-stride accessor; this pool carries \
+             distinct K/V strides"
+        );
+        self.k_per_pos_bytes
     }
 
-    /// Bytes per page (PAGE_TOKENS * per_pos_bytes).
+    /// K-arena per-position stride in bytes.
+    pub fn k_per_pos_bytes(&self) -> usize {
+        self.k_per_pos_bytes
+    }
+
+    /// V-arena per-position stride in bytes.
+    pub fn v_per_pos_bytes(&self) -> usize {
+        self.v_per_pos_bytes
+    }
+
+    /// Bytes per K page (PAGE_TOKENS * k_per_pos_bytes).
+    pub fn k_page_bytes(&self) -> usize {
+        PAGE_TOKENS * self.k_per_pos_bytes
+    }
+
+    /// Bytes per V page (PAGE_TOKENS * v_per_pos_bytes).
+    pub fn v_page_bytes(&self) -> usize {
+        PAGE_TOKENS * self.v_per_pos_bytes
+    }
+
+    /// Bytes per page (PAGE_TOKENS * per_pos_bytes). Equal-stride pools only.
     pub fn page_bytes(&self) -> usize {
-        PAGE_TOKENS * self.per_pos_bytes
+        self.k_page_bytes()
     }
 
     /// Bytes in ONE arena (K or V). The pool holds two of these.
+    /// Equal-stride pools only — see `k_arena_bytes`/`v_arena_bytes`.
     pub fn arena_bytes(&self) -> usize {
-        self.n_pages * self.page_bytes()
+        self.k_arena_bytes()
+    }
+
+    /// Bytes of the K arena.
+    pub fn k_arena_bytes(&self) -> usize {
+        self.n_pages * self.k_page_bytes()
+    }
+
+    /// Bytes of the V arena.
+    pub fn v_arena_bytes(&self) -> usize {
+        self.n_pages * self.v_page_bytes()
     }
 
     /// Number of free pages available for allocation.
