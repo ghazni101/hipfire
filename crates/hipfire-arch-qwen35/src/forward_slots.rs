@@ -1745,6 +1745,10 @@ fn run_fullattn_layer_slots(
     max_ctx_len: usize,
     single_slot: Option<(u64, usize)>,
     n_tiles: Option<usize>,
+    // When true, `pbs.pos3` carries per-row M-RoPE phases: dispatch the
+    // batched M-RoPE kernel instead of the 1D one. Text rows carry [p, p, p]
+    // (bit-identical angles); only VL image/post-image rows genuinely differ.
+    use_mrope: bool,
 ) -> HipResult<()> {
     let attn_dtype = require_batchable_fullattn_layer(layer, gpu.arch.as_str())?;
 
@@ -1875,20 +1879,39 @@ fn run_fullattn_layer_slots(
     // 5. RoPE — slot-agnostic (SP2 Task 2): indexes by global flat row via
     // `pbs.positions`, which SlotBatch already fills per-slot-absolute and
     // global-row-indexed. No compaction in the slot path yet, so
-    // pos_offset is always 0.
+    // pos_offset is always 0. VL steps (use_mrope) dispatch the batched
+    // M-RoPE kernel over `pbs.pos3` instead — per-row (t, h, w) phases with
+    // the HF THW band mapping; text rows carry [p, p, p], which is
+    // bit-identical to the 1D kernel's angles.
     let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
-    gpu.rope_partial_interleaved_f32_batched(
-        &pbs.fa_q_batch,
-        &pbs.fa_k_batch,
-        &pbs.positions,
-        config.n_heads,
-        config.n_kv_heads,
-        config.head_dim,
-        n_rot,
-        config.rope_theta,
-        n,
-        0,
-    )?;
+    if use_mrope {
+        gpu.rope_mrope_halfsplit_f32_batched(
+            &pbs.fa_q_batch,
+            &pbs.fa_k_batch,
+            &pbs.pos3.buf,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            n_rot,
+            config.rope_theta,
+            n,
+            0,
+            config.mrope_section,
+        )?;
+    } else {
+        gpu.rope_partial_interleaved_f32_batched(
+            &pbs.fa_q_batch,
+            &pbs.fa_k_batch,
+            &pbs.positions,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            n_rot,
+            config.rope_theta,
+            n,
+            0,
+        )?;
+    }
 
     // 6. Batched KV write — slot-aware, one launch each for K and V across
     // every slot. Both arenas resolve through `k_base`/`v_base`; correct
@@ -2035,6 +2058,7 @@ fn run_fullattn_moe_layer_slots(
     single_slot: Option<(u64, usize)>,
     n_tiles: Option<usize>,
     weights_moe_has_mq6: bool,
+    use_mrope: bool,
 ) -> HipResult<()> {
     let attn_dtype = require_batchable_fullattn_moe_layer(layer)?;
     require_batchable_moe_ffn(gpu, &layer.ffn)?;
@@ -2165,20 +2189,38 @@ fn run_fullattn_moe_layer_slots(
         config.norm_eps,
     )?;
 
-    // 5. RoPE — slot-agnostic (SP2 Task 2).
+    // 5. RoPE — slot-agnostic (SP2 Task 2). VL steps (use_mrope) dispatch
+    // the batched M-RoPE kernel over `pbs.pos3`; text rows carry [p, p, p],
+    // bit-identical to the 1D kernel's angles.
     let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
-    gpu.rope_partial_interleaved_f32_batched(
-        &pbs.fa_q_batch,
-        &pbs.fa_k_batch,
-        &pbs.positions,
-        config.n_heads,
-        config.n_kv_heads,
-        config.head_dim,
-        n_rot,
-        config.rope_theta,
-        n,
-        0,
-    )?;
+    if use_mrope {
+        gpu.rope_mrope_halfsplit_f32_batched(
+            &pbs.fa_q_batch,
+            &pbs.fa_k_batch,
+            &pbs.pos3.buf,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            n_rot,
+            config.rope_theta,
+            n,
+            0,
+            config.mrope_section,
+        )?;
+    } else {
+        gpu.rope_partial_interleaved_f32_batched(
+            &pbs.fa_q_batch,
+            &pbs.fa_k_batch,
+            &pbs.positions,
+            config.n_heads,
+            config.n_kv_heads,
+            config.head_dim,
+            n_rot,
+            config.rope_theta,
+            n,
+            0,
+        )?;
+    }
 
     // 6. Batched KV write — slot-aware, Q8_0 KV-cache tier regardless of
     // this layer's projection weight dtype (see module doc).
@@ -2582,15 +2624,22 @@ struct DecodeGraphKey {
     n_rows: usize,
     ctx_bucket: usize,
     max_layer: Option<usize>,
-    /// FNV-1a over the per-slot row counts and the per-slot lm_head-skip mask.
-    /// Pure-decode steps all hash the same (every slot 1 row, no skips); an
-    /// MTP verify step hashes its stable `(m, skip)` pattern so the mix of
-    /// verify/decode/prefill slots selects its own graph. The pattern only
-    /// changes when requests start or finish, so re-captures stay rare.
+    /// FNV-1a over the per-slot row counts, the per-slot lm_head-skip mask,
+    /// and the VL step flags (M-RoPE phases present / external-embedding
+    /// rows present). Both flags change which kernels the captured body
+    /// launches — the M-RoPE rope branch and the embed-scatter launch — so
+    /// a VL decode step captures its own graph instead of replaying the
+    /// text-only one. The flags only flip when requests start or finish, so
+    /// re-captures stay rare.
     m_hash: u64,
 }
 
-fn decode_graph_m_hash(m_per_slot: &[usize], lm_head_skip: &[bool]) -> u64 {
+fn decode_graph_m_hash(
+    m_per_slot: &[usize],
+    lm_head_skip: &[bool],
+    vl_mrope: bool,
+    vl_ext: bool,
+) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for &m in m_per_slot {
         h ^= m as u64;
@@ -2600,6 +2649,10 @@ fn decode_graph_m_hash(m_per_slot: &[usize], lm_head_skip: &[bool]) -> u64 {
         h ^= skip as u64;
         h = h.wrapping_mul(0x100000001b3);
     }
+    h ^= vl_mrope as u64;
+    h = h.wrapping_mul(0x100000001b3);
+    h ^= vl_ext as u64;
+    h = h.wrapping_mul(0x100000001b3);
     h
 }
 
@@ -2774,7 +2827,13 @@ pub fn forward_batch_slots_graphed_opts(
         n_rows: batch.total_rows(),
         ctx_bucket,
         max_layer: None,
-        m_hash: decode_graph_m_hash(&batch.m_per_slot, lm_head_skip),
+        m_hash: decode_graph_m_hash(
+            &batch.m_per_slot,
+            lm_head_skip,
+            batch.pos3.len() == batch.positions.len() && !batch.pos3.is_empty(),
+            batch.ext_emb.len() == batch.positions.len()
+                && batch.ext_emb.iter().any(|&e| e >= 0),
+        ),
     };
 
     // The per-step inputs always go up outside the graph: their host source
@@ -2973,6 +3032,27 @@ pub fn upload_step_inputs(
         unsafe { std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n * 4) };
     gpu.hip.memcpy_htod(&pbs.positions.buf, positions_bytes)?;
 
+    // VL side inputs, mirroring the plain path's step-1b/2 uploads. The
+    // per-row external-embedding matrix pointers are NOT uploaded here —
+    // the engine refreshes those per step (it owns the matrices); the
+    // captured scatter kernel reads them through `pbs.ext_emb_row_ptr`.
+    if batch.pos3.len() == batch.positions.len() && !batch.pos3.is_empty() {
+        let pos3_bytes: Vec<u8> = batch
+            .pos3
+            .iter()
+            .flat_map(|t| t.iter().flat_map(|v| v.to_ne_bytes()))
+            .collect();
+        gpu.hip.memcpy_htod(&pbs.pos3.buf, &pos3_bytes)?;
+    }
+    if batch.ext_emb.len() == batch.positions.len() && batch.ext_emb.iter().any(|&e| e >= 0) {
+        let idx_bytes: Vec<u8> = batch
+            .ext_emb
+            .iter()
+            .flat_map(|x| x.to_ne_bytes())
+            .collect();
+        gpu.hip.memcpy_htod(&pbs.ext_emb_index.buf, &idx_bytes)?;
+    }
+
     let row_slot_bytes: Vec<u8> = batch
         .row_slot
         .iter()
@@ -3139,6 +3219,33 @@ pub fn forward_batch_slots_opts(
     }
     gpu.embedding_lookup_q8_batched(&weights.token_embd, &pbs.x_batch, &pbs.tokens, n, dim)?;
 
+    // ── 1b. VL rows: overwrite image-pad rows with vision embeddings ─────
+    // `batch.ext_emb` (per-row matrix index, -1 = token table) and the
+    // per-row matrix base pointers are device-side inputs: the caller
+    // uploads the pointers per step (engine-side, before this call) so a
+    // captured graph replays with fresh values, and the index array is
+    // uploaded here from the batch. The kernel itself is a no-op on rows
+    // with a negative index, and skips null pointers defensively.
+    let use_ext = batch.ext_emb.len() == batch.positions.len()
+        && batch.ext_emb.iter().any(|&e| e >= 0);
+    if use_ext {
+        if !opts.skip_uploads {
+            let idx_bytes: Vec<u8> = batch
+                .ext_emb
+                .iter()
+                .flat_map(|x| x.to_ne_bytes())
+                .collect();
+            gpu.hip.memcpy_htod(&pbs.ext_emb_index.buf, &idx_bytes)?;
+        }
+        gpu.embedding_scatter_ext_batched(
+            &pbs.x_batch,
+            &pbs.ext_emb_index,
+            &pbs.ext_emb_row_ptr,
+            n,
+            dim,
+        )?;
+    }
+
     // ── 2. Upload positions ──────────────────────────────────────────────
     // Per-row ABSOLUTE position within that row's own slot — authoritative
     // for the causal bound everywhere downstream (RoPE angle, KV write
@@ -3149,6 +3256,20 @@ pub fn forward_batch_slots_opts(
         let positions_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n * 4) };
         gpu.hip.memcpy_htod(&pbs.positions.buf, positions_bytes)?;
+    }
+    // VL M-RoPE phases ([t, h, w] per row, absolute). Presence of a complete
+    // pos3 array flips every FA layer's RoPE to the batched M-RoPE kernel —
+    // text rows carry [p, p, p], which that kernel reduces to the same angles
+    // as the 1D path, so mixed text+VL steps stay byte-identical on text.
+    // KV addressing and causal bounds keep reading `positions` regardless.
+    let use_mrope = batch.pos3.len() == batch.positions.len() && !batch.pos3.is_empty();
+    if use_mrope && !opts.skip_uploads {
+        let pos3_bytes: Vec<u8> = batch
+            .pos3
+            .iter()
+            .flat_map(|t| t.iter().flat_map(|v| v.to_ne_bytes()))
+            .collect();
+        gpu.hip.memcpy_htod(&pbs.pos3.buf, &pos3_bytes)?;
     }
 
     // ── 2b. Provision pages for the write frontier (paged mode only) ────
@@ -3334,6 +3455,7 @@ pub fn forward_batch_slots_opts(
                     max_ctx_len,
                     single_slot,
                     n_tiles,
+                    use_mrope,
                 )?;
                 kv_layer_idx += 1;
             }
@@ -3370,6 +3492,7 @@ pub fn forward_batch_slots_opts(
                     single_slot,
                     n_tiles,
                     weights.moe_has_mq6,
+                    use_mrope,
                 )?;
                 kv_layer_idx += 1;
             }
@@ -3542,28 +3665,38 @@ mod tests {
     fn decode_graph_m_hash_separates_patterns() {
         // Same total rows, different patterns → different graphs.
         assert_ne!(
-            decode_graph_m_hash(&[4, 1], &[true, false]),
-            decode_graph_m_hash(&[1, 4], &[false, true])
+            decode_graph_m_hash(&[4, 1], &[true, false], false, false),
+            decode_graph_m_hash(&[1, 4], &[false, true], false, false)
         );
         // The lm_head-skip mask participates: same m-pattern with different
         // skips must not share a captured graph (the recorded GEMV set
         // differs).
         assert_ne!(
-            decode_graph_m_hash(&[4, 1], &[true, false]),
-            decode_graph_m_hash(&[4, 1], &[false, false])
+            decode_graph_m_hash(&[4, 1], &[true, false], false, false),
+            decode_graph_m_hash(&[4, 1], &[false, false], false, false)
         );
         // Stable across calls.
         assert_eq!(
-            decode_graph_m_hash(&[4, 1, 0], &[true, false, false]),
-            decode_graph_m_hash(&[4, 1, 0], &[true, false, false])
+            decode_graph_m_hash(&[4, 1, 0], &[true, false, false], false, false),
+            decode_graph_m_hash(&[4, 1, 0], &[true, false, false], false, false)
         );
         // An absent mask and an all-false mask hash differently. That is
         // acceptable, not a defect: at worst it costs one extra capture when
         // the engine toggles between MTP-on and MTP-off batches — a key
         // mismatch can never alias a wrong graph.
         assert_ne!(
-            decode_graph_m_hash(&[1, 1], &[]),
-            decode_graph_m_hash(&[1, 1], &[false, false])
+            decode_graph_m_hash(&[1, 1], &[], false, false),
+            decode_graph_m_hash(&[1, 1], &[false, false], false, false)
+        );
+        // The VL step flags participate: an M-RoPE or external-embedding
+        // step captures its own graph (different rope/scatter kernel set).
+        assert_ne!(
+            decode_graph_m_hash(&[1, 1], &[false, false], true, false),
+            decode_graph_m_hash(&[1, 1], &[false, false], false, false)
+        );
+        assert_ne!(
+            decode_graph_m_hash(&[1, 1], &[false, false], false, true),
+            decode_graph_m_hash(&[1, 1], &[false, false], false, false)
         );
     }
 }
