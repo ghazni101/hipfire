@@ -56,20 +56,15 @@ pub(crate) struct QuantizeArgs {
     /// ENTIRETY every decoded token — 622 MB of BF16 at 205 GB/s, 90% of this
     /// box's achievable DRAM bandwidth and 36% of the decode token. It is the
     /// only bandwidth-bound part of the model, so this carrier is a decode-speed
-    /// decision, not a fidelity one. `bf16` (default) preserves existing
-    /// behaviour; `q8` is 331 MB, `mq4` is 195 MB.
+    /// decision, not a fidelity one.
     ///
-    /// Does NOT touch `word_embeddings` (same shape, but only ONE ROW is read
-    /// per token — a RAM question, not a bandwidth one), the ternary expert
-    /// path, or the router.
-    /// Default is q8, not bf16. Measured on gfx1151 against a bf16 reference
+    /// Default is `q8` (331 MB). Measured on gfx1151 against a bf16 reference
     /// (2048 teacher-forced tokens): q8 and bf16 heads give the IDENTICAL mean
     /// KL of 0.0511, but q8 decodes 23% faster (144.6 vs 117.6 tok/s). A bf16
     /// head is therefore strictly dominated -- it costs throughput and buys
-    /// exactly zero accuracy. mq4 (qt=30 Lloyd, 5.0 bpw) is +10.4% decode over
-    /// q8 but +51% mean KL and -2.7pp top-1, which is a poor trade on this
-    /// stack; note the vendor DOES ship a Q4_K head, because on their CPU path
-    /// the same swap buys 49% rather than 10%.
+    /// exactly zero accuracy. mq4v2 (qt=44, 4.25 bpw, FWHT-rotated) is +10.4%
+    /// decode over q8 but +51% mean KL and -2.7pp top-1, which is a poor trade
+    /// on this stack.
     ///
     /// `mq4` (qt=30) is DEPRECATED and no longer selectable: mq4v2 (qt=44)
     /// beats it on every axis -- lower KL (0.0744 vs 0.0772), faster (165.8 vs

@@ -1759,7 +1759,9 @@ pub struct SlotSampleParams {
     /// 0.0 means greedy/argmax for this slot.
     pub temperature: f32,
     pub top_p: f32,
-    /// 0 disables top-k for this slot.
+    /// Top-k cap for this slot, 1..=64 (the sampler's widest compiled kernel
+    /// gathers 64 candidates). 0 keeps the engine default (20) — it does NOT
+    /// disable top-k.
     pub top_k: i32,
     /// RNG state, advanced by every non-greedy draw.
     pub seed: u32,

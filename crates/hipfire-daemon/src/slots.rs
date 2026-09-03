@@ -354,6 +354,22 @@ impl SlotBackend {
             let _ = stdout.flush();
             return Ok(());
         }
+        // The parallel sampler compiles 20- and 64-wide kernels; anything
+        // larger would be silently capped to a 64-candidate pool, so reject
+        // it up front instead. 0 keeps the engine default (20).
+        if top_k > 64 {
+            hipfire_engine::emit::emit_active_attempt_error(
+                stdout,
+                Some(id),
+                "invalid top_k: must be <= 64 (the sampler's widest compiled \
+                 kernel); use top_p / min_p for tighter shaping",
+                "validation",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return Ok(());
+        }
         let client_seed = match hipfire_engine::wire_seed::parse_wire_seed(msg.get("seed")) {
             Ok(seed) => seed,
             Err(reason) => {
@@ -895,6 +911,11 @@ impl SlotBackend {
 
         let mut done_reason: Option<(DoneReason, usize)> = None;
         let mut rejected: Option<String> = None;
+        // Set when the engine channel dropped without a terminal event —
+        // the engine thread died (panic/GPU fault). Must NOT be reported as
+        // a normal stop: the client would see a clean-looking truncated
+        // answer while the session leaks resident on its slot.
+        let mut engine_died = false;
 
         loop {
             if batch_check_abort(id, attempt_id) {
@@ -945,8 +966,35 @@ impl SlotBackend {
                     }
                 },
                 Err(RecvTimeoutError::Timeout) => continue,
-                Err(RecvTimeoutError::Disconnected) => break,
+                Err(RecvTimeoutError::Disconnected) => {
+                    engine_died = true;
+                    break;
+                }
             }
+        }
+
+        if engine_died {
+            // The engine thread dropped its end without Done/Rejected. Close
+            // the session (its resident state is untrustworthy) and fail
+            // loudly — never a normal "stop" with partial tokens.
+            drop(rx);
+            if let Some(sess) = accepted_session.take() {
+                let _ = self.engine.close(sess);
+            }
+            hipfire_engine::emit::emit_active_attempt_error(
+                stdout,
+                Some(id),
+                &format!(
+                    "multi_slot engine terminated without completing request {} \
+                     (engine thread exited; {produced} tokens were produced)",
+                    attempt_id
+                ),
+                "internal",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return Ok(());
         }
 
         if let Some(reason) = rejected {
@@ -1179,9 +1227,17 @@ pub fn is_vision_hfq(hfq: &HfqFile) -> bool {
 /// vision tensors in the trunk for backward compat).
 fn discover_vl_sidecar(model_path: &str) -> Option<PathBuf> {
     if let Ok(v) = std::env::var("HIPFIRE_VL_FILE") {
-        let p = PathBuf::from(v);
+        let p = PathBuf::from(&v);
         if p.exists() {
             return Some(p);
+        }
+        // An explicitly-set override that doesn't exist is almost certainly a
+        // typo — silently falling through to sibling discovery hides it.
+        if !v.trim().is_empty() {
+            eprintln!(
+                "[daemon/vl] HIPFIRE_VL_FILE is set to {v:?} but the file does \
+                 not exist; falling back to <stem>.vl sibling discovery"
+            );
         }
     }
     let base = std::path::Path::new(model_path);
@@ -1617,6 +1673,26 @@ fn extract_slot_image(msg: &serde_json::Value) -> Result<Option<SlotImage>, Stri
         return Ok(Some(SlotImage::Path(path.to_string())));
     }
     if let Some(url) = image_url {
+        // Only data-URLs are meaningful here (the CLI validates and forwards
+        // OpenAI-style image_url parts as image_base64). Apply the same size
+        // cap as image_base64 — this is a daemon-wire field, so without the
+        // cap a direct client could force an unbounded base64 decode — and
+        // give remote URLs an actionable message instead of a confusing
+        // base64-decode failure.
+        if url.len() > MAX_BASE64_ENCODED_LEN {
+            return Err(format!(
+                "image payload exceeds maximum encoded size ({} bytes)",
+                MAX_BASE64_ENCODED_LEN
+            ));
+        }
+        let trimmed = url.trim_start();
+        if trimmed.starts_with("http://") || trimmed.starts_with("https://") {
+            return Err(
+                "remote image URLs are not supported — download the image and \
+                 send it inline (data URL or base64)"
+                    .to_string(),
+            );
+        }
         return Ok(Some(SlotImage::Base64(url.to_string())));
     }
     Ok(None)

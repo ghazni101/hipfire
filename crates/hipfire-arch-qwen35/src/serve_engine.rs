@@ -350,7 +350,13 @@ impl Rig {
         let per_pos_bytes = kv_plan.k_bytes_per_pos;
         let per_pos_v_bytes = kv_plan.v_bytes_per_pos;
         let prefill_chunk = cfg.prefill_chunk.max(1).min(cfg.cap_tokens.max(1));
-        let max_batch = (prefill_chunk * cfg.n_slots).max(cfg.n_slots);
+        // A step carries at most max(prefill_chunk, mtp_k + 1) rows per slot:
+        // prefilling slots contribute up to `prefill_chunk` rows, and a
+        // decoding MTP slot injects `mtp_k + 1` verify rows. Sizing without
+        // the mtp term let a small `prefill_chunk` (operator knob) overflow
+        // `pbs.max_batch` on the first verify step — an engine-thread panic,
+        // the serve-hang failure class.
+        let max_batch = (prefill_chunk.max(cfg.mtp_k + 1) * cfg.n_slots).max(cfg.n_slots);
 
         // ── Paged KV opt-in ────────────────────────────────────────────────
         // Default OFF: the pool stays legacy (fixed per-slot slabs). With
@@ -1277,6 +1283,15 @@ fn mtp_head_prefill_chunk(
         state
             .ensure_compressed_lm_logits(&mut rig.gpu, cvs)
             .map_err(|e| format!("ensure compressed logits: {e}"))?;
+        // The draft phase reads `mtp_scratch.logits_compressed` (head-side
+        // buffer) — distinct from `mtp_lm_logits_compressed` above. Without
+        // this allocation the first draft step on a compressed head panics
+        // the engine thread (the sequential speculator was the only caller
+        // of `ensure_compressed_logits`).
+        state
+            .mtp_scratch
+            .ensure_compressed_logits(&mut rig.gpu, cvs)
+            .map_err(|e| format!("ensure head compressed logits: {e}"))?;
     }
 
     let dim = rig.config.dim;
@@ -1377,6 +1392,15 @@ fn mtp_draft_step(
             rig.mtp_states[slot.0] = Some(state);
             return Err(format!("ensure compressed logits: {e}"));
         }
+        // Head-side compressed buffer for the draft phase (see the alloc
+        // comment in `mtp_head_prefill_chunk`).
+        if let Err(e) = state
+            .mtp_scratch
+            .ensure_compressed_logits(&mut rig.gpu, cvs)
+        {
+            rig.mtp_states[slot.0] = Some(state);
+            return Err(format!("ensure head compressed logits: {e}"));
+        }
     }
 
     let prompt_tokens = std::mem::take(&mut work.remaining_prompt);
@@ -1417,18 +1441,25 @@ fn mtp_draft_step(
 }
 
 /// MTP verify/accept phase: after the batched forward, run the trunk lm_head
-/// over the slot's verify rows (a view of `pbs.x_batch`), greedy-accept, and
-/// repair the DeltaNet state on partial accepts.
+/// over the slot's verify rows (normed views of `pbs.x_batch`), greedy-accept,
+/// and repair the DeltaNet state on partial accepts.
 ///
 /// `hidden_row_offset` is the flat row index where this slot's verify rows
 /// begin in the step batch (computed from `batch.m_per_slot` by the caller).
-/// Returns committed tokens (excludes seed, includes bonus).
+/// `produced`/`max_tokens` are the in-flight request counters, used to clamp
+/// the accepted burst to what the commit path can actually keep (see
+/// `mtp_batched_verify_accept_from_batch`). Returns committed tokens
+/// (excludes seed, includes bonus).
+#[allow(clippy::too_many_arguments)]
 fn mtp_verify_accept_step(
     rig: &mut Rig,
     slot: SlotId,
     work: &mut PendingWork,
     draft: crate::mtp_spec::MtpDraftOutput,
     hidden_row_offset: usize,
+    produced: usize,
+    max_tokens: usize,
+    sess_len: usize,
 ) -> Result<Vec<u32>, String> {
     let mut state = rig
         .mtp_states[slot.0]
@@ -1436,6 +1467,15 @@ fn mtp_verify_accept_step(
         .expect("mtp state must exist from draft phase");
 
     let pos = work.next_pos;
+
+    // How many tokens of this burst the commit path can keep before a
+    // terminator fires: the request's remaining max_tokens budget and its
+    // remaining context room (`commit_sampled_token` stops decode when
+    // `sess.tokens.len() + 1 >= cap`, so room is `cap - len`).
+    let commit_budget = max_tokens
+        .saturating_sub(produced)
+        .min(rig.cap_tokens.saturating_sub(sess_len))
+        .max(1);
 
     let outcome: Result<Vec<u32>, String> = (|| {
         let result = crate::mtp_spec::mtp_batched_verify_accept_from_batch(
@@ -1453,6 +1493,8 @@ fn mtp_verify_accept_step(
             rig.mtp_k + 1,
             slot.0,
             rig.tokenizer.eos_id,
+            rig.tokenizer.eot_id,
+            commit_budget,
         )
         .map_err(|e| format!("mtp verify: {e}"))?;
 
@@ -1479,17 +1521,29 @@ fn mtp_verify_accept_step(
 /// conversations): verify rows are text rows of the slot they belong to, so
 /// a slot continuing an image conversation phases them at `pos + delta`
 /// exactly like the scheduler does for its prefill/decode rows.
+///
+/// `force_pos3` is the scheduler's work-level "this step needs M-RoPE" flag
+/// (`(vl_prefill && !vl_sequential) || pos3_delta != 0` over ALL work, not
+/// just the rows the scheduler emitted). It MUST be passed in by the caller:
+/// an MTP-decoding slot contributes zero scheduler rows, so a verify-only
+/// step — the steady state whenever the only active request is an MTP slot —
+/// has an empty `batch.pos3` even though the slot's rows need the shifted
+/// phases. Deriving the flag from `batch.pos3` emptiness here would silently
+/// drop pos3 for exactly those steps and phase-shift every verify query
+/// against the image turn's stored keys.
 fn inject_mtp_verify_tokens(
     batch: &SlotBatch,
     mtp_drafts: &[Option<crate::mtp_spec::MtpDraftOutput>],
     n_slots: usize,
     pos3_deltas: &[i32],
+    force_pos3: bool,
 ) -> SlotBatch {
     // A VL row anywhere in the step keeps the batch on the M-RoPE/scatter
     // path, so the side arrays must survive the rebuild: verify rows are
     // text rows of text slots and take their (possibly shifted) phase; VL
     // rows are copied through untouched.
-    let vl_step = batch.pos3.len() == batch.positions.len() && !batch.pos3.is_empty();
+    let vl_step = force_pos3
+        || (batch.pos3.len() == batch.positions.len() && !batch.pos3.is_empty());
     let mut new_batch = SlotBatch::default();
     let mut old_row_off = 0usize;
     for s in 0..n_slots {
@@ -1542,6 +1596,13 @@ fn clear_work_slot(work: &mut PendingWork) {
     work.vl_prefill = None;
     work.mtp_active = false;
     work.pos3_delta = 0;
+    // Adaptive-retire counters are per-REQUEST state: a request that ends
+    // mid-window must not leave its failures behind for the slot's next
+    // occupant (one bad window would sit one failure from retirement, and
+    // the next request's window mean would mix both requests' advances).
+    work.mtp_cycles = 0;
+    work.mtp_committed = 0;
+    work.mtp_retire_fails = 0;
 }
 
 /// True when an MTP verify batch — `mtp_k + 1` rows at positions
@@ -1576,6 +1637,15 @@ fn request_penalized(req: &SubmitRequest) -> bool {
         && (req.repeat_penalty > 1.0
             || req.presence_penalty > 0.0
             || req.frequency_penalty > 0.0)
+}
+
+/// True when the request asks for real sampling. Sampled requests decode AR
+/// for the same reason penalized ones do: the verify accept is a bare greedy
+/// argmax and cannot reproduce a sampled pick — running MTP anyway would emit
+/// a greedy/spec hybrid instead of the requested distribution. The daemon
+/// defaults temperature to 0.0 (greedy), so MTP stays on for default requests.
+fn request_sampled(req: &SubmitRequest) -> bool {
+    req.temperature > 1e-6
 }
 
 /// Install a request's sampling parameters (including token penalties and
@@ -1659,6 +1729,14 @@ struct InFlight {
     reply: Sender<Event>,
     produced: usize,
     max_tokens: usize,
+    /// The REQUESTED penalty window (min of the request's repeat_window and
+    /// REPEAT_WINDOW_MAX), kept unclamped so the per-step effective window
+    /// grows with the session instead of ratcheting down permanently: the
+    /// clamp used to write the effective window back into
+    /// `sample_params[s].repeat_window`, which the next step then read as the
+    /// "requested" value — freezing the window at the first step's session
+    /// length for the whole generation.
+    repeat_window_req: usize,
 }
 
 fn run_loop(
@@ -1892,7 +1970,14 @@ fn run_loop(
         let sched_batch = sched.next_batch(&mut work);
         let batch = if mtp_drafts.iter().any(|d| d.is_some()) {
             let pos3_deltas: Vec<i32> = work.iter().map(|w| w.pos3_delta).collect();
-            inject_mtp_verify_tokens(&sched_batch, &mtp_drafts, n, &pos3_deltas)
+            // Work-level M-RoPE need — the same predicate the scheduler's
+            // `any_pos3` uses — NOT derived from `sched_batch.pos3`, which is
+            // empty whenever the scheduler emitted no rows (verify-only
+            // steps; see `inject_mtp_verify_tokens`).
+            let force_pos3 = work.iter().any(|w| {
+                (w.vl_prefill.is_some() && !rig.vl_sequential) || w.pos3_delta != 0
+            });
+            inject_mtp_verify_tokens(&sched_batch, &mtp_drafts, n, &pos3_deltas, force_pos3)
         } else {
             sched_batch
         };
@@ -2031,7 +2116,10 @@ fn run_loop(
             let Some(sess) = rig.sessions.get(session) else {
                 continue;
             };
-            let requested = rig.sample_params[s].repeat_window.max(0) as usize;
+            let requested = slots[s]
+                .as_ref()
+                .map(|f| f.repeat_window_req)
+                .unwrap_or(0);
             let effective = requested.min(sess.tokens.len());
             rig.sample_params[s].repeat_window = effective as i32;
             if effective == 0 {
@@ -2088,12 +2176,28 @@ fn run_loop(
                 let hidden_row_offset: usize = (0..s)
                     .map(|i| batch.m_per_slot.get(i).copied().unwrap_or(0))
                     .sum();
+                // Commit context for the burst clamp: the request counters
+                // and the session's current stored length.
+                let (produced, max_tokens, sess_len) = match slots[s].as_ref() {
+                    Some(f) => (
+                        f.produced,
+                        f.max_tokens,
+                        rig.sessions
+                            .get(f.session)
+                            .map(|sess| sess.tokens.len())
+                            .unwrap_or(0),
+                    ),
+                    None => (0, usize::MAX, 0),
+                };
                 match mtp_verify_accept_step(
                     &mut rig,
                     SlotId(s),
                     &mut work[s],
                     draft,
                     hidden_row_offset,
+                    produced,
+                    max_tokens,
+                    sess_len,
                 ) {
                     Ok(tokens) => {
                         for tok in &tokens {
@@ -2519,6 +2623,27 @@ fn admit(
                     rig.sessions.close(&mut rig.pool, &mut rig.adm, existing);
                     return;
                 }
+                // vLLM-style admission belt, mirroring the daemon's cold-path
+                // belt: the extension plus the requested generation budget
+                // must fit the context. Without this, a request admitted in
+                // the (cap - max_tokens, cap) window decodes until the ctx-cap
+                // guard truncates it — a silent "length" finish the client
+                // never asked for. The SESSION is kept (it still has room to
+                // grow): only this request is rejected, so a retry with a
+                // smaller max_tokens can still continue the conversation.
+                if extended.len() + req.max_tokens.max(1) > rig.cap_tokens {
+                    let reason = format!(
+                        "context window budget: the conversation would hold {} \
+                         tokens and the request asks for {} more, beyond the {} \
+                         token context — reduce max_tokens or start a new \
+                         conversation",
+                        extended.len(),
+                        req.max_tokens.max(1),
+                        rig.cap_tokens
+                    );
+                    let _ = send_event(&req.reply, Event::Rejected { reason });
+                    return;
+                }
                 if let Ok(plan) = rig.sessions.begin_turn(&mut rig.pool, existing, &extended) {
                     if let Some(sess) = rig.sessions.get_mut(existing) {
                         sess.tokens = extended.clone();
@@ -2567,7 +2692,8 @@ fn admit(
                     work[slot.0].mtp_active = rig.mtp_head.is_some()
                         && rig.mtp_k > 0
                         && req.visual_data.is_none()
-                        && !request_penalized(&req);
+                        && !request_penalized(&req)
+                        && !request_sampled(&req);
                     if work[slot.0].mtp_active
                         && !(mtp_head_kv_valid && rig.mtp_states[slot.0].is_some())
                     {
@@ -2581,6 +2707,7 @@ fn admit(
                         reply: req.reply,
                         produced: 0,
                         max_tokens: req.max_tokens.max(1),
+                        repeat_window_req: req.repeat_window.min(REPEAT_WINDOW_MAX),
                     });
                     rig.sessions.touch(existing);
                     if rig.gpu.slot_trace() {
@@ -2796,9 +2923,13 @@ fn admit(
         work[slot.0].pos3_delta = 0; // fresh session: no image-turn offset
         // Activate MTP for text-only requests when the head is loaded.
         // Penalized requests stay on AR: the verify accept is a bare greedy
-        // argmax and cannot reproduce penalize-then-argmax.
-        work[slot.0].mtp_active =
-            rig.mtp_head.is_some() && rig.mtp_k > 0 && !penalized;
+        // argmax and cannot reproduce penalize-then-argmax; sampled requests
+        // (temperature > 0) stay on AR for the same reason — the verify path
+        // cannot reproduce a sampled pick.
+        work[slot.0].mtp_active = rig.mtp_head.is_some()
+            && rig.mtp_k > 0
+            && !penalized
+            && !request_sampled(&req);
     }
     rig.sample_params[slot.0] = sample_params;
     slots[slot.0] = Some(InFlight {
@@ -2806,6 +2937,7 @@ fn admit(
         reply: req.reply,
         produced: 0,
         max_tokens: req.max_tokens.max(1),
+        repeat_window_req: req.repeat_window.min(REPEAT_WINDOW_MAX),
     });
     if rig.gpu.slot_trace() {
         eprintln!(

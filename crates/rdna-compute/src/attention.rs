@@ -2134,6 +2134,18 @@ impl Gpu {
         window: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // The bf16 tile kernel maps head-dim elements in fixed 128-element
+        // halves (Q load, phase A and phase D all index `half * 128 + ...`);
+        // a head_dim that is not a positive multiple of 128 would read past
+        // q/k and trample the NEXT tile's partials header — silent attention
+        // corruption, so fail loudly instead. (Inherited contract from the
+        // q8 tile kernel; maple is head_dim 128 today.)
+        assert!(
+            head_dim > 0 && head_dim % 128 == 0,
+            "attention_flash_bf16_windowed: the bf16 tile kernel requires \
+             head_dim to be a positive multiple of 128 (got {head_dim}); \
+             pick a KV tier whose kernels match this head_dim"
+        );
         // Same tile-size policy as the Q8 path, so a partials buffer sized
         // from max_tiles stays correct whichever tier the caller picked.
         let tile_size = q8_flash_tile_size(&self.arch, n_heads, n_kv_heads, head_dim, max_seq);
@@ -5410,8 +5422,10 @@ impl Gpu {
         v_mode_bits: i32,
         // Sliding-window span for the tile kernel: a query at position p attends
         // only to keys in [p-window+1, p]. <= 0 = full causal (legacy behavior).
-        // Pushed as a trailing scalar kernarg; only the q8 tile kernel reads it
-        // (asym/lloyd tile kernels declare fewer args and ignore the extra).
+        // Pushed as a trailing scalar kernarg. NOTE: only the q8 and bf16 tile
+        // kernels READ it — the asym/fwht tile kernels declare the arg but
+        // ignore it, so a caller with a real window must route only to
+        // window-aware kernels (the slots ladder passes 0 for every tier).
         window: i32,
         // When true, use the WMMA grid shape `[n_heads, ceil(chunk/BLOCK_M),
         // max_tiles]` and omit the `v_mode_bits` kernarg, even if the inline
@@ -5434,12 +5448,11 @@ impl Gpu {
         // `desc` off `slot_descs`, so that combination would silently pin
         // every row to slot 0's descriptor while still running the
         // descriptor addressing path. Pushed unconditionally as the last two
-        // non-WMMA kernargs below for every caller of this launcher; only
-        // the q8 and asym3 tile kernels declare trailing parameters for them
-        // today (see the assertion below for the WMMA exclusion) — every
-        // other tile kernel routed through here (fwht/lloyd/asym2/asym4)
-        // simply has fewer declared params and ignores the extra trailing
-        // kernarg bytes, the same way they already ignore `window`.
+        // non-WMMA kernargs below for every caller of this launcher; every
+        // descriptor-aware tile kernel (q8 + asym{2,3,4} + fwht{2,3,4})
+        // declares the trailing pair — any kernel that does not simply
+        // ignores the extra trailing kernarg bytes, the same way the
+        // non-windowed tiers ignore `window`.
         slot_descs: Option<&GpuTensor>,
         row_slot: Option<&GpuTensor>,
     ) -> HipResult<()> {
@@ -5457,9 +5470,21 @@ impl Gpu {
             "tree_bias combined with multi-slot descriptors has no defined \
              contract and no coverage: tree-verify batches are single-slot \
              (block_start/block_cols index one shared linearized tree), and \
-             row_slot-per-row addressing for a tree-verify batch has not \
-             been designed. Tree-verify + multi-slot is deliberately out of \
+             row_slot-per-row addressing for a tree-verify batch has not been \
+             designed. Tree-verify + multi-slot is deliberately out of \
              SP1 scope."
+        );
+        // The batched tile kernels hold per-lane register accumulators sized
+        // for head_dim <= 512 (float mq[16] at 32 dims per lane) and compute
+        // `dpt = head_dim / 32`, which silently truncates non-multiples of 32
+        // (dims past the truncation would never be accumulated). Inherited
+        // contract from the q8 batched kernel; every rotated tier routed
+        // through this launcher shares it.
+        assert!(
+            head_dim > 0 && head_dim % 32 == 0 && head_dim <= 512,
+            "launch_asym_flash_batched ({tile_func_name}): batched tile \
+             kernels require head_dim to be a positive multiple of 32 and \
+             <= 512 (got {head_dim})"
         );
         // gfx1151 is the dev box; gfx1201 is the target. Never bake a tuned
         // constant into a `const` — see spec §11. Resolution lives in
@@ -9327,17 +9352,24 @@ impl Gpu {
         head_dim: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
+        // Shapes outside the Q-tiled contract (per-lane accumulators are
+        // sized for head_dim <= 128 in 16-lane multiples of 16) fall back
+        // to the naive kernel instead of asserting: an assert here runs on
+        // the engine-owning thread, where a panic is a serve hang. The
+        // naive kernel is slower but correct for any tower shape.
+        if head_dim % 16 != 0 || head_dim > 128 {
+            eprintln!(
+                "vit_attention_qtiled_f32: head_dim={head_dim} is outside the \
+                 Q-tiled contract (multiple of 16, <= 128); falling back to \
+                 vit_attention_f32"
+            );
+            return self.vit_attention_f32(qkv, out, n, hidden, num_heads, head_dim);
+        }
         self.ensure_kernel(
             "vit_attention_qtiled_f32",
             kernels::VIT_ATTENTION_QTILED_SRC,
             "vit_attention_qtiled_f32",
         )?;
-        assert!(
-            head_dim % 16 == 0 && head_dim <= 128,
-            "vit_attention_qtiled_f32: head_dim={head_dim} must be a multiple of 16 \
-             and <= 128 (per-lane accumulator arrays are sized A_MAX=8); \
-             fall back to vit_attention_f32 for exotic towers",
-        );
         let func = &self.functions["vit_attention_qtiled_f32"];
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut qp = qkv.buf.as_ptr();

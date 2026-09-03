@@ -48,9 +48,17 @@ struct SourceMeta {
 /// then `<stem>.vl` sibling.
 fn discover_vl_path(model_path: &str) -> Option<std::path::PathBuf> {
     if let Ok(v) = std::env::var("HIPFIRE_VL_FILE") {
-        let p = std::path::PathBuf::from(v);
+        let p = std::path::PathBuf::from(&v);
         if p.exists() {
             return Some(p);
+        }
+        // Same rationale as the daemon's discover_vl_sidecar: an explicit
+        // override that doesn't exist deserves a warning, not silence.
+        if !v.trim().is_empty() {
+            eprintln!(
+                "HIPFIRE_VL_FILE is set to {v:?} but the file does not exist; \
+                 falling back to <stem>.vl sibling discovery"
+            );
         }
     }
     let base = std::path::Path::new(model_path);
@@ -562,14 +570,22 @@ impl Carrier for Qwen35Carrier {
                             .map_err(|e| format!("open .vl file {}: {e}", vl.display()))?;
                         let vc = Qwen35Vl::config_from_hfq(&vl_hfq)
                             .map_err(|e| format!(".vl vision_config: {e}"))?;
+                        // Fail the load, loudly: swallowing the error here
+                        // used to yield (Some(config), None) — a model whose
+                        // daemon-side image gate stays open (has_vision keys
+                        // off the config) but whose vision weights are gone.
+                        // The sequential path then panics on the unwrap and
+                        // the slots path rejects image requests with a
+                        // misleading "no vision encoder" message. A corrupt
+                        // or truncated .vl must be a load-time error the
+                        // operator can see.
                         let vw = Qwen35Vl::load_weights(&mut vl_hfq, &vc, ctx.gpu)
-                            .map_err(|e| format!("VL weight load from .vl: {e:?}"))
-                            .ok();
+                            .map_err(|e| format!("VL weight load from .vl: {e:?}"))?;
                         eprintln!(
                             "  VL model: vision encoder (hidden={}, layers={})",
                             vc.hidden_size, vc.num_layers
                         );
-                        (Some(vc), vw)
+                        (Some(vc), Some(vw))
                     } else {
                         let has_vision = has_inline_vision;
                         let vc = Qwen35Vl::config_from_hfq(&hfq_file).ok();

@@ -2050,15 +2050,32 @@ pub fn mtp_batched_verify_accept_from_batch(
     tape_stride: usize,
     slot: usize,
     eos_token_id: u32,
+    aux_eot_id: Option<u32>,
+    commit_budget: usize,
 ) -> HipResult<MtpSpecResult> {
     let dim = config.dim;
     let vocab = config.vocab_size;
     let n_verify = draft.n_verify();
     let drafts_generated = draft.drafts_generated;
 
-    // View of this slot's verify rows inside the batched forward's hidden
-    // buffer — no staging copy.
-    let verify_hidden = pbs.x_batch.sub_offset(hidden_row_offset * dim, n_verify * dim);
+    // `pbs.x_batch` holds the PRE-final-norm residual — the same buffer
+    // `final_logits_per_slot` norms per slot before its AR GEMV — while the
+    // trunk lm_head consumes POST-output-norm hidden (the convention the
+    // sequential verify path gets from `forward_prefill_batch`'s
+    // `per_token_hidden_out`). Norm the verify rows into the state's post-norm
+    // staging so acceptance compares against exactly what the AR path would
+    // sample; skipping this skews every argmax by the per-channel γ scale and
+    // breaks the MTP ≡ AR-at-greedy identity (the bonus token in particular).
+    let verify_raw = pbs.x_batch.sub_offset(hidden_row_offset * dim, n_verify * dim);
+    let verify_hidden = state.verify_hidden.sub_offset(0, n_verify * dim);
+    gpu.rmsnorm_batched(
+        &verify_raw,
+        &weights.output_norm,
+        &verify_hidden,
+        n_verify,
+        dim,
+        config.norm_eps,
+    )?;
 
     // Trunk lm_head over all verify rows (batched GEMM; handles every
     // admissible lm_head dtype incl. the FWHT-rotate for MQ-family).
@@ -2100,39 +2117,53 @@ pub fn mtp_batched_verify_accept_from_batch(
     }
     let accepted = greedy_trunk_spine_accept(&draft.candidates, &argmax_per_pos, eos_token_id);
 
-    let committed = accepted.committed;
+    let mut committed = accepted.committed;
+    let mut hit_eos = accepted.hit_eos;
+
+    // Clamp the burst to what the engine can actually KEEP. The accept rule
+    // above only early-stops on `eos_token_id`, but the commit path also
+    // terminates on the auxiliary eot, on `max_tokens`, and on the context
+    // cap — and the DN repair below replays exactly `advance` rows. If a
+    // terminator fires mid-burst, committing the full accepted burst would
+    // leave the recurrent state advanced past the session store for the rest
+    // of the conversation (KV rewinds via `begin_turn`; DN cannot rewind).
+    // Clamping here keeps `advance` == the rows the store will actually hold.
+    //
+    // `commit_budget` (min of the request's remaining max_tokens and its
+    // remaining context room, at least 1) bounds how many tokens may be
+    // committed; an auxiliary eot inside the kept prefix truncates the burst
+    // to end on it, mirroring how the accept rule itself ends on eos.
+    let mut keep = committed.len().min(commit_budget.max(1));
+    for (i, t) in committed[..keep].iter().enumerate() {
+        if i + 1 < keep && Some(*t) == aux_eot_id {
+            keep = i + 1;
+            hit_eos = true;
+            break;
+        }
+    }
+    committed.truncate(keep);
+
     let accept_count = accepted.accept_count;
-    let hit_eos = accepted.hit_eos;
     let advance = committed.len();
     debug_assert!(advance >= 1 && advance <= drafts_generated + 1);
     if mtp_trace_enabled() {
         eprintln!(
-            "[mtp-trace] result advance={} accept_count={} committed={:?} hit_eos={}",
-            advance, accept_count, committed, hit_eos
+            "[mtp-trace] result advance={} accept_count={} committed={:?} hit_eos={} (budget {})",
+            advance, accept_count, committed, hit_eos, commit_budget
         );
     }
 
     // Next cycle's MTP head input: the trunk hidden at the last committed
-    // row. The head consumes POST-output-norm hidden (the same convention
-    // the sequential path gets from forward_prefill_batch's
-    // per_token_hidden_out capture); pbs.x_batch holds the PRE-norm residual,
-    // so copy the row and norm it explicitly.
+    // row. `verify_hidden` already holds the POST-output-norm rows (normed
+    // above), which is the convention the head was exported with and the one
+    // the sequential path feeds it — so copy the row directly.
     let prev_hidden_row = advance - 1;
     gpu.hip.memcpy_dtod_at(
-        &state.mtp_lm_tmp.buf,
+        &state.prev_hidden.buf,
         0,
         &verify_hidden.buf,
         prev_hidden_row * dim * 4,
         dim * 4,
-    )?;
-    // rmsnorm_f32 derives n from the tensor's last dim, so hand it a
-    // dim-sized view of the staging row (the staging buffer is max_n*dim).
-    let tmp_row = state.mtp_lm_tmp.sub_offset(0, dim);
-    gpu.rmsnorm_f32(
-        &tmp_row,
-        &weights.output_norm,
-        &state.prev_hidden,
-        config.norm_eps,
     )?;
 
     // State repair: full accept leaves the verify-advanced state exactly

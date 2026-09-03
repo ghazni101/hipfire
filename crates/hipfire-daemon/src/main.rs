@@ -1042,6 +1042,7 @@ fn main() {
                             let dim = backend.dim();
                             let layers = backend.layers();
                             let vocab = backend.vocab();
+                            let vl = backend.is_vl();
                             // Ensure ordinary model stays None — exactly one weight copy.
                             model = None;
                             slot_backend = Some(std::sync::Arc::new(backend));
@@ -1052,7 +1053,7 @@ fn main() {
                                 "dim": dim,
                                 "layers": layers,
                                 "vocab": vocab,
-                                "vl": false,
+                                "vl": vl,
                                 "reasoning_contract": "qwen_jinja",
                                 "reasoning_effort_native": false,
                                 "reasoning_efforts": [],

@@ -454,6 +454,9 @@ impl PrefillBatchScratch {
             self.dn_normed_rot_batch,
             self.positions,
             self.rope_positions,
+            self.pos3,
+            self.ext_emb_index,
+            self.ext_emb_row_ptr,
             self.tokens,
             self.fa_q_full_batch,
             self.fa_q_batch,
@@ -1193,6 +1196,12 @@ impl PrefillBatchScratch {
         add(n, 4)?;
         add(n, 4)?;
         add(n, 4)?;
+        // VL side arrays: pos3 [n×3] and ext_emb_index [n] (i32-in-F32, 4
+        // B/row each) plus ext_emb_row_ptr [n] raw u64 pointers (8 B/row) —
+        // must mirror the alloc!s in new_opt exactly.
+        add(cm(n, 3)?, 4)?;
+        add(n, 4)?;
+        add(n, 8)?;
         add(
             cm(n, q_dim)?
                 .checked_mul(2)

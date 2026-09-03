@@ -1655,7 +1655,23 @@ pub(crate) fn complete_request_attempt(
             include_reasoning_content(runtime.current_arch.as_deref()),
         )?;
         let max_tokens = contract.max_tokens;
-        let required_max_seq = max_tokens.saturating_add(1024);
+        // Belt alignment: in multi-slot mode the daemon applies the EXACT
+        // admission belt (tokenized prompt — including image-pad expansion —
+        // plus max_tokens vs the slot ctx) and its rejection surfaces as an
+        // HTTP 400 through this front end. The sequential path keeps the
+        // historical fixed 1024-token prompt allowance, which drives the
+        // max_seq reload; in multi-slot mode that allowance both
+        // over-admits (one image is ~1700+ pad tokens, so the CLI gate
+        // passed requests the daemon must reject late) and over-rejects
+        // (up to ~1023 tokens of usable budget refused). Here we reject up
+        // front only what the daemon belt can NEVER admit — max_tokens alone
+        // beyond the ctx (any prompt is at least one token) — and defer the
+        // rest to the exact belt.
+        let required_max_seq = if runtime.multi_slot_enabled {
+            max_tokens.saturating_add(1)
+        } else {
+            max_tokens.saturating_add(1024)
+        };
         if runtime.current_max_seq < required_max_seq {
             runtime.ensure_model(&model, &shared.meta, Some(required_max_seq))?;
         }
@@ -2097,12 +2113,15 @@ pub(crate) fn complete_request_attempt(
 
 /// Whether the experimental multi-slot daemon path can honour this request.
 ///
-/// Pure pre-send gate. Temperature / top_p / top_k remain supported. Images
-/// are supported when the loaded model has a vision encoder (the daemon slot
-/// backend gates on is_vl). Rejects tools, non-null stop, logprobs, non-neutral
-/// repeat/frequency/presence penalties, min_p, reasoning caps >= 2, and named
-/// thinking budgets other than `"off"`. Callers with `serve.multi_slot` enabled
-/// must surface the error — there is no ordinary-model fallback in that mode.
+/// Pure pre-send gate. Temperature / top_p / top_k remain supported, and
+/// token penalties (repeat/frequency/presence, min_p) are FORWARDED — the
+/// slot engine honours them via its penalize-then-argmax prepass (penalized
+/// requests decode AR; MTP stays off). Images are supported when the loaded
+/// model has a vision encoder (the daemon slot backend gates on is_vl).
+/// Rejects tools, non-null stop, logprobs, reasoning caps >= 2, and named
+/// thinking budgets other than `"off"`. Callers with `serve.multi_slot`
+/// enabled must surface the error — there is no ordinary-model fallback in
+/// that mode.
 pub(crate) fn multi_slot_request_supported(body: &serde_json::Value) -> Result<(), String> {
     if body
         .get("tools")
@@ -6648,9 +6667,10 @@ mod tests {
 
     /// Experimental multi-slot accepts sampling that the daemon slot engine
     /// implements (temperature/top_p/top_k) and rejects every other listed
-    /// capability before the generate is sent. Penalty knobs are the one
-    /// exception: the slot sampler cannot apply them, so they are accepted
-    /// and ignored (logged) rather than refusing standard clients.
+    /// capability before the generate is sent. Penalty knobs
+    /// (repeat/frequency/presence, min_p) are forwarded and honoured by the
+    /// slot sampler's penalize-then-argmax prepass — penalized requests
+    /// decode AR with MTP off.
     #[test]
     fn multi_slot_request_supported_accepts_sampling_rejects_unsupported() {
         let ok = |v: serde_json::Value| multi_slot_request_supported(&v).is_ok();
