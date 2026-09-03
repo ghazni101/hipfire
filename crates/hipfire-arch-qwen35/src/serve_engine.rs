@@ -427,24 +427,20 @@ impl Rig {
         // Mirrors finish_qwen35_load: try bundled trailer first, then .mtp sidecar.
         // The head is shared across all slots (small ~216 MB for 27B).
         //
-        // MTP is incompatible with a paged pool: the sequential MTP path
-        // (prompt prefill and the post-accept KV/DN replay) writes through the
-        // flat per-slot slab view (`slot_kv_view`), whose `legacy_k_base` is 0
-        // for every slot in paged mode — prefill would land in the arena
-        // prefix instead of the slot's own pages, while the batched verify
-        // (paged-aware) reads the slot's real pages. Silent garbage + cross-
-        // slot corruption. The batching itself has no paged fix yet, so the
-        // combination is refused at load: paged wins, MTP stays off (mirror
-        // of the VL gate above). Zeroing mtp_k also skips the head load.
-        let mtp_k = if paged_pages.is_some() && cfg.mtp_k > 0 {
-            eprintln!(
-                "  [hipfire] MTP disabled: paged KV pool is incompatible with \
-                 the sequential MTP path (flat slab view)"
-            );
-            0
-        } else {
-            cfg.mtp_k
-        };
+        // MTP × paged: ALLOWED. The gate below (59c731dd0) refused the
+        // combination because the then-current MTP path prefilled and
+        // replayed KV through the flat slab view (`slot_kv_view`, whose
+        // legacy bases are 0 under paged → silent cross-slot corruption).
+        // The 85dde5df0 rewrite removed every flat-view writer from the MTP
+        // path: prefill runs through the scheduler's batched chunk path
+        // (paged block tables + write-frontier provisioning), the verify is
+        // the batched forward, and a partial accept repairs only the
+        // DeltaNet state (private per-slot buffers) from the verify tape —
+        // `slot_kv_view` has no MTP caller left. Graph capture simply does
+        // not engage under paged (the graphed entry falls back to the plain
+        // step), and `mtp_verify_fits_cap` retires MTP before a verify's
+        // k+1-row frontier could fail the paged provision closed.
+        let mtp_k = cfg.mtp_k;
         let mtp_head: Option<crate::mtp_head::Qwen35MtpHead> = if mtp_k > 0 {
             let trunk_path = &cfg.model_path;
             let mut head_opt: Option<crate::mtp_head::Qwen35MtpHead> = None;
@@ -1338,20 +1334,27 @@ fn mtp_verify_accept_step(
 
 /// Rebuild a `SlotBatch` to include MTP verify tokens for slots that have
 /// draft outputs. Non-MTP slots keep their scheduler-provided rows.
+///
+/// `pos3_deltas[s]` is the slot's continuation rope offset (0 for pure-text
+/// conversations): verify rows are text rows of the slot they belong to, so
+/// a slot continuing an image conversation phases them at `pos + delta`
+/// exactly like the scheduler does for its prefill/decode rows.
 fn inject_mtp_verify_tokens(
     batch: &SlotBatch,
     mtp_drafts: &[Option<crate::mtp_spec::MtpDraftOutput>],
     n_slots: usize,
+    pos3_deltas: &[i32],
 ) -> SlotBatch {
     // A VL row anywhere in the step keeps the batch on the M-RoPE/scatter
     // path, so the side arrays must survive the rebuild: verify rows are
-    // text rows of text slots and take [p, p, p] / -1; VL rows are copied
-    // through untouched.
+    // text rows of text slots and take their (possibly shifted) phase; VL
+    // rows are copied through untouched.
     let vl_step = batch.pos3.len() == batch.positions.len() && !batch.pos3.is_empty();
     let mut new_batch = SlotBatch::default();
     let mut old_row_off = 0usize;
     for s in 0..n_slots {
         if let Some(draft) = &mtp_drafts[s] {
+            let delta = pos3_deltas.get(s).copied().unwrap_or(0);
             let verify_tokens = draft.verify_tokens();
             new_batch.m_per_slot.push(verify_tokens.len());
             for (i, t) in verify_tokens.iter().enumerate() {
@@ -1360,7 +1363,7 @@ fn inject_mtp_verify_tokens(
                 new_batch.positions.push(pos as i32);
                 new_batch.row_slot.push(s as i32);
                 if vl_step {
-                    new_batch.pos3.push([pos as i32; 3]);
+                    new_batch.pos3.push([pos as i32 + delta; 3]);
                     new_batch.ext_emb.push(-1);
                 }
             }
@@ -1398,6 +1401,7 @@ fn clear_work_slot(work: &mut PendingWork) {
     work.next_pos = 0;
     work.vl_prefill = None;
     work.mtp_active = false;
+    work.pos3_delta = 0;
 }
 
 /// True when an MTP verify batch — `mtp_k + 1` rows at positions
@@ -1535,6 +1539,7 @@ fn run_loop(
             mtp_cycles: 0,
             mtp_committed: 0,
             mtp_retire_fails: 0,
+            pos3_delta: 0,
         })
         .collect();
     let mut sched = Scheduler {
@@ -1746,7 +1751,8 @@ fn run_loop(
         // produced draft outputs.
         let sched_batch = sched.next_batch(&mut work);
         let batch = if mtp_drafts.iter().any(|d| d.is_some()) {
-            inject_mtp_verify_tokens(&sched_batch, &mtp_drafts, n)
+            let pos3_deltas: Vec<i32> = work.iter().map(|w| w.pos3_delta).collect();
+            inject_mtp_verify_tokens(&sched_batch, &mtp_drafts, n, &pos3_deltas)
         } else {
             sched_batch
         };
@@ -2380,6 +2386,15 @@ fn admit(
                     work[slot.0].remaining_prompt = extended[plan.reused..].to_vec();
                     work[slot.0].next_pos = plan.reused;
                     work[slot.0].decoding = false;
+                    // A text follow-up on a conversation that carries an
+                    // image turn keeps that turn's M-RoPE phase offset: KV
+                    // rows are addressed by token index, but the image
+                    // turn's keys hold compressed-grid phases, so this
+                    // turn's rows must phase-shift by the same delta.
+                    // (Image turns themselves are forced Cold and rebuild
+                    // the offset from their own table.)
+                    work[slot.0].pos3_delta =
+                        rig.sessions.get(existing).map(|s| s.rope_delta).unwrap_or(0);
                     // MTP: activate if enabled. Vision continuations stay on
                     // the sequential M-RoPE path (no MTP), matching cold
                     // admits; penalized requests stay on AR (see
@@ -2550,6 +2565,11 @@ fn admit(
     if let Some(sess) = rig.sessions.get_mut(id) {
         sess.tokens = req.prompt_tokens.clone();
         sess.convo = req.convo.clone();
+        // An image turn defines the conversation's M-RoPE phase offset for
+        // every later text continuation; a text-only conversation stays 0
+        // (fresh sessions are, but this path also serves continuation-miss
+        // re-prefills, which must not inherit anything stale).
+        sess.rope_delta = req.visual_data.as_ref().map(|vd| vd.rope_delta).unwrap_or(0);
     }
 
     if send_event(
@@ -2584,6 +2604,7 @@ fn admit(
     if let Some(vd) = req.visual_data {
         work[slot.0].remaining_prompt = req.prompt_tokens.clone();
         work[slot.0].next_pos = 0;
+        work[slot.0].pos3_delta = 0; // phases come from the VL table below
         // Drop any previous request's vision matrix: the new request's
         // embeddings are not produced until its first batched chunk, and the
         // scheduler holds the slot's rows until then.
@@ -2609,6 +2630,7 @@ fn admit(
         work[slot.0].remaining_prompt = req.prompt_tokens[plan.reused..].to_vec();
         work[slot.0].next_pos = plan.reused;
         work[slot.0].vl_prefill = None;
+        work[slot.0].pos3_delta = 0; // fresh session: no image-turn offset
         // Activate MTP for text-only requests when the head is loaded.
         // Penalized requests stay on AR: the verify accept is a bare greedy
         // argmax and cannot reproduce penalize-then-argmax.

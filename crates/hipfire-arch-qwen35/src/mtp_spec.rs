@@ -2027,7 +2027,8 @@ pub fn mtp_dn_repair_from_tape(
 /// * greedy accept reads one packed `n_verify`-int D2H instead of routing
 ///   through the GPU device-token-chain accept;
 /// * a partial accept repairs the DeltaNet state with
-///   [`mtp_dn_repair_from_pbs`] (two launches per DN layer) instead of
+///   [`mtp_dn_repair_from_tape`] replaying the verify tape over the
+///   accepted rows (~5 launches per DN layer) instead of
 ///   re-running a full trunk `forward_prefill_batch` replay;
 /// * `prev_hidden` for the next draft cycle is captured from the same
 ///   `x_batch` view.

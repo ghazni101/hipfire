@@ -59,6 +59,11 @@ pub struct SlotBackend {
     vocab: usize,
     is_vl: bool,
     vision_config: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionConfig>,
+    /// Per-slot context cap handed to the engine at load. Admission-side
+    /// only (the engine re-enforces it per token); kept here so an
+    /// over-budget request can be rejected with an actionable message
+    /// before it occupies a slot.
+    cap_tokens: usize,
     active: AtomicUsize,
 }
 
@@ -112,6 +117,7 @@ impl SlotBackend {
             vocab,
             is_vl,
             vision_config,
+            cap_tokens,
             active: AtomicUsize::new(0),
         })
     }
@@ -655,6 +661,28 @@ impl SlotBackend {
             return Ok(());
         }
         let prompt_len = prompt_tokens.len();
+        // vLLM-style admission: prompt + generation budget must fit the
+        // slot's context cap. The engine's per-token ctx guard would stop
+        // the decode at the cap anyway, but that surfaces as a silently
+        // truncated answer; an explicit rejection up front tells the client
+        // the request was too large and by how much.
+        if prompt_len.saturating_add(max_tokens) > self.cap_tokens {
+            hipfire_engine::emit::emit_active_attempt_error(
+                stdout,
+                Some(id),
+                &format!(
+                    "request requires context {prompt_len} prompt + {max_tokens} max_tokens = {}, \
+                     exceeding the slot context cap of {} tokens — reduce max_tokens or shorten the prompt",
+                    prompt_len + max_tokens,
+                    self.cap_tokens
+                ),
+                "validation",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return Ok(());
+        }
         let continuation = if visual_data.is_some() {
             Continuation::Cold
         } else if convo.len() >= 3 {

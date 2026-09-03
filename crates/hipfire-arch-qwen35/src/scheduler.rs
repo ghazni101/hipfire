@@ -54,6 +54,16 @@ pub struct PendingWork {
     pub mtp_committed: usize,
     /// Consecutive retire-windows whose mean advance fell below the line.
     pub mtp_retire_fails: usize,
+    /// M-RoPE phase offset for a TEXT continuation whose conversation
+    /// carries image-turn KV (the session's `rope_delta`; 0 = pure text).
+    ///
+    /// KV rows are addressed by token index, but the image turn's stored
+    /// keys carry compressed-grid phases: every row this slot prefills or
+    /// decodes must take its phase from `pos + rope_delta`, not from the
+    /// raw token index, or cross-turn attention re-rotates by the whole
+    /// delta. Rows still emit `ext_emb = -1` — this is a phase fix, not an
+    /// embedding splice.
+    pub pos3_delta: i32,
 }
 
 /// Visual + M-RoPE data for one slot's VL request.
@@ -109,10 +119,12 @@ impl Scheduler {
     pub fn next_batch(&mut self, work: &mut [PendingWork]) -> SlotBatch {
         // A step carrying VL rows runs the batched M-RoPE kernel for EVERY
         // row (text rows take [p, p, p], bit-identical to 1D RoPE), so the
-        // per-row pos3/ext side arrays exist only when some slot is VL.
-        let any_vl = work
-            .iter()
-            .any(|w| w.vl_prefill.is_some() && !self.vl_sequential);
+        // per-row pos3/ext side arrays exist whenever some slot is VL — or
+        // carries a continuation rope delta, whose rows need the shifted
+        // phases for the same kernel.
+        let any_pos3 = work.iter().any(|w| {
+            (w.vl_prefill.is_some() && !self.vl_sequential) || w.pos3_delta != 0
+        });
         let mut b = SlotBatch::default();
         for w in work.iter_mut() {
             // Sequential-mode VL slots are owned by the per-token M-RoPE
@@ -150,7 +162,7 @@ impl Scheduler {
                 b.tokens.push(*t);
                 b.positions.push(pos as i32);
                 b.row_slot.push(w.slot.0 as i32);
-                if !any_vl {
+                if !any_pos3 {
                     continue;
                 }
                 match w.vl_prefill.as_mut() {
@@ -166,7 +178,10 @@ impl Scheduler {
                         }
                     }
                     None => {
-                        b.pos3.push([pos as i32; 3]);
+                        // Text row: [p, p, p] is bit-identical to 1D RoPE;
+                        // a continuation of an image conversation shifts the
+                        // phase by its session's rope delta instead.
+                        b.pos3.push([pos as i32 + w.pos3_delta; 3]);
                         b.ext_emb.push(-1);
                     }
                 }
@@ -194,7 +209,7 @@ mod tests {
             remaining_prompt: prompt(1000),
             next_pos: 0,
             decoding: false,
-            vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0,
+            vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0, pos3_delta: 0,
         }];
         let b = s.next_batch(&mut work);
         assert_eq!(
@@ -215,14 +230,14 @@ mod tests {
                 remaining_prompt: prompt(300),
                 next_pos: 0,
                 decoding: false,
-                vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0,
+                vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0, pos3_delta: 0,
             },
             PendingWork {
                 slot: SlotId(1),
                 remaining_prompt: vec![42],
                 next_pos: 10,
                 decoding: true,
-                vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0,
+                vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0, pos3_delta: 0,
             },
         ];
         let b = s.next_batch(&mut work);
@@ -241,7 +256,7 @@ mod tests {
             remaining_prompt: prompt(10),
             next_pos: 0,
             decoding: false,
-            vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0,
+            vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0, pos3_delta: 0,
         }];
         let b = s.next_batch(&mut work);
         assert_eq!(b.total_rows(), 10);
@@ -256,7 +271,7 @@ mod tests {
             remaining_prompt: vec![],
             next_pos: 0,
             decoding: false,
-            vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0,
+            vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0, pos3_delta: 0,
         }];
         let b = s.next_batch(&mut work);
         assert!(b.is_empty());
@@ -305,14 +320,14 @@ mod tests {
                     embeddings: vec![],
                     ..vl_state(1, 10)
                 }),
-                mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0,
+                mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0, pos3_delta: 0,
             },
             PendingWork {
                 slot: SlotId(1),
                 remaining_prompt: vec![7],
                 next_pos: 3,
                 decoding: true,
-                vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0,
+                vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0, pos3_delta: 0,
             },
         ];
         let b = s.next_batch(&mut work);
@@ -334,7 +349,7 @@ mod tests {
             next_pos: 0,
             decoding: false,
             vl_prefill: Some(vl_state(1, 10)),
-            mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0,
+            mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0, pos3_delta: 0,
         }];
         let b = s.next_batch(&mut work);
         assert_eq!(b.total_rows(), 10);
@@ -354,7 +369,7 @@ mod tests {
             next_pos: 12,
             decoding: true,
             vl_prefill: Some(vl_state(2, 4)),
-            mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0,
+            mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0, pos3_delta: 0,
         }];
         let b = s.next_batch(&mut work);
         assert_eq!(b.total_rows(), 1);
@@ -372,7 +387,7 @@ mod tests {
             next_pos: 0,
             decoding: false,
             vl_prefill: Some(vl_state(1, 10)),
-            mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0,
+            mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0, pos3_delta: 0,
         }];
         let b = s.next_batch(&mut work);
         assert!(b.is_empty(), "sequential mode owns the slot");
@@ -381,8 +396,7 @@ mod tests {
     }
 
     #[test]
-    fn mtp_prefill_slots_batch_but_decoding_mtp_slots_are_skipped() {
-        let mut s = Scheduler { chunk_size: 256, vl_sequential: false };
+    fn mtp_prefill_slots_batch_but_decoding_mtp_slots_are_skipped() {        let mut s = Scheduler { chunk_size: 256, vl_sequential: false };
         let mut work = vec![
             PendingWork {
                 // MTP slot still prefilling: its prompt chunk flows through
@@ -395,7 +409,7 @@ mod tests {
                 mtp_active: true,
                 mtp_cycles: 0,
                 mtp_committed: 0,
-                mtp_retire_fails: 0,
+                mtp_retire_fails: 0, pos3_delta: 0,
             },
             PendingWork {
                 // MTP slot decoding: owned by the draft/verify cycle; its
@@ -408,7 +422,7 @@ mod tests {
                 mtp_active: true,
                 mtp_cycles: 0,
                 mtp_committed: 0,
-                mtp_retire_fails: 0,
+                mtp_retire_fails: 0, pos3_delta: 0,
             },
         ];
         let b = s.next_batch(&mut work);
@@ -421,5 +435,68 @@ mod tests {
         assert_eq!(work[0].next_pos, 10);
         assert_eq!(work[1].remaining_prompt, vec![7], "seed stays put");
         assert_eq!(work[1].next_pos, 3);
+    }
+
+    #[test]
+    fn continuation_rope_delta_shifts_phases_without_splicing_embeddings() {
+        // A text follow-up to an image turn: no vl_prefill, but the session's
+        // rope delta must phase-shift every row while ext_emb stays -1 (no
+        // vision matrix exists any more). A pure-text neighbour keeps
+        // [p, p, p].
+        let mut s = Scheduler { chunk_size: 256, vl_sequential: false };
+        let mut work = vec![
+            PendingWork {
+                slot: SlotId(0),
+                remaining_prompt: prompt(3),
+                next_pos: 300,
+                decoding: false,
+                vl_prefill: None,
+                mtp_active: false,
+                mtp_cycles: 0,
+                mtp_committed: 0,
+                mtp_retire_fails: 0,
+                pos3_delta: -240,
+            },
+            PendingWork {
+                slot: SlotId(1),
+                remaining_prompt: vec![9],
+                next_pos: 5,
+                decoding: true,
+                vl_prefill: None,
+                mtp_active: false,
+                mtp_cycles: 0,
+                mtp_committed: 0,
+                mtp_retire_fails: 0,
+                pos3_delta: 0,
+            },
+        ];
+        let b = s.next_batch(&mut work);
+        assert_eq!(b.m_per_slot, vec![3, 1]);
+        assert_eq!(b.pos3.len(), 4, "delta rows put the step on M-RoPE too");
+        assert_eq!(b.pos3[0], [300 - 240; 3], "phase = pos + session delta");
+        assert_eq!(b.pos3[2], [302 - 240; 3]);
+        assert_eq!(b.pos3[3], [5, 5, 5], "pure-text rows stay at [p, p, p]");
+        assert!(b.ext_emb.iter().all(|&e| e == -1), "never splice here");
+    }
+
+    #[test]
+    fn plain_text_step_still_skips_the_pos3_arrays() {
+        let mut s = Scheduler { chunk_size: 256, vl_sequential: false };
+        let mut work = vec![PendingWork {
+            slot: SlotId(0),
+            remaining_prompt: prompt(4),
+            next_pos: 0,
+            decoding: false,
+            vl_prefill: None,
+            mtp_active: true,
+            mtp_cycles: 0,
+            mtp_committed: 0,
+            mtp_retire_fails: 0,
+            pos3_delta: 0,
+        }];
+        let b = s.next_batch(&mut work);
+        assert_eq!(b.total_rows(), 4);
+        assert!(b.pos3.is_empty(), "no VL rows implies no side arrays");
+        assert!(b.ext_emb.is_empty());
     }
 }
