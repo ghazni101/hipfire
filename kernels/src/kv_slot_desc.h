@@ -29,6 +29,15 @@
 //
 // Layout must stay byte-identical to the Rust mirror in
 // crates/rdna-compute/src/kv_slots.rs. 32 bytes, 8-byte aligned.
+//
+// KERNEL-AUTHORING INVARIANT (MTP stale-read safety): every batched attention
+// kernel MUST bound its causal sweep by the per-row `positions[]` array the
+// host uploads, never by `desc.seq_len`. The slot engine's MTP verify writes
+// k+1 rows ahead of the committed frontier; after a partial accept the rows
+// between the frontier and the draft tip hold REJECTED tokens' KV until the
+// next cycle overwrites them. Bounding by positions[] masks those rows off
+// (they sit past every live query's position); bounding by seq_len would
+// sweep them back into the softmax as silent garbage.
 
 #pragma once
 

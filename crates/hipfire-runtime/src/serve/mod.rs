@@ -60,6 +60,18 @@ pub struct SubmitRequest {
     /// 0 disables top-k.
     pub top_k: i32,
     pub seed: u32,
+    /// Recency window in recent tokens for the penalties below. 0 disables
+    /// token penalties regardless of the penalty values.
+    pub repeat_window: usize,
+    /// Multiplicative recency-weighted repeat penalty; 1.0 = off.
+    pub repeat_penalty: f32,
+    /// OpenAI flat presence penalty; 0.0 = off. This is the mechanism that
+    /// suppresses block-level repetition loops on long generations.
+    pub presence_penalty: f32,
+    /// OpenAI frequency penalty (scaled by in-window count); 0.0 = off.
+    pub frequency_penalty: f32,
+    /// min-p cutoff; 0.0 = off.
+    pub min_p: f32,
     /// Visual embeddings + M-RoPE for VL requests. None for text-only.
     pub visual_data: Option<VisualData>,
     pub reply: Sender<Event>,

@@ -19,6 +19,11 @@ use rdna_compute::slot_pool::SlotId;
 
 pub struct Scheduler {
     pub chunk_size: usize,
+    /// Serve VL slots on the legacy sequential per-token M-RoPE path instead
+    /// of the batched paged-capable one. Opt-in via HIPFIRE_VL_SEQUENTIAL=1;
+    /// the batched path is the default (and the only one compatible with a
+    /// paged pool).
+    pub vl_sequential: bool,
 }
 
 /// One slot's outstanding work as seen by the scheduler.
@@ -51,7 +56,13 @@ pub struct PendingWork {
     pub mtp_retire_fails: usize,
 }
 
-/// Visual + M-RoPE data for one slot's sequential VL path.
+/// Visual + M-RoPE data for one slot's VL request.
+///
+/// On the default batched path the scheduler splices vision embeddings (via
+/// per-row `SlotBatch::ext_emb` indices) and M-RoPE phases (via
+/// `SlotBatch::pos3`) into the chunked batch like any other slot. The
+/// sequential fallback (`vl_sequential`) instead owns the slot for the whole
+/// request and prefills/decodes per token.
 pub struct VlPrefill {
     /// Vision-tower patches; consumed once by `vision_forward`.
     pub patches: Vec<f32>,
@@ -65,6 +76,8 @@ pub struct VlPrefill {
     pub dim: usize,
     /// Index into `embeddings` for the next visual token to splice.
     pub visual_idx: usize,
+    /// Prompt token id that carries one visual embedding per occurrence.
+    pub image_pad_id: u32,
     /// 3D M-RoPE positions for every prompt token, offset by base.
     pub mrope_positions: Vec<[i32; 3]>,
     /// rope_delta for decode positions past the prompt.
@@ -73,21 +86,54 @@ pub struct VlPrefill {
     pub base: usize,
 }
 
+impl VlPrefill {
+    /// Absolute rope phases for position `pos`: this request's prompt table
+    /// while in range, `pos + rope_delta` beyond it. Same rule as
+    /// `MropeCtx::pos3` on the sequential path.
+    pub fn pos3(&self, pos: usize) -> [i32; 3] {
+        match pos
+            .checked_sub(self.base)
+            .and_then(|i| self.mrope_positions.get(i))
+        {
+            Some(p) => *p,
+            None => [pos as i32 + self.rope_delta; 3],
+        }
+    }
+}
+
 impl Scheduler {
     /// Build the next step's `SlotBatch`, taking `min(chunk_size,
     /// remaining_prompt.len())` tokens from each prefilling slot and one
     /// token from each decoding slot, in slot order. Advances `next_pos`
     /// (and drains `remaining_prompt`) for whatever it takes.
     pub fn next_batch(&mut self, work: &mut [PendingWork]) -> SlotBatch {
+        // A step carrying VL rows runs the batched M-RoPE kernel for EVERY
+        // row (text rows take [p, p, p], bit-identical to 1D RoPE), so the
+        // per-row pos3/ext side arrays exist only when some slot is VL.
+        let any_vl = work
+            .iter()
+            .any(|w| w.vl_prefill.is_some() && !self.vl_sequential);
         let mut b = SlotBatch::default();
         for w in work.iter_mut() {
-            // Sequential VL path owns these slots: 1D batched RoPE would
-            // disagree with M-RoPE on image and post-image tokens.
-            // MTP slots prefill through this batched path like any other
-            // slot (their head-KV fill runs post-forward from x_batch);
+            // Sequential-mode VL slots are owned by the per-token M-RoPE
+            // path. MTP slots prefill through this batched path like any
+            // other slot (their head-KV fill runs post-forward from x_batch);
             // once decoding, the MTP verify rows are injected by the caller
             // instead, so skip them here.
-            if w.vl_prefill.is_some() || (w.mtp_active && w.decoding) {
+            if (w.vl_prefill.is_some() && self.vl_sequential)
+                || (w.mtp_active && w.decoding)
+            {
+                b.m_per_slot.push(0);
+                continue;
+            }
+            // Batched-mode VL slots wait until the engine has run
+            // vision_forward and uploaded their embedding matrix — building
+            // rows before that would embed garbage for the image pads.
+            let vl_waiting = w
+                .vl_prefill
+                .as_ref()
+                .is_some_and(|vl| vl.embeddings.is_empty() && vl.n_visual_tokens > 0);
+            if vl_waiting {
                 b.m_per_slot.push(0);
                 continue;
             }
@@ -100,9 +146,30 @@ impl Scheduler {
             let start_pos = w.next_pos;
             b.m_per_slot.push(toks.len());
             for (i, t) in toks.iter().enumerate() {
+                let pos = start_pos + i;
                 b.tokens.push(*t);
-                b.positions.push((start_pos + i) as i32);
+                b.positions.push(pos as i32);
                 b.row_slot.push(w.slot.0 as i32);
+                if !any_vl {
+                    continue;
+                }
+                match w.vl_prefill.as_mut() {
+                    Some(vl) => {
+                        b.pos3.push(vl.pos3(pos));
+                        // Image pads splice visual embeddings in prompt
+                        // order; everything else uses the token table.
+                        if *t == vl.image_pad_id && vl.visual_idx < vl.n_visual_tokens {
+                            b.ext_emb.push(vl.visual_idx as i32);
+                            vl.visual_idx += 1;
+                        } else {
+                            b.ext_emb.push(-1);
+                        }
+                    }
+                    None => {
+                        b.pos3.push([pos as i32; 3]);
+                        b.ext_emb.push(-1);
+                    }
+                }
             }
             w.next_pos += toks.len();
         }
@@ -121,7 +188,7 @@ mod tests {
 
     #[test]
     fn a_long_prompt_is_chunked_not_run_whole() {
-        let mut s = Scheduler { chunk_size: 256 };
+        let mut s = Scheduler { chunk_size: 256, vl_sequential: false };
         let mut work = vec![PendingWork {
             slot: SlotId(0),
             remaining_prompt: prompt(1000),
@@ -141,7 +208,7 @@ mod tests {
 
     #[test]
     fn prefill_and_decode_mix_in_one_batch() {
-        let mut s = Scheduler { chunk_size: 256 };
+        let mut s = Scheduler { chunk_size: 256, vl_sequential: false };
         let mut work = vec![
             PendingWork {
                 slot: SlotId(0),
@@ -168,7 +235,7 @@ mod tests {
 
     #[test]
     fn a_prompt_shorter_than_a_chunk_completes_in_one_batch() {
-        let mut s = Scheduler { chunk_size: 256 };
+        let mut s = Scheduler { chunk_size: 256, vl_sequential: false };
         let mut work = vec![PendingWork {
             slot: SlotId(0),
             remaining_prompt: prompt(10),
@@ -183,7 +250,7 @@ mod tests {
 
     #[test]
     fn an_idle_slot_contributes_nothing() {
-        let mut s = Scheduler { chunk_size: 256 };
+        let mut s = Scheduler { chunk_size: 256, vl_sequential: false };
         let mut work = vec![PendingWork {
             slot: SlotId(0),
             remaining_prompt: vec![],
@@ -195,9 +262,39 @@ mod tests {
         assert!(b.is_empty());
     }
 
+    fn vl_state(n_visual: usize, n_prompt: usize) -> VlPrefill {
+        VlPrefill {
+            patches: vec![],
+            grid_h: 1,
+            grid_w: 1,
+            n_visual_tokens: n_visual,
+            embeddings: vec![0.0; n_visual * 4],
+            dim: 4,
+            visual_idx: 0,
+            image_pad_id: 42,
+            // Phases for the prompt: text rows [p,p,p]; an "image" row at
+            // position 4 stretched on h/w (values arbitrary but distinct
+            // from the 1D phase, to prove the table wins).
+            mrope_positions: (0..n_prompt)
+                .map(|p| {
+                    if p == 4 {
+                        [4, 9, 9]
+                    } else {
+                        [p as i32, p as i32, p as i32]
+                    }
+                })
+                .collect(),
+            rope_delta: 7,
+            base: 0,
+        }
+    }
+
     #[test]
-    fn vl_slots_are_skipped_by_the_batched_scheduler() {
-        let mut s = Scheduler { chunk_size: 256 };
+    fn vl_slots_waiting_on_vision_forward_are_skipped() {
+        // Embeddings not yet produced: the slot must not enter the batch
+        // (image pads would embed garbage), but the decoding slot next to it
+        // is unaffected.
+        let mut s = Scheduler { chunk_size: 256, vl_sequential: false };
         let mut work = vec![
             PendingWork {
                 slot: SlotId(0),
@@ -205,16 +302,8 @@ mod tests {
                 next_pos: 0,
                 decoding: false,
                 vl_prefill: Some(VlPrefill {
-                    patches: vec![],
-                    grid_h: 1,
-                    grid_w: 1,
-                    n_visual_tokens: 1,
                     embeddings: vec![],
-                    dim: 4,
-                    visual_idx: 0,
-                    mrope_positions: vec![],
-                    rope_delta: 0,
-                    base: 0,
+                    ..vl_state(1, 10)
                 }),
                 mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0,
             },
@@ -227,19 +316,73 @@ mod tests {
             },
         ];
         let b = s.next_batch(&mut work);
-        assert_eq!(
-            b.m_per_slot,
-            vec![0, 1],
-            "VL slots must not enter the 1D-RoPE batch"
-        );
+        assert_eq!(b.m_per_slot, vec![0, 1], "unprepared VL slots must wait");
         assert_eq!(work[0].remaining_prompt.len(), 10);
         assert_eq!(work[0].next_pos, 0);
         assert!(work[1].remaining_prompt.is_empty());
     }
 
     #[test]
+    fn batched_vl_rows_carry_mrope_phases() {
+        let mut s = Scheduler { chunk_size: 256, vl_sequential: false };
+        // Prompt where position 4 is an image pad.
+        let mut toks = prompt(10);
+        toks[4] = 42;
+        let mut work = vec![PendingWork {
+            slot: SlotId(0),
+            remaining_prompt: toks,
+            next_pos: 0,
+            decoding: false,
+            vl_prefill: Some(vl_state(1, 10)),
+            mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0,
+        }];
+        let b = s.next_batch(&mut work);
+        assert_eq!(b.total_rows(), 10);
+        assert_eq!(b.pos3.len(), 10, "one phase triplet per row");
+        assert_eq!(b.pos3[4], [4, 9, 9], "the image row reads the table");
+        assert_eq!(b.pos3[0], [0, 0, 0], "text rows stay at [p, p, p]");
+        assert_eq!(b.ext_emb, vec![-1, -1, -1, -1, 0, -1, -1, -1, -1, -1]);
+        assert_eq!(work[0].vl_prefill.as_ref().unwrap().visual_idx, 1);
+    }
+
+    #[test]
+    fn vl_decode_rows_use_pos_plus_rope_delta() {
+        let mut s = Scheduler { chunk_size: 4, vl_sequential: false };
+        let mut work = vec![PendingWork {
+            slot: SlotId(0),
+            remaining_prompt: vec![9],
+            next_pos: 12,
+            decoding: true,
+            vl_prefill: Some(vl_state(2, 4)),
+            mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0,
+        }];
+        let b = s.next_batch(&mut work);
+        assert_eq!(b.total_rows(), 1);
+        // Position 12 is past the 4-row table: [p + rope_delta; 3].
+        assert_eq!(b.pos3[0], [12 + 7, 12 + 7, 12 + 7]);
+        assert_eq!(b.ext_emb[0], -1, "decode rows never splice embeddings");
+    }
+
+    #[test]
+    fn sequential_vl_slots_still_bypass_the_batch() {
+        let mut s = Scheduler { chunk_size: 256, vl_sequential: true };
+        let mut work = vec![PendingWork {
+            slot: SlotId(0),
+            remaining_prompt: prompt(10),
+            next_pos: 0,
+            decoding: false,
+            vl_prefill: Some(vl_state(1, 10)),
+            mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0,
+        }];
+        let b = s.next_batch(&mut work);
+        assert!(b.is_empty(), "sequential mode owns the slot");
+        assert!(b.pos3.is_empty(), "no VL rows implies no side arrays");
+        assert_eq!(work[0].remaining_prompt.len(), 10);
+    }
+
+    #[test]
     fn mtp_prefill_slots_batch_but_decoding_mtp_slots_are_skipped() {
-        let mut s = Scheduler { chunk_size: 256 };
+        let mut s = Scheduler { chunk_size: 256, vl_sequential: false };
         let mut work = vec![
             PendingWork {
                 // MTP slot still prefilling: its prompt chunk flows through

@@ -1784,6 +1784,14 @@ pub(crate) fn complete_request_attempt(
             // choice. Carry only that typed decision across the slot wire;
             // the daemon must never reinterpret the original HTTP body.
             generate["tool_choice_policy"] = tool_choice_policy.daemon_projection();
+            // Penalty knobs are forwarded as-is: the slot sampler applies
+            // repeat/presence/frequency penalties and min_p exactly like the
+            // sequential path (repeat/presence/frequency in-kernel over a
+            // per-slot recent-token window; min_p in the top-p tail). A
+            // penalized request decodes as plain AR on the slot engine —
+            // MTP verify accept is a bare greedy argmax and cannot reproduce
+            // penalize-then-argmax — which is the same trade the sequential
+            // MTP path makes.
             // Re-check the fully projected wire request, not only the raw HTTP
             // body: registry/config defaults may have inserted a
             // reasoning control the slot sampler cannot honor.
@@ -2163,35 +2171,14 @@ pub(crate) fn multi_slot_request_supported(body: &serde_json::Value) -> Result<(
     {
         return Err("logprobs are not supported".to_owned());
     }
-    // Penalties: the slot sampler does not implement them. Rather than
-    // refusing every standard client that carries a non-neutral penalty
-    // (which made the endpoint unusable), they are accepted and IGNORED —
-    // logged once per request so the divergence is visible in server logs.
-    for key in ["presence_penalty", "frequency_penalty"] {
-        if let Some(value) = body.get(key).and_then(serde_json::Value::as_f64) {
-            let neutral = if key == "repeat_penalty" { 1.0 } else { 0.0 };
-            if value != neutral {
-                eprintln!(
-                    "[hipfire] multi-slot: ignoring non-neutral {key}={value} \
-                     (not implemented by the slot sampler)"
-                );
-            }
-        }
-    }
-    if let Some(value) = body
-        .get("repeat_penalty")
-        .and_then(serde_json::Value::as_f64)
-    {
-        if value != 1.0 {
-            eprintln!(
-                "[hipfire] multi-slot: ignoring non-neutral repeat_penalty={value} \
-                 (not implemented by the slot sampler)"
-            );
-        }
-    }
+    // Penalties are supported end-to-end on the slot engine (in-kernel
+    // repeat/presence/frequency over a per-slot recent-token window, min_p in
+    // the top-p tail), so non-neutral values are forwarded, not refused or
+    // ignored. A penalized request decodes as plain AR (no MTP verify), see
+    // the multi-slot projection above.
     if let Some(value) = body.get("min_p").and_then(serde_json::Value::as_f64) {
-        if value != 0.0 {
-            return Err("min_p is not supported".to_owned());
+        if !(0.0..=1.0).contains(&value) {
+            return Err("min_p must be within [0, 1]".to_owned());
         }
     }
     if body
@@ -6806,13 +6793,14 @@ mod tests {
         err_contains(serde_json::json!({ "stop": "END" }), "stop");
         err_contains(serde_json::json!({ "logprobs": true }), "logprobs");
         err_contains(serde_json::json!({ "top_logprobs": 5 }), "logprobs");
-        // Non-neutral penalties are ACCEPTED since the slot sampler cannot
-        // apply them — refusing them made the endpoint unusable for standard
-        // clients. They are ignored (logged server-side), so no error here.
+        // Non-neutral penalties are supported end-to-end on the slot engine
+        // (in-kernel repeat/presence/frequency over a per-slot recent-token
+        // window), so they are forwarded — no error here.
         assert!(ok(serde_json::json!({ "presence_penalty": 0.5 })));
         assert!(ok(serde_json::json!({ "frequency_penalty": 0.1 })));
         assert!(ok(serde_json::json!({ "repeat_penalty": 1.05 })));
-        err_contains(serde_json::json!({ "min_p": 0.05 }), "min_p");
+        assert!(ok(serde_json::json!({ "min_p": 0.05 })));
+        err_contains(serde_json::json!({ "min_p": 1.5 }), "min_p");
         err_contains(
             serde_json::json!({ "max_think_tokens": 2 }),
             "reasoning cap",
