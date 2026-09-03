@@ -253,6 +253,17 @@ impl SlotPool {
                 id.0, seq_len, self.cap_tokens
             ));
         }
+        // The device ABI carries seq_len as i32; in paged mode cap_tokens is
+        // admission-only and never preflighted against arena geometry, so the
+        // cap guard above does not implicitly bound it. A pathological
+        // multi_slot_ctx above i32::MAX would truncate on the cast below and
+        // hand kernels a negative length — refuse loudly instead.
+        if seq_len > i32::MAX as usize {
+            return Err(format!(
+                "SlotPool: slot {} seq_len {} exceeds the i32 descriptor ABI",
+                id.0, seq_len
+            ));
+        }
         if let Some(pool) = self.page_pool.as_mut() {
             let bt = self
                 .block_tables[id.0]
@@ -407,6 +418,19 @@ impl SlotPool {
             .as_mut()
             .ok_or_else(|| "share_prefix: pool is not in paged mode".to_string())?;
         pool.share_prefix(&src_snap, dst_bt, n_pages)?;
+        // Complete the fork here instead of leaving it to the caller: a
+        // table with shared pages but live_tokens == 0 would upload fine and
+        // then silently attend to nothing until the next write-frontier
+        // provision happened to fix it.
+        let live = n_pages * PAGE_TOKENS;
+        if live > self.cap_tokens {
+            return Err(format!(
+                "share_prefix: {n_pages} pages ({live} tokens) exceed dst cap {}",
+                self.cap_tokens
+            ));
+        }
+        dst_bt.set_live_tokens(live);
+        self.descs[dst.0].seq_len = live as i32;
         self.block_tables_dirty[dst.0] = true;
         self.dirty = true;
         Ok(())

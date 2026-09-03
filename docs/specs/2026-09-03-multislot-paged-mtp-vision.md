@@ -351,3 +351,113 @@ matrix in `.codeinsight+research/mtp-paged-vl-validate-2026-09-03/RESULTS.md`
 | — | open | PM4/Redline parity for the batched-VL scatter + mrope kernels (owed from a448eb627; no new kernels this session) |
 | — | **closed** | KV-cache tier was hardwired Q8_0 across the whole slot engine (`per_pos_bytes = n_kv_heads·(head_dim/32)·34`, q8-named kernels only). Now tier-generic across the full static ladder — q8, asym{2,3,4}, fwht{2,3,4} — under BOTH the legacy slab pool and the paged pool, with batching/MTP/VL unchanged: (a) `SlotKvTierPlan::resolve` (saddle-core) publishes per-tier K/V bytes-per-pos and rotation-table geometry; (b) `SlotPool`/`PagePool` track separate K/V strides and descriptors carry distinct `legacy_k_base`/`legacy_v_base`; (c) the five rotated tile-batched attention kernels and six batched K-writers were ported to descriptor addressing (`kv_offset_for_k/v` + trailing `slot_descs`/`row_slot`, byte-identical when null — ABI pinned by `kv_slot_desc_port_tests`); (d) the Q8 batched writer gained a `use_v_base` arm so rotated-V writes resolve their own slab base; (e) `forward_slots` dispatches per tier (`kv_write_slots` / `tier_attend_slots`); the single-slot WMMA reduction and WMMA prefill tiles stay q8-gated; (f) swap snapshots carry both strides (format v2) and a per-tier `kv_dtype_tag`; (g) the engine resolves the tier via a dedicated site policy (`qwen35-slots`): full ladder accepted, q8 kept as the slots default because the rotated slots paths lack a GPU validation pass — an explicit `HIPFIRE_KV_MODE=asym3`-style request opts in. Sequential-VL (`HIPFIRE_VL_SEQUENTIAL=1`) is refused under rotated tiers (its flat slab view is q8-only). GPU-validated 2026-09-03 in the ROCm container on gfx1101 (evidence: `.codeinsight+research/kv-tier-validate/RESULTS.md`): (a) kernel ports bit-exact on all six rotated tiers — zero-base parity, non-zero-base understudy isolation, composite-write byte equality, q8 `use_v_base` both directions (`crates/rdna-compute/examples/test_kv_slot_desc_ports.rs`, committed, re-runnable); (b) end-to-end slots serve smoke per tier under legacy AND paged pools (asym3/asym4/fwht2/fwht3/fwht4: coherent greedy answers, correct tier banners and stride math), MTP trace shows healthy draft/accept cycles under asym3+paged (546 lines, advance 3-4), 2-slot concurrency probe PASS (no cross-slot bleed), q8 regression unchanged |
 | — | open (by design) | MTP verify greedy-only; MTP head attention v1 (≈V); multi-image unwired; sequential-VL drops penalties; no CoW/defrag under paged |
+
+## 9. Full-branch audit addendum (2026-09-03, second session)
+
+Deep review of the whole branch (all 36 commits) + hardening pass, base
+dffd24f33 + working tree. Host tests: rdna-compute 243, qwen35 199, runtime
+600, daemon 22 — all pass. GPU validation on gfx1101 (container
+`local/hipfire-ornith:dev-mtp`, Qwen3.5-4B-MQ4 trunk + .mtp + .vl, 2 slots ×
+8192 ctx, greedy, thinking off): AR/MTP × legacy/paged — smoke 4/4 each,
+**MTP-vs-AR greedy identity 4/4 byte-identical on both pools**, full
+regression battery 11/11 on both pools (evidence:
+`.codeinsight+research/multislot-hardening-2026-09-03/`). Binaries under
+test: hipfire `7ba549f1e467947f325ccc734e8b2bc2`, daemon
+`f685a8295f7950fcb32d3c278b35d263`.
+
+Bugs found and fixed this session:
+
+1. **MTP verify lm_head consumed PRE-norm residual** (`mtp_spec.rs`):
+   `pbs.x_batch` is the pre-final-norm residual (the AR path
+   `final_logits_per_slot` norms each row with `output_norm` before its
+   GEMV) but the batched verify fed the raw view to
+   `mtp_trunk_verify_lm_head` — acceptance argmax skewed by the per-channel
+   γ scale, breaking the MTP ≡ AR-at-greedy identity (bonus tokens were
+   never the AR pick). Fixed: `rmsnorm_batched` the verify rows into
+   `state.verify_hidden` staging (matching that buffer's post-norm
+   semantics); `prev_hidden` now copies the staged row directly. Proven by
+   the 4/4 identity result above.
+2. **DN state skew on mid-burst termination** (`mtp_spec.rs` +
+   `serve_engine.rs`): the accept rule stops only on `eos_id`, but
+   `commit_sampled_token` also terminates on auxiliary eot, `max_tokens`,
+   and ctx-cap; the DN repair replayed the FULL `advance` rows, leaving the
+   recurrent state past the store for the rest of the conversation. Fixed:
+   the burst is clamped to `min(remaining max_tokens, remaining ctx room)`
+   and to the first auxiliary terminator before repair, so `advance` ==
+   the rows the store will hold. Trace-verified (`(budget 1)` clamps a
+   full accept to one committed token) and by multi-turn recall
+   ('PORT-9') after a max_tokens=2 MTP burst.
+3. **rope_delta hole on verify-only steps** (`serve_engine.rs`):
+   `inject_mtp_verify_tokens` derived the pos3 need from scheduler-batch
+   emptiness; an MTP-decoding slot emits zero scheduler rows, so a
+   verify-only step (the steady state for a single active MTP slot
+   continuing an image conversation) dropped pos3 entirely — phase-shifted
+   verify queries against the image turn's KV. Fixed: work-level
+   `force_pos3` (same predicate as the scheduler's `any_pos3`) passed into
+   the injection. GPU-verified: image turn → text follow-up with MTP
+   cycles active answers "Red" (both pools).
+4. **Compressed-sidecar MTP head panicked the engine thread** at first
+   draft (`mtp_scratch.logits_compressed` never allocated on the slots
+   path — only the sequential speculator called
+   `ensure_compressed_logits`). Fixed at both slot-engine alloc sites.
+5. **Sampled requests activated MTP** (verify is a bare greedy argmax —
+   cannot reproduce a sampled pick): now gated `temperature <= 1e-6`,
+   mirroring the penalized gate. Default temperature 0.0 keeps MTP on.
+6. **Repeat-window ratchet-down**: the per-step clamp wrote the effective
+   window back into `sample_params[s].repeat_window`, which the next step
+   read as "requested" — freezing the window at the first step's session
+   length for the whole generation. Fixed: requested window carried on
+   `InFlight.repeat_window_req`, clamped fresh each step.
+7. **`max_batch` ignored `mtp_k + 1`**: `prefill_chunk < mtp_k + 1`
+   (operator knobs) overflowed `pbs.max_batch` on the first verify step —
+   an engine-thread panic (serve-hang class). Fixed: sized
+   `max(prefill_chunk, mtp_k + 1) × n_slots`.
+8. **Adaptive-retire counters leaked across requests** on a slot
+   (`clear_work_slot` didn't reset them) — a request ending mid-window
+   left the next one near retirement with a mixed window mean. Reset now.
+9. **Engine-channel `Disconnected` reported as a normal "stop"**
+   (`slots.rs`): an engine-thread death surfaced as a clean truncated
+   answer with the session leaked resident. Now an internal error envelope
+   + session close.
+10. **`.vl` sidecar weight-load failure was silently discarded**
+    (`carriers.rs` `.map_err(..).ok()`): a corrupt/truncated .vl yielded a
+    model whose image gate stayed open with no weights (sequential path
+    panics on unwrap; slots path rejects misleadingly). Now a loud
+    load-time error.
+11. **HFQ data-region truncation**: an intact header+index over a short
+    file panicked the mmap slice path or silently zero-filled the pread
+    tail. Both read paths now detect the overrun/short-read and fail
+    loudly.
+12. **CLI/daemon admission-belt divergence** (§8 open item): the CLI
+    counted `max_tokens + 1024` (one image is ~1700+ pad tokens). In
+    multi-slot mode the CLI now rejects only what the exact daemon belt
+    can never admit (`max_tokens` alone beyond ctx) and defers the rest —
+    the daemon's 400 (already correctly mapped) is the single authority.
+    **§8 CLI-belt open item: closed.**
+13. **Continuation admits had no budget belt**: a multi-turn request in
+    the (cap − max_tokens, cap) window decoded until silent truncation.
+    The engine now rejects the request up front (actionable message) while
+    keeping the session (retry with smaller max_tokens still continues).
+14. **Robustness cluster**: `image_url` now under the same 40 MiB cap with
+    an actionable remote-URL error; `top_k > 64` rejected (was silently
+    capped) with a 400-mapped message; `"vl": true` in the slot-mode
+    loaded ack (was hardcoded false); `HIPFIRE_VL_FILE` set-but-missing
+    warns instead of silently falling back; kv-mode fallback warning
+    echoes the rejected value and chosen default;
+    `vit_attention_qtiled_f32` falls back to the naive kernel for
+    out-of-contract head shapes instead of asserting (engine-thread
+    panic class); `attention_flash_bf16_windowed` asserts the tile
+    kernel's head_dim%128==0 contract; `launch_asym_flash_batched` asserts
+    head_dim%32==0 && <=512 (register-array ceiling);
+    `PrefillBatchScratch::free_gpu` frees the three VL buffers and the
+    allocation projection counts them; `SlotPool::share_prefix` completes
+    the fork (live_tokens + desc.seq_len) instead of trusting the caller;
+    `set_seq_len` refuses lengths beyond the i32 descriptor ABI;
+    `MapleState::new` routes through MAPLE_POLICY instead of hardcoding
+    Q8; stale doc comments corrected (penalty forwarding, batched-kernel
+    kernarg trailing params, maple head-quant help).
+
+Still open (unchanged from §8): PM4/Redline parity for the batched-VL
+scatter + mrope kernels; the by-design MTP limitations. Config-schema
+note: `models`/`aliases` now belong in `models.toml`; older inline
+`[aliases]` config.toml files fail loudly at parse.
