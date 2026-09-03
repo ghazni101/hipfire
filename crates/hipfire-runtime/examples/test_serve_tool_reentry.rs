@@ -53,6 +53,9 @@ fn main() {
         host_budget_bytes: 8 * 1024 * 1024 * 1024,
         swap_dir: std::env::temp_dir().join("hipfire-tool-reentry-swap"),
         is_vl: false,
+        vl_path: None,
+        mtp_k: 0,
+        kv_mode_raw: String::new(),
     })
     .expect("engine");
 

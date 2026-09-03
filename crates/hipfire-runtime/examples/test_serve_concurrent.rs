@@ -69,6 +69,9 @@ fn main() {
         host_budget_bytes: 4 * 1024 * 1024 * 1024,
         swap_dir: std::env::temp_dir().join("hipfire-sp7-swap"),
         is_vl: false,
+        vl_path: None,
+        mtp_k: 0,
+        kv_mode_raw: String::new(),
     })
     .expect("SlotEngine::spawn");
     println!("engine up: {N_SLOTS} slots, {n_clients} clients, {MAX_TOKENS} tokens each");
