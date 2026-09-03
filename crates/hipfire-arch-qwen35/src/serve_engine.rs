@@ -19,7 +19,7 @@ use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 
-use hipfire_runtime::admission::{AdmissionController, ModelFootprint};
+use hipfire_runtime::admission::{AdmissionController, AdmitError, ModelFootprint};
 use hipfire_runtime::serve::{
     send_event, Continuation, DoneReason, EngineStats, Event, SubmitRequest,
 };
@@ -2457,57 +2457,60 @@ fn admit(
         return;
     }
 
-    // Try to open; if the pool is full, evict the LRU idle session first.
-    let id = match rig
-        .sessions
-        .open(&mut rig.pool, &mut rig.adm, rig.cap_tokens)
-    {
-        Ok(id) => id,
-        Err(_) => {
-            let victim = rig.sessions.lru_idle_victim(&busy);
-            match victim {
-                Some(v) => {
-                    if !evict(rig, v) {
-                        let _ = send_event(
-                            &req.reply,
-                            Event::Rejected {
-                                reason: "eviction failed".to_string(),
-                            },
-                        );
-                        stats.lock().expect("stats").note_rejected();
-                        return;
-                    }
-                    stats.lock().expect("stats").note_eviction();
-                    match rig
-                        .sessions
-                        .open(&mut rig.pool, &mut rig.adm, rig.cap_tokens)
-                    {
-                        Ok(id) => id,
-                        Err(e) => {
-                            let _ = send_event(
-                                &req.reply,
-                                Event::Rejected {
-                                    reason: format!("{e:?}"),
-                                },
-                            );
-                            stats.lock().expect("stats").note_rejected();
-                            return;
-                        }
-                    }
-                }
-                None => {
-                    // Every resident session is generating. Reject with a
-                    // reason rather than preempting one or queueing forever.
-                    let _ = send_event(
-                        &req.reply,
-                        Event::Rejected {
-                            reason: "all slots busy".to_string(),
-                        },
-                    );
-                    stats.lock().expect("stats").note_rejected();
-                    return;
-                }
+    // Try to open; when admission refuses, make room from the LRU idle
+    // sessions and retry — bounded by how many victims there are.
+    //
+    // Two distinct shortages need two distinct remedies:
+    // * PoolFull — a slot is the missing resource: PARK the victim to swap
+    //   (its grant stays reserved against the snapshot, which is fine).
+    // * WouldExceedBudget — context grant bytes are the missing resource,
+    //   and parking does not release those (it swaps where they live, it
+    //   does not forgive them), so the retry would fail identically. CLOSE
+    //   the victim instead: its grant returns to the budget and a future
+    //   turn on that conversation simply cold-prefills.
+    // In both cases only IDLE sessions are touched — never an active one.
+    let mut opened = rig.sessions.open(&mut rig.pool, &mut rig.adm, rig.cap_tokens);
+    while opened.is_err() && rig.sessions.lru_idle_victim(&busy).is_some() {
+        let budget_shaped = matches!(
+            opened,
+            Err(AdmitError::WouldExceedBudget { .. })
+        );
+        // Re-derive the victim each pass: the previous remedy consumed it.
+        let victim = rig.sessions.lru_idle_victim(&busy).expect("checked above");
+        if budget_shaped {
+            rig.swap.forget(victim.0);
+            rig.sessions.close(&mut rig.pool, &mut rig.adm, victim);
+            if rig.gpu.slot_trace() {
+                eprintln!(
+                    "[slot-trace] admission budget full -- closed idle session {} to make room",
+                    victim.0
+                );
             }
+        } else {
+            if !evict(rig, victim) {
+                let _ = send_event(
+                    &req.reply,
+                    Event::Rejected { reason: "eviction failed".to_string() },
+                );
+                stats.lock().expect("stats").note_rejected();
+                return;
+            }
+            stats.lock().expect("stats").note_eviction();
+        }
+        opened = rig.sessions.open(&mut rig.pool, &mut rig.adm, rig.cap_tokens);
+    }
+    let id = match opened {
+        Ok(id) => id,
+        Err(e) => {
+            // No idle session left to make room with. Every resident session
+            // is generating. Reject with a reason rather than preempting one
+            // or queueing forever.
+            let _ = send_event(
+                &req.reply,
+                Event::Rejected { reason: format!("{e:?}") },
+            );
+            stats.lock().expect("stats").note_rejected();
+            return;
         }
     };
 
