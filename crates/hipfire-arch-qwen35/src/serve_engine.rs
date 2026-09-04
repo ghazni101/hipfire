@@ -1904,6 +1904,11 @@ fn run_loop(
         // the slot's external-embedding source; until it exists the
         // scheduler holds the slot's rows back (image pads would otherwise
         // embed as the raw pad token).
+        //
+        // All pending vision forwards run in the same iteration so their
+        // prefills batch together in the scheduler's next_batch — splitting
+        // them across iterations would serialize the prefills and cause
+        // inter-token freezes on the slot that prefilled first.
         if !rig.vl_sequential {
             for s in 0..n {
                 if slots[s].is_none() {
@@ -1924,7 +1929,7 @@ fn run_loop(
                         .vision_config
                         .as_ref()
                         .ok_or("VL request but model has no vision config")?;
-                    let emb = hipfire_arch_qwen35_vl::qwen35_vl::vision_forward(
+                    let dev = hipfire_arch_qwen35_vl::qwen35_vl::vision_forward_gpu(
                         &mut rig.gpu,
                         weights,
                         vconfig,
@@ -1932,20 +1937,10 @@ fn run_loop(
                         vl.grid_h,
                         vl.grid_w,
                     )
-                    .map_err(|e| format!("vision_forward: {e}"))?;
-                    let mut dev = rig
-                        .gpu
-                        .zeros(&[emb.len()], DType::F32)
-                        .map_err(|e| format!("vl ext alloc: {e}"))?;
-                    let bytes: &[u8] = unsafe {
-                        std::slice::from_raw_parts(emb.as_ptr() as *const u8, emb.len() * 4)
-                    };
-                    rig.gpu
-                        .hip
-                        .memcpy_htod(&dev.buf, bytes)
-                        .map_err(|e| format!("vl ext upload: {e}"))?;
+                    .map_err(|e| format!("vision_forward_gpu: {e}"))?;
+                    let n_emb = dev.numel() / vconfig.out_hidden_size;
                     rig.vl_ext_devs[s] = Some(dev);
-                    vl.embeddings = emb;
+                    vl.embeddings = vec![0.0f32; n_emb * vconfig.out_hidden_size];
                     vl.dim = rig.config.dim;
                     vl.patches.clear();
                     Ok(())
@@ -1963,9 +1958,6 @@ fn run_loop(
                 }
             }
         }
-
-        // Build the batch: scheduler handles regular slots (including MTP
-        // prefill chunks), then inject MTP verify tokens for slots that
         // produced draft outputs.
         let sched_batch = sched.next_batch(&mut work);
         let batch = if mtp_drafts.iter().any(|d| d.is_some()) {
