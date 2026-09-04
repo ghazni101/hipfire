@@ -982,6 +982,12 @@ fn vl_dump_tensor(
     Ok(())
 }
 
+
+/// Legacy path: runs the vision tower and returns merged embeddings as a
+/// host `Vec<f32>`. Used by the sequential VL path and standalone generation.
+///
+/// The serve hot path uses [`vision_forward_gpu`] instead, which keeps the
+/// result on GPU and skips the D2H+H2D roundtrip.
 pub fn vision_forward(
     gpu: &mut Gpu,
     weights: &VisionWeights,
@@ -990,14 +996,37 @@ pub fn vision_forward(
     grid_h: usize,
     grid_w: usize,
 ) -> HipResult<Vec<f32>> {
-    let h = config.hidden_size;
-    let n = grid_h * grid_w;
-    let patch_dim = 3 * config.temporal_patch_size * config.patch_size * config.patch_size;
-    let t0 = std::time::Instant::now();
-    let dump_dir = std::env::var_os("HIPFIRE_VL_DUMP_DIR").map(std::path::PathBuf::from);
-    let dump_dir = dump_dir.as_deref();
+    let m2 = vision_forward_gpu(gpu, weights, config, patches, grid_h, grid_w)?;
+    let result = gpu.download_f32(&m2)?;
+    gpu.free_tensor(m2)?;
+    Ok(result)
+}
 
-    // Diagnostic stage dumps (env-gated; see `vl_dump_slice`).
+/// Like `vision_forward` but returns the merged embeddings as a `GpuTensor`
+/// instead of downloading to host. This eliminates the D2H+H2D roundtrip
+/// (and its implicit `device_synchronize`) from the serve hot path — the
+/// embeddings stay on GPU and are passed directly to the scatter kernel.
+///
+/// The spatial-merge rearrange is a zero-copy reshape: patches are stored
+/// in 2×2-block-grouped order, so `[n, h]` viewed as `[n_merged, 4, h]` is
+/// already `[n_merged, merge_dim]` in C-order. No kernel or copy needed.
+pub fn vision_forward_gpu(
+    gpu: &mut Gpu,
+    weights: &VisionWeights,
+    config: &VisionConfig,
+    patches: &[f32],
+    grid_h: usize,
+    grid_w: usize,
+) -> HipResult<GpuTensor> {
+    let n = grid_h * grid_w;
+    let h = config.hidden_size;
+    let sms = config.spatial_merge_size;
+    let merged_h = grid_h / sms;
+    let merged_w = grid_w / sms;
+    let n_merged = merged_h * merged_w;
+    let merge_dim = h * sms * sms;
+    let t0 = std::time::Instant::now();
+
     let dump_dir: Option<std::path::PathBuf> =
         std::env::var("HIPFIRE_VL_DUMP_DIR").ok().map(Into::into);
     let dd = dump_dir.as_deref();
@@ -1013,6 +1042,7 @@ pub fn vision_forward(
         n, grid_h, grid_w
     );
 
+    let patch_dim = 3 * config.temporal_patch_size * config.patch_size * config.patch_size;
     if let Some(d) = dd {
         vl_dump_slice(d, "pixel_values", patches, &[n, patch_dim]);
     }
@@ -1021,7 +1051,7 @@ pub fn vision_forward(
     let x_patches = gpu.upload_f32(patches, &[n * patch_dim])?;
 
     // Patch embedding: linear_f16 → [n, h]
-    let x = linear_f16(
+    let mut x = linear_f16(
         gpu,
         &weights.patch_embed_w,
         &x_patches,
@@ -1033,14 +1063,8 @@ pub fn vision_forward(
     gpu.free_tensor(x_patches)?;
     vl_dump_tensor(gpu, dd, "patch_embed", &x, &[n, h])?;
 
-    // Bilinear-interpolate the learned (K×K, h) pos_embed table down to the
-    // actual (grid_h, grid_w) and reorder into 2x2-grouped patch sequence,
-    // then add. HF's `fast_pos_embed_interpolate`.
+    // Position embedding (interpolated + 2x2-grouped reorder) + add.
     let num_grid_per_side = (config.num_position_embeddings as f64).sqrt().round() as usize;
-    // Hard assertion (not debug_assert): a non-square pos_embed table is a
-    // model-config malformation that silently produces wrong indexing in
-    // `fast_pos_embed_interpolate` if we round to the nearest int. Fail loud
-    // at vision_forward entry instead of producing garbage tokens.
     assert_eq!(
         num_grid_per_side * num_grid_per_side,
         config.num_position_embeddings,
@@ -1063,10 +1087,7 @@ pub fn vision_forward(
         vl_dump_slice(d, "pos_embed_interp", &pos_embed_interp, &[n, h]);
     }
 
-    // Compute the 2D rotary cos/sin tables once per image and upload. The
-    // kernel reads `head_dim/2` floats per token for each of cos/sin (HF's
-    // `cat((rope, rope), dim=-1)` makes the two head_dim halves see the same
-    // angle, so we store the half only).
+    // 2D rotary cos/sin tables (uploaded once, read every layer).
     let rot_dim_half = config.head_dim / 2;
     let (rope_cos, rope_sin) = compute_vision_rope_cos_sin(
         grid_h,
@@ -1078,32 +1099,15 @@ pub fn vision_forward(
     let rope_cos_gpu = gpu.upload_f32(&rope_cos, &[n * rot_dim_half])?;
     let rope_sin_gpu = gpu.upload_f32(&rope_sin, &[n * rot_dim_half])?;
 
-    // Scratch buffers reused across layers
-    let qkv_dim = 3 * h;
-
-    // Stream invariant: every kernel below is enqueued on the same default
-    // stream (`gpu.stream_ref()`), and per-layer scratch tensors (`tmp`,
-    // `qkv`, `attn_out`, `proj`, `tmp2`, `fc1`, `fc2`) are freed within the
-    // same iteration. Correctness depends on submission-order serialization:
-    // pool reuse of a freed buffer is fine because the next kernel using
-    // that VRAM is queued AFTER the previous one on the same stream. If
-    // anyone ever refactors `rdna_compute` to use multiple streams for the
-    // vision path (e.g., async memcpy on a side stream), this pattern must
-    // be revisited — either add per-layer syncs or attach kernels to the
-    // freeing buffer's stream. See review notes in `vision_rev_claude.md`.
-    // Attention dispatch: the Q-tiled kernel is the production path (the
-    // per-(head, query) kernel was 1.02 s/layer at a 68x68 grid on gfx1101
-    // — the whole 25 s image-request stall). HIPFIRE_VIT_ATTN=naive forces
-    // the old kernel for rollback/A-B; head shapes outside the Q-tiled
-    // kernel's contract fall back to naive instead of asserting.
     let vit_attn_naive = matches!(
         hipfire_config::developer_var("HIPFIRE_VIT_ATTN").as_deref(),
         Ok("naive")
     ) || config.head_dim % 16 != 0
         || config.head_dim > 128;
-    for li in 0..config.num_layers {
-        let lw = &weights.layers[li];
 
+    // Transformer layers
+    let qkv_dim = 3 * h;
+    for (li, lw) in weights.layers.iter().enumerate() {
         // LayerNorm1 → tmp
         let tmp = gpu.alloc_tensor(&[n * h], DType::F32)?;
         gpu.layernorm_batched(&x, &lw.norm1_w, &lw.norm1_b, &tmp, n, h, config.norm_eps)?;
@@ -1112,7 +1116,7 @@ pub fn vision_forward(
         let qkv = linear_f16(gpu, &lw.qkv_w, &tmp, &lw.qkv_b, qkv_dim, h, n)?;
         gpu.free_tensor(tmp)?;
 
-        // 2D rotary applied in-place to Q and K halves of the QKV buffer.
+        // 2D rotary on Q and K
         gpu.apply_rope_2d_vision_f32(
             &qkv,
             &rope_cos_gpu,
@@ -1123,7 +1127,7 @@ pub fn vision_forward(
             config.head_dim,
         )?;
 
-        // Self-attention on GPU: qkv[n, 3h] → attn_out[n, h]
+        // Self-attention
         let attn_out = gpu.alloc_tensor(&[n * h], DType::F32)?;
         if vit_attn_naive {
             gpu.vit_attention_f32(&qkv, &attn_out, n, h, config.num_heads, config.head_dim)?;
@@ -1132,11 +1136,9 @@ pub fn vision_forward(
         }
         gpu.free_tensor(qkv)?;
 
-        // Output projection → [n, h]
+        // Output projection + residual
         let proj = linear_f16(gpu, &lw.proj_w, &attn_out, &lw.proj_b, h, h, n)?;
         gpu.free_tensor(attn_out)?;
-
-        // Residual: x += proj
         gpu.add_inplace_f32(&x, &proj)?;
         gpu.free_tensor(proj)?;
 
@@ -1144,39 +1146,30 @@ pub fn vision_forward(
         let tmp2 = gpu.alloc_tensor(&[n * h], DType::F32)?;
         gpu.layernorm_batched(&x, &lw.norm2_w, &lw.norm2_b, &tmp2, n, h, config.norm_eps)?;
 
-        // MLP: fc1 → GELU → fc2
+        // MLP: fc1 → GELU → fc2 + residual
         let fc1 = linear_f16(gpu, &lw.fc1_w, &tmp2, &lw.fc1_b, config.mlp_dim, h, n)?;
         gpu.free_tensor(tmp2)?;
         gpu.gelu_tanh_f32(&fc1, &fc1, n * config.mlp_dim)?;
-
         let fc2 = linear_f16(gpu, &lw.fc2_w, &fc1, &lw.fc2_b, h, config.mlp_dim, n)?;
         gpu.free_tensor(fc1)?;
-
-        // Residual: x += fc2
         gpu.add_inplace_f32(&x, &fc2)?;
         gpu.free_tensor(fc2)?;
 
         vl_dump_tensor(gpu, dd, &format!("block_{li:02}"), &x, &[n, h])?;
     }
-    vl_dump_tensor(gpu, dd, "pre_merger", &x, &[n, h])?;
 
-    // Single sync at end of all layers (avoids per-layer sync overhead)
-    gpu.hip.device_synchronize()?;
+    // Free rope tables (no sync needed — they're not used after the loop)
     gpu.free_tensor(rope_cos_gpu)?;
     gpu.free_tensor(rope_sin_gpu)?;
+
+    vl_dump_tensor(gpu, dd, "pre_merger", &x, &[n, h])?;
     eprintln!(
-        "  vision forward complete ({:.2}s)",
-        t0.elapsed().as_secs_f32()
+        "  vision forward complete ({:.2}s, {} layers)",
+        t0.elapsed().as_secs_f64(),
+        config.num_layers
     );
 
-    // Spatial merge: [n, h] → [n_merged, merge_dim] (CPU rearrange, small data)
-    let sms = config.spatial_merge_size;
-    let merged_h = grid_h / sms;
-    let merged_w = grid_w / sms;
-    let n_merged = merged_h * merged_w;
-    let merge_dim = h * sms * sms;
-
-    // LayerNorm all patches
+    // LayerNorm all patches → [n, h]
     let normed = gpu.alloc_tensor(&[n * h], DType::F32)?;
     gpu.layernorm_batched(
         &x,
@@ -1189,27 +1182,13 @@ pub fn vision_forward(
     )?;
     gpu.free_tensor(x)?;
 
-    // Download for 2x2 rearrange (only ~3.6MB, one-time cost)
-    let normed_data = gpu.download_f32(&normed)?;
-    gpu.free_tensor(normed)?;
-
-    // Patches in `normed_data` are stored in 2x2-block-grouped order (see
-    // `extract_patches`), so the 4 patches that merge into one output token
-    // are CONSECUTIVE in the buffer: src indices [out_idx*4 .. out_idx*4+4].
-    let mut merged = vec![0.0f32; n_merged * merge_dim];
-    for my in 0..merged_h {
-        for mx in 0..merged_w {
-            let out_idx = my * merged_w + mx;
-            for sub in 0..(sms * sms) {
-                let src = out_idx * (sms * sms) + sub;
-                merged[out_idx * merge_dim + sub * h..out_idx * merge_dim + sub * h + h]
-                    .copy_from_slice(&normed_data[src * h..src * h + h]);
-            }
-        }
-    }
+    // Spatial merge: zero-copy reshape.
+    // Patches are in 2×2-block-grouped order, so [n, h] viewed as
+    // [n_merged, sms*sms, h] is already [n_merged, merge_dim] in C-order.
+    // Just pass `normed` directly to the merger MLP.
+    let merged_gpu = normed; // rename, no copy
 
     // Merger MLP on GPU
-    let merged_gpu = gpu.upload_f32(&merged, &[n_merged * merge_dim])?;
     let m1 = linear_f16(
         gpu,
         &weights.merger_fc1_w,
@@ -1231,25 +1210,23 @@ pub fn vision_forward(
         merge_dim,
         n_merged,
     )?;
-    gpu.free_tensor(m1)?;
+    // Sync so the timing below reflects actual GPU execution time, not just
+    // CPU enqueue time. Without this, back-to-back vision forwards report
+    // misleadingly fast times — the second one absorbs the first one's GPU
+    // wait, making it appear 100× slower.
+    gpu.hip.device_synchronize()?;
 
-    let result = gpu.download_f32(&m2)?;
-    gpu.free_tensor(m2)?;
     if let Some(d) = dd {
-        vl_dump_slice(
-            d,
-            "post_merger",
-            &result,
-            &[n_merged, config.out_hidden_size],
-        );
-        vl_dump_slice(d, "merged_pre_mlp", &merged, &[n_merged, merge_dim]);
+        // Download only for dump, not on the hot path
+        let result = gpu.download_f32(&m2)?;
+        vl_dump_slice(d, "post_merger", &result, &[n_merged, config.out_hidden_size]);
     }
 
     eprintln!(
         "  vision done: {} tokens × {} dims ({:.2}s)",
         n_merged,
         config.out_hidden_size,
-        t0.elapsed().as_secs_f32()
+        t0.elapsed().as_secs_f64()
     );
-    Ok(result)
+    Ok(m2)
 }
