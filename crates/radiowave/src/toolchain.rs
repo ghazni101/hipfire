@@ -1,9 +1,9 @@
 // SPDX-License-Identifier: Apache-2.0
 // SPDX-FileCopyrightText: 2026 Kaden Schutt <kaden@hipfire.dev>
 
-//! ROCm 7.14 toolchain facts for radiowave.
+//! ROCm 10.0 toolchain facts for radiowave.
 //!
-//! Verified on hipcc 7.14.60850 / AMD clang 23.0.0git under `/opt/rocm/core`
+//! Verified on hipcc 7.15.26333 / AMD clang 23.0.0git under `/opt/rocm/core`
 //! (ROCM_PATH-sensitive layout). `llc` is **absent** from this install, so
 //! scheduler `-mllvm -amdgpu-*` knobs stay passthrough-only — no live
 //! enumeration via `llc --help-hidden`.
@@ -16,7 +16,7 @@ use std::process::Command;
 /// Snapshot of the hipcc / amdclang toolchain radiowave will invoke.
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ToolchainInfo {
-    /// HIP package version string (e.g. `"7.14.60850-0000000"`).
+    /// HIP package version string (e.g. `"7.15.26333-0000000"`).
     pub hip_version: String,
     /// AMD clang version string (e.g. `"23.0.0git"`).
     pub clang_version: String,
@@ -24,7 +24,7 @@ pub struct ToolchainInfo {
     pub offload_arches: Vec<String>,
     /// Whether an `llc` binary sits next to hipcc / in the clang install dir.
     ///
-    /// Mining proved `llc` absent on ROCm 7.14 core — expect `false`.
+    /// Mining proved `llc` absent on ROCm 10.0 core — expect `false`.
     pub llc_available: bool,
     /// Clang resource directory (`…/lib/clang/23`), derived from InstalledDir.
     pub resource_dir: PathBuf,
@@ -38,9 +38,9 @@ impl ToolchainInfo {
     }
 }
 
-/// Minimum accepted HIP major.minor for radiowave (ROCm 7.14 floor).
+/// Minimum accepted HIP major.minor for radiowave (ROCm 10.0 floor).
 pub const MIN_HIP_MAJOR: u32 = 7;
-pub const MIN_HIP_MINOR: u32 = 14;
+pub const MIN_HIP_MINOR: u32 = 15;
 
 /// Probe the toolchain rooted at `hipcc`.
 ///
@@ -53,7 +53,7 @@ pub const MIN_HIP_MINOR: u32 = 14;
 ///
 /// # Errors
 /// Returns [`Error::ToolFailed`] / [`Error::Io`] when version probes fail,
-/// [`Error::UnsupportedHipVersion`] when HIP is below 7.14,
+/// [`Error::UnsupportedHipVersion`] when HIP is below 7.15,
 /// or [`Error::InvalidCertification`] when version text / arches cannot be
 /// established.
 pub fn probe(hipcc: &Path) -> Result<ToolchainInfo> {
@@ -75,11 +75,11 @@ pub fn probe(hipcc: &Path) -> Result<ToolchainInfo> {
     let clang_version = parse_clang_version(&clang_out)
         .or_else(|| parse_clang_version(&hipcc_out))
         .ok_or_else(|| {
-            // 7.14-only: generic upstream `clang version` banners are rejected.
+            // 10.0-only: generic upstream `clang version` banners are rejected.
             // AMD's toolchain always prints `AMD clang version …`.
             Error::NonAmdClang(format!(
                 "toolchain did not report an AMD clang version banner \
-                 (requires ROCm >= 7.14 / amdclang); got:\n{clang_out}"
+                 (requires ROCm >= 10.0 / amdclang); got:\n{clang_out}"
             ))
         })?;
 
@@ -122,7 +122,7 @@ pub fn ensure_hip_at_least(hip_version: &str, major: u32, minor: u32) -> Result<
     })
 }
 
-/// Extract `(major, minor)` from strings like `7.14.60850-0000000`.
+/// Extract `(major, minor)` from strings like `7.15.26333-0000000`.
 pub fn parse_hip_major_minor(text: &str) -> Option<(u32, u32)> {
     let mut parts = text.split(|c: char| !c.is_ascii_digit());
     let major = parts.next()?.parse().ok()?;
@@ -168,7 +168,7 @@ fn run_version(tool: &Path, label: &str) -> Result<String> {
     Ok(combined)
 }
 
-/// Parse `HIP version: 7.14.60850-0000000` from hipcc --version text.
+/// Parse `HIP version: 7.15.26333-0000000` from hipcc --version text.
 pub fn parse_hip_version(text: &str) -> Option<String> {
     for line in text.lines() {
         let line = line.trim();
@@ -184,7 +184,7 @@ pub fn parse_hip_version(text: &str) -> Option<String> {
 
 /// Parse `AMD clang version 23.0.0git (...)` from amdclang/hipcc --version text.
 ///
-/// **AMD marker required** (7.14-only policy): only lines starting with
+/// **AMD marker required** (10.0-only policy): only lines starting with
 /// `AMD clang version` are accepted. Generic upstream `clang version N.M.P`
 /// banners return `None` so callers can surface [`Error::NonAmdClang`].
 pub fn parse_clang_version(text: &str) -> Option<String> {
@@ -200,7 +200,7 @@ pub fn parse_clang_version(text: &str) -> Option<String> {
     None
 }
 
-/// Parse `InstalledDir: /opt/rocm/core-7.14/lib/llvm/bin`.
+/// Parse `InstalledDir: /opt/rocm/core-10.0/lib/llvm/bin`.
 pub fn parse_installed_dir(text: &str) -> Option<String> {
     for line in text.lines() {
         let line = line.trim();
@@ -257,9 +257,9 @@ fn llc_present(hipcc: &Path, installed_dir: Option<&Path>) -> bool {
     if let Some(dir) = installed_dir {
         candidates.push(dir.join("llc"));
     }
-    // Canonical 7.14 llvm bin (ROCM_PATH=/opt/rocm/core layout).
+    // Canonical 10.0 llvm bin (ROCM_PATH=/opt/rocm/core layout).
     candidates.push(PathBuf::from("/opt/rocm/core/lib/llvm/bin/llc"));
-    candidates.push(PathBuf::from("/opt/rocm/core-7.14/lib/llvm/bin/llc"));
+    candidates.push(PathBuf::from("/opt/rocm/core-10.0/lib/llvm/bin/llc"));
     candidates.iter().any(|p| p.is_file())
 }
 
@@ -290,12 +290,12 @@ fn resolve_resource_dir(
         }
     }
 
-    // Last resort stable 7.14 core layout.
+    // Last resort stable 10.0 core layout.
     let fallback = PathBuf::from("/opt/rocm/core/lib/llvm/lib/clang/23");
     if fallback.is_dir() {
         return Ok(fallback);
     }
-    let fallback714 = PathBuf::from("/opt/rocm/core-7.14/lib/llvm/lib/clang/23");
+    let fallback714 = PathBuf::from("/opt/rocm/core-10.0/lib/llvm/lib/clang/23");
     if fallback714.is_dir() {
         return Ok(fallback714);
     }
@@ -341,7 +341,7 @@ fn probe_offload_arches(hipcc: &Path) -> Result<Vec<String>> {
     }
     // Documented TheRock / core fallbacks only after hipcc-local tools.
     tools.push(PathBuf::from("/opt/rocm/core/bin/offload-arch"));
-    tools.push(PathBuf::from("/opt/rocm/core-7.14/bin/offload-arch"));
+    tools.push(PathBuf::from("/opt/rocm/core-10.0/bin/offload-arch"));
     tools.push(PathBuf::from("/opt/rocm/core/lib/llvm/bin/offload-arch"));
     tools.push(PathBuf::from("/opt/rocm/core/lib/llvm/bin/amdgpu-arch"));
 
@@ -363,7 +363,7 @@ fn probe_offload_arches(hipcc: &Path) -> Result<Vec<String>> {
     // rocminfo fallback when offload-arch is missing — still prefer hipcc root.
     let mut rocminfo_candidates = vec![sibling_of(hipcc, "rocminfo")];
     rocminfo_candidates.push(PathBuf::from("/opt/rocm/core/bin/rocminfo"));
-    rocminfo_candidates.push(PathBuf::from("/opt/rocm/core-7.14/bin/rocminfo"));
+    rocminfo_candidates.push(PathBuf::from("/opt/rocm/core-10.0/bin/rocminfo"));
     rocminfo_candidates.push(PathBuf::from("rocminfo"));
 
     for tool in &rocminfo_candidates {
@@ -386,13 +386,13 @@ fn probe_offload_arches(hipcc: &Path) -> Result<Vec<String>> {
 mod tests {
     use super::*;
 
-    /// Fixed sample from hipcc --version on ROCm 7.14.60850 (no process spawn).
+    /// Fixed sample from hipcc --version on ROCm 10.0.60850 (no process spawn).
     const HIPCC_VERSION_SAMPLE: &str = "\
-HIP version: 7.14.60850-0000000
+HIP version: 7.15.26333-0000000
 AMD clang version 23.0.0git (https://github.com/ROCm/llvm-project.git 46fcb339fb61119b337f973c7ca9e710a319fdd0+PATCHED:440716f8b87be9d8e20ed910e10e5b6d14d57cf6)
 Target: x86_64-unknown-linux-gnu
 Thread model: posix
-InstalledDir: /opt/rocm/core-7.14/lib/llvm/bin
+InstalledDir: /opt/rocm/core-10.0/lib/llvm/bin
 ";
 
     /// Fixed sample from amdclang++ --version on the same install.
@@ -400,14 +400,14 @@ InstalledDir: /opt/rocm/core-7.14/lib/llvm/bin
 AMD clang version 23.0.0git (https://github.com/ROCm/llvm-project.git 46fcb339fb61119b337f973c7ca9e710a319fdd0+PATCHED:440716f8b87be9d8e20ed910e10e5b6d14d57cf6)
 Target: x86_64-unknown-linux-gnu
 Thread model: posix
-InstalledDir: /opt/rocm/core-7.14/lib/llvm/bin
+InstalledDir: /opt/rocm/core-10.0/lib/llvm/bin
 ";
 
     #[test]
     fn parses_hipcc_version_sample() {
         assert_eq!(
             parse_hip_version(HIPCC_VERSION_SAMPLE).as_deref(),
-            Some("7.14.60850-0000000")
+            Some("7.15.26333-0000000")
         );
         assert_eq!(
             parse_clang_version(HIPCC_VERSION_SAMPLE).as_deref(),
@@ -415,7 +415,7 @@ InstalledDir: /opt/rocm/core-7.14/lib/llvm/bin
         );
         assert_eq!(
             parse_installed_dir(HIPCC_VERSION_SAMPLE).as_deref(),
-            Some("/opt/rocm/core-7.14/lib/llvm/bin")
+            Some("/opt/rocm/core-10.0/lib/llvm/bin")
         );
     }
 
@@ -428,7 +428,7 @@ InstalledDir: /opt/rocm/core-7.14/lib/llvm/bin
         assert!(parse_hip_version(AMDCLANG_VERSION_SAMPLE).is_none());
         assert_eq!(
             parse_installed_dir(AMDCLANG_VERSION_SAMPLE).as_deref(),
-            Some("/opt/rocm/core-7.14/lib/llvm/bin")
+            Some("/opt/rocm/core-10.0/lib/llvm/bin")
         );
     }
     #[test]
@@ -461,12 +461,12 @@ InstalledDir: /usr/bin
         // Named error path used by probe when only upstream clang is present.
         let err = Error::NonAmdClang(
             "toolchain did not report an AMD clang version banner \
-             (requires ROCm >= 7.14 / amdclang)"
+             (requires ROCm >= 10.0 / amdclang)"
                 .to_owned(),
         );
         let msg = err.to_string();
         assert!(
-            msg.contains("AMD clang") && msg.contains("requires ROCm >= 7.14"),
+            msg.contains("AMD clang") && msg.contains("requires ROCm >= 10.0"),
             "{msg}"
         );
     }
@@ -480,17 +480,17 @@ InstalledDir: /usr/bin
 
     #[test]
     fn hip_major_minor_and_floor_gate() {
-        assert_eq!(parse_hip_major_minor("7.14.60850-0000000"), Some((7, 14)));
+        assert_eq!(parse_hip_major_minor("7.15.26333-0000000"), Some((7, 14)));
         assert_eq!(parse_hip_major_minor("7.13.0"), Some((7, 13)));
         assert!(parse_hip_major_minor("not-a-version").is_none());
 
-        assert!(ensure_hip_at_least("7.14.60850-0000000", 7, 14).is_ok());
+        assert!(ensure_hip_at_least("7.15.26333-0000000", 7, 14).is_ok());
         assert!(ensure_hip_at_least("8.0.0", 7, 14).is_ok());
         let err = ensure_hip_at_least("7.13.1", 7, 14).unwrap_err();
         match err {
             Error::UnsupportedHipVersion { found, required } => {
                 assert!(found.starts_with("7.13"));
-                assert_eq!(required, "7.14");
+                assert_eq!(required, "7.15");
             }
             other => panic!("expected UnsupportedHipVersion, got {other}"),
         }
@@ -520,11 +520,11 @@ InstalledDir: /usr/bin
     #[test]
     fn llc_absent_forces_mllvm_passthrough_only() {
         let info = ToolchainInfo {
-            hip_version: "7.14.60850-0000000".to_owned(),
+            hip_version: "7.15.26333-0000000".to_owned(),
             clang_version: "23.0.0git".to_owned(),
             offload_arches: vec!["gfx1201".to_owned()],
             llc_available: false,
-            resource_dir: PathBuf::from("/opt/rocm/core-7.14/lib/llvm/lib/clang/23"),
+            resource_dir: PathBuf::from("/opt/rocm/core-10.0/lib/llvm/lib/clang/23"),
         };
         assert!(info.scheduler_mllvm_passthrough_only());
         // Enumeration is forbidden when llc is missing — no help-hidden scrape.

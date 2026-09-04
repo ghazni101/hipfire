@@ -58,11 +58,11 @@ GPU_ARCH=gfx1100 \
 The build uses the selected CK sources directly and has no PyTorch dependency.
 No `.so` is copied into or committed to hipfire.
 
-The validated local build used ROCm 7.14:
+The validated local build used ROCm 10.0:
 
 ```text
-HIP version: 7.14.60850-0000000
-RUNPATH: /opt/rocm/core-7.14/lib
+HIP version: 7.15.26333-0000000
+RUNPATH: /opt/rocm/core-10.0/lib
 NEEDED: libamdhip64.so.7
 ```
 
@@ -80,7 +80,7 @@ The pure-HIP smoke runs dense FP16 MHA/MQA/GQA and packed Q8 D256 GQA cases
 against CPU references. The Q8 reference uses reconstructed quantized values,
 so it checks staging and attention independently of quantization error.
 
-Validated on Radeon Pro W7900 / gfx1100 with ROCm 7.14:
+Validated on Radeon Pro W7900 / gfx1100 with ROCm 10.0:
 
 | Case | max abs | mean abs |
 | --- | ---: | ---: |

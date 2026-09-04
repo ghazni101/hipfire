@@ -1,295 +1,295 @@
-# Golden Redline reproduction
+# | 10.0 | | 10.0 **10.0**Golden | 10.0 | | 10.0 **10.0**Redline | 10.0 | | 10.0 **10.0**reproduction
 
-One-command, fail-closed reproduction of the measured Qwen 3.6 35B-A3B MQ4R
-retained-PM4 routes on gfx1100, gfx1151, and gfx1201.
+One-command, | 10.0 | | 10.0 **10.0**fail-closed | 10.0 | | 10.0 **10.0**reproduction | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**measured | 10.0 | | 10.0 **10.0**Qwen | 10.0 | | 10.0 **10.0**3.6 | 10.0 | | 10.0 **10.0**35B-A3B | 10.0 | | 10.0 **10.0**MQ4R
+retained-PM4 | 10.0 | | 10.0 **10.0**routes | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**gfx1100, | 10.0 | | 10.0 **10.0**gfx1151, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**gfx1201.
 
-| Field | Value |
+| | 10.0 | | 10.0 **10.0**Field | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Value | 10.0 | | 10.0 **10.0**|
 |---|---|
-| Page state | **branch-implemented** |
-| Fixture registry | [`registry/redline-golden-v1.json`](../registry/redline-golden-v1.json) |
-| Runner | [`tools/redline/golden.py`](../tools/redline/golden.py) (`python3 -m tools.redline golden`) |
-| Product harness | [`tools/redline/product_bench.py`](../tools/redline/product_bench.py) (`python3 -m tools.redline bench`) |
-| Certification policy | [`REDLINE.md`](REDLINE.md) |
+| | 10.0 | | 10.0 **10.0**Page | 10.0 | | 10.0 **10.0**state | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0****branch-implemented** | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**Fixture | 10.0 | | 10.0 **10.0**registry | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**[`registry/redline-golden-v1.json`](../registry/redline-golden-v1.json) | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**Runner | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**[`tools/redline/golden.py`](../tools/redline/golden.py) | 10.0 | | 10.0 **10.0**(`python3 | 10.0 | | 10.0 **10.0**-m | 10.0 | | 10.0 **10.0**tools.redline | 10.0 | | 10.0 **10.0**golden`) | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**Product | 10.0 | | 10.0 **10.0**harness | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**[`tools/redline/product_bench.py`](../tools/redline/product_bench.py) | 10.0 | | 10.0 **10.0**(`python3 | 10.0 | | 10.0 **10.0**-m | 10.0 | | 10.0 **10.0**tools.redline | 10.0 | | 10.0 **10.0**bench`) | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**Certification | 10.0 | | 10.0 **10.0**policy | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**[`REDLINE.md`](REDLINE.md) | 10.0 | | 10.0 **10.0**|
 
-This runner is developer orchestration. Persistent product configuration still
-goes through the native Rust `hipfire` CLI. Passing a golden reproduction does
-not create a model/route admission; admissions remain owned exclusively by
+This | 10.0 | | 10.0 **10.0**runner | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**developer | 10.0 | | 10.0 **10.0**orchestration. | 10.0 | | 10.0 **10.0**Persistent | 10.0 | | 10.0 **10.0**product | 10.0 | | 10.0 **10.0**configuration | 10.0 | | 10.0 **10.0**still
+goes | 10.0 | | 10.0 **10.0**through | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**native | 10.0 | | 10.0 **10.0**Rust | 10.0 | | 10.0 **10.0**`hipfire` | 10.0 | | 10.0 **10.0**CLI. | 10.0 | | 10.0 **10.0**Passing | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**golden | 10.0 | | 10.0 **10.0**reproduction | 10.0 | | 10.0 **10.0**does
+not | 10.0 | | 10.0 **10.0**create | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**model/route | 10.0 | | 10.0 **10.0**admission; | 10.0 | | 10.0 **10.0**admissions | 10.0 | | 10.0 **10.0**remain | 10.0 | | 10.0 **10.0**owned | 10.0 | | 10.0 **10.0**exclusively | 10.0 | | 10.0 **10.0**by
 [`admissions.yml`](admissions.yml).
 
-## Run it
+## | 10.0 | | 10.0 **10.0**Run | 10.0 | | 10.0 **10.0**it
 
-From a source checkout:
-
-```bash
-python3 -m tools.redline golden
-```
-
-The runner:
-
-1. selects the fixture for the physical GPU selected by `--device`;
-2. filters that physical device through ROCr and exposes it to HIP as logical
-   device zero;
-3. verifies the checked-in MQ4R registry card and sampling-profile hashes;
-4. verifies the exact 18.7 GB model size and SHA-256 before GPU load;
-5. builds the release daemon when it is absent;
-6. runs the product TG128 HIP-versus-retained-PM4 benchmark with the sealed
-   Q8, context, warmup, stationarity, transport, and PM4-policy parameters;
-7. requires positive timed-arm route proof and the exact architecture-specific
-   tape/prepared identity;
-8. checks the architecture-specific throughput and speedup floors; and
-9. writes both the raw product report and a hashed golden attestation under
-   `.redline-work/golden/`.
-
-Useful forms:
+From | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**source | 10.0 | | 10.0 **10.0**checkout:
 
 ```bash
-# Show fixtures without touching a GPU.
-python3 -m tools.redline golden --list
-
-# Pull the model when absent and pin it as the default after a pass.
-python3 -m tools.redline golden --pull --set-default --yes
-
-# Select a physical device on a multi-GPU host.
-python3 -m tools.redline golden --device 3
-
-# Print the exact command without building, hashing, loading, or running.
-python3 -m tools.redline golden --arch gfx1201 --dry-run
-
-# Audit an existing report; exact source and daemon hashes are mandatory here.
-python3 -m tools.redline golden \
-  --arch gfx1100 \
-  --report /path/to/report.json \
-  --strict-binary
+python3 | 10.0 | | 10.0 **10.0**-m | 10.0 | | 10.0 **10.0**tools.redline | 10.0 | | 10.0 **10.0**golden
 ```
 
-The stationarity ceiling is 120 TG128 rows. This preserves the existing slope,
-spread, confirmation, and median-drift criteria while allowing slow cold-start
-clock convergence. It does not relax the acceptance gates.
+The | 10.0 | | 10.0 **10.0**runner:
 
-## Reproducing on a box that disagrees
+1. | 10.0 | | 10.0 **10.0**selects | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**fixture | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**physical | 10.0 | | 10.0 **10.0**GPU | 10.0 | | 10.0 **10.0**selected | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**`--device`;
+2. | 10.0 | | 10.0 **10.0**filters | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**physical | 10.0 | | 10.0 **10.0**device | 10.0 | | 10.0 **10.0**through | 10.0 | | 10.0 **10.0**ROCr | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**exposes | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**HIP | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**logical
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**device | 10.0 | | 10.0 **10.0**zero;
+3. | 10.0 | | 10.0 **10.0**verifies | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**checked-in | 10.0 | | 10.0 **10.0**MQ4R | 10.0 | | 10.0 **10.0**registry | 10.0 | | 10.0 **10.0**card | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**sampling-profile | 10.0 | | 10.0 **10.0**hashes;
+4. | 10.0 | | 10.0 **10.0**verifies | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**exact | 10.0 | | 10.0 **10.0**18.7 | 10.0 | | 10.0 **10.0**GB | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**size | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**SHA-256 | 10.0 | | 10.0 **10.0**before | 10.0 | | 10.0 **10.0**GPU | 10.0 | | 10.0 **10.0**load;
+5. | 10.0 | | 10.0 **10.0**builds | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**release | 10.0 | | 10.0 **10.0**daemon | 10.0 | | 10.0 **10.0**when | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**absent;
+6. | 10.0 | | 10.0 **10.0**runs | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**product | 10.0 | | 10.0 **10.0**TG128 | 10.0 | | 10.0 **10.0**HIP-versus-retained-PM4 | 10.0 | | 10.0 **10.0**benchmark | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**sealed
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**Q8, | 10.0 | | 10.0 **10.0**context, | 10.0 | | 10.0 **10.0**warmup, | 10.0 | | 10.0 **10.0**stationarity, | 10.0 | | 10.0 **10.0**transport, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**PM4-policy | 10.0 | | 10.0 **10.0**parameters;
+7. | 10.0 | | 10.0 **10.0**requires | 10.0 | | 10.0 **10.0**positive | 10.0 | | 10.0 **10.0**timed-arm | 10.0 | | 10.0 **10.0**route | 10.0 | | 10.0 **10.0**proof | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**exact | 10.0 | | 10.0 **10.0**architecture-specific
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**tape/prepared | 10.0 | | 10.0 **10.0**identity;
+8. | 10.0 | | 10.0 **10.0**checks | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**architecture-specific | 10.0 | | 10.0 **10.0**throughput | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**speedup | 10.0 | | 10.0 **10.0**floors; | 10.0 | | 10.0 **10.0**and
+9. | 10.0 | | 10.0 **10.0**writes | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**raw | 10.0 | | 10.0 **10.0**product | 10.0 | | 10.0 **10.0**report | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**hashed | 10.0 | | 10.0 **10.0**golden | 10.0 | | 10.0 **10.0**attestation | 10.0 | | 10.0 **10.0**under
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`.redline-work/golden/`.
 
-`python3 -m tools.redline golden` pins the model, sampling profile, benchmark contract, PM4
-policy and route identity — but not the compiled code objects or the host
-toolchain. When a contributor reports the same route identity (same dispatch
-count, kernel count and sequence hash) with different throughput, the
-divergence is below the tape and none of the above will catch it.
-
-`scripts/redline-repro-package.sh` closes that gap.
+Useful | 10.0 | | 10.0 **10.0**forms:
 
 ```bash
-# On a box where the fixture passes, right after a successful golden run:
-scripts/redline-repro-package.sh capture --arch gfx1201
+# | 10.0 | | 10.0 **10.0**Show | 10.0 | | 10.0 **10.0**fixtures | 10.0 | | 10.0 **10.0**without | 10.0 | | 10.0 **10.0**touching | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**GPU.
+python3 | 10.0 | | 10.0 **10.0**-m | 10.0 | | 10.0 **10.0**tools.redline | 10.0 | | 10.0 **10.0**golden | 10.0 | | 10.0 **10.0**--list
 
-# On the box that cannot reproduce:
-scripts/redline-repro-package.sh verify --package repro-gfx1201-*.tar.gz
-scripts/redline-repro-package.sh run    --package repro-gfx1201-*.tar.gz --pin-kernels
+# | 10.0 | | 10.0 **10.0**Pull | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**when | 10.0 | | 10.0 **10.0**absent | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**pin | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**default | 10.0 | | 10.0 **10.0**after | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**pass.
+python3 | 10.0 | | 10.0 **10.0**-m | 10.0 | | 10.0 **10.0**tools.redline | 10.0 | | 10.0 **10.0**golden | 10.0 | | 10.0 **10.0**--pull | 10.0 | | 10.0 **10.0**--set-default | 10.0 | | 10.0 **10.0**--yes
+
+# | 10.0 | | 10.0 **10.0**Select | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**physical | 10.0 | | 10.0 **10.0**device | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**multi-GPU | 10.0 | | 10.0 **10.0**host.
+python3 | 10.0 | | 10.0 **10.0**-m | 10.0 | | 10.0 **10.0**tools.redline | 10.0 | | 10.0 **10.0**golden | 10.0 | | 10.0 **10.0**--device | 10.0 | | 10.0 **10.0**3
+
+# | 10.0 | | 10.0 **10.0**Print | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**exact | 10.0 | | 10.0 **10.0**command | 10.0 | | 10.0 **10.0**without | 10.0 | | 10.0 **10.0**building, | 10.0 | | 10.0 **10.0**hashing, | 10.0 | | 10.0 **10.0**loading, | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**running.
+python3 | 10.0 | | 10.0 **10.0**-m | 10.0 | | 10.0 **10.0**tools.redline | 10.0 | | 10.0 **10.0**golden | 10.0 | | 10.0 **10.0**--arch | 10.0 | | 10.0 **10.0**gfx1201 | 10.0 | | 10.0 **10.0**--dry-run
+
+# | 10.0 | | 10.0 **10.0**Audit | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**existing | 10.0 | | 10.0 **10.0**report; | 10.0 | | 10.0 **10.0**exact | 10.0 | | 10.0 **10.0**source | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**daemon | 10.0 | | 10.0 **10.0**hashes | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**mandatory | 10.0 | | 10.0 **10.0**here.
+python3 | 10.0 | | 10.0 **10.0**-m | 10.0 | | 10.0 **10.0**tools.redline | 10.0 | | 10.0 **10.0**golden | 10.0 | | 10.0 **10.0**\
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**--arch | 10.0 | | 10.0 **10.0**gfx1100 | 10.0 | | 10.0 **10.0**\
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**--report | 10.0 | | 10.0 **10.0**/path/to/report.json | 10.0 | | 10.0 **10.0**\
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**--strict-binary
 ```
 
-The package is ~156 KB and carries the 46 compiled code objects with a manifest
-hash, the ROCm and code-generator versions, GPU state, the PM4 policy, the
-acceptance floors, the required tape, and the reference attestation.
+The | 10.0 | | 10.0 **10.0**stationarity | 10.0 | | 10.0 **10.0**ceiling | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**120 | 10.0 | | 10.0 **10.0**TG128 | 10.0 | | 10.0 **10.0**rows. | 10.0 | | 10.0 **10.0**This | 10.0 | | 10.0 **10.0**preserves | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**existing | 10.0 | | 10.0 **10.0**slope,
+spread, | 10.0 | | 10.0 **10.0**confirmation, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**median-drift | 10.0 | | 10.0 **10.0**criteria | 10.0 | | 10.0 **10.0**while | 10.0 | | 10.0 **10.0**allowing | 10.0 | | 10.0 **10.0**slow | 10.0 | | 10.0 **10.0**cold-start
+clock | 10.0 | | 10.0 **10.0**convergence. | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**does | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**relax | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**acceptance | 10.0 | | 10.0 **10.0**gates.
 
-`verify` classifies every difference as BLOCKING (arch, model SHA-256, PM4
-policy) or ADVISORY (source commit, daemon hash, ROCm version, code-generator
-version, code-object manifest) and exits 2 on a blocking mismatch. `--force`
-proceeds anyway.
+## | 10.0 | | 10.0 **10.0**Reproducing | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**box | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**disagrees
 
-`--pin-kernels` installs the packaged code objects into
-`kernels/compiled/<arch>/` and shadows the device compilers with failing stubs,
-so the engine takes its "pre-compiled blob, no compiler available" branch and
-runs *our* binaries rather than rebuilding with the local toolchain. The engine
-prints `Output may be incorrect` in that state; under `--pin-kernels` that
-warning is expected and is the confirmation the pinning took effect. A pinned
-run recompiles nothing, which shows up as a much shorter warm-up.
+`python3 | 10.0 | | 10.0 **10.0**-m | 10.0 | | 10.0 **10.0**tools.redline | 10.0 | | 10.0 **10.0**golden` | 10.0 | | 10.0 **10.0**pins | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**model, | 10.0 | | 10.0 **10.0**sampling | 10.0 | | 10.0 **10.0**profile, | 10.0 | | 10.0 **10.0**benchmark | 10.0 | | 10.0 **10.0**contract, | 10.0 | | 10.0 **10.0**PM4
+policy | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**route | 10.0 | | 10.0 **10.0**identity | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**compiled | 10.0 | | 10.0 **10.0**code | 10.0 | | 10.0 **10.0**objects | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**host
+toolchain. | 10.0 | | 10.0 **10.0**When | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**contributor | 10.0 | | 10.0 **10.0**reports | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**route | 10.0 | | 10.0 **10.0**identity | 10.0 | | 10.0 **10.0**(same | 10.0 | | 10.0 **10.0**dispatch
+count, | 10.0 | | 10.0 **10.0**kernel | 10.0 | | 10.0 **10.0**count | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**sequence | 10.0 | | 10.0 **10.0**hash) | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**different | 10.0 | | 10.0 **10.0**throughput, | 10.0 | | 10.0 **10.0**the
+divergence | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**below | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**tape | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**none | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**above | 10.0 | | 10.0 **10.0**will | 10.0 | | 10.0 **10.0**catch | 10.0 | | 10.0 **10.0**it.
 
-Note the stubs shadow only the compiler *names* — `rocminfo`, `rocm-smi` and
-the rest of `PATH` stay reachable. Removing whole `PATH` directories instead
-would strip device detection along with the compilers and hang the bench.
+`scripts/redline-repro-package.sh` | 10.0 | | 10.0 **10.0**closes | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**gap.
 
-## What counts as a pass
+```bash
+# | 10.0 | | 10.0 **10.0**On | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**box | 10.0 | | 10.0 **10.0**where | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**fixture | 10.0 | | 10.0 **10.0**passes, | 10.0 | | 10.0 **10.0**right | 10.0 | | 10.0 **10.0**after | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**successful | 10.0 | | 10.0 **10.0**golden | 10.0 | | 10.0 **10.0**run:
+scripts/redline-repro-package.sh | 10.0 | | 10.0 **10.0**capture | 10.0 | | 10.0 **10.0**--arch | 10.0 | | 10.0 **10.0**gfx1201
 
-Identity is exact. Performance is an evidence-bound floor rather than a demand
-that every board produce the same final decimal.
+# | 10.0 | | 10.0 **10.0**On | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**box | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**cannot | 10.0 | | 10.0 **10.0**reproduce:
+scripts/redline-repro-package.sh | 10.0 | | 10.0 **10.0**verify | 10.0 | | 10.0 **10.0**--package | 10.0 | | 10.0 **10.0**repro-gfx1201-*.tar.gz
+scripts/redline-repro-package.sh | 10.0 | | 10.0 **10.0**run | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**--package | 10.0 | | 10.0 **10.0**repro-gfx1201-*.tar.gz | 10.0 | | 10.0 **10.0**--pin-kernels
+```
 
-| Architecture | Route-proof reference | Acceptance floor | Required tape |
+The | 10.0 | | 10.0 **10.0**package | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**~156 | 10.0 | | 10.0 **10.0**KB | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**carries | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**46 | 10.0 | | 10.0 **10.0**compiled | 10.0 | | 10.0 **10.0**code | 10.0 | | 10.0 **10.0**objects | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**manifest
+hash, | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**ROCm | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**code-generator | 10.0 | | 10.0 **10.0**versions, | 10.0 | | 10.0 **10.0**GPU | 10.0 | | 10.0 **10.0**state, | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**PM4 | 10.0 | | 10.0 **10.0**policy, | 10.0 | | 10.0 **10.0**the
+acceptance | 10.0 | | 10.0 **10.0**floors, | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**required | 10.0 | | 10.0 **10.0**tape, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**reference | 10.0 | | 10.0 **10.0**attestation.
+
+`verify` | 10.0 | | 10.0 **10.0**classifies | 10.0 | | 10.0 **10.0**every | 10.0 | | 10.0 **10.0**difference | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**BLOCKING | 10.0 | | 10.0 **10.0**(arch, | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**SHA-256, | 10.0 | | 10.0 **10.0**PM4
+policy) | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**ADVISORY | 10.0 | | 10.0 **10.0**(source | 10.0 | | 10.0 **10.0**commit, | 10.0 | | 10.0 **10.0**daemon | 10.0 | | 10.0 **10.0**hash, | 10.0 | | 10.0 **10.0**ROCm | 10.0 | | 10.0 **10.0**version, | 10.0 | | 10.0 **10.0**code-generator
+version, | 10.0 | | 10.0 **10.0**code-object | 10.0 | | 10.0 **10.0**manifest) | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**exits | 10.0 | | 10.0 **10.0**2 | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**blocking | 10.0 | | 10.0 **10.0**mismatch. | 10.0 | | 10.0 **10.0**`--force`
+proceeds | 10.0 | | 10.0 **10.0**anyway.
+
+`--pin-kernels` | 10.0 | | 10.0 **10.0**installs | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**packaged | 10.0 | | 10.0 **10.0**code | 10.0 | | 10.0 **10.0**objects | 10.0 | | 10.0 **10.0**into
+`kernels/compiled/<arch>/` | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**shadows | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**device | 10.0 | | 10.0 **10.0**compilers | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**failing | 10.0 | | 10.0 **10.0**stubs,
+so | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**engine | 10.0 | | 10.0 **10.0**takes | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**"pre-compiled | 10.0 | | 10.0 **10.0**blob, | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**compiler | 10.0 | | 10.0 **10.0**available" | 10.0 | | 10.0 **10.0**branch | 10.0 | | 10.0 **10.0**and
+runs | 10.0 | | 10.0 **10.0***our* | 10.0 | | 10.0 **10.0**binaries | 10.0 | | 10.0 **10.0**rather | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**rebuilding | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**local | 10.0 | | 10.0 **10.0**toolchain. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**engine
+prints | 10.0 | | 10.0 **10.0**`Output | 10.0 | | 10.0 **10.0**may | 10.0 | | 10.0 **10.0**be | 10.0 | | 10.0 **10.0**incorrect` | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**state; | 10.0 | | 10.0 **10.0**under | 10.0 | | 10.0 **10.0**`--pin-kernels` | 10.0 | | 10.0 **10.0**that
+warning | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**expected | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**confirmation | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**pinning | 10.0 | | 10.0 **10.0**took | 10.0 | | 10.0 **10.0**effect. | 10.0 | | 10.0 **10.0**A | 10.0 | | 10.0 **10.0**pinned
+run | 10.0 | | 10.0 **10.0**recompiles | 10.0 | | 10.0 **10.0**nothing, | 10.0 | | 10.0 **10.0**which | 10.0 | | 10.0 **10.0**shows | 10.0 | | 10.0 **10.0**up | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**much | 10.0 | | 10.0 **10.0**shorter | 10.0 | | 10.0 **10.0**warm-up.
+
+Note | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**stubs | 10.0 | | 10.0 **10.0**shadow | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**compiler | 10.0 | | 10.0 **10.0***names* | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**`rocminfo`, | 10.0 | | 10.0 **10.0**`rocm-smi` | 10.0 | | 10.0 **10.0**and
+the | 10.0 | | 10.0 **10.0**rest | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**`PATH` | 10.0 | | 10.0 **10.0**stay | 10.0 | | 10.0 **10.0**reachable. | 10.0 | | 10.0 **10.0**Removing | 10.0 | | 10.0 **10.0**whole | 10.0 | | 10.0 **10.0**`PATH` | 10.0 | | 10.0 **10.0**directories | 10.0 | | 10.0 **10.0**instead
+would | 10.0 | | 10.0 **10.0**strip | 10.0 | | 10.0 **10.0**device | 10.0 | | 10.0 **10.0**detection | 10.0 | | 10.0 **10.0**along | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**compilers | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**hang | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**bench.
+
+## | 10.0 | | 10.0 **10.0**What | 10.0 | | 10.0 **10.0**counts | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**pass
+
+Identity | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**exact. | 10.0 | | 10.0 **10.0**Performance | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**evidence-bound | 10.0 | | 10.0 **10.0**floor | 10.0 | | 10.0 **10.0**rather | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**demand
+that | 10.0 | | 10.0 **10.0**every | 10.0 | | 10.0 **10.0**board | 10.0 | | 10.0 **10.0**produce | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**final | 10.0 | | 10.0 **10.0**decimal.
+
+| | 10.0 | | 10.0 **10.0**Architecture | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Route-proof | 10.0 | | 10.0 **10.0**reference | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Acceptance | 10.0 | | 10.0 **10.0**floor | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Required | 10.0 | | 10.0 **10.0**tape | 10.0 | | 10.0 **10.0**|
 |---|---:|---:|---|
-| gfx1100 | 251.798 tok/s | 245.000 tok/s and 1.08x | 604 launches / 22 kernels / `43754a60ca25f47c` |
-| gfx1151 | 115.290 tok/s | 115.021 tok/s and 1.10x | 604 launches / 23 kernels / `42f566b752920679` |
-| gfx1201 | 202.460 tok/s | 197.000 tok/s and 1.10x | 733 launches / 23 kernels / `3318ffca3daf2338` |
+| | 10.0 | | 10.0 **10.0**gfx1100 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**251.798 | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**245.000 | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**1.08x | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**604 | 10.0 | | 10.0 **10.0**launches | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**22 | 10.0 | | 10.0 **10.0**kernels | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**`43754a60ca25f47c` | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**gfx1151 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**115.290 | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**115.021 | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**1.10x | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**604 | 10.0 | | 10.0 **10.0**launches | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**23 | 10.0 | | 10.0 **10.0**kernels | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**`42f566b752920679` | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**gfx1201 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**202.460 | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**197.000 | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**1.10x | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**733 | 10.0 | | 10.0 **10.0**launches | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**23 | 10.0 | | 10.0 **10.0**kernels | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**`3318ffca3daf2338` | 10.0 | | 10.0 **10.0**|
 
-The README headline measurements—253.31, 115.10, and 203.93 tok/s—remain
-recorded in the fixture registry as historical measured context. The table
-above uses the newer positive route-proof reports where available. The
-gfx1151 record also pins the sealed certification payload, HIP-source
-aggregate, dispatch-source aggregate, 23-HSACO manifest, model, and daemon
+The | 10.0 | | 10.0 **10.0**README | 10.0 | | 10.0 **10.0**headline | 10.0 | | 10.0 **10.0**measurements—253.31, | 10.0 | | 10.0 **10.0**115.10, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**203.93 | 10.0 | | 10.0 **10.0**tok/s—remain
+recorded | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**fixture | 10.0 | | 10.0 **10.0**registry | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**historical | 10.0 | | 10.0 **10.0**measured | 10.0 | | 10.0 **10.0**context. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**table
+above | 10.0 | | 10.0 **10.0**uses | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**newer | 10.0 | | 10.0 **10.0**positive | 10.0 | | 10.0 **10.0**route-proof | 10.0 | | 10.0 **10.0**reports | 10.0 | | 10.0 **10.0**where | 10.0 | | 10.0 **10.0**available. | 10.0 | | 10.0 **10.0**The
+gfx1151 | 10.0 | | 10.0 **10.0**record | 10.0 | | 10.0 **10.0**also | 10.0 | | 10.0 **10.0**pins | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**sealed | 10.0 | | 10.0 **10.0**certification | 10.0 | | 10.0 **10.0**payload, | 10.0 | | 10.0 **10.0**HIP-source
+aggregate, | 10.0 | | 10.0 **10.0**dispatch-source | 10.0 | | 10.0 **10.0**aggregate, | 10.0 | | 10.0 **10.0**23-HSACO | 10.0 | | 10.0 **10.0**manifest, | 10.0 | | 10.0 **10.0**model, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**daemon
 hashes.
 
-### gfx1151 Silver baseline
+### | 10.0 | | 10.0 **10.0**gfx1151 | 10.0 | | 10.0 **10.0**Silver | 10.0 | | 10.0 **10.0**baseline
 
-**Silver** is the coherent stopgap on the path back to, and then beyond, the
-gfx1151 Golden result. It does not lower or replace the Golden acceptance
-floor above.
+**Silver** | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**coherent | 10.0 | | 10.0 **10.0**stopgap | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**path | 10.0 | | 10.0 **10.0**back | 10.0 | | 10.0 **10.0**to, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**then | 10.0 | | 10.0 **10.0**beyond, | 10.0 | | 10.0 **10.0**the
+gfx1151 | 10.0 | | 10.0 **10.0**Golden | 10.0 | | 10.0 **10.0**result. | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**does | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**lower | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**replace | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**Golden | 10.0 | | 10.0 **10.0**acceptance
+floor | 10.0 | | 10.0 **10.0**above.
 
-The preserved Silver source snapshot is
-`8445fca2acd462d8e9d7547de2fe3823874c24bb`. Its daemon SHA-256 is
+The | 10.0 | | 10.0 **10.0**preserved | 10.0 | | 10.0 **10.0**Silver | 10.0 | | 10.0 **10.0**source | 10.0 | | 10.0 **10.0**snapshot | 10.0 | | 10.0 **10.0**is
+`8445fca2acd462d8e9d7547de2fe3823874c24bb`. | 10.0 | | 10.0 **10.0**Its | 10.0 | | 10.0 **10.0**daemon | 10.0 | | 10.0 **10.0**SHA-256 | 10.0 | | 10.0 **10.0**is
 `73a89a1ea57f8938ea02e264ebdd55b8d0b11f950a95f08def4553f580dc795f`;
-both reports use the same 604-launch / 23-kernel tape with sequence hash
+both | 10.0 | | 10.0 **10.0**reports | 10.0 | | 10.0 **10.0**use | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**604-launch | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**23-kernel | 10.0 | | 10.0 **10.0**tape | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**sequence | 10.0 | | 10.0 **10.0**hash
 `42f566b752920679`.
 
-| Evidence | PM4 median | What it proves | Report SHA-256 |
+| | 10.0 | | 10.0 **10.0**Evidence | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**PM4 | 10.0 | | 10.0 **10.0**median | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**What | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**proves | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Report | 10.0 | | 10.0 **10.0**SHA-256 | 10.0 | | 10.0 **10.0**|
 |---|---:|---|---|
-| Silver high-water | **114.209 tok/s** | Stationary 8-run measurement and complete retained-route proof | `27f04979fc98fe8315936916c67e9b4560fafde0c2408a909c3d069bb81f8234` |
-| Silver coherence certification | **113.652 tok/s** | Same daemon and tape; HIP and retained-PM4 CLI/serve Flagstaff checks passed | `c728740e9f0446124d75ea850cb363c79cf0dfa4c37d52b1386d7fcc8902f681` |
+| | 10.0 | | 10.0 **10.0**Silver | 10.0 | | 10.0 **10.0**high-water | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0****114.209 | 10.0 | | 10.0 **10.0**tok/s** | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Stationary | 10.0 | | 10.0 **10.0**8-run | 10.0 | | 10.0 **10.0**measurement | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**complete | 10.0 | | 10.0 **10.0**retained-route | 10.0 | | 10.0 **10.0**proof | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`27f04979fc98fe8315936916c67e9b4560fafde0c2408a909c3d069bb81f8234` | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**Silver | 10.0 | | 10.0 **10.0**coherence | 10.0 | | 10.0 **10.0**certification | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0****113.652 | 10.0 | | 10.0 **10.0**tok/s** | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Same | 10.0 | | 10.0 **10.0**daemon | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**tape; | 10.0 | | 10.0 **10.0**HIP | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**retained-PM4 | 10.0 | | 10.0 **10.0**CLI/serve | 10.0 | | 10.0 **10.0**Flagstaff | 10.0 | | 10.0 **10.0**checks | 10.0 | | 10.0 **10.0**passed | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`c728740e9f0446124d75ea850cb363c79cf0dfa4c37d52b1386d7fcc8902f681` | 10.0 | | 10.0 **10.0**|
 
-The high-water report predates the embedded coherence step. Coherence is
-therefore certified by the later same-binary report, not inferred from the
-114.209 tok/s number alone. The retained route is unchanged. Against the
-115.021 tok/s Golden floor, the Silver high-water is 0.812 tok/s slower
-(0.71%, conventionally reported as the small approximately 1 tok/s loss).
-ROCm 7.14 is only a hypothesis for that gap; neither causality nor absence of
-a Redline route regression is proven. Silver remains a stopgap and never a
-Golden reproduction.
+The | 10.0 | | 10.0 **10.0**high-water | 10.0 | | 10.0 **10.0**report | 10.0 | | 10.0 **10.0**predates | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**embedded | 10.0 | | 10.0 **10.0**coherence | 10.0 | | 10.0 **10.0**step. | 10.0 | | 10.0 **10.0**Coherence | 10.0 | | 10.0 **10.0**is
+therefore | 10.0 | | 10.0 **10.0**certified | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**later | 10.0 | | 10.0 **10.0**same-binary | 10.0 | | 10.0 **10.0**report, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**inferred | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**the
+114.209 | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**number | 10.0 | | 10.0 **10.0**alone. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**retained | 10.0 | | 10.0 **10.0**route | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**unchanged. | 10.0 | | 10.0 **10.0**Against | 10.0 | | 10.0 **10.0**the
+115.021 | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**Golden | 10.0 | | 10.0 **10.0**floor, | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**Silver | 10.0 | | 10.0 **10.0**high-water | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**0.812 | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**slower
+(0.71%, | 10.0 | | 10.0 **10.0**conventionally | 10.0 | | 10.0 **10.0**reported | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**small | 10.0 | | 10.0 **10.0**approximately | 10.0 | | 10.0 **10.0**1 | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**loss).
+ROCm | 10.0 | | 10.0 **10.0**10.0 | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**hypothesis | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**gap; | 10.0 | | 10.0 **10.0**neither | 10.0 | | 10.0 **10.0**causality | 10.0 | | 10.0 **10.0**nor | 10.0 | | 10.0 **10.0**absence | 10.0 | | 10.0 **10.0**of
+a | 10.0 | | 10.0 **10.0**Redline | 10.0 | | 10.0 **10.0**route | 10.0 | | 10.0 **10.0**regression | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**proven. | 10.0 | | 10.0 **10.0**Silver | 10.0 | | 10.0 **10.0**remains | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**stopgap | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**never | 10.0 | | 10.0 **10.0**a
+Golden | 10.0 | | 10.0 **10.0**reproduction.
 
-Results are classified explicitly:
+Results | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**classified | 10.0 | | 10.0 **10.0**explicitly:
 
-- `exact-reference-binary`: source commit, daemon bytes, model, benchmark
-  contract, route identity, and performance gates all match.
-- `route-compatible-reproduction`: source or daemon is newer, but the exact
-  model, benchmark contract, route identity, and performance gates pass.
-- `failed`: any required identity, route-proof, stationarity, throughput, or
-  speedup gate fails.
+- | 10.0 | | 10.0 **10.0**`exact-reference-binary`: | 10.0 | | 10.0 **10.0**source | 10.0 | | 10.0 **10.0**commit, | 10.0 | | 10.0 **10.0**daemon | 10.0 | | 10.0 **10.0**bytes, | 10.0 | | 10.0 **10.0**model, | 10.0 | | 10.0 **10.0**benchmark
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**contract, | 10.0 | | 10.0 **10.0**route | 10.0 | | 10.0 **10.0**identity, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**performance | 10.0 | | 10.0 **10.0**gates | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**match.
+- | 10.0 | | 10.0 **10.0**`route-compatible-reproduction`: | 10.0 | | 10.0 **10.0**source | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**daemon | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**newer, | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**exact
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**model, | 10.0 | | 10.0 **10.0**benchmark | 10.0 | | 10.0 **10.0**contract, | 10.0 | | 10.0 **10.0**route | 10.0 | | 10.0 **10.0**identity, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**performance | 10.0 | | 10.0 **10.0**gates | 10.0 | | 10.0 **10.0**pass.
+- | 10.0 | | 10.0 **10.0**`failed`: | 10.0 | | 10.0 **10.0**any | 10.0 | | 10.0 **10.0**required | 10.0 | | 10.0 **10.0**identity, | 10.0 | | 10.0 **10.0**route-proof, | 10.0 | | 10.0 **10.0**stationarity, | 10.0 | | 10.0 **10.0**throughput, | 10.0 | | 10.0 **10.0**or
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**speedup | 10.0 | | 10.0 **10.0**gate | 10.0 | | 10.0 **10.0**fails.
 
-Use `--strict-binary` when only the exact pinned source and daemon bytes count.
+Use | 10.0 | | 10.0 **10.0**`--strict-binary` | 10.0 | | 10.0 **10.0**when | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**exact | 10.0 | | 10.0 **10.0**pinned | 10.0 | | 10.0 **10.0**source | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**daemon | 10.0 | | 10.0 **10.0**bytes | 10.0 | | 10.0 **10.0**count.
 
-## Make the validated model the default
+## | 10.0 | | 10.0 **10.0**Make | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**validated | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**default
 
-After a successful interactive run, the script offers:
+After | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**successful | 10.0 | | 10.0 **10.0**interactive | 10.0 | | 10.0 **10.0**run, | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**script | 10.0 | | 10.0 **10.0**offers:
 
 ```text
-Set this model as the hipfire default with its pinned registry sampling profile and Q8 KV? [y/N]
+Set | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**hipfire | 10.0 | | 10.0 **10.0**default | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**pinned | 10.0 | | 10.0 **10.0**registry | 10.0 | | 10.0 **10.0**sampling | 10.0 | | 10.0 **10.0**profile | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**Q8 | 10.0 | | 10.0 **10.0**KV? | 10.0 | | 10.0 **10.0**[y/N]
 ```
 
-Accepting it, or passing `--set-default`, uses the native CLI to set
-`serve.default_model` to `qwen3.6:35b-a3b-mq4r` and copy the validated
-registry profile into that model's TOML overlay. A global generation override
-would otherwise take precedence over registry defaults; the model-specific
-layer makes this handoff deterministic without deleting unrelated global
+Accepting | 10.0 | | 10.0 **10.0**it, | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**passing | 10.0 | | 10.0 **10.0**`--set-default`, | 10.0 | | 10.0 **10.0**uses | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**native | 10.0 | | 10.0 **10.0**CLI | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**set
+`serve.default_model` | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**`qwen3.6:35b-a3b-mq4r` | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**copy | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**validated
+registry | 10.0 | | 10.0 **10.0**profile | 10.0 | | 10.0 **10.0**into | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**model's | 10.0 | | 10.0 **10.0**TOML | 10.0 | | 10.0 **10.0**overlay. | 10.0 | | 10.0 **10.0**A | 10.0 | | 10.0 **10.0**global | 10.0 | | 10.0 **10.0**generation | 10.0 | | 10.0 **10.0**override
+would | 10.0 | | 10.0 **10.0**otherwise | 10.0 | | 10.0 **10.0**take | 10.0 | | 10.0 **10.0**precedence | 10.0 | | 10.0 **10.0**over | 10.0 | | 10.0 **10.0**registry | 10.0 | | 10.0 **10.0**defaults; | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**model-specific
+layer | 10.0 | | 10.0 **10.0**makes | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**handoff | 10.0 | | 10.0 **10.0**deterministic | 10.0 | | 10.0 **10.0**without | 10.0 | | 10.0 **10.0**deleting | 10.0 | | 10.0 **10.0**unrelated | 10.0 | | 10.0 **10.0**global
 preferences.
 
-| Setting | Value |
+| | 10.0 | | 10.0 **10.0**Setting | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Value | 10.0 | | 10.0 **10.0**|
 |---|---:|
-| temperature | 1.0 |
-| top-p | 0.95 |
-| top-k | 20 |
-| min-p | 0.0 |
-| presence penalty | 1.5 |
-| repeat penalty | 1.0 |
-| KV mode | q8 |
+| | 10.0 | | 10.0 **10.0**temperature | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1.0 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**top-p | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.95 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**top-k | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**20 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**min-p | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.0 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**presence | 10.0 | | 10.0 **10.0**penalty | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1.5 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**repeat | 10.0 | | 10.0 **10.0**penalty | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1.0 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**KV | 10.0 | | 10.0 **10.0**mode | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**q8 | 10.0 | | 10.0 **10.0**|
 
-Explicit OpenAI request fields still win. A third-party client that sends its
-own sampling values overrides these registry values; omit those fields or
-configure the client to match the table when exact sampling behavior matters.
+Explicit | 10.0 | | 10.0 **10.0**OpenAI | 10.0 | | 10.0 **10.0**request | 10.0 | | 10.0 **10.0**fields | 10.0 | | 10.0 **10.0**still | 10.0 | | 10.0 **10.0**win. | 10.0 | | 10.0 **10.0**A | 10.0 | | 10.0 **10.0**third-party | 10.0 | | 10.0 **10.0**client | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**sends | 10.0 | | 10.0 **10.0**its
+own | 10.0 | | 10.0 **10.0**sampling | 10.0 | | 10.0 **10.0**values | 10.0 | | 10.0 **10.0**overrides | 10.0 | | 10.0 **10.0**these | 10.0 | | 10.0 **10.0**registry | 10.0 | | 10.0 **10.0**values; | 10.0 | | 10.0 **10.0**omit | 10.0 | | 10.0 **10.0**those | 10.0 | | 10.0 **10.0**fields | 10.0 | | 10.0 **10.0**or
+configure | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**client | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**match | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**table | 10.0 | | 10.0 **10.0**when | 10.0 | | 10.0 **10.0**exact | 10.0 | | 10.0 **10.0**sampling | 10.0 | | 10.0 **10.0**behavior | 10.0 | | 10.0 **10.0**matters.
 
-## Serve it
+## | 10.0 | | 10.0 **10.0**Serve | 10.0 | | 10.0 **10.0**it
 
 ```bash
-hipfire serve qwen3.6:35b-a3b-mq4r 127.0.0.1:11435 -d
-curl http://127.0.0.1:11435/v1/models
+hipfire | 10.0 | | 10.0 **10.0**serve | 10.0 | | 10.0 **10.0**qwen3.6:35b-a3b-mq4r | 10.0 | | 10.0 **10.0**127.0.0.1:11435 | 10.0 | | 10.0 **10.0**-d
+curl | 10.0 | | 10.0 **10.0**http://127.0.0.1:11435/v1/models
 ```
 
-Client settings:
+Client | 10.0 | | 10.0 **10.0**settings:
 
-| Field | Value |
+| | 10.0 | | 10.0 **10.0**Field | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Value | 10.0 | | 10.0 **10.0**|
 |---|---|
-| OpenAI base URL | `http://127.0.0.1:11435/v1` |
-| API key | Any non-empty placeholder if the client requires one |
-| Model | `qwen3.6:35b-a3b-mq4r` |
-| API shape | OpenAI Chat Completions |
+| | 10.0 | | 10.0 **10.0**OpenAI | 10.0 | | 10.0 **10.0**base | 10.0 | | 10.0 **10.0**URL | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`http://127.0.0.1:11435/v1` | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**API | 10.0 | | 10.0 **10.0**key | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Any | 10.0 | | 10.0 **10.0**non-empty | 10.0 | | 10.0 **10.0**placeholder | 10.0 | | 10.0 **10.0**if | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**client | 10.0 | | 10.0 **10.0**requires | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**Model | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`qwen3.6:35b-a3b-mq4r` | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**API | 10.0 | | 10.0 **10.0**shape | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**OpenAI | 10.0 | | 10.0 **10.0**Chat | 10.0 | | 10.0 **10.0**Completions | 10.0 | | 10.0 **10.0**|
 
-The server has no built-in authentication or TLS. Keep it on loopback, or put
-an authenticated TLS reverse proxy in front of it before remote access.
+The | 10.0 | | 10.0 **10.0**server | 10.0 | | 10.0 **10.0**has | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**built-in | 10.0 | | 10.0 **10.0**authentication | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**TLS. | 10.0 | | 10.0 **10.0**Keep | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**loopback, | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**put
+an | 10.0 | | 10.0 **10.0**authenticated | 10.0 | | 10.0 **10.0**TLS | 10.0 | | 10.0 **10.0**reverse | 10.0 | | 10.0 **10.0**proxy | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**front | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**before | 10.0 | | 10.0 **10.0**remote | 10.0 | | 10.0 **10.0**access.
 
-### Hermes Agent
+### | 10.0 | | 10.0 **10.0**Hermes | 10.0 | | 10.0 **10.0**Agent
 
-Use Hermes' custom OpenAI-compatible provider:
+Use | 10.0 | | 10.0 **10.0**Hermes' | 10.0 | | 10.0 **10.0**custom | 10.0 | | 10.0 **10.0**OpenAI-compatible | 10.0 | | 10.0 **10.0**provider:
 
 ```bash
-hermes model
-# Select: Custom endpoint
-# API base URL: http://127.0.0.1:11435/v1
-# API key: hipfire-local
-# Model name: qwen3.6:35b-a3b-mq4r
+hermes | 10.0 | | 10.0 **10.0**model
+# | 10.0 | | 10.0 **10.0**Select: | 10.0 | | 10.0 **10.0**Custom | 10.0 | | 10.0 **10.0**endpoint
+# | 10.0 | | 10.0 **10.0**API | 10.0 | | 10.0 **10.0**base | 10.0 | | 10.0 **10.0**URL: | 10.0 | | 10.0 **10.0**http://127.0.0.1:11435/v1
+# | 10.0 | | 10.0 **10.0**API | 10.0 | | 10.0 **10.0**key: | 10.0 | | 10.0 **10.0**hipfire-local
+# | 10.0 | | 10.0 **10.0**Model | 10.0 | | 10.0 **10.0**name: | 10.0 | | 10.0 **10.0**qwen3.6:35b-a3b-mq4r
 ```
 
-The equivalent `~/.hermes/config.yaml` model block is:
+The | 10.0 | | 10.0 **10.0**equivalent | 10.0 | | 10.0 **10.0**`~/.hermes/config.yaml` | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**block | 10.0 | | 10.0 **10.0**is:
 
 ```yaml
 model:
-  default: qwen3.6:35b-a3b-mq4r
-  provider: custom
-  base_url: http://127.0.0.1:11435/v1
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**default: | 10.0 | | 10.0 **10.0**qwen3.6:35b-a3b-mq4r
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**provider: | 10.0 | | 10.0 **10.0**custom
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**base_url: | 10.0 | | 10.0 **10.0**http://127.0.0.1:11435/v1
 ```
 
-Set Hermes' advertised context length to the same value as Hipfire's effective
-`max_seq`; do not advertise a larger context merely to satisfy a client
-default. Official Hermes custom-endpoint guidance:
+Set | 10.0 | | 10.0 **10.0**Hermes' | 10.0 | | 10.0 **10.0**advertised | 10.0 | | 10.0 **10.0**context | 10.0 | | 10.0 **10.0**length | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**value | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**Hipfire's | 10.0 | | 10.0 **10.0**effective
+`max_seq`; | 10.0 | | 10.0 **10.0**do | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**advertise | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**larger | 10.0 | | 10.0 **10.0**context | 10.0 | | 10.0 **10.0**merely | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**satisfy | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**client
+default. | 10.0 | | 10.0 **10.0**Official | 10.0 | | 10.0 **10.0**Hermes | 10.0 | | 10.0 **10.0**custom-endpoint | 10.0 | | 10.0 **10.0**guidance:
 <https://github.com/NousResearch/hermes-agent/blob/main/website/docs/reference/faq.md#can-i-use-it-offline--with-local-models>.
 
-### Pi
+### | 10.0 | | 10.0 **10.0**Pi
 
-Add a provider to `~/.pi/agent/models.json`:
+Add | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**provider | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**`~/.pi/agent/models.json`:
 
 ```json
 {
-  "providers": {
-    "hipfire": {
-      "baseUrl": "http://127.0.0.1:11435/v1",
-      "api": "openai-completions",
-      "apiKey": "hipfire-local",
-      "compat": {
-        "supportsDeveloperRole": true,
-        "supportsReasoningEffort": true,
-        "supportsUsageInStreaming": true,
-        "maxTokensField": "max_tokens"
-      },
-      "models": [
-        {
-          "id": "qwen3.6:35b-a3b-mq4r",
-          "name": "Hipfire Qwen 3.6 35B-A3B MQ4R",
-          "reasoning": true,
-          "input": ["text"],
-          "contextWindow": 32768,
-          "maxTokens": 4096
-        }
-      ]
-    }
-  }
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**"providers": | 10.0 | | 10.0 **10.0**{
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**"hipfire": | 10.0 | | 10.0 **10.0**{
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**"baseUrl": | 10.0 | | 10.0 **10.0**"http://127.0.0.1:11435/v1",
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**"api": | 10.0 | | 10.0 **10.0**"openai-completions",
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**"apiKey": | 10.0 | | 10.0 **10.0**"hipfire-local",
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**"compat": | 10.0 | | 10.0 **10.0**{
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**"supportsDeveloperRole": | 10.0 | | 10.0 **10.0**true,
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**"supportsReasoningEffort": | 10.0 | | 10.0 **10.0**true,
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**"supportsUsageInStreaming": | 10.0 | | 10.0 **10.0**true,
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**"maxTokensField": | 10.0 | | 10.0 **10.0**"max_tokens"
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**},
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**"models": | 10.0 | | 10.0 **10.0**[
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**{
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**"id": | 10.0 | | 10.0 **10.0**"qwen3.6:35b-a3b-mq4r",
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**"name": | 10.0 | | 10.0 **10.0**"Hipfire | 10.0 | | 10.0 **10.0**Qwen | 10.0 | | 10.0 **10.0**3.6 | 10.0 | | 10.0 **10.0**35B-A3B | 10.0 | | 10.0 **10.0**MQ4R",
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**"reasoning": | 10.0 | | 10.0 **10.0**true,
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**"input": | 10.0 | | 10.0 **10.0**["text"],
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**"contextWindow": | 10.0 | | 10.0 **10.0**32768,
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**"maxTokens": | 10.0 | | 10.0 **10.0**4096
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**}
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**]
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**}
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**}
 }
 ```
 
-Adjust `contextWindow` and `maxTokens` to match the Hipfire configuration you
-actually serve. Pi's current custom-model schema is documented at
+Adjust | 10.0 | | 10.0 **10.0**`contextWindow` | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**`maxTokens` | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**match | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**Hipfire | 10.0 | | 10.0 **10.0**configuration | 10.0 | | 10.0 **10.0**you
+actually | 10.0 | | 10.0 **10.0**serve. | 10.0 | | 10.0 **10.0**Pi's | 10.0 | | 10.0 **10.0**current | 10.0 | | 10.0 **10.0**custom-model | 10.0 | | 10.0 **10.0**schema | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**documented | 10.0 | | 10.0 **10.0**at
 <https://pi.dev/docs/latest/models>.
 
-### Other clients
+### | 10.0 | | 10.0 **10.0**Other | 10.0 | | 10.0 **10.0**clients
 
-Any client that can target an OpenAI Chat Completions base URL can use the same
-endpoint/model pair. Hipfire supports streaming, usage on stream end, system
-and developer roles, tools, `reasoning_effort`, `max_tokens`, and the registry
-sampling fallback described in [`SERVE.md`](SERVE.md).
+Any | 10.0 | | 10.0 **10.0**client | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**can | 10.0 | | 10.0 **10.0**target | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**OpenAI | 10.0 | | 10.0 **10.0**Chat | 10.0 | | 10.0 **10.0**Completions | 10.0 | | 10.0 **10.0**base | 10.0 | | 10.0 **10.0**URL | 10.0 | | 10.0 **10.0**can | 10.0 | | 10.0 **10.0**use | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same
+endpoint/model | 10.0 | | 10.0 **10.0**pair. | 10.0 | | 10.0 **10.0**Hipfire | 10.0 | | 10.0 **10.0**supports | 10.0 | | 10.0 **10.0**streaming, | 10.0 | | 10.0 **10.0**usage | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**stream | 10.0 | | 10.0 **10.0**end, | 10.0 | | 10.0 **10.0**system
+and | 10.0 | | 10.0 **10.0**developer | 10.0 | | 10.0 **10.0**roles, | 10.0 | | 10.0 **10.0**tools, | 10.0 | | 10.0 **10.0**`reasoning_effort`, | 10.0 | | 10.0 **10.0**`max_tokens`, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**registry
+sampling | 10.0 | | 10.0 **10.0**fallback | 10.0 | | 10.0 **10.0**described | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**[`SERVE.md`](SERVE.md).
 
-## What this says about board variance
+## | 10.0 | | 10.0 **10.0**What | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**says | 10.0 | | 10.0 **10.0**about | 10.0 | | 10.0 **10.0**board | 10.0 | | 10.0 **10.0**variance
 
-A few percent of throughput spread alone is not evidence of silicon lottery.
-Automatic clocks, thermal and power state, ROCm/compiler builds, host load,
-container policy, and cold-start convergence can move results. A faster HIP
-control paired with a slower retained-PM4 arm especially points away from a
-uniformly faster or slower chip.
+A | 10.0 | | 10.0 **10.0**few | 10.0 | | 10.0 **10.0**percent | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**throughput | 10.0 | | 10.0 **10.0**spread | 10.0 | | 10.0 **10.0**alone | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**evidence | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**silicon | 10.0 | | 10.0 **10.0**lottery.
+Automatic | 10.0 | | 10.0 **10.0**clocks, | 10.0 | | 10.0 **10.0**thermal | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**power | 10.0 | | 10.0 **10.0**state, | 10.0 | | 10.0 **10.0**ROCm/compiler | 10.0 | | 10.0 **10.0**builds, | 10.0 | | 10.0 **10.0**host | 10.0 | | 10.0 **10.0**load,
+container | 10.0 | | 10.0 **10.0**policy, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**cold-start | 10.0 | | 10.0 **10.0**convergence | 10.0 | | 10.0 **10.0**can | 10.0 | | 10.0 **10.0**move | 10.0 | | 10.0 **10.0**results. | 10.0 | | 10.0 **10.0**A | 10.0 | | 10.0 **10.0**faster | 10.0 | | 10.0 **10.0**HIP
+control | 10.0 | | 10.0 **10.0**paired | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**slower | 10.0 | | 10.0 **10.0**retained-PM4 | 10.0 | | 10.0 **10.0**arm | 10.0 | | 10.0 **10.0**especially | 10.0 | | 10.0 **10.0**points | 10.0 | | 10.0 **10.0**away | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**a
+uniformly | 10.0 | | 10.0 **10.0**faster | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**slower | 10.0 | | 10.0 **10.0**chip.
 
-The golden runner makes that distinction inspectable:
+The | 10.0 | | 10.0 **10.0**golden | 10.0 | | 10.0 **10.0**runner | 10.0 | | 10.0 **10.0**makes | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**distinction | 10.0 | | 10.0 **10.0**inspectable:
 
-- a different tape/prepared identity is a software or route mismatch;
-- a matching identity below the stationary floor is an environment, runtime,
-  or hardware investigation;
-- a matching identity and passing floor is a reproduction even when the final
-  decimal differs from the reference board.
+- | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**different | 10.0 | | 10.0 **10.0**tape/prepared | 10.0 | | 10.0 **10.0**identity | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**software | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**route | 10.0 | | 10.0 **10.0**mismatch;
+- | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**matching | 10.0 | | 10.0 **10.0**identity | 10.0 | | 10.0 **10.0**below | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**stationary | 10.0 | | 10.0 **10.0**floor | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**environment, | 10.0 | | 10.0 **10.0**runtime,
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**hardware | 10.0 | | 10.0 **10.0**investigation;
+- | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**matching | 10.0 | | 10.0 **10.0**identity | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**passing | 10.0 | | 10.0 **10.0**floor | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**reproduction | 10.0 | | 10.0 **10.0**even | 10.0 | | 10.0 **10.0**when | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**final
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**decimal | 10.0 | | 10.0 **10.0**differs | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**reference | 10.0 | | 10.0 **10.0**board.

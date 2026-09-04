@@ -18,7 +18,7 @@
 // accumulation order remain identical to fused_gate_up_hfq4g256.hip.
 //
 // The host admits this kernel only when gate_m == up_m. Grid=[gate_m], block=32.
-// Default OFF: Qwen3.6-27B MQ4 on a W7900 (ROCm 7.14, HIP/q8, graph off,
+// Default OFF: Qwen3.6-27B MQ4 on a W7900 (ROCm 10.0, HIP/q8, graph off,
 // 8-token warmup + 2 s DPM settle + 64 timed tokens) measured 35.6/35.4
 // tok/s for the base kernel and 35.3/35.3 for this arm in A/B/B/A order
 // (-0.56% median throughput; +0.43% median p50 latency). The emitted object

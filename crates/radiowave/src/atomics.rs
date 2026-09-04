@@ -4,12 +4,12 @@
 //! Per-architecture atomic capability matrix and fail-closed recipe emission gate.
 //!
 //! Hardware support is taken from the AMD GPU atomics operation support docs
-//! (ROCm 7.14), corrected by header-proven overload presence in
+//! (ROCm 10.0), corrected by header-proven overload presence in
 //! `hip/amd_detail/amd_hip_atomic.h`, `amd_hip_fp16.h`, and `amd_hip_bf16.h`.
 //! Header declaration alone is not HW support: double atomics are declared
 //! unconditionally but are unsupported on RDNA (gfx10/11/12).
 //!
-//! Proven header surface (7.14):
+//! Proven header surface (10.0):
 //! - `atomicAdd`: int32/uint32, uint64, float, double, `__half`, `__half2`,
 //!   `__hip_bfloat16`, `__hip_bfloat162`
 //! - `atomicMin`/`atomicMax`: int32/64, uint32/64, float, double — **not**
@@ -554,7 +554,7 @@ fn host_memory_support(
     match device {
         Support::Unsupported => Support::Unsupported,
         other => {
-            // ROCm 7.14 gfx12 tables: host coarse cells and host fine+device
+            // ROCm 10.0 gfx12 tables: host coarse cells and host fine+device
             // cells retain native HW atomics for types that are native on
             // device. Other host paths (pre-gfx12, or fine+system) degrade
             // over PCIe to load-op-store / scope downgrade.

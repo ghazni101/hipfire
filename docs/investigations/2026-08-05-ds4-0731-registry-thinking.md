@@ -1,109 +1,109 @@
-# DeepSeek V4 Flash 0731 registry and thinking enablement
+# | 10.0 | | 10.0 **10.0**DeepSeek | 10.0 | | 10.0 **10.0**V4 | 10.0 | | 10.0 **10.0**Flash | 10.0 | | 10.0 **10.0**0731 | 10.0 | | 10.0 **10.0**registry | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**thinking | 10.0 | | 10.0 **10.0**enablement
 
-Date: 2026-08-05  
-Branch: `ds4-beta-staging`  
-Implementation commits: `7638148bd`, `29ff746cc`
+Date: | 10.0 | | 10.0 **10.0**2026-08-05 | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**
+Branch: | 10.0 | | 10.0 **10.0**`ds4-beta-staging` | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**
+Implementation | 10.0 | | 10.0 **10.0**commits: | 10.0 | | 10.0 **10.0**`7638148bd`, | 10.0 | | 10.0 **10.0**`29ff746cc`
 
-## Result
+## | 10.0 | | 10.0 **10.0**Result
 
-DeepSeek V4 Flash 0731 now owns the canonical `deepseek-v4-flash` / `deepseek4`
-registry identity. The matching MQ2R product is `deepseek-v4-flash:mq2r` /
-`deepseek4:mq2r`. The prior preview package remains addressable only as
-`deepseek-v4-flash-preview`; there is deliberately no preview MQ2R entry or
+DeepSeek | 10.0 | | 10.0 **10.0**V4 | 10.0 | | 10.0 **10.0**Flash | 10.0 | | 10.0 **10.0**0731 | 10.0 | | 10.0 **10.0**now | 10.0 | | 10.0 **10.0**owns | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**canonical | 10.0 | | 10.0 **10.0**`deepseek-v4-flash` | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**`deepseek4`
+registry | 10.0 | | 10.0 **10.0**identity. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**matching | 10.0 | | 10.0 **10.0**MQ2R | 10.0 | | 10.0 **10.0**product | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**`deepseek-v4-flash:mq2r` | 10.0 | | 10.0 **10.0**/
+`deepseek4:mq2r`. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**prior | 10.0 | | 10.0 **10.0**preview | 10.0 | | 10.0 **10.0**package | 10.0 | | 10.0 **10.0**remains | 10.0 | | 10.0 **10.0**addressable | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**as
+`deepseek-v4-flash-preview`; | 10.0 | | 10.0 **10.0**there | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**deliberately | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**preview | 10.0 | | 10.0 **10.0**MQ2R | 10.0 | | 10.0 **10.0**entry | 10.0 | | 10.0 **10.0**or
 alias.
 
-The parent checkpoint's reasoning-effort contract is carried end to end:
+The | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**checkpoint's | 10.0 | | 10.0 **10.0**reasoning-effort | 10.0 | | 10.0 **10.0**contract | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**carried | 10.0 | | 10.0 **10.0**end | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**end:
 
-- `low`: thinking enabled with no extra effort prefix;
-- `high`: the checkpoint's exact high-effort prefix;
-- `max`: the checkpoint's exact maximum-effort prefix;
-- `none`: closed-think / non-thinking framing.
+- | 10.0 | | 10.0 **10.0**`low`: | 10.0 | | 10.0 **10.0**thinking | 10.0 | | 10.0 **10.0**enabled | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**extra | 10.0 | | 10.0 **10.0**effort | 10.0 | | 10.0 **10.0**prefix;
+- | 10.0 | | 10.0 **10.0**`high`: | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**checkpoint's | 10.0 | | 10.0 **10.0**exact | 10.0 | | 10.0 **10.0**high-effort | 10.0 | | 10.0 **10.0**prefix;
+- | 10.0 | | 10.0 **10.0**`max`: | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**checkpoint's | 10.0 | | 10.0 **10.0**exact | 10.0 | | 10.0 **10.0**maximum-effort | 10.0 | | 10.0 **10.0**prefix;
+- | 10.0 | | 10.0 **10.0**`none`: | 10.0 | | 10.0 **10.0**closed-think | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**non-thinking | 10.0 | | 10.0 **10.0**framing.
 
-Effort and token budget are independent. The 0731 general and coding profiles
-use `thinking_budget=uncapped`, so `max` does not silently become a hipfire
-32K cap. An explicit request cap remains supported up to 393,216 tokens, and
-the typed maximum sequence limit is 1,048,576.
+Effort | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**token | 10.0 | | 10.0 **10.0**budget | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**independent. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**0731 | 10.0 | | 10.0 **10.0**general | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**coding | 10.0 | | 10.0 **10.0**profiles
+use | 10.0 | | 10.0 **10.0**`thinking_budget=uncapped`, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**`max` | 10.0 | | 10.0 **10.0**does | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**silently | 10.0 | | 10.0 **10.0**become | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**hipfire
+32K | 10.0 | | 10.0 **10.0**cap. | 10.0 | | 10.0 **10.0**An | 10.0 | | 10.0 **10.0**explicit | 10.0 | | 10.0 **10.0**request | 10.0 | | 10.0 **10.0**cap | 10.0 | | 10.0 **10.0**remains | 10.0 | | 10.0 **10.0**supported | 10.0 | | 10.0 **10.0**up | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**393,216 | 10.0 | | 10.0 **10.0**tokens, | 10.0 | | 10.0 **10.0**and
+the | 10.0 | | 10.0 **10.0**typed | 10.0 | | 10.0 **10.0**maximum | 10.0 | | 10.0 **10.0**sequence | 10.0 | | 10.0 **10.0**limit | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**1,048,576.
 
-## Published artifacts
+## | 10.0 | | 10.0 **10.0**Published | 10.0 | | 10.0 **10.0**artifacts
 
-Repository: `hipfire-models/hipfire-deepseek-v4-flash-0731`  
-Repository revision after publication: `584fb6b143e7031e8b8703df7355b408d733f494`
+Repository: | 10.0 | | 10.0 **10.0**`hipfire-models/hipfire-deepseek-v4-flash-0731` | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**
+Repository | 10.0 | | 10.0 **10.0**revision | 10.0 | | 10.0 **10.0**after | 10.0 | | 10.0 **10.0**publication: | 10.0 | | 10.0 **10.0**`584fb6b143e7031e8b8703df7355b408d733f494`
 
-| File | Bytes | LFS SHA-256 |
+| | 10.0 | | 10.0 **10.0**File | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Bytes | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**LFS | 10.0 | | 10.0 **10.0**SHA-256 | 10.0 | | 10.0 **10.0**|
 |---|---:|---|
-| `deepseek-v4-flash-0731.mq2r` | 82,191,359,851 | `cbf2bbcfa3f47b1712a071836b2c48232dad7dfb763813a720f7d348a9318cce` |
-| `deepseek-v4-flash-0731-dspark.mq2r` | 5,788,397,278 | `bc695a000643801d26e5ae96c9f4ac4c222a36d9db40566f4cc1de0e9d3d5d2e` |
+| | 10.0 | | 10.0 **10.0**`deepseek-v4-flash-0731.mq2r` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**82,191,359,851 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`cbf2bbcfa3f47b1712a071836b2c48232dad7dfb763813a720f7d348a9318cce` | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**`deepseek-v4-flash-0731-dspark.mq2r` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**5,788,397,278 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`bc695a000643801d26e5ae96c9f4ac4c222a36d9db40566f4cc1de0e9d3d5d2e` | 10.0 | | 10.0 **10.0**|
 
-Only these 0731 MQ2R artifacts were uploaded in this change. No preview MQ2R
-artifact was uploaded.
+Only | 10.0 | | 10.0 **10.0**these | 10.0 | | 10.0 **10.0**0731 | 10.0 | | 10.0 **10.0**MQ2R | 10.0 | | 10.0 **10.0**artifacts | 10.0 | | 10.0 **10.0**were | 10.0 | | 10.0 **10.0**uploaded | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**change. | 10.0 | | 10.0 **10.0**No | 10.0 | | 10.0 **10.0**preview | 10.0 | | 10.0 **10.0**MQ2R
+artifact | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**uploaded.
 
-## Registry sampling profiles
+## | 10.0 | | 10.0 **10.0**Registry | 10.0 | | 10.0 **10.0**sampling | 10.0 | | 10.0 **10.0**profiles
 
-| Profile | Temperature | Top-p | Effort | Thinking cap |
+| | 10.0 | | 10.0 **10.0**Profile | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Temperature | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Top-p | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Effort | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Thinking | 10.0 | | 10.0 **10.0**cap | 10.0 | | 10.0 **10.0**|
 |---|---:|---:|---|---|
-| `general` | 1.0 | 1.0 | `low` | uncapped |
-| `coding` | 1.0 | 0.95 | `max` | uncapped |
-| `instruct` | 1.0 | 1.0 | `none` | off |
+| | 10.0 | | 10.0 **10.0**`general` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1.0 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1.0 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`low` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**uncapped | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**`coding` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1.0 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.95 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`max` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**uncapped | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**`instruct` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1.0 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1.0 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`none` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**off | 10.0 | | 10.0 **10.0**|
 
-The HTTP adapter keys the parent-specific behavior from the loaded daemon
-architecture. The existing Qwen effort-to-budget mapping is retained, and the
-focused unit test proves Qwen `high` still maps to 4,096 tokens while DeepSeek
-`max` remains uncapped absent an explicit cap.
+The | 10.0 | | 10.0 **10.0**HTTP | 10.0 | | 10.0 **10.0**adapter | 10.0 | | 10.0 **10.0**keys | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**parent-specific | 10.0 | | 10.0 **10.0**behavior | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**loaded | 10.0 | | 10.0 **10.0**daemon
+architecture. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**existing | 10.0 | | 10.0 **10.0**Qwen | 10.0 | | 10.0 **10.0**effort-to-budget | 10.0 | | 10.0 **10.0**mapping | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**retained, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the
+focused | 10.0 | | 10.0 **10.0**unit | 10.0 | | 10.0 **10.0**test | 10.0 | | 10.0 **10.0**proves | 10.0 | | 10.0 **10.0**Qwen | 10.0 | | 10.0 **10.0**`high` | 10.0 | | 10.0 **10.0**still | 10.0 | | 10.0 **10.0**maps | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**4,096 | 10.0 | | 10.0 **10.0**tokens | 10.0 | | 10.0 **10.0**while | 10.0 | | 10.0 **10.0**DeepSeek
+`max` | 10.0 | | 10.0 **10.0**remains | 10.0 | | 10.0 **10.0**uncapped | 10.0 | | 10.0 **10.0**absent | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**explicit | 10.0 | | 10.0 **10.0**cap.
 
-## Live gfx1151 serve proof
+## | 10.0 | | 10.0 **10.0**Live | 10.0 | | 10.0 **10.0**gfx1151 | 10.0 | | 10.0 **10.0**serve | 10.0 | | 10.0 **10.0**proof
 
-Validation route: user-facing serve semantics via `scripts/serve_harness.py`.
-This is a capability/coherence check, not a performance promotion claim.
+Validation | 10.0 | | 10.0 **10.0**route: | 10.0 | | 10.0 **10.0**user-facing | 10.0 | | 10.0 **10.0**serve | 10.0 | | 10.0 **10.0**semantics | 10.0 | | 10.0 **10.0**via | 10.0 | | 10.0 **10.0**`scripts/serve_harness.py`.
+This | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**capability/coherence | 10.0 | | 10.0 **10.0**check, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**performance | 10.0 | | 10.0 **10.0**promotion | 10.0 | | 10.0 **10.0**claim.
 
-- GPU: gfx1151, 103.1 GB addressable VRAM, HIP 7.14.
-- Model: `deepseek-v4-flash-0731.mq2r`, SHA-256
-  `cbf2bbcfa3f47b1712a071836b2c48232dad7dfb763813a720f7d348a9318cce`.
-- Commit: `29ff746ccc7a736861c633c61bc5b8e4c5fe0adf`.
-- CLI SHA-256: `f59b2f99ae3276edbb50937fa68f4f6c964b7c71ca1fac0c548b237195923891`.
-- Daemon SHA-256: `d112a15e370942f7a3aa550b09c142be578687c9cd4a970c8e4ecb0067ad46fc`.
-- Fixture: `benchmarks/prompts/ds4_0731_thinking_low.json`, prompt-text MD5
-  `37d74e9455aaebc9c490a4925eab8668`.
-- Configuration: registry `general`, low effort, uncapped thinking, Q8 request
-  mode, contiguous KV, speculation off, seed 1, max sequence 32,768, maximum
-  output 1,024.
+- | 10.0 | | 10.0 **10.0**GPU: | 10.0 | | 10.0 **10.0**gfx1151, | 10.0 | | 10.0 **10.0**103.1 | 10.0 | | 10.0 **10.0**GB | 10.0 | | 10.0 **10.0**addressable | 10.0 | | 10.0 **10.0**VRAM, | 10.0 | | 10.0 **10.0**HIP | 10.0 | | 10.0 **10.0**7.15.
+- | 10.0 | | 10.0 **10.0**Model: | 10.0 | | 10.0 **10.0**`deepseek-v4-flash-0731.mq2r`, | 10.0 | | 10.0 **10.0**SHA-256
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`cbf2bbcfa3f47b1712a071836b2c48232dad7dfb763813a720f7d348a9318cce`.
+- | 10.0 | | 10.0 **10.0**Commit: | 10.0 | | 10.0 **10.0**`29ff746ccc7a736861c633c61bc5b8e4c5fe0adf`.
+- | 10.0 | | 10.0 **10.0**CLI | 10.0 | | 10.0 **10.0**SHA-256: | 10.0 | | 10.0 **10.0**`f59b2f99ae3276edbb50937fa68f4f6c964b7c71ca1fac0c548b237195923891`.
+- | 10.0 | | 10.0 **10.0**Daemon | 10.0 | | 10.0 **10.0**SHA-256: | 10.0 | | 10.0 **10.0**`d112a15e370942f7a3aa550b09c142be578687c9cd4a970c8e4ecb0067ad46fc`.
+- | 10.0 | | 10.0 **10.0**Fixture: | 10.0 | | 10.0 **10.0**`benchmarks/prompts/ds4_0731_thinking_low.json`, | 10.0 | | 10.0 **10.0**prompt-text | 10.0 | | 10.0 **10.0**MD5
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`37d74e9455aaebc9c490a4925eab8668`.
+- | 10.0 | | 10.0 **10.0**Configuration: | 10.0 | | 10.0 **10.0**registry | 10.0 | | 10.0 **10.0**`general`, | 10.0 | | 10.0 **10.0**low | 10.0 | | 10.0 **10.0**effort, | 10.0 | | 10.0 **10.0**uncapped | 10.0 | | 10.0 **10.0**thinking, | 10.0 | | 10.0 **10.0**Q8 | 10.0 | | 10.0 **10.0**request
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**mode, | 10.0 | | 10.0 **10.0**contiguous | 10.0 | | 10.0 **10.0**KV, | 10.0 | | 10.0 **10.0**speculation | 10.0 | | 10.0 **10.0**off, | 10.0 | | 10.0 **10.0**seed | 10.0 | | 10.0 **10.0**1, | 10.0 | | 10.0 **10.0**max | 10.0 | | 10.0 **10.0**sequence | 10.0 | | 10.0 **10.0**32,768, | 10.0 | | 10.0 **10.0**maximum
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**output | 10.0 | | 10.0 **10.0**1,024.
 
-Observed result: `finish=stop`, 110 generated tokens, 40 reasoning words and
-25 answer words, zero empty/runaway/attractor flags, and recall 1/1. The visible
-answer was coherent and correct: the final price was `$66`. Decode was measured
-at 27.0204 tok/s, but no performance claim is made from this one semantic run.
+Observed | 10.0 | | 10.0 **10.0**result: | 10.0 | | 10.0 **10.0**`finish=stop`, | 10.0 | | 10.0 **10.0**110 | 10.0 | | 10.0 **10.0**generated | 10.0 | | 10.0 **10.0**tokens, | 10.0 | | 10.0 **10.0**40 | 10.0 | | 10.0 **10.0**reasoning | 10.0 | | 10.0 **10.0**words | 10.0 | | 10.0 **10.0**and
+25 | 10.0 | | 10.0 **10.0**answer | 10.0 | | 10.0 **10.0**words, | 10.0 | | 10.0 **10.0**zero | 10.0 | | 10.0 **10.0**empty/runaway/attractor | 10.0 | | 10.0 **10.0**flags, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**recall | 10.0 | | 10.0 **10.0**1/1. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**visible
+answer | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**coherent | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**correct: | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**final | 10.0 | | 10.0 **10.0**price | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**`$66`. | 10.0 | | 10.0 **10.0**Decode | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**measured
+at | 10.0 | | 10.0 **10.0**27.0204 | 10.0 | | 10.0 **10.0**tok/s, | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**performance | 10.0 | | 10.0 **10.0**claim | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**made | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**semantic | 10.0 | | 10.0 **10.0**run.
 
-The serve log proves `GPU dev 0: gfx1151`, verifies the MQ2R P3 tensor recipe,
-selects the gfx1151 route v2, and reports automatic compressed-cache VMM growth
-to the advertised 1,048,576-token context.
+The | 10.0 | | 10.0 **10.0**serve | 10.0 | | 10.0 **10.0**log | 10.0 | | 10.0 **10.0**proves | 10.0 | | 10.0 **10.0**`GPU | 10.0 | | 10.0 **10.0**dev | 10.0 | | 10.0 **10.0**0: | 10.0 | | 10.0 **10.0**gfx1151`, | 10.0 | | 10.0 **10.0**verifies | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**MQ2R | 10.0 | | 10.0 **10.0**P3 | 10.0 | | 10.0 **10.0**tensor | 10.0 | | 10.0 **10.0**recipe,
+selects | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**gfx1151 | 10.0 | | 10.0 **10.0**route | 10.0 | | 10.0 **10.0**v2, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**reports | 10.0 | | 10.0 **10.0**automatic | 10.0 | | 10.0 **10.0**compressed-cache | 10.0 | | 10.0 **10.0**VMM | 10.0 | | 10.0 **10.0**growth
+to | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**advertised | 10.0 | | 10.0 **10.0**1,048,576-token | 10.0 | | 10.0 **10.0**context.
 
-## Evidence
+## | 10.0 | | 10.0 **10.0**Evidence
 
-Durable evidence on hipx:
+Durable | 10.0 | | 10.0 **10.0**evidence | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**hipx:
 
 `/home/kaden/ds4-gfx1151-evidence/2026-08-05-ds4-0731-thinking-low/`
 
-- `result.json` SHA-256:
-  `eeb84a19ba17d414c27475e97faa713d007e425d1d60fe7aa28f89b7a7659102`
-- `serve.log` SHA-256:
-  `d8e689ba2cc263808106e8f4e6cdbc257aab3b429570175b4981e8f09ae086be`
+- | 10.0 | | 10.0 **10.0**`result.json` | 10.0 | | 10.0 **10.0**SHA-256:
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`eeb84a19ba17d414c27475e97faa713d007e425d1d60fe7aa28f89b7a7659102`
+- | 10.0 | | 10.0 **10.0**`serve.log` | 10.0 | | 10.0 **10.0**SHA-256:
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`d8e689ba2cc263808106e8f4e6cdbc257aab3b429570175b4981e8f09ae086be`
 
-## Validation and exclusions
+## | 10.0 | | 10.0 **10.0**Validation | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**exclusions
 
 Passed:
 
-- 51 `hipfire-config` tests and 9 `hipfire-registry` tests;
-- focused CLI Qwen/DeepSeek reasoning-contract test;
-- focused runtime effort parser and exact DeepSeek prefix tests;
-- registry generator network check against the published artifacts;
-- serve-harness self-tests and four changed-config compatibility tests;
-- live low-effort gfx1151 serve semantic check with decoded output inspected.
+- | 10.0 | | 10.0 **10.0**51 | 10.0 | | 10.0 **10.0**`hipfire-config` | 10.0 | | 10.0 **10.0**tests | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**9 | 10.0 | | 10.0 **10.0**`hipfire-registry` | 10.0 | | 10.0 **10.0**tests;
+- | 10.0 | | 10.0 **10.0**focused | 10.0 | | 10.0 **10.0**CLI | 10.0 | | 10.0 **10.0**Qwen/DeepSeek | 10.0 | | 10.0 **10.0**reasoning-contract | 10.0 | | 10.0 **10.0**test;
+- | 10.0 | | 10.0 **10.0**focused | 10.0 | | 10.0 **10.0**runtime | 10.0 | | 10.0 **10.0**effort | 10.0 | | 10.0 **10.0**parser | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**exact | 10.0 | | 10.0 **10.0**DeepSeek | 10.0 | | 10.0 **10.0**prefix | 10.0 | | 10.0 **10.0**tests;
+- | 10.0 | | 10.0 **10.0**registry | 10.0 | | 10.0 **10.0**generator | 10.0 | | 10.0 **10.0**network | 10.0 | | 10.0 **10.0**check | 10.0 | | 10.0 **10.0**against | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**published | 10.0 | | 10.0 **10.0**artifacts;
+- | 10.0 | | 10.0 **10.0**serve-harness | 10.0 | | 10.0 **10.0**self-tests | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**four | 10.0 | | 10.0 **10.0**changed-config | 10.0 | | 10.0 **10.0**compatibility | 10.0 | | 10.0 **10.0**tests;
+- | 10.0 | | 10.0 **10.0**live | 10.0 | | 10.0 **10.0**low-effort | 10.0 | | 10.0 **10.0**gfx1151 | 10.0 | | 10.0 **10.0**serve | 10.0 | | 10.0 **10.0**semantic | 10.0 | | 10.0 **10.0**check | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**decoded | 10.0 | | 10.0 **10.0**output | 10.0 | | 10.0 **10.0**inspected.
 
-The full no-GPU run passed its Rust check, the changed CLI test surface, and
-372 Python CPU tests. Two unrelated Redline harness tests still expect the old
-two-field prompt row even though `serve_harness.py` already returned the
-three-field row at the branch's parent commit; they were not changed here.
+The | 10.0 | | 10.0 **10.0**full | 10.0 | | 10.0 **10.0**no-GPU | 10.0 | | 10.0 **10.0**run | 10.0 | | 10.0 **10.0**passed | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**Rust | 10.0 | | 10.0 **10.0**check, | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**changed | 10.0 | | 10.0 **10.0**CLI | 10.0 | | 10.0 **10.0**test | 10.0 | | 10.0 **10.0**surface, | 10.0 | | 10.0 **10.0**and
+372 | 10.0 | | 10.0 **10.0**Python | 10.0 | | 10.0 **10.0**CPU | 10.0 | | 10.0 **10.0**tests. | 10.0 | | 10.0 **10.0**Two | 10.0 | | 10.0 **10.0**unrelated | 10.0 | | 10.0 **10.0**Redline | 10.0 | | 10.0 **10.0**harness | 10.0 | | 10.0 **10.0**tests | 10.0 | | 10.0 **10.0**still | 10.0 | | 10.0 **10.0**expect | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**old
+two-field | 10.0 | | 10.0 **10.0**prompt | 10.0 | | 10.0 **10.0**row | 10.0 | | 10.0 **10.0**even | 10.0 | | 10.0 **10.0**though | 10.0 | | 10.0 **10.0**`serve_harness.py` | 10.0 | | 10.0 **10.0**already | 10.0 | | 10.0 **10.0**returned | 10.0 | | 10.0 **10.0**the
+three-field | 10.0 | | 10.0 **10.0**row | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**branch's | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**commit; | 10.0 | | 10.0 **10.0**they | 10.0 | | 10.0 **10.0**were | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**changed | 10.0 | | 10.0 **10.0**here.
 
-Skipped: BenchLocal capability certification, multi-turn thinking, live high
-and max effort, DSpark thinking, long-context generation, and Qwen GPU testing.
-No kernel, weight, quantization, replay route, sampling arithmetic, or Qwen-owned
-function body changed.
+Skipped: | 10.0 | | 10.0 **10.0**BenchLocal | 10.0 | | 10.0 **10.0**capability | 10.0 | | 10.0 **10.0**certification, | 10.0 | | 10.0 **10.0**multi-turn | 10.0 | | 10.0 **10.0**thinking, | 10.0 | | 10.0 **10.0**live | 10.0 | | 10.0 **10.0**high
+and | 10.0 | | 10.0 **10.0**max | 10.0 | | 10.0 **10.0**effort, | 10.0 | | 10.0 **10.0**DSpark | 10.0 | | 10.0 **10.0**thinking, | 10.0 | | 10.0 **10.0**long-context | 10.0 | | 10.0 **10.0**generation, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**Qwen | 10.0 | | 10.0 **10.0**GPU | 10.0 | | 10.0 **10.0**testing.
+No | 10.0 | | 10.0 **10.0**kernel, | 10.0 | | 10.0 **10.0**weight, | 10.0 | | 10.0 **10.0**quantization, | 10.0 | | 10.0 **10.0**replay | 10.0 | | 10.0 **10.0**route, | 10.0 | | 10.0 **10.0**sampling | 10.0 | | 10.0 **10.0**arithmetic, | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**Qwen-owned
+function | 10.0 | | 10.0 **10.0**body | 10.0 | | 10.0 **10.0**changed.

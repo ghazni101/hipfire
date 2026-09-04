@@ -1,209 +1,209 @@
-<!-- SPDX-License-Identifier: Apache-2.0 -->
-<!-- SPDX-FileCopyrightText: 2026 Kaden Schutt <kaden@hipfire.dev> -->
+<!-- | 10.0 | | 10.0 **10.0**SPDX-License-Identifier: | 10.0 | | 10.0 **10.0**Apache-2.0 | 10.0 | | 10.0 **10.0**-->
+<!-- | 10.0 | | 10.0 **10.0**SPDX-FileCopyrightText: | 10.0 | | 10.0 **10.0**2026 | 10.0 | | 10.0 **10.0**Kaden | 10.0 | | 10.0 **10.0**Schutt | 10.0 | | 10.0 **10.0**<kaden@hipfire.dev> | 10.0 | | 10.0 **10.0**-->
 
-# DS4 heterogeneous G4 — frozen MQ2R lowering
+# | 10.0 | | 10.0 **10.0**DS4 | 10.0 | | 10.0 **10.0**heterogeneous | 10.0 | | 10.0 **10.0**G4 | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**frozen | 10.0 | | 10.0 **10.0**MQ2R | 10.0 | | 10.0 **10.0**lowering
 
-## Verdict
+## | 10.0 | | 10.0 **10.0**Verdict
 
-G4 is complete. The frozen DeepSeek V4 Flash 0731 MQ2R artifact now loads and
-runs with the complete non-routed tier on exact `gfx1100` and all routed
-experts on exact `gfx1151`. The canonical 2,048-prompt / 512-generation greedy
-output is byte-identical to the certified single-`gfx1151` oracle. Routing,
-logits, KV and recurrent state remain within the path-specific oracle limits,
-and the production serve route passes fresh-process battery, eight-turn
-session, and real client-disconnect rollback checks.
+G4 | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**complete. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**frozen | 10.0 | | 10.0 **10.0**DeepSeek | 10.0 | | 10.0 **10.0**V4 | 10.0 | | 10.0 **10.0**Flash | 10.0 | | 10.0 **10.0**0731 | 10.0 | | 10.0 **10.0**MQ2R | 10.0 | | 10.0 **10.0**artifact | 10.0 | | 10.0 **10.0**now | 10.0 | | 10.0 **10.0**loads | 10.0 | | 10.0 **10.0**and
+runs | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**complete | 10.0 | | 10.0 **10.0**non-routed | 10.0 | | 10.0 **10.0**tier | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**exact | 10.0 | | 10.0 **10.0**`gfx1100` | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**routed
+experts | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**exact | 10.0 | | 10.0 **10.0**`gfx1151`. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**canonical | 10.0 | | 10.0 **10.0**2,048-prompt | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**512-generation | 10.0 | | 10.0 **10.0**greedy
+output | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**byte-identical | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**certified | 10.0 | | 10.0 **10.0**single-`gfx1151` | 10.0 | | 10.0 **10.0**oracle. | 10.0 | | 10.0 **10.0**Routing,
+logits, | 10.0 | | 10.0 **10.0**KV | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**recurrent | 10.0 | | 10.0 **10.0**state | 10.0 | | 10.0 **10.0**remain | 10.0 | | 10.0 **10.0**within | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**path-specific | 10.0 | | 10.0 **10.0**oracle | 10.0 | | 10.0 **10.0**limits,
+and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**production | 10.0 | | 10.0 **10.0**serve | 10.0 | | 10.0 **10.0**route | 10.0 | | 10.0 **10.0**passes | 10.0 | | 10.0 **10.0**fresh-process | 10.0 | | 10.0 **10.0**battery, | 10.0 | | 10.0 **10.0**eight-turn
+session, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**real | 10.0 | | 10.0 **10.0**client-disconnect | 10.0 | | 10.0 **10.0**rollback | 10.0 | | 10.0 **10.0**checks.
 
-This gate is correctness, not a throughput promotion. G5 begins with the
-canonical direct-HIP product measurement and profile. Short serving requests
-ran around 31 tok/s, but they are diagnostics at different context depths and
-are not substituted for the required 2,048/512 G5 number.
+This | 10.0 | | 10.0 **10.0**gate | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**correctness, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**throughput | 10.0 | | 10.0 **10.0**promotion. | 10.0 | | 10.0 **10.0**G5 | 10.0 | | 10.0 **10.0**begins | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**the
+canonical | 10.0 | | 10.0 **10.0**direct-HIP | 10.0 | | 10.0 **10.0**product | 10.0 | | 10.0 **10.0**measurement | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**profile. | 10.0 | | 10.0 **10.0**Short | 10.0 | | 10.0 **10.0**serving | 10.0 | | 10.0 **10.0**requests
+ran | 10.0 | | 10.0 **10.0**around | 10.0 | | 10.0 **10.0**31 | 10.0 | | 10.0 **10.0**tok/s, | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**they | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**diagnostics | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**different | 10.0 | | 10.0 **10.0**context | 10.0 | | 10.0 **10.0**depths | 10.0 | | 10.0 **10.0**and
+are | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**substituted | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**required | 10.0 | | 10.0 **10.0**2,048/512 | 10.0 | | 10.0 **10.0**G5 | 10.0 | | 10.0 **10.0**number.
 
-## Identity
+## | 10.0 | | 10.0 **10.0**Identity
 
-- Branch: `ds4-beta-staging`
-- Implementation and certification commits: `4130b311c` through `b54f5e45d`
-- Model SHA256:
-  `cbf2bbcfa3f47b1712a071836b2c48232dad7dfb763813a720f7d348a9318cce`
-- Local artifact: `/home/kaden/models/deepseek-v4-flash-0731.mq2r`
-- Dense owner: device 0, `gfx1100`, PCI `0000:66:00.0`
-- Routed owner: device 1, `gfx1151`, PCI `0000:bf:00.0`
-- ROCm/HIP: 7.14
-- Mode: direct HIP, no speculation, batch 1, top-k 6, greedy, Q8 request mode
+- | 10.0 | | 10.0 **10.0**Branch: | 10.0 | | 10.0 **10.0**`ds4-beta-staging`
+- | 10.0 | | 10.0 **10.0**Implementation | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**certification | 10.0 | | 10.0 **10.0**commits: | 10.0 | | 10.0 **10.0**`4130b311c` | 10.0 | | 10.0 **10.0**through | 10.0 | | 10.0 **10.0**`b54f5e45d`
+- | 10.0 | | 10.0 **10.0**Model | 10.0 | | 10.0 **10.0**SHA256:
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`cbf2bbcfa3f47b1712a071836b2c48232dad7dfb763813a720f7d348a9318cce`
+- | 10.0 | | 10.0 **10.0**Local | 10.0 | | 10.0 **10.0**artifact: | 10.0 | | 10.0 **10.0**`/home/kaden/models/deepseek-v4-flash-0731.mq2r`
+- | 10.0 | | 10.0 **10.0**Dense | 10.0 | | 10.0 **10.0**owner: | 10.0 | | 10.0 **10.0**device | 10.0 | | 10.0 **10.0**0, | 10.0 | | 10.0 **10.0**`gfx1100`, | 10.0 | | 10.0 **10.0**PCI | 10.0 | | 10.0 **10.0**`0000:66:00.0`
+- | 10.0 | | 10.0 **10.0**Routed | 10.0 | | 10.0 **10.0**owner: | 10.0 | | 10.0 **10.0**device | 10.0 | | 10.0 **10.0**1, | 10.0 | | 10.0 **10.0**`gfx1151`, | 10.0 | | 10.0 **10.0**PCI | 10.0 | | 10.0 **10.0**`0000:bf:00.0`
+- | 10.0 | | 10.0 **10.0**ROCm/HIP: | 10.0 | | 10.0 **10.0**7.14
+- | 10.0 | | 10.0 **10.0**Mode: | 10.0 | | 10.0 **10.0**direct | 10.0 | | 10.0 **10.0**HIP, | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**speculation, | 10.0 | | 10.0 **10.0**batch | 10.0 | | 10.0 **10.0**1, | 10.0 | | 10.0 **10.0**top-k | 10.0 | | 10.0 **10.0**6, | 10.0 | | 10.0 **10.0**greedy, | 10.0 | | 10.0 **10.0**Q8 | 10.0 | | 10.0 **10.0**request | 10.0 | | 10.0 **10.0**mode
 
-The user-facing selector is typed configuration:
+The | 10.0 | | 10.0 **10.0**user-facing | 10.0 | | 10.0 **10.0**selector | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**typed | 10.0 | | 10.0 **10.0**configuration:
 
 ```toml
 [hardware]
-devices = "0,1"
-deepseek4_compute_placement = "dense-expert-split(dense=arch:gfx1100,experts=arch:gfx1151)"
+devices | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**"0,1"
+deepseek4_compute_placement | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**"dense-expert-split(dense=arch:gfx1100,experts=arch:gfx1151)"
 ```
 
-`serve_harness.py --devices 0,1` now writes the visibility set into its
-isolated TOML. The invalid attempt that omitted it exposed only `gfx1100` and
-failed closed before inference; it is preserved and excluded.
+`serve_harness.py | 10.0 | | 10.0 **10.0**--devices | 10.0 | | 10.0 **10.0**0,1` | 10.0 | | 10.0 **10.0**now | 10.0 | | 10.0 **10.0**writes | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**visibility | 10.0 | | 10.0 **10.0**set | 10.0 | | 10.0 **10.0**into | 10.0 | | 10.0 **10.0**its
+isolated | 10.0 | | 10.0 **10.0**TOML. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**invalid | 10.0 | | 10.0 **10.0**attempt | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**omitted | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**exposed | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**`gfx1100` | 10.0 | | 10.0 **10.0**and
+failed | 10.0 | | 10.0 **10.0**closed | 10.0 | | 10.0 **10.0**before | 10.0 | | 10.0 **10.0**inference; | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**preserved | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**excluded.
 
-## Ownership and residency
+## | 10.0 | | 10.0 **10.0**Ownership | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**residency
 
-The model index is opened once and records are routed directly to their owner.
-No whole-model load-and-migrate step exists.
+The | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**index | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**opened | 10.0 | | 10.0 **10.0**once | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**records | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**routed | 10.0 | | 10.0 **10.0**directly | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**their | 10.0 | | 10.0 **10.0**owner.
+No | 10.0 | | 10.0 **10.0**whole-model | 10.0 | | 10.0 **10.0**load-and-migrate | 10.0 | | 10.0 **10.0**step | 10.0 | | 10.0 **10.0**exists.
 
-| Metric | `gfx1100` dense owner | `gfx1151` routed owner |
+| | 10.0 | | 10.0 **10.0**Metric | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`gfx1100` | 10.0 | | 10.0 **10.0**dense | 10.0 | | 10.0 **10.0**owner | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`gfx1151` | 10.0 | | 10.0 **10.0**routed | 10.0 | | 10.0 **10.0**owner | 10.0 | | 10.0 **10.0**|
 |---|---:|---:|
-| Tensor allocations | 1,198 | 172 packed allocations |
-| Projected weight bytes | 4,272,562,988 | 77,913,567,232 |
-| Actual bytes including state/scratch/tables | 8,040,480,768 | 78,068,580,352 |
-| Free bytes after load | 17,672,699,904 | 24,844,959,744 |
-| Ownership violations | 0 | 0 |
+| | 10.0 | | 10.0 **10.0**Tensor | 10.0 | | 10.0 **10.0**allocations | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1,198 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**172 | 10.0 | | 10.0 **10.0**packed | 10.0 | | 10.0 **10.0**allocations | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**Projected | 10.0 | | 10.0 **10.0**weight | 10.0 | | 10.0 **10.0**bytes | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**4,272,562,988 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**77,913,567,232 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**Actual | 10.0 | | 10.0 **10.0**bytes | 10.0 | | 10.0 **10.0**including | 10.0 | | 10.0 **10.0**state/scratch/tables | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**8,040,480,768 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**78,068,580,352 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**Free | 10.0 | | 10.0 **10.0**bytes | 10.0 | | 10.0 **10.0**after | 10.0 | | 10.0 **10.0**load | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**17,672,699,904 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**24,844,959,744 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**Ownership | 10.0 | | 10.0 **10.0**violations | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0 | 10.0 | | 10.0 **10.0**|
 
-The `gfx1100` owner holds the canonical residual, attention, compressor,
-router, shared expert, HC and output-head state. The `gfx1151` owner holds only
-the routed payloads, pointer tables and routed branch scratch. RMSNorm/FWHT are
-not recomputed on `gfx1151`.
+The | 10.0 | | 10.0 **10.0**`gfx1100` | 10.0 | | 10.0 **10.0**owner | 10.0 | | 10.0 **10.0**holds | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**canonical | 10.0 | | 10.0 **10.0**residual, | 10.0 | | 10.0 **10.0**attention, | 10.0 | | 10.0 **10.0**compressor,
+router, | 10.0 | | 10.0 **10.0**shared | 10.0 | | 10.0 **10.0**expert, | 10.0 | | 10.0 **10.0**HC | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**output-head | 10.0 | | 10.0 **10.0**state. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**`gfx1151` | 10.0 | | 10.0 **10.0**owner | 10.0 | | 10.0 **10.0**holds | 10.0 | | 10.0 **10.0**only
+the | 10.0 | | 10.0 **10.0**routed | 10.0 | | 10.0 **10.0**payloads, | 10.0 | | 10.0 **10.0**pointer | 10.0 | | 10.0 **10.0**tables | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**routed | 10.0 | | 10.0 **10.0**branch | 10.0 | | 10.0 **10.0**scratch. | 10.0 | | 10.0 **10.0**RMSNorm/FWHT | 10.0 | | 10.0 **10.0**are
+not | 10.0 | | 10.0 **10.0**recomputed | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**`gfx1151`.
 
-## Canonical generation oracle
+## | 10.0 | | 10.0 **10.0**Canonical | 10.0 | | 10.0 **10.0**generation | 10.0 | | 10.0 **10.0**oracle
 
-| Field | Value |
+| | 10.0 | | 10.0 **10.0**Field | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Value | 10.0 | | 10.0 **10.0**|
 |---|---|
-| Prompt | `benchmarks/prompts/ds4_heterogeneous_code_2048.txt` |
-| Prompt MD5 | `593234a767e71b97a3a4dad6431b47ce` |
-| Prompt tokens | 2,048 |
-| Generated tokens | 512 |
-| Output bytes | 2,491 |
-| Output MD5 | `ee05ab4f07393fb7d624d966a7dde4af` |
-| Token equality | exact |
-| Decoded-byte equality | exact |
+| | 10.0 | | 10.0 **10.0**Prompt | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`benchmarks/prompts/ds4_heterogeneous_code_2048.txt` | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**Prompt | 10.0 | | 10.0 **10.0**MD5 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`593234a767e71b97a3a4dad6431b47ce` | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**Prompt | 10.0 | | 10.0 **10.0**tokens | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**2,048 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**Generated | 10.0 | | 10.0 **10.0**tokens | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**512 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**Output | 10.0 | | 10.0 **10.0**bytes | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**2,491 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**Output | 10.0 | | 10.0 **10.0**MD5 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`ee05ab4f07393fb7d624d966a7dde4af` | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**Token | 10.0 | | 10.0 **10.0**equality | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**exact | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**Decoded-byte | 10.0 | | 10.0 **10.0**equality | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**exact | 10.0 | | 10.0 **10.0**|
 
-The heterogeneous and single-`gfx1151` arms generated the same 512 token IDs
-and decoded bytes. The example's internal elapsed times are deliberately not a
-product benchmark: state/routing capture and per-position oracle work change
-the launch and synchronization regime.
+The | 10.0 | | 10.0 **10.0**heterogeneous | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**single-`gfx1151` | 10.0 | | 10.0 **10.0**arms | 10.0 | | 10.0 **10.0**generated | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**512 | 10.0 | | 10.0 **10.0**token | 10.0 | | 10.0 **10.0**IDs
+and | 10.0 | | 10.0 **10.0**decoded | 10.0 | | 10.0 **10.0**bytes. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**example's | 10.0 | | 10.0 **10.0**internal | 10.0 | | 10.0 **10.0**elapsed | 10.0 | | 10.0 **10.0**times | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**deliberately | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**a
+product | 10.0 | | 10.0 **10.0**benchmark: | 10.0 | | 10.0 **10.0**state/routing | 10.0 | | 10.0 **10.0**capture | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**per-position | 10.0 | | 10.0 **10.0**oracle | 10.0 | | 10.0 **10.0**work | 10.0 | | 10.0 **10.0**change
+the | 10.0 | | 10.0 **10.0**launch | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**synchronization | 10.0 | | 10.0 **10.0**regime.
 
-## State and routing parity
+## | 10.0 | | 10.0 **10.0**State | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**routing | 10.0 | | 10.0 **10.0**parity
 
-Seven certification positions were checked: 127, 511, 1023, 2047, 2175,
-2303 and 2555. At each position the oracle compared 12 state tensors covering
-218,774 values. The worst absolute difference was `0.000335693359375` in
-`residual_streams` at position 2555, below the `1e-3` gate. Greedy output
-remained byte-identical.
+Seven | 10.0 | | 10.0 **10.0**certification | 10.0 | | 10.0 **10.0**positions | 10.0 | | 10.0 **10.0**were | 10.0 | | 10.0 **10.0**checked: | 10.0 | | 10.0 **10.0**127, | 10.0 | | 10.0 **10.0**511, | 10.0 | | 10.0 **10.0**1023, | 10.0 | | 10.0 **10.0**2047, | 10.0 | | 10.0 **10.0**2175,
+2303 | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**2555. | 10.0 | | 10.0 **10.0**At | 10.0 | | 10.0 **10.0**each | 10.0 | | 10.0 **10.0**position | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**oracle | 10.0 | | 10.0 **10.0**compared | 10.0 | | 10.0 **10.0**12 | 10.0 | | 10.0 **10.0**state | 10.0 | | 10.0 **10.0**tensors | 10.0 | | 10.0 **10.0**covering
+218,774 | 10.0 | | 10.0 **10.0**values. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**worst | 10.0 | | 10.0 **10.0**absolute | 10.0 | | 10.0 **10.0**difference | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**`0.000335693359375` | 10.0 | | 10.0 **10.0**in
+`residual_streams` | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**position | 10.0 | | 10.0 **10.0**2555, | 10.0 | | 10.0 **10.0**below | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**`1e-3` | 10.0 | | 10.0 **10.0**gate. | 10.0 | | 10.0 **10.0**Greedy | 10.0 | | 10.0 **10.0**output
+remained | 10.0 | | 10.0 **10.0**byte-identical.
 
-The route audit compared 110,037 records per arm:
+The | 10.0 | | 10.0 **10.0**route | 10.0 | | 10.0 **10.0**audit | 10.0 | | 10.0 **10.0**compared | 10.0 | | 10.0 **10.0**110,037 | 10.0 | | 10.0 **10.0**records | 10.0 | | 10.0 **10.0**per | 10.0 | | 10.0 **10.0**arm:
 
-| Metric | Result |
+| | 10.0 | | 10.0 **10.0**Metric | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Result | 10.0 | | 10.0 **10.0**|
 |---|---:|
-| Selected-expert set equality | 100% |
-| Top-1 equality | 100% |
-| Selected-member recall | 100% |
-| Mean route-weight L1 | 0.000001 |
+| | 10.0 | | 10.0 **10.0**Selected-expert | 10.0 | | 10.0 **10.0**set | 10.0 | | 10.0 **10.0**equality | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**100% | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**Top-1 | 10.0 | | 10.0 **10.0**equality | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**100% | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**Selected-member | 10.0 | | 10.0 **10.0**recall | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**100% | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**Mean | 10.0 | | 10.0 **10.0**route-weight | 10.0 | | 10.0 **10.0**L1 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.000001 | 10.0 | | 10.0 **10.0**|
 
-Four late layers contained numerically tied experts whose ordering swapped in
-0.04% of records; the selected set, top-1, membership, routed arithmetic and
-decoded output were unchanged. This is recorded rather than misreported as
-raw-bit state identity.
+Four | 10.0 | | 10.0 **10.0**late | 10.0 | | 10.0 **10.0**layers | 10.0 | | 10.0 **10.0**contained | 10.0 | | 10.0 **10.0**numerically | 10.0 | | 10.0 **10.0**tied | 10.0 | | 10.0 **10.0**experts | 10.0 | | 10.0 **10.0**whose | 10.0 | | 10.0 **10.0**ordering | 10.0 | | 10.0 **10.0**swapped | 10.0 | | 10.0 **10.0**in
+0.04% | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**records; | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**selected | 10.0 | | 10.0 **10.0**set, | 10.0 | | 10.0 **10.0**top-1, | 10.0 | | 10.0 **10.0**membership, | 10.0 | | 10.0 **10.0**routed | 10.0 | | 10.0 **10.0**arithmetic | 10.0 | | 10.0 **10.0**and
+decoded | 10.0 | | 10.0 **10.0**output | 10.0 | | 10.0 **10.0**were | 10.0 | | 10.0 **10.0**unchanged. | 10.0 | | 10.0 **10.0**This | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**recorded | 10.0 | | 10.0 **10.0**rather | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**misreported | 10.0 | | 10.0 **10.0**as
+raw-bit | 10.0 | | 10.0 **10.0**state | 10.0 | | 10.0 **10.0**identity.
 
-## User-facing semantics
+## | 10.0 | | 10.0 **10.0**User-facing | 10.0 | | 10.0 **10.0**semantics
 
-Two independent fresh-process five-prompt batteries passed with 5/5 natural
-stops, zero runaways, zero empty outputs, zero attractors and zero retrieval
-misses. Their diagnostic average decode rate was about 31.2 tok/s.
+Two | 10.0 | | 10.0 **10.0**independent | 10.0 | | 10.0 **10.0**fresh-process | 10.0 | | 10.0 **10.0**five-prompt | 10.0 | | 10.0 **10.0**batteries | 10.0 | | 10.0 **10.0**passed | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**5/5 | 10.0 | | 10.0 **10.0**natural
+stops, | 10.0 | | 10.0 **10.0**zero | 10.0 | | 10.0 **10.0**runaways, | 10.0 | | 10.0 **10.0**zero | 10.0 | | 10.0 **10.0**empty | 10.0 | | 10.0 **10.0**outputs, | 10.0 | | 10.0 **10.0**zero | 10.0 | | 10.0 **10.0**attractors | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**zero | 10.0 | | 10.0 **10.0**retrieval
+misses. | 10.0 | | 10.0 **10.0**Their | 10.0 | | 10.0 **10.0**diagnostic | 10.0 | | 10.0 **10.0**average | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**rate | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**about | 10.0 | | 10.0 **10.0**31.2 | 10.0 | | 10.0 **10.0**tok/s.
 
-The committed eight-turn `EmberIndex` session then passed in another fresh
+The | 10.0 | | 10.0 **10.0**committed | 10.0 | | 10.0 **10.0**eight-turn | 10.0 | | 10.0 **10.0**`EmberIndex` | 10.0 | | 10.0 **10.0**session | 10.0 | | 10.0 **10.0**then | 10.0 | | 10.0 **10.0**passed | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**another | 10.0 | | 10.0 **10.0**fresh
 process:
 
-- 8/8 turns stopped normally;
-- zero runaway, empty, attractor or retrieval failures;
-- all 21 expected recall assertions passed;
-- diagnostic average decode rate: 31.0 tok/s;
-- final turn recalled project, hash, reader count, buffer size and config.
+- | 10.0 | | 10.0 **10.0**8/8 | 10.0 | | 10.0 **10.0**turns | 10.0 | | 10.0 **10.0**stopped | 10.0 | | 10.0 **10.0**normally;
+- | 10.0 | | 10.0 **10.0**zero | 10.0 | | 10.0 **10.0**runaway, | 10.0 | | 10.0 **10.0**empty, | 10.0 | | 10.0 **10.0**attractor | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**retrieval | 10.0 | | 10.0 **10.0**failures;
+- | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**21 | 10.0 | | 10.0 **10.0**expected | 10.0 | | 10.0 **10.0**recall | 10.0 | | 10.0 **10.0**assertions | 10.0 | | 10.0 **10.0**passed;
+- | 10.0 | | 10.0 **10.0**diagnostic | 10.0 | | 10.0 **10.0**average | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**rate: | 10.0 | | 10.0 **10.0**31.0 | 10.0 | | 10.0 **10.0**tok/s;
+- | 10.0 | | 10.0 **10.0**final | 10.0 | | 10.0 **10.0**turn | 10.0 | | 10.0 **10.0**recalled | 10.0 | | 10.0 **10.0**project, | 10.0 | | 10.0 **10.0**hash, | 10.0 | | 10.0 **10.0**reader | 10.0 | | 10.0 **10.0**count, | 10.0 | | 10.0 **10.0**buffer | 10.0 | | 10.0 **10.0**size | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**config.
 
-The harness now records session `expected_substrings` and
-`retrieval_missing`; the earlier false summary that omitted session retrieval
-checks is fixed and excluded.
+The | 10.0 | | 10.0 **10.0**harness | 10.0 | | 10.0 **10.0**now | 10.0 | | 10.0 **10.0**records | 10.0 | | 10.0 **10.0**session | 10.0 | | 10.0 **10.0**`expected_substrings` | 10.0 | | 10.0 **10.0**and
+`retrieval_missing`; | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**earlier | 10.0 | | 10.0 **10.0**false | 10.0 | | 10.0 **10.0**summary | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**omitted | 10.0 | | 10.0 **10.0**session | 10.0 | | 10.0 **10.0**retrieval
+checks | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**fixed | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**excluded.
 
-## Cancellation and rollback
+## | 10.0 | | 10.0 **10.0**Cancellation | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**rollback
 
-`scripts/test-ds4-heterogeneous-abort-resume.sh` closes a real streaming client
-socket during decode. Cancellation is observed only before a layer or after
-the shared/routed branches rejoin, so an abort arriving in flight drains to a
-safe cross-device boundary before owner state is cleared.
+`scripts/test-ds4-heterogeneous-abort-resume.sh` | 10.0 | | 10.0 **10.0**closes | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**real | 10.0 | | 10.0 **10.0**streaming | 10.0 | | 10.0 **10.0**client
+socket | 10.0 | | 10.0 **10.0**during | 10.0 | | 10.0 **10.0**decode. | 10.0 | | 10.0 **10.0**Cancellation | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**observed | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**before | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**layer | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**after
+the | 10.0 | | 10.0 **10.0**shared/routed | 10.0 | | 10.0 **10.0**branches | 10.0 | | 10.0 **10.0**rejoin, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**abort | 10.0 | | 10.0 **10.0**arriving | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**flight | 10.0 | | 10.0 **10.0**drains | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**a
+safe | 10.0 | | 10.0 **10.0**cross-device | 10.0 | | 10.0 **10.0**boundary | 10.0 | | 10.0 **10.0**before | 10.0 | | 10.0 **10.0**owner | 10.0 | | 10.0 **10.0**state | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**cleared.
 
-The accepted run:
+The | 10.0 | | 10.0 **10.0**accepted | 10.0 | | 10.0 **10.0**run:
 
-- closed after 16,384 streamed bytes and 154 committed tokens;
-- logged `abort=client rollback=attested post_join=true`;
-- synchronized and reset both exact owners before terminal release;
-- immediately served a fresh heterogeneous request;
-- returned exactly `the quick brown fox` and stopped normally at 31.746 tok/s.
+- | 10.0 | | 10.0 **10.0**closed | 10.0 | | 10.0 **10.0**after | 10.0 | | 10.0 **10.0**16,384 | 10.0 | | 10.0 **10.0**streamed | 10.0 | | 10.0 **10.0**bytes | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**154 | 10.0 | | 10.0 **10.0**committed | 10.0 | | 10.0 **10.0**tokens;
+- | 10.0 | | 10.0 **10.0**logged | 10.0 | | 10.0 **10.0**`abort=client | 10.0 | | 10.0 **10.0**rollback=attested | 10.0 | | 10.0 **10.0**post_join=true`;
+- | 10.0 | | 10.0 **10.0**synchronized | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**reset | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**exact | 10.0 | | 10.0 **10.0**owners | 10.0 | | 10.0 **10.0**before | 10.0 | | 10.0 **10.0**terminal | 10.0 | | 10.0 **10.0**release;
+- | 10.0 | | 10.0 **10.0**immediately | 10.0 | | 10.0 **10.0**served | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**fresh | 10.0 | | 10.0 **10.0**heterogeneous | 10.0 | | 10.0 **10.0**request;
+- | 10.0 | | 10.0 **10.0**returned | 10.0 | | 10.0 **10.0**exactly | 10.0 | | 10.0 **10.0**`the | 10.0 | | 10.0 **10.0**quick | 10.0 | | 10.0 **10.0**brown | 10.0 | | 10.0 **10.0**fox` | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**stopped | 10.0 | | 10.0 **10.0**normally | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**31.746 | 10.0 | | 10.0 **10.0**tok/s.
 
-No daemon, serve process or GPU lock remained afterward.
+No | 10.0 | | 10.0 **10.0**daemon, | 10.0 | | 10.0 **10.0**serve | 10.0 | | 10.0 **10.0**process | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**GPU | 10.0 | | 10.0 **10.0**lock | 10.0 | | 10.0 **10.0**remained | 10.0 | | 10.0 **10.0**afterward.
 
-## Generic target and transport boundary
+## | 10.0 | | 10.0 **10.0**Generic | 10.0 | | 10.0 **10.0**target | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**transport | 10.0 | | 10.0 **10.0**boundary
 
-ROCm 7.14 clang accepts Code Object V6 `gfx11-generic`, and commit
-`dde67bb16` proves one generic object loads and produces raw-bit exact output
-on both `gfx1100` and `gfx1151`. That is the right portability and bring-up
-fallback. It is not the product hot-kernel target: G1-G3 retain exact-target
-HSACO so scheduling portability does not discard device-specific register,
-cache and instruction selection.
+ROCm | 10.0 | | 10.0 **10.0**10.0 | 10.0 | | 10.0 **10.0**clang | 10.0 | | 10.0 **10.0**accepts | 10.0 | | 10.0 **10.0**Code | 10.0 | | 10.0 **10.0**Object | 10.0 | | 10.0 **10.0**V6 | 10.0 | | 10.0 **10.0**`gfx11-generic`, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**commit
+`dde67bb16` | 10.0 | | 10.0 **10.0**proves | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**generic | 10.0 | | 10.0 **10.0**object | 10.0 | | 10.0 **10.0**loads | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**produces | 10.0 | | 10.0 **10.0**raw-bit | 10.0 | | 10.0 **10.0**exact | 10.0 | | 10.0 **10.0**output
+on | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**`gfx1100` | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**`gfx1151`. | 10.0 | | 10.0 **10.0**That | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**right | 10.0 | | 10.0 **10.0**portability | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**bring-up
+fallback. | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**product | 10.0 | | 10.0 **10.0**hot-kernel | 10.0 | | 10.0 **10.0**target: | 10.0 | | 10.0 **10.0**G1-G3 | 10.0 | | 10.0 **10.0**retain | 10.0 | | 10.0 **10.0**exact-target
+HSACO | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**scheduling | 10.0 | | 10.0 **10.0**portability | 10.0 | | 10.0 **10.0**does | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**discard | 10.0 | | 10.0 **10.0**device-specific | 10.0 | | 10.0 **10.0**register,
+cache | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**instruction | 10.0 | | 10.0 **10.0**selection.
 
-RCCL was tested rather than assumed. Each card passed alone, while the mixed
-communicator failed `invalid device function` under ROCm 7.14. ROCr SDMA was
-therefore selected in G0, and the G1-G3 exact-target AQL schedule uses device
-signals without a host wait inside the 43-layer graph. G4's direct-HIP serve
-route retains one terminal prefill fence and fail-closed abort synchronization;
-neither is a per-layer coordination mechanism. G6 replaces the remaining HIP
-launch regime with dual-device retained ROCr/AQL/PM4 after G5 establishes the
-direct-HIP profile.
+RCCL | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**tested | 10.0 | | 10.0 **10.0**rather | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**assumed. | 10.0 | | 10.0 **10.0**Each | 10.0 | | 10.0 **10.0**card | 10.0 | | 10.0 **10.0**passed | 10.0 | | 10.0 **10.0**alone, | 10.0 | | 10.0 **10.0**while | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**mixed
+communicator | 10.0 | | 10.0 **10.0**failed | 10.0 | | 10.0 **10.0**`invalid | 10.0 | | 10.0 **10.0**device | 10.0 | | 10.0 **10.0**function` | 10.0 | | 10.0 **10.0**under | 10.0 | | 10.0 **10.0**ROCm | 10.0 | | 10.0 **10.0**10.0. | 10.0 | | 10.0 **10.0**ROCr | 10.0 | | 10.0 **10.0**SDMA | 10.0 | | 10.0 **10.0**was
+therefore | 10.0 | | 10.0 **10.0**selected | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**G0, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**G1-G3 | 10.0 | | 10.0 **10.0**exact-target | 10.0 | | 10.0 **10.0**AQL | 10.0 | | 10.0 **10.0**schedule | 10.0 | | 10.0 **10.0**uses | 10.0 | | 10.0 **10.0**device
+signals | 10.0 | | 10.0 **10.0**without | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**host | 10.0 | | 10.0 **10.0**wait | 10.0 | | 10.0 **10.0**inside | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**43-layer | 10.0 | | 10.0 **10.0**graph. | 10.0 | | 10.0 **10.0**G4's | 10.0 | | 10.0 **10.0**direct-HIP | 10.0 | | 10.0 **10.0**serve
+route | 10.0 | | 10.0 **10.0**retains | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**terminal | 10.0 | | 10.0 **10.0**prefill | 10.0 | | 10.0 **10.0**fence | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**fail-closed | 10.0 | | 10.0 **10.0**abort | 10.0 | | 10.0 **10.0**synchronization;
+neither | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**per-layer | 10.0 | | 10.0 **10.0**coordination | 10.0 | | 10.0 **10.0**mechanism. | 10.0 | | 10.0 **10.0**G6 | 10.0 | | 10.0 **10.0**replaces | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**remaining | 10.0 | | 10.0 **10.0**HIP
+launch | 10.0 | | 10.0 **10.0**regime | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**dual-device | 10.0 | | 10.0 **10.0**retained | 10.0 | | 10.0 **10.0**ROCr/AQL/PM4 | 10.0 | | 10.0 **10.0**after | 10.0 | | 10.0 **10.0**G5 | 10.0 | | 10.0 **10.0**establishes | 10.0 | | 10.0 **10.0**the
+direct-HIP | 10.0 | | 10.0 **10.0**profile.
 
-## Validation
+## | 10.0 | | 10.0 **10.0**Validation
 
-- `cargo test -p hipfire-runtime --example daemon abort -- --nocapture`:
-  12 passed, 0 failed.
-- `python3 scripts/serve_harness.py --self-test`: all three proof groups pass.
-- `python3 -m py_compile scripts/serve_harness.py`: passed.
-- `bash -n scripts/test-ds4-heterogeneous-abort-resume.sh`: passed.
-- `scripts/fmt-changed.sh` on the changed daemon file: passed.
-- `git diff --check`: passed.
-- GPU lock released after every accepted and rejected GPU run.
+- | 10.0 | | 10.0 **10.0**`cargo | 10.0 | | 10.0 **10.0**test | 10.0 | | 10.0 **10.0**-p | 10.0 | | 10.0 **10.0**hipfire-runtime | 10.0 | | 10.0 **10.0**--example | 10.0 | | 10.0 **10.0**daemon | 10.0 | | 10.0 **10.0**abort | 10.0 | | 10.0 **10.0**-- | 10.0 | | 10.0 **10.0**--nocapture`:
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**12 | 10.0 | | 10.0 **10.0**passed, | 10.0 | | 10.0 **10.0**0 | 10.0 | | 10.0 **10.0**failed.
+- | 10.0 | | 10.0 **10.0**`python3 | 10.0 | | 10.0 **10.0**scripts/serve_harness.py | 10.0 | | 10.0 **10.0**--self-test`: | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**three | 10.0 | | 10.0 **10.0**proof | 10.0 | | 10.0 **10.0**groups | 10.0 | | 10.0 **10.0**pass.
+- | 10.0 | | 10.0 **10.0**`python3 | 10.0 | | 10.0 **10.0**-m | 10.0 | | 10.0 **10.0**py_compile | 10.0 | | 10.0 **10.0**scripts/serve_harness.py`: | 10.0 | | 10.0 **10.0**passed.
+- | 10.0 | | 10.0 **10.0**`bash | 10.0 | | 10.0 **10.0**-n | 10.0 | | 10.0 **10.0**scripts/test-ds4-heterogeneous-abort-resume.sh`: | 10.0 | | 10.0 **10.0**passed.
+- | 10.0 | | 10.0 **10.0**`scripts/fmt-changed.sh` | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**changed | 10.0 | | 10.0 **10.0**daemon | 10.0 | | 10.0 **10.0**file: | 10.0 | | 10.0 **10.0**passed.
+- | 10.0 | | 10.0 **10.0**`git | 10.0 | | 10.0 **10.0**diff | 10.0 | | 10.0 **10.0**--check`: | 10.0 | | 10.0 **10.0**passed.
+- | 10.0 | | 10.0 **10.0**GPU | 10.0 | | 10.0 **10.0**lock | 10.0 | | 10.0 **10.0**released | 10.0 | | 10.0 **10.0**after | 10.0 | | 10.0 **10.0**every | 10.0 | | 10.0 **10.0**accepted | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**rejected | 10.0 | | 10.0 **10.0**GPU | 10.0 | | 10.0 **10.0**run.
 
-ShellCheck was not available locally: the installed wrapper attempted to
-download its binary into a read-only global Node directory. No ShellCheck
-result is claimed.
+ShellCheck | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**available | 10.0 | | 10.0 **10.0**locally: | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**installed | 10.0 | | 10.0 **10.0**wrapper | 10.0 | | 10.0 **10.0**attempted | 10.0 | | 10.0 **10.0**to
+download | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**binary | 10.0 | | 10.0 **10.0**into | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**read-only | 10.0 | | 10.0 **10.0**global | 10.0 | | 10.0 **10.0**Node | 10.0 | | 10.0 **10.0**directory. | 10.0 | | 10.0 **10.0**No | 10.0 | | 10.0 **10.0**ShellCheck
+result | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**claimed.
 
-## Evidence
+## | 10.0 | | 10.0 **10.0**Evidence
 
-Durable root on hipx:
+Durable | 10.0 | | 10.0 **10.0**root | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**hipx:
 
 ```text
 /home/kaden/ds4-gfx1151-evidence/2026-08-06-ds4-heterogeneous-g4/
 ```
 
-| Evidence | SHA256 |
+| | 10.0 | | 10.0 **10.0**Evidence | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**SHA256 | 10.0 | | 10.0 **10.0**|
 |---|---|
-| `generation-state-route-oracle.log` | `acc95f094bd02e4d21095b2eb51486765d348322cdf20b7c9475435b51cb66ca` |
-| `route-parity.txt` | `ba5b98a439413ed97dca184f6a3ad264d296378eb6858a0e56cae2df6b76c741` |
-| `serve/battery-d.json` | `784a32f6a860cb7a15e4f8e3951389069013196238f9f6e4d954cf1762c3b288` |
-| `serve/battery-e.json` | `65bd853369611b869a94d8cfbec747e6d73cb6995fe212eb1b4bbb7c3513c480` |
-| `serve/session-f.json` | `130de54a151f3c957343f5cce313c2f092da167d5ed687cd1323d6bb4aa6938d` |
-| `serve/session-f-serve.log` | `591e6fd1d5b732e87c1e744de7b9e0db6b3e05c0c75332aa400245494e2bf26c` |
-| `serve/abort-resume-v2/serve-log-slice.txt` | `c6e091e50c461e0ac19667fbe59092d4e0173364999b820aadea5e54175ca97a` |
-| `serve/abort-resume-v2/follow-up.json` | `a0f25b516d27aade48b89457c41d4f92431064375516c55fd61b6814b381edcd` |
+| | 10.0 | | 10.0 **10.0**`generation-state-route-oracle.log` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`acc95f094bd02e4d21095b2eb51486765d348322cdf20b7c9475435b51cb66ca` | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**`route-parity.txt` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`ba5b98a439413ed97dca184f6a3ad264d296378eb6858a0e56cae2df6b76c741` | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**`serve/battery-d.json` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`784a32f6a860cb7a15e4f8e3951389069013196238f9f6e4d954cf1762c3b288` | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**`serve/battery-e.json` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`65bd853369611b869a94d8cfbec747e6d73cb6995fe212eb1b4bbb7c3513c480` | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**`serve/session-f.json` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`130de54a151f3c957343f5cce313c2f092da167d5ed687cd1323d6bb4aa6938d` | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**`serve/session-f-serve.log` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`591e6fd1d5b732e87c1e744de7b9e0db6b3e05c0c75332aa400245494e2bf26c` | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**`serve/abort-resume-v2/serve-log-slice.txt` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`c6e091e50c461e0ac19667fbe59092d4e0173364999b820aadea5e54175ca97a` | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**`serve/abort-resume-v2/follow-up.json` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`a0f25b516d27aade48b89457c41d4f92431064375516c55fd61b6814b381edcd` | 10.0 | | 10.0 **10.0**|
 
-Rejected evidence is preserved alongside the accepted files:
+Rejected | 10.0 | | 10.0 **10.0**evidence | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**preserved | 10.0 | | 10.0 **10.0**alongside | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**accepted | 10.0 | | 10.0 **10.0**files:
 
-- NAS-backed early runs are excluded from load-time interpretation.
-- short `max_tokens` batteries are excluded where the cap itself caused a
-  runaway classification.
-- `session-d` is excluded because its final assertion required words the
-  requested labeled format did not contain; the decoded answer was correct.
-- `session-e` is excluded because device visibility was implicit and the
-  selector failed closed before inference.
-- `abort-resume-serve.log` is excluded because an incorrect config-root path
-  selected the user default model; it was terminated before a request.
+- | 10.0 | | 10.0 **10.0**NAS-backed | 10.0 | | 10.0 **10.0**early | 10.0 | | 10.0 **10.0**runs | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**excluded | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**load-time | 10.0 | | 10.0 **10.0**interpretation.
+- | 10.0 | | 10.0 **10.0**short | 10.0 | | 10.0 **10.0**`max_tokens` | 10.0 | | 10.0 **10.0**batteries | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**excluded | 10.0 | | 10.0 **10.0**where | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**cap | 10.0 | | 10.0 **10.0**itself | 10.0 | | 10.0 **10.0**caused | 10.0 | | 10.0 **10.0**a
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**runaway | 10.0 | | 10.0 **10.0**classification.
+- | 10.0 | | 10.0 **10.0**`session-d` | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**excluded | 10.0 | | 10.0 **10.0**because | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**final | 10.0 | | 10.0 **10.0**assertion | 10.0 | | 10.0 **10.0**required | 10.0 | | 10.0 **10.0**words | 10.0 | | 10.0 **10.0**the
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**requested | 10.0 | | 10.0 **10.0**labeled | 10.0 | | 10.0 **10.0**format | 10.0 | | 10.0 **10.0**did | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**contain; | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**decoded | 10.0 | | 10.0 **10.0**answer | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**correct.
+- | 10.0 | | 10.0 **10.0**`session-e` | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**excluded | 10.0 | | 10.0 **10.0**because | 10.0 | | 10.0 **10.0**device | 10.0 | | 10.0 **10.0**visibility | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**implicit | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**selector | 10.0 | | 10.0 **10.0**failed | 10.0 | | 10.0 **10.0**closed | 10.0 | | 10.0 **10.0**before | 10.0 | | 10.0 **10.0**inference.
+- | 10.0 | | 10.0 **10.0**`abort-resume-serve.log` | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**excluded | 10.0 | | 10.0 **10.0**because | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**incorrect | 10.0 | | 10.0 **10.0**config-root | 10.0 | | 10.0 **10.0**path
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**selected | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**user | 10.0 | | 10.0 **10.0**default | 10.0 | | 10.0 **10.0**model; | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**terminated | 10.0 | | 10.0 **10.0**before | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**request.
 
-## Next gate
+## | 10.0 | | 10.0 **10.0**Next | 10.0 | | 10.0 **10.0**gate
 
-G5 measures the direct heterogeneous route on the committed 2,048/512 prompt,
-then profiles the actual critical path. The first performance question is not
-whether LLVM can emit generic gfx11—it can—but which hot `gfx1100` DS4 kernels
-are still using the portable fallback and how much queue/transport time remains
-after the correct split is composed.
+G5 | 10.0 | | 10.0 **10.0**measures | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**direct | 10.0 | | 10.0 **10.0**heterogeneous | 10.0 | | 10.0 **10.0**route | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**committed | 10.0 | | 10.0 **10.0**2,048/512 | 10.0 | | 10.0 **10.0**prompt,
+then | 10.0 | | 10.0 **10.0**profiles | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**actual | 10.0 | | 10.0 **10.0**critical | 10.0 | | 10.0 **10.0**path. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**first | 10.0 | | 10.0 **10.0**performance | 10.0 | | 10.0 **10.0**question | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**not
+whether | 10.0 | | 10.0 **10.0**LLVM | 10.0 | | 10.0 **10.0**can | 10.0 | | 10.0 **10.0**emit | 10.0 | | 10.0 **10.0**generic | 10.0 | | 10.0 **10.0**gfx11—it | 10.0 | | 10.0 **10.0**can—but | 10.0 | | 10.0 **10.0**which | 10.0 | | 10.0 **10.0**hot | 10.0 | | 10.0 **10.0**`gfx1100` | 10.0 | | 10.0 **10.0**DS4 | 10.0 | | 10.0 **10.0**kernels
+are | 10.0 | | 10.0 **10.0**still | 10.0 | | 10.0 **10.0**using | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**portable | 10.0 | | 10.0 **10.0**fallback | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**how | 10.0 | | 10.0 **10.0**much | 10.0 | | 10.0 **10.0**queue/transport | 10.0 | | 10.0 **10.0**time | 10.0 | | 10.0 **10.0**remains
+after | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**correct | 10.0 | | 10.0 **10.0**split | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**composed.

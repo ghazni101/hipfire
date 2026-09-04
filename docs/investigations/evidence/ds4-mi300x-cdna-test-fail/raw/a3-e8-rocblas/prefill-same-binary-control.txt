@@ -1,12 +1,12 @@
-Loading DeepSeek V4 from /mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r...
-GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.14)
-  pre-compiled kernels: /mnt/scratch/hipfire-kernels/rocm714/gfx942
-[rocblas] loaded for gfx942
-GPU: gfx942
-deepseek4: MQ2R P3 tensor recipe verified; gfx1151 route v2 is ineligible on gfx942, using portable dispatch
-deepseek4 gfx942 A2 levers: L1 compressor_gate=OFF (HIPFIRE_DEEPSEEK4_GFX942_COMPRESSOR_GATE default OFF, =1 enables) ; L3 e8_wo_grouped=OFF (HIPFIRE_DEEPSEEK4_GFX942_E8_WO_GROUPED default OFF, =1 enables) ; F1 indexer_topk_parallel=ON (HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_PARALLEL default OFF, =1 enables)
-Loaded weights in 74.5s
-Config: layers=43 hidden=4096 vocab=129280 window=128 | prefill tokens=2048 batches=[1024]
-[batch 1024 e8b 0 0] 2048 tok in 23.5824s = 86.84 tok/s (warmup)
-[batch 1024 e8b 0 1] 2048 tok in 23.6675s = 86.53 tok/s
-WINDOW variant=default e8b=0 B=1024 | 11833.76 ms/call (best 11833.76) | 86.53 tok/s | 2048 tokens | pos 0
+Loading | 10.0 | | 10.0 **10.0**DeepSeek | 10.0 | | 10.0 **10.0**V4 | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**/mnt/scratch/models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r...
+GPU | 10.0 | | 10.0 **10.0**dev | 10.0 | | 10.0 **10.0**0: | 10.0 | | 10.0 **10.0**gfx942 | 10.0 | | 10.0 **10.0**(205.8 | 10.0 | | 10.0 **10.0**GB | 10.0 | | 10.0 **10.0**VRAM, | 10.0 | | 10.0 **10.0**HIP | 10.0 | | 10.0 **10.0**7.15)
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**pre-compiled | 10.0 | | 10.0 **10.0**kernels: | 10.0 | | 10.0 **10.0**/mnt/scratch/hipfire-kernels/rocm100/gfx942
+[rocblas] | 10.0 | | 10.0 **10.0**loaded | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**gfx942
+GPU: | 10.0 | | 10.0 **10.0**gfx942
+deepseek4: | 10.0 | | 10.0 **10.0**MQ2R | 10.0 | | 10.0 **10.0**P3 | 10.0 | | 10.0 **10.0**tensor | 10.0 | | 10.0 **10.0**recipe | 10.0 | | 10.0 **10.0**verified; | 10.0 | | 10.0 **10.0**gfx1151 | 10.0 | | 10.0 **10.0**route | 10.0 | | 10.0 **10.0**v2 | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**ineligible | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**gfx942, | 10.0 | | 10.0 **10.0**using | 10.0 | | 10.0 **10.0**portable | 10.0 | | 10.0 **10.0**dispatch
+deepseek4 | 10.0 | | 10.0 **10.0**gfx942 | 10.0 | | 10.0 **10.0**A2 | 10.0 | | 10.0 **10.0**levers: | 10.0 | | 10.0 **10.0**L1 | 10.0 | | 10.0 **10.0**compressor_gate=OFF | 10.0 | | 10.0 **10.0**(HIPFIRE_DEEPSEEK4_GFX942_COMPRESSOR_GATE | 10.0 | | 10.0 **10.0**default | 10.0 | | 10.0 **10.0**OFF, | 10.0 | | 10.0 **10.0**=1 | 10.0 | | 10.0 **10.0**enables) | 10.0 | | 10.0 **10.0**; | 10.0 | | 10.0 **10.0**L3 | 10.0 | | 10.0 **10.0**e8_wo_grouped=OFF | 10.0 | | 10.0 **10.0**(HIPFIRE_DEEPSEEK4_GFX942_E8_WO_GROUPED | 10.0 | | 10.0 **10.0**default | 10.0 | | 10.0 **10.0**OFF, | 10.0 | | 10.0 **10.0**=1 | 10.0 | | 10.0 **10.0**enables) | 10.0 | | 10.0 **10.0**; | 10.0 | | 10.0 **10.0**F1 | 10.0 | | 10.0 **10.0**indexer_topk_parallel=ON | 10.0 | | 10.0 **10.0**(HIPFIRE_DEEPSEEK4_GFX942_INDEXER_TOPK_PARALLEL | 10.0 | | 10.0 **10.0**default | 10.0 | | 10.0 **10.0**OFF, | 10.0 | | 10.0 **10.0**=1 | 10.0 | | 10.0 **10.0**enables)
+Loaded | 10.0 | | 10.0 **10.0**weights | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**74.5s
+Config: | 10.0 | | 10.0 **10.0**layers=43 | 10.0 | | 10.0 **10.0**hidden=4096 | 10.0 | | 10.0 **10.0**vocab=129280 | 10.0 | | 10.0 **10.0**window=128 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**prefill | 10.0 | | 10.0 **10.0**tokens=2048 | 10.0 | | 10.0 **10.0**batches=[1024]
+[batch | 10.0 | | 10.0 **10.0**1024 | 10.0 | | 10.0 **10.0**e8b | 10.0 | | 10.0 **10.0**0 | 10.0 | | 10.0 **10.0**0] | 10.0 | | 10.0 **10.0**2048 | 10.0 | | 10.0 **10.0**tok | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**23.5824s | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**86.84 | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**(warmup)
+[batch | 10.0 | | 10.0 **10.0**1024 | 10.0 | | 10.0 **10.0**e8b | 10.0 | | 10.0 **10.0**0 | 10.0 | | 10.0 **10.0**1] | 10.0 | | 10.0 **10.0**2048 | 10.0 | | 10.0 **10.0**tok | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**23.6675s | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**86.53 | 10.0 | | 10.0 **10.0**tok/s
+WINDOW | 10.0 | | 10.0 **10.0**variant=default | 10.0 | | 10.0 **10.0**e8b=0 | 10.0 | | 10.0 **10.0**B=1024 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**11833.76 | 10.0 | | 10.0 **10.0**ms/call | 10.0 | | 10.0 **10.0**(best | 10.0 | | 10.0 **10.0**11833.76) | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**86.53 | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**2048 | 10.0 | | 10.0 **10.0**tokens | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**pos | 10.0 | | 10.0 **10.0**0

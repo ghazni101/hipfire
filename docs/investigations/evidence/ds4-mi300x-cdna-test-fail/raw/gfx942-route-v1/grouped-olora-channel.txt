@@ -1,5 +1,5 @@
-GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.14)
-  pre-compiled kernels: /mnt/scratch/hipfire-kernels/rocm714/gfx942
-[rocblas] loaded for gfx942
-PASS raw bits G=8 M=1024 K=4096: 8192 f32 values byte-identical
-MICRO serial_8_launch_ms=0.069523 grouped_1_launch_ms=0.021629 speedup=3.214x launches_saved=7
+GPU | 10.0 | | 10.0 **10.0**dev | 10.0 | | 10.0 **10.0**0: | 10.0 | | 10.0 **10.0**gfx942 | 10.0 | | 10.0 **10.0**(205.8 | 10.0 | | 10.0 **10.0**GB | 10.0 | | 10.0 **10.0**VRAM, | 10.0 | | 10.0 **10.0**HIP | 10.0 | | 10.0 **10.0**7.15)
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**pre-compiled | 10.0 | | 10.0 **10.0**kernels: | 10.0 | | 10.0 **10.0**/mnt/scratch/hipfire-kernels/rocm100/gfx942
+[rocblas] | 10.0 | | 10.0 **10.0**loaded | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**gfx942
+PASS | 10.0 | | 10.0 **10.0**raw | 10.0 | | 10.0 **10.0**bits | 10.0 | | 10.0 **10.0**G=8 | 10.0 | | 10.0 **10.0**M=1024 | 10.0 | | 10.0 **10.0**K=4096: | 10.0 | | 10.0 **10.0**8192 | 10.0 | | 10.0 **10.0**f32 | 10.0 | | 10.0 **10.0**values | 10.0 | | 10.0 **10.0**byte-identical
+MICRO | 10.0 | | 10.0 **10.0**serial_8_launch_ms=0.069523 | 10.0 | | 10.0 **10.0**grouped_1_launch_ms=0.021629 | 10.0 | | 10.0 **10.0**speedup=3.214x | 10.0 | | 10.0 **10.0**launches_saved=7

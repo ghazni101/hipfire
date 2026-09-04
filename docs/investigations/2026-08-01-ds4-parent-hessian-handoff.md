@@ -1,1089 +1,1089 @@
-# DeepSeek V4 Flash 0731 parent-Hessian handoff
+# | 10.0 | | 10.0 **10.0**DeepSeek | 10.0 | | 10.0 **10.0**V4 | 10.0 | | 10.0 **10.0**Flash | 10.0 | | 10.0 **10.0**0731 | 10.0 | | 10.0 **10.0**parent-Hessian | 10.0 | | 10.0 **10.0**handoff
 
-Date: 2026-08-01 (America/Phoenix)
+Date: | 10.0 | | 10.0 **10.0**2026-08-01 | 10.0 | | 10.0 **10.0**(America/Phoenix)
 
-Branch: `ds4-cdna-test-fail`
+Branch: | 10.0 | | 10.0 **10.0**`ds4-cdna-test-fail`
 
-Pre-checkpoint HEAD: `b15edf38d35843b7a9d31bb609214d6abb172d4b`
+Pre-checkpoint | 10.0 | | 10.0 **10.0**HEAD: | 10.0 | | 10.0 **10.0**`b15edf38d35843b7a9d31bb609214d6abb172d4b`
 
-Host: `mi300x` (`gfx942`, ROCm `/opt/rocm/core-7.14`)
+Host: | 10.0 | | 10.0 **10.0**`mi300x` | 10.0 | | 10.0 **10.0**(`gfx942`, | 10.0 | | 10.0 **10.0**ROCm | 10.0 | | 10.0 **10.0**`/opt/rocm/core-10.0`)
 
-## Checkpoint — 2026-08-02, effort stopped deliberately
+## | 10.0 | | 10.0 **10.0**Checkpoint | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**2026-08-02, | 10.0 | | 10.0 **10.0**effort | 10.0 | | 10.0 **10.0**stopped | 10.0 | | 10.0 **10.0**deliberately
 
-**Read this first.** The sections below were written 2026-08-01 and remain
-accurate as history, but the outcome is different from what they anticipated.
+**Read | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**first.** | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**sections | 10.0 | | 10.0 **10.0**below | 10.0 | | 10.0 **10.0**were | 10.0 | | 10.0 **10.0**written | 10.0 | | 10.0 **10.0**2026-08-01 | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**remain
+accurate | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**history, | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**outcome | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**different | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**what | 10.0 | | 10.0 **10.0**they | 10.0 | | 10.0 **10.0**anticipated.
 
-**Where it landed.** The teacher exists, the quants are fixed and shipping, and
-the Rust parent is labelled broken. The effort was stopped by decision, not by
-failure — the remaining GPU time was worth more elsewhere than closing Gates
+**Where | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**landed.** | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**teacher | 10.0 | | 10.0 **10.0**exists, | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**quants | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**fixed | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**shipping, | 10.0 | | 10.0 **10.0**and
+the | 10.0 | | 10.0 **10.0**Rust | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**labelled | 10.0 | | 10.0 **10.0**broken. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**effort | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**stopped | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**decision, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**by
+failure | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**remaining | 10.0 | | 10.0 **10.0**GPU | 10.0 | | 10.0 **10.0**time | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**worth | 10.0 | | 10.0 **10.0**more | 10.0 | | 10.0 **10.0**elsewhere | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**closing | 10.0 | | 10.0 **10.0**Gates
 7-9.
 
-**The teacher is the PyTorch reference, not `parent/*`.** The original plan was
-a Rust parent forward serving as the KLD reference. That is not what works.
-`crates/hipfire-arch-deepseek4/reference_oracle/` imports the reference
-`model.py` verbatim and scores **PPL 4.693** at 1024 tokens; the Rust
-`parent/*` backend scores **59.507** and is marked NOT A CALIBRATION REFERENCE
-at the top of `src/parent/mod.rs`. Canonical baseline, with digests and a
-measured floor, is at
+**The | 10.0 | | 10.0 **10.0**teacher | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**PyTorch | 10.0 | | 10.0 **10.0**reference, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**`parent/*`.** | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**original | 10.0 | | 10.0 **10.0**plan | 10.0 | | 10.0 **10.0**was
+a | 10.0 | | 10.0 **10.0**Rust | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**forward | 10.0 | | 10.0 **10.0**serving | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**KLD | 10.0 | | 10.0 **10.0**reference. | 10.0 | | 10.0 **10.0**That | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**what | 10.0 | | 10.0 **10.0**works.
+`crates/hipfire-arch-deepseek4/reference_oracle/` | 10.0 | | 10.0 **10.0**imports | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**reference
+`model.py` | 10.0 | | 10.0 **10.0**verbatim | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**scores | 10.0 | | 10.0 **10.0****PPL | 10.0 | | 10.0 **10.0**4.693** | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**1024 | 10.0 | | 10.0 **10.0**tokens; | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**Rust
+`parent/*` | 10.0 | | 10.0 **10.0**backend | 10.0 | | 10.0 **10.0**scores | 10.0 | | 10.0 **10.0****59.507** | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**marked | 10.0 | | 10.0 **10.0**NOT | 10.0 | | 10.0 **10.0**A | 10.0 | | 10.0 **10.0**CALIBRATION | 10.0 | | 10.0 **10.0**REFERENCE
+at | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**top | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**`src/parent/mod.rs`. | 10.0 | | 10.0 **10.0**Canonical | 10.0 | | 10.0 **10.0**baseline, | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**digests | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**a
+measured | 10.0 | | 10.0 **10.0**floor, | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**at
 `/mnt/scratch/quantization/deepseek-v4-flash-0731-teacher/BASELINE_SUMMARY.txt`.
 
-**The most valuable outcome was a production fix, not a calibration one.**
-`route_scale` was wrong for every DeepSeek V4 artifact. On the same tokens and
-the same binary, MQ2R went **14.703 → 9.254 PPL, a 37% reduction**, from one
-constant. Per-build defaults now ship: `.mq2r` 1.8 (measured at ctx2048),
-other DS4 2.2 (the calibrated value it served on for two months). The
-checkpoint's 1.5 is never used — it costs ~51%. See `resolve_route_scale`.
+**The | 10.0 | | 10.0 **10.0**most | 10.0 | | 10.0 **10.0**valuable | 10.0 | | 10.0 **10.0**outcome | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**production | 10.0 | | 10.0 **10.0**fix, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**calibration | 10.0 | | 10.0 **10.0**one.**
+`route_scale` | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**wrong | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**every | 10.0 | | 10.0 **10.0**DeepSeek | 10.0 | | 10.0 **10.0**V4 | 10.0 | | 10.0 **10.0**artifact. | 10.0 | | 10.0 **10.0**On | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**tokens | 10.0 | | 10.0 **10.0**and
+the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**binary, | 10.0 | | 10.0 **10.0**MQ2R | 10.0 | | 10.0 **10.0**went | 10.0 | | 10.0 **10.0****14.703 | 10.0 | | 10.0 **10.0**→ | 10.0 | | 10.0 **10.0**9.254 | 10.0 | | 10.0 **10.0**PPL, | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**37% | 10.0 | | 10.0 **10.0**reduction**, | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**one
+constant. | 10.0 | | 10.0 **10.0**Per-build | 10.0 | | 10.0 **10.0**defaults | 10.0 | | 10.0 **10.0**now | 10.0 | | 10.0 **10.0**ship: | 10.0 | | 10.0 **10.0**`.mq2r` | 10.0 | | 10.0 **10.0**1.8 | 10.0 | | 10.0 **10.0**(measured | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**ctx2048),
+other | 10.0 | | 10.0 **10.0**DS4 | 10.0 | | 10.0 **10.0**2.2 | 10.0 | | 10.0 **10.0**(the | 10.0 | | 10.0 **10.0**calibrated | 10.0 | | 10.0 **10.0**value | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**served | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**two | 10.0 | | 10.0 **10.0**months). | 10.0 | | 10.0 **10.0**The
+checkpoint's | 10.0 | | 10.0 **10.0**1.5 | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**never | 10.0 | | 10.0 **10.0**used | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**costs | 10.0 | | 10.0 **10.0**~51%. | 10.0 | | 10.0 **10.0**See | 10.0 | | 10.0 **10.0**`resolve_route_scale`.
 
-**Numbers worth carrying forward, all at 1024 tokens on `tokens.bin`:**
+**Numbers | 10.0 | | 10.0 **10.0**worth | 10.0 | | 10.0 **10.0**carrying | 10.0 | | 10.0 **10.0**forward, | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**1024 | 10.0 | | 10.0 **10.0**tokens | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**`tokens.bin`:**
 
-| system | PPL | vs teacher |
+| | 10.0 | | 10.0 **10.0**system | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**PPL | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**vs | 10.0 | | 10.0 **10.0**teacher | 10.0 | | 10.0 **10.0**|
 |---|---|---|
-| teacher (reference fp8) | 4.693 | — |
-| MQ2R @ route_scale 2.0 | 9.254 | 1.97x |
-| MQ2-Lloyd | 14.564 | 3.10x |
-| `parent/*` | 59.507 | 12.7x |
+| | 10.0 | | 10.0 **10.0**teacher | 10.0 | | 10.0 **10.0**(reference | 10.0 | | 10.0 **10.0**fp8) | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**4.693 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**MQ2R | 10.0 | | 10.0 **10.0**@ | 10.0 | | 10.0 **10.0**route_scale | 10.0 | | 10.0 **10.0**2.0 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**9.254 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1.97x | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**MQ2-Lloyd | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**14.564 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**3.10x | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**`parent/*` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**59.507 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**12.7x | 10.0 | | 10.0 **10.0**|
 
-**The floor, and why it matters.** `ref_fp8` against `ref_exact` — identical
-weights, arithmetic the only difference — gives KLD mean 0.0404 and **top-1
-agreement 0.9297**. The teacher disagrees with itself on 7% of top-1
-predictions. The ceiling is ~0.93, not 1.0. Read every candidate against that.
+**The | 10.0 | | 10.0 **10.0**floor, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**why | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**matters.** | 10.0 | | 10.0 **10.0**`ref_fp8` | 10.0 | | 10.0 **10.0**against | 10.0 | | 10.0 **10.0**`ref_exact` | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**identical
+weights, | 10.0 | | 10.0 **10.0**arithmetic | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**difference | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**gives | 10.0 | | 10.0 **10.0**KLD | 10.0 | | 10.0 **10.0**mean | 10.0 | | 10.0 **10.0**0.0404 | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0****top-1
+agreement | 10.0 | | 10.0 **10.0**0.9297**. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**teacher | 10.0 | | 10.0 **10.0**disagrees | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**itself | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**7% | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**top-1
+predictions. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**ceiling | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**~0.93, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**1.0. | 10.0 | | 10.0 **10.0**Read | 10.0 | | 10.0 **10.0**every | 10.0 | | 10.0 **10.0**candidate | 10.0 | | 10.0 **10.0**against | 10.0 | | 10.0 **10.0**that.
 
-**Two shortcuts this effort proved invalid:**
+**Two | 10.0 | | 10.0 **10.0**shortcuts | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**effort | 10.0 | | 10.0 **10.0**proved | 10.0 | | 10.0 **10.0**invalid:**
 
-1. **Residual magnitude does not predict quality.** `ref_fp8` and `ref_exact`
-   differ 5x in final residual L2 (124858.6 vs 23899.6) at identical PPL. Any
-   magnitude-based stability gate measures nothing established.
-2. **fp8 activation quantization costs 1.5% of PPL** (4.693 vs 4.624). Never a
-   plausible explanation for a large gap.
+1. | 10.0 | | 10.0 **10.0****Residual | 10.0 | | 10.0 **10.0**magnitude | 10.0 | | 10.0 **10.0**does | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**predict | 10.0 | | 10.0 **10.0**quality.** | 10.0 | | 10.0 **10.0**`ref_fp8` | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**`ref_exact`
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**differ | 10.0 | | 10.0 **10.0**5x | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**final | 10.0 | | 10.0 **10.0**residual | 10.0 | | 10.0 **10.0**L2 | 10.0 | | 10.0 **10.0**(124858.6 | 10.0 | | 10.0 **10.0**vs | 10.0 | | 10.0 **10.0**23899.6) | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**identical | 10.0 | | 10.0 **10.0**PPL. | 10.0 | | 10.0 **10.0**Any
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**magnitude-based | 10.0 | | 10.0 **10.0**stability | 10.0 | | 10.0 **10.0**gate | 10.0 | | 10.0 **10.0**measures | 10.0 | | 10.0 **10.0**nothing | 10.0 | | 10.0 **10.0**established.
+2. | 10.0 | | 10.0 **10.0****fp8 | 10.0 | | 10.0 **10.0**activation | 10.0 | | 10.0 **10.0**quantization | 10.0 | | 10.0 **10.0**costs | 10.0 | | 10.0 **10.0**1.5% | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**PPL** | 10.0 | | 10.0 **10.0**(4.693 | 10.0 | | 10.0 **10.0**vs | 10.0 | | 10.0 **10.0**4.624). | 10.0 | | 10.0 **10.0**Never | 10.0 | | 10.0 **10.0**a
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**plausible | 10.0 | | 10.0 **10.0**explanation | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**large | 10.0 | | 10.0 **10.0**gap.
 
-**The methodological lesson, which cost the most time.** Every oracle compared
-`parent/forward.rs` against `parent/*_ref`, both written from the same reading
-of `model.py`. A shared misreading is invisible by construction: HC comparisons
-agreed to ~1e-7 while the model was badly broken. **Ten measurement artifacts**
-fired before the real defect surfaced, including an "8.2x layer step" that was
-one massive-activation row in an aggregate L2, and an attention divergence that
-turned out to sit at 1.24x its own quantization floor. Establish a comparison's
-floor on a known-correct case *before* calling any gap a defect — and prefer an
-oracle that shares no code with the thing under test.
+**The | 10.0 | | 10.0 **10.0**methodological | 10.0 | | 10.0 **10.0**lesson, | 10.0 | | 10.0 **10.0**which | 10.0 | | 10.0 **10.0**cost | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**most | 10.0 | | 10.0 **10.0**time.** | 10.0 | | 10.0 **10.0**Every | 10.0 | | 10.0 **10.0**oracle | 10.0 | | 10.0 **10.0**compared
+`parent/forward.rs` | 10.0 | | 10.0 **10.0**against | 10.0 | | 10.0 **10.0**`parent/*_ref`, | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**written | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**reading
+of | 10.0 | | 10.0 **10.0**`model.py`. | 10.0 | | 10.0 **10.0**A | 10.0 | | 10.0 **10.0**shared | 10.0 | | 10.0 **10.0**misreading | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**invisible | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**construction: | 10.0 | | 10.0 **10.0**HC | 10.0 | | 10.0 **10.0**comparisons
+agreed | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**~1e-7 | 10.0 | | 10.0 **10.0**while | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**badly | 10.0 | | 10.0 **10.0**broken. | 10.0 | | 10.0 **10.0****Ten | 10.0 | | 10.0 **10.0**measurement | 10.0 | | 10.0 **10.0**artifacts**
+fired | 10.0 | | 10.0 **10.0**before | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**real | 10.0 | | 10.0 **10.0**defect | 10.0 | | 10.0 **10.0**surfaced, | 10.0 | | 10.0 **10.0**including | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**"8.2x | 10.0 | | 10.0 **10.0**layer | 10.0 | | 10.0 **10.0**step" | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**was
+one | 10.0 | | 10.0 **10.0**massive-activation | 10.0 | | 10.0 **10.0**row | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**aggregate | 10.0 | | 10.0 **10.0**L2, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**attention | 10.0 | | 10.0 **10.0**divergence | 10.0 | | 10.0 **10.0**that
+turned | 10.0 | | 10.0 **10.0**out | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**sit | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**1.24x | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**own | 10.0 | | 10.0 **10.0**quantization | 10.0 | | 10.0 **10.0**floor. | 10.0 | | 10.0 **10.0**Establish | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**comparison's
+floor | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**known-correct | 10.0 | | 10.0 **10.0**case | 10.0 | | 10.0 **10.0***before* | 10.0 | | 10.0 **10.0**calling | 10.0 | | 10.0 **10.0**any | 10.0 | | 10.0 **10.0**gap | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**defect | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**prefer | 10.0 | | 10.0 **10.0**an
+oracle | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**shares | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**code | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**thing | 10.0 | | 10.0 **10.0**under | 10.0 | | 10.0 **10.0**test.
 
-**What remains open**, should anyone resume: the Rust parent's 12.7x gap is
-unexplained (residuals match the teacher to sub-1%, every measured stage sits
-at floor, the head path is clean — so it lives somewhere in layers 3-41), and
-Gates 7-9 were never run. They are gated on a value test: re-quantize one MQ2R
-build with teacher-derived Hessians and beat **9.254**, not the stale 14.703.
+**What | 10.0 | | 10.0 **10.0**remains | 10.0 | | 10.0 **10.0**open**, | 10.0 | | 10.0 **10.0**should | 10.0 | | 10.0 **10.0**anyone | 10.0 | | 10.0 **10.0**resume: | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**Rust | 10.0 | | 10.0 **10.0**parent's | 10.0 | | 10.0 **10.0**12.7x | 10.0 | | 10.0 **10.0**gap | 10.0 | | 10.0 **10.0**is
+unexplained | 10.0 | | 10.0 **10.0**(residuals | 10.0 | | 10.0 **10.0**match | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**teacher | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**sub-1%, | 10.0 | | 10.0 **10.0**every | 10.0 | | 10.0 **10.0**measured | 10.0 | | 10.0 **10.0**stage | 10.0 | | 10.0 **10.0**sits
+at | 10.0 | | 10.0 **10.0**floor, | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**head | 10.0 | | 10.0 **10.0**path | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**clean | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**lives | 10.0 | | 10.0 **10.0**somewhere | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**layers | 10.0 | | 10.0 **10.0**3-41), | 10.0 | | 10.0 **10.0**and
+Gates | 10.0 | | 10.0 **10.0**7-9 | 10.0 | | 10.0 **10.0**were | 10.0 | | 10.0 **10.0**never | 10.0 | | 10.0 **10.0**run. | 10.0 | | 10.0 **10.0**They | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**gated | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**value | 10.0 | | 10.0 **10.0**test: | 10.0 | | 10.0 **10.0**re-quantize | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**MQ2R
+build | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**teacher-derived | 10.0 | | 10.0 **10.0**Hessians | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**beat | 10.0 | | 10.0 **10.0****9.254**, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**stale | 10.0 | | 10.0 **10.0**14.703.
 
-**One root cause found and fixed** (`dc4a6cd8f`). `Block.hc_post` contracted the
-wrong axis of the sinkhorn `comb` matrix. PPL at 1024 went 163.892 → 59.507; at
-256 the parent now *beats* both 2-bit quants (8.619 against 11.080 / 11.289).
-Details in "Root cause found" below.
+**One | 10.0 | | 10.0 **10.0**root | 10.0 | | 10.0 **10.0**cause | 10.0 | | 10.0 **10.0**found | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**fixed** | 10.0 | | 10.0 **10.0**(`dc4a6cd8f`). | 10.0 | | 10.0 **10.0**`Block.hc_post` | 10.0 | | 10.0 **10.0**contracted | 10.0 | | 10.0 **10.0**the
+wrong | 10.0 | | 10.0 **10.0**axis | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**sinkhorn | 10.0 | | 10.0 **10.0**`comb` | 10.0 | | 10.0 **10.0**matrix. | 10.0 | | 10.0 **10.0**PPL | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**1024 | 10.0 | | 10.0 **10.0**went | 10.0 | | 10.0 **10.0**163.892 | 10.0 | | 10.0 **10.0**→ | 10.0 | | 10.0 **10.0**59.507; | 10.0 | | 10.0 **10.0**at
+256 | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**now | 10.0 | | 10.0 **10.0***beats* | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**2-bit | 10.0 | | 10.0 **10.0**quants | 10.0 | | 10.0 **10.0**(8.619 | 10.0 | | 10.0 **10.0**against | 10.0 | | 10.0 **10.0**11.080 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**11.289).
+Details | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**"Root | 10.0 | | 10.0 **10.0**cause | 10.0 | | 10.0 **10.0**found" | 10.0 | | 10.0 **10.0**below.
 
-**Why it took so long, and the lesson for anyone touching `parent/*`.** Every
-oracle we had compared `parent/forward.rs` against `parent/*_ref`, and both were
-written from the same reading of `model.py`. A shared misreading is invisible by
-construction, so HC comparisons agreed to ~1e-7 while the model was badly wrong.
-Thirteen-plus hypotheses were eliminated before an *independent* implementation
-(production's forward) exposed it. There is now a PyTorch oracle that imports
-`model.py` verbatim — use it.
+**Why | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**took | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**long, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**lesson | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**anyone | 10.0 | | 10.0 **10.0**touching | 10.0 | | 10.0 **10.0**`parent/*`.** | 10.0 | | 10.0 **10.0**Every
+oracle | 10.0 | | 10.0 **10.0**we | 10.0 | | 10.0 **10.0**had | 10.0 | | 10.0 **10.0**compared | 10.0 | | 10.0 **10.0**`parent/forward.rs` | 10.0 | | 10.0 **10.0**against | 10.0 | | 10.0 **10.0**`parent/*_ref`, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**were
+written | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**reading | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**`model.py`. | 10.0 | | 10.0 **10.0**A | 10.0 | | 10.0 **10.0**shared | 10.0 | | 10.0 **10.0**misreading | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**invisible | 10.0 | | 10.0 **10.0**by
+construction, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**HC | 10.0 | | 10.0 **10.0**comparisons | 10.0 | | 10.0 **10.0**agreed | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**~1e-7 | 10.0 | | 10.0 **10.0**while | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**badly | 10.0 | | 10.0 **10.0**wrong.
+Thirteen-plus | 10.0 | | 10.0 **10.0**hypotheses | 10.0 | | 10.0 **10.0**were | 10.0 | | 10.0 **10.0**eliminated | 10.0 | | 10.0 **10.0**before | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0***independent* | 10.0 | | 10.0 **10.0**implementation
+(production's | 10.0 | | 10.0 **10.0**forward) | 10.0 | | 10.0 **10.0**exposed | 10.0 | | 10.0 **10.0**it. | 10.0 | | 10.0 **10.0**There | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**now | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**PyTorch | 10.0 | | 10.0 **10.0**oracle | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**imports
+`model.py` | 10.0 | | 10.0 **10.0**verbatim | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**use | 10.0 | | 10.0 **10.0**it.
 
-**Two defects still open**, cleanly separated by the data:
+**Two | 10.0 | | 10.0 **10.0**defects | 10.0 | | 10.0 **10.0**still | 10.0 | | 10.0 **10.0**open**, | 10.0 | | 10.0 **10.0**cleanly | 10.0 | | 10.0 **10.0**separated | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**data:
 
-1. **L37 → L38 residual step of 8.2x** (14221.72 → 116669.77). Present at all
-   four sequence lengths. Weights bit-exact at L36-39; sinkhorn clean at L38
-   (column sums 1.000, host-vs-GPU 1.4e-7). Localised to `moe_out` at L38,
-   which is ~38k against a ~14k incoming residual where L36/L37 attenuate.
-2. **Accuracy step near position 448-512 that then plateaus.** Full-resolution
-   scan shows the parent tracking mq2r to 448, dropping, then holding flat near
-   0.28 while mq2r holds near 0.50. A latching step, not a ramp. Reference-side
-   `index_topk` selection is *refuted* as the cause (the SWA window is exempt
-   from the budget and it never binds below ~2048 tokens); whether *our* path
-   also treats it as a no-op is open.
+1. | 10.0 | | 10.0 **10.0****L37 | 10.0 | | 10.0 **10.0**→ | 10.0 | | 10.0 **10.0**L38 | 10.0 | | 10.0 **10.0**residual | 10.0 | | 10.0 **10.0**step | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**8.2x** | 10.0 | | 10.0 **10.0**(14221.72 | 10.0 | | 10.0 **10.0**→ | 10.0 | | 10.0 **10.0**116669.77). | 10.0 | | 10.0 **10.0**Present | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**all
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**four | 10.0 | | 10.0 **10.0**sequence | 10.0 | | 10.0 **10.0**lengths. | 10.0 | | 10.0 **10.0**Weights | 10.0 | | 10.0 **10.0**bit-exact | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**L36-39; | 10.0 | | 10.0 **10.0**sinkhorn | 10.0 | | 10.0 **10.0**clean | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**L38
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**(column | 10.0 | | 10.0 **10.0**sums | 10.0 | | 10.0 **10.0**1.000, | 10.0 | | 10.0 **10.0**host-vs-GPU | 10.0 | | 10.0 **10.0**1.4e-7). | 10.0 | | 10.0 **10.0**Localised | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**`moe_out` | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**L38,
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**which | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**~38k | 10.0 | | 10.0 **10.0**against | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**~14k | 10.0 | | 10.0 **10.0**incoming | 10.0 | | 10.0 **10.0**residual | 10.0 | | 10.0 **10.0**where | 10.0 | | 10.0 **10.0**L36/L37 | 10.0 | | 10.0 **10.0**attenuate.
+2. | 10.0 | | 10.0 **10.0****Accuracy | 10.0 | | 10.0 **10.0**step | 10.0 | | 10.0 **10.0**near | 10.0 | | 10.0 **10.0**position | 10.0 | | 10.0 **10.0**448-512 | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**then | 10.0 | | 10.0 **10.0**plateaus.** | 10.0 | | 10.0 **10.0**Full-resolution
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**scan | 10.0 | | 10.0 **10.0**shows | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**tracking | 10.0 | | 10.0 **10.0**mq2r | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**448, | 10.0 | | 10.0 **10.0**dropping, | 10.0 | | 10.0 **10.0**then | 10.0 | | 10.0 **10.0**holding | 10.0 | | 10.0 **10.0**flat | 10.0 | | 10.0 **10.0**near
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**0.28 | 10.0 | | 10.0 **10.0**while | 10.0 | | 10.0 **10.0**mq2r | 10.0 | | 10.0 **10.0**holds | 10.0 | | 10.0 **10.0**near | 10.0 | | 10.0 **10.0**0.50. | 10.0 | | 10.0 **10.0**A | 10.0 | | 10.0 **10.0**latching | 10.0 | | 10.0 **10.0**step, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**ramp. | 10.0 | | 10.0 **10.0**Reference-side
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`index_topk` | 10.0 | | 10.0 **10.0**selection | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0***refuted* | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**cause | 10.0 | | 10.0 **10.0**(the | 10.0 | | 10.0 **10.0**SWA | 10.0 | | 10.0 **10.0**window | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**exempt
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**budget | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**never | 10.0 | | 10.0 **10.0**binds | 10.0 | | 10.0 **10.0**below | 10.0 | | 10.0 **10.0**~2048 | 10.0 | | 10.0 **10.0**tokens); | 10.0 | | 10.0 **10.0**whether | 10.0 | | 10.0 **10.0***our* | 10.0 | | 10.0 **10.0**path
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**also | 10.0 | | 10.0 **10.0**treats | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**no-op | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**open.
 
-**Gates 7-9 are conditional now**, not assumed — see "Gates 7-9 are conditional
-on a value test" below. The independent GPTQ cross-reference found our solver
-math already correct, so the program rests on the unproven premise that
-parent-derived calibration beats what the pipeline already ships. The gate is a
-single parent-calibrated MQ2R re-quant measured against the shipped 14.703 at
+**Gates | 10.0 | | 10.0 **10.0**7-9 | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**conditional | 10.0 | | 10.0 **10.0**now**, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**assumed | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**see | 10.0 | | 10.0 **10.0**"Gates | 10.0 | | 10.0 **10.0**7-9 | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**conditional
+on | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**value | 10.0 | | 10.0 **10.0**test" | 10.0 | | 10.0 **10.0**below. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**independent | 10.0 | | 10.0 **10.0**GPTQ | 10.0 | | 10.0 **10.0**cross-reference | 10.0 | | 10.0 **10.0**found | 10.0 | | 10.0 **10.0**our | 10.0 | | 10.0 **10.0**solver
+math | 10.0 | | 10.0 **10.0**already | 10.0 | | 10.0 **10.0**correct, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**program | 10.0 | | 10.0 **10.0**rests | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**unproven | 10.0 | | 10.0 **10.0**premise | 10.0 | | 10.0 **10.0**that
+parent-derived | 10.0 | | 10.0 **10.0**calibration | 10.0 | | 10.0 **10.0**beats | 10.0 | | 10.0 **10.0**what | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**pipeline | 10.0 | | 10.0 **10.0**already | 10.0 | | 10.0 **10.0**ships. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**gate | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**a
+single | 10.0 | | 10.0 **10.0**parent-calibrated | 10.0 | | 10.0 **10.0**MQ2R | 10.0 | | 10.0 **10.0**re-quant | 10.0 | | 10.0 **10.0**measured | 10.0 | | 10.0 **10.0**against | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**shipped | 10.0 | | 10.0 **10.0**14.703 | 10.0 | | 10.0 **10.0**at
 1024.
 
-**New tooling on this branch, all reusable:**
+**New | 10.0 | | 10.0 **10.0**tooling | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**branch, | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**reusable:**
 
-- `crates/hipfire-quantize/reference_gptq/` — GPTQ oracle written from the paper,
-  not from our Rust. Catches transposed Hessians, missing damping, missing
-  inverse permutation, missing error feedback.
-- `crates/hipfire-arch-deepseek4/reference_oracle/` — PyTorch harness importing
-  `model.py` verbatim (in flight).
-- `crates/hipfire-arch-deepseek4/scripts/plog_fine_scan.py` — full-resolution
-  position scan; distinguishes a latching step from a ramp.
-- `examples/ds4_parent_loader_oracle.rs`, `ds4_prod_vs_parent_trace.rs`,
-  `ds4_parent_plumbing_probe.rs`.
+- | 10.0 | | 10.0 **10.0**`crates/hipfire-quantize/reference_gptq/` | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**GPTQ | 10.0 | | 10.0 **10.0**oracle | 10.0 | | 10.0 **10.0**written | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**paper,
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**our | 10.0 | | 10.0 **10.0**Rust. | 10.0 | | 10.0 **10.0**Catches | 10.0 | | 10.0 **10.0**transposed | 10.0 | | 10.0 **10.0**Hessians, | 10.0 | | 10.0 **10.0**missing | 10.0 | | 10.0 **10.0**damping, | 10.0 | | 10.0 **10.0**missing
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**inverse | 10.0 | | 10.0 **10.0**permutation, | 10.0 | | 10.0 **10.0**missing | 10.0 | | 10.0 **10.0**error | 10.0 | | 10.0 **10.0**feedback.
+- | 10.0 | | 10.0 **10.0**`crates/hipfire-arch-deepseek4/reference_oracle/` | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**PyTorch | 10.0 | | 10.0 **10.0**harness | 10.0 | | 10.0 **10.0**importing
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`model.py` | 10.0 | | 10.0 **10.0**verbatim | 10.0 | | 10.0 **10.0**(in | 10.0 | | 10.0 **10.0**flight).
+- | 10.0 | | 10.0 **10.0**`crates/hipfire-arch-deepseek4/scripts/plog_fine_scan.py` | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**full-resolution
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**position | 10.0 | | 10.0 **10.0**scan; | 10.0 | | 10.0 **10.0**distinguishes | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**latching | 10.0 | | 10.0 **10.0**step | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**ramp.
+- | 10.0 | | 10.0 **10.0**`examples/ds4_parent_loader_oracle.rs`, | 10.0 | | 10.0 **10.0**`ds4_prod_vs_parent_trace.rs`,
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`ds4_parent_plumbing_probe.rs`.
 
-**Methodology notes that cost us time — please honour them.** Compare PPL and
-geo-mean residual growth only *within* a sequence length; both are
-length-dependent. Position-bucket accuracy is the one length-invariant metric.
-`KLD(P_parent || Q_quant)` is weighted by the parent's own distribution, so a
-sharper-but-still-wrong parent scores *higher* — judge by PPL, top-1 and buckets.
-And `pgrep -f` matches the polling script's own command line: two separate
-pollers hung on this, one for 40 minutes. Use `pgrep -f "[d]s4_..."` or poll for
-output artifacts.
+**Methodology | 10.0 | | 10.0 **10.0**notes | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**cost | 10.0 | | 10.0 **10.0**us | 10.0 | | 10.0 **10.0**time | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**please | 10.0 | | 10.0 **10.0**honour | 10.0 | | 10.0 **10.0**them.** | 10.0 | | 10.0 **10.0**Compare | 10.0 | | 10.0 **10.0**PPL | 10.0 | | 10.0 **10.0**and
+geo-mean | 10.0 | | 10.0 **10.0**residual | 10.0 | | 10.0 **10.0**growth | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0***within* | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**sequence | 10.0 | | 10.0 **10.0**length; | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**are
+length-dependent. | 10.0 | | 10.0 **10.0**Position-bucket | 10.0 | | 10.0 **10.0**accuracy | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**length-invariant | 10.0 | | 10.0 **10.0**metric.
+`KLD(P_parent | 10.0 | | 10.0 **10.0**|| | 10.0 | | 10.0 **10.0**Q_quant)` | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**weighted | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**parent's | 10.0 | | 10.0 **10.0**own | 10.0 | | 10.0 **10.0**distribution, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**a
+sharper-but-still-wrong | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**scores | 10.0 | | 10.0 **10.0***higher* | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**judge | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**PPL, | 10.0 | | 10.0 **10.0**top-1 | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**buckets.
+And | 10.0 | | 10.0 **10.0**`pgrep | 10.0 | | 10.0 **10.0**-f` | 10.0 | | 10.0 **10.0**matches | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**polling | 10.0 | | 10.0 **10.0**script's | 10.0 | | 10.0 **10.0**own | 10.0 | | 10.0 **10.0**command | 10.0 | | 10.0 **10.0**line: | 10.0 | | 10.0 **10.0**two | 10.0 | | 10.0 **10.0**separate
+pollers | 10.0 | | 10.0 **10.0**hung | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**this, | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**40 | 10.0 | | 10.0 **10.0**minutes. | 10.0 | | 10.0 **10.0**Use | 10.0 | | 10.0 **10.0**`pgrep | 10.0 | | 10.0 **10.0**-f | 10.0 | | 10.0 **10.0**"[d]s4_..."` | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**poll | 10.0 | | 10.0 **10.0**for
+output | 10.0 | | 10.0 **10.0**artifacts.
 
-## Executive state
+## | 10.0 | | 10.0 **10.0**Executive | 10.0 | | 10.0 **10.0**state
 
-The Hipfire-native activation dumper and rocBLAS Hessian builder work, but the
-only complete 554-tensor capture was driven by the quantized DeepSeek V4 Flash
-0731 MQ2R P3 artifact. It was **not** driven by the original parent checkpoint.
+The | 10.0 | | 10.0 **10.0**Hipfire-native | 10.0 | | 10.0 **10.0**activation | 10.0 | | 10.0 **10.0**dumper | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**rocBLAS | 10.0 | | 10.0 **10.0**Hessian | 10.0 | | 10.0 **10.0**builder | 10.0 | | 10.0 **10.0**work, | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**the
+only | 10.0 | | 10.0 **10.0**complete | 10.0 | | 10.0 **10.0**554-tensor | 10.0 | | 10.0 **10.0**capture | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**driven | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**quantized | 10.0 | | 10.0 **10.0**DeepSeek | 10.0 | | 10.0 **10.0**V4 | 10.0 | | 10.0 **10.0**Flash
+0731 | 10.0 | | 10.0 **10.0**MQ2R | 10.0 | | 10.0 **10.0**P3 | 10.0 | | 10.0 **10.0**artifact. | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0****not** | 10.0 | | 10.0 **10.0**driven | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**original | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**checkpoint.
 
-The generated activations and Hessians are therefore rejected as input to the
-parent-derived GPTQ procedure. Preserve them as quant-self-calibration and
-collector-validation evidence, but do not promote, rename, or consume them as
-parent Hessians.
+The | 10.0 | | 10.0 **10.0**generated | 10.0 | | 10.0 **10.0**activations | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**Hessians | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**therefore | 10.0 | | 10.0 **10.0**rejected | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**input | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**the
+parent-derived | 10.0 | | 10.0 **10.0**GPTQ | 10.0 | | 10.0 **10.0**procedure. | 10.0 | | 10.0 **10.0**Preserve | 10.0 | | 10.0 **10.0**them | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**quant-self-calibration | 10.0 | | 10.0 **10.0**and
+collector-validation | 10.0 | | 10.0 **10.0**evidence, | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**do | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**promote, | 10.0 | | 10.0 **10.0**rename, | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**consume | 10.0 | | 10.0 **10.0**them | 10.0 | | 10.0 **10.0**as
+parent | 10.0 | | 10.0 **10.0**Hessians.
 
-No pre-quant KLD/PPL baseline was recorded. No GPTQ bake has consumed these
-Hessians, and no GPTQ/Hessian/quantization process was active when this handoff
-was written.
+No | 10.0 | | 10.0 **10.0**pre-quant | 10.0 | | 10.0 **10.0**KLD/PPL | 10.0 | | 10.0 **10.0**baseline | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**recorded. | 10.0 | | 10.0 **10.0**No | 10.0 | | 10.0 **10.0**GPTQ | 10.0 | | 10.0 **10.0**bake | 10.0 | | 10.0 **10.0**has | 10.0 | | 10.0 **10.0**consumed | 10.0 | | 10.0 **10.0**these
+Hessians, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**GPTQ/Hessian/quantization | 10.0 | | 10.0 **10.0**process | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**active | 10.0 | | 10.0 **10.0**when | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**handoff
+was | 10.0 | | 10.0 **10.0**written.
 
-The next gate is not GPTQ. It is a correct, fail-closed Hipfire forward for the
-original mixed-precision parent checkpoint, followed by saved parent logits and
-measured MQ2L/MQ2R KLD against those logits.
+The | 10.0 | | 10.0 **10.0**next | 10.0 | | 10.0 **10.0**gate | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**GPTQ. | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**correct, | 10.0 | | 10.0 **10.0**fail-closed | 10.0 | | 10.0 **10.0**Hipfire | 10.0 | | 10.0 **10.0**forward | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**the
+original | 10.0 | | 10.0 **10.0**mixed-precision | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**checkpoint, | 10.0 | | 10.0 **10.0**followed | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**saved | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**logits | 10.0 | | 10.0 **10.0**and
+measured | 10.0 | | 10.0 **10.0**MQ2L/MQ2R | 10.0 | | 10.0 **10.0**KLD | 10.0 | | 10.0 **10.0**against | 10.0 | | 10.0 **10.0**those | 10.0 | | 10.0 **10.0**logits.
 
-## What this checkpoint contains
+## | 10.0 | | 10.0 **10.0**What | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**checkpoint | 10.0 | | 10.0 **10.0**contains
 
-### Activation producer
+### | 10.0 | | 10.0 **10.0**Activation | 10.0 | | 10.0 **10.0**producer
 
-`crates/hipfire-arch-deepseek4/src/forward.rs` adds an environment-gated P3
-activation recorder at the actual DeepSeek forward projection boundaries.
+`crates/hipfire-arch-deepseek4/src/forward.rs` | 10.0 | | 10.0 **10.0**adds | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**environment-gated | 10.0 | | 10.0 **10.0**P3
+activation | 10.0 | | 10.0 **10.0**recorder | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**actual | 10.0 | | 10.0 **10.0**DeepSeek | 10.0 | | 10.0 **10.0**forward | 10.0 | | 10.0 **10.0**projection | 10.0 | | 10.0 **10.0**boundaries.
 
-- Environment: `HIPFIRE_DS4_DENSE_ACT_DIR`
-- File contract: `[u32 rows][u32 K][rows * K * f32]`
-- Logical tensor names match the 554-tensor P3 map.
-- Shared inputs are downloaded once and fanned out to all consuming tensor
-  names.
-- Batched prefill records all active rows, including the eight grouped rows per
-  token consumed by `wo_a`.
-- Finalization patches row counts only after a successful run.
+- | 10.0 | | 10.0 **10.0**Environment: | 10.0 | | 10.0 **10.0**`HIPFIRE_DS4_DENSE_ACT_DIR`
+- | 10.0 | | 10.0 **10.0**File | 10.0 | | 10.0 **10.0**contract: | 10.0 | | 10.0 **10.0**`[u32 | 10.0 | | 10.0 **10.0**rows][u32 | 10.0 | | 10.0 **10.0**K][rows | 10.0 | | 10.0 **10.0*** | 10.0 | | 10.0 **10.0**K | 10.0 | | 10.0 **10.0*** | 10.0 | | 10.0 **10.0**f32]`
+- | 10.0 | | 10.0 **10.0**Logical | 10.0 | | 10.0 **10.0**tensor | 10.0 | | 10.0 **10.0**names | 10.0 | | 10.0 **10.0**match | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**554-tensor | 10.0 | | 10.0 **10.0**P3 | 10.0 | | 10.0 **10.0**map.
+- | 10.0 | | 10.0 **10.0**Shared | 10.0 | | 10.0 **10.0**inputs | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**downloaded | 10.0 | | 10.0 **10.0**once | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**fanned | 10.0 | | 10.0 **10.0**out | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**consuming | 10.0 | | 10.0 **10.0**tensor
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**names.
+- | 10.0 | | 10.0 **10.0**Batched | 10.0 | | 10.0 **10.0**prefill | 10.0 | | 10.0 **10.0**records | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**active | 10.0 | | 10.0 **10.0**rows, | 10.0 | | 10.0 **10.0**including | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**eight | 10.0 | | 10.0 **10.0**grouped | 10.0 | | 10.0 **10.0**rows | 10.0 | | 10.0 **10.0**per
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**token | 10.0 | | 10.0 **10.0**consumed | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**`wo_a`.
+- | 10.0 | | 10.0 **10.0**Finalization | 10.0 | | 10.0 **10.0**patches | 10.0 | | 10.0 **10.0**row | 10.0 | | 10.0 **10.0**counts | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**after | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**successful | 10.0 | | 10.0 **10.0**run.
 
-`crates/hipfire-arch-deepseek4/examples/deepseek4_prefill_bench.rs` exposes the
-recorder as `--dump-dense-acts DIR` and refuses ambiguous benchmark settings:
-one repetition, no warmup, one variant/batch/E8 arm, no prefix/AR reference,
-and a positive token count.
+`crates/hipfire-arch-deepseek4/examples/deepseek4_prefill_bench.rs` | 10.0 | | 10.0 **10.0**exposes | 10.0 | | 10.0 **10.0**the
+recorder | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**`--dump-dense-acts | 10.0 | | 10.0 **10.0**DIR` | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**refuses | 10.0 | | 10.0 **10.0**ambiguous | 10.0 | | 10.0 **10.0**benchmark | 10.0 | | 10.0 **10.0**settings:
+one | 10.0 | | 10.0 **10.0**repetition, | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**warmup, | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**variant/batch/E8 | 10.0 | | 10.0 **10.0**arm, | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**prefix/AR | 10.0 | | 10.0 **10.0**reference,
+and | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**positive | 10.0 | | 10.0 **10.0**token | 10.0 | | 10.0 **10.0**count.
 
-### Hessian consumer
+### | 10.0 | | 10.0 **10.0**Hessian | 10.0 | | 10.0 **10.0**consumer
 
-`crates/hip-bridge/examples/collect_e8_hessian_rocblas.rs` reads one or more
-activation files, computes each 256-channel `X^T X` block with rocBLAS FP32
-GEMM on gfx942, canonicalizes the independent rocBLAS triangles to exact
-symmetry, validates finite entries and nonnegative diagonals, and writes the
-`E8H1` `.hblk` contract consumed by `hipfire-quantize --hessian-dir`.
+`crates/hip-bridge/examples/collect_e8_hessian_rocblas.rs` | 10.0 | | 10.0 **10.0**reads | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**more
+activation | 10.0 | | 10.0 **10.0**files, | 10.0 | | 10.0 **10.0**computes | 10.0 | | 10.0 **10.0**each | 10.0 | | 10.0 **10.0**256-channel | 10.0 | | 10.0 **10.0**`X^T | 10.0 | | 10.0 **10.0**X` | 10.0 | | 10.0 **10.0**block | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**rocBLAS | 10.0 | | 10.0 **10.0**FP32
+GEMM | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**gfx942, | 10.0 | | 10.0 **10.0**canonicalizes | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**independent | 10.0 | | 10.0 **10.0**rocBLAS | 10.0 | | 10.0 **10.0**triangles | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**exact
+symmetry, | 10.0 | | 10.0 **10.0**validates | 10.0 | | 10.0 **10.0**finite | 10.0 | | 10.0 **10.0**entries | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**nonnegative | 10.0 | | 10.0 **10.0**diagonals, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**writes | 10.0 | | 10.0 **10.0**the
+`E8H1` | 10.0 | | 10.0 **10.0**`.hblk` | 10.0 | | 10.0 **10.0**contract | 10.0 | | 10.0 **10.0**consumed | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**`hipfire-quantize | 10.0 | | 10.0 **10.0**--hessian-dir`.
 
-This utility is model-agnostic with respect to activation provenance. The
-producer determines whether a resulting Hessian is a parent Hessian, a
-quant-self Hessian, or invalid. The utility does not make that claim itself.
+This | 10.0 | | 10.0 **10.0**utility | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**model-agnostic | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**respect | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**activation | 10.0 | | 10.0 **10.0**provenance. | 10.0 | | 10.0 **10.0**The
+producer | 10.0 | | 10.0 **10.0**determines | 10.0 | | 10.0 **10.0**whether | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**resulting | 10.0 | | 10.0 **10.0**Hessian | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**Hessian, | 10.0 | | 10.0 **10.0**a
+quant-self | 10.0 | | 10.0 **10.0**Hessian, | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**invalid. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**utility | 10.0 | | 10.0 **10.0**does | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**make | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**claim | 10.0 | | 10.0 **10.0**itself.
 
-## Preserved rejected capture
+## | 10.0 | | 10.0 **10.0**Preserved | 10.0 | | 10.0 **10.0**rejected | 10.0 | | 10.0 **10.0**capture
 
 Root:
 
 `/mnt/scratch/quantization/deepseek-v4-flash-0731-native-hessian`
 
-The directory name predates the provenance correction and is misleading.
-"Native" here only meant that Hipfire produced F32 activation buffers and
-rocBLAS produced the Gram matrices. It did not mean that the original parent
-weights produced those activations.
+The | 10.0 | | 10.0 **10.0**directory | 10.0 | | 10.0 **10.0**name | 10.0 | | 10.0 **10.0**predates | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**provenance | 10.0 | | 10.0 **10.0**correction | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**misleading.
+"Native" | 10.0 | | 10.0 **10.0**here | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**meant | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**Hipfire | 10.0 | | 10.0 **10.0**produced | 10.0 | | 10.0 **10.0**F32 | 10.0 | | 10.0 **10.0**activation | 10.0 | | 10.0 **10.0**buffers | 10.0 | | 10.0 **10.0**and
+rocBLAS | 10.0 | | 10.0 **10.0**produced | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**Gram | 10.0 | | 10.0 **10.0**matrices. | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**did | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**mean | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**original | 10.0 | | 10.0 **10.0**parent
+weights | 10.0 | | 10.0 **10.0**produced | 10.0 | | 10.0 **10.0**those | 10.0 | | 10.0 **10.0**activations.
 
-| Item | Value |
+| | 10.0 | | 10.0 **10.0**Item | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Value | 10.0 | | 10.0 **10.0**|
 |---|---:|
-| Corpus tokens | 1,024 WikiText tokens |
-| Corpus MD5 | `83b0205a304bf4e52172ecdb05f2e895` |
-| Capture time | 22.1196 s under instrumentation |
-| Source artifact | `deepseek-v4-flash-0731.mq2r` |
-| Source SHA-256 | `cbf2bbcfa3f47b1712a071836b2c48232dad7dfb763813a720f7d348a9318cce` |
-| Activation files | 554 |
-| Activation rows | 875,520 |
-| Activation bytes | 13,899,927,888 |
-| Raw Hessian files | 554 |
-| Raw Hessian bytes | 2,212,502,008 |
-| Symmetric Hessian files | 554 |
-| Symmetric Hessian bytes | 2,212,502,008 |
-| Representative symmetric hash | `head.weight.hblk` = `abc5f736949b27528356d3cbfc6abe5ecca85ad49f380d16a46229f1dad4d53d` |
+| | 10.0 | | 10.0 **10.0**Corpus | 10.0 | | 10.0 **10.0**tokens | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1,024 | 10.0 | | 10.0 **10.0**WikiText | 10.0 | | 10.0 **10.0**tokens | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**Corpus | 10.0 | | 10.0 **10.0**MD5 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`83b0205a304bf4e52172ecdb05f2e895` | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**Capture | 10.0 | | 10.0 **10.0**time | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**22.1196 | 10.0 | | 10.0 **10.0**s | 10.0 | | 10.0 **10.0**under | 10.0 | | 10.0 **10.0**instrumentation | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**Source | 10.0 | | 10.0 **10.0**artifact | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`deepseek-v4-flash-0731.mq2r` | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**Source | 10.0 | | 10.0 **10.0**SHA-256 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`cbf2bbcfa3f47b1712a071836b2c48232dad7dfb763813a720f7d348a9318cce` | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**Activation | 10.0 | | 10.0 **10.0**files | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**554 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**Activation | 10.0 | | 10.0 **10.0**rows | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**875,520 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**Activation | 10.0 | | 10.0 **10.0**bytes | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**13,899,927,888 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**Raw | 10.0 | | 10.0 **10.0**Hessian | 10.0 | | 10.0 **10.0**files | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**554 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**Raw | 10.0 | | 10.0 **10.0**Hessian | 10.0 | | 10.0 **10.0**bytes | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**2,212,502,008 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**Symmetric | 10.0 | | 10.0 **10.0**Hessian | 10.0 | | 10.0 **10.0**files | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**554 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**Symmetric | 10.0 | | 10.0 **10.0**Hessian | 10.0 | | 10.0 **10.0**bytes | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**2,212,502,008 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**Representative | 10.0 | | 10.0 **10.0**symmetric | 10.0 | | 10.0 **10.0**hash | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`head.weight.hblk` | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**`abc5f736949b27528356d3cbfc6abe5ecca85ad49f380d16a46229f1dad4d53d` | 10.0 | | 10.0 **10.0**|
 
 Subdirectories:
 
-- `p3-wikitext-1024-acts`
-- `p3-wikitext-1024-hblk`
-- `p3-wikitext-1024-hblk-symmetric`
-- four smaller `smoke-*` directories
+- | 10.0 | | 10.0 **10.0**`p3-wikitext-1024-acts`
+- | 10.0 | | 10.0 **10.0**`p3-wikitext-1024-hblk`
+- | 10.0 | | 10.0 **10.0**`p3-wikitext-1024-hblk-symmetric`
+- | 10.0 | | 10.0 **10.0**four | 10.0 | | 10.0 **10.0**smaller | 10.0 | | 10.0 **10.0**`smoke-*` | 10.0 | | 10.0 **10.0**directories
 
-The loader discovered the sibling MTP artifact during the capture load, but
-the benchmark executed ordinary target-only batched prefill. No MTP or
-speculative forward generated these activations.
+The | 10.0 | | 10.0 **10.0**loader | 10.0 | | 10.0 **10.0**discovered | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**sibling | 10.0 | | 10.0 **10.0**MTP | 10.0 | | 10.0 **10.0**artifact | 10.0 | | 10.0 **10.0**during | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**capture | 10.0 | | 10.0 **10.0**load, | 10.0 | | 10.0 **10.0**but
+the | 10.0 | | 10.0 **10.0**benchmark | 10.0 | | 10.0 **10.0**executed | 10.0 | | 10.0 **10.0**ordinary | 10.0 | | 10.0 **10.0**target-only | 10.0 | | 10.0 **10.0**batched | 10.0 | | 10.0 **10.0**prefill. | 10.0 | | 10.0 **10.0**No | 10.0 | | 10.0 **10.0**MTP | 10.0 | | 10.0 **10.0**or
+speculative | 10.0 | | 10.0 **10.0**forward | 10.0 | | 10.0 **10.0**generated | 10.0 | | 10.0 **10.0**these | 10.0 | | 10.0 **10.0**activations.
 
-The capture directory contains no provenance manifest, parent-logit baseline,
-KLD result, or exact saved invocation. That absence is itself a provenance
-failure and must not be repaired retrospectively by inference.
+The | 10.0 | | 10.0 **10.0**capture | 10.0 | | 10.0 **10.0**directory | 10.0 | | 10.0 **10.0**contains | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**provenance | 10.0 | | 10.0 **10.0**manifest, | 10.0 | | 10.0 **10.0**parent-logit | 10.0 | | 10.0 **10.0**baseline,
+KLD | 10.0 | | 10.0 **10.0**result, | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**exact | 10.0 | | 10.0 **10.0**saved | 10.0 | | 10.0 **10.0**invocation. | 10.0 | | 10.0 **10.0**That | 10.0 | | 10.0 **10.0**absence | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**itself | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**provenance
+failure | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**must | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**be | 10.0 | | 10.0 **10.0**repaired | 10.0 | | 10.0 **10.0**retrospectively | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**inference.
 
-## Root cause of the rejected provenance
+## | 10.0 | | 10.0 **10.0**Root | 10.0 | | 10.0 **10.0**cause | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**rejected | 10.0 | | 10.0 **10.0**provenance
 
-The work conflated two different meanings of "native":
+The | 10.0 | | 10.0 **10.0**work | 10.0 | | 10.0 **10.0**conflated | 10.0 | | 10.0 **10.0**two | 10.0 | | 10.0 **10.0**different | 10.0 | | 10.0 **10.0**meanings | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**"native":
 
-1. Hipfire generated and stored activation buffers as F32.
-2. The original parent checkpoint generated the activation distribution.
+1. | 10.0 | | 10.0 **10.0**Hipfire | 10.0 | | 10.0 **10.0**generated | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**stored | 10.0 | | 10.0 **10.0**activation | 10.0 | | 10.0 **10.0**buffers | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**F32.
+2. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**original | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**checkpoint | 10.0 | | 10.0 **10.0**generated | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**activation | 10.0 | | 10.0 **10.0**distribution.
 
-Only the first statement was true. The benchmark CLI accepted an HFQ/MQ2R
-model path and loaded the quantized P3 artifact directly. Converting its
-intermediate values to F32 does not turn it into the parent model.
+Only | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**first | 10.0 | | 10.0 **10.0**statement | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**true. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**benchmark | 10.0 | | 10.0 **10.0**CLI | 10.0 | | 10.0 **10.0**accepted | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**HFQ/MQ2R
+model | 10.0 | | 10.0 **10.0**path | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**loaded | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**quantized | 10.0 | | 10.0 **10.0**P3 | 10.0 | | 10.0 **10.0**artifact | 10.0 | | 10.0 **10.0**directly. | 10.0 | | 10.0 **10.0**Converting | 10.0 | | 10.0 **10.0**its
+intermediate | 10.0 | | 10.0 **10.0**values | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**F32 | 10.0 | | 10.0 **10.0**does | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**turn | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**into | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**model.
 
-The original checkpoint is present and fits on the MI300X, but the current
-DeepSeek safetensors loader cannot execute its formats correctly. It indexes
-the tensors, then uploads unrecognized FP8/I8 payloads as raw bytes without
-pairing their `.scale` tensors or selecting matching kernels.
+The | 10.0 | | 10.0 **10.0**original | 10.0 | | 10.0 **10.0**checkpoint | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**present | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**fits | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**MI300X, | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**current
+DeepSeek | 10.0 | | 10.0 **10.0**safetensors | 10.0 | | 10.0 **10.0**loader | 10.0 | | 10.0 **10.0**cannot | 10.0 | | 10.0 **10.0**execute | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**formats | 10.0 | | 10.0 **10.0**correctly. | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**indexes
+the | 10.0 | | 10.0 **10.0**tensors, | 10.0 | | 10.0 **10.0**then | 10.0 | | 10.0 **10.0**uploads | 10.0 | | 10.0 **10.0**unrecognized | 10.0 | | 10.0 **10.0**FP8/I8 | 10.0 | | 10.0 **10.0**payloads | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**raw | 10.0 | | 10.0 **10.0**bytes | 10.0 | | 10.0 **10.0**without
+pairing | 10.0 | | 10.0 **10.0**their | 10.0 | | 10.0 **10.0**`.scale` | 10.0 | | 10.0 **10.0**tensors | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**selecting | 10.0 | | 10.0 **10.0**matching | 10.0 | | 10.0 **10.0**kernels.
 
-## Original parent checkpoint inventory
+## | 10.0 | | 10.0 **10.0**Original | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**checkpoint | 10.0 | | 10.0 **10.0**inventory
 
 Path:
 
 `/mnt/scratch/models/DeepSeek-V4-Flash-0731`
 
-The checkpoint occupies approximately 156 GiB across 48 safetensors shards
-and contains 72,317 tensors.
+The | 10.0 | | 10.0 **10.0**checkpoint | 10.0 | | 10.0 **10.0**occupies | 10.0 | | 10.0 **10.0**approximately | 10.0 | | 10.0 **10.0**156 | 10.0 | | 10.0 **10.0**GiB | 10.0 | | 10.0 **10.0**across | 10.0 | | 10.0 **10.0**48 | 10.0 | | 10.0 **10.0**safetensors | 10.0 | | 10.0 **10.0**shards
+and | 10.0 | | 10.0 **10.0**contains | 10.0 | | 10.0 **10.0**72,317 | 10.0 | | 10.0 **10.0**tensors.
 
-| Safetensors dtype | Tensors | Payload GiB | Meaning |
+| | 10.0 | | 10.0 **10.0**Safetensors | 10.0 | | 10.0 **10.0**dtype | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Tensors | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Payload | 10.0 | | 10.0 **10.0**GiB | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Meaning | 10.0 | | 10.0 **10.0**|
 |---|---:|---:|---|
-| `I8` | 35,328 | 138.000 | Two packed E2M1 FP4 values per byte for routed experts |
-| `F8_E8M0` | 35,718 | 8.625 | UE8M0 block scales, primarily expert per-32 scales |
-| `F8_E4M3` | 390 | 5.871 | Dense FP8 weights with 128 by 128 scaling |
-| `BF16` | 445 | 2.763 | Embeddings, norms, head, and other parent tensors |
-| `F32` | 433 | 0.141 | Sinks, biases, and other full-precision tensors |
-| `I64` | 3 | 0.017 | Hash-routing tables |
+| | 10.0 | | 10.0 **10.0**`I8` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**35,328 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**138.000 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Two | 10.0 | | 10.0 **10.0**packed | 10.0 | | 10.0 **10.0**E2M1 | 10.0 | | 10.0 **10.0**FP4 | 10.0 | | 10.0 **10.0**values | 10.0 | | 10.0 **10.0**per | 10.0 | | 10.0 **10.0**byte | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**routed | 10.0 | | 10.0 **10.0**experts | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**`F8_E8M0` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**35,718 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**8.625 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**UE8M0 | 10.0 | | 10.0 **10.0**block | 10.0 | | 10.0 **10.0**scales, | 10.0 | | 10.0 **10.0**primarily | 10.0 | | 10.0 **10.0**expert | 10.0 | | 10.0 **10.0**per-32 | 10.0 | | 10.0 **10.0**scales | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**`F8_E4M3` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**390 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**5.871 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Dense | 10.0 | | 10.0 **10.0**FP8 | 10.0 | | 10.0 **10.0**weights | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**128 | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**128 | 10.0 | | 10.0 **10.0**scaling | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**`BF16` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**445 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**2.763 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Embeddings, | 10.0 | | 10.0 **10.0**norms, | 10.0 | | 10.0 **10.0**head, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**other | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**tensors | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**`F32` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**433 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.141 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Sinks, | 10.0 | | 10.0 **10.0**biases, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**other | 10.0 | | 10.0 **10.0**full-precision | 10.0 | | 10.0 **10.0**tensors | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**`I64` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**3 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.017 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Hash-routing | 10.0 | | 10.0 **10.0**tables | 10.0 | | 10.0 **10.0**|
 
-Relevant configuration:
+Relevant | 10.0 | | 10.0 **10.0**configuration:
 
-- `quant_method = fp8`
-- `fmt = e4m3`
-- `scale_fmt = ue8m0`
-- dense `weight_block_size = [128, 128]`
-- `expert_dtype = fp4`
-- expert FP4 scale group = 32 along K
-- `num_experts_per_tok = 6`
-- 256 routed experts
-- 43 target layers plus one MTP layer
+- | 10.0 | | 10.0 **10.0**`quant_method | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**fp8`
+- | 10.0 | | 10.0 **10.0**`fmt | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**e4m3`
+- | 10.0 | | 10.0 **10.0**`scale_fmt | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**ue8m0`
+- | 10.0 | | 10.0 **10.0**dense | 10.0 | | 10.0 **10.0**`weight_block_size | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**[128, | 10.0 | | 10.0 **10.0**128]`
+- | 10.0 | | 10.0 **10.0**`expert_dtype | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**fp4`
+- | 10.0 | | 10.0 **10.0**expert | 10.0 | | 10.0 **10.0**FP4 | 10.0 | | 10.0 **10.0**scale | 10.0 | | 10.0 **10.0**group | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**32 | 10.0 | | 10.0 **10.0**along | 10.0 | | 10.0 **10.0**K
+- | 10.0 | | 10.0 **10.0**`num_experts_per_tok | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**6`
+- | 10.0 | | 10.0 **10.0**256 | 10.0 | | 10.0 **10.0**routed | 10.0 | | 10.0 **10.0**experts
+- | 10.0 | | 10.0 **10.0**43 | 10.0 | | 10.0 **10.0**target | 10.0 | | 10.0 **10.0**layers | 10.0 | | 10.0 **10.0**plus | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**MTP | 10.0 | | 10.0 **10.0**layer
 
-## Proposed parent-calibration backend
+## | 10.0 | | 10.0 **10.0**Proposed | 10.0 | | 10.0 **10.0**parent-calibration | 10.0 | | 10.0 **10.0**backend
 
-Implement a DS4-owned `Ds4ParentBackend`; do not extend the generic MQ2R byte
+Implement | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**DS4-owned | 10.0 | | 10.0 **10.0**`Ds4ParentBackend`; | 10.0 | | 10.0 **10.0**do | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**extend | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**generic | 10.0 | | 10.0 **10.0**MQ2R | 10.0 | | 10.0 **10.0**byte
 heuristics.
 
-Admission must require all of:
+Admission | 10.0 | | 10.0 **10.0**must | 10.0 | | 10.0 **10.0**require | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**of:
 
-- `model_type = deepseek_v4`
-- `quant_method = fp8`
-- `expert_dtype = fp4`
-- exact weight/scale dtype and shape contracts
-- `gfx942`
+- | 10.0 | | 10.0 **10.0**`model_type | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**deepseek_v4`
+- | 10.0 | | 10.0 **10.0**`quant_method | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**fp8`
+- | 10.0 | | 10.0 **10.0**`expert_dtype | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**fp4`
+- | 10.0 | | 10.0 **10.0**exact | 10.0 | | 10.0 **10.0**weight/scale | 10.0 | | 10.0 **10.0**dtype | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**shape | 10.0 | | 10.0 **10.0**contracts
+- | 10.0 | | 10.0 **10.0**`gfx942`
 
-Any missing scale, unexpected dtype/shape, or unsupported device fails the
-load. There is no fallback to `Raw`, MQ2R, Qwen, or a generic gfx11/gfx12
+Any | 10.0 | | 10.0 **10.0**missing | 10.0 | | 10.0 **10.0**scale, | 10.0 | | 10.0 **10.0**unexpected | 10.0 | | 10.0 **10.0**dtype/shape, | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**unsupported | 10.0 | | 10.0 **10.0**device | 10.0 | | 10.0 **10.0**fails | 10.0 | | 10.0 **10.0**the
+load. | 10.0 | | 10.0 **10.0**There | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**fallback | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**`Raw`, | 10.0 | | 10.0 **10.0**MQ2R, | 10.0 | | 10.0 **10.0**Qwen, | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**generic | 10.0 | | 10.0 **10.0**gfx11/gfx12
 path.
 
-### Dense weights
+### | 10.0 | | 10.0 **10.0**Dense | 10.0 | | 10.0 **10.0**weights
 
-Decode `E4M3 * UE8M0` dense weights to resident BF16 on the GPU. The stored
-values are exactly representable in BF16 because BF16 has a wider exponent and
-mantissa than E4M3 and the UE8M0 multiplier is a power of two. After the decode
-oracle passes, release the original dense FP8 code/scale buffers.
+Decode | 10.0 | | 10.0 **10.0**`E4M3 | 10.0 | | 10.0 **10.0*** | 10.0 | | 10.0 **10.0**UE8M0` | 10.0 | | 10.0 **10.0**dense | 10.0 | | 10.0 **10.0**weights | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**resident | 10.0 | | 10.0 **10.0**BF16 | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**GPU. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**stored
+values | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**exactly | 10.0 | | 10.0 **10.0**representable | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**BF16 | 10.0 | | 10.0 **10.0**because | 10.0 | | 10.0 **10.0**BF16 | 10.0 | | 10.0 **10.0**has | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**wider | 10.0 | | 10.0 **10.0**exponent | 10.0 | | 10.0 **10.0**and
+mantissa | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**E4M3 | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**UE8M0 | 10.0 | | 10.0 **10.0**multiplier | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**power | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**two. | 10.0 | | 10.0 **10.0**After | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**decode
+oracle | 10.0 | | 10.0 **10.0**passes, | 10.0 | | 10.0 **10.0**release | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**original | 10.0 | | 10.0 **10.0**dense | 10.0 | | 10.0 **10.0**FP8 | 10.0 | | 10.0 **10.0**code/scale | 10.0 | | 10.0 **10.0**buffers.
 
-The 5.871 GiB dense tier expands to approximately 11.742 GiB.
+The | 10.0 | | 10.0 **10.0**5.871 | 10.0 | | 10.0 **10.0**GiB | 10.0 | | 10.0 **10.0**dense | 10.0 | | 10.0 **10.0**tier | 10.0 | | 10.0 **10.0**expands | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**approximately | 10.0 | | 10.0 **10.0**11.742 | 10.0 | | 10.0 **10.0**GiB.
 
-### Routed experts
+### | 10.0 | | 10.0 **10.0**Routed | 10.0 | | 10.0 **10.0**experts
 
-Keep all expert E2M1 codes and UE8M0 scales compressed in HBM. Do not expand
-all 256 experts. Route tokens first, decode only each selected expert matrix
-into a reusable BF16 scratch allocation, execute it through the gfx942 BF16
-MFMA path, and reuse the scratch for the next matrix.
+Keep | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**expert | 10.0 | | 10.0 **10.0**E2M1 | 10.0 | | 10.0 **10.0**codes | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**UE8M0 | 10.0 | | 10.0 **10.0**scales | 10.0 | | 10.0 **10.0**compressed | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**HBM. | 10.0 | | 10.0 **10.0**Do | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**expand
+all | 10.0 | | 10.0 **10.0**256 | 10.0 | | 10.0 **10.0**experts. | 10.0 | | 10.0 **10.0**Route | 10.0 | | 10.0 **10.0**tokens | 10.0 | | 10.0 **10.0**first, | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**each | 10.0 | | 10.0 **10.0**selected | 10.0 | | 10.0 **10.0**expert | 10.0 | | 10.0 **10.0**matrix
+into | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**reusable | 10.0 | | 10.0 **10.0**BF16 | 10.0 | | 10.0 **10.0**scratch | 10.0 | | 10.0 **10.0**allocation, | 10.0 | | 10.0 **10.0**execute | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**through | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**gfx942 | 10.0 | | 10.0 **10.0**BF16
+MFMA | 10.0 | | 10.0 **10.0**path, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**reuse | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**scratch | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**next | 10.0 | | 10.0 **10.0**matrix.
 
-Expected resident model footprint is approximately 162--166 GiB, leaving about
-25 GiB for state, KV, activation, and decode scratch on a 192 GB MI300X. Do not
-load MTP for parent KLD/Hessian collection.
+Expected | 10.0 | | 10.0 **10.0**resident | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**footprint | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**approximately | 10.0 | | 10.0 **10.0**162--166 | 10.0 | | 10.0 **10.0**GiB, | 10.0 | | 10.0 **10.0**leaving | 10.0 | | 10.0 **10.0**about
+25 | 10.0 | | 10.0 **10.0**GiB | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**state, | 10.0 | | 10.0 **10.0**KV, | 10.0 | | 10.0 **10.0**activation, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**scratch | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**192 | 10.0 | | 10.0 **10.0**GB | 10.0 | | 10.0 **10.0**MI300X. | 10.0 | | 10.0 **10.0**Do | 10.0 | | 10.0 **10.0**not
+load | 10.0 | | 10.0 **10.0**MTP | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**KLD/Hessian | 10.0 | | 10.0 **10.0**collection.
 
-### Parent activation semantics
+### | 10.0 | | 10.0 **10.0**Parent | 10.0 | | 10.0 **10.0**activation | 10.0 | | 10.0 **10.0**semantics
 
-Reproduce the bundled parent implementation's arithmetic rather than silently
-running a higher-precision reinterpretation:
+Reproduce | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**bundled | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**implementation's | 10.0 | | 10.0 **10.0**arithmetic | 10.0 | | 10.0 **10.0**rather | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**silently
+running | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**higher-precision | 10.0 | | 10.0 **10.0**reinterpretation:
 
-- Before every FP8/FP4 linear, apply dynamic E4M3 activation quantization with
-  a per-128 UE8M0 power-of-two scale, then dequantize for the BF16 MFMA
-  correctness path.
-- Mirror the explicit FP4 simulation points in the indexer.
-- Mirror the explicit FP8 simulation of non-RoPE KV dimensions.
-- Preserve top-k 6 routing and all 256 parent experts.
-- Keep DSpark and MTP disabled.
+- | 10.0 | | 10.0 **10.0**Before | 10.0 | | 10.0 **10.0**every | 10.0 | | 10.0 **10.0**FP8/FP4 | 10.0 | | 10.0 **10.0**linear, | 10.0 | | 10.0 **10.0**apply | 10.0 | | 10.0 **10.0**dynamic | 10.0 | | 10.0 **10.0**E4M3 | 10.0 | | 10.0 **10.0**activation | 10.0 | | 10.0 **10.0**quantization | 10.0 | | 10.0 **10.0**with
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**per-128 | 10.0 | | 10.0 **10.0**UE8M0 | 10.0 | | 10.0 **10.0**power-of-two | 10.0 | | 10.0 **10.0**scale, | 10.0 | | 10.0 **10.0**then | 10.0 | | 10.0 **10.0**dequantize | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**BF16 | 10.0 | | 10.0 **10.0**MFMA
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**correctness | 10.0 | | 10.0 **10.0**path.
+- | 10.0 | | 10.0 **10.0**Mirror | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**explicit | 10.0 | | 10.0 **10.0**FP4 | 10.0 | | 10.0 **10.0**simulation | 10.0 | | 10.0 **10.0**points | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**indexer.
+- | 10.0 | | 10.0 **10.0**Mirror | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**explicit | 10.0 | | 10.0 **10.0**FP8 | 10.0 | | 10.0 **10.0**simulation | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**non-RoPE | 10.0 | | 10.0 **10.0**KV | 10.0 | | 10.0 **10.0**dimensions.
+- | 10.0 | | 10.0 **10.0**Preserve | 10.0 | | 10.0 **10.0**top-k | 10.0 | | 10.0 **10.0**6 | 10.0 | | 10.0 **10.0**routing | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**256 | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**experts.
+- | 10.0 | | 10.0 **10.0**Keep | 10.0 | | 10.0 **10.0**DSpark | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**MTP | 10.0 | | 10.0 **10.0**disabled.
 
-Reuse the existing DS4 attention, compressor, routing, Hyper-Connections, and
-state control flow. Branch on a DS4 model-owned backend, not on a process-wide
-architecture flag. No Qwen-owned body changes.
+Reuse | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**existing | 10.0 | | 10.0 **10.0**DS4 | 10.0 | | 10.0 **10.0**attention, | 10.0 | | 10.0 **10.0**compressor, | 10.0 | | 10.0 **10.0**routing, | 10.0 | | 10.0 **10.0**Hyper-Connections, | 10.0 | | 10.0 **10.0**and
+state | 10.0 | | 10.0 **10.0**control | 10.0 | | 10.0 **10.0**flow. | 10.0 | | 10.0 **10.0**Branch | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**DS4 | 10.0 | | 10.0 **10.0**model-owned | 10.0 | | 10.0 **10.0**backend, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**process-wide
+architecture | 10.0 | | 10.0 **10.0**flag. | 10.0 | | 10.0 **10.0**No | 10.0 | | 10.0 **10.0**Qwen-owned | 10.0 | | 10.0 **10.0**body | 10.0 | | 10.0 **10.0**changes.
 
-## Required gate order
+## | 10.0 | | 10.0 **10.0**Required | 10.0 | | 10.0 **10.0**gate | 10.0 | | 10.0 **10.0**order
 
-1. **Inventory gate** — **PASSED 2026-08-02.** All 72,317 source tensors
-   accounted for; every native weight has exactly one valid scale companion;
-   MTP is explicitly excluded. See "Gate status" below.
-2. **Codec gate** — **PASSED 2026-08-02.** GPU E4M3/UE8M0 and E2M1/UE8M0
-   decode matches an independent CPU oracle on fixed edge cases and sampled
-   checkpoint values, bit for bit. See "Gate status" below.
-3. **Linear gate** — **PASSED 2026-08-02.** Dense and expert matmul outputs
-   match the checkpoint's bundled operator semantics on fixed inputs and on
-   real checkpoint tensors. See "Gate 3 evidence" below.
-4. **One-layer gate** — **PASSED 2026-08-02.** 16-token layer canary, finite
-   state, 14/14 sub-block checks against an f64 CPU oracle. See "Gate 4
-   evidence" below.
-5. **Parent-forward gate** — **PASSED 2026-08-02.** Full 43-layer forward at
-   32 and 256 tokens, finite logits, deterministic in-process hash, coherent
-   next-token. See "Gate 5 evidence" below.
-6. **Pre-GPTQ quality gate**: save parent reference logits, then measure the
-   existing MQ2L and MQ2R artifacts on the exact same token IDs, positions,
-   tokenizer, RoPE convention, and engine fingerprint. Record KLD/PPL before
-   any GPTQ mutation.
-7. **Hessian canary**: capture 1,024 parent tokens and verify the 554-tensor
-   map, row counts, finite/nonnegative Hessians, exact symmetry, and consumer
-   compatibility.
-8. **Calibration expansion**: accumulate diverse fixed 1K shards to 8K, 16K,
-   and 32K tokens; stop when quant decisions and quality stabilize.
-9. **GPTQ**: only after gates 1--8, apply `gptq.rs` to original parent weights
-   and compare RTN versus GPTQ against the saved parent logits.
+1. | 10.0 | | 10.0 **10.0****Inventory | 10.0 | | 10.0 **10.0**gate** | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0****PASSED | 10.0 | | 10.0 **10.0**2026-08-02.** | 10.0 | | 10.0 **10.0**All | 10.0 | | 10.0 **10.0**72,317 | 10.0 | | 10.0 **10.0**source | 10.0 | | 10.0 **10.0**tensors
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**accounted | 10.0 | | 10.0 **10.0**for; | 10.0 | | 10.0 **10.0**every | 10.0 | | 10.0 **10.0**native | 10.0 | | 10.0 **10.0**weight | 10.0 | | 10.0 **10.0**has | 10.0 | | 10.0 **10.0**exactly | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**valid | 10.0 | | 10.0 **10.0**scale | 10.0 | | 10.0 **10.0**companion;
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**MTP | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**explicitly | 10.0 | | 10.0 **10.0**excluded. | 10.0 | | 10.0 **10.0**See | 10.0 | | 10.0 **10.0**"Gate | 10.0 | | 10.0 **10.0**status" | 10.0 | | 10.0 **10.0**below.
+2. | 10.0 | | 10.0 **10.0****Codec | 10.0 | | 10.0 **10.0**gate** | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0****PASSED | 10.0 | | 10.0 **10.0**2026-08-02.** | 10.0 | | 10.0 **10.0**GPU | 10.0 | | 10.0 **10.0**E4M3/UE8M0 | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**E2M1/UE8M0
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**matches | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**independent | 10.0 | | 10.0 **10.0**CPU | 10.0 | | 10.0 **10.0**oracle | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**fixed | 10.0 | | 10.0 **10.0**edge | 10.0 | | 10.0 **10.0**cases | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**sampled
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**checkpoint | 10.0 | | 10.0 **10.0**values, | 10.0 | | 10.0 **10.0**bit | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**bit. | 10.0 | | 10.0 **10.0**See | 10.0 | | 10.0 **10.0**"Gate | 10.0 | | 10.0 **10.0**status" | 10.0 | | 10.0 **10.0**below.
+3. | 10.0 | | 10.0 **10.0****Linear | 10.0 | | 10.0 **10.0**gate** | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0****PASSED | 10.0 | | 10.0 **10.0**2026-08-02.** | 10.0 | | 10.0 **10.0**Dense | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**expert | 10.0 | | 10.0 **10.0**matmul | 10.0 | | 10.0 **10.0**outputs
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**match | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**checkpoint's | 10.0 | | 10.0 **10.0**bundled | 10.0 | | 10.0 **10.0**operator | 10.0 | | 10.0 **10.0**semantics | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**fixed | 10.0 | | 10.0 **10.0**inputs | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**on
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**real | 10.0 | | 10.0 **10.0**checkpoint | 10.0 | | 10.0 **10.0**tensors. | 10.0 | | 10.0 **10.0**See | 10.0 | | 10.0 **10.0**"Gate | 10.0 | | 10.0 **10.0**3 | 10.0 | | 10.0 **10.0**evidence" | 10.0 | | 10.0 **10.0**below.
+4. | 10.0 | | 10.0 **10.0****One-layer | 10.0 | | 10.0 **10.0**gate** | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0****PASSED | 10.0 | | 10.0 **10.0**2026-08-02.** | 10.0 | | 10.0 **10.0**16-token | 10.0 | | 10.0 **10.0**layer | 10.0 | | 10.0 **10.0**canary, | 10.0 | | 10.0 **10.0**finite
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**state, | 10.0 | | 10.0 **10.0**14/14 | 10.0 | | 10.0 **10.0**sub-block | 10.0 | | 10.0 **10.0**checks | 10.0 | | 10.0 **10.0**against | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**f64 | 10.0 | | 10.0 **10.0**CPU | 10.0 | | 10.0 **10.0**oracle. | 10.0 | | 10.0 **10.0**See | 10.0 | | 10.0 **10.0**"Gate | 10.0 | | 10.0 **10.0**4
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**evidence" | 10.0 | | 10.0 **10.0**below.
+5. | 10.0 | | 10.0 **10.0****Parent-forward | 10.0 | | 10.0 **10.0**gate** | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0****PASSED | 10.0 | | 10.0 **10.0**2026-08-02.** | 10.0 | | 10.0 **10.0**Full | 10.0 | | 10.0 **10.0**43-layer | 10.0 | | 10.0 **10.0**forward | 10.0 | | 10.0 **10.0**at
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**32 | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**256 | 10.0 | | 10.0 **10.0**tokens, | 10.0 | | 10.0 **10.0**finite | 10.0 | | 10.0 **10.0**logits, | 10.0 | | 10.0 **10.0**deterministic | 10.0 | | 10.0 **10.0**in-process | 10.0 | | 10.0 **10.0**hash, | 10.0 | | 10.0 **10.0**coherent
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**next-token. | 10.0 | | 10.0 **10.0**See | 10.0 | | 10.0 **10.0**"Gate | 10.0 | | 10.0 **10.0**5 | 10.0 | | 10.0 **10.0**evidence" | 10.0 | | 10.0 **10.0**below.
+6. | 10.0 | | 10.0 **10.0****Pre-GPTQ | 10.0 | | 10.0 **10.0**quality | 10.0 | | 10.0 **10.0**gate**: | 10.0 | | 10.0 **10.0**save | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**reference | 10.0 | | 10.0 **10.0**logits, | 10.0 | | 10.0 **10.0**then | 10.0 | | 10.0 **10.0**measure | 10.0 | | 10.0 **10.0**the
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**existing | 10.0 | | 10.0 **10.0**MQ2L | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**MQ2R | 10.0 | | 10.0 **10.0**artifacts | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**exact | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**token | 10.0 | | 10.0 **10.0**IDs, | 10.0 | | 10.0 **10.0**positions,
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**tokenizer, | 10.0 | | 10.0 **10.0**RoPE | 10.0 | | 10.0 **10.0**convention, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**engine | 10.0 | | 10.0 **10.0**fingerprint. | 10.0 | | 10.0 **10.0**Record | 10.0 | | 10.0 **10.0**KLD/PPL | 10.0 | | 10.0 **10.0**before
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**any | 10.0 | | 10.0 **10.0**GPTQ | 10.0 | | 10.0 **10.0**mutation.
+7. | 10.0 | | 10.0 **10.0****Hessian | 10.0 | | 10.0 **10.0**canary**: | 10.0 | | 10.0 **10.0**capture | 10.0 | | 10.0 **10.0**1,024 | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**tokens | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**verify | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**554-tensor
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**map, | 10.0 | | 10.0 **10.0**row | 10.0 | | 10.0 **10.0**counts, | 10.0 | | 10.0 **10.0**finite/nonnegative | 10.0 | | 10.0 **10.0**Hessians, | 10.0 | | 10.0 **10.0**exact | 10.0 | | 10.0 **10.0**symmetry, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**consumer
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**compatibility.
+8. | 10.0 | | 10.0 **10.0****Calibration | 10.0 | | 10.0 **10.0**expansion**: | 10.0 | | 10.0 **10.0**accumulate | 10.0 | | 10.0 **10.0**diverse | 10.0 | | 10.0 **10.0**fixed | 10.0 | | 10.0 **10.0**1K | 10.0 | | 10.0 **10.0**shards | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**8K, | 10.0 | | 10.0 **10.0**16K,
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**32K | 10.0 | | 10.0 **10.0**tokens; | 10.0 | | 10.0 **10.0**stop | 10.0 | | 10.0 **10.0**when | 10.0 | | 10.0 **10.0**quant | 10.0 | | 10.0 **10.0**decisions | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**quality | 10.0 | | 10.0 **10.0**stabilize.
+9. | 10.0 | | 10.0 **10.0****GPTQ**: | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**after | 10.0 | | 10.0 **10.0**gates | 10.0 | | 10.0 **10.0**1--8, | 10.0 | | 10.0 **10.0**apply | 10.0 | | 10.0 **10.0**`gptq.rs` | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**original | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**weights
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**compare | 10.0 | | 10.0 **10.0**RTN | 10.0 | | 10.0 **10.0**versus | 10.0 | | 10.0 **10.0**GPTQ | 10.0 | | 10.0 **10.0**against | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**saved | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**logits.
 
-## Gate status (updated 2026-08-02)
+## | 10.0 | | 10.0 **10.0**Gate | 10.0 | | 10.0 **10.0**status | 10.0 | | 10.0 **10.0**(updated | 10.0 | | 10.0 **10.0**2026-08-02)
 
-Gates 1-5 are closed. The original parent checkpoint runs end to end on the
-MI300X and produces coherent output. Gate 6 (parent logit baseline + MQ2L/MQ2R
-KLD) is the next work.
+Gates | 10.0 | | 10.0 **10.0**1-5 | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**closed. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**original | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**checkpoint | 10.0 | | 10.0 **10.0**runs | 10.0 | | 10.0 **10.0**end | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**end | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**the
+MI300X | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**produces | 10.0 | | 10.0 **10.0**coherent | 10.0 | | 10.0 **10.0**output. | 10.0 | | 10.0 **10.0**Gate | 10.0 | | 10.0 **10.0**6 | 10.0 | | 10.0 **10.0**(parent | 10.0 | | 10.0 **10.0**logit | 10.0 | | 10.0 **10.0**baseline | 10.0 | | 10.0 **10.0**+ | 10.0 | | 10.0 **10.0**MQ2L/MQ2R
+KLD) | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**next | 10.0 | | 10.0 **10.0**work.
 
-### What landed
+### | 10.0 | | 10.0 **10.0**What | 10.0 | | 10.0 **10.0**landed
 
-Commit `f8b98f0a2` (branch `ds4-cdna-test-fail`) adds
+Commit | 10.0 | | 10.0 **10.0**`f8b98f0a2` | 10.0 | | 10.0 **10.0**(branch | 10.0 | | 10.0 **10.0**`ds4-cdna-test-fail`) | 10.0 | | 10.0 **10.0**adds
 `crates/hipfire-arch-deepseek4/src/parent/`:
 
-| module | role |
+| | 10.0 | | 10.0 **10.0**module | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**role | 10.0 | | 10.0 **10.0**|
 |---|---|
-| `mod.rs` | `Ds4ParentBackend` admission: `model_type=deepseek_v4`, `quant_method=fp8`, `fmt=e4m3`, `scale_fmt=ue8m0`, `weight_block_size=[128,128]`, `expert_dtype=fp4`, exact gfx942. No env override, no portable fallback. |
-| `inventory.rs` | Gate 1. Tensor accounting, scale pairing, dtype/shape contract, MTP exclusion. |
-| `codec.rs` | Gate 2 CPU oracle. E4M3/UE8M0/E2M1 codecs, dense 128x128 and expert per-32 dequant, bit-exact `fast_log2_ceil`/`fast_pow2`/`fast_round_scale` activation-quant reference. |
-| `manifest.rs` | The mandatory evidence manifest, with `validate()`. |
-| `plog.rs` | Gate 6's parent-logit container and KLD/PPL comparator. |
+| | 10.0 | | 10.0 **10.0**`mod.rs` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`Ds4ParentBackend` | 10.0 | | 10.0 **10.0**admission: | 10.0 | | 10.0 **10.0**`model_type=deepseek_v4`, | 10.0 | | 10.0 **10.0**`quant_method=fp8`, | 10.0 | | 10.0 **10.0**`fmt=e4m3`, | 10.0 | | 10.0 **10.0**`scale_fmt=ue8m0`, | 10.0 | | 10.0 **10.0**`weight_block_size=[128,128]`, | 10.0 | | 10.0 **10.0**`expert_dtype=fp4`, | 10.0 | | 10.0 **10.0**exact | 10.0 | | 10.0 **10.0**gfx942. | 10.0 | | 10.0 **10.0**No | 10.0 | | 10.0 **10.0**env | 10.0 | | 10.0 **10.0**override, | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**portable | 10.0 | | 10.0 **10.0**fallback. | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**`inventory.rs` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Gate | 10.0 | | 10.0 **10.0**1. | 10.0 | | 10.0 **10.0**Tensor | 10.0 | | 10.0 **10.0**accounting, | 10.0 | | 10.0 **10.0**scale | 10.0 | | 10.0 **10.0**pairing, | 10.0 | | 10.0 **10.0**dtype/shape | 10.0 | | 10.0 **10.0**contract, | 10.0 | | 10.0 **10.0**MTP | 10.0 | | 10.0 **10.0**exclusion. | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**`codec.rs` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Gate | 10.0 | | 10.0 **10.0**2 | 10.0 | | 10.0 **10.0**CPU | 10.0 | | 10.0 **10.0**oracle. | 10.0 | | 10.0 **10.0**E4M3/UE8M0/E2M1 | 10.0 | | 10.0 **10.0**codecs, | 10.0 | | 10.0 **10.0**dense | 10.0 | | 10.0 **10.0**128x128 | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**expert | 10.0 | | 10.0 **10.0**per-32 | 10.0 | | 10.0 **10.0**dequant, | 10.0 | | 10.0 **10.0**bit-exact | 10.0 | | 10.0 **10.0**`fast_log2_ceil`/`fast_pow2`/`fast_round_scale` | 10.0 | | 10.0 **10.0**activation-quant | 10.0 | | 10.0 **10.0**reference. | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**`manifest.rs` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**mandatory | 10.0 | | 10.0 **10.0**evidence | 10.0 | | 10.0 **10.0**manifest, | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**`validate()`. | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**`plog.rs` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Gate | 10.0 | | 10.0 **10.0**6's | 10.0 | | 10.0 **10.0**parent-logit | 10.0 | | 10.0 **10.0**container | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**KLD/PPL | 10.0 | | 10.0 **10.0**comparator. | 10.0 | | 10.0 **10.0**|
 
-Four new gfx942 kernels: `dequant_fp8_e4m3_ue8m0_blk128_to_bf16`,
-`dequant_fp4_e2m1_ue8m0_g32_to_bf16`, `act_quant_fp8_ue8m0_inplace`
-(block 128 at linears, 64 at the KV simulation sites), and
+Four | 10.0 | | 10.0 **10.0**new | 10.0 | | 10.0 **10.0**gfx942 | 10.0 | | 10.0 **10.0**kernels: | 10.0 | | 10.0 **10.0**`dequant_fp8_e4m3_ue8m0_blk128_to_bf16`,
+`dequant_fp4_e2m1_ue8m0_g32_to_bf16`, | 10.0 | | 10.0 **10.0**`act_quant_fp8_ue8m0_inplace`
+(block | 10.0 | | 10.0 **10.0**128 | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**linears, | 10.0 | | 10.0 **10.0**64 | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**KV | 10.0 | | 10.0 **10.0**simulation | 10.0 | | 10.0 **10.0**sites), | 10.0 | | 10.0 **10.0**and
 `act_quant_fp4_ue8m0_g32_inplace`.
 
-Two executable gates:
-`examples/ds4_parent_inventory_gate.rs`, `examples/ds4_parent_codec_gate.rs`.
+Two | 10.0 | | 10.0 **10.0**executable | 10.0 | | 10.0 **10.0**gates:
+`examples/ds4_parent_inventory_gate.rs`, | 10.0 | | 10.0 **10.0**`examples/ds4_parent_codec_gate.rs`.
 
-### Gate 1 evidence
+### | 10.0 | | 10.0 **10.0**Gate | 10.0 | | 10.0 **10.0**1 | 10.0 | | 10.0 **10.0**evidence
 
-Run on `mi300x` (gfx942) against `/mnt/scratch/models/DeepSeek-V4-Flash-0731`:
+Run | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**`mi300x` | 10.0 | | 10.0 **10.0**(gfx942) | 10.0 | | 10.0 **10.0**against | 10.0 | | 10.0 **10.0**`/mnt/scratch/models/DeepSeek-V4-Flash-0731`:
 
-- 72,317 tensors seen, `assert_complete(72317)` PASS, walk time 0.082 s.
-- 35,718 scale pairings verified; **zero** orphan scales, zero unquantized
-  tensors carrying a scale, zero non-expert `I8`, zero unknown dtypes.
-- Main tower 67,612 tensors / 145.301 GiB; 4,705 MTP tensors excluded.
-- Index SHA-256 `98efab455cf08dfbbbaaba6f570e1bf10bf927d2b4c3c453a59c2f6f0e3be92b`;
-  config SHA-256 `6c8f3d2d3b48707541b88f32f22ef3f0f8a6b57d8523281e2b8d3cdb0ae9a023`;
-  all 48 shard SHA-256s recorded in the emitted manifest.
+- | 10.0 | | 10.0 **10.0**72,317 | 10.0 | | 10.0 **10.0**tensors | 10.0 | | 10.0 **10.0**seen, | 10.0 | | 10.0 **10.0**`assert_complete(72317)` | 10.0 | | 10.0 **10.0**PASS, | 10.0 | | 10.0 **10.0**walk | 10.0 | | 10.0 **10.0**time | 10.0 | | 10.0 **10.0**0.082 | 10.0 | | 10.0 **10.0**s.
+- | 10.0 | | 10.0 **10.0**35,718 | 10.0 | | 10.0 **10.0**scale | 10.0 | | 10.0 **10.0**pairings | 10.0 | | 10.0 **10.0**verified; | 10.0 | | 10.0 **10.0****zero** | 10.0 | | 10.0 **10.0**orphan | 10.0 | | 10.0 **10.0**scales, | 10.0 | | 10.0 **10.0**zero | 10.0 | | 10.0 **10.0**unquantized
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**tensors | 10.0 | | 10.0 **10.0**carrying | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**scale, | 10.0 | | 10.0 **10.0**zero | 10.0 | | 10.0 **10.0**non-expert | 10.0 | | 10.0 **10.0**`I8`, | 10.0 | | 10.0 **10.0**zero | 10.0 | | 10.0 **10.0**unknown | 10.0 | | 10.0 **10.0**dtypes.
+- | 10.0 | | 10.0 **10.0**Main | 10.0 | | 10.0 **10.0**tower | 10.0 | | 10.0 **10.0**67,612 | 10.0 | | 10.0 **10.0**tensors | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**145.301 | 10.0 | | 10.0 **10.0**GiB; | 10.0 | | 10.0 **10.0**4,705 | 10.0 | | 10.0 **10.0**MTP | 10.0 | | 10.0 **10.0**tensors | 10.0 | | 10.0 **10.0**excluded.
+- | 10.0 | | 10.0 **10.0**Index | 10.0 | | 10.0 **10.0**SHA-256 | 10.0 | | 10.0 **10.0**`98efab455cf08dfbbbaaba6f570e1bf10bf927d2b4c3c453a59c2f6f0e3be92b`;
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**config | 10.0 | | 10.0 **10.0**SHA-256 | 10.0 | | 10.0 **10.0**`6c8f3d2d3b48707541b88f32f22ef3f0f8a6b57d8523281e2b8d3cdb0ae9a023`;
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**48 | 10.0 | | 10.0 **10.0**shard | 10.0 | | 10.0 **10.0**SHA-256s | 10.0 | | 10.0 **10.0**recorded | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**emitted | 10.0 | | 10.0 **10.0**manifest.
 
-**VRAM residency projection (main tower, weights only):**
+**VRAM | 10.0 | | 10.0 **10.0**residency | 10.0 | | 10.0 **10.0**projection | 10.0 | | 10.0 **10.0**(main | 10.0 | | 10.0 **10.0**tower, | 10.0 | | 10.0 **10.0**weights | 10.0 | | 10.0 **10.0**only):**
 
-| tier | treatment | GiB |
+| | 10.0 | | 10.0 **10.0**tier | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**treatment | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**GiB | 10.0 | | 10.0 **10.0**|
 |---|---|---:|
-| dense `F8_E4M3` | decoded to resident BF16 (2x stored) | 10.910 |
-| routed experts | `I8` + `F8_E8M0` left compressed | 137.062 |
-| `BF16` | as stored | 2.634 |
-| `F32` | as stored | 0.132 |
-| `I64` | as stored | 0.017 |
-| **total** | | **150.756** |
+| | 10.0 | | 10.0 **10.0**dense | 10.0 | | 10.0 **10.0**`F8_E4M3` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**decoded | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**resident | 10.0 | | 10.0 **10.0**BF16 | 10.0 | | 10.0 **10.0**(2x | 10.0 | | 10.0 **10.0**stored) | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**10.910 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**routed | 10.0 | | 10.0 **10.0**experts | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`I8` | 10.0 | | 10.0 **10.0**+ | 10.0 | | 10.0 **10.0**`F8_E8M0` | 10.0 | | 10.0 **10.0**left | 10.0 | | 10.0 **10.0**compressed | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**137.062 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**`BF16` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**stored | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**2.634 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**`F32` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**stored | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.132 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**`I64` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**stored | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.017 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0****total** | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0****150.756** | 10.0 | | 10.0 **10.0**|
 
-Against a 192 GiB card that is **41.244 GiB of headroom**, so the parent
-forward fits with MTP excluded. This is weights only — KV, activations, and
-expert decode scratch come out of the headroom.
+Against | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**192 | 10.0 | | 10.0 **10.0**GiB | 10.0 | | 10.0 **10.0**card | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0****41.244 | 10.0 | | 10.0 **10.0**GiB | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**headroom**, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**parent
+forward | 10.0 | | 10.0 **10.0**fits | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**MTP | 10.0 | | 10.0 **10.0**excluded. | 10.0 | | 10.0 **10.0**This | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**weights | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**KV, | 10.0 | | 10.0 **10.0**activations, | 10.0 | | 10.0 **10.0**and
+expert | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**scratch | 10.0 | | 10.0 **10.0**come | 10.0 | | 10.0 **10.0**out | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**headroom.
 
-### Gate 2 evidence
+### | 10.0 | | 10.0 **10.0**Gate | 10.0 | | 10.0 **10.0**2 | 10.0 | | 10.0 **10.0**evidence
 
-`ds4_parent_codec_gate` on `mi300x` (gfx942): **13/13 PASS, exit 0.** Every
-comparison is **bit-exact** against the CPU oracle, not tolerance-based.
+`ds4_parent_codec_gate` | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**`mi300x` | 10.0 | | 10.0 **10.0**(gfx942): | 10.0 | | 10.0 **10.0****13/13 | 10.0 | | 10.0 **10.0**PASS, | 10.0 | | 10.0 **10.0**exit | 10.0 | | 10.0 **10.0**0.** | 10.0 | | 10.0 **10.0**Every
+comparison | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0****bit-exact** | 10.0 | | 10.0 **10.0**against | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**CPU | 10.0 | | 10.0 **10.0**oracle, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**tolerance-based.
 
-- Dense FP8: exhaustive 256x256 (65,536 elements), ragged 260x300 (catches
-  `floor` where `ceil` is required, in both dimensions), NaN propagation for
-  scale byte `0xFF` and E4M3 `0x7F`/`0xFF`.
-- Expert FP4: exhaustive 64x512 (32,768 elements), explicit nibble-order
-  assertion.
-- Activation quant: FP8 at block 128 and 64, FP4 at group 32, including
-  power-of-two amax, just-above-power-of-two amax, values under the `1e-4`
-  and `6*2^-126` floors, all-zero groups, single outliers, and exact RNE
-  midpoints.
-- Real checkpoint samples: `layers.3.attn.wq_a.weight` (`F8_E4M3 [1024,4096]`)
-  decoded to min -0.117188 / max 0.117188 / mean -7e-6 / std 0.023066 /
-  0.001 % exact zeros; `layers.3.ffn.experts.0.w1.weight`
-  (`I8 [2048,2048]` logical `[2048,4096]`) to min -0.125 / max 0.125 /
-  mean 2.4e-5 / std 0.025293 / 12.77 % exact zeros. Both trained-looking; the
-  expert's zero fraction is expected given E2M1's zero codes.
+- | 10.0 | | 10.0 **10.0**Dense | 10.0 | | 10.0 **10.0**FP8: | 10.0 | | 10.0 **10.0**exhaustive | 10.0 | | 10.0 **10.0**256x256 | 10.0 | | 10.0 **10.0**(65,536 | 10.0 | | 10.0 **10.0**elements), | 10.0 | | 10.0 **10.0**ragged | 10.0 | | 10.0 **10.0**260x300 | 10.0 | | 10.0 **10.0**(catches
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`floor` | 10.0 | | 10.0 **10.0**where | 10.0 | | 10.0 **10.0**`ceil` | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**required, | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**dimensions), | 10.0 | | 10.0 **10.0**NaN | 10.0 | | 10.0 **10.0**propagation | 10.0 | | 10.0 **10.0**for
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**scale | 10.0 | | 10.0 **10.0**byte | 10.0 | | 10.0 **10.0**`0xFF` | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**E4M3 | 10.0 | | 10.0 **10.0**`0x7F`/`0xFF`.
+- | 10.0 | | 10.0 **10.0**Expert | 10.0 | | 10.0 **10.0**FP4: | 10.0 | | 10.0 **10.0**exhaustive | 10.0 | | 10.0 **10.0**64x512 | 10.0 | | 10.0 **10.0**(32,768 | 10.0 | | 10.0 **10.0**elements), | 10.0 | | 10.0 **10.0**explicit | 10.0 | | 10.0 **10.0**nibble-order
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**assertion.
+- | 10.0 | | 10.0 **10.0**Activation | 10.0 | | 10.0 **10.0**quant: | 10.0 | | 10.0 **10.0**FP8 | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**block | 10.0 | | 10.0 **10.0**128 | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**64, | 10.0 | | 10.0 **10.0**FP4 | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**group | 10.0 | | 10.0 **10.0**32, | 10.0 | | 10.0 **10.0**including
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**power-of-two | 10.0 | | 10.0 **10.0**amax, | 10.0 | | 10.0 **10.0**just-above-power-of-two | 10.0 | | 10.0 **10.0**amax, | 10.0 | | 10.0 **10.0**values | 10.0 | | 10.0 **10.0**under | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**`1e-4`
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**`6*2^-126` | 10.0 | | 10.0 **10.0**floors, | 10.0 | | 10.0 **10.0**all-zero | 10.0 | | 10.0 **10.0**groups, | 10.0 | | 10.0 **10.0**single | 10.0 | | 10.0 **10.0**outliers, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**exact | 10.0 | | 10.0 **10.0**RNE
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**midpoints.
+- | 10.0 | | 10.0 **10.0**Real | 10.0 | | 10.0 **10.0**checkpoint | 10.0 | | 10.0 **10.0**samples: | 10.0 | | 10.0 **10.0**`layers.3.attn.wq_a.weight` | 10.0 | | 10.0 **10.0**(`F8_E4M3 | 10.0 | | 10.0 **10.0**[1024,4096]`)
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**decoded | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**min | 10.0 | | 10.0 **10.0**-0.117188 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**max | 10.0 | | 10.0 **10.0**0.117188 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**mean | 10.0 | | 10.0 **10.0**-7e-6 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**std | 10.0 | | 10.0 **10.0**0.023066 | 10.0 | | 10.0 **10.0**/
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**0.001 | 10.0 | | 10.0 **10.0**% | 10.0 | | 10.0 **10.0**exact | 10.0 | | 10.0 **10.0**zeros; | 10.0 | | 10.0 **10.0**`layers.3.ffn.experts.0.w1.weight`
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**(`I8 | 10.0 | | 10.0 **10.0**[2048,2048]` | 10.0 | | 10.0 **10.0**logical | 10.0 | | 10.0 **10.0**`[2048,4096]`) | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**min | 10.0 | | 10.0 **10.0**-0.125 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**max | 10.0 | | 10.0 **10.0**0.125 | 10.0 | | 10.0 **10.0**/
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**mean | 10.0 | | 10.0 **10.0**2.4e-5 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**std | 10.0 | | 10.0 **10.0**0.025293 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**12.77 | 10.0 | | 10.0 **10.0**% | 10.0 | | 10.0 **10.0**exact | 10.0 | | 10.0 **10.0**zeros. | 10.0 | | 10.0 **10.0**Both | 10.0 | | 10.0 **10.0**trained-looking; | 10.0 | | 10.0 **10.0**the
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**expert's | 10.0 | | 10.0 **10.0**zero | 10.0 | | 10.0 **10.0**fraction | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**expected | 10.0 | | 10.0 **10.0**given | 10.0 | | 10.0 **10.0**E2M1's | 10.0 | | 10.0 **10.0**zero | 10.0 | | 10.0 **10.0**codes.
 
-### Findings worth carrying forward
+### | 10.0 | | 10.0 **10.0**Findings | 10.0 | | 10.0 **10.0**worth | 10.0 | | 10.0 **10.0**carrying | 10.0 | | 10.0 **10.0**forward
 
-1. **`__builtin_amdgcn_cvt_pk_fp8_f32` on gfx942 is FNUZ, not OCP.** Its max
-   finite magnitude is 240 and its NaN encoding is `0x80`; the parent
-   checkpoint uses OCP `float8_e4m3fn` with max 448. Using the hardware
-   builtin would have silently saturated every activation above 240 — a
-   quality bug no coherence check would catch. `act_quant_fp8_ue8m0_inplace`
-   therefore implements OCP RNE in software, cross-checked against
-   `__hip_cvt_float_to_fp8(v, __HIP_SATFINITE, __HIP_E4M3)` over 101 vectors
-   with zero mismatches.
-2. **E2M1 nibble order is low-nibble-first**, confirmed decisively by the
-   checkpoint's own packer at `inference/convert.py:30-33`
-   (`stack([low, high], dim=-1).flatten`), and again on real bytes in Gate 2.
-   Distributional evidence alone was *not* decisive here, because adjacent
-   logical positions share a 32-wide scale group, so swapping nibbles never
-   crosses a scale boundary.
-3. **`inference/convert.py::cast_e2m1fn_to_e4m3fn` is not the decode path.**
-   It is an opt-in FP4→FP8 re-packing utility selected by `main`'s
-   `expert_dtype` argument. This checkpoint declares `expert_dtype = fp4`, and
-   `model.py::linear()` consumes the FP4 weights directly through `fp4_gemm`
-   with their per-32 E8M0 scales. Do not let the `MAX_OFFSET_BITS = 6`
-   arithmetic in that function leak into the decoder.
-4. **The bundled reference cannot be executed.** `mi300x` has no torch, numpy,
-   safetensors, or tilelang. `parent::codec` is consequently the *only*
-   numerical cross-check that exists, which is why it is tested exhaustively
-   over all 256 E4M3 codes, all 256 UE8M0 bytes, and all 16 E2M1 codes rather
-   than spot-checked.
-5. **The parent checkpoint's tensor names already match hipfire's DS4 loader**
-   (`layers.{l}.attn.wq_a.weight`, `embed.weight`, ...). That is not a
-   coincidence: the on-disk checkpoint is post-`convert.py`, and `convert.py`'s
-   rename table produces exactly those names. No name mapping layer is needed
-   for Gate 3.
-6. `engine.rocm_path` in the emitted manifest reads `/opt/rocm-7.0.2`, not
-   `/opt/rocm/core-7.14`, because it reports what `hipfire_config::rocm::root()`
-   resolves. The kernels were compiled with `/opt/rocm/core-7.14/bin/hipcc`.
-   Both installs are present on the host; if the discrepancy matters for a
-   published result, pin `HIPFIRE_ROCM_PATH` before the producing run.
+1. | 10.0 | | 10.0 **10.0****`__builtin_amdgcn_cvt_pk_fp8_f32` | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**gfx942 | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**FNUZ, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**OCP.** | 10.0 | | 10.0 **10.0**Its | 10.0 | | 10.0 **10.0**max
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**finite | 10.0 | | 10.0 **10.0**magnitude | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**240 | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**NaN | 10.0 | | 10.0 **10.0**encoding | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**`0x80`; | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**parent
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**checkpoint | 10.0 | | 10.0 **10.0**uses | 10.0 | | 10.0 **10.0**OCP | 10.0 | | 10.0 **10.0**`float8_e4m3fn` | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**max | 10.0 | | 10.0 **10.0**448. | 10.0 | | 10.0 **10.0**Using | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**hardware
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**builtin | 10.0 | | 10.0 **10.0**would | 10.0 | | 10.0 **10.0**have | 10.0 | | 10.0 **10.0**silently | 10.0 | | 10.0 **10.0**saturated | 10.0 | | 10.0 **10.0**every | 10.0 | | 10.0 **10.0**activation | 10.0 | | 10.0 **10.0**above | 10.0 | | 10.0 **10.0**240 | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**a
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**quality | 10.0 | | 10.0 **10.0**bug | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**coherence | 10.0 | | 10.0 **10.0**check | 10.0 | | 10.0 **10.0**would | 10.0 | | 10.0 **10.0**catch. | 10.0 | | 10.0 **10.0**`act_quant_fp8_ue8m0_inplace`
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**therefore | 10.0 | | 10.0 **10.0**implements | 10.0 | | 10.0 **10.0**OCP | 10.0 | | 10.0 **10.0**RNE | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**software, | 10.0 | | 10.0 **10.0**cross-checked | 10.0 | | 10.0 **10.0**against
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`__hip_cvt_float_to_fp8(v, | 10.0 | | 10.0 **10.0**__HIP_SATFINITE, | 10.0 | | 10.0 **10.0**__HIP_E4M3)` | 10.0 | | 10.0 **10.0**over | 10.0 | | 10.0 **10.0**101 | 10.0 | | 10.0 **10.0**vectors
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**zero | 10.0 | | 10.0 **10.0**mismatches.
+2. | 10.0 | | 10.0 **10.0****E2M1 | 10.0 | | 10.0 **10.0**nibble | 10.0 | | 10.0 **10.0**order | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**low-nibble-first**, | 10.0 | | 10.0 **10.0**confirmed | 10.0 | | 10.0 **10.0**decisively | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**the
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**checkpoint's | 10.0 | | 10.0 **10.0**own | 10.0 | | 10.0 **10.0**packer | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**`inference/convert.py:30-33`
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**(`stack([low, | 10.0 | | 10.0 **10.0**high], | 10.0 | | 10.0 **10.0**dim=-1).flatten`), | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**again | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**real | 10.0 | | 10.0 **10.0**bytes | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**Gate | 10.0 | | 10.0 **10.0**2.
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**Distributional | 10.0 | | 10.0 **10.0**evidence | 10.0 | | 10.0 **10.0**alone | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0***not* | 10.0 | | 10.0 **10.0**decisive | 10.0 | | 10.0 **10.0**here, | 10.0 | | 10.0 **10.0**because | 10.0 | | 10.0 **10.0**adjacent
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**logical | 10.0 | | 10.0 **10.0**positions | 10.0 | | 10.0 **10.0**share | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**32-wide | 10.0 | | 10.0 **10.0**scale | 10.0 | | 10.0 **10.0**group, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**swapping | 10.0 | | 10.0 **10.0**nibbles | 10.0 | | 10.0 **10.0**never
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**crosses | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**scale | 10.0 | | 10.0 **10.0**boundary.
+3. | 10.0 | | 10.0 **10.0****`inference/convert.py::cast_e2m1fn_to_e4m3fn` | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**path.**
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**opt-in | 10.0 | | 10.0 **10.0**FP4→FP8 | 10.0 | | 10.0 **10.0**re-packing | 10.0 | | 10.0 **10.0**utility | 10.0 | | 10.0 **10.0**selected | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**`main`'s
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`expert_dtype` | 10.0 | | 10.0 **10.0**argument. | 10.0 | | 10.0 **10.0**This | 10.0 | | 10.0 **10.0**checkpoint | 10.0 | | 10.0 **10.0**declares | 10.0 | | 10.0 **10.0**`expert_dtype | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**fp4`, | 10.0 | | 10.0 **10.0**and
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`model.py::linear()` | 10.0 | | 10.0 **10.0**consumes | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**FP4 | 10.0 | | 10.0 **10.0**weights | 10.0 | | 10.0 **10.0**directly | 10.0 | | 10.0 **10.0**through | 10.0 | | 10.0 **10.0**`fp4_gemm`
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**their | 10.0 | | 10.0 **10.0**per-32 | 10.0 | | 10.0 **10.0**E8M0 | 10.0 | | 10.0 **10.0**scales. | 10.0 | | 10.0 **10.0**Do | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**let | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**`MAX_OFFSET_BITS | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**6`
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**arithmetic | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**function | 10.0 | | 10.0 **10.0**leak | 10.0 | | 10.0 **10.0**into | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**decoder.
+4. | 10.0 | | 10.0 **10.0****The | 10.0 | | 10.0 **10.0**bundled | 10.0 | | 10.0 **10.0**reference | 10.0 | | 10.0 **10.0**cannot | 10.0 | | 10.0 **10.0**be | 10.0 | | 10.0 **10.0**executed.** | 10.0 | | 10.0 **10.0**`mi300x` | 10.0 | | 10.0 **10.0**has | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**torch, | 10.0 | | 10.0 **10.0**numpy,
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**safetensors, | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**tilelang. | 10.0 | | 10.0 **10.0**`parent::codec` | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**consequently | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0***only*
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**numerical | 10.0 | | 10.0 **10.0**cross-check | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**exists, | 10.0 | | 10.0 **10.0**which | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**why | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**tested | 10.0 | | 10.0 **10.0**exhaustively
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**over | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**256 | 10.0 | | 10.0 **10.0**E4M3 | 10.0 | | 10.0 **10.0**codes, | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**256 | 10.0 | | 10.0 **10.0**UE8M0 | 10.0 | | 10.0 **10.0**bytes, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**16 | 10.0 | | 10.0 **10.0**E2M1 | 10.0 | | 10.0 **10.0**codes | 10.0 | | 10.0 **10.0**rather
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**spot-checked.
+5. | 10.0 | | 10.0 **10.0****The | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**checkpoint's | 10.0 | | 10.0 **10.0**tensor | 10.0 | | 10.0 **10.0**names | 10.0 | | 10.0 **10.0**already | 10.0 | | 10.0 **10.0**match | 10.0 | | 10.0 **10.0**hipfire's | 10.0 | | 10.0 **10.0**DS4 | 10.0 | | 10.0 **10.0**loader**
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**(`layers.{l}.attn.wq_a.weight`, | 10.0 | | 10.0 **10.0**`embed.weight`, | 10.0 | | 10.0 **10.0**...). | 10.0 | | 10.0 **10.0**That | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**a
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**coincidence: | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**on-disk | 10.0 | | 10.0 **10.0**checkpoint | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**post-`convert.py`, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**`convert.py`'s
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**rename | 10.0 | | 10.0 **10.0**table | 10.0 | | 10.0 **10.0**produces | 10.0 | | 10.0 **10.0**exactly | 10.0 | | 10.0 **10.0**those | 10.0 | | 10.0 **10.0**names. | 10.0 | | 10.0 **10.0**No | 10.0 | | 10.0 **10.0**name | 10.0 | | 10.0 **10.0**mapping | 10.0 | | 10.0 **10.0**layer | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**needed
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**Gate | 10.0 | | 10.0 **10.0**3.
+6. | 10.0 | | 10.0 **10.0**`engine.rocm_path` | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**emitted | 10.0 | | 10.0 **10.0**manifest | 10.0 | | 10.0 **10.0**reads | 10.0 | | 10.0 **10.0**`/opt/rocm-7.0.2`, | 10.0 | | 10.0 **10.0**not
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`/opt/rocm/core-10.0`, | 10.0 | | 10.0 **10.0**because | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**reports | 10.0 | | 10.0 **10.0**what | 10.0 | | 10.0 **10.0**`hipfire_config::rocm::root()`
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**resolves. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**kernels | 10.0 | | 10.0 **10.0**were | 10.0 | | 10.0 **10.0**compiled | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**`/opt/rocm/core-10.0/bin/hipcc`.
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**Both | 10.0 | | 10.0 **10.0**installs | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**present | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**host; | 10.0 | | 10.0 **10.0**if | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**discrepancy | 10.0 | | 10.0 **10.0**matters | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**a
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**published | 10.0 | | 10.0 **10.0**result, | 10.0 | | 10.0 **10.0**pin | 10.0 | | 10.0 **10.0**`HIPFIRE_ROCM_PATH` | 10.0 | | 10.0 **10.0**before | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**producing | 10.0 | | 10.0 **10.0**run.
 
-### Gate 3 evidence
+### | 10.0 | | 10.0 **10.0**Gate | 10.0 | | 10.0 **10.0**3 | 10.0 | | 10.0 **10.0**evidence
 
-`ds4_parent_linear_gate` on `mi300x` (gfx942), seed `0xD54CA7E32026`:
-**11 PASS, 1 INCONCLUSIVE, 0 FAIL**, exit 0.
+`ds4_parent_linear_gate` | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**`mi300x` | 10.0 | | 10.0 **10.0**(gfx942), | 10.0 | | 10.0 **10.0**seed | 10.0 | | 10.0 **10.0**`0xD54CA7E32026`:
+**11 | 10.0 | | 10.0 **10.0**PASS, | 10.0 | | 10.0 **10.0**1 | 10.0 | | 10.0 **10.0**INCONCLUSIVE, | 10.0 | | 10.0 **10.0**0 | 10.0 | | 10.0 **10.0**FAIL**, | 10.0 | | 10.0 **10.0**exit | 10.0 | | 10.0 **10.0**0.
 
-The acceptance criterion is relative, not an invented tolerance. The CPU
-oracle (`parent::gemm_ref`) runs in two modes: `Exact` (f64 ground truth) and
-`ReferenceOrder` (f32, reproducing the tilelang block structure exactly). Then
-`err_ref = ||ReferenceOrder - Exact|| / ||Exact||` is the bundled kernel's own
-rounding, and the GPU must not be materially worse.
+The | 10.0 | | 10.0 **10.0**acceptance | 10.0 | | 10.0 **10.0**criterion | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**relative, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**invented | 10.0 | | 10.0 **10.0**tolerance. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**CPU
+oracle | 10.0 | | 10.0 **10.0**(`parent::gemm_ref`) | 10.0 | | 10.0 **10.0**runs | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**two | 10.0 | | 10.0 **10.0**modes: | 10.0 | | 10.0 **10.0**`Exact` | 10.0 | | 10.0 **10.0**(f64 | 10.0 | | 10.0 **10.0**ground | 10.0 | | 10.0 **10.0**truth) | 10.0 | | 10.0 **10.0**and
+`ReferenceOrder` | 10.0 | | 10.0 **10.0**(f32, | 10.0 | | 10.0 **10.0**reproducing | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**tilelang | 10.0 | | 10.0 **10.0**block | 10.0 | | 10.0 **10.0**structure | 10.0 | | 10.0 **10.0**exactly). | 10.0 | | 10.0 **10.0**Then
+`err_ref | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**||ReferenceOrder | 10.0 | | 10.0 **10.0**- | 10.0 | | 10.0 **10.0**Exact|| | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**||Exact||` | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**bundled | 10.0 | | 10.0 **10.0**kernel's | 10.0 | | 10.0 **10.0**own
+rounding, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**GPU | 10.0 | | 10.0 **10.0**must | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**be | 10.0 | | 10.0 **10.0**materially | 10.0 | | 10.0 **10.0**worse.
 
-| signal | result | reading |
+| | 10.0 | | 10.0 **10.0**signal | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**result | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**reading | 10.0 | | 10.0 **10.0**|
 |---|---|---|
-| bias: mean signed err / stddev | <= 0.08 all cases; **0.005** on both real tensors | no misplaced scale |
-| `err_gpu / err_ref` | 0.64 - 2.56x (bar: 4x) | same summation-order class |
-| `err_gpu / err_seq_f32` | 0.54 - 0.83x | MFMA is *tighter* than naive sequential f32 |
+| | 10.0 | | 10.0 **10.0**bias: | 10.0 | | 10.0 **10.0**mean | 10.0 | | 10.0 **10.0**signed | 10.0 | | 10.0 **10.0**err | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**stddev | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**<= | 10.0 | | 10.0 **10.0**0.08 | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**cases; | 10.0 | | 10.0 **10.0****0.005** | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**real | 10.0 | | 10.0 **10.0**tensors | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**misplaced | 10.0 | | 10.0 **10.0**scale | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**`err_gpu | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**err_ref` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.64 | 10.0 | | 10.0 **10.0**- | 10.0 | | 10.0 **10.0**2.56x | 10.0 | | 10.0 **10.0**(bar: | 10.0 | | 10.0 **10.0**4x) | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**summation-order | 10.0 | | 10.0 **10.0**class | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**`err_gpu | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**err_seq_f32` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.54 | 10.0 | | 10.0 **10.0**- | 10.0 | | 10.0 **10.0**0.83x | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**MFMA | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0***tighter* | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**naive | 10.0 | | 10.0 **10.0**sequential | 10.0 | | 10.0 **10.0**f32 | 10.0 | | 10.0 **10.0**|
 
-Bias is the defect detector and magnitude is not: a misplaced scale shows up
-as bias at any magnitude, while a different-but-valid summation tree shows up
-as unbiased noise. Both signals are clean, on synthetic cases with deliberately
-wide UE8M0 exponent spread and on `layers.3.attn.wq_a.weight` and
-`layers.3.ffn.experts.0.w1.weight` from the real checkpoint.
+Bias | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**defect | 10.0 | | 10.0 **10.0**detector | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**magnitude | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**not: | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**misplaced | 10.0 | | 10.0 **10.0**scale | 10.0 | | 10.0 **10.0**shows | 10.0 | | 10.0 **10.0**up
+as | 10.0 | | 10.0 **10.0**bias | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**any | 10.0 | | 10.0 **10.0**magnitude, | 10.0 | | 10.0 **10.0**while | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**different-but-valid | 10.0 | | 10.0 **10.0**summation | 10.0 | | 10.0 **10.0**tree | 10.0 | | 10.0 **10.0**shows | 10.0 | | 10.0 **10.0**up
+as | 10.0 | | 10.0 **10.0**unbiased | 10.0 | | 10.0 **10.0**noise. | 10.0 | | 10.0 **10.0**Both | 10.0 | | 10.0 **10.0**signals | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**clean, | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**synthetic | 10.0 | | 10.0 **10.0**cases | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**deliberately
+wide | 10.0 | | 10.0 **10.0**UE8M0 | 10.0 | | 10.0 **10.0**exponent | 10.0 | | 10.0 **10.0**spread | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**`layers.3.attn.wq_a.weight` | 10.0 | | 10.0 **10.0**and
+`layers.3.ffn.experts.0.w1.weight` | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**real | 10.0 | | 10.0 **10.0**checkpoint.
 
-The one INCONCLUSIVE case is a tiny expert shape where `err_ref == 0` — every
-term happened to be exactly representable, so no rounding occurred anywhere
-and the comparison measures nothing. It is reported as INCONCLUSIVE rather
-than PASS on purpose. **This is a real trap for later gates:** narrow scale
-ranges make GPU and oracle agree bit-for-bit and produce a pass that is
-evidence of nothing. Any future numeric gate must assert `err_ref > 0` before
-counting a case.
+The | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**INCONCLUSIVE | 10.0 | | 10.0 **10.0**case | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**tiny | 10.0 | | 10.0 **10.0**expert | 10.0 | | 10.0 **10.0**shape | 10.0 | | 10.0 **10.0**where | 10.0 | | 10.0 **10.0**`err_ref | 10.0 | | 10.0 **10.0**== | 10.0 | | 10.0 **10.0**0` | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**every
+term | 10.0 | | 10.0 **10.0**happened | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**be | 10.0 | | 10.0 **10.0**exactly | 10.0 | | 10.0 **10.0**representable, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**rounding | 10.0 | | 10.0 **10.0**occurred | 10.0 | | 10.0 **10.0**anywhere
+and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**comparison | 10.0 | | 10.0 **10.0**measures | 10.0 | | 10.0 **10.0**nothing. | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**reported | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**INCONCLUSIVE | 10.0 | | 10.0 **10.0**rather
+than | 10.0 | | 10.0 **10.0**PASS | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**purpose. | 10.0 | | 10.0 **10.0****This | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**real | 10.0 | | 10.0 **10.0**trap | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**later | 10.0 | | 10.0 **10.0**gates:** | 10.0 | | 10.0 **10.0**narrow | 10.0 | | 10.0 **10.0**scale
+ranges | 10.0 | | 10.0 **10.0**make | 10.0 | | 10.0 **10.0**GPU | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**oracle | 10.0 | | 10.0 **10.0**agree | 10.0 | | 10.0 **10.0**bit-for-bit | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**produce | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**pass | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**is
+evidence | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**nothing. | 10.0 | | 10.0 **10.0**Any | 10.0 | | 10.0 **10.0**future | 10.0 | | 10.0 **10.0**numeric | 10.0 | | 10.0 **10.0**gate | 10.0 | | 10.0 **10.0**must | 10.0 | | 10.0 **10.0**assert | 10.0 | | 10.0 **10.0**`err_ref | 10.0 | | 10.0 **10.0**> | 10.0 | | 10.0 **10.0**0` | 10.0 | | 10.0 **10.0**before
+counting | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**case.
 
-### Full-checkpoint residency (`ds4_parent_residency_gate`, mi300x)
+### | 10.0 | | 10.0 **10.0**Full-checkpoint | 10.0 | | 10.0 **10.0**residency | 10.0 | | 10.0 **10.0**(`ds4_parent_residency_gate`, | 10.0 | | 10.0 **10.0**mi300x)
 
-All 43 layers with routed experts, MTP excluded:
+All | 10.0 | | 10.0 **10.0**43 | 10.0 | | 10.0 **10.0**layers | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**routed | 10.0 | | 10.0 **10.0**experts, | 10.0 | | 10.0 **10.0**MTP | 10.0 | | 10.0 **10.0**excluded:
 
-| tier | GiB | bytes |
+| | 10.0 | | 10.0 **10.0**tier | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**GiB | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**bytes | 10.0 | | 10.0 **10.0**|
 |---|---:|---:|
-| dense, decoded to resident BF16 | 10.910 | 11,714,691,072 |
-| routed experts, compressed | 137.062 | 147,169,738,752 |
-| BF16 | 2.634 | 2,828,377,344 |
-| F32 | 0.132 | 141,262,684 |
-| I64 | 0.017 | 18,616,320 |
-| **total** | **150.756** | **161,872,686,172** |
+| | 10.0 | | 10.0 **10.0**dense, | 10.0 | | 10.0 **10.0**decoded | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**resident | 10.0 | | 10.0 **10.0**BF16 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**10.910 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**11,714,691,072 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**routed | 10.0 | | 10.0 **10.0**experts, | 10.0 | | 10.0 **10.0**compressed | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**137.062 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**147,169,738,752 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**BF16 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**2.634 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**2,828,377,344 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**F32 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.132 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**141,262,684 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**I64 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.017 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**18,616,320 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0****total** | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0****150.756** | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0****161,872,686,172** | 10.0 | | 10.0 **10.0**|
 
-Byte-identical to the Gate 1 projection, which was derived independently from
-the safetensors index — two separate code paths agreeing exactly. 41.244 GiB
-headroom on the 192 GiB card. Full load 40.7 s at 3.79 GiB/s; a
-`ParentLoadPlan { layers: 0..1 }` loads in 3.4 s, which is what Gate 4 should
-iterate against.
+Byte-identical | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**Gate | 10.0 | | 10.0 **10.0**1 | 10.0 | | 10.0 **10.0**projection, | 10.0 | | 10.0 **10.0**which | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**derived | 10.0 | | 10.0 **10.0**independently | 10.0 | | 10.0 **10.0**from
+the | 10.0 | | 10.0 **10.0**safetensors | 10.0 | | 10.0 **10.0**index | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**two | 10.0 | | 10.0 **10.0**separate | 10.0 | | 10.0 **10.0**code | 10.0 | | 10.0 **10.0**paths | 10.0 | | 10.0 **10.0**agreeing | 10.0 | | 10.0 **10.0**exactly. | 10.0 | | 10.0 **10.0**41.244 | 10.0 | | 10.0 **10.0**GiB
+headroom | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**192 | 10.0 | | 10.0 **10.0**GiB | 10.0 | | 10.0 **10.0**card. | 10.0 | | 10.0 **10.0**Full | 10.0 | | 10.0 **10.0**load | 10.0 | | 10.0 **10.0**40.7 | 10.0 | | 10.0 **10.0**s | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**3.79 | 10.0 | | 10.0 **10.0**GiB/s; | 10.0 | | 10.0 **10.0**a
+`ParentLoadPlan | 10.0 | | 10.0 **10.0**{ | 10.0 | | 10.0 **10.0**layers: | 10.0 | | 10.0 **10.0**0..1 | 10.0 | | 10.0 **10.0**}` | 10.0 | | 10.0 **10.0**loads | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**3.4 | 10.0 | | 10.0 **10.0**s, | 10.0 | | 10.0 **10.0**which | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**what | 10.0 | | 10.0 **10.0**Gate | 10.0 | | 10.0 **10.0**4 | 10.0 | | 10.0 **10.0**should
+iterate | 10.0 | | 10.0 **10.0**against.
 
-### Additional findings
+### | 10.0 | | 10.0 **10.0**Additional | 10.0 | | 10.0 **10.0**findings
 
-7. **`gemm_bf16_mfma.gfx942.hip` had never been executed.** It was compile-
-   and disassembly-validated on 2026-05-19 but its runtime validation was
-   still marked PENDING and it had no Rust wrapper. It now has
-   `Gpu::gemm_bf16_mfma_gfx942` and is bit-exact against both an F32 reference
-   and rocBLAS on every shape tested. Throughput is 13.8 TFLOP/s vs rocBLAS
-   40.9 at `n=32768, k=1024, m=32` — adequate for calibration (a 1K-token
-   forward is order 13 TFLOP total), so correctness and capture-hook
-   friendliness win over raw speed here.
-8. **BF16 decode is exact, not an approximation.** Every UE8M0 scale is a
-   power of two, and an E4M3 code (3-bit mantissa) or E2M1 code (1-bit
-   mantissa) times a power of two is exactly representable in BF16 (7-bit
-   mantissa, wide exponent). So each product term is the identical real number
-   in both the reference's FP8xFP8 formulation and ours, and exact in FP32.
-   Only summation order differs. This is why Gate 3 can demand near-parity
-   rather than a loose tolerance.
-9. **`parent_linear_dense` destroys `x_bf16`**, matching the reference's
-   `inplace=True` activation quantization at the linear boundary. A caller
-   that reuses the buffer for a second projection double-quantizes silently.
-   The forward must fill a per-linear activation scratch from the residual;
-   never hand it a buffer that has to survive.
+7. | 10.0 | | 10.0 **10.0****`gemm_bf16_mfma.gfx942.hip` | 10.0 | | 10.0 **10.0**had | 10.0 | | 10.0 **10.0**never | 10.0 | | 10.0 **10.0**been | 10.0 | | 10.0 **10.0**executed.** | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**compile-
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**disassembly-validated | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**2026-05-19 | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**runtime | 10.0 | | 10.0 **10.0**validation | 10.0 | | 10.0 **10.0**was
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**still | 10.0 | | 10.0 **10.0**marked | 10.0 | | 10.0 **10.0**PENDING | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**had | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**Rust | 10.0 | | 10.0 **10.0**wrapper. | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**now | 10.0 | | 10.0 **10.0**has
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`Gpu::gemm_bf16_mfma_gfx942` | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**bit-exact | 10.0 | | 10.0 **10.0**against | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**F32 | 10.0 | | 10.0 **10.0**reference
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**rocBLAS | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**every | 10.0 | | 10.0 **10.0**shape | 10.0 | | 10.0 **10.0**tested. | 10.0 | | 10.0 **10.0**Throughput | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**13.8 | 10.0 | | 10.0 **10.0**TFLOP/s | 10.0 | | 10.0 **10.0**vs | 10.0 | | 10.0 **10.0**rocBLAS
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**40.9 | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**`n=32768, | 10.0 | | 10.0 **10.0**k=1024, | 10.0 | | 10.0 **10.0**m=32` | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**adequate | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**calibration | 10.0 | | 10.0 **10.0**(a | 10.0 | | 10.0 **10.0**1K-token
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**forward | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**order | 10.0 | | 10.0 **10.0**13 | 10.0 | | 10.0 **10.0**TFLOP | 10.0 | | 10.0 **10.0**total), | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**correctness | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**capture-hook
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**friendliness | 10.0 | | 10.0 **10.0**win | 10.0 | | 10.0 **10.0**over | 10.0 | | 10.0 **10.0**raw | 10.0 | | 10.0 **10.0**speed | 10.0 | | 10.0 **10.0**here.
+8. | 10.0 | | 10.0 **10.0****BF16 | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**exact, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**approximation.** | 10.0 | | 10.0 **10.0**Every | 10.0 | | 10.0 **10.0**UE8M0 | 10.0 | | 10.0 **10.0**scale | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**a
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**power | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**two, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**E4M3 | 10.0 | | 10.0 **10.0**code | 10.0 | | 10.0 **10.0**(3-bit | 10.0 | | 10.0 **10.0**mantissa) | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**E2M1 | 10.0 | | 10.0 **10.0**code | 10.0 | | 10.0 **10.0**(1-bit
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**mantissa) | 10.0 | | 10.0 **10.0**times | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**power | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**two | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**exactly | 10.0 | | 10.0 **10.0**representable | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**BF16 | 10.0 | | 10.0 **10.0**(7-bit
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**mantissa, | 10.0 | | 10.0 **10.0**wide | 10.0 | | 10.0 **10.0**exponent). | 10.0 | | 10.0 **10.0**So | 10.0 | | 10.0 **10.0**each | 10.0 | | 10.0 **10.0**product | 10.0 | | 10.0 **10.0**term | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**identical | 10.0 | | 10.0 **10.0**real | 10.0 | | 10.0 **10.0**number
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**reference's | 10.0 | | 10.0 **10.0**FP8xFP8 | 10.0 | | 10.0 **10.0**formulation | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**ours, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**exact | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**FP32.
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**Only | 10.0 | | 10.0 **10.0**summation | 10.0 | | 10.0 **10.0**order | 10.0 | | 10.0 **10.0**differs. | 10.0 | | 10.0 **10.0**This | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**why | 10.0 | | 10.0 **10.0**Gate | 10.0 | | 10.0 **10.0**3 | 10.0 | | 10.0 **10.0**can | 10.0 | | 10.0 **10.0**demand | 10.0 | | 10.0 **10.0**near-parity
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**rather | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**loose | 10.0 | | 10.0 **10.0**tolerance.
+9. | 10.0 | | 10.0 **10.0****`parent_linear_dense` | 10.0 | | 10.0 **10.0**destroys | 10.0 | | 10.0 **10.0**`x_bf16`**, | 10.0 | | 10.0 **10.0**matching | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**reference's
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`inplace=True` | 10.0 | | 10.0 **10.0**activation | 10.0 | | 10.0 **10.0**quantization | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**linear | 10.0 | | 10.0 **10.0**boundary. | 10.0 | | 10.0 **10.0**A | 10.0 | | 10.0 **10.0**caller
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**reuses | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**buffer | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**second | 10.0 | | 10.0 **10.0**projection | 10.0 | | 10.0 **10.0**double-quantizes | 10.0 | | 10.0 **10.0**silently.
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**forward | 10.0 | | 10.0 **10.0**must | 10.0 | | 10.0 **10.0**fill | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**per-linear | 10.0 | | 10.0 **10.0**activation | 10.0 | | 10.0 **10.0**scratch | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**residual;
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**never | 10.0 | | 10.0 **10.0**hand | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**buffer | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**has | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**survive.
 
-### Gate 4 evidence
+### | 10.0 | | 10.0 **10.0**Gate | 10.0 | | 10.0 **10.0**4 | 10.0 | | 10.0 **10.0**evidence
 
-`ds4_parent_layer_gate` on `mi300x` (gfx942), layer 0, 16 rows seeded from
-real `embed.weight` token rows: **PASS, 14/14 oracle checks**, exit 0.
-Output finite (0 NaN, 0 Inf, 0 exactly-zero elements), L2 506.71,
-110.9 ms, 27.5 MiB scratch, layer load 0.70 s.
+`ds4_parent_layer_gate` | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**`mi300x` | 10.0 | | 10.0 **10.0**(gfx942), | 10.0 | | 10.0 **10.0**layer | 10.0 | | 10.0 **10.0**0, | 10.0 | | 10.0 **10.0**16 | 10.0 | | 10.0 **10.0**rows | 10.0 | | 10.0 **10.0**seeded | 10.0 | | 10.0 **10.0**from
+real | 10.0 | | 10.0 **10.0**`embed.weight` | 10.0 | | 10.0 **10.0**token | 10.0 | | 10.0 **10.0**rows: | 10.0 | | 10.0 **10.0****PASS, | 10.0 | | 10.0 **10.0**14/14 | 10.0 | | 10.0 **10.0**oracle | 10.0 | | 10.0 **10.0**checks**, | 10.0 | | 10.0 **10.0**exit | 10.0 | | 10.0 **10.0**0.
+Output | 10.0 | | 10.0 **10.0**finite | 10.0 | | 10.0 **10.0**(0 | 10.0 | | 10.0 **10.0**NaN, | 10.0 | | 10.0 **10.0**0 | 10.0 | | 10.0 **10.0**Inf, | 10.0 | | 10.0 **10.0**0 | 10.0 | | 10.0 **10.0**exactly-zero | 10.0 | | 10.0 **10.0**elements), | 10.0 | | 10.0 **10.0**L2 | 10.0 | | 10.0 **10.0**506.71,
+110.9 | 10.0 | | 10.0 **10.0**ms, | 10.0 | | 10.0 **10.0**27.5 | 10.0 | | 10.0 **10.0**MiB | 10.0 | | 10.0 **10.0**scratch, | 10.0 | | 10.0 **10.0**layer | 10.0 | | 10.0 **10.0**load | 10.0 | | 10.0 **10.0**0.70 | 10.0 | | 10.0 **10.0**s.
 
-Every stage with an f64 reference in `parent::layer_ref` was downloaded and
-compared. Agreement is 3.7e-9 to 9.5e-7 max-abs across all HC and norm
-stages — f32 round-off, nothing more:
+Every | 10.0 | | 10.0 **10.0**stage | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**f64 | 10.0 | | 10.0 **10.0**reference | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**`parent::layer_ref` | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**downloaded | 10.0 | | 10.0 **10.0**and
+compared. | 10.0 | | 10.0 **10.0**Agreement | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**3.7e-9 | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**9.5e-7 | 10.0 | | 10.0 **10.0**max-abs | 10.0 | | 10.0 **10.0**across | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**HC | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**norm
+stages | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**f32 | 10.0 | | 10.0 **10.0**round-off, | 10.0 | | 10.0 **10.0**nothing | 10.0 | | 10.0 **10.0**more:
 
-| stage | max abs | mean rel |
+| | 10.0 | | 10.0 **10.0**stage | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**max | 10.0 | | 10.0 **10.0**abs | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**mean | 10.0 | | 10.0 **10.0**rel | 10.0 | | 10.0 **10.0**|
 |---|---:|---:|
-| `hc_pre_attn.y` / `.post` / `.comb` | 3.7e-9 / 1.5e-8 / 8.9e-8 | ~1e-8 - 3e-7 |
-| `attn_norm` | 1.5e-8 | 2.8e-8 |
-| `hc_pre_ffn.y` / `.post` / `.comb` | 2.4e-7 / 1.2e-7 / 4.2e-7 | ~1e-7 - 3e-7 |
-| `ffn_norm` | 2.4e-7 | 3.0e-8 |
-| `hc_post_ffn` | 9.5e-7 | 3.7e-8 |
-| routing (hash, layer 0) | 0 index mismatches, 86 distinct experts | weight sum err 2.4e-7 |
-| expert SwiGLU (shared + routed 254) | scale err 6.7e-9 | — |
+| | 10.0 | | 10.0 **10.0**`hc_pre_attn.y` | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**`.post` | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**`.comb` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**3.7e-9 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**1.5e-8 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**8.9e-8 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**~1e-8 | 10.0 | | 10.0 **10.0**- | 10.0 | | 10.0 **10.0**3e-7 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**`attn_norm` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1.5e-8 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**2.8e-8 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**`hc_pre_ffn.y` | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**`.post` | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**`.comb` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**2.4e-7 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**1.2e-7 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**4.2e-7 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**~1e-7 | 10.0 | | 10.0 **10.0**- | 10.0 | | 10.0 **10.0**3e-7 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**`ffn_norm` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**2.4e-7 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**3.0e-8 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**`hc_post_ffn` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**9.5e-7 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**3.7e-8 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**routing | 10.0 | | 10.0 **10.0**(hash, | 10.0 | | 10.0 **10.0**layer | 10.0 | | 10.0 **10.0**0) | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0 | 10.0 | | 10.0 **10.0**index | 10.0 | | 10.0 **10.0**mismatches, | 10.0 | | 10.0 **10.0**86 | 10.0 | | 10.0 **10.0**distinct | 10.0 | | 10.0 **10.0**experts | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**weight | 10.0 | | 10.0 **10.0**sum | 10.0 | | 10.0 **10.0**err | 10.0 | | 10.0 **10.0**2.4e-7 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**expert | 10.0 | | 10.0 **10.0**SwiGLU | 10.0 | | 10.0 **10.0**(shared | 10.0 | | 10.0 **10.0**+ | 10.0 | | 10.0 **10.0**routed | 10.0 | | 10.0 **10.0**254) | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**scale | 10.0 | | 10.0 **10.0**err | 10.0 | | 10.0 **10.0**6.7e-9 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**|
 
-**Closed-form norm check.** RMSNorm forces per-row RMS to 1, so post-norm L2
-is `sqrt(rows*dim) * mean_abs(weight)`. Using the checkpoint's own BF16 norm
-weights (`attn_norm` mean_abs 0.029486, `ffn_norm` 0.225120):
+**Closed-form | 10.0 | | 10.0 **10.0**norm | 10.0 | | 10.0 **10.0**check.** | 10.0 | | 10.0 **10.0**RMSNorm | 10.0 | | 10.0 **10.0**forces | 10.0 | | 10.0 **10.0**per-row | 10.0 | | 10.0 **10.0**RMS | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**1, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**post-norm | 10.0 | | 10.0 **10.0**L2
+is | 10.0 | | 10.0 **10.0**`sqrt(rows*dim) | 10.0 | | 10.0 **10.0*** | 10.0 | | 10.0 **10.0**mean_abs(weight)`. | 10.0 | | 10.0 **10.0**Using | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**checkpoint's | 10.0 | | 10.0 **10.0**own | 10.0 | | 10.0 **10.0**BF16 | 10.0 | | 10.0 **10.0**norm
+weights | 10.0 | | 10.0 **10.0**(`attn_norm` | 10.0 | | 10.0 **10.0**mean_abs | 10.0 | | 10.0 **10.0**0.029486, | 10.0 | | 10.0 **10.0**`ffn_norm` | 10.0 | | 10.0 **10.0**0.225120):
 
-| norm | predicted | measured | rel err |
+| | 10.0 | | 10.0 **10.0**norm | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**predicted | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**measured | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**rel | 10.0 | | 10.0 **10.0**err | 10.0 | | 10.0 **10.0**|
 |---|---:|---:|---:|
-| `attn_norm` | 7.548 | 7.539 | 0.12% |
-| `ffn_norm` | 57.63 | 58.31 | 1.2% |
+| | 10.0 | | 10.0 **10.0**`attn_norm` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**7.548 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**7.539 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.12% | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**`ffn_norm` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**57.63 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**58.31 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1.2% | 10.0 | | 10.0 **10.0**|
 
-This is the check that catches a `+1` offset convention, a wrong eps, or a
-transposed norm weight. The reference RMSNorm (`model.py:197-202`) is a
-direct multiply with **no offset**, and the real weights are tightly clustered
-and strictly positive, consistent with that. Note `attn_norm`'s mean weight is
-an order of magnitude below `ffn_norm`'s, so the L2 drop from 237 to 7.5
-across that stage is correct, not a collapse.
+This | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**check | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**catches | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**`+1` | 10.0 | | 10.0 **10.0**offset | 10.0 | | 10.0 **10.0**convention, | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**wrong | 10.0 | | 10.0 **10.0**eps, | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**a
+transposed | 10.0 | | 10.0 **10.0**norm | 10.0 | | 10.0 **10.0**weight. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**reference | 10.0 | | 10.0 **10.0**RMSNorm | 10.0 | | 10.0 **10.0**(`model.py:197-202`) | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**a
+direct | 10.0 | | 10.0 **10.0**multiply | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0****no | 10.0 | | 10.0 **10.0**offset**, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**real | 10.0 | | 10.0 **10.0**weights | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**tightly | 10.0 | | 10.0 **10.0**clustered
+and | 10.0 | | 10.0 **10.0**strictly | 10.0 | | 10.0 **10.0**positive, | 10.0 | | 10.0 **10.0**consistent | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**that. | 10.0 | | 10.0 **10.0**Note | 10.0 | | 10.0 **10.0**`attn_norm`'s | 10.0 | | 10.0 **10.0**mean | 10.0 | | 10.0 **10.0**weight | 10.0 | | 10.0 **10.0**is
+an | 10.0 | | 10.0 **10.0**order | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**magnitude | 10.0 | | 10.0 **10.0**below | 10.0 | | 10.0 **10.0**`ffn_norm`'s, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**L2 | 10.0 | | 10.0 **10.0**drop | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**237 | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**7.5
+across | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**stage | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**correct, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**collapse.
 
-### The constant-leak finding
+### | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**constant-leak | 10.0 | | 10.0 **10.0**finding
 
-The single most valuable result of this gate is what the *standalone* forward
-avoided. Reusing the MQ2R production path as a reference would have silently
-inherited at least three serving-tuned constants that contradict the
+The | 10.0 | | 10.0 **10.0**single | 10.0 | | 10.0 **10.0**most | 10.0 | | 10.0 **10.0**valuable | 10.0 | | 10.0 **10.0**result | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**gate | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**what | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0***standalone* | 10.0 | | 10.0 **10.0**forward
+avoided. | 10.0 | | 10.0 **10.0**Reusing | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**MQ2R | 10.0 | | 10.0 **10.0**production | 10.0 | | 10.0 **10.0**path | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**reference | 10.0 | | 10.0 **10.0**would | 10.0 | | 10.0 **10.0**have | 10.0 | | 10.0 **10.0**silently
+inherited | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**least | 10.0 | | 10.0 **10.0**three | 10.0 | | 10.0 **10.0**serving-tuned | 10.0 | | 10.0 **10.0**constants | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**contradict | 10.0 | | 10.0 **10.0**the
 checkpoint:
 
-1. **`route_scale`** — production reads `HIPFIRE_DEEPSEEK4_ROUTE_SCALE` with
-   `unwrap_or(2.2)` and never reads the config's `routed_scaling_factor`
-   (**1.5**).
-2. **`norm_topk_prob`** — present in config, hardwired on in production
-   forward.
-3. **HC `mhc_pre`** — production uses F16 weights, a hardcoded eps, and an
-   env-driven `post_scale`; the reference is `2*sigmoid(...)`.
+1. | 10.0 | | 10.0 **10.0****`route_scale`** | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**production | 10.0 | | 10.0 **10.0**reads | 10.0 | | 10.0 **10.0**`HIPFIRE_DEEPSEEK4_ROUTE_SCALE` | 10.0 | | 10.0 **10.0**with
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`unwrap_or(2.2)` | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**never | 10.0 | | 10.0 **10.0**reads | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**config's | 10.0 | | 10.0 **10.0**`routed_scaling_factor`
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**(**1.5**).
+2. | 10.0 | | 10.0 **10.0****`norm_topk_prob`** | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**present | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**config, | 10.0 | | 10.0 **10.0**hardwired | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**production
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**forward.
+3. | 10.0 | | 10.0 **10.0****HC | 10.0 | | 10.0 **10.0**`mhc_pre`** | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**production | 10.0 | | 10.0 **10.0**uses | 10.0 | | 10.0 **10.0**F16 | 10.0 | | 10.0 **10.0**weights, | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**hardcoded | 10.0 | | 10.0 **10.0**eps, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**an
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**env-driven | 10.0 | | 10.0 **10.0**`post_scale`; | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**reference | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**`2*sigmoid(...)`.
 
-Each would have produced finite, plausible, wrong parent logits. Every
-constant in `parent/*` now traces to `config.json` or a checkpoint tensor, and
-no parent path reads an environment variable to choose a number. **Treat that
-as a standing rule for the remaining gates.**
+Each | 10.0 | | 10.0 **10.0**would | 10.0 | | 10.0 **10.0**have | 10.0 | | 10.0 **10.0**produced | 10.0 | | 10.0 **10.0**finite, | 10.0 | | 10.0 **10.0**plausible, | 10.0 | | 10.0 **10.0**wrong | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**logits. | 10.0 | | 10.0 **10.0**Every
+constant | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**`parent/*` | 10.0 | | 10.0 **10.0**now | 10.0 | | 10.0 **10.0**traces | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**`config.json` | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**checkpoint | 10.0 | | 10.0 **10.0**tensor, | 10.0 | | 10.0 **10.0**and
+no | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**path | 10.0 | | 10.0 **10.0**reads | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**environment | 10.0 | | 10.0 **10.0**variable | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**choose | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**number. | 10.0 | | 10.0 **10.0****Treat | 10.0 | | 10.0 **10.0**that
+as | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**standing | 10.0 | | 10.0 **10.0**rule | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**remaining | 10.0 | | 10.0 **10.0**gates.**
 
-Separately, this is worth a maintainer's judgement on its own terms: if
-`route_scale = 2.2` in the MQ2R serving path is a deliberate, measured tuning,
-it should be recorded as such; if it is drift from `routed_scaling_factor`,
-it may be depressing quantized-artifact quality independently of this work.
+Separately, | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**worth | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**maintainer's | 10.0 | | 10.0 **10.0**judgement | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**own | 10.0 | | 10.0 **10.0**terms: | 10.0 | | 10.0 **10.0**if
+`route_scale | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**2.2` | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**MQ2R | 10.0 | | 10.0 **10.0**serving | 10.0 | | 10.0 **10.0**path | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**deliberate, | 10.0 | | 10.0 **10.0**measured | 10.0 | | 10.0 **10.0**tuning,
+it | 10.0 | | 10.0 **10.0**should | 10.0 | | 10.0 **10.0**be | 10.0 | | 10.0 **10.0**recorded | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**such; | 10.0 | | 10.0 **10.0**if | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**drift | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**`routed_scaling_factor`,
+it | 10.0 | | 10.0 **10.0**may | 10.0 | | 10.0 **10.0**be | 10.0 | | 10.0 **10.0**depressing | 10.0 | | 10.0 **10.0**quantized-artifact | 10.0 | | 10.0 **10.0**quality | 10.0 | | 10.0 **10.0**independently | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**work.
 
-### Parent semantics already reproduced (from `inference/model.py`)
+### | 10.0 | | 10.0 **10.0**Parent | 10.0 | | 10.0 **10.0**semantics | 10.0 | | 10.0 **10.0**already | 10.0 | | 10.0 **10.0**reproduced | 10.0 | | 10.0 **10.0**(from | 10.0 | | 10.0 **10.0**`inference/model.py`)
 
-- `Expert.forward` (592-611): `up = clamp(up, -10, 10)` but
-  `gate = clamp(gate, max=10)` — **`gate` has no lower clamp**. The routing
-  weight multiplies `silu(gate)*up` **before** `w2`, not the expert's output.
-- `MoE.forward` (614-649): `y` accumulates in **f32**, routed experts first,
-  then `y += shared_experts(x)`, then cast back.
-- `Gate.forward` (551-590): `linear(x.float(), weight.float())`, so no
-  activation quantization. `sqrt(softplus(x))` scoring. Bias shifts scores for
-  **selection only**; the returned weight is the *uncorrected* score, then
-  normalized, then scaled by 1.5.
-- Attention (442-549): FP8 in-place simulation at block **64** on the
-  non-RoPE KV dims. RoPE is **interleaved** —
-  `view_as_complex(unflatten(-1, (-1, 2)))` pairs dims `(2i, 2i+1)`. Layers
-  with `compress_ratio == 0` disable YaRN (484-485).
+- | 10.0 | | 10.0 **10.0**`Expert.forward` | 10.0 | | 10.0 **10.0**(592-611): | 10.0 | | 10.0 **10.0**`up | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**clamp(up, | 10.0 | | 10.0 **10.0**-10, | 10.0 | | 10.0 **10.0**10)` | 10.0 | | 10.0 **10.0**but
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`gate | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**clamp(gate, | 10.0 | | 10.0 **10.0**max=10)` | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0****`gate` | 10.0 | | 10.0 **10.0**has | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**lower | 10.0 | | 10.0 **10.0**clamp**. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**routing
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**weight | 10.0 | | 10.0 **10.0**multiplies | 10.0 | | 10.0 **10.0**`silu(gate)*up` | 10.0 | | 10.0 **10.0****before** | 10.0 | | 10.0 **10.0**`w2`, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**expert's | 10.0 | | 10.0 **10.0**output.
+- | 10.0 | | 10.0 **10.0**`MoE.forward` | 10.0 | | 10.0 **10.0**(614-649): | 10.0 | | 10.0 **10.0**`y` | 10.0 | | 10.0 **10.0**accumulates | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0****f32**, | 10.0 | | 10.0 **10.0**routed | 10.0 | | 10.0 **10.0**experts | 10.0 | | 10.0 **10.0**first,
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**then | 10.0 | | 10.0 **10.0**`y | 10.0 | | 10.0 **10.0**+= | 10.0 | | 10.0 **10.0**shared_experts(x)`, | 10.0 | | 10.0 **10.0**then | 10.0 | | 10.0 **10.0**cast | 10.0 | | 10.0 **10.0**back.
+- | 10.0 | | 10.0 **10.0**`Gate.forward` | 10.0 | | 10.0 **10.0**(551-590): | 10.0 | | 10.0 **10.0**`linear(x.float(), | 10.0 | | 10.0 **10.0**weight.float())`, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**no
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**activation | 10.0 | | 10.0 **10.0**quantization. | 10.0 | | 10.0 **10.0**`sqrt(softplus(x))` | 10.0 | | 10.0 **10.0**scoring. | 10.0 | | 10.0 **10.0**Bias | 10.0 | | 10.0 **10.0**shifts | 10.0 | | 10.0 **10.0**scores | 10.0 | | 10.0 **10.0**for
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0****selection | 10.0 | | 10.0 **10.0**only**; | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**returned | 10.0 | | 10.0 **10.0**weight | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0***uncorrected* | 10.0 | | 10.0 **10.0**score, | 10.0 | | 10.0 **10.0**then
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**normalized, | 10.0 | | 10.0 **10.0**then | 10.0 | | 10.0 **10.0**scaled | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**1.5.
+- | 10.0 | | 10.0 **10.0**Attention | 10.0 | | 10.0 **10.0**(442-549): | 10.0 | | 10.0 **10.0**FP8 | 10.0 | | 10.0 **10.0**in-place | 10.0 | | 10.0 **10.0**simulation | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**block | 10.0 | | 10.0 **10.0****64** | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**the
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**non-RoPE | 10.0 | | 10.0 **10.0**KV | 10.0 | | 10.0 **10.0**dims. | 10.0 | | 10.0 **10.0**RoPE | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0****interleaved** | 10.0 | | 10.0 **10.0**—
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`view_as_complex(unflatten(-1, | 10.0 | | 10.0 **10.0**(-1, | 10.0 | | 10.0 **10.0**2)))` | 10.0 | | 10.0 **10.0**pairs | 10.0 | | 10.0 **10.0**dims | 10.0 | | 10.0 **10.0**`(2i, | 10.0 | | 10.0 **10.0**2i+1)`. | 10.0 | | 10.0 **10.0**Layers
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**`compress_ratio | 10.0 | | 10.0 **10.0**== | 10.0 | | 10.0 **10.0**0` | 10.0 | | 10.0 **10.0**disable | 10.0 | | 10.0 **10.0**YaRN | 10.0 | | 10.0 **10.0**(484-485).
 
-### Gate 5 evidence
+### | 10.0 | | 10.0 **10.0**Gate | 10.0 | | 10.0 **10.0**5 | 10.0 | | 10.0 **10.0**evidence
 
-`ds4_parent_forward_gate` on `mi300x` (gfx942), all 43 layers with routed
-experts, MTP excluded. **PASS at both 32 and 256 tokens.**
+`ds4_parent_forward_gate` | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**`mi300x` | 10.0 | | 10.0 **10.0**(gfx942), | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**43 | 10.0 | | 10.0 **10.0**layers | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**routed
+experts, | 10.0 | | 10.0 **10.0**MTP | 10.0 | | 10.0 **10.0**excluded. | 10.0 | | 10.0 **10.0****PASS | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**32 | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**256 | 10.0 | | 10.0 **10.0**tokens.**
 
-| | 32 tok | 256 tok |
+| | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**32 | 10.0 | | 10.0 **10.0**tok | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**256 | 10.0 | | 10.0 **10.0**tok | 10.0 | | 10.0 **10.0**|
 |---|---:|---:|
-| load | 18.48 s | 19.06 s |
-| forward | 4.478 s | 24.81 s |
-| residency | 161,872,686,172 B | same, delta 0 vs Gate 1 |
-| logits | L2 8453.5, mean -1.164, std 3.990 | L2 2.300e4 |
-| NaN / Inf | 0 / 0 | 0 / 0 |
-| determinism (in-process) | bit-identical | bit-identical |
-| `.plog` | 16,547,864 B | 132,382,744 B |
+| | 10.0 | | 10.0 **10.0**load | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**18.48 | 10.0 | | 10.0 **10.0**s | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**19.06 | 10.0 | | 10.0 **10.0**s | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**forward | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**4.478 | 10.0 | | 10.0 **10.0**s | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**24.81 | 10.0 | | 10.0 **10.0**s | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**residency | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**161,872,686,172 | 10.0 | | 10.0 **10.0**B | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**same, | 10.0 | | 10.0 **10.0**delta | 10.0 | | 10.0 **10.0**0 | 10.0 | | 10.0 **10.0**vs | 10.0 | | 10.0 **10.0**Gate | 10.0 | | 10.0 **10.0**1 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**logits | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**L2 | 10.0 | | 10.0 **10.0**8453.5, | 10.0 | | 10.0 **10.0**mean | 10.0 | | 10.0 **10.0**-1.164, | 10.0 | | 10.0 **10.0**std | 10.0 | | 10.0 **10.0**3.990 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**L2 | 10.0 | | 10.0 **10.0**2.300e4 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**NaN | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**Inf | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**0 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**0 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**determinism | 10.0 | | 10.0 **10.0**(in-process) | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**bit-identical | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**bit-identical | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**`.plog` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**16,547,864 | 10.0 | | 10.0 **10.0**B | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**132,382,744 | 10.0 | | 10.0 **10.0**B | 10.0 | | 10.0 **10.0**|
 
-**Coherence.** `"The capital of France is"` gives top-1 `" Paris"` at logit
-30.19, clear of `"Paris"` (25.52) and `"巴黎"` (25.16). This is the first
-coherent output from the parent checkpoint under hipfire.
+**Coherence.** | 10.0 | | 10.0 **10.0**`"The | 10.0 | | 10.0 **10.0**capital | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**France | 10.0 | | 10.0 **10.0**is"` | 10.0 | | 10.0 **10.0**gives | 10.0 | | 10.0 **10.0**top-1 | 10.0 | | 10.0 **10.0**`" | 10.0 | | 10.0 **10.0**Paris"` | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**logit
+30.19, | 10.0 | | 10.0 **10.0**clear | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**`"Paris"` | 10.0 | | 10.0 **10.0**(25.52) | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**`"巴黎"` | 10.0 | | 10.0 **10.0**(25.16). | 10.0 | | 10.0 **10.0**This | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**first
+coherent | 10.0 | | 10.0 **10.0**output | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**checkpoint | 10.0 | | 10.0 **10.0**under | 10.0 | | 10.0 **10.0**hipfire.
 
-Note the gate also prints an argmax decode of the *fixed pseudo-random* token
-sequence, and that output is gibberish. It is correctly labelled
-diagnostic-only: the input is PRNG-generated token ids, not text, so its
-continuation is meaningless. The real prompt is the coherence signal. Do not
-read the fixed-sequence decode as a failure — and do not read a *plausible*
-fixed-sequence decode as a success either.
+Note | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**gate | 10.0 | | 10.0 **10.0**also | 10.0 | | 10.0 **10.0**prints | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**argmax | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0***fixed | 10.0 | | 10.0 **10.0**pseudo-random* | 10.0 | | 10.0 **10.0**token
+sequence, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**output | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**gibberish. | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**correctly | 10.0 | | 10.0 **10.0**labelled
+diagnostic-only: | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**input | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**PRNG-generated | 10.0 | | 10.0 **10.0**token | 10.0 | | 10.0 **10.0**ids, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**text, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**its
+continuation | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**meaningless. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**real | 10.0 | | 10.0 **10.0**prompt | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**coherence | 10.0 | | 10.0 **10.0**signal. | 10.0 | | 10.0 **10.0**Do | 10.0 | | 10.0 **10.0**not
+read | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**fixed-sequence | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**failure | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**do | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**read | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0***plausible*
+fixed-sequence | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**success | 10.0 | | 10.0 **10.0**either.
 
-**Stack stability.** The HC residual norm grows from ~400 to ~631,000 over 43
-layers, geometric mean 1.1917 per layer, with no monotonic trend (the last
-three ratios are 1.0523, 0.9892, 0.9412) and no per-layer ratio outside
-[0.25, 4]. This is not obviously wrong: `hc_post` applies a learned
-`post = 2*sigmoid(...)` factor in (0, 2), and both `hc_pre` and the final
-RMSNorm are scale-invariant, so absolute stream magnitude never reaches the
-logits. `hc_post` is oracle-verified to 9.5e-7. Recorded as an observation to
-re-check against the reference if it ever becomes runnable.
+**Stack | 10.0 | | 10.0 **10.0**stability.** | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**HC | 10.0 | | 10.0 **10.0**residual | 10.0 | | 10.0 **10.0**norm | 10.0 | | 10.0 **10.0**grows | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**~400 | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**~631,000 | 10.0 | | 10.0 **10.0**over | 10.0 | | 10.0 **10.0**43
+layers, | 10.0 | | 10.0 **10.0**geometric | 10.0 | | 10.0 **10.0**mean | 10.0 | | 10.0 **10.0**1.1917 | 10.0 | | 10.0 **10.0**per | 10.0 | | 10.0 **10.0**layer, | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**monotonic | 10.0 | | 10.0 **10.0**trend | 10.0 | | 10.0 **10.0**(the | 10.0 | | 10.0 **10.0**last
+three | 10.0 | | 10.0 **10.0**ratios | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**1.0523, | 10.0 | | 10.0 **10.0**0.9892, | 10.0 | | 10.0 **10.0**0.9412) | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**per-layer | 10.0 | | 10.0 **10.0**ratio | 10.0 | | 10.0 **10.0**outside
+[0.25, | 10.0 | | 10.0 **10.0**4]. | 10.0 | | 10.0 **10.0**This | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**obviously | 10.0 | | 10.0 **10.0**wrong: | 10.0 | | 10.0 **10.0**`hc_post` | 10.0 | | 10.0 **10.0**applies | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**learned
+`post | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**2*sigmoid(...)` | 10.0 | | 10.0 **10.0**factor | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**(0, | 10.0 | | 10.0 **10.0**2), | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**`hc_pre` | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**final
+RMSNorm | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**scale-invariant, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**absolute | 10.0 | | 10.0 **10.0**stream | 10.0 | | 10.0 **10.0**magnitude | 10.0 | | 10.0 **10.0**never | 10.0 | | 10.0 **10.0**reaches | 10.0 | | 10.0 **10.0**the
+logits. | 10.0 | | 10.0 **10.0**`hc_post` | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**oracle-verified | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**9.5e-7. | 10.0 | | 10.0 **10.0**Recorded | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**observation | 10.0 | | 10.0 **10.0**to
+re-check | 10.0 | | 10.0 **10.0**against | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**reference | 10.0 | | 10.0 **10.0**if | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**ever | 10.0 | | 10.0 **10.0**becomes | 10.0 | | 10.0 **10.0**runnable.
 
-### The act-quant BF16-domain finding
+### | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**act-quant | 10.0 | | 10.0 **10.0**BF16-domain | 10.0 | | 10.0 **10.0**finding
 
-While building the compressor, the host FP8 act-quant oracle was found to
-disagree with the GPU kernel by max_abs 0.25 / mean_rel 2.2e-3 — **contradicting
-Gate 2**, which had certified that pair bit-exact.
+While | 10.0 | | 10.0 **10.0**building | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**compressor, | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**host | 10.0 | | 10.0 **10.0**FP8 | 10.0 | | 10.0 **10.0**act-quant | 10.0 | | 10.0 **10.0**oracle | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**found | 10.0 | | 10.0 **10.0**to
+disagree | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**GPU | 10.0 | | 10.0 **10.0**kernel | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**max_abs | 10.0 | | 10.0 **10.0**0.25 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**mean_rel | 10.0 | | 10.0 **10.0**2.2e-3 | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0****contradicting
+Gate | 10.0 | | 10.0 **10.0**2**, | 10.0 | | 10.0 **10.0**which | 10.0 | | 10.0 **10.0**had | 10.0 | | 10.0 **10.0**certified | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**pair | 10.0 | | 10.0 **10.0**bit-exact.
 
-Root cause was an implicit input-domain contract, not a kernel bug.
-`kernel.py:41-102` declares `in_dtype = BF16` and the GPU kernel reads a BF16
-buffer, but the host oracle accepted f32 and computed `amax` at full precision.
-When an f32 amax sits just above a power-of-two boundary of `amax/448` and BF16
-rounds it back onto the boundary, `fast_log2_ceil` differs by one and the scale
-differs by exactly 2x:
+Root | 10.0 | | 10.0 **10.0**cause | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**implicit | 10.0 | | 10.0 **10.0**input-domain | 10.0 | | 10.0 **10.0**contract, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**kernel | 10.0 | | 10.0 **10.0**bug.
+`kernel.py:41-102` | 10.0 | | 10.0 **10.0**declares | 10.0 | | 10.0 **10.0**`in_dtype | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**BF16` | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**GPU | 10.0 | | 10.0 **10.0**kernel | 10.0 | | 10.0 **10.0**reads | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**BF16
+buffer, | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**host | 10.0 | | 10.0 **10.0**oracle | 10.0 | | 10.0 **10.0**accepted | 10.0 | | 10.0 **10.0**f32 | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**computed | 10.0 | | 10.0 **10.0**`amax` | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**full | 10.0 | | 10.0 **10.0**precision.
+When | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**f32 | 10.0 | | 10.0 **10.0**amax | 10.0 | | 10.0 **10.0**sits | 10.0 | | 10.0 **10.0**just | 10.0 | | 10.0 **10.0**above | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**power-of-two | 10.0 | | 10.0 **10.0**boundary | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**`amax/448` | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**BF16
+rounds | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**back | 10.0 | | 10.0 **10.0**onto | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**boundary, | 10.0 | | 10.0 **10.0**`fast_log2_ceil` | 10.0 | | 10.0 **10.0**differs | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**scale
+differs | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**exactly | 10.0 | | 10.0 **10.0**2x:
 
-| | amax | amax/448 | `fast_log2_ceil` | scale |
+| | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**amax | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**amax/448 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`fast_log2_ceil` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**scale | 10.0 | | 10.0 **10.0**|
 |---|---:|---:|---:|---:|
-| f32 | 224.4 | 0.500892 | 0 | 1.0 |
-| BF16 | 224.0 | 0.5 exactly | -1 | 0.5 |
+| | 10.0 | | 10.0 **10.0**f32 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**224.4 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.500892 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1.0 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**BF16 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**224.0 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.5 | 10.0 | | 10.0 **10.0**exactly | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**-1 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.5 | 10.0 | | 10.0 **10.0**|
 
-Sparse groups, large absolute error — exactly the observed signature. The host
-oracles now round to BF16 internally (idempotent), so the misuse is impossible
-rather than merely documented. The GPU kernel was correct and is unchanged.
-Gate 2 re-run: **14/14**, including a new case driven by full-f32 near-boundary
-values that fails without the fix. Gate 3 and Gate 4 conclusions hold — both
-already staged BF16-rounded activations.
+Sparse | 10.0 | | 10.0 **10.0**groups, | 10.0 | | 10.0 **10.0**large | 10.0 | | 10.0 **10.0**absolute | 10.0 | | 10.0 **10.0**error | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**exactly | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**observed | 10.0 | | 10.0 **10.0**signature. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**host
+oracles | 10.0 | | 10.0 **10.0**now | 10.0 | | 10.0 **10.0**round | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**BF16 | 10.0 | | 10.0 **10.0**internally | 10.0 | | 10.0 **10.0**(idempotent), | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**misuse | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**impossible
+rather | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**merely | 10.0 | | 10.0 **10.0**documented. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**GPU | 10.0 | | 10.0 **10.0**kernel | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**correct | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**unchanged.
+Gate | 10.0 | | 10.0 **10.0**2 | 10.0 | | 10.0 **10.0**re-run: | 10.0 | | 10.0 **10.0****14/14**, | 10.0 | | 10.0 **10.0**including | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**new | 10.0 | | 10.0 **10.0**case | 10.0 | | 10.0 **10.0**driven | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**full-f32 | 10.0 | | 10.0 **10.0**near-boundary
+values | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**fails | 10.0 | | 10.0 **10.0**without | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**fix. | 10.0 | | 10.0 **10.0**Gate | 10.0 | | 10.0 **10.0**3 | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**Gate | 10.0 | | 10.0 **10.0**4 | 10.0 | | 10.0 **10.0**conclusions | 10.0 | | 10.0 **10.0**hold | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**both
+already | 10.0 | | 10.0 **10.0**staged | 10.0 | | 10.0 **10.0**BF16-rounded | 10.0 | | 10.0 **10.0**activations.
 
-Lesson for the remaining gates, alongside the `err_ref > 0` rule from Gate 3:
-**an oracle's input domain is part of its contract.** A CPU reference that
-silently accepts a wider type than the kernel it checks will agree on
-synthetic data and diverge on real data.
+Lesson | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**remaining | 10.0 | | 10.0 **10.0**gates, | 10.0 | | 10.0 **10.0**alongside | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**`err_ref | 10.0 | | 10.0 **10.0**> | 10.0 | | 10.0 **10.0**0` | 10.0 | | 10.0 **10.0**rule | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**Gate | 10.0 | | 10.0 **10.0**3:
+**an | 10.0 | | 10.0 **10.0**oracle's | 10.0 | | 10.0 **10.0**input | 10.0 | | 10.0 **10.0**domain | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**part | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**contract.** | 10.0 | | 10.0 **10.0**A | 10.0 | | 10.0 **10.0**CPU | 10.0 | | 10.0 **10.0**reference | 10.0 | | 10.0 **10.0**that
+silently | 10.0 | | 10.0 **10.0**accepts | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**wider | 10.0 | | 10.0 **10.0**type | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**kernel | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**checks | 10.0 | | 10.0 **10.0**will | 10.0 | | 10.0 **10.0**agree | 10.0 | | 10.0 **10.0**on
+synthetic | 10.0 | | 10.0 **10.0**data | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**diverge | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**real | 10.0 | | 10.0 **10.0**data.
 
-### Sequence-length coverage — read before trusting a gate run
+### | 10.0 | | 10.0 **10.0**Sequence-length | 10.0 | | 10.0 **10.0**coverage | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**read | 10.0 | | 10.0 **10.0**before | 10.0 | | 10.0 **10.0**trusting | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**gate | 10.0 | | 10.0 **10.0**run
 
-`compress_ratios` gives 2 layers at ratio 0, 21 at ratio 4, and 20 at ratio 128.
-The number of compress events is `floor(rows / ratio)`, so **short runs do not
-exercise the compressed path**:
+`compress_ratios` | 10.0 | | 10.0 **10.0**gives | 10.0 | | 10.0 **10.0**2 | 10.0 | | 10.0 **10.0**layers | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**ratio | 10.0 | | 10.0 **10.0**0, | 10.0 | | 10.0 **10.0**21 | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**ratio | 10.0 | | 10.0 **10.0**4, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**20 | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**ratio | 10.0 | | 10.0 **10.0**128.
+The | 10.0 | | 10.0 **10.0**number | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**compress | 10.0 | | 10.0 **10.0**events | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**`floor(rows | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**ratio)`, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0****short | 10.0 | | 10.0 **10.0**runs | 10.0 | | 10.0 **10.0**do | 10.0 | | 10.0 **10.0**not
+exercise | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**compressed | 10.0 | | 10.0 **10.0**path**:
 
-| tokens | ratio-4 windows | ratio-128 windows |
+| | 10.0 | | 10.0 **10.0**tokens | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**ratio-4 | 10.0 | | 10.0 **10.0**windows | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**ratio-128 | 10.0 | | 10.0 **10.0**windows | 10.0 | | 10.0 **10.0**|
 |---:|---:|---:|
-| 32 | 8 | **0** |
-| 256 | 64 | 2 |
-| 1024 | 256 | 8 |
+| | 10.0 | | 10.0 **10.0**32 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**8 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0****0** | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**256 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**64 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**2 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**1024 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**256 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**8 | 10.0 | | 10.0 **10.0**|
 
-Gate 5's first run at 32 tokens therefore produced zero compress events on all
-20 ratio-128 layers — 47% of the stack ran an SWA-only fallback while the gate
-reported PASS, finite and coherent. The 256-token run engages them. This is
-pinned by `parent::compressor::tests::compress_events_require_enough_rows` so
-the requirement is explicit rather than inferable from a token count.
+Gate | 10.0 | | 10.0 **10.0**5's | 10.0 | | 10.0 **10.0**first | 10.0 | | 10.0 **10.0**run | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**32 | 10.0 | | 10.0 **10.0**tokens | 10.0 | | 10.0 **10.0**therefore | 10.0 | | 10.0 **10.0**produced | 10.0 | | 10.0 **10.0**zero | 10.0 | | 10.0 **10.0**compress | 10.0 | | 10.0 **10.0**events | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**all
+20 | 10.0 | | 10.0 **10.0**ratio-128 | 10.0 | | 10.0 **10.0**layers | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**47% | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**stack | 10.0 | | 10.0 **10.0**ran | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**SWA-only | 10.0 | | 10.0 **10.0**fallback | 10.0 | | 10.0 **10.0**while | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**gate
+reported | 10.0 | | 10.0 **10.0**PASS, | 10.0 | | 10.0 **10.0**finite | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**coherent. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**256-token | 10.0 | | 10.0 **10.0**run | 10.0 | | 10.0 **10.0**engages | 10.0 | | 10.0 **10.0**them. | 10.0 | | 10.0 **10.0**This | 10.0 | | 10.0 **10.0**is
+pinned | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**`parent::compressor::tests::compress_events_require_enough_rows` | 10.0 | | 10.0 **10.0**so
+the | 10.0 | | 10.0 **10.0**requirement | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**explicit | 10.0 | | 10.0 **10.0**rather | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**inferable | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**token | 10.0 | | 10.0 **10.0**count.
 
-Residual gap: the *integrated* ratio-128 attention path has been exercised at
-256 tokens as part of the full forward, but not with per-layer instrumentation
-confirming the compressed positions were consumed. The compressor component
-itself was verified standalone on real layer 3 at 128 rows. Gate 6's 1024-token
-calibration run should carry that instrumentation.
+Residual | 10.0 | | 10.0 **10.0**gap: | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0***integrated* | 10.0 | | 10.0 **10.0**ratio-128 | 10.0 | | 10.0 **10.0**attention | 10.0 | | 10.0 **10.0**path | 10.0 | | 10.0 **10.0**has | 10.0 | | 10.0 **10.0**been | 10.0 | | 10.0 **10.0**exercised | 10.0 | | 10.0 **10.0**at
+256 | 10.0 | | 10.0 **10.0**tokens | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**part | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**full | 10.0 | | 10.0 **10.0**forward, | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**per-layer | 10.0 | | 10.0 **10.0**instrumentation
+confirming | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**compressed | 10.0 | | 10.0 **10.0**positions | 10.0 | | 10.0 **10.0**were | 10.0 | | 10.0 **10.0**consumed. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**compressor | 10.0 | | 10.0 **10.0**component
+itself | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**verified | 10.0 | | 10.0 **10.0**standalone | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**real | 10.0 | | 10.0 **10.0**layer | 10.0 | | 10.0 **10.0**3 | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**128 | 10.0 | | 10.0 **10.0**rows. | 10.0 | | 10.0 **10.0**Gate | 10.0 | | 10.0 **10.0**6's | 10.0 | | 10.0 **10.0**1024-token
+calibration | 10.0 | | 10.0 **10.0**run | 10.0 | | 10.0 **10.0**should | 10.0 | | 10.0 **10.0**carry | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**instrumentation.
 
-### Which quantized artifacts Gate 6 may compare against
+### | 10.0 | | 10.0 **10.0**Which | 10.0 | | 10.0 **10.0**quantized | 10.0 | | 10.0 **10.0**artifacts | 10.0 | | 10.0 **10.0**Gate | 10.0 | | 10.0 **10.0**6 | 10.0 | | 10.0 **10.0**may | 10.0 | | 10.0 **10.0**compare | 10.0 | | 10.0 **10.0**against
 
-There are **two generations** of DS4 quants on `mi300x` and they are easy to
-confuse: same recipes, near-identical file sizes, different base checkpoints.
-A KLD against the wrong generation measures the difference between two
-*models*, not between a model and its quantization, and is meaningless.
+There | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0****two | 10.0 | | 10.0 **10.0**generations** | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**DS4 | 10.0 | | 10.0 **10.0**quants | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**`mi300x` | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**they | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**easy | 10.0 | | 10.0 **10.0**to
+confuse: | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**recipes, | 10.0 | | 10.0 **10.0**near-identical | 10.0 | | 10.0 **10.0**file | 10.0 | | 10.0 **10.0**sizes, | 10.0 | | 10.0 **10.0**different | 10.0 | | 10.0 **10.0**base | 10.0 | | 10.0 **10.0**checkpoints.
+A | 10.0 | | 10.0 **10.0**KLD | 10.0 | | 10.0 **10.0**against | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**wrong | 10.0 | | 10.0 **10.0**generation | 10.0 | | 10.0 **10.0**measures | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**difference | 10.0 | | 10.0 **10.0**between | 10.0 | | 10.0 **10.0**two
+*models*, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**between | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**quantization, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**meaningless.
 
-**Eligible for Gate 6 — derived from the 0731 parent:**
+**Eligible | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**Gate | 10.0 | | 10.0 **10.0**6 | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**derived | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**0731 | 10.0 | | 10.0 **10.0**parent:**
 
-| path | bytes | sha256 |
+| | 10.0 | | 10.0 **10.0**path | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**bytes | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**sha256 | 10.0 | | 10.0 **10.0**|
 |---|---:|---|
-| `quantization/deepseek-v4-flash-0731-mq2r-p3/artifacts/deepseek-v4-flash-0731.mq2r` | 82,191,359,851 | `cbf2bbcf…9318cce` |
-| `quantization/deepseek-v4-flash-0731-mq2lloyd/artifacts/deepseek-v4-flash-0731.mq2lloyd` | 86,184,307,563 | see `identity/artifacts.sha256` |
+| | 10.0 | | 10.0 **10.0**`quantization/deepseek-v4-flash-0731-mq2r-p3/artifacts/deepseek-v4-flash-0731.mq2r` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**82,191,359,851 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`cbf2bbcf…9318cce` | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**`quantization/deepseek-v4-flash-0731-mq2lloyd/artifacts/deepseek-v4-flash-0731.mq2lloyd` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**86,184,307,563 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**see | 10.0 | | 10.0 **10.0**`identity/artifacts.sha256` | 10.0 | | 10.0 **10.0**|
 
-The MQ2R sha256 matches the pin recorded above for the rejected Hessian
-capture, which confirms it is the same P3 artifact. Both directories carry an
-`identity/` tree (`artifacts.sha256`, `engine-fingerprint.json`,
-`trunk-census.txt`, `qt35-actual.tsv`) — use it, do not re-derive provenance.
+The | 10.0 | | 10.0 **10.0**MQ2R | 10.0 | | 10.0 **10.0**sha256 | 10.0 | | 10.0 **10.0**matches | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**pin | 10.0 | | 10.0 **10.0**recorded | 10.0 | | 10.0 **10.0**above | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**rejected | 10.0 | | 10.0 **10.0**Hessian
+capture, | 10.0 | | 10.0 **10.0**which | 10.0 | | 10.0 **10.0**confirms | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**P3 | 10.0 | | 10.0 **10.0**artifact. | 10.0 | | 10.0 **10.0**Both | 10.0 | | 10.0 **10.0**directories | 10.0 | | 10.0 **10.0**carry | 10.0 | | 10.0 **10.0**an
+`identity/` | 10.0 | | 10.0 **10.0**tree | 10.0 | | 10.0 **10.0**(`artifacts.sha256`, | 10.0 | | 10.0 **10.0**`engine-fingerprint.json`,
+`trunk-census.txt`, | 10.0 | | 10.0 **10.0**`qt35-actual.tsv`) | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**use | 10.0 | | 10.0 **10.0**it, | 10.0 | | 10.0 **10.0**do | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**re-derive | 10.0 | | 10.0 **10.0**provenance.
 
-**NOT eligible — quants of the pre-0731 base:**
+**NOT | 10.0 | | 10.0 **10.0**eligible | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**quants | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**pre-0731 | 10.0 | | 10.0 **10.0**base:**
 
-| path | bytes | date |
+| | 10.0 | | 10.0 **10.0**path | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**bytes | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**date | 10.0 | | 10.0 **10.0**|
 |---|---:|---|
-| `models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r` | 82,191,362,222 | 2026-07-24 |
-| `models/existing-deepseek-v4-flash/deepseek-v4-flash.mq2lloyd` | 86,184,307,283 | 2026-05-27 |
+| | 10.0 | | 10.0 **10.0**`models/deepseek-v4-flash-mq2r/deepseek-v4-flash.mq2r` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**82,191,362,222 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**2026-07-24 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**`models/existing-deepseek-v4-flash/deepseek-v4-flash.mq2lloyd` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**86,184,307,283 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**2026-05-27 | 10.0 | | 10.0 **10.0**|
 
-Note the MQ2R pair differs by only **2,371 bytes** and the MQ2-Lloyd pair by
-**280**. Size is not a discriminator here; only the hash and the path are.
+Note | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**MQ2R | 10.0 | | 10.0 **10.0**pair | 10.0 | | 10.0 **10.0**differs | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0****2,371 | 10.0 | | 10.0 **10.0**bytes** | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**MQ2-Lloyd | 10.0 | | 10.0 **10.0**pair | 10.0 | | 10.0 **10.0**by
+**280**. | 10.0 | | 10.0 **10.0**Size | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**discriminator | 10.0 | | 10.0 **10.0**here; | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**hash | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**path | 10.0 | | 10.0 **10.0**are.
 
-> The `route_scale` perplexity numbers recorded earlier in this document
-> (1.5 → 7.0131, 2.2 → 6.0804 at ctx256) were measured on the **Jul 24
-> pre-0731** MQ2R. They are a valid statement about that artifact and about
-> the routed-vs-shared gain in general, but they are **not** a statement about
-> the 0731 artifact and must not be cited as one. This was caught by asking
-> the obvious provenance question about a file that had simply been assumed
-> current — the same failure mode, one level up, that this whole document
-> exists to prevent. Provenance discipline applies to what you compare
-> against, not only to the thing under test.
+> | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**`route_scale` | 10.0 | | 10.0 **10.0**perplexity | 10.0 | | 10.0 **10.0**numbers | 10.0 | | 10.0 **10.0**recorded | 10.0 | | 10.0 **10.0**earlier | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**document
+> | 10.0 | | 10.0 **10.0**(1.5 | 10.0 | | 10.0 **10.0**→ | 10.0 | | 10.0 **10.0**7.0131, | 10.0 | | 10.0 **10.0**2.2 | 10.0 | | 10.0 **10.0**→ | 10.0 | | 10.0 **10.0**6.0804 | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**ctx256) | 10.0 | | 10.0 **10.0**were | 10.0 | | 10.0 **10.0**measured | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0****Jul | 10.0 | | 10.0 **10.0**24
+> | 10.0 | | 10.0 **10.0**pre-0731** | 10.0 | | 10.0 **10.0**MQ2R. | 10.0 | | 10.0 **10.0**They | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**valid | 10.0 | | 10.0 **10.0**statement | 10.0 | | 10.0 **10.0**about | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**artifact | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**about
+> | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**routed-vs-shared | 10.0 | | 10.0 **10.0**gain | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**general, | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**they | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0****not** | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**statement | 10.0 | | 10.0 **10.0**about
+> | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**0731 | 10.0 | | 10.0 **10.0**artifact | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**must | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**be | 10.0 | | 10.0 **10.0**cited | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**one. | 10.0 | | 10.0 **10.0**This | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**caught | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**asking
+> | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**obvious | 10.0 | | 10.0 **10.0**provenance | 10.0 | | 10.0 **10.0**question | 10.0 | | 10.0 **10.0**about | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**file | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**had | 10.0 | | 10.0 **10.0**simply | 10.0 | | 10.0 **10.0**been | 10.0 | | 10.0 **10.0**assumed
+> | 10.0 | | 10.0 **10.0**current | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**failure | 10.0 | | 10.0 **10.0**mode, | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**level | 10.0 | | 10.0 **10.0**up, | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**whole | 10.0 | | 10.0 **10.0**document
+> | 10.0 | | 10.0 **10.0**exists | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**prevent. | 10.0 | | 10.0 **10.0**Provenance | 10.0 | | 10.0 **10.0**discipline | 10.0 | | 10.0 **10.0**applies | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**what | 10.0 | | 10.0 **10.0**you | 10.0 | | 10.0 **10.0**compare
+> | 10.0 | | 10.0 **10.0**against, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**thing | 10.0 | | 10.0 **10.0**under | 10.0 | | 10.0 **10.0**test.
 
-### Quant-tier structure (identical across both generations)
+### | 10.0 | | 10.0 **10.0**Quant-tier | 10.0 | | 10.0 **10.0**structure | 10.0 | | 10.0 **10.0**(identical | 10.0 | | 10.0 **10.0**across | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**generations)
 
-`dump_hfq_dtypes` over all four artifacts:
+`dump_hfq_dtypes` | 10.0 | | 10.0 **10.0**over | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**four | 10.0 | | 10.0 **10.0**artifacts:
 
-| tier | MQ2-Lloyd build | MQ2R build |
+| | 10.0 | | 10.0 **10.0**tier | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**MQ2-Lloyd | 10.0 | | 10.0 **10.0**build | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**MQ2R | 10.0 | | 10.0 **10.0**build | 10.0 | | 10.0 **10.0**|
 |---|---|---|
-| routed experts `ffn.experts.N.w{1,2,3}` | qt=19 MQ2-Lloyd, 33,024 tensors, 277,025,390,592 elems | **byte-identical count** |
-| shared expert `ffn.shared_experts.w{1,2,3}` | **qt=3 Q8_0** (8-bit) | **qt=35 MFP4G32E8SOA** (4-bit) |
-| router `ffn.gate.weight` | qt=3 Q8_0 | qt=35 FP4-E8 |
-| dense tier totals | 389 × qt=3, 807 × qt=1 | 554 × qt=35, 641 × qt=1 |
+| | 10.0 | | 10.0 **10.0**routed | 10.0 | | 10.0 **10.0**experts | 10.0 | | 10.0 **10.0**`ffn.experts.N.w{1,2,3}` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**qt=19 | 10.0 | | 10.0 **10.0**MQ2-Lloyd, | 10.0 | | 10.0 **10.0**33,024 | 10.0 | | 10.0 **10.0**tensors, | 10.0 | | 10.0 **10.0**277,025,390,592 | 10.0 | | 10.0 **10.0**elems | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0****byte-identical | 10.0 | | 10.0 **10.0**count** | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**shared | 10.0 | | 10.0 **10.0**expert | 10.0 | | 10.0 **10.0**`ffn.shared_experts.w{1,2,3}` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0****qt=3 | 10.0 | | 10.0 **10.0**Q8_0** | 10.0 | | 10.0 **10.0**(8-bit) | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0****qt=35 | 10.0 | | 10.0 **10.0**MFP4G32E8SOA** | 10.0 | | 10.0 **10.0**(4-bit) | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**router | 10.0 | | 10.0 **10.0**`ffn.gate.weight` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**qt=3 | 10.0 | | 10.0 **10.0**Q8_0 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**qt=35 | 10.0 | | 10.0 **10.0**FP4-E8 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**dense | 10.0 | | 10.0 **10.0**tier | 10.0 | | 10.0 **10.0**totals | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**389 | 10.0 | | 10.0 **10.0**× | 10.0 | | 10.0 **10.0**qt=3, | 10.0 | | 10.0 **10.0**807 | 10.0 | | 10.0 **10.0**× | 10.0 | | 10.0 **10.0**qt=1 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**554 | 10.0 | | 10.0 **10.0**× | 10.0 | | 10.0 **10.0**qt=35, | 10.0 | | 10.0 **10.0**641 | 10.0 | | 10.0 **10.0**× | 10.0 | | 10.0 **10.0**qt=1 | 10.0 | | 10.0 **10.0**|
 
-This is the mechanism behind the `route_scale` puzzle. `route_scale` is
-exactly the routed:shared gain
-(`y = s·⟨E_i⟩_w + E_shared(x)`, weights normalized to sum `s`). Between the
-two builds the **routed tier is unchanged and the shared tier was halved in
-precision**, so the optimal value is necessarily build-specific — a constant
-defaulted in the Q8-shared era cannot also be right for a 4-bit shared expert.
-That a *routing* constant is sensitive to which tier the *shared expert* lives
-in is strong evidence for quantization compensation rather than for a routing
-bug in hipfire, since a genuine routing bug would not care.
+This | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**mechanism | 10.0 | | 10.0 **10.0**behind | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**`route_scale` | 10.0 | | 10.0 **10.0**puzzle. | 10.0 | | 10.0 **10.0**`route_scale` | 10.0 | | 10.0 **10.0**is
+exactly | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**routed:shared | 10.0 | | 10.0 **10.0**gain
+(`y | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**s·⟨E_i⟩_w | 10.0 | | 10.0 **10.0**+ | 10.0 | | 10.0 **10.0**E_shared(x)`, | 10.0 | | 10.0 **10.0**weights | 10.0 | | 10.0 **10.0**normalized | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**sum | 10.0 | | 10.0 **10.0**`s`). | 10.0 | | 10.0 **10.0**Between | 10.0 | | 10.0 **10.0**the
+two | 10.0 | | 10.0 **10.0**builds | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0****routed | 10.0 | | 10.0 **10.0**tier | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**unchanged | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**shared | 10.0 | | 10.0 **10.0**tier | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**halved | 10.0 | | 10.0 **10.0**in
+precision**, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**optimal | 10.0 | | 10.0 **10.0**value | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**necessarily | 10.0 | | 10.0 **10.0**build-specific | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**constant
+defaulted | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**Q8-shared | 10.0 | | 10.0 **10.0**era | 10.0 | | 10.0 **10.0**cannot | 10.0 | | 10.0 **10.0**also | 10.0 | | 10.0 **10.0**be | 10.0 | | 10.0 **10.0**right | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**4-bit | 10.0 | | 10.0 **10.0**shared | 10.0 | | 10.0 **10.0**expert.
+That | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0***routing* | 10.0 | | 10.0 **10.0**constant | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**sensitive | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**which | 10.0 | | 10.0 **10.0**tier | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0***shared | 10.0 | | 10.0 **10.0**expert* | 10.0 | | 10.0 **10.0**lives
+in | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**strong | 10.0 | | 10.0 **10.0**evidence | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**quantization | 10.0 | | 10.0 **10.0**compensation | 10.0 | | 10.0 **10.0**rather | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**routing
+bug | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**hipfire, | 10.0 | | 10.0 **10.0**since | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**genuine | 10.0 | | 10.0 **10.0**routing | 10.0 | | 10.0 **10.0**bug | 10.0 | | 10.0 **10.0**would | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**care.
 
-Independently: the router `gate.weight` itself went Q8 → FP4, so a 4-bit
-router perturbs *which* experts are selected, not merely how much they
-contribute. Two builds are not comparable at a fixed `route_scale` for that
-reason alone.
+Independently: | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**router | 10.0 | | 10.0 **10.0**`gate.weight` | 10.0 | | 10.0 **10.0**itself | 10.0 | | 10.0 **10.0**went | 10.0 | | 10.0 **10.0**Q8 | 10.0 | | 10.0 **10.0**→ | 10.0 | | 10.0 **10.0**FP4, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**4-bit
+router | 10.0 | | 10.0 **10.0**perturbs | 10.0 | | 10.0 **10.0***which* | 10.0 | | 10.0 **10.0**experts | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**selected, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**merely | 10.0 | | 10.0 **10.0**how | 10.0 | | 10.0 **10.0**much | 10.0 | | 10.0 **10.0**they
+contribute. | 10.0 | | 10.0 **10.0**Two | 10.0 | | 10.0 **10.0**builds | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**comparable | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**fixed | 10.0 | | 10.0 **10.0**`route_scale` | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**that
+reason | 10.0 | | 10.0 **10.0**alone.
 
-### route_scale sweep on the 0731 MQ2R (standalone PPL)
+### | 10.0 | | 10.0 **10.0**route_scale | 10.0 | | 10.0 **10.0**sweep | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**0731 | 10.0 | | 10.0 **10.0**MQ2R | 10.0 | | 10.0 **10.0**(standalone | 10.0 | | 10.0 **10.0**PPL)
 
-`deepseek4_perplexity`, ctx 256 / warmup 8 / offset 0, wikitext2 slice md5
-`83b0205a304bf4e52172ecdb05f2e895`, fresh process per point, target verified
-by sha256 against `cbf2bbcf…9318cce` before the sweep ran:
+`deepseek4_perplexity`, | 10.0 | | 10.0 **10.0**ctx | 10.0 | | 10.0 **10.0**256 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**warmup | 10.0 | | 10.0 **10.0**8 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**offset | 10.0 | | 10.0 **10.0**0, | 10.0 | | 10.0 **10.0**wikitext2 | 10.0 | | 10.0 **10.0**slice | 10.0 | | 10.0 **10.0**md5
+`83b0205a304bf4e52172ecdb05f2e895`, | 10.0 | | 10.0 **10.0**fresh | 10.0 | | 10.0 **10.0**process | 10.0 | | 10.0 **10.0**per | 10.0 | | 10.0 **10.0**point, | 10.0 | | 10.0 **10.0**target | 10.0 | | 10.0 **10.0**verified
+by | 10.0 | | 10.0 **10.0**sha256 | 10.0 | | 10.0 **10.0**against | 10.0 | | 10.0 **10.0**`cbf2bbcf…9318cce` | 10.0 | | 10.0 **10.0**before | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**sweep | 10.0 | | 10.0 **10.0**ran:
 
-| route_scale | 1.2 | 1.5 | 1.8 | **2.0** | 2.2 | 2.4 | 2.6 |
+| | 10.0 | | 10.0 **10.0**route_scale | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1.2 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1.5 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1.8 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0****2.0** | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**2.2 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**2.4 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**2.6 | 10.0 | | 10.0 **10.0**|
 |---|---:|---:|---:|---:|---:|---:|---:|
-| PPL | 15.59 | 9.13 | 6.63 | **6.03** | 6.84 | 7.30 | 7.90 |
+| | 10.0 | | 10.0 **10.0**PPL | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**15.59 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**9.13 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**6.63 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0****6.03** | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**6.84 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**7.30 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**7.90 | 10.0 | | 10.0 **10.0**|
 
-A sharp, unambiguous minimum at **2.0**, monotone on both sides. Three things
+A | 10.0 | | 10.0 **10.0**sharp, | 10.0 | | 10.0 **10.0**unambiguous | 10.0 | | 10.0 **10.0**minimum | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0****2.0**, | 10.0 | | 10.0 **10.0**monotone | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**sides. | 10.0 | | 10.0 **10.0**Three | 10.0 | | 10.0 **10.0**things
 follow.
 
-First, **the optimum is build-specific.** The pre-0731 MQ2R measured earlier
-gave 7.01 at 1.5 and 6.08 at 2.2; the 0731 build gives 9.13 at 1.5 and 6.84 at
-2.2. Same recipe, different base weights, materially different curve. Neither
-the hardcoded 2.2 nor the checkpoint's 1.5 is the optimum for this artifact.
+First, | 10.0 | | 10.0 **10.0****the | 10.0 | | 10.0 **10.0**optimum | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**build-specific.** | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**pre-0731 | 10.0 | | 10.0 **10.0**MQ2R | 10.0 | | 10.0 **10.0**measured | 10.0 | | 10.0 **10.0**earlier
+gave | 10.0 | | 10.0 **10.0**7.01 | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**1.5 | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**6.08 | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**2.2; | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**0731 | 10.0 | | 10.0 **10.0**build | 10.0 | | 10.0 **10.0**gives | 10.0 | | 10.0 **10.0**9.13 | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**1.5 | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**6.84 | 10.0 | | 10.0 **10.0**at
+2.2. | 10.0 | | 10.0 **10.0**Same | 10.0 | | 10.0 **10.0**recipe, | 10.0 | | 10.0 **10.0**different | 10.0 | | 10.0 **10.0**base | 10.0 | | 10.0 **10.0**weights, | 10.0 | | 10.0 **10.0**materially | 10.0 | | 10.0 **10.0**different | 10.0 | | 10.0 **10.0**curve. | 10.0 | | 10.0 **10.0**Neither
+the | 10.0 | | 10.0 **10.0**hardcoded | 10.0 | | 10.0 **10.0**2.2 | 10.0 | | 10.0 **10.0**nor | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**checkpoint's | 10.0 | | 10.0 **10.0**1.5 | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**optimum | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**artifact.
 
-Second, **the compensation is large.** At the checkpoint's declared 1.5 the
-0731 MQ2R scores 9.13 against 6.03 at its optimum — a 51% PPL penalty. A
-routed:shared gain that has to move this far to recover quality is strong
-evidence that MQ2 expert quantization is losing substantial routed-expert
-magnitude, i.e. the constant is compensating for a quantization defect rather
-than expressing a model property.
+Second, | 10.0 | | 10.0 **10.0****the | 10.0 | | 10.0 **10.0**compensation | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**large.** | 10.0 | | 10.0 **10.0**At | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**checkpoint's | 10.0 | | 10.0 **10.0**declared | 10.0 | | 10.0 **10.0**1.5 | 10.0 | | 10.0 **10.0**the
+0731 | 10.0 | | 10.0 **10.0**MQ2R | 10.0 | | 10.0 **10.0**scores | 10.0 | | 10.0 **10.0**9.13 | 10.0 | | 10.0 **10.0**against | 10.0 | | 10.0 **10.0**6.03 | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**optimum | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**51% | 10.0 | | 10.0 **10.0**PPL | 10.0 | | 10.0 **10.0**penalty. | 10.0 | | 10.0 **10.0**A
+routed:shared | 10.0 | | 10.0 **10.0**gain | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**has | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**move | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**far | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**recover | 10.0 | | 10.0 **10.0**quality | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**strong
+evidence | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**MQ2 | 10.0 | | 10.0 **10.0**expert | 10.0 | | 10.0 **10.0**quantization | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**losing | 10.0 | | 10.0 **10.0**substantial | 10.0 | | 10.0 **10.0**routed-expert
+magnitude, | 10.0 | | 10.0 **10.0**i.e. | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**constant | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**compensating | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**quantization | 10.0 | | 10.0 **10.0**defect | 10.0 | | 10.0 **10.0**rather
+than | 10.0 | | 10.0 **10.0**expressing | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**property.
 
-Third, and this is the actionable one: **the real fix is at quantization
-time.** `route_scale` is a single scalar applied uniformly to the routed
-branch. If the underlying problem is per-expert magnitude loss, recovering it
-in the quantizer would let 1.5 be both correct and better, and would remove a
-per-artifact tuning knob from the serving path entirely.
+Third, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**actionable | 10.0 | | 10.0 **10.0**one: | 10.0 | | 10.0 **10.0****the | 10.0 | | 10.0 **10.0**real | 10.0 | | 10.0 **10.0**fix | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**quantization
+time.** | 10.0 | | 10.0 **10.0**`route_scale` | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**single | 10.0 | | 10.0 **10.0**scalar | 10.0 | | 10.0 **10.0**applied | 10.0 | | 10.0 **10.0**uniformly | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**routed
+branch. | 10.0 | | 10.0 **10.0**If | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**underlying | 10.0 | | 10.0 **10.0**problem | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**per-expert | 10.0 | | 10.0 **10.0**magnitude | 10.0 | | 10.0 **10.0**loss, | 10.0 | | 10.0 **10.0**recovering | 10.0 | | 10.0 **10.0**it
+in | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**quantizer | 10.0 | | 10.0 **10.0**would | 10.0 | | 10.0 **10.0**let | 10.0 | | 10.0 **10.0**1.5 | 10.0 | | 10.0 **10.0**be | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**correct | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**better, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**would | 10.0 | | 10.0 **10.0**remove | 10.0 | | 10.0 **10.0**a
+per-artifact | 10.0 | | 10.0 **10.0**tuning | 10.0 | | 10.0 **10.0**knob | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**serving | 10.0 | | 10.0 **10.0**path | 10.0 | | 10.0 **10.0**entirely.
 
-> This is standalone PPL and is a **bracket only**. The Gate 6 objective is
-> minimum **KLD against the parent**, a different criterion: PPL rewards a
-> quantized model for being confidently right on the corpus, whereas KLD
-> rewards it for matching the teacher's distribution including where the
-> teacher is uncertain. Expect the KLD optimum near but not necessarily at
-> 2.0, and report both.
+> | 10.0 | | 10.0 **10.0**This | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**standalone | 10.0 | | 10.0 **10.0**PPL | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0****bracket | 10.0 | | 10.0 **10.0**only**. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**Gate | 10.0 | | 10.0 **10.0**6 | 10.0 | | 10.0 **10.0**objective | 10.0 | | 10.0 **10.0**is
+> | 10.0 | | 10.0 **10.0**minimum | 10.0 | | 10.0 **10.0****KLD | 10.0 | | 10.0 **10.0**against | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**parent**, | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**different | 10.0 | | 10.0 **10.0**criterion: | 10.0 | | 10.0 **10.0**PPL | 10.0 | | 10.0 **10.0**rewards | 10.0 | | 10.0 **10.0**a
+> | 10.0 | | 10.0 **10.0**quantized | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**being | 10.0 | | 10.0 **10.0**confidently | 10.0 | | 10.0 **10.0**right | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**corpus, | 10.0 | | 10.0 **10.0**whereas | 10.0 | | 10.0 **10.0**KLD
+> | 10.0 | | 10.0 **10.0**rewards | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**matching | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**teacher's | 10.0 | | 10.0 **10.0**distribution | 10.0 | | 10.0 **10.0**including | 10.0 | | 10.0 **10.0**where | 10.0 | | 10.0 **10.0**the
+> | 10.0 | | 10.0 **10.0**teacher | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**uncertain. | 10.0 | | 10.0 **10.0**Expect | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**KLD | 10.0 | | 10.0 **10.0**optimum | 10.0 | | 10.0 **10.0**near | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**necessarily | 10.0 | | 10.0 **10.0**at
+> | 10.0 | | 10.0 **10.0**2.0, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**report | 10.0 | | 10.0 **10.0**both.
 
-### Gate 6 in progress — the parent forward is wrong at long sequence
+### | 10.0 | | 10.0 **10.0**Gate | 10.0 | | 10.0 **10.0**6 | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**progress | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**forward | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**wrong | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**long | 10.0 | | 10.0 **10.0**sequence
 
-Gate 6's first real measurement did exactly what a gate is for: it falsified
-something Gate 5 had passed.
+Gate | 10.0 | | 10.0 **10.0**6's | 10.0 | | 10.0 **10.0**first | 10.0 | | 10.0 **10.0**real | 10.0 | | 10.0 **10.0**measurement | 10.0 | | 10.0 **10.0**did | 10.0 | | 10.0 **10.0**exactly | 10.0 | | 10.0 **10.0**what | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**gate | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**for: | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**falsified
+something | 10.0 | | 10.0 **10.0**Gate | 10.0 | | 10.0 **10.0**5 | 10.0 | | 10.0 **10.0**had | 10.0 | | 10.0 **10.0**passed.
 
-**Infrastructure landed.** `ds4_tokenize_corpus` pins a real corpus to a
-byte-identical token-id file that every run consumes, so no producer
-re-tokenizes. `ds4_quant_plog` captures an HFQ model's logits into the same
-`HFPLOG01` container as the parent and **requires** `--expect-sha256`, refusing
-to load an artifact whose hash does not match. All three 1024-token captures
-live under
+**Infrastructure | 10.0 | | 10.0 **10.0**landed.** | 10.0 | | 10.0 **10.0**`ds4_tokenize_corpus` | 10.0 | | 10.0 **10.0**pins | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**real | 10.0 | | 10.0 **10.0**corpus | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**a
+byte-identical | 10.0 | | 10.0 **10.0**token-id | 10.0 | | 10.0 **10.0**file | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**every | 10.0 | | 10.0 **10.0**run | 10.0 | | 10.0 **10.0**consumes, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**producer
+re-tokenizes. | 10.0 | | 10.0 **10.0**`ds4_quant_plog` | 10.0 | | 10.0 **10.0**captures | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**HFQ | 10.0 | | 10.0 **10.0**model's | 10.0 | | 10.0 **10.0**logits | 10.0 | | 10.0 **10.0**into | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same
+`HFPLOG01` | 10.0 | | 10.0 **10.0**container | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0****requires** | 10.0 | | 10.0 **10.0**`--expect-sha256`, | 10.0 | | 10.0 **10.0**refusing
+to | 10.0 | | 10.0 **10.0**load | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**artifact | 10.0 | | 10.0 **10.0**whose | 10.0 | | 10.0 **10.0**hash | 10.0 | | 10.0 **10.0**does | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**match. | 10.0 | | 10.0 **10.0**All | 10.0 | | 10.0 **10.0**three | 10.0 | | 10.0 **10.0**1024-token | 10.0 | | 10.0 **10.0**captures
+live | 10.0 | | 10.0 **10.0**under
 `/mnt/scratch/quantization/deepseek-v4-flash-0731-parent-baseline/`:
 
-| file | bytes | note |
+| | 10.0 | | 10.0 **10.0**file | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**bytes | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**note | 10.0 | | 10.0 **10.0**|
 |---|---:|---|
-| `tokens.bin` | 4,096 | 1024 ids, sha256 `48b0f834…5bb86dd`, from the wikitext2 slice md5 `83b0205a…` |
-| `parent_1024.plog` | 529,530,904 | batched prefill |
-| `mq2r_1024.plog` | 529,530,904 | sha256-verified `cbf2bbcf…9318cce` |
-| `mq2lloyd_1024.plog` | 529,530,904 | sha256-verified `a6195336…` |
+| | 10.0 | | 10.0 **10.0**`tokens.bin` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**4,096 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1024 | 10.0 | | 10.0 **10.0**ids, | 10.0 | | 10.0 **10.0**sha256 | 10.0 | | 10.0 **10.0**`48b0f834…5bb86dd`, | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**wikitext2 | 10.0 | | 10.0 **10.0**slice | 10.0 | | 10.0 **10.0**md5 | 10.0 | | 10.0 **10.0**`83b0205a…` | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**`parent_1024.plog` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**529,530,904 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**batched | 10.0 | | 10.0 **10.0**prefill | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**`mq2r_1024.plog` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**529,530,904 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**sha256-verified | 10.0 | | 10.0 **10.0**`cbf2bbcf…9318cce` | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**`mq2lloyd_1024.plog` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**529,530,904 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**sha256-verified | 10.0 | | 10.0 **10.0**`a6195336…` | 10.0 | | 10.0 **10.0**|
 
-**A comparator bug found first.** PPL came back at 5.7e6 (parent) and 1.8e6
-(MQ2R) — worse than the uniform 129,280 — while both models emitted coherent
-text. `.plog` row `t` predicts token `t+1`, but `compare()` scored row `t`
-against `token_ids[t]`. A shift scan settled it empirically:
-`argmax == token_ids[t]` in **0/48** sampled rows for both files, against
-`argmax == token_ids[t+1]` in 13/48 (parent) and 26/48 (MQ2R). The shift now
-happens inside `compare()`, same remedy as the BF16 `amax` fix — an
-interface's input convention is part of its contract. KLD never used targets
-and was unaffected.
+**A | 10.0 | | 10.0 **10.0**comparator | 10.0 | | 10.0 **10.0**bug | 10.0 | | 10.0 **10.0**found | 10.0 | | 10.0 **10.0**first.** | 10.0 | | 10.0 **10.0**PPL | 10.0 | | 10.0 **10.0**came | 10.0 | | 10.0 **10.0**back | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**5.7e6 | 10.0 | | 10.0 **10.0**(parent) | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**1.8e6
+(MQ2R) | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**worse | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**uniform | 10.0 | | 10.0 **10.0**129,280 | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**while | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**models | 10.0 | | 10.0 **10.0**emitted | 10.0 | | 10.0 **10.0**coherent
+text. | 10.0 | | 10.0 **10.0**`.plog` | 10.0 | | 10.0 **10.0**row | 10.0 | | 10.0 **10.0**`t` | 10.0 | | 10.0 **10.0**predicts | 10.0 | | 10.0 **10.0**token | 10.0 | | 10.0 **10.0**`t+1`, | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**`compare()` | 10.0 | | 10.0 **10.0**scored | 10.0 | | 10.0 **10.0**row | 10.0 | | 10.0 **10.0**`t`
+against | 10.0 | | 10.0 **10.0**`token_ids[t]`. | 10.0 | | 10.0 **10.0**A | 10.0 | | 10.0 **10.0**shift | 10.0 | | 10.0 **10.0**scan | 10.0 | | 10.0 **10.0**settled | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**empirically:
+`argmax | 10.0 | | 10.0 **10.0**== | 10.0 | | 10.0 **10.0**token_ids[t]` | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0****0/48** | 10.0 | | 10.0 **10.0**sampled | 10.0 | | 10.0 **10.0**rows | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**files, | 10.0 | | 10.0 **10.0**against
+`argmax | 10.0 | | 10.0 **10.0**== | 10.0 | | 10.0 **10.0**token_ids[t+1]` | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**13/48 | 10.0 | | 10.0 **10.0**(parent) | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**26/48 | 10.0 | | 10.0 **10.0**(MQ2R). | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**shift | 10.0 | | 10.0 **10.0**now
+happens | 10.0 | | 10.0 **10.0**inside | 10.0 | | 10.0 **10.0**`compare()`, | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**remedy | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**BF16 | 10.0 | | 10.0 **10.0**`amax` | 10.0 | | 10.0 **10.0**fix | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**an
+interface's | 10.0 | | 10.0 **10.0**input | 10.0 | | 10.0 **10.0**convention | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**part | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**contract. | 10.0 | | 10.0 **10.0**KLD | 10.0 | | 10.0 **10.0**never | 10.0 | | 10.0 **10.0**used | 10.0 | | 10.0 **10.0**targets
+and | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**unaffected.
 
-**The real finding.** With PPL corrected:
+**The | 10.0 | | 10.0 **10.0**real | 10.0 | | 10.0 **10.0**finding.** | 10.0 | | 10.0 **10.0**With | 10.0 | | 10.0 **10.0**PPL | 10.0 | | 10.0 **10.0**corrected:
 
-| model | PPL | KLD vs parent | top-1 vs parent |
+| | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**PPL | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**KLD | 10.0 | | 10.0 **10.0**vs | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**top-1 | 10.0 | | 10.0 **10.0**vs | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**|
 |---|---:|---:|---:|
-| parent | **163.89** | — | — |
-| MQ2R | 14.70 | 7.676 | 0.3008 |
-| MQ2-Lloyd | 14.56 | 7.659 | 0.3008 |
+| | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0****163.89** | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**MQ2R | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**14.70 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**7.676 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.3008 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**MQ2-Lloyd | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**14.56 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**7.659 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.3008 | 10.0 | | 10.0 **10.0**|
 
-**The parent is 11x worse than its own 2-bit quantization.** That is not
-possible for a correct teacher.
+**The | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**11x | 10.0 | | 10.0 **10.0**worse | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**own | 10.0 | | 10.0 **10.0**2-bit | 10.0 | | 10.0 **10.0**quantization.** | 10.0 | | 10.0 **10.0**That | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**not
+possible | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**correct | 10.0 | | 10.0 **10.0**teacher.
 
-Triangulation makes it conclusive. Comparing the two quantized artifacts
-**against each other** — different recipes, one with a Q8 shared tier and one
-with FP4-E8 — gives KLD **0.102**, top-1 **0.873**, p95 0.373. Two independent
-quantizations converge; the parent diverges from both by the same amount, to
-six digits of identical top-1 (308/1024). The parent is the outlier, which
-also means the production DS4 path is fine and the defect is in the parent
-code written this session.
+Triangulation | 10.0 | | 10.0 **10.0**makes | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**conclusive. | 10.0 | | 10.0 **10.0**Comparing | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**two | 10.0 | | 10.0 **10.0**quantized | 10.0 | | 10.0 **10.0**artifacts
+**against | 10.0 | | 10.0 **10.0**each | 10.0 | | 10.0 **10.0**other** | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**different | 10.0 | | 10.0 **10.0**recipes, | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**Q8 | 10.0 | | 10.0 **10.0**shared | 10.0 | | 10.0 **10.0**tier | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**one
+with | 10.0 | | 10.0 **10.0**FP4-E8 | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**gives | 10.0 | | 10.0 **10.0**KLD | 10.0 | | 10.0 **10.0****0.102**, | 10.0 | | 10.0 **10.0**top-1 | 10.0 | | 10.0 **10.0****0.873**, | 10.0 | | 10.0 **10.0**p95 | 10.0 | | 10.0 **10.0**0.373. | 10.0 | | 10.0 **10.0**Two | 10.0 | | 10.0 **10.0**independent
+quantizations | 10.0 | | 10.0 **10.0**converge; | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**diverges | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**amount, | 10.0 | | 10.0 **10.0**to
+six | 10.0 | | 10.0 **10.0**digits | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**identical | 10.0 | | 10.0 **10.0**top-1 | 10.0 | | 10.0 **10.0**(308/1024). | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**outlier, | 10.0 | | 10.0 **10.0**which
+also | 10.0 | | 10.0 **10.0**means | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**production | 10.0 | | 10.0 **10.0**DS4 | 10.0 | | 10.0 **10.0**path | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**fine | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**defect | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**parent
+code | 10.0 | | 10.0 **10.0**written | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**session.
 
-Accuracy by position, identical tokens for all three:
+Accuracy | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**position, | 10.0 | | 10.0 **10.0**identical | 10.0 | | 10.0 **10.0**tokens | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**three:
 
-| bucket | parent | mq2r | lloyd |
+| | 10.0 | | 10.0 **10.0**bucket | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**mq2r | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**lloyd | 10.0 | | 10.0 **10.0**|
 |---|---:|---:|---:|
-| [1,32) | 0.292 | 0.292 | 0.292 |
-| [32,64) | 0.542 | 0.625 | 0.708 |
-| [64,127) | 0.458 | 0.708 | 0.625 |
-| [128,256) | 0.458 | 0.583 | 0.583 |
-| [256,512) | 0.333 | 0.458 | 0.375 |
-| [512,1022) | **0.208** | 0.500 | 0.542 |
+| | 10.0 | | 10.0 **10.0**[1,32) | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.292 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.292 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.292 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**[32,64) | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.542 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.625 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.708 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**[64,127) | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.458 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.708 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.625 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**[128,256) | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.458 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.583 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.583 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**[256,512) | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.333 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.458 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.375 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**[512,1022) | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0****0.208** | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.500 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.542 | 10.0 | | 10.0 **10.0**|
 
-The parent decays progressively while both quants stay flat, and all three
-agree exactly at [1,32) — a clean control. There is **no break at 128**, so
-this is not the ratio-128 compressor switching on; it is cumulative in
-context length. The parent runs batched prefill while the quantized path runs
-sequential decode, so the batched SWA/compressor bookkeeping is the leading
+The | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**decays | 10.0 | | 10.0 **10.0**progressively | 10.0 | | 10.0 **10.0**while | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**quants | 10.0 | | 10.0 **10.0**stay | 10.0 | | 10.0 **10.0**flat, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**three
+agree | 10.0 | | 10.0 **10.0**exactly | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**[1,32) | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**clean | 10.0 | | 10.0 **10.0**control. | 10.0 | | 10.0 **10.0**There | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0****no | 10.0 | | 10.0 **10.0**break | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**128**, | 10.0 | | 10.0 **10.0**so
+this | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**ratio-128 | 10.0 | | 10.0 **10.0**compressor | 10.0 | | 10.0 **10.0**switching | 10.0 | | 10.0 **10.0**on; | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**cumulative | 10.0 | | 10.0 **10.0**in
+context | 10.0 | | 10.0 **10.0**length. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**runs | 10.0 | | 10.0 **10.0**batched | 10.0 | | 10.0 **10.0**prefill | 10.0 | | 10.0 **10.0**while | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**quantized | 10.0 | | 10.0 **10.0**path | 10.0 | | 10.0 **10.0**runs
+sequential | 10.0 | | 10.0 **10.0**decode, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**batched | 10.0 | | 10.0 **10.0**SWA/compressor | 10.0 | | 10.0 **10.0**bookkeeping | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**leading
 suspect.
 
-**Why Gate 5 missed it.** Gate 5 checked finiteness, in-process determinism,
-stage-norm sanity, and a **5-token** prompt. None of those exercise long
-context. Its 256-token run *did* emit gibberish on the fixed sequence, and
-that was explained away as "pseudo-random input, so a meaningless
-continuation" — a reasonable-sounding story that turned out to be covering a
-real defect. **A gate that cannot fail teaches nothing:** next-token accuracy
-against a real corpus, compared to a known-good reference, is the check that
-would have caught this on day one, and it costs one perplexity number.
+**Why | 10.0 | | 10.0 **10.0**Gate | 10.0 | | 10.0 **10.0**5 | 10.0 | | 10.0 **10.0**missed | 10.0 | | 10.0 **10.0**it.** | 10.0 | | 10.0 **10.0**Gate | 10.0 | | 10.0 **10.0**5 | 10.0 | | 10.0 **10.0**checked | 10.0 | | 10.0 **10.0**finiteness, | 10.0 | | 10.0 **10.0**in-process | 10.0 | | 10.0 **10.0**determinism,
+stage-norm | 10.0 | | 10.0 **10.0**sanity, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0****5-token** | 10.0 | | 10.0 **10.0**prompt. | 10.0 | | 10.0 **10.0**None | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**those | 10.0 | | 10.0 **10.0**exercise | 10.0 | | 10.0 **10.0**long
+context. | 10.0 | | 10.0 **10.0**Its | 10.0 | | 10.0 **10.0**256-token | 10.0 | | 10.0 **10.0**run | 10.0 | | 10.0 **10.0***did* | 10.0 | | 10.0 **10.0**emit | 10.0 | | 10.0 **10.0**gibberish | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**fixed | 10.0 | | 10.0 **10.0**sequence, | 10.0 | | 10.0 **10.0**and
+that | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**explained | 10.0 | | 10.0 **10.0**away | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**"pseudo-random | 10.0 | | 10.0 **10.0**input, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**meaningless
+continuation" | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**reasonable-sounding | 10.0 | | 10.0 **10.0**story | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**turned | 10.0 | | 10.0 **10.0**out | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**be | 10.0 | | 10.0 **10.0**covering | 10.0 | | 10.0 **10.0**a
+real | 10.0 | | 10.0 **10.0**defect. | 10.0 | | 10.0 **10.0****A | 10.0 | | 10.0 **10.0**gate | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**cannot | 10.0 | | 10.0 **10.0**fail | 10.0 | | 10.0 **10.0**teaches | 10.0 | | 10.0 **10.0**nothing:** | 10.0 | | 10.0 **10.0**next-token | 10.0 | | 10.0 **10.0**accuracy
+against | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**real | 10.0 | | 10.0 **10.0**corpus, | 10.0 | | 10.0 **10.0**compared | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**known-good | 10.0 | | 10.0 **10.0**reference, | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**check | 10.0 | | 10.0 **10.0**that
+would | 10.0 | | 10.0 **10.0**have | 10.0 | | 10.0 **10.0**caught | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**day | 10.0 | | 10.0 **10.0**one, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**costs | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**perplexity | 10.0 | | 10.0 **10.0**number.
 
-Diagnostic scripts are on the box at `/root/plog_shift_scan.py` (alignment)
-and `/root/plog_pos_scan.py` (accuracy by position); both sample rows rather
-than streaming 529 MB and run in seconds.
+Diagnostic | 10.0 | | 10.0 **10.0**scripts | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**box | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**`/root/plog_shift_scan.py` | 10.0 | | 10.0 **10.0**(alignment)
+and | 10.0 | | 10.0 **10.0**`/root/plog_pos_scan.py` | 10.0 | | 10.0 **10.0**(accuracy | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**position); | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**sample | 10.0 | | 10.0 **10.0**rows | 10.0 | | 10.0 **10.0**rather
+than | 10.0 | | 10.0 **10.0**streaming | 10.0 | | 10.0 **10.0**529 | 10.0 | | 10.0 **10.0**MB | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**run | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**seconds.
 
-> Until this is fixed, `parent_1024.plog` is **not** a baseline and no KLD
-> number derived from it means anything. The route_scale KLD optimization,
-> Gate 7 Hessians, and Gate 9 GPTQ all depend on a correct teacher and are
-> blocked behind it.
+> | 10.0 | | 10.0 **10.0**Until | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**fixed, | 10.0 | | 10.0 **10.0**`parent_1024.plog` | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0****not** | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**baseline | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**KLD
+> | 10.0 | | 10.0 **10.0**number | 10.0 | | 10.0 **10.0**derived | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**means | 10.0 | | 10.0 **10.0**anything. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**route_scale | 10.0 | | 10.0 **10.0**KLD | 10.0 | | 10.0 **10.0**optimization,
+> | 10.0 | | 10.0 **10.0**Gate | 10.0 | | 10.0 **10.0**7 | 10.0 | | 10.0 **10.0**Hessians, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**Gate | 10.0 | | 10.0 **10.0**9 | 10.0 | | 10.0 **10.0**GPTQ | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**depend | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**correct | 10.0 | | 10.0 **10.0**teacher | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**are
+> | 10.0 | | 10.0 **10.0**blocked | 10.0 | | 10.0 **10.0**behind | 10.0 | | 10.0 **10.0**it.
 
-#### Elimination ledger — what the defect is NOT
+#### | 10.0 | | 10.0 **10.0**Elimination | 10.0 | | 10.0 **10.0**ledger | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**what | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**defect | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**NOT
 
-Each closed with evidence at a realistic operating point, not by inspection.
-Recorded because the search space is large and re-treading it is the main way
-this stalls.
+Each | 10.0 | | 10.0 **10.0**closed | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**evidence | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**realistic | 10.0 | | 10.0 **10.0**operating | 10.0 | | 10.0 **10.0**point, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**inspection.
+Recorded | 10.0 | | 10.0 **10.0**because | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**search | 10.0 | | 10.0 **10.0**space | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**large | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**re-treading | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**main | 10.0 | | 10.0 **10.0**way
+this | 10.0 | | 10.0 **10.0**stalls.
 
-| hypothesis | verdict | evidence |
+| | 10.0 | | 10.0 **10.0**hypothesis | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**verdict | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**evidence | 10.0 | | 10.0 **10.0**|
 |---|---|---|
-| `.plog` row misalignment | closed | shift 0 optimal; `argmax==tok[t]` 0/48 for both files |
-| PPL scoring off-by-one | **was real, fixed** | row `t` scored against `token_ids[t]`; shift moved inside `compare()` |
-| batch size / prefill width | closed | a 128-token run **bit-matches** 1024 on every shared bucket |
-| compressed-index `offset=0` | closed | sentinel proves idx 5 → COMP 2005, never SWA 1005 |
-| wave64 `__shfl_down` width | closed | fixed defensively; recaptured plog **byte-identical** |
-| sequential decode vs batched prefill | closed | sequential slightly *worse* (0.484 vs 0.516) |
-| Hyper-Connections gain | closed | f64 oracle ~1e-7 at layers 0/5/20/40 on grown residuals; `post` mean 0.37, not saturating |
-| MoE component paths | closed | f64 oracle ~1e-7 at L5 row 0: routing exact, weight sum exactly 1.5, expert-35 5.7e-6, shared 2.9e-6 |
-| RoPE frequency tables | closed | bit-identical to f64 transcription, both policies; constants from `config.json`, not `ModelArgs` defaults |
-| RoPE table *selection* on ratio>0 | closed | GPU q vs correct YaRN oracle 1.4e-6, vs wrong plain table 21.3 |
-| ratio-0 attention | closed | f64 oracle **flat** across position (row 0 1.19e-6, row 100 1.43e-6) |
-| ratio>0 main attention | closed | same 1e-6 floor and flatness on layers 2 and 3 |
-| row 0's 6e5 residual | red herring | row 0's input direction aligns gate/up (cos 0.498 vs −0.009 isotropic); all three models agree exactly in [1,32); massive first-token activations are documented and functional |
+| | 10.0 | | 10.0 **10.0**`.plog` | 10.0 | | 10.0 **10.0**row | 10.0 | | 10.0 **10.0**misalignment | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**closed | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**shift | 10.0 | | 10.0 **10.0**0 | 10.0 | | 10.0 **10.0**optimal; | 10.0 | | 10.0 **10.0**`argmax==tok[t]` | 10.0 | | 10.0 **10.0**0/48 | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**files | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**PPL | 10.0 | | 10.0 **10.0**scoring | 10.0 | | 10.0 **10.0**off-by-one | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0****was | 10.0 | | 10.0 **10.0**real, | 10.0 | | 10.0 **10.0**fixed** | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**row | 10.0 | | 10.0 **10.0**`t` | 10.0 | | 10.0 **10.0**scored | 10.0 | | 10.0 **10.0**against | 10.0 | | 10.0 **10.0**`token_ids[t]`; | 10.0 | | 10.0 **10.0**shift | 10.0 | | 10.0 **10.0**moved | 10.0 | | 10.0 **10.0**inside | 10.0 | | 10.0 **10.0**`compare()` | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**batch | 10.0 | | 10.0 **10.0**size | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**prefill | 10.0 | | 10.0 **10.0**width | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**closed | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**128-token | 10.0 | | 10.0 **10.0**run | 10.0 | | 10.0 **10.0****bit-matches** | 10.0 | | 10.0 **10.0**1024 | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**every | 10.0 | | 10.0 **10.0**shared | 10.0 | | 10.0 **10.0**bucket | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**compressed-index | 10.0 | | 10.0 **10.0**`offset=0` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**closed | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**sentinel | 10.0 | | 10.0 **10.0**proves | 10.0 | | 10.0 **10.0**idx | 10.0 | | 10.0 **10.0**5 | 10.0 | | 10.0 **10.0**→ | 10.0 | | 10.0 **10.0**COMP | 10.0 | | 10.0 **10.0**2005, | 10.0 | | 10.0 **10.0**never | 10.0 | | 10.0 **10.0**SWA | 10.0 | | 10.0 **10.0**1005 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**wave64 | 10.0 | | 10.0 **10.0**`__shfl_down` | 10.0 | | 10.0 **10.0**width | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**closed | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**fixed | 10.0 | | 10.0 **10.0**defensively; | 10.0 | | 10.0 **10.0**recaptured | 10.0 | | 10.0 **10.0**plog | 10.0 | | 10.0 **10.0****byte-identical** | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**sequential | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**vs | 10.0 | | 10.0 **10.0**batched | 10.0 | | 10.0 **10.0**prefill | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**closed | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**sequential | 10.0 | | 10.0 **10.0**slightly | 10.0 | | 10.0 **10.0***worse* | 10.0 | | 10.0 **10.0**(0.484 | 10.0 | | 10.0 **10.0**vs | 10.0 | | 10.0 **10.0**0.516) | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**Hyper-Connections | 10.0 | | 10.0 **10.0**gain | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**closed | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**f64 | 10.0 | | 10.0 **10.0**oracle | 10.0 | | 10.0 **10.0**~1e-7 | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**layers | 10.0 | | 10.0 **10.0**0/5/20/40 | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**grown | 10.0 | | 10.0 **10.0**residuals; | 10.0 | | 10.0 **10.0**`post` | 10.0 | | 10.0 **10.0**mean | 10.0 | | 10.0 **10.0**0.37, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**saturating | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**MoE | 10.0 | | 10.0 **10.0**component | 10.0 | | 10.0 **10.0**paths | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**closed | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**f64 | 10.0 | | 10.0 **10.0**oracle | 10.0 | | 10.0 **10.0**~1e-7 | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**L5 | 10.0 | | 10.0 **10.0**row | 10.0 | | 10.0 **10.0**0: | 10.0 | | 10.0 **10.0**routing | 10.0 | | 10.0 **10.0**exact, | 10.0 | | 10.0 **10.0**weight | 10.0 | | 10.0 **10.0**sum | 10.0 | | 10.0 **10.0**exactly | 10.0 | | 10.0 **10.0**1.5, | 10.0 | | 10.0 **10.0**expert-35 | 10.0 | | 10.0 **10.0**5.7e-6, | 10.0 | | 10.0 **10.0**shared | 10.0 | | 10.0 **10.0**2.9e-6 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**RoPE | 10.0 | | 10.0 **10.0**frequency | 10.0 | | 10.0 **10.0**tables | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**closed | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**bit-identical | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**f64 | 10.0 | | 10.0 **10.0**transcription, | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**policies; | 10.0 | | 10.0 **10.0**constants | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**`config.json`, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**`ModelArgs` | 10.0 | | 10.0 **10.0**defaults | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**RoPE | 10.0 | | 10.0 **10.0**table | 10.0 | | 10.0 **10.0***selection* | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**ratio>0 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**closed | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**GPU | 10.0 | | 10.0 **10.0**q | 10.0 | | 10.0 **10.0**vs | 10.0 | | 10.0 **10.0**correct | 10.0 | | 10.0 **10.0**YaRN | 10.0 | | 10.0 **10.0**oracle | 10.0 | | 10.0 **10.0**1.4e-6, | 10.0 | | 10.0 **10.0**vs | 10.0 | | 10.0 **10.0**wrong | 10.0 | | 10.0 **10.0**plain | 10.0 | | 10.0 **10.0**table | 10.0 | | 10.0 **10.0**21.3 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**ratio-0 | 10.0 | | 10.0 **10.0**attention | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**closed | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**f64 | 10.0 | | 10.0 **10.0**oracle | 10.0 | | 10.0 **10.0****flat** | 10.0 | | 10.0 **10.0**across | 10.0 | | 10.0 **10.0**position | 10.0 | | 10.0 **10.0**(row | 10.0 | | 10.0 **10.0**0 | 10.0 | | 10.0 **10.0**1.19e-6, | 10.0 | | 10.0 **10.0**row | 10.0 | | 10.0 **10.0**100 | 10.0 | | 10.0 **10.0**1.43e-6) | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**ratio>0 | 10.0 | | 10.0 **10.0**main | 10.0 | | 10.0 **10.0**attention | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**closed | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**1e-6 | 10.0 | | 10.0 **10.0**floor | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**flatness | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**layers | 10.0 | | 10.0 **10.0**2 | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**3 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**row | 10.0 | | 10.0 **10.0**0's | 10.0 | | 10.0 **10.0**6e5 | 10.0 | | 10.0 **10.0**residual | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**red | 10.0 | | 10.0 **10.0**herring | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**row | 10.0 | | 10.0 **10.0**0's | 10.0 | | 10.0 **10.0**input | 10.0 | | 10.0 **10.0**direction | 10.0 | | 10.0 **10.0**aligns | 10.0 | | 10.0 **10.0**gate/up | 10.0 | | 10.0 **10.0**(cos | 10.0 | | 10.0 **10.0**0.498 | 10.0 | | 10.0 **10.0**vs | 10.0 | | 10.0 **10.0**−0.009 | 10.0 | | 10.0 **10.0**isotropic); | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**three | 10.0 | | 10.0 **10.0**models | 10.0 | | 10.0 **10.0**agree | 10.0 | | 10.0 **10.0**exactly | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**[1,32); | 10.0 | | 10.0 **10.0**massive | 10.0 | | 10.0 **10.0**first-token | 10.0 | | 10.0 **10.0**activations | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**documented | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**functional | 10.0 | | 10.0 **10.0**|
 
-**Two methodology notes worth more than any single elimination.**
+**Two | 10.0 | | 10.0 **10.0**methodology | 10.0 | | 10.0 **10.0**notes | 10.0 | | 10.0 **10.0**worth | 10.0 | | 10.0 **10.0**more | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**any | 10.0 | | 10.0 **10.0**single | 10.0 | | 10.0 **10.0**elimination.**
 
-*Know the oracle's arithmetic domain.* A layer bisect reported the MoE block
-diverging from an f64 reference by 6.4e-3 at layer 0 — apparently four orders
-above the 1e-6 floor every other block shows. But BF16 carries 8 significant
-bits, so its unit roundoff is `2^-8 = 3.9e-3`, and `parent_linear_expert` runs
-BF16 MFMA while HC and the norms run f32/host-f64 paths. An f64 oracle *should*
-disagree with a bf16 GEMM at ~4e-3, so the apparent signal is the same order as
-the expected floor. This is the third instance this session of the same class
-of mistake (BF16-vs-f32 `amax`, the plog target shift). **A comparison is only
-meaningful once its floor is established on a case known to be correct, or the
-oracle is domain-matched by rounding operands to bf16.**
+*Know | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**oracle's | 10.0 | | 10.0 **10.0**arithmetic | 10.0 | | 10.0 **10.0**domain.* | 10.0 | | 10.0 **10.0**A | 10.0 | | 10.0 **10.0**layer | 10.0 | | 10.0 **10.0**bisect | 10.0 | | 10.0 **10.0**reported | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**MoE | 10.0 | | 10.0 **10.0**block
+diverging | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**f64 | 10.0 | | 10.0 **10.0**reference | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**6.4e-3 | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**layer | 10.0 | | 10.0 **10.0**0 | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**apparently | 10.0 | | 10.0 **10.0**four | 10.0 | | 10.0 **10.0**orders
+above | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**1e-6 | 10.0 | | 10.0 **10.0**floor | 10.0 | | 10.0 **10.0**every | 10.0 | | 10.0 **10.0**other | 10.0 | | 10.0 **10.0**block | 10.0 | | 10.0 **10.0**shows. | 10.0 | | 10.0 **10.0**But | 10.0 | | 10.0 **10.0**BF16 | 10.0 | | 10.0 **10.0**carries | 10.0 | | 10.0 **10.0**8 | 10.0 | | 10.0 **10.0**significant
+bits, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**unit | 10.0 | | 10.0 **10.0**roundoff | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**`2^-8 | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**3.9e-3`, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**`parent_linear_expert` | 10.0 | | 10.0 **10.0**runs
+BF16 | 10.0 | | 10.0 **10.0**MFMA | 10.0 | | 10.0 **10.0**while | 10.0 | | 10.0 **10.0**HC | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**norms | 10.0 | | 10.0 **10.0**run | 10.0 | | 10.0 **10.0**f32/host-f64 | 10.0 | | 10.0 **10.0**paths. | 10.0 | | 10.0 **10.0**An | 10.0 | | 10.0 **10.0**f64 | 10.0 | | 10.0 **10.0**oracle | 10.0 | | 10.0 **10.0***should*
+disagree | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**bf16 | 10.0 | | 10.0 **10.0**GEMM | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**~4e-3, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**apparent | 10.0 | | 10.0 **10.0**signal | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**order | 10.0 | | 10.0 **10.0**as
+the | 10.0 | | 10.0 **10.0**expected | 10.0 | | 10.0 **10.0**floor. | 10.0 | | 10.0 **10.0**This | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**third | 10.0 | | 10.0 **10.0**instance | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**session | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**class
+of | 10.0 | | 10.0 **10.0**mistake | 10.0 | | 10.0 **10.0**(BF16-vs-f32 | 10.0 | | 10.0 **10.0**`amax`, | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**plog | 10.0 | | 10.0 **10.0**target | 10.0 | | 10.0 **10.0**shift). | 10.0 | | 10.0 **10.0****A | 10.0 | | 10.0 **10.0**comparison | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**only
+meaningful | 10.0 | | 10.0 **10.0**once | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**floor | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**established | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**case | 10.0 | | 10.0 **10.0**known | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**be | 10.0 | | 10.0 **10.0**correct, | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**the
+oracle | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**domain-matched | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**rounding | 10.0 | | 10.0 **10.0**operands | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**bf16.**
 
-*Beware relative error on pathological magnitudes.* The same bisect reports FFN
-divergence growing to 4e0 deep in the stack — but the residual there is ~6e5,
-and a relative metric against a huge, possibly degenerate input misleads in
-either direction.
+*Beware | 10.0 | | 10.0 **10.0**relative | 10.0 | | 10.0 **10.0**error | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**pathological | 10.0 | | 10.0 **10.0**magnitudes.* | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**bisect | 10.0 | | 10.0 **10.0**reports | 10.0 | | 10.0 **10.0**FFN
+divergence | 10.0 | | 10.0 **10.0**growing | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**4e0 | 10.0 | | 10.0 **10.0**deep | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**stack | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**residual | 10.0 | | 10.0 **10.0**there | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**~6e5,
+and | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**relative | 10.0 | | 10.0 **10.0**metric | 10.0 | | 10.0 **10.0**against | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**huge, | 10.0 | | 10.0 **10.0**possibly | 10.0 | | 10.0 **10.0**degenerate | 10.0 | | 10.0 **10.0**input | 10.0 | | 10.0 **10.0**misleads | 10.0 | | 10.0 **10.0**in
+either | 10.0 | | 10.0 **10.0**direction.
 
-bf16 also cannot explain the gap on its own: both quantized models run at bf16
-or worse and score 14.6 against the parent's 163.89.
+bf16 | 10.0 | | 10.0 **10.0**also | 10.0 | | 10.0 **10.0**cannot | 10.0 | | 10.0 **10.0**explain | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**gap | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**own: | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**quantized | 10.0 | | 10.0 **10.0**models | 10.0 | | 10.0 **10.0**run | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**bf16
+or | 10.0 | | 10.0 **10.0**worse | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**score | 10.0 | | 10.0 **10.0**14.6 | 10.0 | | 10.0 **10.0**against | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**parent's | 10.0 | | 10.0 **10.0**163.89.
 
-### Root cause found — `hc_post` contracted the wrong `comb` axis (2026-08-02)
+### | 10.0 | | 10.0 **10.0**Root | 10.0 | | 10.0 **10.0**cause | 10.0 | | 10.0 **10.0**found | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**`hc_post` | 10.0 | | 10.0 **10.0**contracted | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**wrong | 10.0 | | 10.0 **10.0**`comb` | 10.0 | | 10.0 **10.0**axis | 10.0 | | 10.0 **10.0**(2026-08-02)
 
-`Block.hc_post` contracted the wrong axis of the sinkhorn `comb` matrix.
-`model.py:692` is
-`torch.sum(comb.unsqueeze(-1) * residual.unsqueeze(-2), dim=2)`, which
-broadcasts to `comb[A,B] * residual[A,d]` and sums over `A`, the **first** hc
+`Block.hc_post` | 10.0 | | 10.0 **10.0**contracted | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**wrong | 10.0 | | 10.0 **10.0**axis | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**sinkhorn | 10.0 | | 10.0 **10.0**`comb` | 10.0 | | 10.0 **10.0**matrix.
+`model.py:692` | 10.0 | | 10.0 **10.0**is
+`torch.sum(comb.unsqueeze(-1) | 10.0 | | 10.0 **10.0*** | 10.0 | | 10.0 **10.0**residual.unsqueeze(-2), | 10.0 | | 10.0 **10.0**dim=2)`, | 10.0 | | 10.0 **10.0**which
+broadcasts | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**`comb[A,B] | 10.0 | | 10.0 **10.0*** | 10.0 | | 10.0 **10.0**residual[A,d]` | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**sums | 10.0 | | 10.0 **10.0**over | 10.0 | | 10.0 **10.0**`A`, | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0****first** | 10.0 | | 10.0 **10.0**hc
 axis:
 
 ```text
-y[B,d] = sum_A comb[A][B] * residual[A,d]
+y[B,d] | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**sum_A | 10.0 | | 10.0 **10.0**comb[A][B] | 10.0 | | 10.0 **10.0*** | 10.0 | | 10.0 **10.0**residual[A,d]
 ```
 
-`hc_mix_4stream_batched` contracts the **second** (kernel line 46,
-`A[stream_out * HC_MULT + s_in]`), so it requires `comb^T`. The parent passed
-`comb` untransposed. Production reaches the same kernel with its comb already
-in the kernel's orientation, which is why production was never affected.
+`hc_mix_4stream_batched` | 10.0 | | 10.0 **10.0**contracts | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0****second** | 10.0 | | 10.0 **10.0**(kernel | 10.0 | | 10.0 **10.0**line | 10.0 | | 10.0 **10.0**46,
+`A[stream_out | 10.0 | | 10.0 **10.0*** | 10.0 | | 10.0 **10.0**HC_MULT | 10.0 | | 10.0 **10.0**+ | 10.0 | | 10.0 **10.0**s_in]`), | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**requires | 10.0 | | 10.0 **10.0**`comb^T`. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**passed
+`comb` | 10.0 | | 10.0 **10.0**untransposed. | 10.0 | | 10.0 **10.0**Production | 10.0 | | 10.0 **10.0**reaches | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**kernel | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**comb | 10.0 | | 10.0 **10.0**already
+in | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**kernel's | 10.0 | | 10.0 **10.0**orientation, | 10.0 | | 10.0 **10.0**which | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**why | 10.0 | | 10.0 **10.0**production | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**never | 10.0 | | 10.0 **10.0**affected.
 
-The axis is load-bearing, not a naming convention: `hc_split_sinkhorn`
-(`kernel.py:401-423`) ends its loop on `comb / comb.sum(-2)`, so the **columns**
-sum to 1. Contracting `A` is norm-preserving; contracting the other axis
-weights the residual by row sums, which are not 1, and amplifies it every
+The | 10.0 | | 10.0 **10.0**axis | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**load-bearing, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**naming | 10.0 | | 10.0 **10.0**convention: | 10.0 | | 10.0 **10.0**`hc_split_sinkhorn`
+(`kernel.py:401-423`) | 10.0 | | 10.0 **10.0**ends | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**loop | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**`comb | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**comb.sum(-2)`, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0****columns**
+sum | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**1. | 10.0 | | 10.0 **10.0**Contracting | 10.0 | | 10.0 **10.0**`A` | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**norm-preserving; | 10.0 | | 10.0 **10.0**contracting | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**other | 10.0 | | 10.0 **10.0**axis
+weights | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**residual | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**row | 10.0 | | 10.0 **10.0**sums, | 10.0 | | 10.0 **10.0**which | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**1, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**amplifies | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**every
 layer.
 
-**Why it survived thirteen-plus eliminated hypotheses.**
-`layer_ref.rs::hc_post_ref`, the host oracle, contracted the same wrong axis.
-Every HC comparison therefore agreed to ~1e-7 while the model was badly wrong,
-and the layer-0 bisect put the median row at the floor (p50 3.576e-7). A shared
-misreading between `parent/forward.rs` and `parent/*_ref` is invisible by
-construction — the documented cost of the standalone-parent decision, now paid.
-No test caught it either; the tests encode the same convention.
+**Why | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**survived | 10.0 | | 10.0 **10.0**thirteen-plus | 10.0 | | 10.0 **10.0**eliminated | 10.0 | | 10.0 **10.0**hypotheses.**
+`layer_ref.rs::hc_post_ref`, | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**host | 10.0 | | 10.0 **10.0**oracle, | 10.0 | | 10.0 **10.0**contracted | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**wrong | 10.0 | | 10.0 **10.0**axis.
+Every | 10.0 | | 10.0 **10.0**HC | 10.0 | | 10.0 **10.0**comparison | 10.0 | | 10.0 **10.0**therefore | 10.0 | | 10.0 **10.0**agreed | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**~1e-7 | 10.0 | | 10.0 **10.0**while | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**badly | 10.0 | | 10.0 **10.0**wrong,
+and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**layer-0 | 10.0 | | 10.0 **10.0**bisect | 10.0 | | 10.0 **10.0**put | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**median | 10.0 | | 10.0 **10.0**row | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**floor | 10.0 | | 10.0 **10.0**(p50 | 10.0 | | 10.0 **10.0**3.576e-7). | 10.0 | | 10.0 **10.0**A | 10.0 | | 10.0 **10.0**shared
+misreading | 10.0 | | 10.0 **10.0**between | 10.0 | | 10.0 **10.0**`parent/forward.rs` | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**`parent/*_ref` | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**invisible | 10.0 | | 10.0 **10.0**by
+construction | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**documented | 10.0 | | 10.0 **10.0**cost | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**standalone-parent | 10.0 | | 10.0 **10.0**decision, | 10.0 | | 10.0 **10.0**now | 10.0 | | 10.0 **10.0**paid.
+No | 10.0 | | 10.0 **10.0**test | 10.0 | | 10.0 **10.0**caught | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**either; | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**tests | 10.0 | | 10.0 **10.0**encode | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**convention.
 
-Fixed in `dc4a6cd8f`. `comb` now has one meaning across the parent (reference
-orientation), converted at the single kernel boundary.
+Fixed | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**`dc4a6cd8f`. | 10.0 | | 10.0 **10.0**`comb` | 10.0 | | 10.0 **10.0**now | 10.0 | | 10.0 **10.0**has | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**meaning | 10.0 | | 10.0 **10.0**across | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**(reference
+orientation), | 10.0 | | 10.0 **10.0**converted | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**single | 10.0 | | 10.0 **10.0**kernel | 10.0 | | 10.0 **10.0**boundary.
 
-### Post-fix state — parent wins at 256, two defects remain
+### | 10.0 | | 10.0 **10.0**Post-fix | 10.0 | | 10.0 **10.0**state | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**wins | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**256, | 10.0 | | 10.0 **10.0**two | 10.0 | | 10.0 **10.0**defects | 10.0 | | 10.0 **10.0**remain
 
-| tokens | parent pre → post | mq2r | lloyd |
+| | 10.0 | | 10.0 **10.0**tokens | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**pre | 10.0 | | 10.0 **10.0**→ | 10.0 | | 10.0 **10.0**post | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**mq2r | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**lloyd | 10.0 | | 10.0 **10.0**|
 |---|---|---|---|
-| 128 | 23.638 → 11.538 | 9.297 | 8.734 |
-| 256 | 29.644 → **8.619** | 11.080 | 11.289 |
-| 512 | 63.498 → 17.162 | 11.693 | 12.167 |
-| 1024 | 163.892 → 59.507 | 14.703 | 14.564 |
+| | 10.0 | | 10.0 **10.0**128 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**23.638 | 10.0 | | 10.0 **10.0**→ | 10.0 | | 10.0 **10.0**11.538 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**9.297 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**8.734 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**256 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**29.644 | 10.0 | | 10.0 **10.0**→ | 10.0 | | 10.0 **10.0****8.619** | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**11.080 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**11.289 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**512 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**63.498 | 10.0 | | 10.0 **10.0**→ | 10.0 | | 10.0 **10.0**17.162 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**11.693 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**12.167 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**1024 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**163.892 | 10.0 | | 10.0 **10.0**→ | 10.0 | | 10.0 **10.0**59.507 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**14.703 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**14.564 | 10.0 | | 10.0 **10.0**|
 
-Two independent defects remain, cleanly separated by the data:
+Two | 10.0 | | 10.0 **10.0**independent | 10.0 | | 10.0 **10.0**defects | 10.0 | | 10.0 **10.0**remain, | 10.0 | | 10.0 **10.0**cleanly | 10.0 | | 10.0 **10.0**separated | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**data:
 
-1. **L37 → L38 step of 8.2x** (14221.72 → 116669.77), present at *all four*
-   lengths including 128 where `index_topk=512` selection is a complete no-op.
-   Independent of any long-context path. `LoaderOracle` verified the loader
-   bit-exactly but sampled only layers 4 and 26 — layers 36-39 were never
-   checked, and one malformed tensor produces exactly this signature.
-2. **Accuracy step at position 512.** Buckets are position-anchored and
-   length-invariant. The parent beats mq2r in four of six buckets and holds
-   through `[256,512)` at 0.583, then drops to 0.333 in `[512,1022)` where mq2r
-   manages 0.500. `index_topk = 512`. Prior indexer work eliminated *causality*,
-   not *selection correctness*, and ran at 128 tokens where top-k selects
-   everything and the selection logic is never exercised.
+1. | 10.0 | | 10.0 **10.0****L37 | 10.0 | | 10.0 **10.0**→ | 10.0 | | 10.0 **10.0**L38 | 10.0 | | 10.0 **10.0**step | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**8.2x** | 10.0 | | 10.0 **10.0**(14221.72 | 10.0 | | 10.0 **10.0**→ | 10.0 | | 10.0 **10.0**116669.77), | 10.0 | | 10.0 **10.0**present | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0***all | 10.0 | | 10.0 **10.0**four*
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**lengths | 10.0 | | 10.0 **10.0**including | 10.0 | | 10.0 **10.0**128 | 10.0 | | 10.0 **10.0**where | 10.0 | | 10.0 **10.0**`index_topk=512` | 10.0 | | 10.0 **10.0**selection | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**complete | 10.0 | | 10.0 **10.0**no-op.
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**Independent | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**any | 10.0 | | 10.0 **10.0**long-context | 10.0 | | 10.0 **10.0**path. | 10.0 | | 10.0 **10.0**`LoaderOracle` | 10.0 | | 10.0 **10.0**verified | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**loader
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**bit-exactly | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**sampled | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**layers | 10.0 | | 10.0 **10.0**4 | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**26 | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**layers | 10.0 | | 10.0 **10.0**36-39 | 10.0 | | 10.0 **10.0**were | 10.0 | | 10.0 **10.0**never
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**checked, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**malformed | 10.0 | | 10.0 **10.0**tensor | 10.0 | | 10.0 **10.0**produces | 10.0 | | 10.0 **10.0**exactly | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**signature.
+2. | 10.0 | | 10.0 **10.0****Accuracy | 10.0 | | 10.0 **10.0**step | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**position | 10.0 | | 10.0 **10.0**512.** | 10.0 | | 10.0 **10.0**Buckets | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**position-anchored | 10.0 | | 10.0 **10.0**and
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**length-invariant. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**beats | 10.0 | | 10.0 **10.0**mq2r | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**four | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**six | 10.0 | | 10.0 **10.0**buckets | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**holds
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**through | 10.0 | | 10.0 **10.0**`[256,512)` | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**0.583, | 10.0 | | 10.0 **10.0**then | 10.0 | | 10.0 **10.0**drops | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**0.333 | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**`[512,1022)` | 10.0 | | 10.0 **10.0**where | 10.0 | | 10.0 **10.0**mq2r
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**manages | 10.0 | | 10.0 **10.0**0.500. | 10.0 | | 10.0 **10.0**`index_topk | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**512`. | 10.0 | | 10.0 **10.0**Prior | 10.0 | | 10.0 **10.0**indexer | 10.0 | | 10.0 **10.0**work | 10.0 | | 10.0 **10.0**eliminated | 10.0 | | 10.0 **10.0***causality*,
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0***selection | 10.0 | | 10.0 **10.0**correctness*, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**ran | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**128 | 10.0 | | 10.0 **10.0**tokens | 10.0 | | 10.0 **10.0**where | 10.0 | | 10.0 **10.0**top-k | 10.0 | | 10.0 **10.0**selects
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**everything | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**selection | 10.0 | | 10.0 **10.0**logic | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**never | 10.0 | | 10.0 **10.0**exercised.
 
-Reading KLD here: it rose at 1024 (7.676 → 8.793) while PPL fell 2.75x and
-top-1 rose 0.3008 → 0.3408, and fell at 128 (5.297 → 4.768).
-`KLD(P_parent || Q_quant)` is weighted by the parent's own distribution, so a
-sharper-but-still-wrong parent scores higher. Judge by PPL, top-1 and buckets.
+Reading | 10.0 | | 10.0 **10.0**KLD | 10.0 | | 10.0 **10.0**here: | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**rose | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**1024 | 10.0 | | 10.0 **10.0**(7.676 | 10.0 | | 10.0 **10.0**→ | 10.0 | | 10.0 **10.0**8.793) | 10.0 | | 10.0 **10.0**while | 10.0 | | 10.0 **10.0**PPL | 10.0 | | 10.0 **10.0**fell | 10.0 | | 10.0 **10.0**2.75x | 10.0 | | 10.0 **10.0**and
+top-1 | 10.0 | | 10.0 **10.0**rose | 10.0 | | 10.0 **10.0**0.3008 | 10.0 | | 10.0 **10.0**→ | 10.0 | | 10.0 **10.0**0.3408, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**fell | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**128 | 10.0 | | 10.0 **10.0**(5.297 | 10.0 | | 10.0 **10.0**→ | 10.0 | | 10.0 **10.0**4.768).
+`KLD(P_parent | 10.0 | | 10.0 **10.0**|| | 10.0 | | 10.0 **10.0**Q_quant)` | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**weighted | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**parent's | 10.0 | | 10.0 **10.0**own | 10.0 | | 10.0 **10.0**distribution, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**a
+sharper-but-still-wrong | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**scores | 10.0 | | 10.0 **10.0**higher. | 10.0 | | 10.0 **10.0**Judge | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**PPL, | 10.0 | | 10.0 **10.0**top-1 | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**buckets.
 
-Only compare PPL and geo-mean growth **within a length** — both are
-length-dependent (geo mean 1.1684 at 128, 1.1498 at 512, 1.1410 at 1024).
-Position-bucket accuracy is the one length-invariant metric.
+Only | 10.0 | | 10.0 **10.0**compare | 10.0 | | 10.0 **10.0**PPL | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**geo-mean | 10.0 | | 10.0 **10.0**growth | 10.0 | | 10.0 **10.0****within | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**length** | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**are
+length-dependent | 10.0 | | 10.0 **10.0**(geo | 10.0 | | 10.0 **10.0**mean | 10.0 | | 10.0 **10.0**1.1684 | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**128, | 10.0 | | 10.0 **10.0**1.1498 | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**512, | 10.0 | | 10.0 **10.0**1.1410 | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**1024).
+Position-bucket | 10.0 | | 10.0 **10.0**accuracy | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**length-invariant | 10.0 | | 10.0 **10.0**metric.
 
-### Gates 7-9 are conditional on a value test (decided 2026-08-02)
+### | 10.0 | | 10.0 **10.0**Gates | 10.0 | | 10.0 **10.0**7-9 | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**conditional | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**value | 10.0 | | 10.0 **10.0**test | 10.0 | | 10.0 **10.0**(decided | 10.0 | | 10.0 **10.0**2026-08-02)
 
-Gates 7-9 are **no longer a given**. The independent GPTQ cross-reference
-(`crates/hipfire-quantize/reference_gptq/`) found the solver math already
-correct — exact agreement with the paper reference in f64 — so there is no
-broken GPTQ to fix. The entire program therefore rests on an unproven premise:
-that parent-derived Hessians and parent-KLD calibration produce measurably
-better children than the pipeline already ships.
+Gates | 10.0 | | 10.0 **10.0**7-9 | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0****no | 10.0 | | 10.0 **10.0**longer | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**given**. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**independent | 10.0 | | 10.0 **10.0**GPTQ | 10.0 | | 10.0 **10.0**cross-reference
+(`crates/hipfire-quantize/reference_gptq/`) | 10.0 | | 10.0 **10.0**found | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**solver | 10.0 | | 10.0 **10.0**math | 10.0 | | 10.0 **10.0**already
+correct | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**exact | 10.0 | | 10.0 **10.0**agreement | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**paper | 10.0 | | 10.0 **10.0**reference | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**f64 | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**there | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**no
+broken | 10.0 | | 10.0 **10.0**GPTQ | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**fix. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**entire | 10.0 | | 10.0 **10.0**program | 10.0 | | 10.0 **10.0**therefore | 10.0 | | 10.0 **10.0**rests | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**unproven | 10.0 | | 10.0 **10.0**premise:
+that | 10.0 | | 10.0 **10.0**parent-derived | 10.0 | | 10.0 **10.0**Hessians | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**parent-KLD | 10.0 | | 10.0 **10.0**calibration | 10.0 | | 10.0 **10.0**produce | 10.0 | | 10.0 **10.0**measurably
+better | 10.0 | | 10.0 **10.0**children | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**pipeline | 10.0 | | 10.0 **10.0**already | 10.0 | | 10.0 **10.0**ships.
 
-**The gate:** once the parent is correct, re-quantize *one* MQ2R build with
-parent-derived Hessians and a parent-KLD-swept `route_scale`, and measure
-against the shipped **14.703 at 1024 tokens**. Proceed to the full program only
-if it wins. If it does not, stop — that is a cheap answer, not a wasted one.
+**The | 10.0 | | 10.0 **10.0**gate:** | 10.0 | | 10.0 **10.0**once | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**correct, | 10.0 | | 10.0 **10.0**re-quantize | 10.0 | | 10.0 **10.0***one* | 10.0 | | 10.0 **10.0**MQ2R | 10.0 | | 10.0 **10.0**build | 10.0 | | 10.0 **10.0**with
+parent-derived | 10.0 | | 10.0 **10.0**Hessians | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**parent-KLD-swept | 10.0 | | 10.0 **10.0**`route_scale`, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**measure
+against | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**shipped | 10.0 | | 10.0 **10.0****14.703 | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**1024 | 10.0 | | 10.0 **10.0**tokens**. | 10.0 | | 10.0 **10.0**Proceed | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**full | 10.0 | | 10.0 **10.0**program | 10.0 | | 10.0 **10.0**only
+if | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**wins. | 10.0 | | 10.0 **10.0**If | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**does | 10.0 | | 10.0 **10.0**not, | 10.0 | | 10.0 **10.0**stop | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**cheap | 10.0 | | 10.0 **10.0**answer, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**wasted | 10.0 | | 10.0 **10.0**one.
 
-Cheap wins to keep regardless of the outcome:
+Cheap | 10.0 | | 10.0 **10.0**wins | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**keep | 10.0 | | 10.0 **10.0**regardless | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**outcome:
 
-- `route_scale` at quantization time: MQ2R standalone PPL goes 6.63 → **6.03** →
-  6.84 across 1.8/2.0/2.2.
-- The `gptq.rs` absolute-vs-fractional damp footgun: it takes `initial_damp` as
-  an absolute value while `e8_gptq` uses fractional `LAMBDA*mean(diag)`. DS4
-  rides the safe path; other callers must pre-multiply by `mean(diag)`.
-- E8H1 discards cross-block Hessian mass (Frobenius ≈1.25e3 on an N=24, K=512
-  draw). By design, but it is an accuracy ceiling no calibration data can lift.
+- | 10.0 | | 10.0 **10.0**`route_scale` | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**quantization | 10.0 | | 10.0 **10.0**time: | 10.0 | | 10.0 **10.0**MQ2R | 10.0 | | 10.0 **10.0**standalone | 10.0 | | 10.0 **10.0**PPL | 10.0 | | 10.0 **10.0**goes | 10.0 | | 10.0 **10.0**6.63 | 10.0 | | 10.0 **10.0**→ | 10.0 | | 10.0 **10.0****6.03** | 10.0 | | 10.0 **10.0**→
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**6.84 | 10.0 | | 10.0 **10.0**across | 10.0 | | 10.0 **10.0**1.8/2.0/2.2.
+- | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**`gptq.rs` | 10.0 | | 10.0 **10.0**absolute-vs-fractional | 10.0 | | 10.0 **10.0**damp | 10.0 | | 10.0 **10.0**footgun: | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**takes | 10.0 | | 10.0 **10.0**`initial_damp` | 10.0 | | 10.0 **10.0**as
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**absolute | 10.0 | | 10.0 **10.0**value | 10.0 | | 10.0 **10.0**while | 10.0 | | 10.0 **10.0**`e8_gptq` | 10.0 | | 10.0 **10.0**uses | 10.0 | | 10.0 **10.0**fractional | 10.0 | | 10.0 **10.0**`LAMBDA*mean(diag)`. | 10.0 | | 10.0 **10.0**DS4
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**rides | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**safe | 10.0 | | 10.0 **10.0**path; | 10.0 | | 10.0 **10.0**other | 10.0 | | 10.0 **10.0**callers | 10.0 | | 10.0 **10.0**must | 10.0 | | 10.0 **10.0**pre-multiply | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**`mean(diag)`.
+- | 10.0 | | 10.0 **10.0**E8H1 | 10.0 | | 10.0 **10.0**discards | 10.0 | | 10.0 **10.0**cross-block | 10.0 | | 10.0 **10.0**Hessian | 10.0 | | 10.0 **10.0**mass | 10.0 | | 10.0 **10.0**(Frobenius | 10.0 | | 10.0 **10.0**≈1.25e3 | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**N=24, | 10.0 | | 10.0 **10.0**K=512
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**draw). | 10.0 | | 10.0 **10.0**By | 10.0 | | 10.0 **10.0**design, | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**accuracy | 10.0 | | 10.0 **10.0**ceiling | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**calibration | 10.0 | | 10.0 **10.0**data | 10.0 | | 10.0 **10.0**can | 10.0 | | 10.0 **10.0**lift.
 
-### Not yet done
+### | 10.0 | | 10.0 **10.0**Not | 10.0 | | 10.0 **10.0**yet | 10.0 | | 10.0 **10.0**done
 
-Gates 6-9. Specifically:
+Gates | 10.0 | | 10.0 **10.0**6-9. | 10.0 | | 10.0 **10.0**Specifically:
 
-- **No pinned parent logit baseline yet.** Both Gate 5 runs used
-  `--skip-shard-hashes`, so their manifests carry placeholders rather than a
-  pin, and the token sequences were pseudo-random rather than a real corpus.
-  Those `.plog` files are smoke artifacts and **must not** be promoted to the
-  Gate 6 baseline.
-- Gate 6 needs: a real 1024-token corpus with a recorded hash, a full-shard-hash
-  manifest, cross-process determinism confirmed (only in-process is proven so
-  far), and then MQ2L/MQ2R logits captured on byte-identical token ids for the
-  KLD comparison. `plog::compare` is written and unit-tested but has never
-  consumed a real parent logit file. **Use only the 0731-derived artifacts
-  listed above, verified by sha256 before the run, not by filename.**
-- Forward cost is 24.8 s per 256 tokens, so a 1024-token capture is order
-  100 s per model plus load. Tractable; measure before scaling to the 8K/16K/32K
-  expansion in gate 8.
+- | 10.0 | | 10.0 **10.0****No | 10.0 | | 10.0 **10.0**pinned | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**logit | 10.0 | | 10.0 **10.0**baseline | 10.0 | | 10.0 **10.0**yet.** | 10.0 | | 10.0 **10.0**Both | 10.0 | | 10.0 **10.0**Gate | 10.0 | | 10.0 **10.0**5 | 10.0 | | 10.0 **10.0**runs | 10.0 | | 10.0 **10.0**used
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`--skip-shard-hashes`, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**their | 10.0 | | 10.0 **10.0**manifests | 10.0 | | 10.0 **10.0**carry | 10.0 | | 10.0 **10.0**placeholders | 10.0 | | 10.0 **10.0**rather | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**a
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**pin, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**token | 10.0 | | 10.0 **10.0**sequences | 10.0 | | 10.0 **10.0**were | 10.0 | | 10.0 **10.0**pseudo-random | 10.0 | | 10.0 **10.0**rather | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**real | 10.0 | | 10.0 **10.0**corpus.
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**Those | 10.0 | | 10.0 **10.0**`.plog` | 10.0 | | 10.0 **10.0**files | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**smoke | 10.0 | | 10.0 **10.0**artifacts | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0****must | 10.0 | | 10.0 **10.0**not** | 10.0 | | 10.0 **10.0**be | 10.0 | | 10.0 **10.0**promoted | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**the
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**Gate | 10.0 | | 10.0 **10.0**6 | 10.0 | | 10.0 **10.0**baseline.
+- | 10.0 | | 10.0 **10.0**Gate | 10.0 | | 10.0 **10.0**6 | 10.0 | | 10.0 **10.0**needs: | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**real | 10.0 | | 10.0 **10.0**1024-token | 10.0 | | 10.0 **10.0**corpus | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**recorded | 10.0 | | 10.0 **10.0**hash, | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**full-shard-hash
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**manifest, | 10.0 | | 10.0 **10.0**cross-process | 10.0 | | 10.0 **10.0**determinism | 10.0 | | 10.0 **10.0**confirmed | 10.0 | | 10.0 **10.0**(only | 10.0 | | 10.0 **10.0**in-process | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**proven | 10.0 | | 10.0 **10.0**so
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**far), | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**then | 10.0 | | 10.0 **10.0**MQ2L/MQ2R | 10.0 | | 10.0 **10.0**logits | 10.0 | | 10.0 **10.0**captured | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**byte-identical | 10.0 | | 10.0 **10.0**token | 10.0 | | 10.0 **10.0**ids | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**the
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**KLD | 10.0 | | 10.0 **10.0**comparison. | 10.0 | | 10.0 **10.0**`plog::compare` | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**written | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**unit-tested | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**has | 10.0 | | 10.0 **10.0**never
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**consumed | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**real | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**logit | 10.0 | | 10.0 **10.0**file. | 10.0 | | 10.0 **10.0****Use | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**0731-derived | 10.0 | | 10.0 **10.0**artifacts
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**listed | 10.0 | | 10.0 **10.0**above, | 10.0 | | 10.0 **10.0**verified | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**sha256 | 10.0 | | 10.0 **10.0**before | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**run, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**filename.**
+- | 10.0 | | 10.0 **10.0**Forward | 10.0 | | 10.0 **10.0**cost | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**24.8 | 10.0 | | 10.0 **10.0**s | 10.0 | | 10.0 **10.0**per | 10.0 | | 10.0 **10.0**256 | 10.0 | | 10.0 **10.0**tokens, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**1024-token | 10.0 | | 10.0 **10.0**capture | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**order
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**100 | 10.0 | | 10.0 **10.0**s | 10.0 | | 10.0 **10.0**per | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**plus | 10.0 | | 10.0 **10.0**load. | 10.0 | | 10.0 **10.0**Tractable; | 10.0 | | 10.0 **10.0**measure | 10.0 | | 10.0 **10.0**before | 10.0 | | 10.0 **10.0**scaling | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**8K/16K/32K
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**expansion | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**gate | 10.0 | | 10.0 **10.0**8.
 
 
-## Producer boundary
+## | 10.0 | | 10.0 **10.0**Producer | 10.0 | | 10.0 **10.0**boundary
 
-For GPTQ, accumulate the operand actually consumed by the parent weight
-matmul: the post-dynamic-activation-quantization/dequantization matrix. Record
-the pre-quant matrix only as optional diagnostic evidence. The boundary must
-be named in the output manifest; "F32 activations" is not sufficient
+For | 10.0 | | 10.0 **10.0**GPTQ, | 10.0 | | 10.0 **10.0**accumulate | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**operand | 10.0 | | 10.0 **10.0**actually | 10.0 | | 10.0 **10.0**consumed | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**weight
+matmul: | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**post-dynamic-activation-quantization/dequantization | 10.0 | | 10.0 **10.0**matrix. | 10.0 | | 10.0 **10.0**Record
+the | 10.0 | | 10.0 **10.0**pre-quant | 10.0 | | 10.0 **10.0**matrix | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**optional | 10.0 | | 10.0 **10.0**diagnostic | 10.0 | | 10.0 **10.0**evidence. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**boundary | 10.0 | | 10.0 **10.0**must
+be | 10.0 | | 10.0 **10.0**named | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**output | 10.0 | | 10.0 **10.0**manifest; | 10.0 | | 10.0 **10.0**"F32 | 10.0 | | 10.0 **10.0**activations" | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**sufficient
 provenance.
 
-Accumulate 256-channel `X^T X` blocks online with rocBLAS and write the
-Hessians directly. The intermediate `.acts` format remains useful for codec
-and collector debugging, but the production parent run should avoid another
-13 GiB activation dump.
+Accumulate | 10.0 | | 10.0 **10.0**256-channel | 10.0 | | 10.0 **10.0**`X^T | 10.0 | | 10.0 **10.0**X` | 10.0 | | 10.0 **10.0**blocks | 10.0 | | 10.0 **10.0**online | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**rocBLAS | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**write | 10.0 | | 10.0 **10.0**the
+Hessians | 10.0 | | 10.0 **10.0**directly. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**intermediate | 10.0 | | 10.0 **10.0**`.acts` | 10.0 | | 10.0 **10.0**format | 10.0 | | 10.0 **10.0**remains | 10.0 | | 10.0 **10.0**useful | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**codec
+and | 10.0 | | 10.0 **10.0**collector | 10.0 | | 10.0 **10.0**debugging, | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**production | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**run | 10.0 | | 10.0 **10.0**should | 10.0 | | 10.0 **10.0**avoid | 10.0 | | 10.0 **10.0**another
+13 | 10.0 | | 10.0 **10.0**GiB | 10.0 | | 10.0 **10.0**activation | 10.0 | | 10.0 **10.0**dump.
 
-## Mandatory evidence manifest
+## | 10.0 | | 10.0 **10.0**Mandatory | 10.0 | | 10.0 **10.0**evidence | 10.0 | | 10.0 **10.0**manifest
 
-Every parent-logit and Hessian bundle must include:
+Every | 10.0 | | 10.0 **10.0**parent-logit | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**Hessian | 10.0 | | 10.0 **10.0**bundle | 10.0 | | 10.0 **10.0**must | 10.0 | | 10.0 **10.0**include:
 
-- source shard/index hashes
-- engine commit and dirty diff hash
-- producer binary hash
-- ROCm path/version and GPU architecture
-- tokenizer hash
-- exact token IDs or corpus hash
-- model configuration and RoPE convention
-- activation capture boundary (`pre_quant` or `post_dynamic_fp8`)
-- per-tensor row counts and shapes
-- logits/Hessian hashes
-- KLD/PPL command and result artifacts
+- | 10.0 | | 10.0 **10.0**source | 10.0 | | 10.0 **10.0**shard/index | 10.0 | | 10.0 **10.0**hashes
+- | 10.0 | | 10.0 **10.0**engine | 10.0 | | 10.0 **10.0**commit | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**dirty | 10.0 | | 10.0 **10.0**diff | 10.0 | | 10.0 **10.0**hash
+- | 10.0 | | 10.0 **10.0**producer | 10.0 | | 10.0 **10.0**binary | 10.0 | | 10.0 **10.0**hash
+- | 10.0 | | 10.0 **10.0**ROCm | 10.0 | | 10.0 **10.0**path/version | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**GPU | 10.0 | | 10.0 **10.0**architecture
+- | 10.0 | | 10.0 **10.0**tokenizer | 10.0 | | 10.0 **10.0**hash
+- | 10.0 | | 10.0 **10.0**exact | 10.0 | | 10.0 **10.0**token | 10.0 | | 10.0 **10.0**IDs | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**corpus | 10.0 | | 10.0 **10.0**hash
+- | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**configuration | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**RoPE | 10.0 | | 10.0 **10.0**convention
+- | 10.0 | | 10.0 **10.0**activation | 10.0 | | 10.0 **10.0**capture | 10.0 | | 10.0 **10.0**boundary | 10.0 | | 10.0 **10.0**(`pre_quant` | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**`post_dynamic_fp8`)
+- | 10.0 | | 10.0 **10.0**per-tensor | 10.0 | | 10.0 **10.0**row | 10.0 | | 10.0 **10.0**counts | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**shapes
+- | 10.0 | | 10.0 **10.0**logits/Hessian | 10.0 | | 10.0 **10.0**hashes
+- | 10.0 | | 10.0 **10.0**KLD/PPL | 10.0 | | 10.0 **10.0**command | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**result | 10.0 | | 10.0 **10.0**artifacts
 
-No artifact without this manifest is eligible for GPTQ or a quality claim.
+No | 10.0 | | 10.0 **10.0**artifact | 10.0 | | 10.0 **10.0**without | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**manifest | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**eligible | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**GPTQ | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**quality | 10.0 | | 10.0 **10.0**claim.
 
-## Do not do
+## | 10.0 | | 10.0 **10.0**Do | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**do
 
-- Do not use the preserved 554 MQ2R-driven Hessians for parent GPTQ.
-- Do not delete or overwrite the preserved capture.
-- Do not call an activation parent-derived merely because its buffer dtype is
-  F32.
-- Do not let unrecognized `F8_E4M3`, `F8_E8M0`, or packed expert `I8` fall
-  through to `DType::Raw`.
-- Do not dequantize all 256 experts simultaneously.
-- Do not begin GPTQ before the parent logit baseline and existing-quant KLD
-  are durable.
-- Do not treat coherent text alone as numerical validation of the parent
-  forward.
+- | 10.0 | | 10.0 **10.0**Do | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**use | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**preserved | 10.0 | | 10.0 **10.0**554 | 10.0 | | 10.0 **10.0**MQ2R-driven | 10.0 | | 10.0 **10.0**Hessians | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**GPTQ.
+- | 10.0 | | 10.0 **10.0**Do | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**delete | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**overwrite | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**preserved | 10.0 | | 10.0 **10.0**capture.
+- | 10.0 | | 10.0 **10.0**Do | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**call | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**activation | 10.0 | | 10.0 **10.0**parent-derived | 10.0 | | 10.0 **10.0**merely | 10.0 | | 10.0 **10.0**because | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**buffer | 10.0 | | 10.0 **10.0**dtype | 10.0 | | 10.0 **10.0**is
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**F32.
+- | 10.0 | | 10.0 **10.0**Do | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**let | 10.0 | | 10.0 **10.0**unrecognized | 10.0 | | 10.0 **10.0**`F8_E4M3`, | 10.0 | | 10.0 **10.0**`F8_E8M0`, | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**packed | 10.0 | | 10.0 **10.0**expert | 10.0 | | 10.0 **10.0**`I8` | 10.0 | | 10.0 **10.0**fall
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**through | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**`DType::Raw`.
+- | 10.0 | | 10.0 **10.0**Do | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**dequantize | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**256 | 10.0 | | 10.0 **10.0**experts | 10.0 | | 10.0 **10.0**simultaneously.
+- | 10.0 | | 10.0 **10.0**Do | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**begin | 10.0 | | 10.0 **10.0**GPTQ | 10.0 | | 10.0 **10.0**before | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**logit | 10.0 | | 10.0 **10.0**baseline | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**existing-quant | 10.0 | | 10.0 **10.0**KLD
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**durable.
+- | 10.0 | | 10.0 **10.0**Do | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**treat | 10.0 | | 10.0 **10.0**coherent | 10.0 | | 10.0 **10.0**text | 10.0 | | 10.0 **10.0**alone | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**numerical | 10.0 | | 10.0 **10.0**validation | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**parent
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**forward.

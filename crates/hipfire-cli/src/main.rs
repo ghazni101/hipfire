@@ -7184,13 +7184,13 @@ mod tests {
         fs::create_dir_all(&home).unwrap();
         fs::write(
             home.join("install.json"),
-            r#"{"commit":"abc","ref":"master","rocm_root":"/opt/rocm/core-7.14","gpu_arch":"gfx1201","profile":"auto","installed_at":1}"#,
+            r#"{"commit":"abc","ref":"master","rocm_root":"/opt/rocm/core-10.0","gpu_arch":"gfx1201","profile":"auto","installed_at":1}"#,
         )
         .unwrap();
         let recorded = recorded_install_metadata(&home);
         assert_eq!(
             recorded.rocm_root.as_deref(),
-            Some(Path::new("/opt/rocm/core-7.14"))
+            Some(Path::new("/opt/rocm/core-10.0"))
         );
         assert_eq!(recorded.gpu_arch.as_deref(), Some("gfx1201"));
         let args = installer_handoff_args(
@@ -7210,7 +7210,7 @@ mod tests {
                 "--branch".to_owned(),
                 "beta".to_owned(),
                 "--rocm-root".to_owned(),
-                "/opt/rocm/core-7.14".to_owned(),
+                "/opt/rocm/core-10.0".to_owned(),
                 "--gpu-arch".to_owned(),
                 "gfx1201".to_owned(),
             ]

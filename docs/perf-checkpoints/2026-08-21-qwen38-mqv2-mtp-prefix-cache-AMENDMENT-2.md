@@ -1,76 +1,76 @@
-# Amendment 2 — compressed MTP draft-head screen
+# | 10.0 | | 10.0 **10.0**Amendment | 10.0 | | 10.0 **10.0**2 | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**compressed | 10.0 | | 10.0 **10.0**MTP | 10.0 | | 10.0 **10.0**draft-head | 10.0 | | 10.0 **10.0**screen
 
-**Lifecycle:** historical
-**Disposition:** artifact/mechanism screen; not a gfx1151 performance claim or product default
-**Amends:** [`2026-08-21-qwen38-mqv2-mtp-prefix-cache.md`](./2026-08-21-qwen38-mqv2-mtp-prefix-cache.md)
+**Lifecycle:** | 10.0 | | 10.0 **10.0**historical
+**Disposition:** | 10.0 | | 10.0 **10.0**artifact/mechanism | 10.0 | | 10.0 **10.0**screen; | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**gfx1151 | 10.0 | | 10.0 **10.0**performance | 10.0 | | 10.0 **10.0**claim | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**product | 10.0 | | 10.0 **10.0**default
+**Amends:** | 10.0 | | 10.0 **10.0**[`2026-08-21-qwen38-mqv2-mtp-prefix-cache.md`](./2026-08-21-qwen38-mqv2-mtp-prefix-cache.md)
 
-## Reason for amendment
+## | 10.0 | | 10.0 **10.0**Reason | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**amendment
 
-The original checkpoint recorded 38.2 tok/s as the best gfx1151 MQ4V2 XT MTP result and found no bounded source-only lever with enough margin to prove 40 tok/s. The runtime and `mtp_extract` already support FastMTP-style compressed draft heads, but the production Qwen3.8 sidecar contains only the 15 base tensors and therefore reads the full 248,320-row trunk lm-head once per proposal step.
+The | 10.0 | | 10.0 **10.0**original | 10.0 | | 10.0 **10.0**checkpoint | 10.0 | | 10.0 **10.0**recorded | 10.0 | | 10.0 **10.0**38.2 | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**best | 10.0 | | 10.0 **10.0**gfx1151 | 10.0 | | 10.0 **10.0**MQ4V2 | 10.0 | | 10.0 **10.0**XT | 10.0 | | 10.0 **10.0**MTP | 10.0 | | 10.0 **10.0**result | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**found | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**bounded | 10.0 | | 10.0 **10.0**source-only | 10.0 | | 10.0 **10.0**lever | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**enough | 10.0 | | 10.0 **10.0**margin | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**prove | 10.0 | | 10.0 **10.0**40 | 10.0 | | 10.0 **10.0**tok/s. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**runtime | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**`mtp_extract` | 10.0 | | 10.0 **10.0**already | 10.0 | | 10.0 **10.0**support | 10.0 | | 10.0 **10.0**FastMTP-style | 10.0 | | 10.0 **10.0**compressed | 10.0 | | 10.0 **10.0**draft | 10.0 | | 10.0 **10.0**heads, | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**production | 10.0 | | 10.0 **10.0**Qwen3.8 | 10.0 | | 10.0 **10.0**sidecar | 10.0 | | 10.0 **10.0**contains | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**15 | 10.0 | | 10.0 **10.0**base | 10.0 | | 10.0 **10.0**tensors | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**therefore | 10.0 | | 10.0 **10.0**reads | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**full | 10.0 | | 10.0 **10.0**248,320-row | 10.0 | | 10.0 **10.0**trunk | 10.0 | | 10.0 **10.0**lm-head | 10.0 | | 10.0 **10.0**once | 10.0 | | 10.0 **10.0**per | 10.0 | | 10.0 **10.0**proposal | 10.0 | | 10.0 **10.0**step.
 
-This amendment screens a corpus-derived 32,768-row compressed draft head on gfx1201. It establishes a concrete, already-supported artifact lever with enough measured margin to justify a direct gfx1151 trial after `hipx` recovers. It does **not** substitute the gfx1201 result for the required gfx1151 proof.
+This | 10.0 | | 10.0 **10.0**amendment | 10.0 | | 10.0 **10.0**screens | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**corpus-derived | 10.0 | | 10.0 **10.0**32,768-row | 10.0 | | 10.0 **10.0**compressed | 10.0 | | 10.0 **10.0**draft | 10.0 | | 10.0 **10.0**head | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**gfx1201. | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**establishes | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**concrete, | 10.0 | | 10.0 **10.0**already-supported | 10.0 | | 10.0 **10.0**artifact | 10.0 | | 10.0 **10.0**lever | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**enough | 10.0 | | 10.0 **10.0**measured | 10.0 | | 10.0 **10.0**margin | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**justify | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**direct | 10.0 | | 10.0 **10.0**gfx1151 | 10.0 | | 10.0 **10.0**trial | 10.0 | | 10.0 **10.0**after | 10.0 | | 10.0 **10.0**`hipx` | 10.0 | | 10.0 **10.0**recovers. | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**does | 10.0 | | 10.0 **10.0****not** | 10.0 | | 10.0 **10.0**substitute | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**gfx1201 | 10.0 | | 10.0 **10.0**result | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**required | 10.0 | | 10.0 **10.0**gfx1151 | 10.0 | | 10.0 **10.0**proof.
 
-## Artifact construction
+## | 10.0 | | 10.0 **10.0**Artifact | 10.0 | | 10.0 **10.0**construction
 
-The vocabulary corpus was built from all 72 assistant outputs in the nine completed gfx1201 `session_coding.json` arms (XT/Base/Pro × AR/DFlash/MTP):
+The | 10.0 | | 10.0 **10.0**vocabulary | 10.0 | | 10.0 **10.0**corpus | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**built | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**72 | 10.0 | | 10.0 **10.0**assistant | 10.0 | | 10.0 **10.0**outputs | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**nine | 10.0 | | 10.0 **10.0**completed | 10.0 | | 10.0 **10.0**gfx1201 | 10.0 | | 10.0 **10.0**`session_coding.json` | 10.0 | | 10.0 **10.0**arms | 10.0 | | 10.0 **10.0**(XT/Base/Pro | 10.0 | | 10.0 **10.0**× | 10.0 | | 10.0 **10.0**AR/DFlash/MTP):
 
-| item | value |
+| | 10.0 | | 10.0 **10.0**item | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**value | 10.0 | | 10.0 **10.0**|
 |---|---:|
-| corpus records | 72 |
-| tokenizer output tokens | 276,185 |
-| unique token IDs | 8,923 |
-| selected draft vocabulary | 32,768 IDs |
-| measured corpus coverage | 100.00% |
+| | 10.0 | | 10.0 **10.0**corpus | 10.0 | | 10.0 **10.0**records | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**72 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**tokenizer | 10.0 | | 10.0 **10.0**output | 10.0 | | 10.0 **10.0**tokens | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**276,185 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**unique | 10.0 | | 10.0 **10.0**token | 10.0 | | 10.0 **10.0**IDs | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**8,923 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**selected | 10.0 | | 10.0 **10.0**draft | 10.0 | | 10.0 **10.0**vocabulary | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**32,768 | 10.0 | | 10.0 **10.0**IDs | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**measured | 10.0 | | 10.0 **10.0**corpus | 10.0 | | 10.0 **10.0**coverage | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**100.00% | 10.0 | | 10.0 **10.0**|
 
-`build_mtp_vocab_sidecar.py` force-included the tokenizer's special/added tokens and filled the unused remainder deterministically. `mtp_extract --quant mq4 --vocab-sidecar ...` then extracted the existing Qwen3.8 MTP layer and appended:
+`build_mtp_vocab_sidecar.py` | 10.0 | | 10.0 **10.0**force-included | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**tokenizer's | 10.0 | | 10.0 **10.0**special/added | 10.0 | | 10.0 **10.0**tokens | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**filled | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**unused | 10.0 | | 10.0 **10.0**remainder | 10.0 | | 10.0 **10.0**deterministically. | 10.0 | | 10.0 **10.0**`mtp_extract | 10.0 | | 10.0 **10.0**--quant | 10.0 | | 10.0 **10.0**mq4 | 10.0 | | 10.0 **10.0**--vocab-sidecar | 10.0 | | 10.0 **10.0**...` | 10.0 | | 10.0 **10.0**then | 10.0 | | 10.0 **10.0**extracted | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**existing | 10.0 | | 10.0 **10.0**Qwen3.8 | 10.0 | | 10.0 **10.0**MTP | 10.0 | | 10.0 **10.0**layer | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**appended:
 
-- `lm_head_draft.weight`: `[32768, 5120]`, MQ4G256, 89,128,960 bytes
-- `lm_head_draft.vocab_map`: `[32768]`, F32-packed token IDs
+- | 10.0 | | 10.0 **10.0**`lm_head_draft.weight`: | 10.0 | | 10.0 **10.0**`[32768, | 10.0 | | 10.0 **10.0**5120]`, | 10.0 | | 10.0 **10.0**MQ4G256, | 10.0 | | 10.0 **10.0**89,128,960 | 10.0 | | 10.0 **10.0**bytes
+- | 10.0 | | 10.0 **10.0**`lm_head_draft.vocab_map`: | 10.0 | | 10.0 **10.0**`[32768]`, | 10.0 | | 10.0 **10.0**F32-packed | 10.0 | | 10.0 **10.0**token | 10.0 | | 10.0 **10.0**IDs
 
-The resulting 17-tensor container passed `mtp_extract`'s HFQ round-trip verification.
+The | 10.0 | | 10.0 **10.0**resulting | 10.0 | | 10.0 **10.0**17-tensor | 10.0 | | 10.0 **10.0**container | 10.0 | | 10.0 **10.0**passed | 10.0 | | 10.0 **10.0**`mtp_extract`'s | 10.0 | | 10.0 **10.0**HFQ | 10.0 | | 10.0 **10.0**round-trip | 10.0 | | 10.0 **10.0**verification.
 
-| artifact | md5 |
+| | 10.0 | | 10.0 **10.0**artifact | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**md5 | 10.0 | | 10.0 **10.0**|
 |---|---|
-| compressed MTP sidecar | `d393fcc8bc4b718ec82ecec81287d83a` |
-| 32K vocabulary map | `a769032aa2b02a98bb85a9da1256bbe2` |
-| 72-output corpus JSONL | `c99e0b9c5289610649820f7c1ece4eee` |
-| MQ4V2 XT target | `e45d15bfe0c9a87132697101d17cbed6` |
-| original full-vocab MTP sidecar | `1a78dd0d2c8c8a97abfc2f873193ae58` |
+| | 10.0 | | 10.0 **10.0**compressed | 10.0 | | 10.0 **10.0**MTP | 10.0 | | 10.0 **10.0**sidecar | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`d393fcc8bc4b718ec82ecec81287d83a` | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**32K | 10.0 | | 10.0 **10.0**vocabulary | 10.0 | | 10.0 **10.0**map | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`a769032aa2b02a98bb85a9da1256bbe2` | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**72-output | 10.0 | | 10.0 **10.0**corpus | 10.0 | | 10.0 **10.0**JSONL | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`c99e0b9c5289610649820f7c1ece4eee` | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**MQ4V2 | 10.0 | | 10.0 **10.0**XT | 10.0 | | 10.0 **10.0**target | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`e45d15bfe0c9a87132697101d17cbed6` | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**original | 10.0 | | 10.0 **10.0**full-vocab | 10.0 | | 10.0 **10.0**MTP | 10.0 | | 10.0 **10.0**sidecar | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`1a78dd0d2c8c8a97abfc2f873193ae58` | 10.0 | | 10.0 **10.0**|
 
-No runtime source change was required: this uses the existing compressed-head loader and `spec_step_mtp_compressed_serial_with_k` branch.
+No | 10.0 | | 10.0 **10.0**runtime | 10.0 | | 10.0 **10.0**source | 10.0 | | 10.0 **10.0**change | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**required: | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**uses | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**existing | 10.0 | | 10.0 **10.0**compressed-head | 10.0 | | 10.0 **10.0**loader | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**`spec_step_mtp_compressed_serial_with_k` | 10.0 | | 10.0 **10.0**branch.
 
-## gfx1201 A/B
+## | 10.0 | | 10.0 **10.0**gfx1201 | 10.0 | | 10.0 **10.0**A/B
 
-Hardware: `hiptrx` HIP device 3, Radeon AI PRO R9700 gfx1201, BDF `0000:13:00.0`, HIP 7.14. Binary md5s matched the full-session campaign (`hipfire` `4b8c6f03465eaf0f339b92bdffea3b2d`, daemon `bbd3a1defd1fa2c620321e4352c1fb18`).
+Hardware: | 10.0 | | 10.0 **10.0**`hiptrx` | 10.0 | | 10.0 **10.0**HIP | 10.0 | | 10.0 **10.0**device | 10.0 | | 10.0 **10.0**3, | 10.0 | | 10.0 **10.0**Radeon | 10.0 | | 10.0 **10.0**AI | 10.0 | | 10.0 **10.0**PRO | 10.0 | | 10.0 **10.0**R9700 | 10.0 | | 10.0 **10.0**gfx1201, | 10.0 | | 10.0 **10.0**BDF | 10.0 | | 10.0 **10.0**`0000:13:00.0`, | 10.0 | | 10.0 **10.0**HIP | 10.0 | | 10.0 **10.0**7.15. | 10.0 | | 10.0 **10.0**Binary | 10.0 | | 10.0 **10.0**md5s | 10.0 | | 10.0 **10.0**matched | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**full-session | 10.0 | | 10.0 **10.0**campaign | 10.0 | | 10.0 **10.0**(`hipfire` | 10.0 | | 10.0 **10.0**`4b8c6f03465eaf0f339b92bdffea3b2d`, | 10.0 | | 10.0 **10.0**daemon | 10.0 | | 10.0 **10.0**`bbd3a1defd1fa2c620321e4352c1fb18`).
 
-Protocol: byte-identical `merge_sort_thinking_off.txt` (md5 `253c7ac50857fe6d0e10fb0d2c5e35c0`), K7, `p_min=0`, Q8 VMM KV, `noslots`, 3 warmups + 5 measured 128-token runs, verify/proposal graphs off.
+Protocol: | 10.0 | | 10.0 **10.0**byte-identical | 10.0 | | 10.0 **10.0**`merge_sort_thinking_off.txt` | 10.0 | | 10.0 **10.0**(md5 | 10.0 | | 10.0 **10.0**`253c7ac50857fe6d0e10fb0d2c5e35c0`), | 10.0 | | 10.0 **10.0**K7, | 10.0 | | 10.0 **10.0**`p_min=0`, | 10.0 | | 10.0 **10.0**Q8 | 10.0 | | 10.0 **10.0**VMM | 10.0 | | 10.0 **10.0**KV, | 10.0 | | 10.0 **10.0**`noslots`, | 10.0 | | 10.0 **10.0**3 | 10.0 | | 10.0 **10.0**warmups | 10.0 | | 10.0 **10.0**+ | 10.0 | | 10.0 **10.0**5 | 10.0 | | 10.0 **10.0**measured | 10.0 | | 10.0 **10.0**128-token | 10.0 | | 10.0 **10.0**runs, | 10.0 | | 10.0 **10.0**verify/proposal | 10.0 | | 10.0 **10.0**graphs | 10.0 | | 10.0 **10.0**off.
 
-| arm | decode median | five samples | wall median | tau |
+| | 10.0 | | 10.0 **10.0**arm | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**median | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**five | 10.0 | | 10.0 **10.0**samples | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**wall | 10.0 | | 10.0 **10.0**median | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**tau | 10.0 | | 10.0 **10.0**|
 |---|---:|---|---:|---:|
-| original full-vocab head | 101.5 tok/s | 101.5, 101.5, 101.5, 101.4, 101.3 | 92.5 | 4.29 |
-| compressed 32K head | 113.4 tok/s | 113.4, 113.5, 113.5, 113.4, 113.3 | 102.2 | 4.08 |
+| | 10.0 | | 10.0 **10.0**original | 10.0 | | 10.0 **10.0**full-vocab | 10.0 | | 10.0 **10.0**head | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**101.5 | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**101.5, | 10.0 | | 10.0 **10.0**101.5, | 10.0 | | 10.0 **10.0**101.5, | 10.0 | | 10.0 **10.0**101.4, | 10.0 | | 10.0 **10.0**101.3 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**92.5 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**4.29 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**compressed | 10.0 | | 10.0 **10.0**32K | 10.0 | | 10.0 **10.0**head | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**113.4 | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**113.4, | 10.0 | | 10.0 **10.0**113.5, | 10.0 | | 10.0 **10.0**113.5, | 10.0 | | 10.0 **10.0**113.4, | 10.0 | | 10.0 **10.0**113.3 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**102.2 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**4.08 | 10.0 | | 10.0 **10.0**|
 
-The compressed head improved decode by **11.7%** and wall throughput by **10.5%** despite a 4.9% reduction in tau. This clears the raw 4.8% margin that gfx1151 needs to move 38.2 past 40 tok/s, but architecture transfer remains an inference until measured on gfx1151.
+The | 10.0 | | 10.0 **10.0**compressed | 10.0 | | 10.0 **10.0**head | 10.0 | | 10.0 **10.0**improved | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0****11.7%** | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**wall | 10.0 | | 10.0 **10.0**throughput | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0****10.5%** | 10.0 | | 10.0 **10.0**despite | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**4.9% | 10.0 | | 10.0 **10.0**reduction | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**tau. | 10.0 | | 10.0 **10.0**This | 10.0 | | 10.0 **10.0**clears | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**raw | 10.0 | | 10.0 **10.0**4.8% | 10.0 | | 10.0 **10.0**margin | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**gfx1151 | 10.0 | | 10.0 **10.0**needs | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**move | 10.0 | | 10.0 **10.0**38.2 | 10.0 | | 10.0 **10.0**past | 10.0 | | 10.0 **10.0**40 | 10.0 | | 10.0 **10.0**tok/s, | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**architecture | 10.0 | | 10.0 **10.0**transfer | 10.0 | | 10.0 **10.0**remains | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**inference | 10.0 | | 10.0 **10.0**until | 10.0 | | 10.0 **10.0**measured | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**gfx1151.
 
-An earlier local A/B row named `mtp-cvs32k-gfx1201.json` was rejected: the target was a symlink, model-path canonicalization selected the original adjacent sidecar, and the daemon log proved the compressed head did not load. The accepted compressed result is `mtp-cvs32k-gfx1201-r2.json`; its target is a hardlink and the daemon log names the compressed sidecar explicitly.
+An | 10.0 | | 10.0 **10.0**earlier | 10.0 | | 10.0 **10.0**local | 10.0 | | 10.0 **10.0**A/B | 10.0 | | 10.0 **10.0**row | 10.0 | | 10.0 **10.0**named | 10.0 | | 10.0 **10.0**`mtp-cvs32k-gfx1201.json` | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**rejected: | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**target | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**symlink, | 10.0 | | 10.0 **10.0**model-path | 10.0 | | 10.0 **10.0**canonicalization | 10.0 | | 10.0 **10.0**selected | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**original | 10.0 | | 10.0 **10.0**adjacent | 10.0 | | 10.0 **10.0**sidecar, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**daemon | 10.0 | | 10.0 **10.0**log | 10.0 | | 10.0 **10.0**proved | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**compressed | 10.0 | | 10.0 **10.0**head | 10.0 | | 10.0 **10.0**did | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**load. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**accepted | 10.0 | | 10.0 **10.0**compressed | 10.0 | | 10.0 **10.0**result | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**`mtp-cvs32k-gfx1201-r2.json`; | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**target | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**hardlink | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**daemon | 10.0 | | 10.0 **10.0**log | 10.0 | | 10.0 **10.0**names | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**compressed | 10.0 | | 10.0 **10.0**sidecar | 10.0 | | 10.0 **10.0**explicitly.
 
-## Decoded-output check
+## | 10.0 | | 10.0 **10.0**Decoded-output | 10.0 | | 10.0 **10.0**check
 
-A separate five-prompt greedy battery used the compressed sidecar with K7 and graphs off. All five turns stopped naturally with `mtp=true`, no empty output, no runaway, and no attractor. The visible answers contained:
+A | 10.0 | | 10.0 **10.0**separate | 10.0 | | 10.0 **10.0**five-prompt | 10.0 | | 10.0 **10.0**greedy | 10.0 | | 10.0 **10.0**battery | 10.0 | | 10.0 **10.0**used | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**compressed | 10.0 | | 10.0 **10.0**sidecar | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**K7 | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**graphs | 10.0 | | 10.0 **10.0**off. | 10.0 | | 10.0 **10.0**All | 10.0 | | 10.0 **10.0**five | 10.0 | | 10.0 **10.0**turns | 10.0 | | 10.0 **10.0**stopped | 10.0 | | 10.0 **10.0**naturally | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**`mtp=true`, | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**empty | 10.0 | | 10.0 **10.0**output, | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**runaway, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**attractor. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**visible | 10.0 | | 10.0 **10.0**answers | 10.0 | | 10.0 **10.0**contained:
 
-- a correct stable merge of two sorted lists,
-- the correct 210-mile calculation,
-- an accurate explanation of seasons,
-- a coherent lighthouse story,
-- five concrete maintainability practices.
+- | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**correct | 10.0 | | 10.0 **10.0**stable | 10.0 | | 10.0 **10.0**merge | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**two | 10.0 | | 10.0 **10.0**sorted | 10.0 | | 10.0 **10.0**lists,
+- | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**correct | 10.0 | | 10.0 **10.0**210-mile | 10.0 | | 10.0 **10.0**calculation,
+- | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**accurate | 10.0 | | 10.0 **10.0**explanation | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**seasons,
+- | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**coherent | 10.0 | | 10.0 **10.0**lighthouse | 10.0 | | 10.0 **10.0**story,
+- | 10.0 | | 10.0 **10.0**five | 10.0 | | 10.0 **10.0**concrete | 10.0 | | 10.0 **10.0**maintainability | 10.0 | | 10.0 **10.0**practices.
 
 Evidence:
 
-- `/home/kaden/qcal/mtp-cvs32k-full-gfx1201.json`
-- `/home/kaden/qcal/mtp-cvs32k-gfx1201-r2.json`
-- `/home/kaden/qcal/mtp-cvs32k-battery-gfx1201.json`
-- `/home/kaden/qcal/qwen3.8-27b.mtp-cvs32k`
-- `/home/kaden/qcal/q38-mtp-vocab-32768.json`
-- `/home/kaden/qcal/q38-mtp-output-corpus.jsonl`
+- | 10.0 | | 10.0 **10.0**`/home/kaden/qcal/mtp-cvs32k-full-gfx1201.json`
+- | 10.0 | | 10.0 **10.0**`/home/kaden/qcal/mtp-cvs32k-gfx1201-r2.json`
+- | 10.0 | | 10.0 **10.0**`/home/kaden/qcal/mtp-cvs32k-battery-gfx1201.json`
+- | 10.0 | | 10.0 **10.0**`/home/kaden/qcal/qwen3.8-27b.mtp-cvs32k`
+- | 10.0 | | 10.0 **10.0**`/home/kaden/qcal/q38-mtp-vocab-32768.json`
+- | 10.0 | | 10.0 **10.0**`/home/kaden/qcal/q38-mtp-output-corpus.jsonl`
 
-The compressed sidecar and vocabulary map were also staged under `/home/kaden/qcal/` on `hipx`. Direct gfx1151 A/B and the 40 tok/s claim remain blocked while `hipx` reports gfx1100 link-down and `dstate=16`.
+The | 10.0 | | 10.0 **10.0**compressed | 10.0 | | 10.0 **10.0**sidecar | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**vocabulary | 10.0 | | 10.0 **10.0**map | 10.0 | | 10.0 **10.0**were | 10.0 | | 10.0 **10.0**also | 10.0 | | 10.0 **10.0**staged | 10.0 | | 10.0 **10.0**under | 10.0 | | 10.0 **10.0**`/home/kaden/qcal/` | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**`hipx`. | 10.0 | | 10.0 **10.0**Direct | 10.0 | | 10.0 **10.0**gfx1151 | 10.0 | | 10.0 **10.0**A/B | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**40 | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**claim | 10.0 | | 10.0 **10.0**remain | 10.0 | | 10.0 **10.0**blocked | 10.0 | | 10.0 **10.0**while | 10.0 | | 10.0 **10.0**`hipx` | 10.0 | | 10.0 **10.0**reports | 10.0 | | 10.0 **10.0**gfx1100 | 10.0 | | 10.0 **10.0**link-down | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**`dstate=16`.

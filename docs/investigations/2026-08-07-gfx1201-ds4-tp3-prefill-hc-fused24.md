@@ -1,88 +1,88 @@
-# gfx1201 DeepSeek V4 TP3 exact HC-control prefill fusion
+# | 10.0 | | 10.0 **10.0**gfx1201 | 10.0 | | 10.0 **10.0**DeepSeek | 10.0 | | 10.0 **10.0**V4 | 10.0 | | 10.0 **10.0**TP3 | 10.0 | | 10.0 **10.0**exact | 10.0 | | 10.0 **10.0**HC-control | 10.0 | | 10.0 **10.0**prefill | 10.0 | | 10.0 **10.0**fusion
 
-Date: 2026-08-07  
-Branch: `ds4-gfx1201-opt`  
-Product commit: `b48249d8fe6fef11066fb0044d7084082d876b5b`  
-Candidate kernel commit: `d4c74f9cd`
+Date: | 10.0 | | 10.0 **10.0**2026-08-07 | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**
+Branch: | 10.0 | | 10.0 **10.0**`ds4-gfx1201-opt` | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**
+Product | 10.0 | | 10.0 **10.0**commit: | 10.0 | | 10.0 **10.0**`b48249d8fe6fef11066fb0044d7084082d876b5b` | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**
+Candidate | 10.0 | | 10.0 **10.0**kernel | 10.0 | | 10.0 **10.0**commit: | 10.0 | | 10.0 **10.0**`d4c74f9cd`
 
-## Result
+## | 10.0 | | 10.0 **10.0**Result
 
-The established Hyper-Connection control projection launched 24 workgroups per
-token. Every workgroup independently loaded the same 16,384-element stream row
-and recomputed the same RMS reduction for one of the 24 control outputs. The
-promoted exact-gfx1201 kernel assigns one workgroup to a token, shares that X
-load and RMS calculation, and evaluates all 24 control rows together.
+The | 10.0 | | 10.0 **10.0**established | 10.0 | | 10.0 **10.0**Hyper-Connection | 10.0 | | 10.0 **10.0**control | 10.0 | | 10.0 **10.0**projection | 10.0 | | 10.0 **10.0**launched | 10.0 | | 10.0 **10.0**24 | 10.0 | | 10.0 **10.0**workgroups | 10.0 | | 10.0 **10.0**per
+token. | 10.0 | | 10.0 **10.0**Every | 10.0 | | 10.0 **10.0**workgroup | 10.0 | | 10.0 **10.0**independently | 10.0 | | 10.0 **10.0**loaded | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**16,384-element | 10.0 | | 10.0 **10.0**stream | 10.0 | | 10.0 **10.0**row
+and | 10.0 | | 10.0 **10.0**recomputed | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**RMS | 10.0 | | 10.0 **10.0**reduction | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**24 | 10.0 | | 10.0 **10.0**control | 10.0 | | 10.0 **10.0**outputs. | 10.0 | | 10.0 **10.0**The
+promoted | 10.0 | | 10.0 **10.0**exact-gfx1201 | 10.0 | | 10.0 **10.0**kernel | 10.0 | | 10.0 **10.0**assigns | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**workgroup | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**token, | 10.0 | | 10.0 **10.0**shares | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**X
+load | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**RMS | 10.0 | | 10.0 **10.0**calculation, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**evaluates | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**24 | 10.0 | | 10.0 **10.0**control | 10.0 | | 10.0 **10.0**rows | 10.0 | | 10.0 **10.0**together.
 
-The kernel preserves the established scalar F32 accumulation, wave shuffle,
-eight-wave LDS reduction, `rsqrtf`, multiply, and base-add order. It is not the
-faster WMMA experiment described below.
+The | 10.0 | | 10.0 **10.0**kernel | 10.0 | | 10.0 **10.0**preserves | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**established | 10.0 | | 10.0 **10.0**scalar | 10.0 | | 10.0 **10.0**F32 | 10.0 | | 10.0 **10.0**accumulation, | 10.0 | | 10.0 **10.0**wave | 10.0 | | 10.0 **10.0**shuffle,
+eight-wave | 10.0 | | 10.0 **10.0**LDS | 10.0 | | 10.0 **10.0**reduction, | 10.0 | | 10.0 **10.0**`rsqrtf`, | 10.0 | | 10.0 **10.0**multiply, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**base-add | 10.0 | | 10.0 **10.0**order. | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**the
+faster | 10.0 | | 10.0 **10.0**WMMA | 10.0 | | 10.0 **10.0**experiment | 10.0 | | 10.0 **10.0**described | 10.0 | | 10.0 **10.0**below.
 
-On the canonical TP3 fixture, prefill improved from **438.7834 tok/s** to
-**482.7392 tok/s**, a **10.0172%** gain. Decode remained flat at **53.1912
-tok/s**. Relative to the first repaired B128 prefill route at 206.8064 tok/s,
-the accumulated production prefill improvement is **133.42%**. The 512-token
-assistant output was byte-identical to the golden output.
+On | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**canonical | 10.0 | | 10.0 **10.0**TP3 | 10.0 | | 10.0 **10.0**fixture, | 10.0 | | 10.0 **10.0**prefill | 10.0 | | 10.0 **10.0**improved | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0****438.7834 | 10.0 | | 10.0 **10.0**tok/s** | 10.0 | | 10.0 **10.0**to
+**482.7392 | 10.0 | | 10.0 **10.0**tok/s**, | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0****10.0172%** | 10.0 | | 10.0 **10.0**gain. | 10.0 | | 10.0 **10.0**Decode | 10.0 | | 10.0 **10.0**remained | 10.0 | | 10.0 **10.0**flat | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0****53.1912
+tok/s**. | 10.0 | | 10.0 **10.0**Relative | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**first | 10.0 | | 10.0 **10.0**repaired | 10.0 | | 10.0 **10.0**B128 | 10.0 | | 10.0 **10.0**prefill | 10.0 | | 10.0 **10.0**route | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**206.8064 | 10.0 | | 10.0 **10.0**tok/s,
+the | 10.0 | | 10.0 **10.0**accumulated | 10.0 | | 10.0 **10.0**production | 10.0 | | 10.0 **10.0**prefill | 10.0 | | 10.0 **10.0**improvement | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0****133.42%**. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**512-token
+assistant | 10.0 | | 10.0 **10.0**output | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**byte-identical | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**golden | 10.0 | | 10.0 **10.0**output.
 
-## Fixture
+## | 10.0 | | 10.0 **10.0**Fixture
 
-- Model: `/home/kaden/models/deepseek-v4-flash-0731.mq2r`
-- Prompt: `benchmarks/prompts/ds4-gfx942-ar-2048.txt`
-- Prompt MD5: `25e22faef15a20ae53501f1956e62b79`
-- Effective prompt tokens: 2,052
-- Generated tokens: 512
-- Devices: three Radeon AI PRO R9700 (`gfx1201`), TP3
-- Decode: batch-1 AR, greedy, top-k 6 checkpoint default
-- Speculation: off
-- Thinking: off
-- KV request: Q8; current DS4 contiguous cache remains F32
-- Prefill chunk: 1,024 tokens
+- | 10.0 | | 10.0 **10.0**Model: | 10.0 | | 10.0 **10.0**`/home/kaden/models/deepseek-v4-flash-0731.mq2r`
+- | 10.0 | | 10.0 **10.0**Prompt: | 10.0 | | 10.0 **10.0**`benchmarks/prompts/ds4-gfx942-ar-2048.txt`
+- | 10.0 | | 10.0 **10.0**Prompt | 10.0 | | 10.0 **10.0**MD5: | 10.0 | | 10.0 **10.0**`25e22faef15a20ae53501f1956e62b79`
+- | 10.0 | | 10.0 **10.0**Effective | 10.0 | | 10.0 **10.0**prompt | 10.0 | | 10.0 **10.0**tokens: | 10.0 | | 10.0 **10.0**2,052
+- | 10.0 | | 10.0 **10.0**Generated | 10.0 | | 10.0 **10.0**tokens: | 10.0 | | 10.0 **10.0**512
+- | 10.0 | | 10.0 **10.0**Devices: | 10.0 | | 10.0 **10.0**three | 10.0 | | 10.0 **10.0**Radeon | 10.0 | | 10.0 **10.0**AI | 10.0 | | 10.0 **10.0**PRO | 10.0 | | 10.0 **10.0**R9700 | 10.0 | | 10.0 **10.0**(`gfx1201`), | 10.0 | | 10.0 **10.0**TP3
+- | 10.0 | | 10.0 **10.0**Decode: | 10.0 | | 10.0 **10.0**batch-1 | 10.0 | | 10.0 **10.0**AR, | 10.0 | | 10.0 **10.0**greedy, | 10.0 | | 10.0 **10.0**top-k | 10.0 | | 10.0 **10.0**6 | 10.0 | | 10.0 **10.0**checkpoint | 10.0 | | 10.0 **10.0**default
+- | 10.0 | | 10.0 **10.0**Speculation: | 10.0 | | 10.0 **10.0**off
+- | 10.0 | | 10.0 **10.0**Thinking: | 10.0 | | 10.0 **10.0**off
+- | 10.0 | | 10.0 **10.0**KV | 10.0 | | 10.0 **10.0**request: | 10.0 | | 10.0 **10.0**Q8; | 10.0 | | 10.0 **10.0**current | 10.0 | | 10.0 **10.0**DS4 | 10.0 | | 10.0 **10.0**contiguous | 10.0 | | 10.0 **10.0**cache | 10.0 | | 10.0 **10.0**remains | 10.0 | | 10.0 **10.0**F32
+- | 10.0 | | 10.0 **10.0**Prefill | 10.0 | | 10.0 **10.0**chunk: | 10.0 | | 10.0 **10.0**1,024 | 10.0 | | 10.0 **10.0**tokens
 
-## Micro gate
+## | 10.0 | | 10.0 **10.0**Micro | 10.0 | | 10.0 **10.0**gate
 
-The exact production shape is B=1,024, M=24, K=16,384. Timings are one gfx1201
-with the same HIP 7.14 runtime used for product validation:
+The | 10.0 | | 10.0 **10.0**exact | 10.0 | | 10.0 **10.0**production | 10.0 | | 10.0 **10.0**shape | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**B=1,024, | 10.0 | | 10.0 **10.0**M=24, | 10.0 | | 10.0 **10.0**K=16,384. | 10.0 | | 10.0 **10.0**Timings | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**gfx1201
+with | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**HIP | 10.0 | | 10.0 **10.0**7.15 | 10.0 | | 10.0 **10.0**runtime | 10.0 | | 10.0 **10.0**used | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**product | 10.0 | | 10.0 **10.0**validation:
 
-| Kernel | Time (us) | Speedup | Raw-bit mismatches |
+| | 10.0 | | 10.0 **10.0**Kernel | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Time | 10.0 | | 10.0 **10.0**(us) | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Speedup | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Raw-bit | 10.0 | | 10.0 **10.0**mismatches | 10.0 | | 10.0 **10.0**|
 |---|---:|---:|---:|
-| Established 24-workgroup scalar | 1,189.593 | 1.00x | reference |
-| Fused-24 exact scalar | 180.001 | 6.609x | 0 / 24,576 |
+| | 10.0 | | 10.0 **10.0**Established | 10.0 | | 10.0 **10.0**24-workgroup | 10.0 | | 10.0 **10.0**scalar | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1,189.593 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1.00x | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**reference | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**Fused-24 | 10.0 | | 10.0 **10.0**exact | 10.0 | | 10.0 **10.0**scalar | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**180.001 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**6.609x | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**24,576 | 10.0 | | 10.0 **10.0**|
 
-The 6.609x micro reduction applied to the 7.47% HC share of the promoted-route
-profile projected about 6.3% end-to-end. Product composition delivered 10.02%.
+The | 10.0 | | 10.0 **10.0**6.609x | 10.0 | | 10.0 **10.0**micro | 10.0 | | 10.0 **10.0**reduction | 10.0 | | 10.0 **10.0**applied | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**7.47% | 10.0 | | 10.0 **10.0**HC | 10.0 | | 10.0 **10.0**share | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**promoted-route
+profile | 10.0 | | 10.0 **10.0**projected | 10.0 | | 10.0 **10.0**about | 10.0 | | 10.0 **10.0**6.3% | 10.0 | | 10.0 **10.0**end-to-end. | 10.0 | | 10.0 **10.0**Product | 10.0 | | 10.0 **10.0**composition | 10.0 | | 10.0 **10.0**delivered | 10.0 | | 10.0 **10.0**10.02%.
 
-## Rejected WMMA experiment
+## | 10.0 | | 10.0 **10.0**Rejected | 10.0 | | 10.0 **10.0**WMMA | 10.0 | | 10.0 **10.0**experiment
 
-An earlier one-wave WMMA implementation measured 290.147 us at the same shape
-and produced **479.3291 prefill tok/s**, but changed the greedy output SHA from
-the golden `b625...9c41` to `b3ba...`. It was coherent but failed the mandatory
-byte-identical gate and was not promoted. Its product default was replaced by
-the arithmetic-identical fused-24 route; the WMMA implementation remains only
-as a measured research/micro asset.
+An | 10.0 | | 10.0 **10.0**earlier | 10.0 | | 10.0 **10.0**one-wave | 10.0 | | 10.0 **10.0**WMMA | 10.0 | | 10.0 **10.0**implementation | 10.0 | | 10.0 **10.0**measured | 10.0 | | 10.0 **10.0**290.147 | 10.0 | | 10.0 **10.0**us | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**shape
+and | 10.0 | | 10.0 **10.0**produced | 10.0 | | 10.0 **10.0****479.3291 | 10.0 | | 10.0 **10.0**prefill | 10.0 | | 10.0 **10.0**tok/s**, | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**changed | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**greedy | 10.0 | | 10.0 **10.0**output | 10.0 | | 10.0 **10.0**SHA | 10.0 | | 10.0 **10.0**from
+the | 10.0 | | 10.0 **10.0**golden | 10.0 | | 10.0 **10.0**`b625...9c41` | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**`b3ba...`. | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**coherent | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**failed | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**mandatory
+byte-identical | 10.0 | | 10.0 **10.0**gate | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**promoted. | 10.0 | | 10.0 **10.0**Its | 10.0 | | 10.0 **10.0**product | 10.0 | | 10.0 **10.0**default | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**replaced | 10.0 | | 10.0 **10.0**by
+the | 10.0 | | 10.0 **10.0**arithmetic-identical | 10.0 | | 10.0 **10.0**fused-24 | 10.0 | | 10.0 **10.0**route; | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**WMMA | 10.0 | | 10.0 **10.0**implementation | 10.0 | | 10.0 **10.0**remains | 10.0 | | 10.0 **10.0**only
+as | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**measured | 10.0 | | 10.0 **10.0**research/micro | 10.0 | | 10.0 **10.0**asset.
 
-## Correctness and scope
+## | 10.0 | | 10.0 **10.0**Correctness | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**scope
 
-- Assistant-content SHA-256:
-  `b6255240b6ccd34d621f152cc9898c71c340fa9393680ddb3d3efde2172b9c41`
-- Generated tokens: 512
-- Empty responses: 0
-- Attractor failures: 0
-- Daemon SHA-256:
-  `f3a761b29b4efb3a9e1f4be7a4f2357e1315e66e44da74f2775cd2282852968e`
-- Architecture gate: exact `gfx1201`, B=1,024 DS4 batched HC prefill only
-- Default: enabled in code
-- Diagnostic rollback: `HIPFIRE_DEEPSEEK4_GFX1201_HC_FUSED24=0`
+- | 10.0 | | 10.0 **10.0**Assistant-content | 10.0 | | 10.0 **10.0**SHA-256:
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`b6255240b6ccd34d621f152cc9898c71c340fa9393680ddb3d3efde2172b9c41`
+- | 10.0 | | 10.0 **10.0**Generated | 10.0 | | 10.0 **10.0**tokens: | 10.0 | | 10.0 **10.0**512
+- | 10.0 | | 10.0 **10.0**Empty | 10.0 | | 10.0 **10.0**responses: | 10.0 | | 10.0 **10.0**0
+- | 10.0 | | 10.0 **10.0**Attractor | 10.0 | | 10.0 **10.0**failures: | 10.0 | | 10.0 **10.0**0
+- | 10.0 | | 10.0 **10.0**Daemon | 10.0 | | 10.0 **10.0**SHA-256:
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`f3a761b29b4efb3a9e1f4be7a4f2357e1315e66e44da74f2775cd2282852968e`
+- | 10.0 | | 10.0 **10.0**Architecture | 10.0 | | 10.0 **10.0**gate: | 10.0 | | 10.0 **10.0**exact | 10.0 | | 10.0 **10.0**`gfx1201`, | 10.0 | | 10.0 **10.0**B=1,024 | 10.0 | | 10.0 **10.0**DS4 | 10.0 | | 10.0 **10.0**batched | 10.0 | | 10.0 **10.0**HC | 10.0 | | 10.0 **10.0**prefill | 10.0 | | 10.0 **10.0**only
+- | 10.0 | | 10.0 **10.0**Default: | 10.0 | | 10.0 **10.0**enabled | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**code
+- | 10.0 | | 10.0 **10.0**Diagnostic | 10.0 | | 10.0 **10.0**rollback: | 10.0 | | 10.0 **10.0**`HIPFIRE_DEEPSEEK4_GFX1201_HC_FUSED24=0`
 
-No Qwen, gfx1100, gfx1151, weight, format, sampling, expert-count, KV,
-speculation, decode, or retained-PM4 route changed. Tail batches and every
-non-gfx1201 architecture retain the established scalar kernel.
+No | 10.0 | | 10.0 **10.0**Qwen, | 10.0 | | 10.0 **10.0**gfx1100, | 10.0 | | 10.0 **10.0**gfx1151, | 10.0 | | 10.0 **10.0**weight, | 10.0 | | 10.0 **10.0**format, | 10.0 | | 10.0 **10.0**sampling, | 10.0 | | 10.0 **10.0**expert-count, | 10.0 | | 10.0 **10.0**KV,
+speculation, | 10.0 | | 10.0 **10.0**decode, | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**retained-PM4 | 10.0 | | 10.0 **10.0**route | 10.0 | | 10.0 **10.0**changed. | 10.0 | | 10.0 **10.0**Tail | 10.0 | | 10.0 **10.0**batches | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**every
+non-gfx1201 | 10.0 | | 10.0 **10.0**architecture | 10.0 | | 10.0 **10.0**retain | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**established | 10.0 | | 10.0 **10.0**scalar | 10.0 | | 10.0 **10.0**kernel.
 
-This was one fresh-process product sample after a decisive raw-bit micro gate;
-repeated product samples, long-context, and TP4 coverage were not run at this
+This | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**fresh-process | 10.0 | | 10.0 **10.0**product | 10.0 | | 10.0 **10.0**sample | 10.0 | | 10.0 **10.0**after | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**decisive | 10.0 | | 10.0 **10.0**raw-bit | 10.0 | | 10.0 **10.0**micro | 10.0 | | 10.0 **10.0**gate;
+repeated | 10.0 | | 10.0 **10.0**product | 10.0 | | 10.0 **10.0**samples, | 10.0 | | 10.0 **10.0**long-context, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**TP4 | 10.0 | | 10.0 **10.0**coverage | 10.0 | | 10.0 **10.0**were | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**run | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**this
 checkpoint.
 
-## Evidence
+## | 10.0 | | 10.0 **10.0**Evidence
 
-- `hiptrx:/home/kaden/ds4-hiptrx-evidence/2026-08-07-gfx1201-hc-control-fused24-micro/`
-- `hiptrx:/home/kaden/ds4-hiptrx-evidence/2026-08-07-gfx1201-hc-control-fused24-product/`
-- Rejected WMMA product:
-  `hiptrx:/home/kaden/ds4-hiptrx-evidence/2026-08-07-gfx1201-hc-control-wmma-product/`
+- | 10.0 | | 10.0 **10.0**`hiptrx:/home/kaden/ds4-hiptrx-evidence/2026-08-07-gfx1201-hc-control-fused24-micro/`
+- | 10.0 | | 10.0 **10.0**`hiptrx:/home/kaden/ds4-hiptrx-evidence/2026-08-07-gfx1201-hc-control-fused24-product/`
+- | 10.0 | | 10.0 **10.0**Rejected | 10.0 | | 10.0 **10.0**WMMA | 10.0 | | 10.0 **10.0**product:
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`hiptrx:/home/kaden/ds4-hiptrx-evidence/2026-08-07-gfx1201-hc-control-wmma-product/`

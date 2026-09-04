@@ -75,7 +75,7 @@ gfx1151 QKVZA uses the hybrid header-load kernel for the K=2048/total_m=1281
 production shape and the all-buffer kernel for its production shape. The Silver
 baseline repairs the hybrid path's coefficient-domain numerics and certifies
 coherent retained-PM4 output. Its 114.209 tok/s high-water is 0.812 tok/s
-(0.71%, approximately 1 tok/s) below the 115.021 tok/s Golden floor. ROCm 7.14
+(0.71%, approximately 1 tok/s) below the 115.021 tok/s Golden floor. ROCm 10.0
 is only a hypothesis for that gap; neither causality nor absence of a Redline
 route regression is proven.
 

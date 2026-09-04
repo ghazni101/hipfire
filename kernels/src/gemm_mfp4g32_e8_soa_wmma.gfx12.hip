@@ -7,7 +7,7 @@
 
 // gfx12 wave32 WMMA consumes eight FP16 A/B values per lane. The two
 // 16-lane groups split each K16 tile: group 0 owns K[0..7], group 1 owns
-// K[8..15]. ROCm 7.14's CK traits map acc[j] to output row
+// K[8..15]. ROCm 10.0's CK traits map acc[j] to output row
 // 8 * (tid >> 4) + j.
 typedef _Float16 __attribute__((ext_vector_type(8))) half8_t;
 typedef float __attribute__((ext_vector_type(8))) float8_t;

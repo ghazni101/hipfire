@@ -1,125 +1,125 @@
-# Amendment: the mq4c prefill gap is tuning debt, not a container cost
+# | 10.0 | | 10.0 **10.0**Amendment: | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**mq4c | 10.0 | | 10.0 **10.0**prefill | 10.0 | | 10.0 **10.0**gap | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**tuning | 10.0 | | 10.0 **10.0**debt, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**container | 10.0 | | 10.0 **10.0**cost
 
-- **Date:** 2026-08-18
-- **Lifecycle:** `historical`
-- **Amends:** [`2026-08-18-qwen38-27b-mq4c-qt45-kld-and-throughput.md`](2026-08-18-qwen38-27b-mq4c-qt45-kld-and-throughput.md)
-  (unchanged; this file corrects its framing of § 3)
-- **Host:** k9lin, gfx1201, HIP 7.14
-- **Harness:** `crates/rdna-compute/examples/bench_mq4c_slab_alignment.rs` (new)
+- | 10.0 | | 10.0 **10.0****Date:** | 10.0 | | 10.0 **10.0**2026-08-18
+- | 10.0 | | 10.0 **10.0****Lifecycle:** | 10.0 | | 10.0 **10.0**`historical`
+- | 10.0 | | 10.0 **10.0****Amends:** | 10.0 | | 10.0 **10.0**[`2026-08-18-qwen38-27b-mq4c-qt45-kld-and-throughput.md`](2026-08-18-qwen38-27b-mq4c-qt45-kld-and-throughput.md)
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**(unchanged; | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**file | 10.0 | | 10.0 **10.0**corrects | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**framing | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**§ | 10.0 | | 10.0 **10.0**3)
+- | 10.0 | | 10.0 **10.0****Host:** | 10.0 | | 10.0 **10.0**k9lin, | 10.0 | | 10.0 **10.0**gfx1201, | 10.0 | | 10.0 **10.0**HIP | 10.0 | | 10.0 **10.0**7.15
+- | 10.0 | | 10.0 **10.0****Harness:** | 10.0 | | 10.0 **10.0**`crates/rdna-compute/examples/bench_mq4c_slab_alignment.rs` | 10.0 | | 10.0 **10.0**(new)
 
-## 1 · What the original checkpoint got wrong
+## | 10.0 | | 10.0 **10.0**1 | 10.0 | | 10.0 **10.0**· | 10.0 | | 10.0 **10.0**What | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**original | 10.0 | | 10.0 **10.0**checkpoint | 10.0 | | 10.0 **10.0**got | 10.0 | | 10.0 **10.0**wrong
 
-§ 3 reported "prefill is genuinely ~2.9% slower than v1" as though it were a
-property of the 132 B container. That framing is wrong, and the comparison it
-implies is not like-for-like.
+§ | 10.0 | | 10.0 **10.0**3 | 10.0 | | 10.0 **10.0**reported | 10.0 | | 10.0 **10.0**"prefill | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**genuinely | 10.0 | | 10.0 **10.0**~2.9% | 10.0 | | 10.0 **10.0**slower | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**v1" | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**though | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**were | 10.0 | | 10.0 **10.0**a
+property | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**132 | 10.0 | | 10.0 **10.0**B | 10.0 | | 10.0 **10.0**container. | 10.0 | | 10.0 **10.0**That | 10.0 | | 10.0 **10.0**framing | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**wrong, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**comparison | 10.0 | | 10.0 **10.0**it
+implies | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**like-for-like.
 
-|family|kernel files|residual-GEMM variants|
+|family|kernel | 10.0 | | 10.0 **10.0**files|residual-GEMM | 10.0 | | 10.0 **10.0**variants|
 |---|---|---|
-|`hfq4g256` (qt=13)|169|**54**|
-|`mq4g256v2` (qt=44)|13|3|
-|`mq4cg256` (qt=45)|13|3|
+|`hfq4g256` | 10.0 | | 10.0 **10.0**(qt=13)|169|**54**|
+|`mq4g256v2` | 10.0 | | 10.0 **10.0**(qt=44)|13|3|
+|`mq4cg256` | 10.0 | | 10.0 **10.0**(qt=45)|13|3|
 
-v1's residual GEMM has been ground through 54 variants: `_k2`, `_k4`,
-`_ksplit`, `_ksplit_det`, `_kt`, `_mw`, `_wmma2`, seven `muse_*` gfx1100
-specialisations, four gfx942 MFMA revisions, and a nine-point gfx906 tile
-sweep (`x8` … `x64`). qt=44 and qt=45 each have exactly one WMMA kernel, one
-`_bt`, and one GEMV. The measurement was never "v1 container vs mq4c
-container" — it was a mature autotuned family against a first-pass port.
+v1's | 10.0 | | 10.0 **10.0**residual | 10.0 | | 10.0 **10.0**GEMM | 10.0 | | 10.0 **10.0**has | 10.0 | | 10.0 **10.0**been | 10.0 | | 10.0 **10.0**ground | 10.0 | | 10.0 **10.0**through | 10.0 | | 10.0 **10.0**54 | 10.0 | | 10.0 **10.0**variants: | 10.0 | | 10.0 **10.0**`_k2`, | 10.0 | | 10.0 **10.0**`_k4`,
+`_ksplit`, | 10.0 | | 10.0 **10.0**`_ksplit_det`, | 10.0 | | 10.0 **10.0**`_kt`, | 10.0 | | 10.0 **10.0**`_mw`, | 10.0 | | 10.0 **10.0**`_wmma2`, | 10.0 | | 10.0 **10.0**seven | 10.0 | | 10.0 **10.0**`muse_*` | 10.0 | | 10.0 **10.0**gfx1100
+specialisations, | 10.0 | | 10.0 **10.0**four | 10.0 | | 10.0 **10.0**gfx942 | 10.0 | | 10.0 **10.0**MFMA | 10.0 | | 10.0 **10.0**revisions, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**nine-point | 10.0 | | 10.0 **10.0**gfx906 | 10.0 | | 10.0 **10.0**tile
+sweep | 10.0 | | 10.0 **10.0**(`x8` | 10.0 | | 10.0 **10.0**… | 10.0 | | 10.0 **10.0**`x64`). | 10.0 | | 10.0 **10.0**qt=44 | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**qt=45 | 10.0 | | 10.0 **10.0**each | 10.0 | | 10.0 **10.0**have | 10.0 | | 10.0 **10.0**exactly | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**WMMA | 10.0 | | 10.0 **10.0**kernel, | 10.0 | | 10.0 **10.0**one
+`_bt`, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**GEMV. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**measurement | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**never | 10.0 | | 10.0 **10.0**"v1 | 10.0 | | 10.0 **10.0**container | 10.0 | | 10.0 **10.0**vs | 10.0 | | 10.0 **10.0**mq4c
+container" | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**mature | 10.0 | | 10.0 **10.0**autotuned | 10.0 | | 10.0 **10.0**family | 10.0 | | 10.0 **10.0**against | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**first-pass | 10.0 | | 10.0 **10.0**port.
 
-## 2 · The gap reproduces at kernel level, and is larger than 2.9%
+## | 10.0 | | 10.0 **10.0**2 | 10.0 | | 10.0 **10.0**· | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**gap | 10.0 | | 10.0 **10.0**reproduces | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**kernel | 10.0 | | 10.0 **10.0**level, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**larger | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**2.9%
 
-Isolated residual `_bt` GEMM, M = K = 5120, seeded logical weights encoded
-ONCE into both containers so the arms differ only by container. Device events,
-64 warmups, 200 launches/sample, 5 samples, arms interleaved, minimum is the
-lead statistic.
+Isolated | 10.0 | | 10.0 **10.0**residual | 10.0 | | 10.0 **10.0**`_bt` | 10.0 | | 10.0 **10.0**GEMM, | 10.0 | | 10.0 **10.0**M | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**K | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**5120, | 10.0 | | 10.0 **10.0**seeded | 10.0 | | 10.0 **10.0**logical | 10.0 | | 10.0 **10.0**weights | 10.0 | | 10.0 **10.0**encoded
+ONCE | 10.0 | | 10.0 **10.0**into | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**containers | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**arms | 10.0 | | 10.0 **10.0**differ | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**container. | 10.0 | | 10.0 **10.0**Device | 10.0 | | 10.0 **10.0**events,
+64 | 10.0 | | 10.0 **10.0**warmups, | 10.0 | | 10.0 **10.0**200 | 10.0 | | 10.0 **10.0**launches/sample, | 10.0 | | 10.0 **10.0**5 | 10.0 | | 10.0 **10.0**samples, | 10.0 | | 10.0 **10.0**arms | 10.0 | | 10.0 **10.0**interleaved, | 10.0 | | 10.0 **10.0**minimum | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the
+lead | 10.0 | | 10.0 **10.0**statistic.
 
-|batch|bt8 mq4c vs v1|bt12 mq4c vs v1|
+|batch|bt8 | 10.0 | | 10.0 **10.0**mq4c | 10.0 | | 10.0 **10.0**vs | 10.0 | | 10.0 **10.0**v1|bt12 | 10.0 | | 10.0 **10.0**mq4c | 10.0 | | 10.0 **10.0**vs | 10.0 | | 10.0 **10.0**v1|
 |---|---|---|
 |8|+11.97%|+5.75%|
 |12|+9.30%|+6.12%|
 |16|+11.18%|+5.08%|
 |32|+7.80%|+4.21%|
 
-Correctness gate passed first: rel-l2 **2.6e-4 (mq4c)** vs **9.6e-4 (v1)**
-against each container's own f64 host dequant. mq4c is ~3.7x MORE accurate,
-matching the earlier qt=44 GEMM parity result. This is not a fast-but-wrong
+Correctness | 10.0 | | 10.0 **10.0**gate | 10.0 | | 10.0 **10.0**passed | 10.0 | | 10.0 **10.0**first: | 10.0 | | 10.0 **10.0**rel-l2 | 10.0 | | 10.0 **10.0****2.6e-4 | 10.0 | | 10.0 **10.0**(mq4c)** | 10.0 | | 10.0 **10.0**vs | 10.0 | | 10.0 **10.0****9.6e-4 | 10.0 | | 10.0 **10.0**(v1)**
+against | 10.0 | | 10.0 **10.0**each | 10.0 | | 10.0 **10.0**container's | 10.0 | | 10.0 **10.0**own | 10.0 | | 10.0 **10.0**f64 | 10.0 | | 10.0 **10.0**host | 10.0 | | 10.0 **10.0**dequant. | 10.0 | | 10.0 **10.0**mq4c | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**~3.7x | 10.0 | | 10.0 **10.0**MORE | 10.0 | | 10.0 **10.0**accurate,
+matching | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**earlier | 10.0 | | 10.0 **10.0**qt=44 | 10.0 | | 10.0 **10.0**GEMM | 10.0 | | 10.0 **10.0**parity | 10.0 | | 10.0 **10.0**result. | 10.0 | | 10.0 **10.0**This | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**fast-but-wrong
 decode.
 
-## 3 · Three hypotheses, all falsified — do not re-run these
+## | 10.0 | | 10.0 **10.0**3 | 10.0 | | 10.0 **10.0**· | 10.0 | | 10.0 **10.0**Three | 10.0 | | 10.0 **10.0**hypotheses, | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**falsified | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**do | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**re-run | 10.0 | | 10.0 **10.0**these
 
-**(a) 16-byte load misalignment.** 132 % 16 == 4, so a 2-group slab (264 B)
-starts 8-byte aligned on odd slabs while v1's 272 B slab is always 16-byte
-aligned; the LDS staging loop issues `uint4v_t` (dwordx4) copies. Arithmetic
-checked out: 5 of 10 slabs misaligned at K=5120 vs 0 of 10 for v1.
+**(a) | 10.0 | | 10.0 **10.0**16-byte | 10.0 | | 10.0 **10.0**load | 10.0 | | 10.0 **10.0**misalignment.** | 10.0 | | 10.0 **10.0**132 | 10.0 | | 10.0 **10.0**% | 10.0 | | 10.0 **10.0**16 | 10.0 | | 10.0 **10.0**== | 10.0 | | 10.0 **10.0**4, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**2-group | 10.0 | | 10.0 **10.0**slab | 10.0 | | 10.0 **10.0**(264 | 10.0 | | 10.0 **10.0**B)
+starts | 10.0 | | 10.0 **10.0**8-byte | 10.0 | | 10.0 **10.0**aligned | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**odd | 10.0 | | 10.0 **10.0**slabs | 10.0 | | 10.0 **10.0**while | 10.0 | | 10.0 **10.0**v1's | 10.0 | | 10.0 **10.0**272 | 10.0 | | 10.0 **10.0**B | 10.0 | | 10.0 **10.0**slab | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**always | 10.0 | | 10.0 **10.0**16-byte
+aligned; | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**LDS | 10.0 | | 10.0 **10.0**staging | 10.0 | | 10.0 **10.0**loop | 10.0 | | 10.0 **10.0**issues | 10.0 | | 10.0 **10.0**`uint4v_t` | 10.0 | | 10.0 **10.0**(dwordx4) | 10.0 | | 10.0 **10.0**copies. | 10.0 | | 10.0 **10.0**Arithmetic
+checked | 10.0 | | 10.0 **10.0**out: | 10.0 | | 10.0 **10.0**5 | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**10 | 10.0 | | 10.0 **10.0**slabs | 10.0 | | 10.0 **10.0**misaligned | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**K=5120 | 10.0 | | 10.0 **10.0**vs | 10.0 | | 10.0 **10.0**0 | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**10 | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**v1.
 
-REFUTED because those kernels are not on the dispatch path. The compiled
-module list from the scoring run contains only
-`gemm_mq4cg256_residual_wmma_gfx12_bt{8,12}.hsaco` and the qkv/qkvza/gate_up
-`_bt` siblings. The LDS-staged `[16][264]` variants never compiled. The `_bt`
-kernels that DO run use 4-byte scalar loads (`gp+4+(kt+n)*8+kg*4`), which are
-4-byte aligned in both containers. A planned 528 B-slab fix was cancelled
-before it was written.
+REFUTED | 10.0 | | 10.0 **10.0**because | 10.0 | | 10.0 **10.0**those | 10.0 | | 10.0 **10.0**kernels | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**dispatch | 10.0 | | 10.0 **10.0**path. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**compiled
+module | 10.0 | | 10.0 **10.0**list | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**scoring | 10.0 | | 10.0 **10.0**run | 10.0 | | 10.0 **10.0**contains | 10.0 | | 10.0 **10.0**only
+`gemm_mq4cg256_residual_wmma_gfx12_bt{8,12}.hsaco` | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**qkv/qkvza/gate_up
+`_bt` | 10.0 | | 10.0 **10.0**siblings. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**LDS-staged | 10.0 | | 10.0 **10.0**`[16][264]` | 10.0 | | 10.0 **10.0**variants | 10.0 | | 10.0 **10.0**never | 10.0 | | 10.0 **10.0**compiled. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**`_bt`
+kernels | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**DO | 10.0 | | 10.0 **10.0**run | 10.0 | | 10.0 **10.0**use | 10.0 | | 10.0 **10.0**4-byte | 10.0 | | 10.0 **10.0**scalar | 10.0 | | 10.0 **10.0**loads | 10.0 | | 10.0 **10.0**(`gp+4+(kt+n)*8+kg*4`), | 10.0 | | 10.0 **10.0**which | 10.0 | | 10.0 **10.0**are
+4-byte | 10.0 | | 10.0 **10.0**aligned | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**containers. | 10.0 | | 10.0 **10.0**A | 10.0 | | 10.0 **10.0**planned | 10.0 | | 10.0 **10.0**528 | 10.0 | | 10.0 **10.0**B-slab | 10.0 | | 10.0 **10.0**fix | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**cancelled
+before | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**written.
 
-**(b) Redundant fp16 round trip.** The header decode reads
-`(_Float16)__half2float(__ushort_as_half(u16))` — f16 -> f32 -> f16 — at 40
-sites across 10 mq4c/v2 kernels, against v1's single `v_cvt_f16_f32`.
+**(b) | 10.0 | | 10.0 **10.0**Redundant | 10.0 | | 10.0 **10.0**fp16 | 10.0 | | 10.0 **10.0**round | 10.0 | | 10.0 **10.0**trip.** | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**header | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**reads
+`(_Float16)__half2float(__ushort_as_half(u16))` | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**f16 | 10.0 | | 10.0 **10.0**-> | 10.0 | | 10.0 **10.0**f32 | 10.0 | | 10.0 **10.0**-> | 10.0 | | 10.0 **10.0**f16 | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**40
+sites | 10.0 | | 10.0 **10.0**across | 10.0 | | 10.0 **10.0**10 | 10.0 | | 10.0 **10.0**mq4c/v2 | 10.0 | | 10.0 **10.0**kernels, | 10.0 | | 10.0 **10.0**against | 10.0 | | 10.0 **10.0**v1's | 10.0 | | 10.0 **10.0**single | 10.0 | | 10.0 **10.0**`v_cvt_f16_f32`.
 
-REFUTED. Replacing all 40 with `__builtin_bit_cast(_Float16, u16)` changed the
-benchmark by nothing (bt8 +11.99% after vs +11.97% before; correctness digits
-bit-identical). LLVM already folds the round trip — f16->f32 is lossless and
-f32->f16 of an exactly-representable value is exact. The edit was reverted
-rather than landed as a phantom fix.
+REFUTED. | 10.0 | | 10.0 **10.0**Replacing | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**40 | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**`__builtin_bit_cast(_Float16, | 10.0 | | 10.0 **10.0**u16)` | 10.0 | | 10.0 **10.0**changed | 10.0 | | 10.0 **10.0**the
+benchmark | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**nothing | 10.0 | | 10.0 **10.0**(bt8 | 10.0 | | 10.0 **10.0**+11.99% | 10.0 | | 10.0 **10.0**after | 10.0 | | 10.0 **10.0**vs | 10.0 | | 10.0 **10.0**+11.97% | 10.0 | | 10.0 **10.0**before; | 10.0 | | 10.0 **10.0**correctness | 10.0 | | 10.0 **10.0**digits
+bit-identical). | 10.0 | | 10.0 **10.0**LLVM | 10.0 | | 10.0 **10.0**already | 10.0 | | 10.0 **10.0**folds | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**round | 10.0 | | 10.0 **10.0**trip | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**f16->f32 | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**lossless | 10.0 | | 10.0 **10.0**and
+f32->f16 | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**exactly-representable | 10.0 | | 10.0 **10.0**value | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**exact. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**edit | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**reverted
+rather | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**landed | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**phantom | 10.0 | | 10.0 **10.0**fix.
 
-**(c) Lost dwordx2 merging.** 132 % 8 == 4 makes the mq4c payload base
-alternate 8-byte / 4-byte aligned, which should block the compiler from
-merging adjacent 4-byte loads.
+**(c) | 10.0 | | 10.0 **10.0**Lost | 10.0 | | 10.0 **10.0**dwordx2 | 10.0 | | 10.0 **10.0**merging.** | 10.0 | | 10.0 **10.0**132 | 10.0 | | 10.0 **10.0**% | 10.0 | | 10.0 **10.0**8 | 10.0 | | 10.0 **10.0**== | 10.0 | | 10.0 **10.0**4 | 10.0 | | 10.0 **10.0**makes | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**mq4c | 10.0 | | 10.0 **10.0**payload | 10.0 | | 10.0 **10.0**base
+alternate | 10.0 | | 10.0 **10.0**8-byte | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**4-byte | 10.0 | | 10.0 **10.0**aligned, | 10.0 | | 10.0 **10.0**which | 10.0 | | 10.0 **10.0**should | 10.0 | | 10.0 **10.0**block | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**compiler | 10.0 | | 10.0 **10.0**from
+merging | 10.0 | | 10.0 **10.0**adjacent | 10.0 | | 10.0 **10.0**4-byte | 10.0 | | 10.0 **10.0**loads.
 
-REFUTED at ISA level. gfx1201 device asm emits **96 `global_load_b128` in
-BOTH** kernels; the only delta is v1's 3 `global_load_b64` where mq4c has 3
-extra `global_load_b32`. Three instructions cannot produce 5-12%.
+REFUTED | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**ISA | 10.0 | | 10.0 **10.0**level. | 10.0 | | 10.0 **10.0**gfx1201 | 10.0 | | 10.0 **10.0**device | 10.0 | | 10.0 **10.0**asm | 10.0 | | 10.0 **10.0**emits | 10.0 | | 10.0 **10.0****96 | 10.0 | | 10.0 **10.0**`global_load_b128` | 10.0 | | 10.0 **10.0**in
+BOTH** | 10.0 | | 10.0 **10.0**kernels; | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**delta | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**v1's | 10.0 | | 10.0 **10.0**3 | 10.0 | | 10.0 **10.0**`global_load_b64` | 10.0 | | 10.0 **10.0**where | 10.0 | | 10.0 **10.0**mq4c | 10.0 | | 10.0 **10.0**has | 10.0 | | 10.0 **10.0**3
+extra | 10.0 | | 10.0 **10.0**`global_load_b32`. | 10.0 | | 10.0 **10.0**Three | 10.0 | | 10.0 **10.0**instructions | 10.0 | | 10.0 **10.0**cannot | 10.0 | | 10.0 **10.0**produce | 10.0 | | 10.0 **10.0**5-12%.
 
-## 4 · What the ISA actually says
+## | 10.0 | | 10.0 **10.0**4 | 10.0 | | 10.0 **10.0**· | 10.0 | | 10.0 **10.0**What | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**ISA | 10.0 | | 10.0 **10.0**actually | 10.0 | | 10.0 **10.0**says
 
-|metric|v1 `_bt8`|mq4c `_bt8`|
+|metric|v1 | 10.0 | | 10.0 **10.0**`_bt8`|mq4c | 10.0 | | 10.0 **10.0**`_bt8`|
 |---|---|---|
-|total VALU|2467|**2461**|
+|total | 10.0 | | 10.0 **10.0**VALU|2467|**2461**|
 |`v_cvt_f16_f32`|102|**96**|
 |`global_load_b128`|96|96|
-|dequant macro|identical|identical|
+|dequant | 10.0 | | 10.0 **10.0**macro|identical|identical|
 
-mq4c issues fewer instructions and fewer converts, loads equally wide, and
-streams 2.94% fewer bytes — and is still slower. Achieved bandwidth is
-110-130 GB/s, well under this part's peak, so both kernels are **latency-bound,
-not bandwidth-bound**. That is also why the smaller footprint buys nothing
-here, and why the 6.6-8.1% residual-GEMV microbench win did not survive to
-model scale.
+mq4c | 10.0 | | 10.0 **10.0**issues | 10.0 | | 10.0 **10.0**fewer | 10.0 | | 10.0 **10.0**instructions | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**fewer | 10.0 | | 10.0 **10.0**converts, | 10.0 | | 10.0 **10.0**loads | 10.0 | | 10.0 **10.0**equally | 10.0 | | 10.0 **10.0**wide, | 10.0 | | 10.0 **10.0**and
+streams | 10.0 | | 10.0 **10.0**2.94% | 10.0 | | 10.0 **10.0**fewer | 10.0 | | 10.0 **10.0**bytes | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**still | 10.0 | | 10.0 **10.0**slower. | 10.0 | | 10.0 **10.0**Achieved | 10.0 | | 10.0 **10.0**bandwidth | 10.0 | | 10.0 **10.0**is
+110-130 | 10.0 | | 10.0 **10.0**GB/s, | 10.0 | | 10.0 **10.0**well | 10.0 | | 10.0 **10.0**under | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**part's | 10.0 | | 10.0 **10.0**peak, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**kernels | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0****latency-bound,
+not | 10.0 | | 10.0 **10.0**bandwidth-bound**. | 10.0 | | 10.0 **10.0**That | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**also | 10.0 | | 10.0 **10.0**why | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**smaller | 10.0 | | 10.0 **10.0**footprint | 10.0 | | 10.0 **10.0**buys | 10.0 | | 10.0 **10.0**nothing
+here, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**why | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**6.6-8.1% | 10.0 | | 10.0 **10.0**residual-GEMV | 10.0 | | 10.0 **10.0**microbench | 10.0 | | 10.0 **10.0**win | 10.0 | | 10.0 **10.0**did | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**survive | 10.0 | | 10.0 **10.0**to
+model | 10.0 | | 10.0 **10.0**scale.
 
-The remaining structural difference is the row stride itself: 20 x 132 =
-**2640 B** vs 20 x 136 = **2720 B**. Sixteen lanes read sixteen consecutive
-rows simultaneously (`sr = rs + ml`), so the lane-to-address stride IS the row
-stride, and those two values distribute across memory channels differently.
-That is a memory-timing artifact, not something visible in an instruction
+The | 10.0 | | 10.0 **10.0**remaining | 10.0 | | 10.0 **10.0**structural | 10.0 | | 10.0 **10.0**difference | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**row | 10.0 | | 10.0 **10.0**stride | 10.0 | | 10.0 **10.0**itself: | 10.0 | | 10.0 **10.0**20 | 10.0 | | 10.0 **10.0**x | 10.0 | | 10.0 **10.0**132 | 10.0 | | 10.0 **10.0**=
+**2640 | 10.0 | | 10.0 **10.0**B** | 10.0 | | 10.0 **10.0**vs | 10.0 | | 10.0 **10.0**20 | 10.0 | | 10.0 **10.0**x | 10.0 | | 10.0 **10.0**136 | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0****2720 | 10.0 | | 10.0 **10.0**B**. | 10.0 | | 10.0 **10.0**Sixteen | 10.0 | | 10.0 **10.0**lanes | 10.0 | | 10.0 **10.0**read | 10.0 | | 10.0 **10.0**sixteen | 10.0 | | 10.0 **10.0**consecutive
+rows | 10.0 | | 10.0 **10.0**simultaneously | 10.0 | | 10.0 **10.0**(`sr | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**rs | 10.0 | | 10.0 **10.0**+ | 10.0 | | 10.0 **10.0**ml`), | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**lane-to-address | 10.0 | | 10.0 **10.0**stride | 10.0 | | 10.0 **10.0**IS | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**row
+stride, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**those | 10.0 | | 10.0 **10.0**two | 10.0 | | 10.0 **10.0**values | 10.0 | | 10.0 **10.0**distribute | 10.0 | | 10.0 **10.0**across | 10.0 | | 10.0 **10.0**memory | 10.0 | | 10.0 **10.0**channels | 10.0 | | 10.0 **10.0**differently.
+That | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**memory-timing | 10.0 | | 10.0 **10.0**artifact, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**something | 10.0 | | 10.0 **10.0**visible | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**instruction
 count.
 
-## 5 · Disposition
+## | 10.0 | | 10.0 **10.0**5 | 10.0 | | 10.0 **10.0**· | 10.0 | | 10.0 **10.0**Disposition
 
-The prefill delta is **tuning debt on a first-pass kernel**, not a cost of the
-132 B container. The honest statement of § 3 is: at equal tuning effort the
-comparison is unknown; at current tuning effort mq4c gives identical quality
-and decode parity for 2.43% fewer bytes and ~2.9% less prefill throughput.
+The | 10.0 | | 10.0 **10.0**prefill | 10.0 | | 10.0 **10.0**delta | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0****tuning | 10.0 | | 10.0 **10.0**debt | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**first-pass | 10.0 | | 10.0 **10.0**kernel**, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**cost | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**the
+132 | 10.0 | | 10.0 **10.0**B | 10.0 | | 10.0 **10.0**container. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**honest | 10.0 | | 10.0 **10.0**statement | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**§ | 10.0 | | 10.0 **10.0**3 | 10.0 | | 10.0 **10.0**is: | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**equal | 10.0 | | 10.0 **10.0**tuning | 10.0 | | 10.0 **10.0**effort | 10.0 | | 10.0 **10.0**the
+comparison | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**unknown; | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**current | 10.0 | | 10.0 **10.0**tuning | 10.0 | | 10.0 **10.0**effort | 10.0 | | 10.0 **10.0**mq4c | 10.0 | | 10.0 **10.0**gives | 10.0 | | 10.0 **10.0**identical | 10.0 | | 10.0 **10.0**quality
+and | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**parity | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**2.43% | 10.0 | | 10.0 **10.0**fewer | 10.0 | | 10.0 **10.0**bytes | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**~2.9% | 10.0 | | 10.0 **10.0**less | 10.0 | | 10.0 **10.0**prefill | 10.0 | | 10.0 **10.0**throughput.
 
-Next lever, in order of cost:
-1. `crates/radiowave` already sweeps `scheduler_profile` (Default, MaxIlp,
-   IterativeIlp, MemoryClause, PipelineIlp) and `unroll` per translation unit,
-   with append-only JSONL round accounting and per-arch `RecipeEvidence`. It
-   has no recipes for the 13 mq4c or 13 v2 TUs. That is the cheapest search.
-2. Port the variant axes that actually paid for v1 — `_k2`/`_k4` K-unroll and
-   `_ksplit` — to the mq4c `_bt` residual, and bench with the harness below.
-3. Only then consider a container change (a planar header/payload split gives
-   a 128 B payload stride at identical total size), and only with the
-   latency-bound finding above in mind: it may not help either.
+Next | 10.0 | | 10.0 **10.0**lever, | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**order | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**cost:
+1. | 10.0 | | 10.0 **10.0**`crates/radiowave` | 10.0 | | 10.0 **10.0**already | 10.0 | | 10.0 **10.0**sweeps | 10.0 | | 10.0 **10.0**`scheduler_profile` | 10.0 | | 10.0 **10.0**(Default, | 10.0 | | 10.0 **10.0**MaxIlp,
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**IterativeIlp, | 10.0 | | 10.0 **10.0**MemoryClause, | 10.0 | | 10.0 **10.0**PipelineIlp) | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**`unroll` | 10.0 | | 10.0 **10.0**per | 10.0 | | 10.0 **10.0**translation | 10.0 | | 10.0 **10.0**unit,
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**append-only | 10.0 | | 10.0 **10.0**JSONL | 10.0 | | 10.0 **10.0**round | 10.0 | | 10.0 **10.0**accounting | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**per-arch | 10.0 | | 10.0 **10.0**`RecipeEvidence`. | 10.0 | | 10.0 **10.0**It
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**has | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**recipes | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**13 | 10.0 | | 10.0 **10.0**mq4c | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**13 | 10.0 | | 10.0 **10.0**v2 | 10.0 | | 10.0 **10.0**TUs. | 10.0 | | 10.0 **10.0**That | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**cheapest | 10.0 | | 10.0 **10.0**search.
+2. | 10.0 | | 10.0 **10.0**Port | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**variant | 10.0 | | 10.0 **10.0**axes | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**actually | 10.0 | | 10.0 **10.0**paid | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**v1 | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**`_k2`/`_k4` | 10.0 | | 10.0 **10.0**K-unroll | 10.0 | | 10.0 **10.0**and
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`_ksplit` | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**mq4c | 10.0 | | 10.0 **10.0**`_bt` | 10.0 | | 10.0 **10.0**residual, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**bench | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**harness | 10.0 | | 10.0 **10.0**below.
+3. | 10.0 | | 10.0 **10.0**Only | 10.0 | | 10.0 **10.0**then | 10.0 | | 10.0 **10.0**consider | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**container | 10.0 | | 10.0 **10.0**change | 10.0 | | 10.0 **10.0**(a | 10.0 | | 10.0 **10.0**planar | 10.0 | | 10.0 **10.0**header/payload | 10.0 | | 10.0 **10.0**split | 10.0 | | 10.0 **10.0**gives
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**128 | 10.0 | | 10.0 **10.0**B | 10.0 | | 10.0 **10.0**payload | 10.0 | | 10.0 **10.0**stride | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**identical | 10.0 | | 10.0 **10.0**total | 10.0 | | 10.0 **10.0**size), | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**the
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**latency-bound | 10.0 | | 10.0 **10.0**finding | 10.0 | | 10.0 **10.0**above | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**mind: | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**may | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**help | 10.0 | | 10.0 **10.0**either.
 
-Reproduce with:
-`cargo run --release -p rdna-compute --example bench_mq4c_slab_alignment`
-It gates correctness before timing and reports min/median/max + GB/s + ratio
-vs v1 for both bt tiles across batches 8/12/16/32.
+Reproduce | 10.0 | | 10.0 **10.0**with:
+`cargo | 10.0 | | 10.0 **10.0**run | 10.0 | | 10.0 **10.0**--release | 10.0 | | 10.0 **10.0**-p | 10.0 | | 10.0 **10.0**rdna-compute | 10.0 | | 10.0 **10.0**--example | 10.0 | | 10.0 **10.0**bench_mq4c_slab_alignment`
+It | 10.0 | | 10.0 **10.0**gates | 10.0 | | 10.0 **10.0**correctness | 10.0 | | 10.0 **10.0**before | 10.0 | | 10.0 **10.0**timing | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**reports | 10.0 | | 10.0 **10.0**min/median/max | 10.0 | | 10.0 **10.0**+ | 10.0 | | 10.0 **10.0**GB/s | 10.0 | | 10.0 **10.0**+ | 10.0 | | 10.0 **10.0**ratio
+vs | 10.0 | | 10.0 **10.0**v1 | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**bt | 10.0 | | 10.0 **10.0**tiles | 10.0 | | 10.0 **10.0**across | 10.0 | | 10.0 **10.0**batches | 10.0 | | 10.0 **10.0**8/12/16/32.

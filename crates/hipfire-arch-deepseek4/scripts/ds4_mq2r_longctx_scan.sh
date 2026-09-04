@@ -13,7 +13,7 @@
 #   ds4_mq2r_longctx_scan.sh analyze      # PPL + pos-scan on existing plogs
 set -u
 
-export PATH="${PATH}:/root/.cargo/bin:/opt/rocm/core-7.14/bin"
+export PATH="${PATH}:/root/.cargo/bin:/opt/rocm/core-10.0/bin"
 
 ROOT="${HIPFIRE_ROOT:-/root/hipfire-work/ds4-parent-gate}"
 OUT="${LONGCTX_OUT:-/mnt/scratch/quantization/deepseek-v4-flash-0731-mq2r-longctx}"

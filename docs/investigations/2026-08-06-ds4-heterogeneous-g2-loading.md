@@ -1,146 +1,146 @@
-<!-- SPDX-License-Identifier: Apache-2.0 -->
-<!-- SPDX-FileCopyrightText: 2026 Kaden Schutt <kaden@hipfire.dev> -->
+<!-- | 10.0 | | 10.0 **10.0**SPDX-License-Identifier: | 10.0 | | 10.0 **10.0**Apache-2.0 | 10.0 | | 10.0 **10.0**-->
+<!-- | 10.0 | | 10.0 **10.0**SPDX-FileCopyrightText: | 10.0 | | 10.0 **10.0**2026 | 10.0 | | 10.0 **10.0**Kaden | 10.0 | | 10.0 **10.0**Schutt | 10.0 | | 10.0 **10.0**<kaden@hipfire.dev> | 10.0 | | 10.0 **10.0**-->
 
-# DS4 heterogeneous G2 — transactional asymmetric loading
+# | 10.0 | | 10.0 **10.0**DS4 | 10.0 | | 10.0 **10.0**heterogeneous | 10.0 | | 10.0 **10.0**G2 | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**transactional | 10.0 | | 10.0 **10.0**asymmetric | 10.0 | | 10.0 **10.0**loading
 
-## Verdict
+## | 10.0 | | 10.0 **10.0**Verdict
 
-G2 is complete for the frozen DeepSeek V4 Flash 0731 MQ2R artifact. The loader
-opens one HFQ file, classifies every record before large allocation, uploads
-the non-routed and routed tiers directly to their final owners, and publishes
-the model only after state, scratch, post-load budgets, and an exact HIP
-pointer-owner audit pass.
+G2 | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**complete | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**frozen | 10.0 | | 10.0 **10.0**DeepSeek | 10.0 | | 10.0 **10.0**V4 | 10.0 | | 10.0 **10.0**Flash | 10.0 | | 10.0 **10.0**0731 | 10.0 | | 10.0 **10.0**MQ2R | 10.0 | | 10.0 **10.0**artifact. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**loader
+opens | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**HFQ | 10.0 | | 10.0 **10.0**file, | 10.0 | | 10.0 **10.0**classifies | 10.0 | | 10.0 **10.0**every | 10.0 | | 10.0 **10.0**record | 10.0 | | 10.0 **10.0**before | 10.0 | | 10.0 **10.0**large | 10.0 | | 10.0 **10.0**allocation, | 10.0 | | 10.0 **10.0**uploads
+the | 10.0 | | 10.0 **10.0**non-routed | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**routed | 10.0 | | 10.0 **10.0**tiers | 10.0 | | 10.0 **10.0**directly | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**their | 10.0 | | 10.0 **10.0**final | 10.0 | | 10.0 **10.0**owners, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**publishes
+the | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**after | 10.0 | | 10.0 **10.0**state, | 10.0 | | 10.0 **10.0**scratch, | 10.0 | | 10.0 **10.0**post-load | 10.0 | | 10.0 **10.0**budgets, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**exact | 10.0 | | 10.0 **10.0**HIP
+pointer-owner | 10.0 | | 10.0 **10.0**audit | 10.0 | | 10.0 **10.0**pass.
 
-The successful split is:
+The | 10.0 | | 10.0 **10.0**successful | 10.0 | | 10.0 **10.0**split | 10.0 | | 10.0 **10.0**is:
 
-| Owner | Records | Projected weights | Actual pooled residency | Free after load |
+| | 10.0 | | 10.0 **10.0**Owner | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Records | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Projected | 10.0 | | 10.0 **10.0**weights | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Actual | 10.0 | | 10.0 **10.0**pooled | 10.0 | | 10.0 **10.0**residency | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Free | 10.0 | | 10.0 **10.0**after | 10.0 | | 10.0 **10.0**load | 10.0 | | 10.0 **10.0**|
 |---|---:|---:|---:|---:|
-| gfx1100 dense/non-routed | 1,199 (1 host-only, 1,198 GPU allocations) | 4,272,562,988 B / 3.979 GiB | 7,887,388,672 B / 7.346 GiB | 17,672,699,904 B / 16.459 GiB |
-| gfx1151 routed experts | 33,024 (172 packed allocations) | 77,913,567,232 B / 72.563 GiB | 77,915,488,256 B / 72.536 GiB | 24,844,959,744 B / 23.139 GiB |
+| | 10.0 | | 10.0 **10.0**gfx1100 | 10.0 | | 10.0 **10.0**dense/non-routed | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1,199 | 10.0 | | 10.0 **10.0**(1 | 10.0 | | 10.0 **10.0**host-only, | 10.0 | | 10.0 **10.0**1,198 | 10.0 | | 10.0 **10.0**GPU | 10.0 | | 10.0 **10.0**allocations) | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**4,272,562,988 | 10.0 | | 10.0 **10.0**B | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**3.979 | 10.0 | | 10.0 **10.0**GiB | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**7,887,388,672 | 10.0 | | 10.0 **10.0**B | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**7.346 | 10.0 | | 10.0 **10.0**GiB | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**17,672,699,904 | 10.0 | | 10.0 **10.0**B | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**16.459 | 10.0 | | 10.0 **10.0**GiB | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**gfx1151 | 10.0 | | 10.0 **10.0**routed | 10.0 | | 10.0 **10.0**experts | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**33,024 | 10.0 | | 10.0 **10.0**(172 | 10.0 | | 10.0 **10.0**packed | 10.0 | | 10.0 **10.0**allocations) | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**77,913,567,232 | 10.0 | | 10.0 **10.0**B | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**72.563 | 10.0 | | 10.0 **10.0**GiB | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**77,915,488,256 | 10.0 | | 10.0 **10.0**B | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**72.536 | 10.0 | | 10.0 **10.0**GiB | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**24,844,959,744 | 10.0 | | 10.0 **10.0**B | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**23.139 | 10.0 | | 10.0 **10.0**GiB | 10.0 | | 10.0 **10.0**|
 
-Both devices retain far more than the required 2 GiB safety margin. The dense
-actual includes the 3,045,289,480-byte projected prefill scratch inventory and
-allocator/kernel pools; the measured non-weight dense pool was
-3,614,825,684 bytes in the final certification process.
+Both | 10.0 | | 10.0 **10.0**devices | 10.0 | | 10.0 **10.0**retain | 10.0 | | 10.0 **10.0**far | 10.0 | | 10.0 **10.0**more | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**required | 10.0 | | 10.0 **10.0**2 | 10.0 | | 10.0 **10.0**GiB | 10.0 | | 10.0 **10.0**safety | 10.0 | | 10.0 **10.0**margin. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**dense
+actual | 10.0 | | 10.0 **10.0**includes | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**3,045,289,480-byte | 10.0 | | 10.0 **10.0**projected | 10.0 | | 10.0 **10.0**prefill | 10.0 | | 10.0 **10.0**scratch | 10.0 | | 10.0 **10.0**inventory | 10.0 | | 10.0 **10.0**and
+allocator/kernel | 10.0 | | 10.0 **10.0**pools; | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**measured | 10.0 | | 10.0 **10.0**non-weight | 10.0 | | 10.0 **10.0**dense | 10.0 | | 10.0 **10.0**pool | 10.0 | | 10.0 **10.0**was
+3,614,825,684 | 10.0 | | 10.0 **10.0**bytes | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**final | 10.0 | | 10.0 **10.0**certification | 10.0 | | 10.0 **10.0**process.
 
-## Identity
+## | 10.0 | | 10.0 **10.0**Identity
 
-- Branch: `ds4-beta-staging`
-- Artifact SHA256:
-  `cbf2bbcfa3f47b1712a071836b2c48232dad7dfb763813a720f7d348a9318cce`
-- Loader commit: `dc33a712e`
-- Typed placement commit: `d678e3b54`
-- Immediate rollback fix and certification harness: `9416a597c`
-- Dense role: exactly one visible `gfx1100`
-- Expert role: exactly one visible `gfx1151`
-- ROCm/HIP: 7.14
+- | 10.0 | | 10.0 **10.0**Branch: | 10.0 | | 10.0 **10.0**`ds4-beta-staging`
+- | 10.0 | | 10.0 **10.0**Artifact | 10.0 | | 10.0 **10.0**SHA256:
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`cbf2bbcfa3f47b1712a071836b2c48232dad7dfb763813a720f7d348a9318cce`
+- | 10.0 | | 10.0 **10.0**Loader | 10.0 | | 10.0 **10.0**commit: | 10.0 | | 10.0 **10.0**`dc33a712e`
+- | 10.0 | | 10.0 **10.0**Typed | 10.0 | | 10.0 **10.0**placement | 10.0 | | 10.0 **10.0**commit: | 10.0 | | 10.0 **10.0**`d678e3b54`
+- | 10.0 | | 10.0 **10.0**Immediate | 10.0 | | 10.0 **10.0**rollback | 10.0 | | 10.0 **10.0**fix | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**certification | 10.0 | | 10.0 **10.0**harness: | 10.0 | | 10.0 **10.0**`9416a597c`
+- | 10.0 | | 10.0 **10.0**Dense | 10.0 | | 10.0 **10.0**role: | 10.0 | | 10.0 **10.0**exactly | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**visible | 10.0 | | 10.0 **10.0**`gfx1100`
+- | 10.0 | | 10.0 **10.0**Expert | 10.0 | | 10.0 **10.0**role: | 10.0 | | 10.0 **10.0**exactly | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**visible | 10.0 | | 10.0 **10.0**`gfx1151`
+- | 10.0 | | 10.0 **10.0**ROCm/HIP: | 10.0 | | 10.0 **10.0**7.14
 
-The typed public syntax is:
+The | 10.0 | | 10.0 **10.0**typed | 10.0 | | 10.0 **10.0**public | 10.0 | | 10.0 **10.0**syntax | 10.0 | | 10.0 **10.0**is:
 
 ```text
 single
 dense-expert-split(dense=arch:gfx1100,experts=arch:gfx1151)
 ```
 
-Logical HIP ordinals are not accepted as selectors. Exact-architecture
-selection fails closed unless exactly one visible device matches. PCI BDF and
-UUID are represented in the typed selector but remain fail-closed until the
-HIP discovery layer can resolve them.
+Logical | 10.0 | | 10.0 **10.0**HIP | 10.0 | | 10.0 **10.0**ordinals | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**accepted | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**selectors. | 10.0 | | 10.0 **10.0**Exact-architecture
+selection | 10.0 | | 10.0 **10.0**fails | 10.0 | | 10.0 **10.0**closed | 10.0 | | 10.0 **10.0**unless | 10.0 | | 10.0 **10.0**exactly | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**visible | 10.0 | | 10.0 **10.0**device | 10.0 | | 10.0 **10.0**matches. | 10.0 | | 10.0 **10.0**PCI | 10.0 | | 10.0 **10.0**BDF | 10.0 | | 10.0 **10.0**and
+UUID | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**represented | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**typed | 10.0 | | 10.0 **10.0**selector | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**remain | 10.0 | | 10.0 **10.0**fail-closed | 10.0 | | 10.0 **10.0**until | 10.0 | | 10.0 **10.0**the
+HIP | 10.0 | | 10.0 **10.0**discovery | 10.0 | | 10.0 **10.0**layer | 10.0 | | 10.0 **10.0**can | 10.0 | | 10.0 **10.0**resolve | 10.0 | | 10.0 **10.0**them.
 
-The typed setting is not yet a user-runnable heterogeneous generation route.
-Connecting it to the production loader and daemon is G4 work, after G3 proves
-the generic cross-device scheduler.
+The | 10.0 | | 10.0 **10.0**typed | 10.0 | | 10.0 **10.0**setting | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**yet | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**user-runnable | 10.0 | | 10.0 **10.0**heterogeneous | 10.0 | | 10.0 **10.0**generation | 10.0 | | 10.0 **10.0**route.
+Connecting | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**production | 10.0 | | 10.0 **10.0**loader | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**daemon | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**G4 | 10.0 | | 10.0 **10.0**work, | 10.0 | | 10.0 **10.0**after | 10.0 | | 10.0 **10.0**G3 | 10.0 | | 10.0 **10.0**proves
+the | 10.0 | | 10.0 **10.0**generic | 10.0 | | 10.0 **10.0**cross-device | 10.0 | | 10.0 **10.0**scheduler.
 
-## Ownership and transaction design
+## | 10.0 | | 10.0 **10.0**Ownership | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**transaction | 10.0 | | 10.0 **10.0**design
 
-The heterogeneous route does not place mixed-device aliases inside ordinary
-`DeepseekV4Weights`. It has three distinct owners:
+The | 10.0 | | 10.0 **10.0**heterogeneous | 10.0 | | 10.0 **10.0**route | 10.0 | | 10.0 **10.0**does | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**place | 10.0 | | 10.0 **10.0**mixed-device | 10.0 | | 10.0 **10.0**aliases | 10.0 | | 10.0 **10.0**inside | 10.0 | | 10.0 **10.0**ordinary
+`DeepseekV4Weights`. | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**has | 10.0 | | 10.0 **10.0**three | 10.0 | | 10.0 **10.0**distinct | 10.0 | | 10.0 **10.0**owners:
 
-- `DeepseekV4DenseWeights` contains a validated ordinary weight tree with no
-  routed allocations;
-- `DeepseekV4RoutedWeights` contains only the 43 packed expert layer tiers and
-  their pointer-table storage;
-- `DeepseekV4HeterogeneousWeights` coordinates exact-owner audit and release.
+- | 10.0 | | 10.0 **10.0**`DeepseekV4DenseWeights` | 10.0 | | 10.0 **10.0**contains | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**validated | 10.0 | | 10.0 **10.0**ordinary | 10.0 | | 10.0 **10.0**weight | 10.0 | | 10.0 **10.0**tree | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**no
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**routed | 10.0 | | 10.0 **10.0**allocations;
+- | 10.0 | | 10.0 **10.0**`DeepseekV4RoutedWeights` | 10.0 | | 10.0 **10.0**contains | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**43 | 10.0 | | 10.0 **10.0**packed | 10.0 | | 10.0 **10.0**expert | 10.0 | | 10.0 **10.0**layer | 10.0 | | 10.0 **10.0**tiers | 10.0 | | 10.0 **10.0**and
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**their | 10.0 | | 10.0 **10.0**pointer-table | 10.0 | | 10.0 **10.0**storage;
+- | 10.0 | | 10.0 **10.0**`DeepseekV4HeterogeneousWeights` | 10.0 | | 10.0 **10.0**coordinates | 10.0 | | 10.0 **10.0**exact-owner | 10.0 | | 10.0 **10.0**audit | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**release.
 
-`DeepseekV4HeterogeneousStaging` owns both devices, split weights, canonical
-state, and prefill scratch until all fallible work succeeds. Its destructor
-releases scratch, state, each weight owner, graph/cache state, and both pools.
-`PrefillBatchScratch::new` likewise stages every tensor independently and
-publishes only after the complete inventory allocates.
+`DeepseekV4HeterogeneousStaging` | 10.0 | | 10.0 **10.0**owns | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**devices, | 10.0 | | 10.0 **10.0**split | 10.0 | | 10.0 **10.0**weights, | 10.0 | | 10.0 **10.0**canonical
+state, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**prefill | 10.0 | | 10.0 **10.0**scratch | 10.0 | | 10.0 **10.0**until | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**fallible | 10.0 | | 10.0 **10.0**work | 10.0 | | 10.0 **10.0**succeeds. | 10.0 | | 10.0 **10.0**Its | 10.0 | | 10.0 **10.0**destructor
+releases | 10.0 | | 10.0 **10.0**scratch, | 10.0 | | 10.0 **10.0**state, | 10.0 | | 10.0 **10.0**each | 10.0 | | 10.0 **10.0**weight | 10.0 | | 10.0 **10.0**owner, | 10.0 | | 10.0 **10.0**graph/cache | 10.0 | | 10.0 **10.0**state, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**pools.
+`PrefillBatchScratch::new` | 10.0 | | 10.0 **10.0**likewise | 10.0 | | 10.0 **10.0**stages | 10.0 | | 10.0 **10.0**every | 10.0 | | 10.0 **10.0**tensor | 10.0 | | 10.0 **10.0**independently | 10.0 | | 10.0 **10.0**and
+publishes | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**after | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**complete | 10.0 | | 10.0 **10.0**inventory | 10.0 | | 10.0 **10.0**allocates.
 
-Failed routed-weight construction bypasses the normal successful-model reuse
-pool and immediately releases pointer tables and packed expert allocations on
-their exact owning device. This is required for a late layer-42 failure: the
-first harness version showed that normal deferred pool cleanup could leave
-tens of GiB resident until process exit.
+Failed | 10.0 | | 10.0 **10.0**routed-weight | 10.0 | | 10.0 **10.0**construction | 10.0 | | 10.0 **10.0**bypasses | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**normal | 10.0 | | 10.0 **10.0**successful-model | 10.0 | | 10.0 **10.0**reuse
+pool | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**immediately | 10.0 | | 10.0 **10.0**releases | 10.0 | | 10.0 **10.0**pointer | 10.0 | | 10.0 **10.0**tables | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**packed | 10.0 | | 10.0 **10.0**expert | 10.0 | | 10.0 **10.0**allocations | 10.0 | | 10.0 **10.0**on
+their | 10.0 | | 10.0 **10.0**exact | 10.0 | | 10.0 **10.0**owning | 10.0 | | 10.0 **10.0**device. | 10.0 | | 10.0 **10.0**This | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**required | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**late | 10.0 | | 10.0 **10.0**layer-42 | 10.0 | | 10.0 **10.0**failure: | 10.0 | | 10.0 **10.0**the
+first | 10.0 | | 10.0 **10.0**harness | 10.0 | | 10.0 **10.0**version | 10.0 | | 10.0 **10.0**showed | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**normal | 10.0 | | 10.0 **10.0**deferred | 10.0 | | 10.0 **10.0**pool | 10.0 | | 10.0 **10.0**cleanup | 10.0 | | 10.0 **10.0**could | 10.0 | | 10.0 **10.0**leave
+tens | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**GiB | 10.0 | | 10.0 **10.0**resident | 10.0 | | 10.0 **10.0**until | 10.0 | | 10.0 **10.0**process | 10.0 | | 10.0 **10.0**exit.
 
-The artifact census is fail-closed at exactly 1,199 non-routed records, one
-host-only record, and `43 × 256 × 3 = 33,024` routed expert records. In-band
-MTP and DSpark payloads are refused for this AR-only gate.
+The | 10.0 | | 10.0 **10.0**artifact | 10.0 | | 10.0 **10.0**census | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**fail-closed | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**exactly | 10.0 | | 10.0 **10.0**1,199 | 10.0 | | 10.0 **10.0**non-routed | 10.0 | | 10.0 **10.0**records, | 10.0 | | 10.0 **10.0**one
+host-only | 10.0 | | 10.0 **10.0**record, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**`43 | 10.0 | | 10.0 **10.0**× | 10.0 | | 10.0 **10.0**256 | 10.0 | | 10.0 **10.0**× | 10.0 | | 10.0 **10.0**3 | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**33,024` | 10.0 | | 10.0 **10.0**routed | 10.0 | | 10.0 **10.0**expert | 10.0 | | 10.0 **10.0**records. | 10.0 | | 10.0 **10.0**In-band
+MTP | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**DSpark | 10.0 | | 10.0 **10.0**payloads | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**refused | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**AR-only | 10.0 | | 10.0 **10.0**gate.
 
-## Hardware validation
+## | 10.0 | | 10.0 **10.0**Hardware | 10.0 | | 10.0 **10.0**validation
 
-The release harness was run under the hipx GPU lock from the local ext4/NVMe
-artifact, not NAS. Successful load/unload was first repeated twice in one
-process. Both cycles reported zero pointer-owner violations and converged on
-the same post-load free bytes (`17,672,699,904` dense and `24,844,959,744`
-routed). The final one-process fault matrix then reused one verified artifact
-receipt for all injected failures, loaded successfully, and exercised failed
-replacement. Exact-target kernel/runtime caches remain process-resident; no
-model allocation survived any failed staging transaction.
+The | 10.0 | | 10.0 **10.0**release | 10.0 | | 10.0 **10.0**harness | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**run | 10.0 | | 10.0 **10.0**under | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**hipx | 10.0 | | 10.0 **10.0**GPU | 10.0 | | 10.0 **10.0**lock | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**local | 10.0 | | 10.0 **10.0**ext4/NVMe
+artifact, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**NAS. | 10.0 | | 10.0 **10.0**Successful | 10.0 | | 10.0 **10.0**load/unload | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**first | 10.0 | | 10.0 **10.0**repeated | 10.0 | | 10.0 **10.0**twice | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**one
+process. | 10.0 | | 10.0 **10.0**Both | 10.0 | | 10.0 **10.0**cycles | 10.0 | | 10.0 **10.0**reported | 10.0 | | 10.0 **10.0**zero | 10.0 | | 10.0 **10.0**pointer-owner | 10.0 | | 10.0 **10.0**violations | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**converged | 10.0 | | 10.0 **10.0**on
+the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**post-load | 10.0 | | 10.0 **10.0**free | 10.0 | | 10.0 **10.0**bytes | 10.0 | | 10.0 **10.0**(`17,672,699,904` | 10.0 | | 10.0 **10.0**dense | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**`24,844,959,744`
+routed). | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**final | 10.0 | | 10.0 **10.0**one-process | 10.0 | | 10.0 **10.0**fault | 10.0 | | 10.0 **10.0**matrix | 10.0 | | 10.0 **10.0**then | 10.0 | | 10.0 **10.0**reused | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**verified | 10.0 | | 10.0 **10.0**artifact
+receipt | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**injected | 10.0 | | 10.0 **10.0**failures, | 10.0 | | 10.0 **10.0**loaded | 10.0 | | 10.0 **10.0**successfully, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**exercised | 10.0 | | 10.0 **10.0**failed
+replacement. | 10.0 | | 10.0 **10.0**Exact-target | 10.0 | | 10.0 **10.0**kernel/runtime | 10.0 | | 10.0 **10.0**caches | 10.0 | | 10.0 **10.0**remain | 10.0 | | 10.0 **10.0**process-resident; | 10.0 | | 10.0 **10.0**no
+model | 10.0 | | 10.0 **10.0**allocation | 10.0 | | 10.0 **10.0**survived | 10.0 | | 10.0 **10.0**any | 10.0 | | 10.0 **10.0**failed | 10.0 | | 10.0 **10.0**staging | 10.0 | | 10.0 **10.0**transaction.
 
-Injected failure points:
+Injected | 10.0 | | 10.0 **10.0**failure | 10.0 | | 10.0 **10.0**points:
 
-| Failure point | Expected error | Immediate in-process used VRAM after rollback |
+| | 10.0 | | 10.0 **10.0**Failure | 10.0 | | 10.0 **10.0**point | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Expected | 10.0 | | 10.0 **10.0**error | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Immediate | 10.0 | | 10.0 **10.0**in-process | 10.0 | | 10.0 **10.0**used | 10.0 | | 10.0 **10.0**VRAM | 10.0 | | 10.0 **10.0**after | 10.0 | | 10.0 **10.0**rollback | 10.0 | | 10.0 **10.0**|
 |---|---|---|
-| after dense weights | observed | gfx1100 192,937,984 B; gfx1151 165,675,008 B |
-| after routed layer 0 | observed | gfx1100 192,937,984 B; gfx1151 318,767,104 B |
-| after routed layer 42 | observed | gfx1100 192,937,984 B; gfx1151 318,767,104 B |
-| after ownership audit | observed | gfx1100 192,937,984 B; gfx1151 318,767,104 B |
-| after state | observed | gfx1100 192,937,984 B; gfx1151 318,767,104 B |
-| after scratch | observed | gfx1100 192,937,984 B; gfx1151 318,767,104 B |
+| | 10.0 | | 10.0 **10.0**after | 10.0 | | 10.0 **10.0**dense | 10.0 | | 10.0 **10.0**weights | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**observed | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**gfx1100 | 10.0 | | 10.0 **10.0**192,937,984 | 10.0 | | 10.0 **10.0**B; | 10.0 | | 10.0 **10.0**gfx1151 | 10.0 | | 10.0 **10.0**165,675,008 | 10.0 | | 10.0 **10.0**B | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**after | 10.0 | | 10.0 **10.0**routed | 10.0 | | 10.0 **10.0**layer | 10.0 | | 10.0 **10.0**0 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**observed | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**gfx1100 | 10.0 | | 10.0 **10.0**192,937,984 | 10.0 | | 10.0 **10.0**B; | 10.0 | | 10.0 **10.0**gfx1151 | 10.0 | | 10.0 **10.0**318,767,104 | 10.0 | | 10.0 **10.0**B | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**after | 10.0 | | 10.0 **10.0**routed | 10.0 | | 10.0 **10.0**layer | 10.0 | | 10.0 **10.0**42 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**observed | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**gfx1100 | 10.0 | | 10.0 **10.0**192,937,984 | 10.0 | | 10.0 **10.0**B; | 10.0 | | 10.0 **10.0**gfx1151 | 10.0 | | 10.0 **10.0**318,767,104 | 10.0 | | 10.0 **10.0**B | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**after | 10.0 | | 10.0 **10.0**ownership | 10.0 | | 10.0 **10.0**audit | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**observed | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**gfx1100 | 10.0 | | 10.0 **10.0**192,937,984 | 10.0 | | 10.0 **10.0**B; | 10.0 | | 10.0 **10.0**gfx1151 | 10.0 | | 10.0 **10.0**318,767,104 | 10.0 | | 10.0 **10.0**B | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**after | 10.0 | | 10.0 **10.0**state | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**observed | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**gfx1100 | 10.0 | | 10.0 **10.0**192,937,984 | 10.0 | | 10.0 **10.0**B; | 10.0 | | 10.0 **10.0**gfx1151 | 10.0 | | 10.0 **10.0**318,767,104 | 10.0 | | 10.0 **10.0**B | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**after | 10.0 | | 10.0 **10.0**scratch | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**observed | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**gfx1100 | 10.0 | | 10.0 **10.0**192,937,984 | 10.0 | | 10.0 **10.0**B; | 10.0 | | 10.0 **10.0**gfx1151 | 10.0 | | 10.0 **10.0**318,767,104 | 10.0 | | 10.0 **10.0**B | 10.0 | | 10.0 **10.0**|
 
-A final successful load follows the complete injected-failure sequence. A
-failed transactional replacement is also checked to leave the previously
-published model identity and pointer-owner audit intact. It fails preflight
-because the already resident model leaves insufficient expert-device margin,
-then reports the original artifact SHA and an empty ownership-violation list.
+A | 10.0 | | 10.0 **10.0**final | 10.0 | | 10.0 **10.0**successful | 10.0 | | 10.0 **10.0**load | 10.0 | | 10.0 **10.0**follows | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**complete | 10.0 | | 10.0 **10.0**injected-failure | 10.0 | | 10.0 **10.0**sequence. | 10.0 | | 10.0 **10.0**A
+failed | 10.0 | | 10.0 **10.0**transactional | 10.0 | | 10.0 **10.0**replacement | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**also | 10.0 | | 10.0 **10.0**checked | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**leave | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**previously
+published | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**identity | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**pointer-owner | 10.0 | | 10.0 **10.0**audit | 10.0 | | 10.0 **10.0**intact. | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**fails | 10.0 | | 10.0 **10.0**preflight
+because | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**already | 10.0 | | 10.0 **10.0**resident | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**leaves | 10.0 | | 10.0 **10.0**insufficient | 10.0 | | 10.0 **10.0**expert-device | 10.0 | | 10.0 **10.0**margin,
+then | 10.0 | | 10.0 **10.0**reports | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**original | 10.0 | | 10.0 **10.0**artifact | 10.0 | | 10.0 **10.0**SHA | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**empty | 10.0 | | 10.0 **10.0**ownership-violation | 10.0 | | 10.0 **10.0**list.
 
-## Software validation
+## | 10.0 | | 10.0 **10.0**Software | 10.0 | | 10.0 **10.0**validation
 
-- `cargo test -p hipfire-arch-deepseek4 --lib`: 251 passed, 1 gfx942-only
-  hardware test ignored.
-- `cargo test -p hipfire-config --lib`: 54 passed.
-- `cargo check -p hipfire-arch-deepseek4 --example ds4_heterogeneous_load`:
-  passed.
-- `cargo check -p hipfire-cli`: passed.
-- `scripts/fmt-changed.sh` and `git diff --check`: passed.
+- | 10.0 | | 10.0 **10.0**`cargo | 10.0 | | 10.0 **10.0**test | 10.0 | | 10.0 **10.0**-p | 10.0 | | 10.0 **10.0**hipfire-arch-deepseek4 | 10.0 | | 10.0 **10.0**--lib`: | 10.0 | | 10.0 **10.0**251 | 10.0 | | 10.0 **10.0**passed, | 10.0 | | 10.0 **10.0**1 | 10.0 | | 10.0 **10.0**gfx942-only
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**hardware | 10.0 | | 10.0 **10.0**test | 10.0 | | 10.0 **10.0**ignored.
+- | 10.0 | | 10.0 **10.0**`cargo | 10.0 | | 10.0 **10.0**test | 10.0 | | 10.0 **10.0**-p | 10.0 | | 10.0 **10.0**hipfire-config | 10.0 | | 10.0 **10.0**--lib`: | 10.0 | | 10.0 **10.0**54 | 10.0 | | 10.0 **10.0**passed.
+- | 10.0 | | 10.0 **10.0**`cargo | 10.0 | | 10.0 **10.0**check | 10.0 | | 10.0 **10.0**-p | 10.0 | | 10.0 **10.0**hipfire-arch-deepseek4 | 10.0 | | 10.0 **10.0**--example | 10.0 | | 10.0 **10.0**ds4_heterogeneous_load`:
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**passed.
+- | 10.0 | | 10.0 **10.0**`cargo | 10.0 | | 10.0 **10.0**check | 10.0 | | 10.0 **10.0**-p | 10.0 | | 10.0 **10.0**hipfire-cli`: | 10.0 | | 10.0 **10.0**passed.
+- | 10.0 | | 10.0 **10.0**`scripts/fmt-changed.sh` | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**`git | 10.0 | | 10.0 **10.0**diff | 10.0 | | 10.0 **10.0**--check`: | 10.0 | | 10.0 **10.0**passed.
 
-## Evidence
+## | 10.0 | | 10.0 **10.0**Evidence
 
-Durable root on hipx:
+Durable | 10.0 | | 10.0 **10.0**root | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**hipx:
 
 ```text
 /home/kaden/ds4-gfx1151-evidence/2026-08-06-ds4-heterogeneous-g2/
 ```
 
-Important files:
+Important | 10.0 | | 10.0 **10.0**files:
 
-- `success-01.log`
-- `success-repeat.log`
-- `fault-matrix-and-recovery-v2.log`
+- | 10.0 | | 10.0 **10.0**`success-01.log`
+- | 10.0 | | 10.0 **10.0**`success-repeat.log`
+- | 10.0 | | 10.0 **10.0**`fault-matrix-and-recovery-v2.log`
 
-Sealed identities:
+Sealed | 10.0 | | 10.0 **10.0**identities:
 
-- certification binary SHA256:
-  `a0b421d7189b53d6f154ed4d176cffa3f12982625d7705fd9551462630885171`;
-- fault/recovery log SHA256:
-  `d081f386768190b412f5378a928f0ef2dd48213139194dc1b5583688ea67aa24`;
-- first success log SHA256:
-  `d0c29641c1ba103f1972f52ece104b07c2fbd063d7d7d9074d3501d271df00c2`;
-- repeated success log SHA256:
-  `7a7412c8748d798c2ccfcc8bb59ad289472f65bef699d40d066697cf3eb355be`.
+- | 10.0 | | 10.0 **10.0**certification | 10.0 | | 10.0 **10.0**binary | 10.0 | | 10.0 **10.0**SHA256:
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`a0b421d7189b53d6f154ed4d176cffa3f12982625d7705fd9551462630885171`;
+- | 10.0 | | 10.0 **10.0**fault/recovery | 10.0 | | 10.0 **10.0**log | 10.0 | | 10.0 **10.0**SHA256:
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`d081f386768190b412f5378a928f0ef2dd48213139194dc1b5583688ea67aa24`;
+- | 10.0 | | 10.0 **10.0**first | 10.0 | | 10.0 **10.0**success | 10.0 | | 10.0 **10.0**log | 10.0 | | 10.0 **10.0**SHA256:
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`d0c29641c1ba103f1972f52ece104b07c2fbd063d7d7d9074d3501d271df00c2`;
+- | 10.0 | | 10.0 **10.0**repeated | 10.0 | | 10.0 **10.0**success | 10.0 | | 10.0 **10.0**log | 10.0 | | 10.0 **10.0**SHA256:
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`7a7412c8748d798c2ccfcc8bb59ad289472f65bef699d40d066697cf3eb355be`.
 
-This gate records no throughput number and makes no model-execution claim.
-G3 is the generic 43-layer cross-device prefill/decode scheduler fixture; DS4
-lowering remains forbidden until that generic graph is correct and overlapping.
+This | 10.0 | | 10.0 **10.0**gate | 10.0 | | 10.0 **10.0**records | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**throughput | 10.0 | | 10.0 **10.0**number | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**makes | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**model-execution | 10.0 | | 10.0 **10.0**claim.
+G3 | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**generic | 10.0 | | 10.0 **10.0**43-layer | 10.0 | | 10.0 **10.0**cross-device | 10.0 | | 10.0 **10.0**prefill/decode | 10.0 | | 10.0 **10.0**scheduler | 10.0 | | 10.0 **10.0**fixture; | 10.0 | | 10.0 **10.0**DS4
+lowering | 10.0 | | 10.0 **10.0**remains | 10.0 | | 10.0 **10.0**forbidden | 10.0 | | 10.0 **10.0**until | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**generic | 10.0 | | 10.0 **10.0**graph | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**correct | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**overlapping.

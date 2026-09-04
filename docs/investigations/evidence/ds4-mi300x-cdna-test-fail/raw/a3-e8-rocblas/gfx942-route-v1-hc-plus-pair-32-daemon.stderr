@@ -1,4 +1,4 @@
-GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.14)
-  pre-compiled kernels: /mnt/scratch/hipfire-kernels/rocm714/gfx942
-[rocblas] loaded for gfx942
-deepseek4: MQ2R P3 tensor recipe verified; selected gfx942 route v1 (native wave64 MQ2/E8 + parallel indexer; 554 E8 tensors; routed experts qt=19)
+GPU | 10.0 | | 10.0 **10.0**dev | 10.0 | | 10.0 **10.0**0: | 10.0 | | 10.0 **10.0**gfx942 | 10.0 | | 10.0 **10.0**(205.8 | 10.0 | | 10.0 **10.0**GB | 10.0 | | 10.0 **10.0**VRAM, | 10.0 | | 10.0 **10.0**HIP | 10.0 | | 10.0 **10.0**7.15)
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**pre-compiled | 10.0 | | 10.0 **10.0**kernels: | 10.0 | | 10.0 **10.0**/mnt/scratch/hipfire-kernels/rocm100/gfx942
+[rocblas] | 10.0 | | 10.0 **10.0**loaded | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**gfx942
+deepseek4: | 10.0 | | 10.0 **10.0**MQ2R | 10.0 | | 10.0 **10.0**P3 | 10.0 | | 10.0 **10.0**tensor | 10.0 | | 10.0 **10.0**recipe | 10.0 | | 10.0 **10.0**verified; | 10.0 | | 10.0 **10.0**selected | 10.0 | | 10.0 **10.0**gfx942 | 10.0 | | 10.0 **10.0**route | 10.0 | | 10.0 **10.0**v1 | 10.0 | | 10.0 **10.0**(native | 10.0 | | 10.0 **10.0**wave64 | 10.0 | | 10.0 **10.0**MQ2/E8 | 10.0 | | 10.0 **10.0**+ | 10.0 | | 10.0 **10.0**parallel | 10.0 | | 10.0 **10.0**indexer; | 10.0 | | 10.0 **10.0**554 | 10.0 | | 10.0 **10.0**E8 | 10.0 | | 10.0 **10.0**tensors; | 10.0 | | 10.0 **10.0**routed | 10.0 | | 10.0 **10.0**experts | 10.0 | | 10.0 **10.0**qt=19)

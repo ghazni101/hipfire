@@ -1,117 +1,117 @@
-# qt=45 planar: faster than v1 on prefill AND decode, at 2.43% fewer bytes
+# | 10.0 | | 10.0 **10.0**qt=45 | 10.0 | | 10.0 **10.0**planar: | 10.0 | | 10.0 **10.0**faster | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**v1 | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**prefill | 10.0 | | 10.0 **10.0**AND | 10.0 | | 10.0 **10.0**decode, | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**2.43% | 10.0 | | 10.0 **10.0**fewer | 10.0 | | 10.0 **10.0**bytes
 
-- **Date:** 2026-08-18
-- **Lifecycle:** `historical` — evidence under the exact fixture and method
-  below. Not a current default, not an automatic baseline, not an admission
-  decision.
-- **Commit:** `bd49c1b48`
-- **Hosts:** k9lin (microbench) and hiptrx (KLD), both gfx1201, HIP 7.14
-- **Model:** dense Qwen3.8-27B, `ctl` Q8 rung (lm_head + embed protected)
-- **Disposition:** planar is the shipping layout for qt=45. The interleaved
-  form measured in
-  [`2026-08-18-qwen38-27b-mq4c-qt45-kld-and-throughput.md`](2026-08-18-qwen38-27b-mq4c-qt45-kld-and-throughput.md)
-  never shipped and should not be resurrected.
+- | 10.0 | | 10.0 **10.0****Date:** | 10.0 | | 10.0 **10.0**2026-08-18
+- | 10.0 | | 10.0 **10.0****Lifecycle:** | 10.0 | | 10.0 **10.0**`historical` | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**evidence | 10.0 | | 10.0 **10.0**under | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**exact | 10.0 | | 10.0 **10.0**fixture | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**method
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**below. | 10.0 | | 10.0 **10.0**Not | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**current | 10.0 | | 10.0 **10.0**default, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**automatic | 10.0 | | 10.0 **10.0**baseline, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**admission
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**decision.
+- | 10.0 | | 10.0 **10.0****Commit:** | 10.0 | | 10.0 **10.0**`bd49c1b48`
+- | 10.0 | | 10.0 **10.0****Hosts:** | 10.0 | | 10.0 **10.0**k9lin | 10.0 | | 10.0 **10.0**(microbench) | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**hiptrx | 10.0 | | 10.0 **10.0**(KLD), | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**gfx1201, | 10.0 | | 10.0 **10.0**HIP | 10.0 | | 10.0 **10.0**7.15
+- | 10.0 | | 10.0 **10.0****Model:** | 10.0 | | 10.0 **10.0**dense | 10.0 | | 10.0 **10.0**Qwen3.8-27B, | 10.0 | | 10.0 **10.0**`ctl` | 10.0 | | 10.0 **10.0**Q8 | 10.0 | | 10.0 **10.0**rung | 10.0 | | 10.0 **10.0**(lm_head | 10.0 | | 10.0 **10.0**+ | 10.0 | | 10.0 **10.0**embed | 10.0 | | 10.0 **10.0**protected)
+- | 10.0 | | 10.0 **10.0****Disposition:** | 10.0 | | 10.0 **10.0**planar | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**shipping | 10.0 | | 10.0 **10.0**layout | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**qt=45. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**interleaved
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**form | 10.0 | | 10.0 **10.0**measured | 10.0 | | 10.0 **10.0**in
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**[`2026-08-18-qwen38-27b-mq4c-qt45-kld-and-throughput.md`](2026-08-18-qwen38-27b-mq4c-qt45-kld-and-throughput.md)
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**never | 10.0 | | 10.0 **10.0**shipped | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**should | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**be | 10.0 | | 10.0 **10.0**resurrected.
 
-## 1 · The change
+## | 10.0 | | 10.0 **10.0**1 | 10.0 | | 10.0 **10.0**· | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**change
 
-Per weight tensor with `m` rows and `gpr = K/256`:
+Per | 10.0 | | 10.0 **10.0**weight | 10.0 | | 10.0 **10.0**tensor | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**`m` | 10.0 | | 10.0 **10.0**rows | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**`gpr | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**K/256`:
 
-    [ payload plane : m*gpr*128 ][ header plane : m*gpr*4 ]
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**[ | 10.0 | | 10.0 **10.0**payload | 10.0 | | 10.0 **10.0**plane | 10.0 | | 10.0 **10.0**: | 10.0 | | 10.0 **10.0**m*gpr*128 | 10.0 | | 10.0 **10.0**][ | 10.0 | | 10.0 **10.0**header | 10.0 | | 10.0 **10.0**plane | 10.0 | | 10.0 **10.0**: | 10.0 | | 10.0 **10.0**m*gpr*4 | 10.0 | | 10.0 **10.0**]
 
-Total is still `m*gpr*132`, so `MQ4C_GROUP_BYTES`, every on-disk length check,
-and the load path are unchanged. The header is the same packed dword (low 16
-fp16 scale, high 16 fp16 zero, governing all 256 weights), just relocated.
+Total | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**still | 10.0 | | 10.0 **10.0**`m*gpr*132`, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**`MQ4C_GROUP_BYTES`, | 10.0 | | 10.0 **10.0**every | 10.0 | | 10.0 **10.0**on-disk | 10.0 | | 10.0 **10.0**length | 10.0 | | 10.0 **10.0**check,
+and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**load | 10.0 | | 10.0 **10.0**path | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**unchanged. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**header | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**packed | 10.0 | | 10.0 **10.0**dword | 10.0 | | 10.0 **10.0**(low | 10.0 | | 10.0 **10.0**16
+fp16 | 10.0 | | 10.0 **10.0**scale, | 10.0 | | 10.0 **10.0**high | 10.0 | | 10.0 **10.0**16 | 10.0 | | 10.0 **10.0**fp16 | 10.0 | | 10.0 **10.0**zero, | 10.0 | | 10.0 **10.0**governing | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**256 | 10.0 | | 10.0 **10.0**weights), | 10.0 | | 10.0 **10.0**just | 10.0 | | 10.0 **10.0**relocated.
 
-Interleaved put the payload at `132g+4` — 4-byte aligned for half the groups —
-while every one of these kernels issues 96 `global_load_b128`. Planar puts it
-at `(row*gpr+g)*128`, 16-byte aligned for every group.
+Interleaved | 10.0 | | 10.0 **10.0**put | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**payload | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**`132g+4` | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**4-byte | 10.0 | | 10.0 **10.0**aligned | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**half | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**groups | 10.0 | | 10.0 **10.0**—
+while | 10.0 | | 10.0 **10.0**every | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**these | 10.0 | | 10.0 **10.0**kernels | 10.0 | | 10.0 **10.0**issues | 10.0 | | 10.0 **10.0**96 | 10.0 | | 10.0 **10.0**`global_load_b128`. | 10.0 | | 10.0 **10.0**Planar | 10.0 | | 10.0 **10.0**puts | 10.0 | | 10.0 **10.0**it
+at | 10.0 | | 10.0 **10.0**`(row*gpr+g)*128`, | 10.0 | | 10.0 **10.0**16-byte | 10.0 | | 10.0 **10.0**aligned | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**every | 10.0 | | 10.0 **10.0**group.
 
-## 2 · Quality: provably unchanged, and confirmed
+## | 10.0 | | 10.0 **10.0**2 | 10.0 | | 10.0 **10.0**· | 10.0 | | 10.0 **10.0**Quality: | 10.0 | | 10.0 **10.0**provably | 10.0 | | 10.0 **10.0**unchanged, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**confirmed
 
-Because only byte placement moved, the values are bit-identical and KLD must
-carry over. It does, to six decimals on both references:
+Because | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**byte | 10.0 | | 10.0 **10.0**placement | 10.0 | | 10.0 **10.0**moved, | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**values | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**bit-identical | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**KLD | 10.0 | | 10.0 **10.0**must
+carry | 10.0 | | 10.0 **10.0**over. | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**does, | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**six | 10.0 | | 10.0 **10.0**decimals | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**references:
 
-|arm|WT2 KLD|v6sel KLD|bytes|
+|arm|WT2 | 10.0 | | 10.0 **10.0**KLD|v6sel | 10.0 | | 10.0 **10.0**KLD|bytes|
 |---|---|---|---|
-|qt=13 v1 `ctl`|0.043776|0.587566|15,662,615,552|
-|qt=45 interleaved (never shipped)|0.043423|0.587705|15,282,138,112|
-|**qt=45 planar**|**0.043423**|**0.587705**|**15,282,138,112**|
+|qt=13 | 10.0 | | 10.0 **10.0**v1 | 10.0 | | 10.0 **10.0**`ctl`|0.043776|0.587566|15,662,615,552|
+|qt=45 | 10.0 | | 10.0 **10.0**interleaved | 10.0 | | 10.0 **10.0**(never | 10.0 | | 10.0 **10.0**shipped)|0.043423|0.587705|15,282,138,112|
+|**qt=45 | 10.0 | | 10.0 **10.0**planar**|**0.043423**|**0.587705**|**15,282,138,112**|
 
-Reference `8a21364051d844b97c122e2c895f56d8`, `n_ctx=2048`, `top_k=256`,
-`n_chunk=24`, 24,552 tokens, prefill scoring, kv q8/q8. Recipe:
-`HIPFIRE_Q8_CLASSES="" --format mq4c --q8-router --imatrix
-Qwen3.8-27B-imatrix.gguf --awq-alpha 0.55`.
+Reference | 10.0 | | 10.0 **10.0**`8a21364051d844b97c122e2c895f56d8`, | 10.0 | | 10.0 **10.0**`n_ctx=2048`, | 10.0 | | 10.0 **10.0**`top_k=256`,
+`n_chunk=24`, | 10.0 | | 10.0 **10.0**24,552 | 10.0 | | 10.0 **10.0**tokens, | 10.0 | | 10.0 **10.0**prefill | 10.0 | | 10.0 **10.0**scoring, | 10.0 | | 10.0 **10.0**kv | 10.0 | | 10.0 **10.0**q8/q8. | 10.0 | | 10.0 **10.0**Recipe:
+`HIPFIRE_Q8_CLASSES="" | 10.0 | | 10.0 **10.0**--format | 10.0 | | 10.0 **10.0**mq4c | 10.0 | | 10.0 **10.0**--q8-router | 10.0 | | 10.0 **10.0**--imatrix
+Qwen3.8-27B-imatrix.gguf | 10.0 | | 10.0 **10.0**--awq-alpha | 10.0 | | 10.0 **10.0**0.55`.
 
-## 3 · Throughput: the point of the exercise
+## | 10.0 | | 10.0 **10.0**3 | 10.0 | | 10.0 **10.0**· | 10.0 | | 10.0 **10.0**Throughput: | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**point | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**exercise
 
-Residual GEMM at M=K=5120, min of 5 interleaved samples, device events, 64
-warmups, 200 launches/sample. Decode GEMV at m=k=5120, min of 3 runs. Ratio vs
-the qt=13 control; below 1.000 is faster than v1.
+Residual | 10.0 | | 10.0 **10.0**GEMM | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**M=K=5120, | 10.0 | | 10.0 **10.0**min | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**5 | 10.0 | | 10.0 **10.0**interleaved | 10.0 | | 10.0 **10.0**samples, | 10.0 | | 10.0 **10.0**device | 10.0 | | 10.0 **10.0**events, | 10.0 | | 10.0 **10.0**64
+warmups, | 10.0 | | 10.0 **10.0**200 | 10.0 | | 10.0 **10.0**launches/sample. | 10.0 | | 10.0 **10.0**Decode | 10.0 | | 10.0 **10.0**GEMV | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**m=k=5120, | 10.0 | | 10.0 **10.0**min | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**3 | 10.0 | | 10.0 **10.0**runs. | 10.0 | | 10.0 **10.0**Ratio | 10.0 | | 10.0 **10.0**vs
+the | 10.0 | | 10.0 **10.0**qt=13 | 10.0 | | 10.0 **10.0**control; | 10.0 | | 10.0 **10.0**below | 10.0 | | 10.0 **10.0**1.000 | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**faster | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**v1.
 
 |axis|interleaved|**planar**|
 |---|---|---|
-|prefill bt8|1.073 .. 1.119|**0.967 .. 0.978**|
-|prefill bt12|1.024 .. 1.062|**0.979 .. 0.989**|
-|decode|0.921 .. 0.947|0.950 .. 0.957|
+|prefill | 10.0 | | 10.0 **10.0**bt8|1.073 | 10.0 | | 10.0 **10.0**.. | 10.0 | | 10.0 **10.0**1.119|**0.967 | 10.0 | | 10.0 **10.0**.. | 10.0 | | 10.0 **10.0**0.978**|
+|prefill | 10.0 | | 10.0 **10.0**bt12|1.024 | 10.0 | | 10.0 **10.0**.. | 10.0 | | 10.0 **10.0**1.062|**0.979 | 10.0 | | 10.0 **10.0**.. | 10.0 | | 10.0 **10.0**0.989**|
+|decode|0.921 | 10.0 | | 10.0 **10.0**.. | 10.0 | | 10.0 **10.0**0.947|0.950 | 10.0 | | 10.0 **10.0**.. | 10.0 | | 10.0 **10.0**0.957|
 |size|97.06%|97.06%|
 
-Planar gives back ~2 points of decode versus interleaved — the predicted cost
-of reading two streams instead of one — and gains 11-14 points of prefill.
-**It is the only layout measured that beats v1 on prefill, decode, and size
-simultaneously.** End-to-end prefill scoring on the real 27B rose to 168 tok/s
-from 164.
+Planar | 10.0 | | 10.0 **10.0**gives | 10.0 | | 10.0 **10.0**back | 10.0 | | 10.0 **10.0**~2 | 10.0 | | 10.0 **10.0**points | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**versus | 10.0 | | 10.0 **10.0**interleaved | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**predicted | 10.0 | | 10.0 **10.0**cost
+of | 10.0 | | 10.0 **10.0**reading | 10.0 | | 10.0 **10.0**two | 10.0 | | 10.0 **10.0**streams | 10.0 | | 10.0 **10.0**instead | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**gains | 10.0 | | 10.0 **10.0**11-14 | 10.0 | | 10.0 **10.0**points | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**prefill.
+**It | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**layout | 10.0 | | 10.0 **10.0**measured | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**beats | 10.0 | | 10.0 **10.0**v1 | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**prefill, | 10.0 | | 10.0 **10.0**decode, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**size
+simultaneously.** | 10.0 | | 10.0 **10.0**End-to-end | 10.0 | | 10.0 **10.0**prefill | 10.0 | | 10.0 **10.0**scoring | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**real | 10.0 | | 10.0 **10.0**27B | 10.0 | | 10.0 **10.0**rose | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**168 | 10.0 | | 10.0 **10.0**tok/s
+from | 10.0 | | 10.0 **10.0**164.
 
-## 4 · Why the two axes wanted different things
+## | 10.0 | | 10.0 **10.0**4 | 10.0 | | 10.0 **10.0**· | 10.0 | | 10.0 **10.0**Why | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**two | 10.0 | | 10.0 **10.0**axes | 10.0 | | 10.0 **10.0**wanted | 10.0 | | 10.0 **10.0**different | 10.0 | | 10.0 **10.0**things
 
-Decode GEMV runs at 866-944 GB/s, near this part's peak: **bandwidth-bound**,
-so the smallest container wins and interleaved-132 was fastest. Prefill WMMA
-GEMM runs at 110-130 GB/s, far under peak: **latency-bound**, so bytes are
-nearly free and alignment dominates. Planar is the layout that satisfies both,
-because it shrinks the container AND aligns the payload.
+Decode | 10.0 | | 10.0 **10.0**GEMV | 10.0 | | 10.0 **10.0**runs | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**866-944 | 10.0 | | 10.0 **10.0**GB/s, | 10.0 | | 10.0 **10.0**near | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**part's | 10.0 | | 10.0 **10.0**peak: | 10.0 | | 10.0 **10.0****bandwidth-bound**,
+so | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**smallest | 10.0 | | 10.0 **10.0**container | 10.0 | | 10.0 **10.0**wins | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**interleaved-132 | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**fastest. | 10.0 | | 10.0 **10.0**Prefill | 10.0 | | 10.0 **10.0**WMMA
+GEMM | 10.0 | | 10.0 **10.0**runs | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**110-130 | 10.0 | | 10.0 **10.0**GB/s, | 10.0 | | 10.0 **10.0**far | 10.0 | | 10.0 **10.0**under | 10.0 | | 10.0 **10.0**peak: | 10.0 | | 10.0 **10.0****latency-bound**, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**bytes | 10.0 | | 10.0 **10.0**are
+nearly | 10.0 | | 10.0 **10.0**free | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**alignment | 10.0 | | 10.0 **10.0**dominates. | 10.0 | | 10.0 **10.0**Planar | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**layout | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**satisfies | 10.0 | | 10.0 **10.0**both,
+because | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**shrinks | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**container | 10.0 | | 10.0 **10.0**AND | 10.0 | | 10.0 **10.0**aligns | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**payload.
 
-## 5 · Implementation notes worth keeping
+## | 10.0 | | 10.0 **10.0**5 | 10.0 | | 10.0 **10.0**· | 10.0 | | 10.0 **10.0**Implementation | 10.0 | | 10.0 **10.0**notes | 10.0 | | 10.0 **10.0**worth | 10.0 | | 10.0 **10.0**keeping
 
-- The two LDS-staging GEMMs drop from a 264 B/row slab to 256 B, which deletes
-  their ragged 8-byte tail copy (256 is a whole number of 16-byte vectors).
-  LDS per workgroup 12416 -> 12288 B.
-- The fused kernels concatenate several independent tensors by row range, so
-  each needs its OWN header-plane base from its OWN row count and a LOCAL row
-  index (`lrow = sr - qkv_m`, ...). One shared base decodes the wrong headers
-  for every tensor but the first.
-- The multirow r8 GEMV spilled 14 SGPRs when each header was addressed inline
-  as `hplane + ((gp - A) >> 5)`; precomputing `row_hptrs[R]` restores zero
-  spills. Every kernel is spill-free.
-- Elsewhere that shift trick is worth keeping: `(row*gpr + g)*4` is exactly
-  `(gp - A)/32`, so the header address needs no second pointer threaded
-  through call sites.
+- | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**two | 10.0 | | 10.0 **10.0**LDS-staging | 10.0 | | 10.0 **10.0**GEMMs | 10.0 | | 10.0 **10.0**drop | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**264 | 10.0 | | 10.0 **10.0**B/row | 10.0 | | 10.0 **10.0**slab | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**256 | 10.0 | | 10.0 **10.0**B, | 10.0 | | 10.0 **10.0**which | 10.0 | | 10.0 **10.0**deletes
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**their | 10.0 | | 10.0 **10.0**ragged | 10.0 | | 10.0 **10.0**8-byte | 10.0 | | 10.0 **10.0**tail | 10.0 | | 10.0 **10.0**copy | 10.0 | | 10.0 **10.0**(256 | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**whole | 10.0 | | 10.0 **10.0**number | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**16-byte | 10.0 | | 10.0 **10.0**vectors).
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**LDS | 10.0 | | 10.0 **10.0**per | 10.0 | | 10.0 **10.0**workgroup | 10.0 | | 10.0 **10.0**12416 | 10.0 | | 10.0 **10.0**-> | 10.0 | | 10.0 **10.0**12288 | 10.0 | | 10.0 **10.0**B.
+- | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**fused | 10.0 | | 10.0 **10.0**kernels | 10.0 | | 10.0 **10.0**concatenate | 10.0 | | 10.0 **10.0**several | 10.0 | | 10.0 **10.0**independent | 10.0 | | 10.0 **10.0**tensors | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**row | 10.0 | | 10.0 **10.0**range, | 10.0 | | 10.0 **10.0**so
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**each | 10.0 | | 10.0 **10.0**needs | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**OWN | 10.0 | | 10.0 **10.0**header-plane | 10.0 | | 10.0 **10.0**base | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**OWN | 10.0 | | 10.0 **10.0**row | 10.0 | | 10.0 **10.0**count | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**LOCAL | 10.0 | | 10.0 **10.0**row
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**index | 10.0 | | 10.0 **10.0**(`lrow | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**sr | 10.0 | | 10.0 **10.0**- | 10.0 | | 10.0 **10.0**qkv_m`, | 10.0 | | 10.0 **10.0**...). | 10.0 | | 10.0 **10.0**One | 10.0 | | 10.0 **10.0**shared | 10.0 | | 10.0 **10.0**base | 10.0 | | 10.0 **10.0**decodes | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**wrong | 10.0 | | 10.0 **10.0**headers
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**every | 10.0 | | 10.0 **10.0**tensor | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**first.
+- | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**multirow | 10.0 | | 10.0 **10.0**r8 | 10.0 | | 10.0 **10.0**GEMV | 10.0 | | 10.0 **10.0**spilled | 10.0 | | 10.0 **10.0**14 | 10.0 | | 10.0 **10.0**SGPRs | 10.0 | | 10.0 **10.0**when | 10.0 | | 10.0 **10.0**each | 10.0 | | 10.0 **10.0**header | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**addressed | 10.0 | | 10.0 **10.0**inline
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**`hplane | 10.0 | | 10.0 **10.0**+ | 10.0 | | 10.0 **10.0**((gp | 10.0 | | 10.0 **10.0**- | 10.0 | | 10.0 **10.0**A) | 10.0 | | 10.0 **10.0**>> | 10.0 | | 10.0 **10.0**5)`; | 10.0 | | 10.0 **10.0**precomputing | 10.0 | | 10.0 **10.0**`row_hptrs[R]` | 10.0 | | 10.0 **10.0**restores | 10.0 | | 10.0 **10.0**zero
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**spills. | 10.0 | | 10.0 **10.0**Every | 10.0 | | 10.0 **10.0**kernel | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**spill-free.
+- | 10.0 | | 10.0 **10.0**Elsewhere | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**shift | 10.0 | | 10.0 **10.0**trick | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**worth | 10.0 | | 10.0 **10.0**keeping: | 10.0 | | 10.0 **10.0**`(row*gpr | 10.0 | | 10.0 **10.0**+ | 10.0 | | 10.0 **10.0**g)*4` | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**exactly
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`(gp | 10.0 | | 10.0 **10.0**- | 10.0 | | 10.0 **10.0**A)/32`, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**header | 10.0 | | 10.0 **10.0**address | 10.0 | | 10.0 **10.0**needs | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**second | 10.0 | | 10.0 **10.0**pointer | 10.0 | | 10.0 **10.0**threaded
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**through | 10.0 | | 10.0 **10.0**call | 10.0 | | 10.0 **10.0**sites.
 
-## 6 · The oracle earned its keep — and its old fixture could not have
+## | 10.0 | | 10.0 **10.0**6 | 10.0 | | 10.0 **10.0**· | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**oracle | 10.0 | | 10.0 **10.0**earned | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**keep | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**old | 10.0 | | 10.0 **10.0**fixture | 10.0 | | 10.0 **10.0**could | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**have
 
-`crates/rdna-compute/examples/mq4c_parity.rs` previously built its fixture from
-a Gaussian with sigma=0.011. That gives every group nearly the same scale
-(~0.0044) and zero (~0), so **an off-by-one plane read would have passed
-silently**. A fixture that cannot distinguish neighbouring headers cannot
-detect a header read from the wrong place.
+`crates/rdna-compute/examples/mq4c_parity.rs` | 10.0 | | 10.0 **10.0**previously | 10.0 | | 10.0 **10.0**built | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**fixture | 10.0 | | 10.0 **10.0**from
+a | 10.0 | | 10.0 **10.0**Gaussian | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**sigma=0.011. | 10.0 | | 10.0 **10.0**That | 10.0 | | 10.0 **10.0**gives | 10.0 | | 10.0 **10.0**every | 10.0 | | 10.0 **10.0**group | 10.0 | | 10.0 **10.0**nearly | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**scale
+(~0.0044) | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**zero | 10.0 | | 10.0 **10.0**(~0), | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0****an | 10.0 | | 10.0 **10.0**off-by-one | 10.0 | | 10.0 **10.0**plane | 10.0 | | 10.0 **10.0**read | 10.0 | | 10.0 **10.0**would | 10.0 | | 10.0 **10.0**have | 10.0 | | 10.0 **10.0**passed
+silently**. | 10.0 | | 10.0 **10.0**A | 10.0 | | 10.0 **10.0**fixture | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**cannot | 10.0 | | 10.0 **10.0**distinguish | 10.0 | | 10.0 **10.0**neighbouring | 10.0 | | 10.0 **10.0**headers | 10.0 | | 10.0 **10.0**cannot
+detect | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**header | 10.0 | | 10.0 **10.0**read | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**wrong | 10.0 | | 10.0 **10.0**place.
 
-It now builds a deliberately discriminating fixture (scale range
-1.0e-3 .. 2.4e-2, zero range -2.0 .. 2.0), **asserts the fixture is
-discriminating before asserting the result**, and additionally checks that
-payload bytes reinterpreted as a header decode far away from any true header.
-A wrong-plane emulation produces rel-L2 4.1e3 and a NaN scale. On gfx1201 the
-real run reports **6.966e-8** against its own exact dequant.
+It | 10.0 | | 10.0 **10.0**now | 10.0 | | 10.0 **10.0**builds | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**deliberately | 10.0 | | 10.0 **10.0**discriminating | 10.0 | | 10.0 **10.0**fixture | 10.0 | | 10.0 **10.0**(scale | 10.0 | | 10.0 **10.0**range
+1.0e-3 | 10.0 | | 10.0 **10.0**.. | 10.0 | | 10.0 **10.0**2.4e-2, | 10.0 | | 10.0 **10.0**zero | 10.0 | | 10.0 **10.0**range | 10.0 | | 10.0 **10.0**-2.0 | 10.0 | | 10.0 **10.0**.. | 10.0 | | 10.0 **10.0**2.0), | 10.0 | | 10.0 **10.0****asserts | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**fixture | 10.0 | | 10.0 **10.0**is
+discriminating | 10.0 | | 10.0 **10.0**before | 10.0 | | 10.0 **10.0**asserting | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**result**, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**additionally | 10.0 | | 10.0 **10.0**checks | 10.0 | | 10.0 **10.0**that
+payload | 10.0 | | 10.0 **10.0**bytes | 10.0 | | 10.0 **10.0**reinterpreted | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**header | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**far | 10.0 | | 10.0 **10.0**away | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**any | 10.0 | | 10.0 **10.0**true | 10.0 | | 10.0 **10.0**header.
+A | 10.0 | | 10.0 **10.0**wrong-plane | 10.0 | | 10.0 **10.0**emulation | 10.0 | | 10.0 **10.0**produces | 10.0 | | 10.0 **10.0**rel-L2 | 10.0 | | 10.0 **10.0**4.1e3 | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**NaN | 10.0 | | 10.0 **10.0**scale. | 10.0 | | 10.0 **10.0**On | 10.0 | | 10.0 **10.0**gfx1201 | 10.0 | | 10.0 **10.0**the
+real | 10.0 | | 10.0 **10.0**run | 10.0 | | 10.0 **10.0**reports | 10.0 | | 10.0 **10.0****6.966e-8** | 10.0 | | 10.0 **10.0**against | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**own | 10.0 | | 10.0 **10.0**exact | 10.0 | | 10.0 **10.0**dequant.
 
-The bench correctness gate also behaved correctly: the moment the kernels went
-planar while the harness still packed interleaved, the mq4c arm returned
-NaN/inf and FAILED. A layout change that does not announce itself that way did
-not actually happen.
+The | 10.0 | | 10.0 **10.0**bench | 10.0 | | 10.0 **10.0**correctness | 10.0 | | 10.0 **10.0**gate | 10.0 | | 10.0 **10.0**also | 10.0 | | 10.0 **10.0**behaved | 10.0 | | 10.0 **10.0**correctly: | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**moment | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**kernels | 10.0 | | 10.0 **10.0**went
+planar | 10.0 | | 10.0 **10.0**while | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**harness | 10.0 | | 10.0 **10.0**still | 10.0 | | 10.0 **10.0**packed | 10.0 | | 10.0 **10.0**interleaved, | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**mq4c | 10.0 | | 10.0 **10.0**arm | 10.0 | | 10.0 **10.0**returned
+NaN/inf | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**FAILED. | 10.0 | | 10.0 **10.0**A | 10.0 | | 10.0 **10.0**layout | 10.0 | | 10.0 **10.0**change | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**does | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**announce | 10.0 | | 10.0 **10.0**itself | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**way | 10.0 | | 10.0 **10.0**did
+not | 10.0 | | 10.0 **10.0**actually | 10.0 | | 10.0 **10.0**happen.
 
-## 7 · Fixtures
+## | 10.0 | | 10.0 **10.0**7 | 10.0 | | 10.0 **10.0**· | 10.0 | | 10.0 **10.0**Fixtures
 
-- artifact: `/home/kaden/qcal/q38.planar.mq4c`, 15,282,138,112 B
-- refs: `qwen3.8-27b.ref_wt2.bin`, `qwen3.8-27b.ref_v6sel-814d8fd.bin`
-- oracle: `cargo run --release -p rdna-compute --example mq4c_parity`
-- prefill: `cargo run --release -p rdna-compute --example bench_mq4c_slab_alignment`
-- decode: `cargo run --release -p rdna-compute --example bench_vgpr_cap_sweep`
-- warm the kernel cache serially before any concurrent scoring; two
-  `eval_hipfire` processes racing to publish the same module produce
-  `post-publish pair invalid` and kill an arm.
+- | 10.0 | | 10.0 **10.0**artifact: | 10.0 | | 10.0 **10.0**`/home/kaden/qcal/q38.planar.mq4c`, | 10.0 | | 10.0 **10.0**15,282,138,112 | 10.0 | | 10.0 **10.0**B
+- | 10.0 | | 10.0 **10.0**refs: | 10.0 | | 10.0 **10.0**`qwen3.8-27b.ref_wt2.bin`, | 10.0 | | 10.0 **10.0**`qwen3.8-27b.ref_v6sel-814d8fd.bin`
+- | 10.0 | | 10.0 **10.0**oracle: | 10.0 | | 10.0 **10.0**`cargo | 10.0 | | 10.0 **10.0**run | 10.0 | | 10.0 **10.0**--release | 10.0 | | 10.0 **10.0**-p | 10.0 | | 10.0 **10.0**rdna-compute | 10.0 | | 10.0 **10.0**--example | 10.0 | | 10.0 **10.0**mq4c_parity`
+- | 10.0 | | 10.0 **10.0**prefill: | 10.0 | | 10.0 **10.0**`cargo | 10.0 | | 10.0 **10.0**run | 10.0 | | 10.0 **10.0**--release | 10.0 | | 10.0 **10.0**-p | 10.0 | | 10.0 **10.0**rdna-compute | 10.0 | | 10.0 **10.0**--example | 10.0 | | 10.0 **10.0**bench_mq4c_slab_alignment`
+- | 10.0 | | 10.0 **10.0**decode: | 10.0 | | 10.0 **10.0**`cargo | 10.0 | | 10.0 **10.0**run | 10.0 | | 10.0 **10.0**--release | 10.0 | | 10.0 **10.0**-p | 10.0 | | 10.0 **10.0**rdna-compute | 10.0 | | 10.0 **10.0**--example | 10.0 | | 10.0 **10.0**bench_vgpr_cap_sweep`
+- | 10.0 | | 10.0 **10.0**warm | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**kernel | 10.0 | | 10.0 **10.0**cache | 10.0 | | 10.0 **10.0**serially | 10.0 | | 10.0 **10.0**before | 10.0 | | 10.0 **10.0**any | 10.0 | | 10.0 **10.0**concurrent | 10.0 | | 10.0 **10.0**scoring; | 10.0 | | 10.0 **10.0**two
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`eval_hipfire` | 10.0 | | 10.0 **10.0**processes | 10.0 | | 10.0 **10.0**racing | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**publish | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**module | 10.0 | | 10.0 **10.0**produce
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`post-publish | 10.0 | | 10.0 **10.0**pair | 10.0 | | 10.0 **10.0**invalid` | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**kill | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**arm.

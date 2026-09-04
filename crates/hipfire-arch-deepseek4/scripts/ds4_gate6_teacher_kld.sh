@@ -21,7 +21,7 @@
 #   ds4_gate6_teacher_kld.sh summary      # rewrite BASELINE_SUMMARY.txt
 
 set -u
-export PATH="${PATH}:/root/.cargo/bin:/opt/rocm/core-7.14/bin"
+export PATH="${PATH}:/root/.cargo/bin:/opt/rocm/core-10.0/bin"
 
 ROOT="${HIPFIRE_ROOT:-/root/hipfire-work/ds4-parent-gate}"
 TEACHER="${TEACHER_DIR:-/mnt/scratch/quantization/deepseek-v4-flash-0731-teacher}"

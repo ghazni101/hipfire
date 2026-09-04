@@ -1,133 +1,133 @@
-# DS4 DSpark LocalMaxxing k6/k4 production comparison
+# | 10.0 | | 10.0 **10.0**DS4 | 10.0 | | 10.0 **10.0**DSpark | 10.0 | | 10.0 **10.0**LocalMaxxing | 10.0 | | 10.0 **10.0**k6/k4 | 10.0 | | 10.0 **10.0**production | 10.0 | | 10.0 **10.0**comparison
 
-Date: 2026-08-06  
-Branch: `ds4-beta-staging`  
-Host/device: `hipx`, Radeon 8060S, `gfx1151`, ROCm 7.14
+Date: | 10.0 | | 10.0 **10.0**2026-08-06 | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**
+Branch: | 10.0 | | 10.0 **10.0**`ds4-beta-staging` | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**
+Host/device: | 10.0 | | 10.0 **10.0**`hipx`, | 10.0 | | 10.0 **10.0**Radeon | 10.0 | | 10.0 **10.0**8060S, | 10.0 | | 10.0 **10.0**`gfx1151`, | 10.0 | | 10.0 **10.0**ROCm | 10.0 | | 10.0 **10.0**10.0
 
-> **Superseded as the k6 baseline (2026-08-08).** The 37.3165 tok/s figure below
-> remains the correct golden *for the commit it was measured at*, and this
-> document's k6/k4 comparison stands. It is no longer the number to benchmark
-> against: the tiled LDS top-K gather (`3bc2b47ee`) moved the shipping k6 path
-> to **38.97192 tok/s** median. See
-> [`2026-08-08-ds4-gfx1151-decode-roofline.md`](2026-08-08-ds4-gfx1151-decode-roofline.md)
-> § "Current k6 golden" for the current reference, and § 6 of that document for
-> the verify cost model, which corrects the assumption that decode throughput
-> scales with tau.
+> | 10.0 | | 10.0 **10.0****Superseded | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**k6 | 10.0 | | 10.0 **10.0**baseline | 10.0 | | 10.0 **10.0**(2026-08-08).** | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**37.3165 | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**figure | 10.0 | | 10.0 **10.0**below
+> | 10.0 | | 10.0 **10.0**remains | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**correct | 10.0 | | 10.0 **10.0**golden | 10.0 | | 10.0 **10.0***for | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**commit | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**measured | 10.0 | | 10.0 **10.0**at*, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**this
+> | 10.0 | | 10.0 **10.0**document's | 10.0 | | 10.0 **10.0**k6/k4 | 10.0 | | 10.0 **10.0**comparison | 10.0 | | 10.0 **10.0**stands. | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**longer | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**number | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**benchmark
+> | 10.0 | | 10.0 **10.0**against: | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**tiled | 10.0 | | 10.0 **10.0**LDS | 10.0 | | 10.0 **10.0**top-K | 10.0 | | 10.0 **10.0**gather | 10.0 | | 10.0 **10.0**(`3bc2b47ee`) | 10.0 | | 10.0 **10.0**moved | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**shipping | 10.0 | | 10.0 **10.0**k6 | 10.0 | | 10.0 **10.0**path
+> | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0****38.97192 | 10.0 | | 10.0 **10.0**tok/s** | 10.0 | | 10.0 **10.0**median. | 10.0 | | 10.0 **10.0**See
+> | 10.0 | | 10.0 **10.0**[`2026-08-08-ds4-gfx1151-decode-roofline.md`](2026-08-08-ds4-gfx1151-decode-roofline.md)
+> | 10.0 | | 10.0 **10.0**§ | 10.0 | | 10.0 **10.0**"Current | 10.0 | | 10.0 **10.0**k6 | 10.0 | | 10.0 **10.0**golden" | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**current | 10.0 | | 10.0 **10.0**reference, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**§ | 10.0 | | 10.0 **10.0**6 | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**document | 10.0 | | 10.0 **10.0**for
+> | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**verify | 10.0 | | 10.0 **10.0**cost | 10.0 | | 10.0 **10.0**model, | 10.0 | | 10.0 **10.0**which | 10.0 | | 10.0 **10.0**corrects | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**assumption | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**throughput
+> | 10.0 | | 10.0 **10.0**scales | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**tau.
 
-This comparison reproduces the shipping top-k6 DSpark golden three times and
-then measures the same production serve path three times with runtime routed
-expert fanout set to four. It supersedes the earlier `dspark_bench` k4 smoke
-for product performance: that direct benchmark framed the prompt as 24 tokens,
-whereas the serving fixture frames the committed prompt as 25 tokens.
+This | 10.0 | | 10.0 **10.0**comparison | 10.0 | | 10.0 **10.0**reproduces | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**shipping | 10.0 | | 10.0 **10.0**top-k6 | 10.0 | | 10.0 **10.0**DSpark | 10.0 | | 10.0 **10.0**golden | 10.0 | | 10.0 **10.0**three | 10.0 | | 10.0 **10.0**times | 10.0 | | 10.0 **10.0**and
+then | 10.0 | | 10.0 **10.0**measures | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**production | 10.0 | | 10.0 **10.0**serve | 10.0 | | 10.0 **10.0**path | 10.0 | | 10.0 **10.0**three | 10.0 | | 10.0 **10.0**times | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**runtime | 10.0 | | 10.0 **10.0**routed
+expert | 10.0 | | 10.0 **10.0**fanout | 10.0 | | 10.0 **10.0**set | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**four. | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**supersedes | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**earlier | 10.0 | | 10.0 **10.0**`dspark_bench` | 10.0 | | 10.0 **10.0**k4 | 10.0 | | 10.0 **10.0**smoke
+for | 10.0 | | 10.0 **10.0**product | 10.0 | | 10.0 **10.0**performance: | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**direct | 10.0 | | 10.0 **10.0**benchmark | 10.0 | | 10.0 **10.0**framed | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**prompt | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**24 | 10.0 | | 10.0 **10.0**tokens,
+whereas | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**serving | 10.0 | | 10.0 **10.0**fixture | 10.0 | | 10.0 **10.0**frames | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**committed | 10.0 | | 10.0 **10.0**prompt | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**25 | 10.0 | | 10.0 **10.0**tokens.
 
-## Fixture
+## | 10.0 | | 10.0 **10.0**Fixture
 
-- Target: `deepseek-v4-flash-0731.mq2r`, preserved P3 artifact
-- Model SHA-256:
-  `cbf2bbcfa3f47b1712a071836b2c48232dad7dfb763813a720f7d348a9318cce`
-- DSpark sidecar: `deepseek-v4-flash-0731-dspark.mq2r`
-- Sidecar SHA-256:
-  `bc695a000643801d26e5ae96c9f4ac4c222a36d9db40566f4cc1de0e9d3d5d2e`
-- Tool: `scripts/serve_harness.py`, production CLI and daemon lifecycle
-- Prompt: entry 0 of `benchmarks/prompts/ds4_dspark_genre_code.json`
-- Prompt MD5: `d782138f5bc8bbbd234ca8e4b17cace9`
-- 25 prompt tokens, 128 generated tokens, batch 1, greedy
-- Q8 KV request, contiguous KV backend
-- DSpark direct HIP, adaptive B, sidecar maximum block 5
-- Thinking, MTP, and DFlash off
-- Three fresh processes per expert-fanout arm
+- | 10.0 | | 10.0 **10.0**Target: | 10.0 | | 10.0 **10.0**`deepseek-v4-flash-0731.mq2r`, | 10.0 | | 10.0 **10.0**preserved | 10.0 | | 10.0 **10.0**P3 | 10.0 | | 10.0 **10.0**artifact
+- | 10.0 | | 10.0 **10.0**Model | 10.0 | | 10.0 **10.0**SHA-256:
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`cbf2bbcfa3f47b1712a071836b2c48232dad7dfb763813a720f7d348a9318cce`
+- | 10.0 | | 10.0 **10.0**DSpark | 10.0 | | 10.0 **10.0**sidecar: | 10.0 | | 10.0 **10.0**`deepseek-v4-flash-0731-dspark.mq2r`
+- | 10.0 | | 10.0 **10.0**Sidecar | 10.0 | | 10.0 **10.0**SHA-256:
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`bc695a000643801d26e5ae96c9f4ac4c222a36d9db40566f4cc1de0e9d3d5d2e`
+- | 10.0 | | 10.0 **10.0**Tool: | 10.0 | | 10.0 **10.0**`scripts/serve_harness.py`, | 10.0 | | 10.0 **10.0**production | 10.0 | | 10.0 **10.0**CLI | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**daemon | 10.0 | | 10.0 **10.0**lifecycle
+- | 10.0 | | 10.0 **10.0**Prompt: | 10.0 | | 10.0 **10.0**entry | 10.0 | | 10.0 **10.0**0 | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**`benchmarks/prompts/ds4_dspark_genre_code.json`
+- | 10.0 | | 10.0 **10.0**Prompt | 10.0 | | 10.0 **10.0**MD5: | 10.0 | | 10.0 **10.0**`d782138f5bc8bbbd234ca8e4b17cace9`
+- | 10.0 | | 10.0 **10.0**25 | 10.0 | | 10.0 **10.0**prompt | 10.0 | | 10.0 **10.0**tokens, | 10.0 | | 10.0 **10.0**128 | 10.0 | | 10.0 **10.0**generated | 10.0 | | 10.0 **10.0**tokens, | 10.0 | | 10.0 **10.0**batch | 10.0 | | 10.0 **10.0**1, | 10.0 | | 10.0 **10.0**greedy
+- | 10.0 | | 10.0 **10.0**Q8 | 10.0 | | 10.0 **10.0**KV | 10.0 | | 10.0 **10.0**request, | 10.0 | | 10.0 **10.0**contiguous | 10.0 | | 10.0 **10.0**KV | 10.0 | | 10.0 **10.0**backend
+- | 10.0 | | 10.0 **10.0**DSpark | 10.0 | | 10.0 **10.0**direct | 10.0 | | 10.0 **10.0**HIP, | 10.0 | | 10.0 **10.0**adaptive | 10.0 | | 10.0 **10.0**B, | 10.0 | | 10.0 **10.0**sidecar | 10.0 | | 10.0 **10.0**maximum | 10.0 | | 10.0 **10.0**block | 10.0 | | 10.0 **10.0**5
+- | 10.0 | | 10.0 **10.0**Thinking, | 10.0 | | 10.0 **10.0**MTP, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**DFlash | 10.0 | | 10.0 **10.0**off
+- | 10.0 | | 10.0 **10.0**Three | 10.0 | | 10.0 **10.0**fresh | 10.0 | | 10.0 **10.0**processes | 10.0 | | 10.0 **10.0**per | 10.0 | | 10.0 **10.0**expert-fanout | 10.0 | | 10.0 **10.0**arm
 
-Top-k6 is the shipping checkpoint default. Top-k4 is a runtime model-load
-choice over the same weights, not a separately baked artifact and not a change
-to the shipping default.
+Top-k6 | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**shipping | 10.0 | | 10.0 **10.0**checkpoint | 10.0 | | 10.0 **10.0**default. | 10.0 | | 10.0 **10.0**Top-k4 | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**runtime | 10.0 | | 10.0 **10.0**model-load
+choice | 10.0 | | 10.0 **10.0**over | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**weights, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**separately | 10.0 | | 10.0 **10.0**baked | 10.0 | | 10.0 **10.0**artifact | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**change
+to | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**shipping | 10.0 | | 10.0 **10.0**default.
 
-## Results
+## | 10.0 | | 10.0 **10.0**Results
 
-| Routed experts/token | Samples (tok/s) | Median | Range / median | Tau | Acceptance | Windows |
+| | 10.0 | | 10.0 **10.0**Routed | 10.0 | | 10.0 **10.0**experts/token | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Samples | 10.0 | | 10.0 **10.0**(tok/s) | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Median | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Range | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**median | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Tau | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Acceptance | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Windows | 10.0 | | 10.0 **10.0**|
 |---:|---|---:|---:|---:|---:|---:|
-| 6 (shipping) | 37.3010 / 37.3214 / 37.3165 | **37.3165** | 0.055% | 2.02381 | 67% | 42 |
-| 4 (matched config) | 39.1688 / 39.1808 / 39.1907 | **39.1808** | 0.056% | 1.64583 | 55% | 48 |
+| | 10.0 | | 10.0 **10.0**6 | 10.0 | | 10.0 **10.0**(shipping) | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**37.3010 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**37.3214 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**37.3165 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0****37.3165** | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.055% | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**2.02381 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**67% | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**42 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**4 | 10.0 | | 10.0 **10.0**(matched | 10.0 | | 10.0 **10.0**config) | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**39.1688 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**39.1808 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**39.1907 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0****39.1808** | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.056% | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1.64583 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**55% | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**48 | 10.0 | | 10.0 **10.0**|
 
-The k4 median is +1.8643 tok/s, or +4.996%, over the reproduced shipping k6
-median. The throughput gain survives a lower proposal-acceptance rate because
-the target moves two fewer routed experts per token.
+The | 10.0 | | 10.0 **10.0**k4 | 10.0 | | 10.0 **10.0**median | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**+1.8643 | 10.0 | | 10.0 **10.0**tok/s, | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**+4.996%, | 10.0 | | 10.0 **10.0**over | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**reproduced | 10.0 | | 10.0 **10.0**shipping | 10.0 | | 10.0 **10.0**k6
+median. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**throughput | 10.0 | | 10.0 **10.0**gain | 10.0 | | 10.0 **10.0**survives | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**lower | 10.0 | | 10.0 **10.0**proposal-acceptance | 10.0 | | 10.0 **10.0**rate | 10.0 | | 10.0 **10.0**because
+the | 10.0 | | 10.0 **10.0**target | 10.0 | | 10.0 **10.0**moves | 10.0 | | 10.0 **10.0**two | 10.0 | | 10.0 **10.0**fewer | 10.0 | | 10.0 **10.0**routed | 10.0 | | 10.0 **10.0**experts | 10.0 | | 10.0 **10.0**per | 10.0 | | 10.0 **10.0**token.
 
-Decoded output was byte-identical within each arm:
+Decoded | 10.0 | | 10.0 **10.0**output | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**byte-identical | 10.0 | | 10.0 **10.0**within | 10.0 | | 10.0 **10.0**each | 10.0 | | 10.0 **10.0**arm:
 
-- k6 MD5: `e49b9893a207d8a698eb17fdca13db51`
-- k4 MD5: `0f6363c0da1396377ba85881e9061c3b`
+- | 10.0 | | 10.0 **10.0**k6 | 10.0 | | 10.0 **10.0**MD5: | 10.0 | | 10.0 **10.0**`e49b9893a207d8a698eb17fdca13db51`
+- | 10.0 | | 10.0 **10.0**k4 | 10.0 | | 10.0 **10.0**MD5: | 10.0 | | 10.0 **10.0**`0f6363c0da1396377ba85881e9061c3b`
 
-The arms are not expected to be byte-identical to one another because changing
-expert fanout changes target arithmetic and is a quality/configuration choice.
-All six outputs were coherent Python merge-function completions and stopped at
-the deliberate 128-token cap. The harness's `runaway` label denotes that cap
-hit; no accepted row was empty or an attractor.
+The | 10.0 | | 10.0 **10.0**arms | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**expected | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**be | 10.0 | | 10.0 **10.0**byte-identical | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**another | 10.0 | | 10.0 **10.0**because | 10.0 | | 10.0 **10.0**changing
+expert | 10.0 | | 10.0 **10.0**fanout | 10.0 | | 10.0 **10.0**changes | 10.0 | | 10.0 **10.0**target | 10.0 | | 10.0 **10.0**arithmetic | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**quality/configuration | 10.0 | | 10.0 **10.0**choice.
+All | 10.0 | | 10.0 **10.0**six | 10.0 | | 10.0 **10.0**outputs | 10.0 | | 10.0 **10.0**were | 10.0 | | 10.0 **10.0**coherent | 10.0 | | 10.0 **10.0**Python | 10.0 | | 10.0 **10.0**merge-function | 10.0 | | 10.0 **10.0**completions | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**stopped | 10.0 | | 10.0 **10.0**at
+the | 10.0 | | 10.0 **10.0**deliberate | 10.0 | | 10.0 **10.0**128-token | 10.0 | | 10.0 **10.0**cap. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**harness's | 10.0 | | 10.0 **10.0**`runaway` | 10.0 | | 10.0 **10.0**label | 10.0 | | 10.0 **10.0**denotes | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**cap
+hit; | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**accepted | 10.0 | | 10.0 **10.0**row | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**empty | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**attractor.
 
-## Production k4 plumbing
+## | 10.0 | | 10.0 **10.0**Production | 10.0 | | 10.0 **10.0**k4 | 10.0 | | 10.0 **10.0**plumbing
 
-Commit `95297149e6c1f9ed18a2487c668ccd152f4e7489` adds the typed nullable config
-field `model.deepseek4_experts_per_token`. Null preserves the checkpoint
-default. Values are schema-bounded to 1 through 6, forwarded in the daemon load
-request, and applied only by `Deepseek4Carrier`; Qwen carriers and Qwen-owned
-function bodies are unchanged.
+Commit | 10.0 | | 10.0 **10.0**`95297149e6c1f9ed18a2487c668ccd152f4e7489` | 10.0 | | 10.0 **10.0**adds | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**typed | 10.0 | | 10.0 **10.0**nullable | 10.0 | | 10.0 **10.0**config
+field | 10.0 | | 10.0 **10.0**`model.deepseek4_experts_per_token`. | 10.0 | | 10.0 **10.0**Null | 10.0 | | 10.0 **10.0**preserves | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**checkpoint
+default. | 10.0 | | 10.0 **10.0**Values | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**schema-bounded | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**1 | 10.0 | | 10.0 **10.0**through | 10.0 | | 10.0 **10.0**6, | 10.0 | | 10.0 **10.0**forwarded | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**daemon | 10.0 | | 10.0 **10.0**load
+request, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**applied | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**`Deepseek4Carrier`; | 10.0 | | 10.0 **10.0**Qwen | 10.0 | | 10.0 **10.0**carriers | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**Qwen-owned
+function | 10.0 | | 10.0 **10.0**bodies | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**unchanged.
 
-The k4 logs prove the selected route for every process:
+The | 10.0 | | 10.0 **10.0**k4 | 10.0 | | 10.0 **10.0**logs | 10.0 | | 10.0 **10.0**prove | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**selected | 10.0 | | 10.0 **10.0**route | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**every | 10.0 | | 10.0 **10.0**process:
 
-- `GPU dev 0: gfx1151 (103.1 GB VRAM, HIP 7.14)`
-- `deepseek4: runtime experts-per-token override 6 -> 4`
-- P3 MQ2R artifact verification
-- P3-aligned DSpark sidecar identity verification
-- `deepseek4 DSpark speculator enabled (sidecar, block=5)`
-- request-level `drafter=dspark`
+- | 10.0 | | 10.0 **10.0**`GPU | 10.0 | | 10.0 **10.0**dev | 10.0 | | 10.0 **10.0**0: | 10.0 | | 10.0 **10.0**gfx1151 | 10.0 | | 10.0 **10.0**(103.1 | 10.0 | | 10.0 **10.0**GB | 10.0 | | 10.0 **10.0**VRAM, | 10.0 | | 10.0 **10.0**HIP | 10.0 | | 10.0 **10.0**7.15)`
+- | 10.0 | | 10.0 **10.0**`deepseek4: | 10.0 | | 10.0 **10.0**runtime | 10.0 | | 10.0 **10.0**experts-per-token | 10.0 | | 10.0 **10.0**override | 10.0 | | 10.0 **10.0**6 | 10.0 | | 10.0 **10.0**-> | 10.0 | | 10.0 **10.0**4`
+- | 10.0 | | 10.0 **10.0**P3 | 10.0 | | 10.0 **10.0**MQ2R | 10.0 | | 10.0 **10.0**artifact | 10.0 | | 10.0 **10.0**verification
+- | 10.0 | | 10.0 **10.0**P3-aligned | 10.0 | | 10.0 **10.0**DSpark | 10.0 | | 10.0 **10.0**sidecar | 10.0 | | 10.0 **10.0**identity | 10.0 | | 10.0 **10.0**verification
+- | 10.0 | | 10.0 **10.0**`deepseek4 | 10.0 | | 10.0 **10.0**DSpark | 10.0 | | 10.0 **10.0**speculator | 10.0 | | 10.0 **10.0**enabled | 10.0 | | 10.0 **10.0**(sidecar, | 10.0 | | 10.0 **10.0**block=5)`
+- | 10.0 | | 10.0 **10.0**request-level | 10.0 | | 10.0 **10.0**`drafter=dspark`
 
-Both accepted arms used these exact binaries:
+Both | 10.0 | | 10.0 **10.0**accepted | 10.0 | | 10.0 **10.0**arms | 10.0 | | 10.0 **10.0**used | 10.0 | | 10.0 **10.0**these | 10.0 | | 10.0 **10.0**exact | 10.0 | | 10.0 **10.0**binaries:
 
-- CLI SHA-256:
-  `abc1489026b449ed052954f32b9bed09a2ef896df27acf4b64784c86ded683ab`
-- Daemon SHA-256:
-  `bade329fe6799bae317a5981a82fa8a8866188c2deb66482401ac1641262b798`
+- | 10.0 | | 10.0 **10.0**CLI | 10.0 | | 10.0 **10.0**SHA-256:
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`abc1489026b449ed052954f32b9bed09a2ef896df27acf4b64784c86ded683ab`
+- | 10.0 | | 10.0 **10.0**Daemon | 10.0 | | 10.0 **10.0**SHA-256:
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`bade329fe6799bae317a5981a82fa8a8866188c2deb66482401ac1641262b798`
 
-Validation before the GPU runs:
+Validation | 10.0 | | 10.0 **10.0**before | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**GPU | 10.0 | | 10.0 **10.0**runs:
 
-- `cargo test -p hipfire-config`: 52 passed
-- focused `hipfire-cli` load-parameter test: passed
-- `cargo check -p hipfire-loader -p hipfire-cli`: passed
-- `cargo check -p hipfire-runtime --example daemon`: passed
-- `scripts/serve_harness.py --self-test`: passed
+- | 10.0 | | 10.0 **10.0**`cargo | 10.0 | | 10.0 **10.0**test | 10.0 | | 10.0 **10.0**-p | 10.0 | | 10.0 **10.0**hipfire-config`: | 10.0 | | 10.0 **10.0**52 | 10.0 | | 10.0 **10.0**passed
+- | 10.0 | | 10.0 **10.0**focused | 10.0 | | 10.0 **10.0**`hipfire-cli` | 10.0 | | 10.0 **10.0**load-parameter | 10.0 | | 10.0 **10.0**test: | 10.0 | | 10.0 **10.0**passed
+- | 10.0 | | 10.0 **10.0**`cargo | 10.0 | | 10.0 **10.0**check | 10.0 | | 10.0 **10.0**-p | 10.0 | | 10.0 **10.0**hipfire-loader | 10.0 | | 10.0 **10.0**-p | 10.0 | | 10.0 **10.0**hipfire-cli`: | 10.0 | | 10.0 **10.0**passed
+- | 10.0 | | 10.0 **10.0**`cargo | 10.0 | | 10.0 **10.0**check | 10.0 | | 10.0 **10.0**-p | 10.0 | | 10.0 **10.0**hipfire-runtime | 10.0 | | 10.0 **10.0**--example | 10.0 | | 10.0 **10.0**daemon`: | 10.0 | | 10.0 **10.0**passed
+- | 10.0 | | 10.0 **10.0**`scripts/serve_harness.py | 10.0 | | 10.0 **10.0**--self-test`: | 10.0 | | 10.0 **10.0**passed
 
-## Excluded but preserved
+## | 10.0 | | 10.0 **10.0**Excluded | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**preserved
 
-- The earlier `dspark_bench` k4 smoke and interrupted repetitions are not
-  product-serving evidence because that benchmark reported a 24-token prompt
-  and bypassed production serve/load behavior.
-- The first valid production k6 trio at the immediate parent commit remains a
-  historical recovery (37.3181 tok/s median), but the primary table uses the
-  subsequent `k6-matched-run1..3` trio on the exact k4 binary hashes. This
-  removes the otherwise inert optional-selector source delta from the A/B.
-- `k4-production-run1.*` is excluded because singular `--prompt-file` treated
-  the JSON fixture itself as a 44-token prose prompt. It measured 32.2269 tok/s
-  and is retained solely as an audit of the fixture error.
-- The accepted runs use plural `--prompts-file`, selecting the embedded code
-  row and reproducing the historical 25-token framing.
+- | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**earlier | 10.0 | | 10.0 **10.0**`dspark_bench` | 10.0 | | 10.0 **10.0**k4 | 10.0 | | 10.0 **10.0**smoke | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**interrupted | 10.0 | | 10.0 **10.0**repetitions | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**not
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**product-serving | 10.0 | | 10.0 **10.0**evidence | 10.0 | | 10.0 **10.0**because | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**benchmark | 10.0 | | 10.0 **10.0**reported | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**24-token | 10.0 | | 10.0 **10.0**prompt
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**bypassed | 10.0 | | 10.0 **10.0**production | 10.0 | | 10.0 **10.0**serve/load | 10.0 | | 10.0 **10.0**behavior.
+- | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**first | 10.0 | | 10.0 **10.0**valid | 10.0 | | 10.0 **10.0**production | 10.0 | | 10.0 **10.0**k6 | 10.0 | | 10.0 **10.0**trio | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**immediate | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**commit | 10.0 | | 10.0 **10.0**remains | 10.0 | | 10.0 **10.0**a
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**historical | 10.0 | | 10.0 **10.0**recovery | 10.0 | | 10.0 **10.0**(37.3181 | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**median), | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**primary | 10.0 | | 10.0 **10.0**table | 10.0 | | 10.0 **10.0**uses | 10.0 | | 10.0 **10.0**the
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**subsequent | 10.0 | | 10.0 **10.0**`k6-matched-run1..3` | 10.0 | | 10.0 **10.0**trio | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**exact | 10.0 | | 10.0 **10.0**k4 | 10.0 | | 10.0 **10.0**binary | 10.0 | | 10.0 **10.0**hashes. | 10.0 | | 10.0 **10.0**This
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**removes | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**otherwise | 10.0 | | 10.0 **10.0**inert | 10.0 | | 10.0 **10.0**optional-selector | 10.0 | | 10.0 **10.0**source | 10.0 | | 10.0 **10.0**delta | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**A/B.
+- | 10.0 | | 10.0 **10.0**`k4-production-run1.*` | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**excluded | 10.0 | | 10.0 **10.0**because | 10.0 | | 10.0 **10.0**singular | 10.0 | | 10.0 **10.0**`--prompt-file` | 10.0 | | 10.0 **10.0**treated
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**JSON | 10.0 | | 10.0 **10.0**fixture | 10.0 | | 10.0 **10.0**itself | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**44-token | 10.0 | | 10.0 **10.0**prose | 10.0 | | 10.0 **10.0**prompt. | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**measured | 10.0 | | 10.0 **10.0**32.2269 | 10.0 | | 10.0 **10.0**tok/s
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**retained | 10.0 | | 10.0 **10.0**solely | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**audit | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**fixture | 10.0 | | 10.0 **10.0**error.
+- | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**accepted | 10.0 | | 10.0 **10.0**runs | 10.0 | | 10.0 **10.0**use | 10.0 | | 10.0 **10.0**plural | 10.0 | | 10.0 **10.0**`--prompts-file`, | 10.0 | | 10.0 **10.0**selecting | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**embedded | 10.0 | | 10.0 **10.0**code
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**row | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**reproducing | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**historical | 10.0 | | 10.0 **10.0**25-token | 10.0 | | 10.0 **10.0**framing.
 
-## Evidence
+## | 10.0 | | 10.0 **10.0**Evidence
 
 `hipx:/home/kaden/ds4-gfx1151-evidence/2026-08-06-localmaxxing/`
 
-Accepted result JSON SHA-256 values:
+Accepted | 10.0 | | 10.0 **10.0**result | 10.0 | | 10.0 **10.0**JSON | 10.0 | | 10.0 **10.0**SHA-256 | 10.0 | | 10.0 **10.0**values:
 
-- k6: `fb5d9a4b474dbadb5d7496caf19c00bda51297f9f8dc4f4a13150fdc1d8bfc9e`,
-  `6a0a96a62fe32ce20d27f8e8e4b138d04582c092ba40dbf47d5bfac6290985a6`,
-  `d91af249916c841ce02a5821721bf1e6649b777a291af32433d661b41e1c3c36`
-- k4: `5f8f8d9460bfc00b03ceac97cab598bd176ea1ef88f63d9f03089136596b01f8`,
-  `ab7f3a13305878051a1fc6ee057b28f47c5da7aac1a5e12e3217b849610c2325`,
-  `28ec3391cabc1e0e1893e0ad498b8374e9ca0418fcf3fc87eee95557c6bc8682`
+- | 10.0 | | 10.0 **10.0**k6: | 10.0 | | 10.0 **10.0**`fb5d9a4b474dbadb5d7496caf19c00bda51297f9f8dc4f4a13150fdc1d8bfc9e`,
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`6a0a96a62fe32ce20d27f8e8e4b138d04582c092ba40dbf47d5bfac6290985a6`,
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`d91af249916c841ce02a5821721bf1e6649b777a291af32433d661b41e1c3c36`
+- | 10.0 | | 10.0 **10.0**k4: | 10.0 | | 10.0 **10.0**`5f8f8d9460bfc00b03ceac97cab598bd176ea1ef88f63d9f03089136596b01f8`,
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`ab7f3a13305878051a1fc6ee057b28f47c5da7aac1a5e12e3217b849610c2325`,
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`28ec3391cabc1e0e1893e0ad498b8374e9ca0418fcf3fc87eee95557c6bc8682`
 
-Skipped: no AR arm in this comparison; no quality promotion of k4; no weight,
-kernel, PM4, KV, sampling, or shipping-default change; no 2,048/512 or
-long-context run.
+Skipped: | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**AR | 10.0 | | 10.0 **10.0**arm | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**comparison; | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**quality | 10.0 | | 10.0 **10.0**promotion | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**k4; | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**weight,
+kernel, | 10.0 | | 10.0 **10.0**PM4, | 10.0 | | 10.0 **10.0**KV, | 10.0 | | 10.0 **10.0**sampling, | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**shipping-default | 10.0 | | 10.0 **10.0**change; | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**2,048/512 | 10.0 | | 10.0 **10.0**or
+long-context | 10.0 | | 10.0 **10.0**run.
 
-Verdict: the production shipping k6 DSpark golden is recovered at 37.3165 tok/s
-median, while the same production fixture at user-selectable k4 reaches 39.1808
-tok/s median. Keep k6 as the quality/default row and report k4 separately as the
-matched-config performance row.
+Verdict: | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**production | 10.0 | | 10.0 **10.0**shipping | 10.0 | | 10.0 **10.0**k6 | 10.0 | | 10.0 **10.0**DSpark | 10.0 | | 10.0 **10.0**golden | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**recovered | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**37.3165 | 10.0 | | 10.0 **10.0**tok/s
+median, | 10.0 | | 10.0 **10.0**while | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**production | 10.0 | | 10.0 **10.0**fixture | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**user-selectable | 10.0 | | 10.0 **10.0**k4 | 10.0 | | 10.0 **10.0**reaches | 10.0 | | 10.0 **10.0**39.1808
+tok/s | 10.0 | | 10.0 **10.0**median. | 10.0 | | 10.0 **10.0**Keep | 10.0 | | 10.0 **10.0**k6 | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**quality/default | 10.0 | | 10.0 **10.0**row | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**report | 10.0 | | 10.0 **10.0**k4 | 10.0 | | 10.0 **10.0**separately | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**the
+matched-config | 10.0 | | 10.0 **10.0**performance | 10.0 | | 10.0 **10.0**row.

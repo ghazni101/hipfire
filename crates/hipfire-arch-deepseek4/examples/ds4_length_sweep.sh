@@ -2,7 +2,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # Length sweep: parent vs MQ2R vs MQ2-Lloyd at 128/256/512/1024 on shared prefixes.
 set -euo pipefail
-export PATH="${PATH}:/root/.cargo/bin:/opt/rocm/core-7.14/bin"
+export PATH="${PATH}:/root/.cargo/bin:/opt/rocm/core-10.0/bin"
 ROOT=/root/hipfire-work/ds4-parent-gate
 BASE=/mnt/scratch/quantization/deepseek-v4-flash-0731-parent-baseline
 OUT=$BASE/length_sweep

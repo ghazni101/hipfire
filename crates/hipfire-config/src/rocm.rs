@@ -43,7 +43,7 @@
 use std::path::{Path, PathBuf};
 
 /// Device compilers, most specific first. `hipcc` is being wound down upstream
-/// in favour of invoking the LLVM driver directly, and on ROCm 7.14 `hipcc` is
+/// in favour of invoking the LLVM driver directly, and on ROCm 10.0 `hipcc` is
 /// already a thin wrapper around `amdclang++`, so both are probed.
 pub const DEVICE_COMPILERS: &[&str] = &["hipcc", "amdclang++", "amdclang", "clang++"];
 
@@ -59,7 +59,7 @@ const ROOT_HINT_TOOLS: &[&str] = &[
 ];
 
 /// Split a directory name into numeric components for version ordering.
-/// `core-7.14` -> [7, 14]; names without digits sort last.
+/// `core-10.0` -> [7, 14]; names without digits sort last.
 fn version_key(name: &str) -> Vec<u64> {
     let mut out = Vec::new();
     let mut cur = String::new();
@@ -965,7 +965,7 @@ pub fn tool_from_selected_root(root: &Path, name: &str) -> Option<PathBuf> {
 /// and on non-Windows the HSA runtime).
 ///
 /// Some installs keep `/opt/rocm` as a directory holding only version
-/// symlinks (`core`, `core-7`, `core-7.14`) with no `include/`, `lib/` or
+/// symlinks (`core`, `core-7`, `core-10.0`) with no `include/`, `lib/` or
 /// `bin/` of its own. Such a path passes `is_dir` but resolves every header
 /// and library lookup to nothing, so existence alone is not a usable test.
 pub fn is_complete_root(path: &Path) -> bool {
@@ -1350,7 +1350,7 @@ pub fn device_compiler() -> Option<PathBuf> {
 ///
 /// `hipcc` locates its own LLVM as `$ROCM_PATH/lib/llvm/bin/clang++`, and
 /// `ROCM_PATH` defaults to `/opt/rocm`. On an install rooted elsewhere —
-/// `/opt/rocm/core-7.14` on this fleet — pairing that hipcc with a different
+/// `/opt/rocm/core-10.0` on this fleet — pairing that hipcc with a different
 /// `ROCM_PATH` makes every compile fail with
 ///
 ///   sh: 1: /opt/rocm/lib/llvm/bin/clang++: not found
@@ -1413,14 +1413,14 @@ mod compiler_env_tests {
 
     #[test]
     fn compiler_root_follows_the_selected_toolchain() {
-        let selected = Path::new("/opt/rocm/core-7.14/bin/hipcc");
+        let selected = Path::new("/opt/rocm/core-10.0/bin/hipcc");
 
         assert_eq!(
             compiler_env_root_from(selected, Some(Path::new("/opt/rocm"))),
-            Some(PathBuf::from("/opt/rocm/core-7.14"))
+            Some(PathBuf::from("/opt/rocm/core-10.0"))
         );
         assert_eq!(
-            compiler_env_root_from(selected, Some(Path::new("/opt/rocm/core-7.14"))),
+            compiler_env_root_from(selected, Some(Path::new("/opt/rocm/core-10.0"))),
             None
         );
     }
@@ -1432,11 +1432,11 @@ mod tests {
 
     #[test]
     fn version_key_orders_core_dirs_newest_first() {
-        assert_eq!(version_key("core-7.14"), vec![7, 14]);
+        assert_eq!(version_key("core-10.0"), vec![7, 14]);
         assert_eq!(version_key("core-7"), vec![7]);
         assert_eq!(version_key("rocm-6.4.1"), vec![6, 4, 1]);
-        assert!(version_key("core-7.14") > version_key("core-7"));
-        assert!(version_key("core-7.14") > version_key("core-7.9"));
+        assert!(version_key("core-10.0") > version_key("core-7"));
+        assert!(version_key("core-10.0") > version_key("core-7.9"));
         assert!(version_key("nodigits").is_empty());
     }
 
@@ -1457,7 +1457,7 @@ mod tests {
     fn versioned_siblings_sorts_newest_first_and_skips_files() {
         let tmp = std::env::temp_dir().join(format!("hipfire-rocm-test-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        for d in ["core-7", "core-7.14", "core-6.4", "unrelated"] {
+        for d in ["core-7", "core-10.0", "core-6.4", "unrelated"] {
             std::fs::create_dir_all(tmp.join(d)).unwrap();
         }
         // A regular file matching the prefix must not be treated as a root.
@@ -1468,7 +1468,7 @@ mod tests {
             .iter()
             .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
-        assert_eq!(names, vec!["core-7.14", "core-7", "core-6.4"]);
+        assert_eq!(names, vec!["core-10.0", "core-7", "core-6.4"]);
 
         std::fs::remove_dir_all(&tmp).unwrap();
     }
@@ -1480,7 +1480,7 @@ mod tests {
     fn a_compiler_only_root_reports_both_hip_components_missing() {
         let tmp = std::env::temp_dir().join(format!("hipfire-rocm-parts-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        let root = tmp.join("core-7.14");
+        let root = tmp.join("core-10.0");
         std::fs::create_dir_all(root.join("bin")).unwrap();
         std::fs::write(root.join("bin").join("hipcc"), b"#!/bin/sh\n").unwrap();
 
@@ -1598,7 +1598,7 @@ mod tests {
     fn a_root_with_headers_and_runtime_is_not_missing_anything() {
         let tmp = std::env::temp_dir().join(format!("hipfire-rocm-full-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&tmp);
-        let root = tmp.join("core-7.14");
+        let root = tmp.join("core-10.0");
         // Build the tree through the platform constants so this test exercises
         // the real Windows layout (bin/amdhip64.dll) when run on Windows.
         std::fs::create_dir_all(root.join("include").join("hip")).unwrap();
@@ -1661,9 +1661,9 @@ mod tests {
         // This is the real layout on installs that keep the tree under
         // /opt/rocm/core-<ver>.
         let shim = tmp.join("rocm");
-        std::fs::create_dir_all(shim.join("core-7.14").join("include").join("hip")).unwrap();
+        std::fs::create_dir_all(shim.join("core-10.0").join("include").join("hip")).unwrap();
         std::fs::write(
-            shim.join("core-7.14")
+            shim.join("core-10.0")
                 .join("include")
                 .join("hip")
                 .join("hip_runtime.h"),
@@ -1676,7 +1676,7 @@ mod tests {
             "a directory with no include/hip/hip_runtime.h must not count as a root"
         );
         assert!(
-            is_complete_root(&shim.join("core-7.14")),
+            is_complete_root(&shim.join("core-10.0")),
             "the versioned sibling carrying the headers is the real root"
         );
 
@@ -1941,13 +1941,13 @@ mod tests {
     fn split_tree_expansion_never_leaves_the_configured_family() {
         let base = std::env::temp_dir().join(format!("hipfire-rocm-family-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
-        std::fs::create_dir_all(base.join("core-7.14")).unwrap();
+        std::fs::create_dir_all(base.join("core-10.0")).unwrap();
         std::fs::create_dir_all(base.join("core-7.2")).unwrap();
 
         let family = root_family(&base);
         assert_eq!(family[0], base);
         assert!(family.iter().all(|candidate| candidate.starts_with(&base)));
-        assert!(family[1].ends_with("core-7.14"));
+        assert!(family[1].ends_with("core-10.0"));
         assert!(family[2].ends_with("core-7.2"));
 
         std::fs::remove_dir_all(&base).unwrap();
@@ -1979,7 +1979,7 @@ mod tests {
         let base =
             std::env::temp_dir().join(format!("hipfire-rocm-ambiguous-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
-        for version in ["core-7.14", "core-7.2"] {
+        for version in ["core-10.0", "core-7.2"] {
             write_coherent_sdk(&base.join(version));
         }
 
@@ -2003,7 +2003,7 @@ mod tests {
             std::process::id()
         ));
         let _ = std::fs::remove_dir_all(&base);
-        let headers_only = base.join("core-7.14");
+        let headers_only = base.join("core-10.0");
         let full = base.join("core-7.2");
 
         std::fs::create_dir_all(headers_only.join("include").join("hip")).unwrap();
@@ -2053,7 +2053,7 @@ mod tests {
         let base =
             std::env::temp_dir().join(format!("hipfire-rocm-two-coherent-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&base);
-        let a = base.join("core-7.14");
+        let a = base.join("core-10.0");
         let b = base.join("core-7.2");
         write_coherent_sdk(&a);
         write_coherent_sdk(&b);
@@ -2238,12 +2238,12 @@ mod tests {
         )
         .unwrap();
         std::fs::create_dir_all(libs.join(".info")).unwrap();
-        std::fs::write(libs.join(".info").join("version"), b"7.14.0").unwrap();
+        std::fs::write(libs.join(".info").join("version"), b"10.0.0").unwrap();
         // Fake compiler on PATH (and its own root with version).
         let comp_root = base.join("compiler_root");
         std::fs::create_dir_all(comp_root.join("bin")).unwrap();
         std::fs::create_dir_all(comp_root.join(".info")).unwrap();
-        std::fs::write(comp_root.join(".info").join("version"), b"7.14.0").unwrap();
+        std::fs::write(comp_root.join(".info").join("version"), b"10.0.0").unwrap();
         let comp = comp_root.join("bin").join("hipcc");
         std::fs::write(&comp, b"#!/bin/sh\n").unwrap();
         #[cfg(unix)]
@@ -2265,7 +2265,7 @@ mod tests {
         assert!(joined.contains(&libs.display().to_string()), "{joined}");
         assert!(joined.contains(&comp.display().to_string()), "{joined}");
         assert!(joined.contains(&result.compiler_root.unwrap().display().to_string()), "{joined}");
-        assert!(joined.contains("7.14.0"), "{joined}");
+        assert!(joined.contains("10.0.0"), "{joined}");
         assert!(joined.to_lowercase().contains("different"), "{joined}");
         std::fs::remove_dir_all(&base).unwrap();
     }

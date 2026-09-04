@@ -1,5 +1,5 @@
-GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.14)
-  pre-compiled kernels: /mnt/scratch/hipfire-kernels/rocm714/gfx942
-[rocblas] loaded for gfx942
-CHANNEL topk=6 M=4096 K=4096 values=24576 raw_bit_mismatches=0 numerical_violations=0 max_abs=0.000000000e0 first_raw=None cpu_sentinels=42 cpu_violations=0 max_cpu_abs=2.479553223e-5 guards=[true, true, true, true]
-MICRO repeats=20 wave64_ms=0.023257 wave64x8_shared_x_ms=0.030054 speedup=0.7738x baseline_grid=4096x6x64 candidate_grid=512x6x512
+GPU | 10.0 | | 10.0 **10.0**dev | 10.0 | | 10.0 **10.0**0: | 10.0 | | 10.0 **10.0**gfx942 | 10.0 | | 10.0 **10.0**(205.8 | 10.0 | | 10.0 **10.0**GB | 10.0 | | 10.0 **10.0**VRAM, | 10.0 | | 10.0 **10.0**HIP | 10.0 | | 10.0 **10.0**7.15)
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**pre-compiled | 10.0 | | 10.0 **10.0**kernels: | 10.0 | | 10.0 **10.0**/mnt/scratch/hipfire-kernels/rocm100/gfx942
+[rocblas] | 10.0 | | 10.0 **10.0**loaded | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**gfx942
+CHANNEL | 10.0 | | 10.0 **10.0**topk=6 | 10.0 | | 10.0 **10.0**M=4096 | 10.0 | | 10.0 **10.0**K=4096 | 10.0 | | 10.0 **10.0**values=24576 | 10.0 | | 10.0 **10.0**raw_bit_mismatches=0 | 10.0 | | 10.0 **10.0**numerical_violations=0 | 10.0 | | 10.0 **10.0**max_abs=0.000000000e0 | 10.0 | | 10.0 **10.0**first_raw=None | 10.0 | | 10.0 **10.0**cpu_sentinels=42 | 10.0 | | 10.0 **10.0**cpu_violations=0 | 10.0 | | 10.0 **10.0**max_cpu_abs=2.479553223e-5 | 10.0 | | 10.0 **10.0**guards=[true, | 10.0 | | 10.0 **10.0**true, | 10.0 | | 10.0 **10.0**true, | 10.0 | | 10.0 **10.0**true]
+MICRO | 10.0 | | 10.0 **10.0**repeats=20 | 10.0 | | 10.0 **10.0**wave64_ms=0.023257 | 10.0 | | 10.0 **10.0**wave64x8_shared_x_ms=0.030054 | 10.0 | | 10.0 **10.0**speedup=0.7738x | 10.0 | | 10.0 **10.0**baseline_grid=4096x6x64 | 10.0 | | 10.0 **10.0**candidate_grid=512x6x512

@@ -1,196 +1,196 @@
-# Amendment: the fp16 header at model scale — prefill win survives, decode win inverts
+# | 10.0 | | 10.0 **10.0**Amendment: | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**fp16 | 10.0 | | 10.0 **10.0**header | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**scale | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**prefill | 10.0 | | 10.0 **10.0**win | 10.0 | | 10.0 **10.0**survives, | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**win | 10.0 | | 10.0 **10.0**inverts
 
-- **Date:** 2026-08-18
-- **Lifecycle:** `historical`
-- **Amends:**
-  [`2026-08-18-amendment-fp16-header-and-planar-microbench-matrix.md`](2026-08-18-amendment-fp16-header-and-planar-microbench-matrix.md)
-  § 3, which reported the fp16 header as "a free ~5% on both ends" from
-  isolated benches. Prefill holds. **Decode does not — it reverses sign.**
-- **Host:** hiptrx, gfx1201, HIP 7.14
-- **Commit:** `b815dd97a`
+- | 10.0 | | 10.0 **10.0****Date:** | 10.0 | | 10.0 **10.0**2026-08-18
+- | 10.0 | | 10.0 **10.0****Lifecycle:** | 10.0 | | 10.0 **10.0**`historical`
+- | 10.0 | | 10.0 **10.0****Amends:**
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**[`2026-08-18-amendment-fp16-header-and-planar-microbench-matrix.md`](2026-08-18-amendment-fp16-header-and-planar-microbench-matrix.md)
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**§ | 10.0 | | 10.0 **10.0**3, | 10.0 | | 10.0 **10.0**which | 10.0 | | 10.0 **10.0**reported | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**fp16 | 10.0 | | 10.0 **10.0**header | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**"a | 10.0 | | 10.0 **10.0**free | 10.0 | | 10.0 **10.0**~5% | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**ends" | 10.0 | | 10.0 **10.0**from
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**isolated | 10.0 | | 10.0 **10.0**benches. | 10.0 | | 10.0 **10.0**Prefill | 10.0 | | 10.0 **10.0**holds. | 10.0 | | 10.0 **10.0****Decode | 10.0 | | 10.0 **10.0**does | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**reverses | 10.0 | | 10.0 **10.0**sign.**
+- | 10.0 | | 10.0 **10.0****Host:** | 10.0 | | 10.0 **10.0**hiptrx, | 10.0 | | 10.0 **10.0**gfx1201, | 10.0 | | 10.0 **10.0**HIP | 10.0 | | 10.0 **10.0**7.15
+- | 10.0 | | 10.0 **10.0****Commit:** | 10.0 | | 10.0 **10.0**`b815dd97a`
 
-## 1 · The measurement
+## | 10.0 | | 10.0 **10.0**1 | 10.0 | | 10.0 **10.0**· | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**measurement
 
-qt=45 was rebuilt in the "pad" layout — v1's exact geometry with the header
-re-encoded: `[0..4)` fp16 header, `[4..8)` zero padding, `[8..136)` 128 B
-nibbles. Same file size as qt=13. `hipfire bench --runs 5 --json`, dense
-Qwen3.8-27B `ctl`, serial, with the v1 control run **before and after** in one
-session to bracket thermal drift.
+qt=45 | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**rebuilt | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**"pad" | 10.0 | | 10.0 **10.0**layout | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**v1's | 10.0 | | 10.0 **10.0**exact | 10.0 | | 10.0 **10.0**geometry | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**header
+re-encoded: | 10.0 | | 10.0 **10.0**`[0..4)` | 10.0 | | 10.0 **10.0**fp16 | 10.0 | | 10.0 **10.0**header, | 10.0 | | 10.0 **10.0**`[4..8)` | 10.0 | | 10.0 **10.0**zero | 10.0 | | 10.0 **10.0**padding, | 10.0 | | 10.0 **10.0**`[8..136)` | 10.0 | | 10.0 **10.0**128 | 10.0 | | 10.0 **10.0**B
+nibbles. | 10.0 | | 10.0 **10.0**Same | 10.0 | | 10.0 **10.0**file | 10.0 | | 10.0 **10.0**size | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**qt=13. | 10.0 | | 10.0 **10.0**`hipfire | 10.0 | | 10.0 **10.0**bench | 10.0 | | 10.0 **10.0**--runs | 10.0 | | 10.0 **10.0**5 | 10.0 | | 10.0 **10.0**--json`, | 10.0 | | 10.0 **10.0**dense
+Qwen3.8-27B | 10.0 | | 10.0 **10.0**`ctl`, | 10.0 | | 10.0 **10.0**serial, | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**v1 | 10.0 | | 10.0 **10.0**control | 10.0 | | 10.0 **10.0**run | 10.0 | | 10.0 **10.0****before | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**after** | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**one
+session | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**bracket | 10.0 | | 10.0 **10.0**thermal | 10.0 | | 10.0 **10.0**drift.
 
-|run|decode tok/s|prefill tok/s|ttft ms|
+|run|decode | 10.0 | | 10.0 **10.0**tok/s|prefill | 10.0 | | 10.0 **10.0**tok/s|ttft | 10.0 | | 10.0 **10.0**ms|
 |---|---|---|---|
-|v1 before|34.70|404.70|59.30|
-|**qt=45 pad**|**33.90**|**415.40**|**57.80**|
-|v1 after|34.60|401.30|59.80|
+|v1 | 10.0 | | 10.0 **10.0**before|34.70|404.70|59.30|
+|**qt=45 | 10.0 | | 10.0 **10.0**pad**|**33.90**|**415.40**|**57.80**|
+|v1 | 10.0 | | 10.0 **10.0**after|34.60|401.30|59.80|
 
-Versus the v1 mean (34.65 / 403.0): **prefill +3.1%, decode −2.2%, ttft −2.9%**.
+Versus | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**v1 | 10.0 | | 10.0 **10.0**mean | 10.0 | | 10.0 **10.0**(34.65 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**403.0): | 10.0 | | 10.0 **10.0****prefill | 10.0 | | 10.0 **10.0**+3.1%, | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**−2.2%, | 10.0 | | 10.0 **10.0**ttft | 10.0 | | 10.0 **10.0**−2.9%**.
 
-KLD unchanged from every other qt=45 layout — WT2 0.043423, v6sel 0.587705 —
-confirming again that these layout moves are pure relocations.
+KLD | 10.0 | | 10.0 **10.0**unchanged | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**every | 10.0 | | 10.0 **10.0**other | 10.0 | | 10.0 **10.0**qt=45 | 10.0 | | 10.0 **10.0**layout | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**WT2 | 10.0 | | 10.0 **10.0**0.043423, | 10.0 | | 10.0 **10.0**v6sel | 10.0 | | 10.0 **10.0**0.587705 | 10.0 | | 10.0 **10.0**—
+confirming | 10.0 | | 10.0 **10.0**again | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**these | 10.0 | | 10.0 **10.0**layout | 10.0 | | 10.0 **10.0**moves | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**pure | 10.0 | | 10.0 **10.0**relocations.
 
-## 2 · What the microbenches got right and wrong
+## | 10.0 | | 10.0 **10.0**2 | 10.0 | | 10.0 **10.0**· | 10.0 | | 10.0 **10.0**What | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**microbenches | 10.0 | | 10.0 **10.0**got | 10.0 | | 10.0 **10.0**right | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**wrong
 
-|axis|isolated bench|model scale|verdict|
+|axis|isolated | 10.0 | | 10.0 **10.0**bench|model | 10.0 | | 10.0 **10.0**scale|verdict|
 |---|---|---|---|
-|prefill|−3.0% (faster than v1)|**+3.1% faster**|direction AND magnitude survived|
-|decode|−5.0% (faster than v1)|**−2.2% slower**|**sign inverted**|
+|prefill|−3.0% | 10.0 | | 10.0 **10.0**(faster | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**v1)|**+3.1% | 10.0 | | 10.0 **10.0**faster**|direction | 10.0 | | 10.0 **10.0**AND | 10.0 | | 10.0 **10.0**magnitude | 10.0 | | 10.0 **10.0**survived|
+|decode|−5.0% | 10.0 | | 10.0 **10.0**(faster | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**v1)|**−2.2% | 10.0 | | 10.0 **10.0**slower**|**sign | 10.0 | | 10.0 **10.0**inverted**|
 
-This is the sharpest result of the campaign on methodology. A residual-GEMM
-microbench predicted model prefill well. A residual-GEMV microbench predicted
-model decode *backwards*. Decode at model scale runs many more distinct kernels
-than the residual GEMV, and it is bandwidth-bound near peak, so a single
-kernel's schedule improvement does not compose.
+This | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**sharpest | 10.0 | | 10.0 **10.0**result | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**campaign | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**methodology. | 10.0 | | 10.0 **10.0**A | 10.0 | | 10.0 **10.0**residual-GEMM
+microbench | 10.0 | | 10.0 **10.0**predicted | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**prefill | 10.0 | | 10.0 **10.0**well. | 10.0 | | 10.0 **10.0**A | 10.0 | | 10.0 **10.0**residual-GEMV | 10.0 | | 10.0 **10.0**microbench | 10.0 | | 10.0 **10.0**predicted
+model | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0***backwards*. | 10.0 | | 10.0 **10.0**Decode | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**scale | 10.0 | | 10.0 **10.0**runs | 10.0 | | 10.0 **10.0**many | 10.0 | | 10.0 **10.0**more | 10.0 | | 10.0 **10.0**distinct | 10.0 | | 10.0 **10.0**kernels
+than | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**residual | 10.0 | | 10.0 **10.0**GEMV, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**bandwidth-bound | 10.0 | | 10.0 **10.0**near | 10.0 | | 10.0 **10.0**peak, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**single
+kernel's | 10.0 | | 10.0 **10.0**schedule | 10.0 | | 10.0 **10.0**improvement | 10.0 | | 10.0 **10.0**does | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**compose.
 
-**Prefill microbenches are usable as directional evidence. Decode microbenches
-are not.** Any decode claim needs `hipfire bench` with the control bracketed.
+**Prefill | 10.0 | | 10.0 **10.0**microbenches | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**usable | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**directional | 10.0 | | 10.0 **10.0**evidence. | 10.0 | | 10.0 **10.0**Decode | 10.0 | | 10.0 **10.0**microbenches
+are | 10.0 | | 10.0 **10.0**not.** | 10.0 | | 10.0 **10.0**Any | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**claim | 10.0 | | 10.0 **10.0**needs | 10.0 | | 10.0 **10.0**`hipfire | 10.0 | | 10.0 **10.0**bench` | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**control | 10.0 | | 10.0 **10.0**bracketed.
 
-## 3 · The fp16 header has a consistent signature: buy prefill, sell decode
+## | 10.0 | | 10.0 **10.0**3 | 10.0 | | 10.0 **10.0**· | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**fp16 | 10.0 | | 10.0 **10.0**header | 10.0 | | 10.0 **10.0**has | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**consistent | 10.0 | | 10.0 **10.0**signature: | 10.0 | | 10.0 **10.0**buy | 10.0 | | 10.0 **10.0**prefill, | 10.0 | | 10.0 **10.0**sell | 10.0 | | 10.0 **10.0**decode
 
-Three formats now measured at model scale, all 136 B/group:
+Three | 10.0 | | 10.0 **10.0**formats | 10.0 | | 10.0 **10.0**now | 10.0 | | 10.0 **10.0**measured | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**scale, | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**136 | 10.0 | | 10.0 **10.0**B/group:
 
-|format|decode|prefill|KLD (WT2)|
+|format|decode|prefill|KLD | 10.0 | | 10.0 **10.0**(WT2)|
 |---|---|---|---|
-|qt=13 v1 (two f32 headers)|34.65|403.0|0.043776|
-|qt=44 v2 (two fp16 pairs, per-128)|33.40 (−3.6%)|**420.4 (+4.3%)**|**0.039033 (−10.8%)**|
-|qt=45 pad (one fp16 pair, per-256)|33.90 (−2.2%)|415.4 (+3.1%)|0.043423 (−0.8%)|
+|qt=13 | 10.0 | | 10.0 **10.0**v1 | 10.0 | | 10.0 **10.0**(two | 10.0 | | 10.0 **10.0**f32 | 10.0 | | 10.0 **10.0**headers)|34.65|403.0|0.043776|
+|qt=44 | 10.0 | | 10.0 **10.0**v2 | 10.0 | | 10.0 **10.0**(two | 10.0 | | 10.0 **10.0**fp16 | 10.0 | | 10.0 **10.0**pairs, | 10.0 | | 10.0 **10.0**per-128)|33.40 | 10.0 | | 10.0 **10.0**(−3.6%)|**420.4 | 10.0 | | 10.0 **10.0**(+4.3%)**|**0.039033 | 10.0 | | 10.0 **10.0**(−10.8%)**|
+|qt=45 | 10.0 | | 10.0 **10.0**pad | 10.0 | | 10.0 **10.0**(one | 10.0 | | 10.0 **10.0**fp16 | 10.0 | | 10.0 **10.0**pair, | 10.0 | | 10.0 **10.0**per-256)|33.90 | 10.0 | | 10.0 **10.0**(−2.2%)|415.4 | 10.0 | | 10.0 **10.0**(+3.1%)|0.043423 | 10.0 | | 10.0 **10.0**(−0.8%)|
 
-Both fp16-header formats trade decode for prefill, in the same direction and
-roughly proportional magnitude. That is the header's real signature — not the
-"free win on both ends" the isolated benches suggested.
+Both | 10.0 | | 10.0 **10.0**fp16-header | 10.0 | | 10.0 **10.0**formats | 10.0 | | 10.0 **10.0**trade | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**prefill, | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**direction | 10.0 | | 10.0 **10.0**and
+roughly | 10.0 | | 10.0 **10.0**proportional | 10.0 | | 10.0 **10.0**magnitude. | 10.0 | | 10.0 **10.0**That | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**header's | 10.0 | | 10.0 **10.0**real | 10.0 | | 10.0 **10.0**signature | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**the
+"free | 10.0 | | 10.0 **10.0**win | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**ends" | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**isolated | 10.0 | | 10.0 **10.0**benches | 10.0 | | 10.0 **10.0**suggested.
 
-## 4 · Consequence: qt=45 has no defensible niche
+## | 10.0 | | 10.0 **10.0**4 | 10.0 | | 10.0 **10.0**· | 10.0 | | 10.0 **10.0**Consequence: | 10.0 | | 10.0 **10.0**qt=45 | 10.0 | | 10.0 **10.0**has | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**defensible | 10.0 | | 10.0 **10.0**niche
 
-**qt=44 dominates qt=45 pad**: better KLD by 10 points and better prefill,
-giving up 1.5% decode. Both are the same size. qt=45 pad is qt=44 with the
-quality win deleted — the difference is that qt=44 spends its 8 header bytes on
-per-128 granularity and earns −10.8% KLD, while qt=45 spends 4 and pads the
+**qt=44 | 10.0 | | 10.0 **10.0**dominates | 10.0 | | 10.0 **10.0**qt=45 | 10.0 | | 10.0 **10.0**pad**: | 10.0 | | 10.0 **10.0**better | 10.0 | | 10.0 **10.0**KLD | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**10 | 10.0 | | 10.0 **10.0**points | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**better | 10.0 | | 10.0 **10.0**prefill,
+giving | 10.0 | | 10.0 **10.0**up | 10.0 | | 10.0 **10.0**1.5% | 10.0 | | 10.0 **10.0**decode. | 10.0 | | 10.0 **10.0**Both | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**size. | 10.0 | | 10.0 **10.0**qt=45 | 10.0 | | 10.0 **10.0**pad | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**qt=44 | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**the
+quality | 10.0 | | 10.0 **10.0**win | 10.0 | | 10.0 **10.0**deleted | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**difference | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**qt=44 | 10.0 | | 10.0 **10.0**spends | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**8 | 10.0 | | 10.0 **10.0**header | 10.0 | | 10.0 **10.0**bytes | 10.0 | | 10.0 **10.0**on
+per-128 | 10.0 | | 10.0 **10.0**granularity | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**earns | 10.0 | | 10.0 **10.0**−10.8% | 10.0 | | 10.0 **10.0**KLD, | 10.0 | | 10.0 **10.0**while | 10.0 | | 10.0 **10.0**qt=45 | 10.0 | | 10.0 **10.0**spends | 10.0 | | 10.0 **10.0**4 | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**pads | 10.0 | | 10.0 **10.0**the
 rest.
 
-The full qt=45 design space, measured:
+The | 10.0 | | 10.0 **10.0**full | 10.0 | | 10.0 **10.0**qt=45 | 10.0 | | 10.0 **10.0**design | 10.0 | | 10.0 **10.0**space, | 10.0 | | 10.0 **10.0**measured:
 
 |layout|size|decode|prefill|niche|
 |---|---|---|---|---|
-|interleaved 132|97.06%|34.50|388.8|none — worst prefill|
-|planar 132|97.06%|34.20|394.0|2.43% size for 1-2% throughput|
-|pad 136|100%|33.90|415.4|dominated by qt=44|
+|interleaved | 10.0 | | 10.0 **10.0**132|97.06%|34.50|388.8|none | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**worst | 10.0 | | 10.0 **10.0**prefill|
+|planar | 10.0 | | 10.0 **10.0**132|97.06%|34.20|394.0|2.43% | 10.0 | | 10.0 **10.0**size | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**1-2% | 10.0 | | 10.0 **10.0**throughput|
+|pad | 10.0 | | 10.0 **10.0**136|100%|33.90|415.4|dominated | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**qt=44|
 
-The one thing qt=45 pad still does that qt=44 cannot: it is reachable from an
-**already-distributed `.mq4` by a pure header rewrite**, with no parent
-checkpoint and no requantization, since the nibbles are untouched and the size
-is identical. Whether +3.1% prefill for −2.2% decode justifies shipping a
-format for that path is a product call, not a measurement one.
+The | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**thing | 10.0 | | 10.0 **10.0**qt=45 | 10.0 | | 10.0 **10.0**pad | 10.0 | | 10.0 **10.0**still | 10.0 | | 10.0 **10.0**does | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**qt=44 | 10.0 | | 10.0 **10.0**cannot: | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**reachable | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**an
+**already-distributed | 10.0 | | 10.0 **10.0**`.mq4` | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**pure | 10.0 | | 10.0 **10.0**header | 10.0 | | 10.0 **10.0**rewrite**, | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**parent
+checkpoint | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**requantization, | 10.0 | | 10.0 **10.0**since | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**nibbles | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**untouched | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**size
+is | 10.0 | | 10.0 **10.0**identical. | 10.0 | | 10.0 **10.0**Whether | 10.0 | | 10.0 **10.0**+3.1% | 10.0 | | 10.0 **10.0**prefill | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**−2.2% | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**justifies | 10.0 | | 10.0 **10.0**shipping | 10.0 | | 10.0 **10.0**a
+format | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**path | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**product | 10.0 | | 10.0 **10.0**call, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**measurement | 10.0 | | 10.0 **10.0**one.
 
-## 5 · Two defects worth recording
+## | 10.0 | | 10.0 **10.0**5 | 10.0 | | 10.0 **10.0**· | 10.0 | | 10.0 **10.0**Two | 10.0 | | 10.0 **10.0**defects | 10.0 | | 10.0 **10.0**worth | 10.0 | | 10.0 **10.0**recording
 
-**The load path hardcoded the stride.** `qwen35.rs` computed
-`expected = m * gpr * 132` from a literal, so the first pad artifact failed to
-load with `blob length mismatch: expected 27033600, got 27852800` — the same
-204800 groups at two strides. The comment above it had explicitly argued for
-hardcoding the number rather than sharing the constant, which is exactly what
-broke. Now derived from `rdna_compute::MQ4C_GROUP_BYTES`.
+**The | 10.0 | | 10.0 **10.0**load | 10.0 | | 10.0 **10.0**path | 10.0 | | 10.0 **10.0**hardcoded | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**stride.** | 10.0 | | 10.0 **10.0**`qwen35.rs` | 10.0 | | 10.0 **10.0**computed
+`expected | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**m | 10.0 | | 10.0 **10.0*** | 10.0 | | 10.0 **10.0**gpr | 10.0 | | 10.0 **10.0*** | 10.0 | | 10.0 **10.0**132` | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**literal, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**first | 10.0 | | 10.0 **10.0**pad | 10.0 | | 10.0 **10.0**artifact | 10.0 | | 10.0 **10.0**failed | 10.0 | | 10.0 **10.0**to
+load | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**`blob | 10.0 | | 10.0 **10.0**length | 10.0 | | 10.0 **10.0**mismatch: | 10.0 | | 10.0 **10.0**expected | 10.0 | | 10.0 **10.0**27033600, | 10.0 | | 10.0 **10.0**got | 10.0 | | 10.0 **10.0**27852800` | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same
+204800 | 10.0 | | 10.0 **10.0**groups | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**two | 10.0 | | 10.0 **10.0**strides. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**comment | 10.0 | | 10.0 **10.0**above | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**had | 10.0 | | 10.0 **10.0**explicitly | 10.0 | | 10.0 **10.0**argued | 10.0 | | 10.0 **10.0**for
+hardcoding | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**number | 10.0 | | 10.0 **10.0**rather | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**sharing | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**constant, | 10.0 | | 10.0 **10.0**which | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**exactly | 10.0 | | 10.0 **10.0**what
+broke. | 10.0 | | 10.0 **10.0**Now | 10.0 | | 10.0 **10.0**derived | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**`rdna_compute::MQ4C_GROUP_BYTES`.
 
-**A conversion agent broke the oracle's control arm.** It replaced the shared
-`gfx12_weight_cache_policy.inc` include in `mq4c_parity` with two hand-rolled
-defines so its own arm would compile standalone. That compiled out v1's
-`weight_rsrc` declaration while leaving its uses, so the **control** stopped
-building. An oracle whose control cannot build measures nothing. Test
-infrastructure shared between an arm and its control must stay shared.
+**A | 10.0 | | 10.0 **10.0**conversion | 10.0 | | 10.0 **10.0**agent | 10.0 | | 10.0 **10.0**broke | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**oracle's | 10.0 | | 10.0 **10.0**control | 10.0 | | 10.0 **10.0**arm.** | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**replaced | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**shared
+`gfx12_weight_cache_policy.inc` | 10.0 | | 10.0 **10.0**include | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**`mq4c_parity` | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**two | 10.0 | | 10.0 **10.0**hand-rolled
+defines | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**own | 10.0 | | 10.0 **10.0**arm | 10.0 | | 10.0 **10.0**would | 10.0 | | 10.0 **10.0**compile | 10.0 | | 10.0 **10.0**standalone. | 10.0 | | 10.0 **10.0**That | 10.0 | | 10.0 **10.0**compiled | 10.0 | | 10.0 **10.0**out | 10.0 | | 10.0 **10.0**v1's
+`weight_rsrc` | 10.0 | | 10.0 **10.0**declaration | 10.0 | | 10.0 **10.0**while | 10.0 | | 10.0 **10.0**leaving | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**uses, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0****control** | 10.0 | | 10.0 **10.0**stopped
+building. | 10.0 | | 10.0 **10.0**An | 10.0 | | 10.0 **10.0**oracle | 10.0 | | 10.0 **10.0**whose | 10.0 | | 10.0 **10.0**control | 10.0 | | 10.0 **10.0**cannot | 10.0 | | 10.0 **10.0**build | 10.0 | | 10.0 **10.0**measures | 10.0 | | 10.0 **10.0**nothing. | 10.0 | | 10.0 **10.0**Test
+infrastructure | 10.0 | | 10.0 **10.0**shared | 10.0 | | 10.0 **10.0**between | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**arm | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**control | 10.0 | | 10.0 **10.0**must | 10.0 | | 10.0 **10.0**stay | 10.0 | | 10.0 **10.0**shared.
 
-Both were caught by a loud failure rather than a silent one, which is the only
-reason each cost one cycle instead of a debugging session.
+Both | 10.0 | | 10.0 **10.0**were | 10.0 | | 10.0 **10.0**caught | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**loud | 10.0 | | 10.0 **10.0**failure | 10.0 | | 10.0 **10.0**rather | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**silent | 10.0 | | 10.0 **10.0**one, | 10.0 | | 10.0 **10.0**which | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**only
+reason | 10.0 | | 10.0 **10.0**each | 10.0 | | 10.0 **10.0**cost | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**cycle | 10.0 | | 10.0 **10.0**instead | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**debugging | 10.0 | | 10.0 **10.0**session.
 
-## 6 · CORRECTION (same day): the occupancy explanation is falsified
+## | 10.0 | | 10.0 **10.0**6 | 10.0 | | 10.0 **10.0**· | 10.0 | | 10.0 **10.0**CORRECTION | 10.0 | | 10.0 **10.0**(same | 10.0 | | 10.0 **10.0**day): | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**occupancy | 10.0 | | 10.0 **10.0**explanation | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**falsified
 
-An earlier draft of this file attributed the decode penalty to an occupancy
-cliff — the qt=45 decode GEMV at 97 VGPR / 12 waves against v1's 93 / 16, with
-decode being bandwidth-bound so a 4-of-16 wave loss should cost real
-memory-level parallelism. That mechanism was tested and is **wrong**.
+An | 10.0 | | 10.0 **10.0**earlier | 10.0 | | 10.0 **10.0**draft | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**file | 10.0 | | 10.0 **10.0**attributed | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**penalty | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**occupancy
+cliff | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**qt=45 | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**GEMV | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**97 | 10.0 | | 10.0 **10.0**VGPR | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**12 | 10.0 | | 10.0 **10.0**waves | 10.0 | | 10.0 **10.0**against | 10.0 | | 10.0 **10.0**v1's | 10.0 | | 10.0 **10.0**93 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**16, | 10.0 | | 10.0 **10.0**with
+decode | 10.0 | | 10.0 **10.0**being | 10.0 | | 10.0 **10.0**bandwidth-bound | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**4-of-16 | 10.0 | | 10.0 **10.0**wave | 10.0 | | 10.0 **10.0**loss | 10.0 | | 10.0 **10.0**should | 10.0 | | 10.0 **10.0**cost | 10.0 | | 10.0 **10.0**real
+memory-level | 10.0 | | 10.0 **10.0**parallelism. | 10.0 | | 10.0 **10.0**That | 10.0 | | 10.0 **10.0**mechanism | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**tested | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0****wrong**.
 
-Unpacking the header through a native `ext_vector_type(2)` of `_Float16`
-instead of mask/shift removes the integer temp and brings the kernel to
-**94 VGPR / 16 waves, zero spills** — v1's occupancy exactly. Model scale, v1
+Unpacking | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**header | 10.0 | | 10.0 **10.0**through | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**native | 10.0 | | 10.0 **10.0**`ext_vector_type(2)` | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**`_Float16`
+instead | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**mask/shift | 10.0 | | 10.0 **10.0**removes | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**integer | 10.0 | | 10.0 **10.0**temp | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**brings | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**kernel | 10.0 | | 10.0 **10.0**to
+**94 | 10.0 | | 10.0 **10.0**VGPR | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**16 | 10.0 | | 10.0 **10.0**waves, | 10.0 | | 10.0 **10.0**zero | 10.0 | | 10.0 **10.0**spills** | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**v1's | 10.0 | | 10.0 **10.0**occupancy | 10.0 | | 10.0 **10.0**exactly. | 10.0 | | 10.0 **10.0**Model | 10.0 | | 10.0 **10.0**scale, | 10.0 | | 10.0 **10.0**v1
 bracketed:
 
-|build|VGPR/waves|isolated bench|model decode|model prefill|
+|build|VGPR/waves|isolated | 10.0 | | 10.0 **10.0**bench|model | 10.0 | | 10.0 **10.0**decode|model | 10.0 | | 10.0 **10.0**prefill|
 |---|---|---|---|---|
-|v1|93 / 16|15.0-15.6 us|34.65|403-407|
-|qt=45 mask/shift|97 / 12|**14.5 us**|33.90|415.4|
-|qt=45 packed-half|94 / 16|16.0 us|**34.00**|415.9|
+|v1|93 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**16|15.0-15.6 | 10.0 | | 10.0 **10.0**us|34.65|403-407|
+|qt=45 | 10.0 | | 10.0 **10.0**mask/shift|97 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**12|**14.5 | 10.0 | | 10.0 **10.0**us**|33.90|415.4|
+|qt=45 | 10.0 | | 10.0 **10.0**packed-half|94 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**16|16.0 | 10.0 | | 10.0 **10.0**us|**34.00**|415.9|
 
-Restoring occupancy moved model decode **33.90 -> 34.00**: one 0.1 tok/s
-reporting quantum against a 0.75 tok/s deficit. The cliff explains essentially
-none of the gap.
+Restoring | 10.0 | | 10.0 **10.0**occupancy | 10.0 | | 10.0 **10.0**moved | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0****33.90 | 10.0 | | 10.0 **10.0**-> | 10.0 | | 10.0 **10.0**34.00**: | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**0.1 | 10.0 | | 10.0 **10.0**tok/s
+reporting | 10.0 | | 10.0 **10.0**quantum | 10.0 | | 10.0 **10.0**against | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**0.75 | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**deficit. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**cliff | 10.0 | | 10.0 **10.0**explains | 10.0 | | 10.0 **10.0**essentially
+none | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**gap.
 
-Two things follow.
+Two | 10.0 | | 10.0 **10.0**things | 10.0 | | 10.0 **10.0**follow.
 
-**The real cause is inherent unpack ALU.** v1 loads two dwords that ARE the
-scale and zero; qt=45 loads one dword and must take it apart. Prefill is
-latency-bound at ~1/5 of peak bandwidth and profits from the cheaper load;
-decode is bandwidth-bound near peak and simply pays the extra ALU. No register
-trick recovers it, because nothing about the register allocation is the problem.
+**The | 10.0 | | 10.0 **10.0**real | 10.0 | | 10.0 **10.0**cause | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**inherent | 10.0 | | 10.0 **10.0**unpack | 10.0 | | 10.0 **10.0**ALU.** | 10.0 | | 10.0 **10.0**v1 | 10.0 | | 10.0 **10.0**loads | 10.0 | | 10.0 **10.0**two | 10.0 | | 10.0 **10.0**dwords | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**ARE | 10.0 | | 10.0 **10.0**the
+scale | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**zero; | 10.0 | | 10.0 **10.0**qt=45 | 10.0 | | 10.0 **10.0**loads | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**dword | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**must | 10.0 | | 10.0 **10.0**take | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**apart. | 10.0 | | 10.0 **10.0**Prefill | 10.0 | | 10.0 **10.0**is
+latency-bound | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**~1/5 | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**peak | 10.0 | | 10.0 **10.0**bandwidth | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**profits | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**cheaper | 10.0 | | 10.0 **10.0**load;
+decode | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**bandwidth-bound | 10.0 | | 10.0 **10.0**near | 10.0 | | 10.0 **10.0**peak | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**simply | 10.0 | | 10.0 **10.0**pays | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**extra | 10.0 | | 10.0 **10.0**ALU. | 10.0 | | 10.0 **10.0**No | 10.0 | | 10.0 **10.0**register
+trick | 10.0 | | 10.0 **10.0**recovers | 10.0 | | 10.0 **10.0**it, | 10.0 | | 10.0 **10.0**because | 10.0 | | 10.0 **10.0**nothing | 10.0 | | 10.0 **10.0**about | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**register | 10.0 | | 10.0 **10.0**allocation | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**problem.
 
-**Third consecutive inversion from the isolated decode microbench, and the
-sharpest.** It called the packed-half change a 10% REGRESSION (14.5 -> 16.0 us,
-slower than v1) while model scale measured +0.3%. It also reproduces this
-campaign's earlier "the occupancy-12 build is the fastest" result exactly — a
-finding that is now shown to be an artifact of measuring one kernel in
-isolation. Two separate conclusions in this repo rested on that microbench and
-both were wrong at model scale.
+**Third | 10.0 | | 10.0 **10.0**consecutive | 10.0 | | 10.0 **10.0**inversion | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**isolated | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**microbench, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the
+sharpest.** | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**called | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**packed-half | 10.0 | | 10.0 **10.0**change | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**10% | 10.0 | | 10.0 **10.0**REGRESSION | 10.0 | | 10.0 **10.0**(14.5 | 10.0 | | 10.0 **10.0**-> | 10.0 | | 10.0 **10.0**16.0 | 10.0 | | 10.0 **10.0**us,
+slower | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**v1) | 10.0 | | 10.0 **10.0**while | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**scale | 10.0 | | 10.0 **10.0**measured | 10.0 | | 10.0 **10.0**+0.3%. | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**also | 10.0 | | 10.0 **10.0**reproduces | 10.0 | | 10.0 **10.0**this
+campaign's | 10.0 | | 10.0 **10.0**earlier | 10.0 | | 10.0 **10.0**"the | 10.0 | | 10.0 **10.0**occupancy-12 | 10.0 | | 10.0 **10.0**build | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**fastest" | 10.0 | | 10.0 **10.0**result | 10.0 | | 10.0 **10.0**exactly | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**a
+finding | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**now | 10.0 | | 10.0 **10.0**shown | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**be | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**artifact | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**measuring | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**kernel | 10.0 | | 10.0 **10.0**in
+isolation. | 10.0 | | 10.0 **10.0**Two | 10.0 | | 10.0 **10.0**separate | 10.0 | | 10.0 **10.0**conclusions | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**repo | 10.0 | | 10.0 **10.0**rested | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**microbench | 10.0 | | 10.0 **10.0**and
+both | 10.0 | | 10.0 **10.0**were | 10.0 | | 10.0 **10.0**wrong | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**scale.
 
-The packed-half unpack is KEPT: at model scale it is neutral-to-marginally
-better, it is correct (oracle 6.966e-8), spill-free, and 16 waves is the more
-robust operating point under concurrency. It is simply not a fix for the decode
-deficit, and the deficit appears not to be fixable.
+The | 10.0 | | 10.0 **10.0**packed-half | 10.0 | | 10.0 **10.0**unpack | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**KEPT: | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**scale | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**neutral-to-marginally
+better, | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**correct | 10.0 | | 10.0 **10.0**(oracle | 10.0 | | 10.0 **10.0**6.966e-8), | 10.0 | | 10.0 **10.0**spill-free, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**16 | 10.0 | | 10.0 **10.0**waves | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**more
+robust | 10.0 | | 10.0 **10.0**operating | 10.0 | | 10.0 **10.0**point | 10.0 | | 10.0 **10.0**under | 10.0 | | 10.0 **10.0**concurrency. | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**simply | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**fix | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**decode
+deficit, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**deficit | 10.0 | | 10.0 **10.0**appears | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**be | 10.0 | | 10.0 **10.0**fixable.
 
-## 7 · Three mechanisms proposed for the decode deficit, three falsified
+## | 10.0 | | 10.0 **10.0**7 | 10.0 | | 10.0 **10.0**· | 10.0 | | 10.0 **10.0**Three | 10.0 | | 10.0 **10.0**mechanisms | 10.0 | | 10.0 **10.0**proposed | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**deficit, | 10.0 | | 10.0 **10.0**three | 10.0 | | 10.0 **10.0**falsified
 
-The ~2% model-scale decode gap between qt=45 and v1 was chased through three
-independent hypotheses. Every one was implemented, measured at model scale with
-the v1 control bracketed, and refuted.
+The | 10.0 | | 10.0 **10.0**~2% | 10.0 | | 10.0 **10.0**model-scale | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**gap | 10.0 | | 10.0 **10.0**between | 10.0 | | 10.0 **10.0**qt=45 | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**v1 | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**chased | 10.0 | | 10.0 **10.0**through | 10.0 | | 10.0 **10.0**three
+independent | 10.0 | | 10.0 **10.0**hypotheses. | 10.0 | | 10.0 **10.0**Every | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**implemented, | 10.0 | | 10.0 **10.0**measured | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**scale | 10.0 | | 10.0 **10.0**with
+the | 10.0 | | 10.0 **10.0**v1 | 10.0 | | 10.0 **10.0**control | 10.0 | | 10.0 **10.0**bracketed, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**refuted.
 
-|build|VGPR/waves|FMA form|isolated decode|**model decode**|
+|build|VGPR/waves|FMA | 10.0 | | 10.0 **10.0**form|isolated | 10.0 | | 10.0 **10.0**decode|**model | 10.0 | | 10.0 **10.0**decode**|
 |---|---|---|---|---|
-|v1|93 / 16|98 `v_fma_f32`|15.4 us|**34.65**|
-|qt=45 mask/shift|97 / 12|112 `v_fma_mix_f32`|14.5 us|33.90|
-|qt=45 packed-half|94 / **16**|112 mix|16.0 us|**34.00**|
-|qt=45 + FMA barrier|102 / 12|**98 plain**, dual 68->70|14.9 us|33.90|
+|v1|93 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**16|98 | 10.0 | | 10.0 **10.0**`v_fma_f32`|15.4 | 10.0 | | 10.0 **10.0**us|**34.65**|
+|qt=45 | 10.0 | | 10.0 **10.0**mask/shift|97 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**12|112 | 10.0 | | 10.0 **10.0**`v_fma_mix_f32`|14.5 | 10.0 | | 10.0 **10.0**us|33.90|
+|qt=45 | 10.0 | | 10.0 **10.0**packed-half|94 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0****16**|112 | 10.0 | | 10.0 **10.0**mix|16.0 | 10.0 | | 10.0 **10.0**us|**34.00**|
+|qt=45 | 10.0 | | 10.0 **10.0**+ | 10.0 | | 10.0 **10.0**FMA | 10.0 | | 10.0 **10.0**barrier|102 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**12|**98 | 10.0 | | 10.0 **10.0**plain**, | 10.0 | | 10.0 **10.0**dual | 10.0 | | 10.0 **10.0**68->70|14.9 | 10.0 | | 10.0 **10.0**us|33.90|
 
-**(a) Occupancy cliff.** qt=45 sat at 97 VGPR / 12 waves against v1's 93 / 16.
-Unpacking through a native `ext_vector_type(2)` of `_Float16` reaches 94 / 16 —
-v1's occupancy exactly, spill-free. Model decode moved 33.90 -> 34.00, one 0.1
-tok/s quantum on a 0.75 tok/s gap.
+**(a) | 10.0 | | 10.0 **10.0**Occupancy | 10.0 | | 10.0 **10.0**cliff.** | 10.0 | | 10.0 **10.0**qt=45 | 10.0 | | 10.0 **10.0**sat | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**97 | 10.0 | | 10.0 **10.0**VGPR | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**12 | 10.0 | | 10.0 **10.0**waves | 10.0 | | 10.0 **10.0**against | 10.0 | | 10.0 **10.0**v1's | 10.0 | | 10.0 **10.0**93 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**16.
+Unpacking | 10.0 | | 10.0 **10.0**through | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**native | 10.0 | | 10.0 **10.0**`ext_vector_type(2)` | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**`_Float16` | 10.0 | | 10.0 **10.0**reaches | 10.0 | | 10.0 **10.0**94 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**16 | 10.0 | | 10.0 **10.0**—
+v1's | 10.0 | | 10.0 **10.0**occupancy | 10.0 | | 10.0 **10.0**exactly, | 10.0 | | 10.0 **10.0**spill-free. | 10.0 | | 10.0 **10.0**Model | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**moved | 10.0 | | 10.0 **10.0**33.90 | 10.0 | | 10.0 **10.0**-> | 10.0 | | 10.0 **10.0**34.00, | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**0.1
+tok/s | 10.0 | | 10.0 **10.0**quantum | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**0.75 | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**gap.
 
-**(b) FMA form / dual-issue.** The decode histogram showed the backend folding
-the f16->f32 widening into the dequant FMA as `v_fma_mix_f32` (VOP3, not
-VOPD-eligible): 98 packable `v_fma_f32` became 112 that issue one at a time,
-with 4 fewer dual-issue slots. Forcing `sc`/`zp` to materialise as opaque f32
-(empty asm, `"+v"` constraint, zero instructions) restored v1's form exactly —
-98 `v_fma_f32`, zero mix, dual-issue 68 -> 70. Model decode: **33.90.** No
-change at all.
+**(b) | 10.0 | | 10.0 **10.0**FMA | 10.0 | | 10.0 **10.0**form | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**dual-issue.** | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**histogram | 10.0 | | 10.0 **10.0**showed | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**backend | 10.0 | | 10.0 **10.0**folding
+the | 10.0 | | 10.0 **10.0**f16->f32 | 10.0 | | 10.0 **10.0**widening | 10.0 | | 10.0 **10.0**into | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**dequant | 10.0 | | 10.0 **10.0**FMA | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**`v_fma_mix_f32` | 10.0 | | 10.0 **10.0**(VOP3, | 10.0 | | 10.0 **10.0**not
+VOPD-eligible): | 10.0 | | 10.0 **10.0**98 | 10.0 | | 10.0 **10.0**packable | 10.0 | | 10.0 **10.0**`v_fma_f32` | 10.0 | | 10.0 **10.0**became | 10.0 | | 10.0 **10.0**112 | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**issue | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**time,
+with | 10.0 | | 10.0 **10.0**4 | 10.0 | | 10.0 **10.0**fewer | 10.0 | | 10.0 **10.0**dual-issue | 10.0 | | 10.0 **10.0**slots. | 10.0 | | 10.0 **10.0**Forcing | 10.0 | | 10.0 **10.0**`sc`/`zp` | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**materialise | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**opaque | 10.0 | | 10.0 **10.0**f32
+(empty | 10.0 | | 10.0 **10.0**asm, | 10.0 | | 10.0 **10.0**`"+v"` | 10.0 | | 10.0 **10.0**constraint, | 10.0 | | 10.0 **10.0**zero | 10.0 | | 10.0 **10.0**instructions) | 10.0 | | 10.0 **10.0**restored | 10.0 | | 10.0 **10.0**v1's | 10.0 | | 10.0 **10.0**form | 10.0 | | 10.0 **10.0**exactly | 10.0 | | 10.0 **10.0**—
+98 | 10.0 | | 10.0 **10.0**`v_fma_f32`, | 10.0 | | 10.0 **10.0**zero | 10.0 | | 10.0 **10.0**mix, | 10.0 | | 10.0 **10.0**dual-issue | 10.0 | | 10.0 **10.0**68 | 10.0 | | 10.0 **10.0**-> | 10.0 | | 10.0 **10.0**70. | 10.0 | | 10.0 **10.0**Model | 10.0 | | 10.0 **10.0**decode: | 10.0 | | 10.0 **10.0****33.90.** | 10.0 | | 10.0 **10.0**No
+change | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**all.
 
-**(c) Earlier, in § 5 and prior files:** 16-byte load misalignment, a redundant
-f16->f32->f16 round trip, and lost `dwordx2` merging. All three refuted.
+**(c) | 10.0 | | 10.0 **10.0**Earlier, | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**§ | 10.0 | | 10.0 **10.0**5 | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**prior | 10.0 | | 10.0 **10.0**files:** | 10.0 | | 10.0 **10.0**16-byte | 10.0 | | 10.0 **10.0**load | 10.0 | | 10.0 **10.0**misalignment, | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**redundant
+f16->f32->f16 | 10.0 | | 10.0 **10.0**round | 10.0 | | 10.0 **10.0**trip, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**lost | 10.0 | | 10.0 **10.0**`dwordx2` | 10.0 | | 10.0 **10.0**merging. | 10.0 | | 10.0 **10.0**All | 10.0 | | 10.0 **10.0**three | 10.0 | | 10.0 **10.0**refuted.
 
-**What this actually establishes.** Perturbing the residual GEMV in three
-independent directions — register pressure, unpack form, FMA form — moved model
-decode by at most 0.1 tok/s. That bounds this kernel's contribution to the gap
-at essentially zero. The deficit is **not in the kernel we spent three
-experiments on**; it is distributed across the remaining decode kernels, which
-are all still on the mask/shift unpack: `gemv_mq4cg256`, `gemv_mq4cg256_multirow`,
-`fused_qkv_mq4cg256`, `fused_qkvza_mq4cg256`, `fused_gate_up_mq4cg256`.
+**What | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**actually | 10.0 | | 10.0 **10.0**establishes.** | 10.0 | | 10.0 **10.0**Perturbing | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**residual | 10.0 | | 10.0 **10.0**GEMV | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**three
+independent | 10.0 | | 10.0 **10.0**directions | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**register | 10.0 | | 10.0 **10.0**pressure, | 10.0 | | 10.0 **10.0**unpack | 10.0 | | 10.0 **10.0**form, | 10.0 | | 10.0 **10.0**FMA | 10.0 | | 10.0 **10.0**form | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**moved | 10.0 | | 10.0 **10.0**model
+decode | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**most | 10.0 | | 10.0 **10.0**0.1 | 10.0 | | 10.0 **10.0**tok/s. | 10.0 | | 10.0 **10.0**That | 10.0 | | 10.0 **10.0**bounds | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**kernel's | 10.0 | | 10.0 **10.0**contribution | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**gap
+at | 10.0 | | 10.0 **10.0**essentially | 10.0 | | 10.0 **10.0**zero. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**deficit | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0****not | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**kernel | 10.0 | | 10.0 **10.0**we | 10.0 | | 10.0 **10.0**spent | 10.0 | | 10.0 **10.0**three
+experiments | 10.0 | | 10.0 **10.0**on**; | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**distributed | 10.0 | | 10.0 **10.0**across | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**remaining | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**kernels, | 10.0 | | 10.0 **10.0**which
+are | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**still | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**mask/shift | 10.0 | | 10.0 **10.0**unpack: | 10.0 | | 10.0 **10.0**`gemv_mq4cg256`, | 10.0 | | 10.0 **10.0**`gemv_mq4cg256_multirow`,
+`fused_qkv_mq4cg256`, | 10.0 | | 10.0 **10.0**`fused_qkvza_mq4cg256`, | 10.0 | | 10.0 **10.0**`fused_gate_up_mq4cg256`.
 
-**Fourth consecutive decode-microbench inversion.** The isolated bench ranked
-these builds 14.5 / 16.0 / 14.9 us; model scale ranked them 33.90 / 34.00 /
-33.90. It got the ordering wrong every time, including preferring the build that
-model scale liked least. The isolated decode bench in this repo has now
-mispredicted four out of four times and should be treated as a mechanism probe
-only — never as a verdict.
+**Fourth | 10.0 | | 10.0 **10.0**consecutive | 10.0 | | 10.0 **10.0**decode-microbench | 10.0 | | 10.0 **10.0**inversion.** | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**isolated | 10.0 | | 10.0 **10.0**bench | 10.0 | | 10.0 **10.0**ranked
+these | 10.0 | | 10.0 **10.0**builds | 10.0 | | 10.0 **10.0**14.5 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**16.0 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**14.9 | 10.0 | | 10.0 **10.0**us; | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**scale | 10.0 | | 10.0 **10.0**ranked | 10.0 | | 10.0 **10.0**them | 10.0 | | 10.0 **10.0**33.90 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**34.00 | 10.0 | | 10.0 **10.0**/
+33.90. | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**got | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**ordering | 10.0 | | 10.0 **10.0**wrong | 10.0 | | 10.0 **10.0**every | 10.0 | | 10.0 **10.0**time, | 10.0 | | 10.0 **10.0**including | 10.0 | | 10.0 **10.0**preferring | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**build | 10.0 | | 10.0 **10.0**that
+model | 10.0 | | 10.0 **10.0**scale | 10.0 | | 10.0 **10.0**liked | 10.0 | | 10.0 **10.0**least. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**isolated | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**bench | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**repo | 10.0 | | 10.0 **10.0**has | 10.0 | | 10.0 **10.0**now
+mispredicted | 10.0 | | 10.0 **10.0**four | 10.0 | | 10.0 **10.0**out | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**four | 10.0 | | 10.0 **10.0**times | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**should | 10.0 | | 10.0 **10.0**be | 10.0 | | 10.0 **10.0**treated | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**mechanism | 10.0 | | 10.0 **10.0**probe
+only | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**never | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**verdict.
 
-**Kept:** the packed-half unpack (94 VGPR / 16 waves), because it measured
-marginally best at model scale, has the lowest register pressure, and 16 waves
-is the more robust operating point under concurrency. The FMA barrier is
-reverted: it cost 8 VGPRs and 4 waves for zero model-scale gain.
+**Kept:** | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**packed-half | 10.0 | | 10.0 **10.0**unpack | 10.0 | | 10.0 **10.0**(94 | 10.0 | | 10.0 **10.0**VGPR | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**16 | 10.0 | | 10.0 **10.0**waves), | 10.0 | | 10.0 **10.0**because | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**measured
+marginally | 10.0 | | 10.0 **10.0**best | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**scale, | 10.0 | | 10.0 **10.0**has | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**lowest | 10.0 | | 10.0 **10.0**register | 10.0 | | 10.0 **10.0**pressure, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**16 | 10.0 | | 10.0 **10.0**waves
+is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**more | 10.0 | | 10.0 **10.0**robust | 10.0 | | 10.0 **10.0**operating | 10.0 | | 10.0 **10.0**point | 10.0 | | 10.0 **10.0**under | 10.0 | | 10.0 **10.0**concurrency. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**FMA | 10.0 | | 10.0 **10.0**barrier | 10.0 | | 10.0 **10.0**is
+reverted: | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**cost | 10.0 | | 10.0 **10.0**8 | 10.0 | | 10.0 **10.0**VGPRs | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**4 | 10.0 | | 10.0 **10.0**waves | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**zero | 10.0 | | 10.0 **10.0**model-scale | 10.0 | | 10.0 **10.0**gain.
 
-**Recommendation: stop here.** The whole remaining deficit is 2% of decode,
-three experiments have each bought under 0.3%, and the format that matters
-(qt=44) carries the same signature with a -10.8% KLD payoff that dwarfs it.
+**Recommendation: | 10.0 | | 10.0 **10.0**stop | 10.0 | | 10.0 **10.0**here.** | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**whole | 10.0 | | 10.0 **10.0**remaining | 10.0 | | 10.0 **10.0**deficit | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**2% | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**decode,
+three | 10.0 | | 10.0 **10.0**experiments | 10.0 | | 10.0 **10.0**have | 10.0 | | 10.0 **10.0**each | 10.0 | | 10.0 **10.0**bought | 10.0 | | 10.0 **10.0**under | 10.0 | | 10.0 **10.0**0.3%, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**format | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**matters
+(qt=44) | 10.0 | | 10.0 **10.0**carries | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**signature | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**-10.8% | 10.0 | | 10.0 **10.0**KLD | 10.0 | | 10.0 **10.0**payoff | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**dwarfs | 10.0 | | 10.0 **10.0**it.

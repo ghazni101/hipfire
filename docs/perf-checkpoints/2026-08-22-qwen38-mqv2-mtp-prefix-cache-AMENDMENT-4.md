@@ -1,92 +1,92 @@
-# Amendment 4 — Q8 query-tiled verify candidate rejected
+# | 10.0 | | 10.0 **10.0**Amendment | 10.0 | | 10.0 **10.0**4 | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**Q8 | 10.0 | | 10.0 **10.0**query-tiled | 10.0 | | 10.0 **10.0**verify | 10.0 | | 10.0 **10.0**candidate | 10.0 | | 10.0 **10.0**rejected
 
-**Lifecycle:** historical
-**Disposition:** rejected, no source/default/product change
-**Amends:** [`2026-08-21-qwen38-mqv2-mtp-prefix-cache.md`](./2026-08-21-qwen38-mqv2-mtp-prefix-cache.md), [`AMENDMENT-2`](./2026-08-21-qwen38-mqv2-mtp-prefix-cache-AMENDMENT-2.md), and [`AMENDMENT-3`](./2026-08-21-qwen38-mqv2-mtp-prefix-cache-AMENDMENT-3.md)
+**Lifecycle:** | 10.0 | | 10.0 **10.0**historical
+**Disposition:** | 10.0 | | 10.0 **10.0**rejected, | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**source/default/product | 10.0 | | 10.0 **10.0**change
+**Amends:** | 10.0 | | 10.0 **10.0**[`2026-08-21-qwen38-mqv2-mtp-prefix-cache.md`](./2026-08-21-qwen38-mqv2-mtp-prefix-cache.md), | 10.0 | | 10.0 **10.0**[`AMENDMENT-2`](./2026-08-21-qwen38-mqv2-mtp-prefix-cache-AMENDMENT-2.md), | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**[`AMENDMENT-3`](./2026-08-21-qwen38-mqv2-mtp-prefix-cache-AMENDMENT-3.md)
 
-## Reason for amendment
+## | 10.0 | | 10.0 **10.0**Reason | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**amendment
 
-Amendments 2 and 3 established a compressed MTP draft-head lever and full-session prefix-cache durability on gfx1201. Separately, a default-off Q8 query-tiled attention verify candidate was screened against the production scalar tiled+reduce path for the Qwen3.8 production attention shape. This amendment records that screen as a closed rejection: the predeclared promotion gate failed, candidate source was removed, and no product path changed.
+Amendments | 10.0 | | 10.0 **10.0**2 | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**3 | 10.0 | | 10.0 **10.0**established | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**compressed | 10.0 | | 10.0 **10.0**MTP | 10.0 | | 10.0 **10.0**draft-head | 10.0 | | 10.0 **10.0**lever | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**full-session | 10.0 | | 10.0 **10.0**prefix-cache | 10.0 | | 10.0 **10.0**durability | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**gfx1201. | 10.0 | | 10.0 **10.0**Separately, | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**default-off | 10.0 | | 10.0 **10.0**Q8 | 10.0 | | 10.0 **10.0**query-tiled | 10.0 | | 10.0 **10.0**attention | 10.0 | | 10.0 **10.0**verify | 10.0 | | 10.0 **10.0**candidate | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**screened | 10.0 | | 10.0 **10.0**against | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**production | 10.0 | | 10.0 **10.0**scalar | 10.0 | | 10.0 **10.0**tiled+reduce | 10.0 | | 10.0 **10.0**path | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**Qwen3.8 | 10.0 | | 10.0 **10.0**production | 10.0 | | 10.0 **10.0**attention | 10.0 | | 10.0 **10.0**shape. | 10.0 | | 10.0 **10.0**This | 10.0 | | 10.0 **10.0**amendment | 10.0 | | 10.0 **10.0**records | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**screen | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**closed | 10.0 | | 10.0 **10.0**rejection: | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**predeclared | 10.0 | | 10.0 **10.0**promotion | 10.0 | | 10.0 **10.0**gate | 10.0 | | 10.0 **10.0**failed, | 10.0 | | 10.0 **10.0**candidate | 10.0 | | 10.0 **10.0**source | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**removed, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**product | 10.0 | | 10.0 **10.0**path | 10.0 | | 10.0 **10.0**changed.
 
-This is historical evidence only. It does **not** claim the candidate improved throughput, quality, or product behavior, and **no code ships**.
+This | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**historical | 10.0 | | 10.0 **10.0**evidence | 10.0 | | 10.0 **10.0**only. | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**does | 10.0 | | 10.0 **10.0****not** | 10.0 | | 10.0 **10.0**claim | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**candidate | 10.0 | | 10.0 **10.0**improved | 10.0 | | 10.0 **10.0**throughput, | 10.0 | | 10.0 **10.0**quality, | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**product | 10.0 | | 10.0 **10.0**behavior, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0****no | 10.0 | | 10.0 **10.0**code | 10.0 | | 10.0 **10.0**ships**.
 
-## Fixtures and host
+## | 10.0 | | 10.0 **10.0**Fixtures | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**host
 
-| item | value |
+| | 10.0 | | 10.0 **10.0**item | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**value | 10.0 | | 10.0 **10.0**|
 |---|---|
-| host | `hiptrx` |
-| device | HIP device 3, Radeon AI PRO R9700 gfx1201, BDF `0000:13:00.0`, HIP 7.14 |
-| base revision | guarded disposable checkout based on `673ea3ae0` |
-| attention shape | Qwen3.8 production: NH24 / NKV4 / HD256 / B7 / CTX24576 |
-| promotion gate (predeclared) | candidate ≥ **1.10×** scalar on paired B7/24K wall time |
-| guard | exclusive device lock/guard used for all hiptrx runs |
+| | 10.0 | | 10.0 **10.0**host | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`hiptrx` | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**device | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**HIP | 10.0 | | 10.0 **10.0**device | 10.0 | | 10.0 **10.0**3, | 10.0 | | 10.0 **10.0**Radeon | 10.0 | | 10.0 **10.0**AI | 10.0 | | 10.0 **10.0**PRO | 10.0 | | 10.0 **10.0**R9700 | 10.0 | | 10.0 **10.0**gfx1201, | 10.0 | | 10.0 **10.0**BDF | 10.0 | | 10.0 **10.0**`0000:13:00.0`, | 10.0 | | 10.0 **10.0**HIP | 10.0 | | 10.0 **10.0**7.15 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**base | 10.0 | | 10.0 **10.0**revision | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**guarded | 10.0 | | 10.0 **10.0**disposable | 10.0 | | 10.0 **10.0**checkout | 10.0 | | 10.0 **10.0**based | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**`673ea3ae0` | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**attention | 10.0 | | 10.0 **10.0**shape | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Qwen3.8 | 10.0 | | 10.0 **10.0**production: | 10.0 | | 10.0 **10.0**NH24 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**NKV4 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**HD256 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**B7 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**CTX24576 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**promotion | 10.0 | | 10.0 **10.0**gate | 10.0 | | 10.0 **10.0**(predeclared) | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**candidate | 10.0 | | 10.0 **10.0**≥ | 10.0 | | 10.0 **10.0****1.10×** | 10.0 | | 10.0 **10.0**scalar | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**paired | 10.0 | | 10.0 **10.0**B7/24K | 10.0 | | 10.0 **10.0**wall | 10.0 | | 10.0 **10.0**time | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**guard | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**exclusive | 10.0 | | 10.0 **10.0**device | 10.0 | | 10.0 **10.0**lock/guard | 10.0 | | 10.0 **10.0**used | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**hiptrx | 10.0 | | 10.0 **10.0**runs | 10.0 | | 10.0 **10.0**|
 
-## Designs under test
+## | 10.0 | | 10.0 **10.0**Designs | 10.0 | | 10.0 **10.0**under | 10.0 | | 10.0 **10.0**test
 
-Two query-tile designs were measured; neither cleared the gate.
+Two | 10.0 | | 10.0 **10.0**query-tile | 10.0 | | 10.0 **10.0**designs | 10.0 | | 10.0 **10.0**were | 10.0 | | 10.0 **10.0**measured; | 10.0 | | 10.0 **10.0**neither | 10.0 | | 10.0 **10.0**cleared | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**gate.
 
-### 1. Initial 32-thread row-owned P@V
+### | 10.0 | | 10.0 **10.0**1. | 10.0 | | 10.0 **10.0**Initial | 10.0 | | 10.0 **10.0**32-thread | 10.0 | | 10.0 **10.0**row-owned | 10.0 | | 10.0 **10.0**P@V
 
-k9lin micro-screen (not the hiptrx promotion pair):
+k9lin | 10.0 | | 10.0 **10.0**micro-screen | 10.0 | | 10.0 **10.0**(not | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**hiptrx | 10.0 | | 10.0 **10.0**promotion | 10.0 | | 10.0 **10.0**pair):
 
-| batch | scalar | candidate | speedup (scalar/query) |
+| | 10.0 | | 10.0 **10.0**batch | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**scalar | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**candidate | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**speedup | 10.0 | | 10.0 **10.0**(scalar/query) | 10.0 | | 10.0 **10.0**|
 |---:|---:|---:|---:|
-| B7 | 2.464 ms | 6.143 ms | 0.401× |
-| B16 | 4.647 ms | 5.530 ms | 0.840× |
+| | 10.0 | | 10.0 **10.0**B7 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**2.464 | 10.0 | | 10.0 **10.0**ms | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**6.143 | 10.0 | | 10.0 **10.0**ms | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.401× | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**B16 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**4.647 | 10.0 | | 10.0 **10.0**ms | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**5.530 | 10.0 | | 10.0 **10.0**ms | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.840× | 10.0 | | 10.0 **10.0**|
 
-### 2. V-sharing design
+### | 10.0 | | 10.0 **10.0**2. | 10.0 | | 10.0 **10.0**V-sharing | 10.0 | | 10.0 **10.0**design
 
-Wave0 WMMA QK; block sized to `head_dim`; V reused across rows within the block. This was the design taken to hiptrx parity and the fresh B7/24K promotion pairs below.
+Wave0 | 10.0 | | 10.0 **10.0**WMMA | 10.0 | | 10.0 **10.0**QK; | 10.0 | | 10.0 **10.0**block | 10.0 | | 10.0 **10.0**sized | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**`head_dim`; | 10.0 | | 10.0 **10.0**V | 10.0 | | 10.0 **10.0**reused | 10.0 | | 10.0 **10.0**across | 10.0 | | 10.0 **10.0**rows | 10.0 | | 10.0 **10.0**within | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**block. | 10.0 | | 10.0 **10.0**This | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**design | 10.0 | | 10.0 **10.0**taken | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**hiptrx | 10.0 | | 10.0 **10.0**parity | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**fresh | 10.0 | | 10.0 **10.0**B7/24K | 10.0 | | 10.0 **10.0**promotion | 10.0 | | 10.0 **10.0**pairs | 10.0 | | 10.0 **10.0**below.
 
-Offline code-object resources (V-sharing candidate):
+Offline | 10.0 | | 10.0 **10.0**code-object | 10.0 | | 10.0 **10.0**resources | 10.0 | | 10.0 **10.0**(V-sharing | 10.0 | | 10.0 **10.0**candidate):
 
-| resource | value |
+| | 10.0 | | 10.0 **10.0**resource | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**value | 10.0 | | 10.0 **10.0**|
 |---|---|
-| wavefront | wave32 |
-| LDS | 24,960 B |
-| VGPR | 55 |
-| SGPR | 42 |
-| spills / private | 0 / 0 |
-| max workgroup | 1024 |
+| | 10.0 | | 10.0 **10.0**wavefront | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**wave32 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**LDS | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**24,960 | 10.0 | | 10.0 **10.0**B | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**VGPR | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**55 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**SGPR | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**42 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**spills | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**private | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**0 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**max | 10.0 | | 10.0 **10.0**workgroup | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1024 | 10.0 | | 10.0 **10.0**|
 
-## Measured evidence (hiptrx)
+## | 10.0 | | 10.0 **10.0**Measured | 10.0 | | 10.0 **10.0**evidence | 10.0 | | 10.0 **10.0**(hiptrx)
 
-### Parity
+### | 10.0 | | 10.0 **10.0**Parity
 
-- Production shape B7 ragged: **PASS**, relL2 `5.366e-4`, cosine `0.999999940`.
-- Shape sweep: B∈{2,4,8,16} × HD∈{128,256} × CTX∈{2048,8192,16384,24576} — **32 shapes, 0 failures**.
-- Worst observed relL2 `1.050e-3`; minimum cosine `0.999999583`.
+- | 10.0 | | 10.0 **10.0**Production | 10.0 | | 10.0 **10.0**shape | 10.0 | | 10.0 **10.0**B7 | 10.0 | | 10.0 **10.0**ragged: | 10.0 | | 10.0 **10.0****PASS**, | 10.0 | | 10.0 **10.0**relL2 | 10.0 | | 10.0 **10.0**`5.366e-4`, | 10.0 | | 10.0 **10.0**cosine | 10.0 | | 10.0 **10.0**`0.999999940`.
+- | 10.0 | | 10.0 **10.0**Shape | 10.0 | | 10.0 **10.0**sweep: | 10.0 | | 10.0 **10.0**B∈{2,4,8,16} | 10.0 | | 10.0 **10.0**× | 10.0 | | 10.0 **10.0**HD∈{128,256} | 10.0 | | 10.0 **10.0**× | 10.0 | | 10.0 **10.0**CTX∈{2048,8192,16384,24576} | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0****32 | 10.0 | | 10.0 **10.0**shapes, | 10.0 | | 10.0 **10.0**0 | 10.0 | | 10.0 **10.0**failures**.
+- | 10.0 | | 10.0 **10.0**Worst | 10.0 | | 10.0 **10.0**observed | 10.0 | | 10.0 **10.0**relL2 | 10.0 | | 10.0 **10.0**`1.050e-3`; | 10.0 | | 10.0 **10.0**minimum | 10.0 | | 10.0 **10.0**cosine | 10.0 | | 10.0 **10.0**`0.999999583`.
 
-Parity establishes numerical agreement with the scalar reference under the harness thresholds. It is **not** a performance claim.
+Parity | 10.0 | | 10.0 **10.0**establishes | 10.0 | | 10.0 **10.0**numerical | 10.0 | | 10.0 **10.0**agreement | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**scalar | 10.0 | | 10.0 **10.0**reference | 10.0 | | 10.0 **10.0**under | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**harness | 10.0 | | 10.0 **10.0**thresholds. | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0****not** | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**performance | 10.0 | | 10.0 **10.0**claim.
 
-### Fresh guarded B7 / CTX24576 paired wall times
+### | 10.0 | | 10.0 **10.0**Fresh | 10.0 | | 10.0 **10.0**guarded | 10.0 | | 10.0 **10.0**B7 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**CTX24576 | 10.0 | | 10.0 **10.0**paired | 10.0 | | 10.0 **10.0**wall | 10.0 | | 10.0 **10.0**times
 
-Three independent guarded paired runs (scalar ms, query-tile ms, scalar/query speedup):
+Three | 10.0 | | 10.0 **10.0**independent | 10.0 | | 10.0 **10.0**guarded | 10.0 | | 10.0 **10.0**paired | 10.0 | | 10.0 **10.0**runs | 10.0 | | 10.0 **10.0**(scalar | 10.0 | | 10.0 **10.0**ms, | 10.0 | | 10.0 **10.0**query-tile | 10.0 | | 10.0 **10.0**ms, | 10.0 | | 10.0 **10.0**scalar/query | 10.0 | | 10.0 **10.0**speedup):
 
-| run | scalar | query-tile | speedup |
+| | 10.0 | | 10.0 **10.0**run | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**scalar | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**query-tile | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**speedup | 10.0 | | 10.0 **10.0**|
 |---:|---:|---:|---:|
-| 1 | 2.332 ms | 4.728 ms | 0.493× |
-| 2 | 1.676 ms | 3.182 ms | 0.527× |
-| 3 | 1.668 ms | 3.173 ms | 0.526× |
+| | 10.0 | | 10.0 **10.0**1 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**2.332 | 10.0 | | 10.0 **10.0**ms | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**4.728 | 10.0 | | 10.0 **10.0**ms | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.493× | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**2 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1.676 | 10.0 | | 10.0 **10.0**ms | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**3.182 | 10.0 | | 10.0 **10.0**ms | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.527× | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**3 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1.668 | 10.0 | | 10.0 **10.0**ms | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**3.173 | 10.0 | | 10.0 **10.0**ms | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.526× | 10.0 | | 10.0 **10.0**|
 
-Median: scalar **1.676 ms** vs query-tile **3.182 ms** → **0.526× speedup**.
+Median: | 10.0 | | 10.0 **10.0**scalar | 10.0 | | 10.0 **10.0****1.676 | 10.0 | | 10.0 **10.0**ms** | 10.0 | | 10.0 **10.0**vs | 10.0 | | 10.0 **10.0**query-tile | 10.0 | | 10.0 **10.0****3.182 | 10.0 | | 10.0 **10.0**ms** | 10.0 | | 10.0 **10.0**→ | 10.0 | | 10.0 **10.0****0.526× | 10.0 | | 10.0 **10.0**speedup**.
 
-The predeclared ≥1.10× promotion gate **failed decisively** (candidate was slower by roughly 2×). Because the gate failed, the compressed-MTP context run that would have exercised the candidate under Amendment 2/3 fixtures was **intentionally not performed**.
+The | 10.0 | | 10.0 **10.0**predeclared | 10.0 | | 10.0 **10.0**≥1.10× | 10.0 | | 10.0 **10.0**promotion | 10.0 | | 10.0 **10.0**gate | 10.0 | | 10.0 **10.0****failed | 10.0 | | 10.0 **10.0**decisively** | 10.0 | | 10.0 **10.0**(candidate | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**slower | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**roughly | 10.0 | | 10.0 **10.0**2×). | 10.0 | | 10.0 **10.0**Because | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**gate | 10.0 | | 10.0 **10.0**failed, | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**compressed-MTP | 10.0 | | 10.0 **10.0**context | 10.0 | | 10.0 **10.0**run | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**would | 10.0 | | 10.0 **10.0**have | 10.0 | | 10.0 **10.0**exercised | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**candidate | 10.0 | | 10.0 **10.0**under | 10.0 | | 10.0 **10.0**Amendment | 10.0 | | 10.0 **10.0**2/3 | 10.0 | | 10.0 **10.0**fixtures | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0****intentionally | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**performed**.
 
-### Device health after runs
+### | 10.0 | | 10.0 **10.0**Device | 10.0 | | 10.0 **10.0**health | 10.0 | | 10.0 **10.0**after | 10.0 | | 10.0 **10.0**runs
 
-After the guarded pairs, device3 remained healthy: `runtime_status=suspended`. Guard/lock were used for exclusive access; no recovery action was required.
+After | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**guarded | 10.0 | | 10.0 **10.0**pairs, | 10.0 | | 10.0 **10.0**device3 | 10.0 | | 10.0 **10.0**remained | 10.0 | | 10.0 **10.0**healthy: | 10.0 | | 10.0 **10.0**`runtime_status=suspended`. | 10.0 | | 10.0 **10.0**Guard/lock | 10.0 | | 10.0 **10.0**were | 10.0 | | 10.0 **10.0**used | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**exclusive | 10.0 | | 10.0 **10.0**access; | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**recovery | 10.0 | | 10.0 **10.0**action | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**required.
 
-## Closure
+## | 10.0 | | 10.0 **10.0**Closure
 
-- Env route, query-tile kernel, and harness wiring were **removed** from the disposable checkout.
-- Production path remains **scalar tiled+reduce**.
-- Source for the six query-tile implementation/harness paths returns exactly to HEAD `673ea3ae0`; only this immutable checkpoint amendment remains.
-- **No source, default, or product change** lands from this experiment.
+- | 10.0 | | 10.0 **10.0**Env | 10.0 | | 10.0 **10.0**route, | 10.0 | | 10.0 **10.0**query-tile | 10.0 | | 10.0 **10.0**kernel, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**harness | 10.0 | | 10.0 **10.0**wiring | 10.0 | | 10.0 **10.0**were | 10.0 | | 10.0 **10.0****removed** | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**disposable | 10.0 | | 10.0 **10.0**checkout.
+- | 10.0 | | 10.0 **10.0**Production | 10.0 | | 10.0 **10.0**path | 10.0 | | 10.0 **10.0**remains | 10.0 | | 10.0 **10.0****scalar | 10.0 | | 10.0 **10.0**tiled+reduce**.
+- | 10.0 | | 10.0 **10.0**Source | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**six | 10.0 | | 10.0 **10.0**query-tile | 10.0 | | 10.0 **10.0**implementation/harness | 10.0 | | 10.0 **10.0**paths | 10.0 | | 10.0 **10.0**returns | 10.0 | | 10.0 **10.0**exactly | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**HEAD | 10.0 | | 10.0 **10.0**`673ea3ae0`; | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**immutable | 10.0 | | 10.0 **10.0**checkpoint | 10.0 | | 10.0 **10.0**amendment | 10.0 | | 10.0 **10.0**remains.
+- | 10.0 | | 10.0 **10.0****No | 10.0 | | 10.0 **10.0**source, | 10.0 | | 10.0 **10.0**default, | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**product | 10.0 | | 10.0 **10.0**change** | 10.0 | | 10.0 **10.0**lands | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**experiment.
 
-## Non-claims
+## | 10.0 | | 10.0 **10.0**Non-claims
 
-- Does not promote query-tiled Q8 verify.
-- Does not attribute MTP, compressed-head, or session numbers from Amendments 2–3 to this candidate.
-- Does not assert occupancy, resource counts, or parity as throughput benefits.
-- Does not recommend a follow-up redesign; the measured gate result is the decision.
+- | 10.0 | | 10.0 **10.0**Does | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**promote | 10.0 | | 10.0 **10.0**query-tiled | 10.0 | | 10.0 **10.0**Q8 | 10.0 | | 10.0 **10.0**verify.
+- | 10.0 | | 10.0 **10.0**Does | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**attribute | 10.0 | | 10.0 **10.0**MTP, | 10.0 | | 10.0 **10.0**compressed-head, | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**session | 10.0 | | 10.0 **10.0**numbers | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**Amendments | 10.0 | | 10.0 **10.0**2–3 | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**candidate.
+- | 10.0 | | 10.0 **10.0**Does | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**assert | 10.0 | | 10.0 **10.0**occupancy, | 10.0 | | 10.0 **10.0**resource | 10.0 | | 10.0 **10.0**counts, | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**parity | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**throughput | 10.0 | | 10.0 **10.0**benefits.
+- | 10.0 | | 10.0 **10.0**Does | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**recommend | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**follow-up | 10.0 | | 10.0 **10.0**redesign; | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**measured | 10.0 | | 10.0 **10.0**gate | 10.0 | | 10.0 **10.0**result | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**decision.

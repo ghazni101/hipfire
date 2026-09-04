@@ -1,97 +1,97 @@
-# Amendment: qt=45 planar does NOT beat v1 at model scale — it is a size lever
+# | 10.0 | | 10.0 **10.0**Amendment: | 10.0 | | 10.0 **10.0**qt=45 | 10.0 | | 10.0 **10.0**planar | 10.0 | | 10.0 **10.0**does | 10.0 | | 10.0 **10.0**NOT | 10.0 | | 10.0 **10.0**beat | 10.0 | | 10.0 **10.0**v1 | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**scale | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**size | 10.0 | | 10.0 **10.0**lever
 
-- **Date:** 2026-08-18
-- **Lifecycle:** `historical`
-- **Amends:** [`2026-08-18-qt45-planar-beats-v1-on-all-three-axes.md`](2026-08-18-qt45-planar-beats-v1-on-all-three-axes.md)
-  — that file's title and § 3 headline are **WRONG at model scale** and are
-  corrected here. Its KLD results, oracle results, and microbench numbers stand.
-- **Host:** hiptrx, gfx1201, HIP 7.14
-- **Commit:** `bd49c1b48`
+- | 10.0 | | 10.0 **10.0****Date:** | 10.0 | | 10.0 **10.0**2026-08-18
+- | 10.0 | | 10.0 **10.0****Lifecycle:** | 10.0 | | 10.0 **10.0**`historical`
+- | 10.0 | | 10.0 **10.0****Amends:** | 10.0 | | 10.0 **10.0**[`2026-08-18-qt45-planar-beats-v1-on-all-three-axes.md`](2026-08-18-qt45-planar-beats-v1-on-all-three-axes.md)
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**file's | 10.0 | | 10.0 **10.0**title | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**§ | 10.0 | | 10.0 **10.0**3 | 10.0 | | 10.0 **10.0**headline | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0****WRONG | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**scale** | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**are
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**corrected | 10.0 | | 10.0 **10.0**here. | 10.0 | | 10.0 **10.0**Its | 10.0 | | 10.0 **10.0**KLD | 10.0 | | 10.0 **10.0**results, | 10.0 | | 10.0 **10.0**oracle | 10.0 | | 10.0 **10.0**results, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**microbench | 10.0 | | 10.0 **10.0**numbers | 10.0 | | 10.0 **10.0**stand.
+- | 10.0 | | 10.0 **10.0****Host:** | 10.0 | | 10.0 **10.0**hiptrx, | 10.0 | | 10.0 **10.0**gfx1201, | 10.0 | | 10.0 **10.0**HIP | 10.0 | | 10.0 **10.0**7.15
+- | 10.0 | | 10.0 **10.0****Commit:** | 10.0 | | 10.0 **10.0**`bd49c1b48`
 
-## 1 · The correction
+## | 10.0 | | 10.0 **10.0**1 | 10.0 | | 10.0 **10.0**· | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**correction
 
-The amended file concluded planar "beats v1 on prefill, decode AND size
-simultaneously." That was measured on the **isolated residual GEMM and residual
-GEMV**. It does not hold for the full model.
+The | 10.0 | | 10.0 **10.0**amended | 10.0 | | 10.0 **10.0**file | 10.0 | | 10.0 **10.0**concluded | 10.0 | | 10.0 **10.0**planar | 10.0 | | 10.0 **10.0**"beats | 10.0 | | 10.0 **10.0**v1 | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**prefill, | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**AND | 10.0 | | 10.0 **10.0**size
+simultaneously." | 10.0 | | 10.0 **10.0**That | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**measured | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0****isolated | 10.0 | | 10.0 **10.0**residual | 10.0 | | 10.0 **10.0**GEMM | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**residual
+GEMV**. | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**does | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**hold | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**full | 10.0 | | 10.0 **10.0**model.
 
-`hipfire bench --runs 5 --json`, dense Qwen3.8-27B `ctl`, serial (the daemon
-holds a single-instance lock), v1 run BEFORE and AFTER planar in one session to
-bracket thermal drift:
+`hipfire | 10.0 | | 10.0 **10.0**bench | 10.0 | | 10.0 **10.0**--runs | 10.0 | | 10.0 **10.0**5 | 10.0 | | 10.0 **10.0**--json`, | 10.0 | | 10.0 **10.0**dense | 10.0 | | 10.0 **10.0**Qwen3.8-27B | 10.0 | | 10.0 **10.0**`ctl`, | 10.0 | | 10.0 **10.0**serial | 10.0 | | 10.0 **10.0**(the | 10.0 | | 10.0 **10.0**daemon
+holds | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**single-instance | 10.0 | | 10.0 **10.0**lock), | 10.0 | | 10.0 **10.0**v1 | 10.0 | | 10.0 **10.0**run | 10.0 | | 10.0 **10.0**BEFORE | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**AFTER | 10.0 | | 10.0 **10.0**planar | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**session | 10.0 | | 10.0 **10.0**to
+bracket | 10.0 | | 10.0 **10.0**thermal | 10.0 | | 10.0 **10.0**drift:
 
-|run|decode tok/s|prefill tok/s|ttft ms|
+|run|decode | 10.0 | | 10.0 **10.0**tok/s|prefill | 10.0 | | 10.0 **10.0**tok/s|ttft | 10.0 | | 10.0 **10.0**ms|
 |---|---|---|---|
-|v1 ctl (qt=13)|34.60|402.10|59.70|
-|**qt=45 planar**|**34.20**|**394.00**|**60.90**|
-|v1 ctl (repeat)|34.60|400.50|59.90|
+|v1 | 10.0 | | 10.0 **10.0**ctl | 10.0 | | 10.0 **10.0**(qt=13)|34.60|402.10|59.70|
+|**qt=45 | 10.0 | | 10.0 **10.0**planar**|**34.20**|**394.00**|**60.90**|
+|v1 | 10.0 | | 10.0 **10.0**ctl | 10.0 | | 10.0 **10.0**(repeat)|34.60|400.50|59.90|
 
-v1 reproduces exactly — 34.60 both times, prefill spread 0.4% — so this is a
-real difference, not drift. At model scale planar is **-1.2% decode** and
-**-1.8% prefill** against v1.
+v1 | 10.0 | | 10.0 **10.0**reproduces | 10.0 | | 10.0 **10.0**exactly | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**34.60 | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**times, | 10.0 | | 10.0 **10.0**prefill | 10.0 | | 10.0 **10.0**spread | 10.0 | | 10.0 **10.0**0.4% | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**a
+real | 10.0 | | 10.0 **10.0**difference, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**drift. | 10.0 | | 10.0 **10.0**At | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**scale | 10.0 | | 10.0 **10.0**planar | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0****-1.2% | 10.0 | | 10.0 **10.0**decode** | 10.0 | | 10.0 **10.0**and
+**-1.8% | 10.0 | | 10.0 **10.0**prefill** | 10.0 | | 10.0 **10.0**against | 10.0 | | 10.0 **10.0**v1.
 
-For completeness, all three qt=45/qt=13 variants through the same harness:
+For | 10.0 | | 10.0 **10.0**completeness, | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**three | 10.0 | | 10.0 **10.0**qt=45/qt=13 | 10.0 | | 10.0 **10.0**variants | 10.0 | | 10.0 **10.0**through | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**harness:
 
-|arm|decode|prefill|size GB|
+|arm|decode|prefill|size | 10.0 | | 10.0 **10.0**GB|
 |---|---|---|---|
-|v1 (qt=13)|34.60|401.3 (mean)|15.663|
-|qt=45 interleaved|34.50|388.80|15.282|
-|qt=45 planar|34.20|394.00|15.282|
+|v1 | 10.0 | | 10.0 **10.0**(qt=13)|34.60|401.3 | 10.0 | | 10.0 **10.0**(mean)|15.663|
+|qt=45 | 10.0 | | 10.0 **10.0**interleaved|34.50|388.80|15.282|
+|qt=45 | 10.0 | | 10.0 **10.0**planar|34.20|394.00|15.282|
 
-Planar's contribution is real but narrower than claimed: it recovers **+1.3%
-prefill** over interleaved (388.8 -> 394.0) at a cost of **-0.9% decode**
-(34.50 -> 34.20). Neither qt=45 layout beats v1 on throughput at model scale.
+Planar's | 10.0 | | 10.0 **10.0**contribution | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**real | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**narrower | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**claimed: | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**recovers | 10.0 | | 10.0 **10.0****+1.3%
+prefill** | 10.0 | | 10.0 **10.0**over | 10.0 | | 10.0 **10.0**interleaved | 10.0 | | 10.0 **10.0**(388.8 | 10.0 | | 10.0 **10.0**-> | 10.0 | | 10.0 **10.0**394.0) | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**cost | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0****-0.9% | 10.0 | | 10.0 **10.0**decode**
+(34.50 | 10.0 | | 10.0 **10.0**-> | 10.0 | | 10.0 **10.0**34.20). | 10.0 | | 10.0 **10.0**Neither | 10.0 | | 10.0 **10.0**qt=45 | 10.0 | | 10.0 **10.0**layout | 10.0 | | 10.0 **10.0**beats | 10.0 | | 10.0 **10.0**v1 | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**throughput | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**scale.
 
-## 2 · Corrected disposition
+## | 10.0 | | 10.0 **10.0**2 | 10.0 | | 10.0 **10.0**· | 10.0 | | 10.0 **10.0**Corrected | 10.0 | | 10.0 **10.0**disposition
 
-qt=45 planar is a **size lever**, not a speed lever:
+qt=45 | 10.0 | | 10.0 **10.0**planar | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0****size | 10.0 | | 10.0 **10.0**lever**, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**speed | 10.0 | | 10.0 **10.0**lever:
 
-- quality: identical or slightly better than v1 (WT2 0.043423 vs 0.043776;
-  v6sel 0.587705 vs 0.587566) — unchanged from the amended file, and confirmed
-  to six decimals across the layout change
-- size: **97.06%** of v1, -380 MB
-- throughput: **~1-2% behind v1** at model scale
+- | 10.0 | | 10.0 **10.0**quality: | 10.0 | | 10.0 **10.0**identical | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**slightly | 10.0 | | 10.0 **10.0**better | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**v1 | 10.0 | | 10.0 **10.0**(WT2 | 10.0 | | 10.0 **10.0**0.043423 | 10.0 | | 10.0 **10.0**vs | 10.0 | | 10.0 **10.0**0.043776;
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**v6sel | 10.0 | | 10.0 **10.0**0.587705 | 10.0 | | 10.0 **10.0**vs | 10.0 | | 10.0 **10.0**0.587566) | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**unchanged | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**amended | 10.0 | | 10.0 **10.0**file, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**confirmed
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**six | 10.0 | | 10.0 **10.0**decimals | 10.0 | | 10.0 **10.0**across | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**layout | 10.0 | | 10.0 **10.0**change
+- | 10.0 | | 10.0 **10.0**size: | 10.0 | | 10.0 **10.0****97.06%** | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**v1, | 10.0 | | 10.0 **10.0**-380 | 10.0 | | 10.0 **10.0**MB
+- | 10.0 | | 10.0 **10.0**throughput: | 10.0 | | 10.0 **10.0****~1-2% | 10.0 | | 10.0 **10.0**behind | 10.0 | | 10.0 **10.0**v1** | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**scale
 
-That is still worth shipping for a size-constrained deployment. It is not the
-free win the amended file described.
+That | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**still | 10.0 | | 10.0 **10.0**worth | 10.0 | | 10.0 **10.0**shipping | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**size-constrained | 10.0 | | 10.0 **10.0**deployment. | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**the
+free | 10.0 | | 10.0 **10.0**win | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**amended | 10.0 | | 10.0 **10.0**file | 10.0 | | 10.0 **10.0**described.
 
-## 3 · Why the microbench did not translate, again
+## | 10.0 | | 10.0 **10.0**3 | 10.0 | | 10.0 **10.0**· | 10.0 | | 10.0 **10.0**Why | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**microbench | 10.0 | | 10.0 **10.0**did | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**translate, | 10.0 | | 10.0 **10.0**again
 
-This is the third instance in one session:
+This | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**third | 10.0 | | 10.0 **10.0**instance | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**session:
 
-1. the mq4c residual GEMV measured 6.6-8.1% faster than v1 and produced no
-   model-level decode change,
-2. removing 40 redundant fp16 round-trips changed a benchmark by nothing
-   because LLVM already folded them,
-3. and now the residual GEMM measured 2-3% faster than v1 while full prefill
-   came in 1.8% slower.
+1. | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**mq4c | 10.0 | | 10.0 **10.0**residual | 10.0 | | 10.0 **10.0**GEMV | 10.0 | | 10.0 **10.0**measured | 10.0 | | 10.0 **10.0**6.6-8.1% | 10.0 | | 10.0 **10.0**faster | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**v1 | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**produced | 10.0 | | 10.0 **10.0**no
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**model-level | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**change,
+2. | 10.0 | | 10.0 **10.0**removing | 10.0 | | 10.0 **10.0**40 | 10.0 | | 10.0 **10.0**redundant | 10.0 | | 10.0 **10.0**fp16 | 10.0 | | 10.0 **10.0**round-trips | 10.0 | | 10.0 **10.0**changed | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**benchmark | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**nothing
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**because | 10.0 | | 10.0 **10.0**LLVM | 10.0 | | 10.0 **10.0**already | 10.0 | | 10.0 **10.0**folded | 10.0 | | 10.0 **10.0**them,
+3. | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**now | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**residual | 10.0 | | 10.0 **10.0**GEMM | 10.0 | | 10.0 **10.0**measured | 10.0 | | 10.0 **10.0**2-3% | 10.0 | | 10.0 **10.0**faster | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**v1 | 10.0 | | 10.0 **10.0**while | 10.0 | | 10.0 **10.0**full | 10.0 | | 10.0 **10.0**prefill
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**came | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**1.8% | 10.0 | | 10.0 **10.0**slower.
 
-The mechanism is the same each time: the residual GEMM is one kernel among
-many. Full prefill also runs qkv, qkvza, gate_up, attention, and the norms, and
-the alignment argument that made the residual kernel faster does not
-automatically apply to all of them. A single-kernel A/B bounds what a change
-*can* do; it does not measure what it *does*.
+The | 10.0 | | 10.0 **10.0**mechanism | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**each | 10.0 | | 10.0 **10.0**time: | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**residual | 10.0 | | 10.0 **10.0**GEMM | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**kernel | 10.0 | | 10.0 **10.0**among
+many. | 10.0 | | 10.0 **10.0**Full | 10.0 | | 10.0 **10.0**prefill | 10.0 | | 10.0 **10.0**also | 10.0 | | 10.0 **10.0**runs | 10.0 | | 10.0 **10.0**qkv, | 10.0 | | 10.0 **10.0**qkvza, | 10.0 | | 10.0 **10.0**gate_up, | 10.0 | | 10.0 **10.0**attention, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**norms, | 10.0 | | 10.0 **10.0**and
+the | 10.0 | | 10.0 **10.0**alignment | 10.0 | | 10.0 **10.0**argument | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**made | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**residual | 10.0 | | 10.0 **10.0**kernel | 10.0 | | 10.0 **10.0**faster | 10.0 | | 10.0 **10.0**does | 10.0 | | 10.0 **10.0**not
+automatically | 10.0 | | 10.0 **10.0**apply | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**them. | 10.0 | | 10.0 **10.0**A | 10.0 | | 10.0 **10.0**single-kernel | 10.0 | | 10.0 **10.0**A/B | 10.0 | | 10.0 **10.0**bounds | 10.0 | | 10.0 **10.0**what | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**change
+*can* | 10.0 | | 10.0 **10.0**do; | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**does | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**measure | 10.0 | | 10.0 **10.0**what | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0***does*.
 
-**Rule for this project going forward: no format-level throughput claim without
-a model-scale `hipfire bench` with the control bracketed in the same session.**
-The isolated bench is for mechanism, not for the headline.
+**Rule | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**project | 10.0 | | 10.0 **10.0**going | 10.0 | | 10.0 **10.0**forward: | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**format-level | 10.0 | | 10.0 **10.0**throughput | 10.0 | | 10.0 **10.0**claim | 10.0 | | 10.0 **10.0**without
+a | 10.0 | | 10.0 **10.0**model-scale | 10.0 | | 10.0 **10.0**`hipfire | 10.0 | | 10.0 **10.0**bench` | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**control | 10.0 | | 10.0 **10.0**bracketed | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**session.**
+The | 10.0 | | 10.0 **10.0**isolated | 10.0 | | 10.0 **10.0**bench | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**mechanism, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**headline.
 
-## 4 · Open follow-up
+## | 10.0 | | 10.0 **10.0**4 | 10.0 | | 10.0 **10.0**· | 10.0 | | 10.0 **10.0**Open | 10.0 | | 10.0 **10.0**follow-up
 
-The residual GEMM got faster while total prefill got slower, so at least one
-other converted mq4c kernel is now slower than its v1 twin. Candidates, in
-order of prefill weight: `gemm_qkvza_mq4cg256_wmma_gfx12_bt`,
-`gemm_gate_up_mq4cg256_wmma_gfx12_bt`, `gemm_qkv_mq4cg256_wmma.gfx12`, and the
-two LDS-staging variants whose slab changed 264 -> 256 B. Extending
-`bench_mq4c_slab_alignment` to cover the qkv/qkvza/gate_up shapes would locate
-it; that harness currently benches only the residual shape.
+The | 10.0 | | 10.0 **10.0**residual | 10.0 | | 10.0 **10.0**GEMM | 10.0 | | 10.0 **10.0**got | 10.0 | | 10.0 **10.0**faster | 10.0 | | 10.0 **10.0**while | 10.0 | | 10.0 **10.0**total | 10.0 | | 10.0 **10.0**prefill | 10.0 | | 10.0 **10.0**got | 10.0 | | 10.0 **10.0**slower, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**least | 10.0 | | 10.0 **10.0**one
+other | 10.0 | | 10.0 **10.0**converted | 10.0 | | 10.0 **10.0**mq4c | 10.0 | | 10.0 **10.0**kernel | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**now | 10.0 | | 10.0 **10.0**slower | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**v1 | 10.0 | | 10.0 **10.0**twin. | 10.0 | | 10.0 **10.0**Candidates, | 10.0 | | 10.0 **10.0**in
+order | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**prefill | 10.0 | | 10.0 **10.0**weight: | 10.0 | | 10.0 **10.0**`gemm_qkvza_mq4cg256_wmma_gfx12_bt`,
+`gemm_gate_up_mq4cg256_wmma_gfx12_bt`, | 10.0 | | 10.0 **10.0**`gemm_qkv_mq4cg256_wmma.gfx12`, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the
+two | 10.0 | | 10.0 **10.0**LDS-staging | 10.0 | | 10.0 **10.0**variants | 10.0 | | 10.0 **10.0**whose | 10.0 | | 10.0 **10.0**slab | 10.0 | | 10.0 **10.0**changed | 10.0 | | 10.0 **10.0**264 | 10.0 | | 10.0 **10.0**-> | 10.0 | | 10.0 **10.0**256 | 10.0 | | 10.0 **10.0**B. | 10.0 | | 10.0 **10.0**Extending
+`bench_mq4c_slab_alignment` | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**cover | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**qkv/qkvza/gate_up | 10.0 | | 10.0 **10.0**shapes | 10.0 | | 10.0 **10.0**would | 10.0 | | 10.0 **10.0**locate
+it; | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**harness | 10.0 | | 10.0 **10.0**currently | 10.0 | | 10.0 **10.0**benches | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**residual | 10.0 | | 10.0 **10.0**shape.
 
-## 5 · What still stands from the amended file
+## | 10.0 | | 10.0 **10.0**5 | 10.0 | | 10.0 **10.0**· | 10.0 | | 10.0 **10.0**What | 10.0 | | 10.0 **10.0**still | 10.0 | | 10.0 **10.0**stands | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**amended | 10.0 | | 10.0 **10.0**file
 
-- KLD: 0.043423 / 0.587705, matched to six decimals across the relocation.
-- Oracle: 6.966e-8 on gfx1201, with a fixture that asserts its own
-  discriminating power first.
-- Zero register spills in all 13 kernels; LDS 12416 -> 12288 B on the two
-  staging GEMMs.
-- Decode correctness verified by real autoregressive generation on the planar
-  artifact (coherent Python, 32.4 tok/s warm), which is the only thing that
-  exercises `gemv_mq4cg256` and `gemv_mq4cg256_multirow` — prefill scoring and
-  the residual microbench both miss them.
+- | 10.0 | | 10.0 **10.0**KLD: | 10.0 | | 10.0 **10.0**0.043423 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**0.587705, | 10.0 | | 10.0 **10.0**matched | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**six | 10.0 | | 10.0 **10.0**decimals | 10.0 | | 10.0 **10.0**across | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**relocation.
+- | 10.0 | | 10.0 **10.0**Oracle: | 10.0 | | 10.0 **10.0**6.966e-8 | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**gfx1201, | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**fixture | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**asserts | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**own
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**discriminating | 10.0 | | 10.0 **10.0**power | 10.0 | | 10.0 **10.0**first.
+- | 10.0 | | 10.0 **10.0**Zero | 10.0 | | 10.0 **10.0**register | 10.0 | | 10.0 **10.0**spills | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**13 | 10.0 | | 10.0 **10.0**kernels; | 10.0 | | 10.0 **10.0**LDS | 10.0 | | 10.0 **10.0**12416 | 10.0 | | 10.0 **10.0**-> | 10.0 | | 10.0 **10.0**12288 | 10.0 | | 10.0 **10.0**B | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**two
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**staging | 10.0 | | 10.0 **10.0**GEMMs.
+- | 10.0 | | 10.0 **10.0**Decode | 10.0 | | 10.0 **10.0**correctness | 10.0 | | 10.0 **10.0**verified | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**real | 10.0 | | 10.0 **10.0**autoregressive | 10.0 | | 10.0 **10.0**generation | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**planar
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**artifact | 10.0 | | 10.0 **10.0**(coherent | 10.0 | | 10.0 **10.0**Python, | 10.0 | | 10.0 **10.0**32.4 | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**warm), | 10.0 | | 10.0 **10.0**which | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**thing | 10.0 | | 10.0 **10.0**that
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**exercises | 10.0 | | 10.0 **10.0**`gemv_mq4cg256` | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**`gemv_mq4cg256_multirow` | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**prefill | 10.0 | | 10.0 **10.0**scoring | 10.0 | | 10.0 **10.0**and
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**residual | 10.0 | | 10.0 **10.0**microbench | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**miss | 10.0 | | 10.0 **10.0**them.

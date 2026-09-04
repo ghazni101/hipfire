@@ -1,136 +1,136 @@
-# DeepSeek V4 Flash MQ2R on MI300X: failed CDNA port postmortem
+# | 10.0 | | 10.0 **10.0**DeepSeek | 10.0 | | 10.0 **10.0**V4 | 10.0 | | 10.0 **10.0**Flash | 10.0 | | 10.0 **10.0**MQ2R | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**MI300X: | 10.0 | | 10.0 **10.0**failed | 10.0 | | 10.0 **10.0**CDNA | 10.0 | | 10.0 **10.0**port | 10.0 | | 10.0 **10.0**postmortem
 
-Date: 2026-08-01  
-Disposition: archived on `ds4-cdna-test-fail`; do not merge into gfx1151  
-Exact model SHA-256: `392325b5a8cd284c8f305f23f74f178007a14b88173babeb3f4784ec4fc0e511`
+Date: | 10.0 | | 10.0 **10.0**2026-08-01 | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**
+Disposition: | 10.0 | | 10.0 **10.0**archived | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**`ds4-cdna-test-fail`; | 10.0 | | 10.0 **10.0**do | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**merge | 10.0 | | 10.0 **10.0**into | 10.0 | | 10.0 **10.0**gfx1151 | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**
+Exact | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**SHA-256: | 10.0 | | 10.0 **10.0**`392325b5a8cd284c8f305f23f74f178007a14b88173babeb3f4784ec4fc0e511`
 
-## Executive verdict
+## | 10.0 | | 10.0 **10.0**Executive | 10.0 | | 10.0 **10.0**verdict
 
-The campaign failed its objective. It did not reach 50 tok/s ordinary
-autoregressive decode on the exact DeepSeek V4 Flash MQ2R artifact. The best
-repo-native `hipfire bench` discovery result was 32.1932 tok/s on a 2048-token
-prompt with 32 generated tokens. That result is not publication or promotion
-evidence: it is one sample, it is shorter than the 2048/510 acceptance fixture,
-and it did not pass a byte-identical two-arm output gate.
+The | 10.0 | | 10.0 **10.0**campaign | 10.0 | | 10.0 **10.0**failed | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**objective. | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**did | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**reach | 10.0 | | 10.0 **10.0**50 | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**ordinary
+autoregressive | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**exact | 10.0 | | 10.0 **10.0**DeepSeek | 10.0 | | 10.0 **10.0**V4 | 10.0 | | 10.0 **10.0**Flash | 10.0 | | 10.0 **10.0**MQ2R | 10.0 | | 10.0 **10.0**artifact. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**best
+repo-native | 10.0 | | 10.0 **10.0**`hipfire | 10.0 | | 10.0 **10.0**bench` | 10.0 | | 10.0 **10.0**discovery | 10.0 | | 10.0 **10.0**result | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**32.1932 | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**2048-token
+prompt | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**32 | 10.0 | | 10.0 **10.0**generated | 10.0 | | 10.0 **10.0**tokens. | 10.0 | | 10.0 **10.0**That | 10.0 | | 10.0 **10.0**result | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**publication | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**promotion
+evidence: | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**sample, | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**shorter | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**2048/510 | 10.0 | | 10.0 **10.0**acceptance | 10.0 | | 10.0 **10.0**fixture,
+and | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**did | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**pass | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**byte-identical | 10.0 | | 10.0 **10.0**two-arm | 10.0 | | 10.0 **10.0**output | 10.0 | | 10.0 **10.0**gate.
 
-The campaign spent too much of its budget repairing a path that was not a
-working CDNA port and then optimizing individual inherited kernels. MI300X's
-HBM and compute capacity were not the limiting resources. The decode graph
-remained a roughly 2,500-2,800-launch serial pipeline per token, leaving the
-hardware under-occupied. Narrow kernel wins could not remove the approximately
-12 ms/token needed to move from about 31 tok/s to 50 tok/s.
+The | 10.0 | | 10.0 **10.0**campaign | 10.0 | | 10.0 **10.0**spent | 10.0 | | 10.0 **10.0**too | 10.0 | | 10.0 **10.0**much | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**budget | 10.0 | | 10.0 **10.0**repairing | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**path | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**a
+working | 10.0 | | 10.0 **10.0**CDNA | 10.0 | | 10.0 **10.0**port | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**then | 10.0 | | 10.0 **10.0**optimizing | 10.0 | | 10.0 **10.0**individual | 10.0 | | 10.0 **10.0**inherited | 10.0 | | 10.0 **10.0**kernels. | 10.0 | | 10.0 **10.0**MI300X's
+HBM | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**compute | 10.0 | | 10.0 **10.0**capacity | 10.0 | | 10.0 **10.0**were | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**limiting | 10.0 | | 10.0 **10.0**resources. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**graph
+remained | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**roughly | 10.0 | | 10.0 **10.0**2,500-2,800-launch | 10.0 | | 10.0 **10.0**serial | 10.0 | | 10.0 **10.0**pipeline | 10.0 | | 10.0 **10.0**per | 10.0 | | 10.0 **10.0**token, | 10.0 | | 10.0 **10.0**leaving | 10.0 | | 10.0 **10.0**the
+hardware | 10.0 | | 10.0 **10.0**under-occupied. | 10.0 | | 10.0 **10.0**Narrow | 10.0 | | 10.0 **10.0**kernel | 10.0 | | 10.0 **10.0**wins | 10.0 | | 10.0 **10.0**could | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**remove | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**approximately
+12 | 10.0 | | 10.0 **10.0**ms/token | 10.0 | | 10.0 **10.0**needed | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**move | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**about | 10.0 | | 10.0 **10.0**31 | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**50 | 10.0 | | 10.0 **10.0**tok/s.
 
-## Measured endpoint
+## | 10.0 | | 10.0 **10.0**Measured | 10.0 | | 10.0 **10.0**endpoint
 
-| State | Fixture | Samples | Result | Verdict |
+| | 10.0 | | 10.0 **10.0**State | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Fixture | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Samples | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Result | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Verdict | 10.0 | | 10.0 **10.0**|
 |---|---:|---:|---:|---|
-| Corrected repo-native baseline | 2048/32, batch 1, top-k 6, AR | 1 | 31.0982 tok/s | Discovery reference |
-| Shared/routed FFN two-stream overlap | Same | 1 | 31.1284 tok/s | Null, +0.097%; rejected |
-| Compressor sentinel gate + fused HC finalize | Same | 1 | 32.1932 tok/s | Best discovery, +3.521%; not promoted |
-| Target | Ordinary AR | — | 50.0000 tok/s | Missed; another +55.3% was required |
+| | 10.0 | | 10.0 **10.0**Corrected | 10.0 | | 10.0 **10.0**repo-native | 10.0 | | 10.0 **10.0**baseline | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**2048/32, | 10.0 | | 10.0 **10.0**batch | 10.0 | | 10.0 **10.0**1, | 10.0 | | 10.0 **10.0**top-k | 10.0 | | 10.0 **10.0**6, | 10.0 | | 10.0 **10.0**AR | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**31.0982 | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Discovery | 10.0 | | 10.0 **10.0**reference | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**Shared/routed | 10.0 | | 10.0 **10.0**FFN | 10.0 | | 10.0 **10.0**two-stream | 10.0 | | 10.0 **10.0**overlap | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Same | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**31.1284 | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Null, | 10.0 | | 10.0 **10.0**+0.097%; | 10.0 | | 10.0 **10.0**rejected | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**Compressor | 10.0 | | 10.0 **10.0**sentinel | 10.0 | | 10.0 **10.0**gate | 10.0 | | 10.0 **10.0**+ | 10.0 | | 10.0 **10.0**fused | 10.0 | | 10.0 **10.0**HC | 10.0 | | 10.0 **10.0**finalize | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Same | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**32.1932 | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Best | 10.0 | | 10.0 **10.0**discovery, | 10.0 | | 10.0 **10.0**+3.521%; | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**promoted | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**Target | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Ordinary | 10.0 | | 10.0 **10.0**AR | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**50.0000 | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Missed; | 10.0 | | 10.0 **10.0**another | 10.0 | | 10.0 **10.0**+55.3% | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**required | 10.0 | | 10.0 **10.0**|
 
-An attempted graph-plus-HC screen was interrupted before it produced a result.
-It is not evidence and has no inferred value.
+An | 10.0 | | 10.0 **10.0**attempted | 10.0 | | 10.0 **10.0**graph-plus-HC | 10.0 | | 10.0 **10.0**screen | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**interrupted | 10.0 | | 10.0 **10.0**before | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**produced | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**result.
+It | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**evidence | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**has | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**inferred | 10.0 | | 10.0 **10.0**value.
 
-## What went wrong
+## | 10.0 | | 10.0 **10.0**What | 10.0 | | 10.0 **10.0**went | 10.0 | | 10.0 **10.0**wrong
 
-### 1. The starting path was not a valid CDNA product path
+### | 10.0 | | 10.0 **10.0**1. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**starting | 10.0 | | 10.0 **10.0**path | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**valid | 10.0 | | 10.0 **10.0**CDNA | 10.0 | | 10.0 **10.0**product | 10.0 | | 10.0 **10.0**path
 
-The initial route inherited assumptions from RDNA implementations. Source and
-hardware checks found a wave64 attention softmax defect and a grouped-MoE
-prefill route that attempted to compile a wave32 WMMA kernel on gfx942. Before
-performance work could begin, the campaign had to make the model coherent and
-repair routing.
+The | 10.0 | | 10.0 **10.0**initial | 10.0 | | 10.0 **10.0**route | 10.0 | | 10.0 **10.0**inherited | 10.0 | | 10.0 **10.0**assumptions | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**RDNA | 10.0 | | 10.0 **10.0**implementations. | 10.0 | | 10.0 **10.0**Source | 10.0 | | 10.0 **10.0**and
+hardware | 10.0 | | 10.0 **10.0**checks | 10.0 | | 10.0 **10.0**found | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**wave64 | 10.0 | | 10.0 **10.0**attention | 10.0 | | 10.0 **10.0**softmax | 10.0 | | 10.0 **10.0**defect | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**grouped-MoE
+prefill | 10.0 | | 10.0 **10.0**route | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**attempted | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**compile | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**wave32 | 10.0 | | 10.0 **10.0**WMMA | 10.0 | | 10.0 **10.0**kernel | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**gfx942. | 10.0 | | 10.0 **10.0**Before
+performance | 10.0 | | 10.0 **10.0**work | 10.0 | | 10.0 **10.0**could | 10.0 | | 10.0 **10.0**begin, | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**campaign | 10.0 | | 10.0 **10.0**had | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**make | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**coherent | 10.0 | | 10.0 **10.0**and
+repair | 10.0 | | 10.0 **10.0**routing.
 
-### 2. A correctness bug masqueraded as a context-performance problem
+### | 10.0 | | 10.0 **10.0**2. | 10.0 | | 10.0 **10.0**A | 10.0 | | 10.0 **10.0**correctness | 10.0 | | 10.0 **10.0**bug | 10.0 | | 10.0 **10.0**masqueraded | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**context-performance | 10.0 | | 10.0 **10.0**problem
 
-At 2048 prompt tokens, the original indexer top-k implementation fell from a
-parallel path into a thread-0 serial selection sort. Decode collapsed to about
-2 tok/s. Parallel top-k removed the cliff and restored the low-30 tok/s range,
-but this was a portability/correctness repair rather than exploitation of
-MI300X's compute or HBM bandwidth.
+At | 10.0 | | 10.0 **10.0**2048 | 10.0 | | 10.0 **10.0**prompt | 10.0 | | 10.0 **10.0**tokens, | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**original | 10.0 | | 10.0 **10.0**indexer | 10.0 | | 10.0 **10.0**top-k | 10.0 | | 10.0 **10.0**implementation | 10.0 | | 10.0 **10.0**fell | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**a
+parallel | 10.0 | | 10.0 **10.0**path | 10.0 | | 10.0 **10.0**into | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**thread-0 | 10.0 | | 10.0 **10.0**serial | 10.0 | | 10.0 **10.0**selection | 10.0 | | 10.0 **10.0**sort. | 10.0 | | 10.0 **10.0**Decode | 10.0 | | 10.0 **10.0**collapsed | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**about
+2 | 10.0 | | 10.0 **10.0**tok/s. | 10.0 | | 10.0 **10.0**Parallel | 10.0 | | 10.0 **10.0**top-k | 10.0 | | 10.0 **10.0**removed | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**cliff | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**restored | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**low-30 | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**range,
+but | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**portability/correctness | 10.0 | | 10.0 **10.0**repair | 10.0 | | 10.0 **10.0**rather | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**exploitation | 10.0 | | 10.0 **10.0**of
+MI300X's | 10.0 | | 10.0 **10.0**compute | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**HBM | 10.0 | | 10.0 **10.0**bandwidth.
 
-The route also showed pre-existing greedy-output nondeterminism associated with
-non-finite indexer scores. This made the original byte-identical candidate
-contract unsatisfiable until the baseline itself was repaired or the authority
-contract was changed.
+The | 10.0 | | 10.0 **10.0**route | 10.0 | | 10.0 **10.0**also | 10.0 | | 10.0 **10.0**showed | 10.0 | | 10.0 **10.0**pre-existing | 10.0 | | 10.0 **10.0**greedy-output | 10.0 | | 10.0 **10.0**nondeterminism | 10.0 | | 10.0 **10.0**associated | 10.0 | | 10.0 **10.0**with
+non-finite | 10.0 | | 10.0 **10.0**indexer | 10.0 | | 10.0 **10.0**scores. | 10.0 | | 10.0 **10.0**This | 10.0 | | 10.0 **10.0**made | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**original | 10.0 | | 10.0 **10.0**byte-identical | 10.0 | | 10.0 **10.0**candidate
+contract | 10.0 | | 10.0 **10.0**unsatisfiable | 10.0 | | 10.0 **10.0**until | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**baseline | 10.0 | | 10.0 **10.0**itself | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**repaired | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**authority
+contract | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**changed.
 
-### 3. The model remained launch- and dependency-bound
+### | 10.0 | | 10.0 **10.0**3. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**remained | 10.0 | | 10.0 **10.0**launch- | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**dependency-bound
 
-The campaign's own census placed the token graph near 2,795 launches before
-the retained fixes and still around 2,500 after them. The hardware has 304 CUs
-and multi-terabyte-per-second HBM, but most batch-1 kernels expose little work
-and remain serially dependent. More bandwidth or a faster isolated GEMV cannot
-repay thousands of dispatch and synchronization boundaries.
+The | 10.0 | | 10.0 **10.0**campaign's | 10.0 | | 10.0 **10.0**own | 10.0 | | 10.0 **10.0**census | 10.0 | | 10.0 **10.0**placed | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**token | 10.0 | | 10.0 **10.0**graph | 10.0 | | 10.0 **10.0**near | 10.0 | | 10.0 **10.0**2,795 | 10.0 | | 10.0 **10.0**launches | 10.0 | | 10.0 **10.0**before
+the | 10.0 | | 10.0 **10.0**retained | 10.0 | | 10.0 **10.0**fixes | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**still | 10.0 | | 10.0 **10.0**around | 10.0 | | 10.0 **10.0**2,500 | 10.0 | | 10.0 **10.0**after | 10.0 | | 10.0 **10.0**them. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**hardware | 10.0 | | 10.0 **10.0**has | 10.0 | | 10.0 **10.0**304 | 10.0 | | 10.0 **10.0**CUs
+and | 10.0 | | 10.0 **10.0**multi-terabyte-per-second | 10.0 | | 10.0 **10.0**HBM, | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**most | 10.0 | | 10.0 **10.0**batch-1 | 10.0 | | 10.0 **10.0**kernels | 10.0 | | 10.0 **10.0**expose | 10.0 | | 10.0 **10.0**little | 10.0 | | 10.0 **10.0**work
+and | 10.0 | | 10.0 **10.0**remain | 10.0 | | 10.0 **10.0**serially | 10.0 | | 10.0 **10.0**dependent. | 10.0 | | 10.0 **10.0**More | 10.0 | | 10.0 **10.0**bandwidth | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**faster | 10.0 | | 10.0 **10.0**isolated | 10.0 | | 10.0 **10.0**GEMV | 10.0 | | 10.0 **10.0**cannot
+repay | 10.0 | | 10.0 **10.0**thousands | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**dispatch | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**synchronization | 10.0 | | 10.0 **10.0**boundaries.
 
-The required move from 31.0982 to 50 tok/s is 32.15 ms/token to 20 ms/token:
-about 12.15 ms/token had to disappear. The accepted launch bundle saved only
-about 1.10 ms/token.
+The | 10.0 | | 10.0 **10.0**required | 10.0 | | 10.0 **10.0**move | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**31.0982 | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**50 | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**32.15 | 10.0 | | 10.0 **10.0**ms/token | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**20 | 10.0 | | 10.0 **10.0**ms/token:
+about | 10.0 | | 10.0 **10.0**12.15 | 10.0 | | 10.0 **10.0**ms/token | 10.0 | | 10.0 **10.0**had | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**disappear. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**accepted | 10.0 | | 10.0 **10.0**launch | 10.0 | | 10.0 **10.0**bundle | 10.0 | | 10.0 **10.0**saved | 10.0 | | 10.0 **10.0**only
+about | 10.0 | | 10.0 **10.0**1.10 | 10.0 | | 10.0 **10.0**ms/token.
 
-### 4. The attempted CDNA-native kernels were too narrow
+### | 10.0 | | 10.0 **10.0**4. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**attempted | 10.0 | | 10.0 **10.0**CDNA-native | 10.0 | | 10.0 **10.0**kernels | 10.0 | | 10.0 **10.0**were | 10.0 | | 10.0 **10.0**too | 10.0 | | 10.0 **10.0**narrow
 
-- A wave64x8 MQ2 gate-up candidate was bit-identical but only 0.774x as fast as
-  the incumbent.
-- A native E8 wave64x4 scheduler was 3.16% slower than its correctness oracle.
-- An eight-wave E8 family improved one shared projection pair 1.377x, but its
-  occurrence-weighted product ceiling was only about 0.57%; larger shapes
-  regressed.
-- Group-local O-LoRA LDS8 was 0.828x.
-- A two-stream shared/routed FFN overlap product screen was a +0.097% null.
+- | 10.0 | | 10.0 **10.0**A | 10.0 | | 10.0 **10.0**wave64x8 | 10.0 | | 10.0 **10.0**MQ2 | 10.0 | | 10.0 **10.0**gate-up | 10.0 | | 10.0 **10.0**candidate | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**bit-identical | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**0.774x | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**fast | 10.0 | | 10.0 **10.0**as
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**incumbent.
+- | 10.0 | | 10.0 **10.0**A | 10.0 | | 10.0 **10.0**native | 10.0 | | 10.0 **10.0**E8 | 10.0 | | 10.0 **10.0**wave64x4 | 10.0 | | 10.0 **10.0**scheduler | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**3.16% | 10.0 | | 10.0 **10.0**slower | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**correctness | 10.0 | | 10.0 **10.0**oracle.
+- | 10.0 | | 10.0 **10.0**An | 10.0 | | 10.0 **10.0**eight-wave | 10.0 | | 10.0 **10.0**E8 | 10.0 | | 10.0 **10.0**family | 10.0 | | 10.0 **10.0**improved | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**shared | 10.0 | | 10.0 **10.0**projection | 10.0 | | 10.0 **10.0**pair | 10.0 | | 10.0 **10.0**1.377x, | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**its
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**occurrence-weighted | 10.0 | | 10.0 **10.0**product | 10.0 | | 10.0 **10.0**ceiling | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**about | 10.0 | | 10.0 **10.0**0.57%; | 10.0 | | 10.0 **10.0**larger | 10.0 | | 10.0 **10.0**shapes
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**regressed.
+- | 10.0 | | 10.0 **10.0**Group-local | 10.0 | | 10.0 **10.0**O-LoRA | 10.0 | | 10.0 **10.0**LDS8 | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**0.828x.
+- | 10.0 | | 10.0 **10.0**A | 10.0 | | 10.0 **10.0**two-stream | 10.0 | | 10.0 **10.0**shared/routed | 10.0 | | 10.0 **10.0**FFN | 10.0 | | 10.0 **10.0**overlap | 10.0 | | 10.0 **10.0**product | 10.0 | | 10.0 **10.0**screen | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**+0.097% | 10.0 | | 10.0 **10.0**null.
 
-These results do not show that CDNA lacks useful kernels. They show that
-optimizing these isolated shapes was the wrong level of attack for this graph.
+These | 10.0 | | 10.0 **10.0**results | 10.0 | | 10.0 **10.0**do | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**show | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**CDNA | 10.0 | | 10.0 **10.0**lacks | 10.0 | | 10.0 **10.0**useful | 10.0 | | 10.0 **10.0**kernels. | 10.0 | | 10.0 **10.0**They | 10.0 | | 10.0 **10.0**show | 10.0 | | 10.0 **10.0**that
+optimizing | 10.0 | | 10.0 **10.0**these | 10.0 | | 10.0 **10.0**isolated | 10.0 | | 10.0 **10.0**shapes | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**wrong | 10.0 | | 10.0 **10.0**level | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**attack | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**graph.
 
-### 5. Measurement discipline was corrected too late
+### | 10.0 | | 10.0 **10.0**5. | 10.0 | | 10.0 **10.0**Measurement | 10.0 | | 10.0 **10.0**discipline | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**corrected | 10.0 | | 10.0 **10.0**too | 10.0 | | 10.0 **10.0**late
 
-Several early model-level screens used a custom feeder. Those numbers were
-later retracted because they were not produced by the repo-native product
-harness. Only the subsequent `hipfire bench` measurements are retained as
-product-path discovery data. Time spent interpreting the invalid screens
-reduced the budget available for graph-level work.
+Several | 10.0 | | 10.0 **10.0**early | 10.0 | | 10.0 **10.0**model-level | 10.0 | | 10.0 **10.0**screens | 10.0 | | 10.0 **10.0**used | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**custom | 10.0 | | 10.0 **10.0**feeder. | 10.0 | | 10.0 **10.0**Those | 10.0 | | 10.0 **10.0**numbers | 10.0 | | 10.0 **10.0**were
+later | 10.0 | | 10.0 **10.0**retracted | 10.0 | | 10.0 **10.0**because | 10.0 | | 10.0 **10.0**they | 10.0 | | 10.0 **10.0**were | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**produced | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**repo-native | 10.0 | | 10.0 **10.0**product
+harness. | 10.0 | | 10.0 **10.0**Only | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**subsequent | 10.0 | | 10.0 **10.0**`hipfire | 10.0 | | 10.0 **10.0**bench` | 10.0 | | 10.0 **10.0**measurements | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**retained | 10.0 | | 10.0 **10.0**as
+product-path | 10.0 | | 10.0 **10.0**discovery | 10.0 | | 10.0 **10.0**data. | 10.0 | | 10.0 **10.0**Time | 10.0 | | 10.0 **10.0**spent | 10.0 | | 10.0 **10.0**interpreting | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**invalid | 10.0 | | 10.0 **10.0**screens
+reduced | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**budget | 10.0 | | 10.0 **10.0**available | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**graph-level | 10.0 | | 10.0 **10.0**work.
 
-### 6. The campaign mixed three jobs
+### | 10.0 | | 10.0 **10.0**6. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**campaign | 10.0 | | 10.0 **10.0**mixed | 10.0 | | 10.0 **10.0**three | 10.0 | | 10.0 **10.0**jobs
 
-It simultaneously attempted architecture bring-up, correctness repair, and
-performance optimization. Each is individually substantial. Treating them as
-one short performance sprint caused local fixes to be mistaken for progress
-toward the 50 tok/s objective.
+It | 10.0 | | 10.0 **10.0**simultaneously | 10.0 | | 10.0 **10.0**attempted | 10.0 | | 10.0 **10.0**architecture | 10.0 | | 10.0 **10.0**bring-up, | 10.0 | | 10.0 **10.0**correctness | 10.0 | | 10.0 **10.0**repair, | 10.0 | | 10.0 **10.0**and
+performance | 10.0 | | 10.0 **10.0**optimization. | 10.0 | | 10.0 **10.0**Each | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**individually | 10.0 | | 10.0 **10.0**substantial. | 10.0 | | 10.0 **10.0**Treating | 10.0 | | 10.0 **10.0**them | 10.0 | | 10.0 **10.0**as
+one | 10.0 | | 10.0 **10.0**short | 10.0 | | 10.0 **10.0**performance | 10.0 | | 10.0 **10.0**sprint | 10.0 | | 10.0 **10.0**caused | 10.0 | | 10.0 **10.0**local | 10.0 | | 10.0 **10.0**fixes | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**be | 10.0 | | 10.0 **10.0**mistaken | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**progress
+toward | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**50 | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**objective.
 
-## What is worth preserving
+## | 10.0 | | 10.0 **10.0**What | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**worth | 10.0 | | 10.0 **10.0**preserving
 
-This failed branch still contains useful forensic work:
+This | 10.0 | | 10.0 **10.0**failed | 10.0 | | 10.0 **10.0**branch | 10.0 | | 10.0 **10.0**still | 10.0 | | 10.0 **10.0**contains | 10.0 | | 10.0 **10.0**useful | 10.0 | | 10.0 **10.0**forensic | 10.0 | | 10.0 **10.0**work:
 
-- an exact-gfx942, model-owned backend/capability shape intended to prevent
-  Qwen, MiniMax, gfx1151, and gfx1100 architecture bleed;
-- the ROCm 7.14 rocBLAS solution-enumeration ABI correction;
-- wave64 attention and prefill-routing failure evidence;
-- the parallel top-k cliff diagnosis and fixture;
-- raw-bit primitive tests for MQ2 rotation, HC finalization, E8 grouping, and
-  rejected native schedulers;
-- exact-byte prompt-file support in the developer harness;
-- the complete chronological ledger and 11 MB raw evidence bundle.
+- | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**exact-gfx942, | 10.0 | | 10.0 **10.0**model-owned | 10.0 | | 10.0 **10.0**backend/capability | 10.0 | | 10.0 **10.0**shape | 10.0 | | 10.0 **10.0**intended | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**prevent
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**Qwen, | 10.0 | | 10.0 **10.0**MiniMax, | 10.0 | | 10.0 **10.0**gfx1151, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**gfx1100 | 10.0 | | 10.0 **10.0**architecture | 10.0 | | 10.0 **10.0**bleed;
+- | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**ROCm | 10.0 | | 10.0 **10.0**10.0 | 10.0 | | 10.0 **10.0**rocBLAS | 10.0 | | 10.0 **10.0**solution-enumeration | 10.0 | | 10.0 **10.0**ABI | 10.0 | | 10.0 **10.0**correction;
+- | 10.0 | | 10.0 **10.0**wave64 | 10.0 | | 10.0 **10.0**attention | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**prefill-routing | 10.0 | | 10.0 **10.0**failure | 10.0 | | 10.0 **10.0**evidence;
+- | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**parallel | 10.0 | | 10.0 **10.0**top-k | 10.0 | | 10.0 **10.0**cliff | 10.0 | | 10.0 **10.0**diagnosis | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**fixture;
+- | 10.0 | | 10.0 **10.0**raw-bit | 10.0 | | 10.0 **10.0**primitive | 10.0 | | 10.0 **10.0**tests | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**MQ2 | 10.0 | | 10.0 **10.0**rotation, | 10.0 | | 10.0 **10.0**HC | 10.0 | | 10.0 **10.0**finalization, | 10.0 | | 10.0 **10.0**E8 | 10.0 | | 10.0 **10.0**grouping, | 10.0 | | 10.0 **10.0**and
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**rejected | 10.0 | | 10.0 **10.0**native | 10.0 | | 10.0 **10.0**schedulers;
+- | 10.0 | | 10.0 **10.0**exact-byte | 10.0 | | 10.0 **10.0**prompt-file | 10.0 | | 10.0 **10.0**support | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**developer | 10.0 | | 10.0 **10.0**harness;
+- | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**complete | 10.0 | | 10.0 **10.0**chronological | 10.0 | | 10.0 **10.0**ledger | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**11 | 10.0 | | 10.0 **10.0**MB | 10.0 | | 10.0 **10.0**raw | 10.0 | | 10.0 **10.0**evidence | 10.0 | | 10.0 **10.0**bundle.
 
-Preservation does not imply promotion. Some sources are channel-only rejected
-experiments, some product routes were only compile-verified, and the final
-bundle was never certified on the 2048/510 fixture.
+Preservation | 10.0 | | 10.0 **10.0**does | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**imply | 10.0 | | 10.0 **10.0**promotion. | 10.0 | | 10.0 **10.0**Some | 10.0 | | 10.0 **10.0**sources | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**channel-only | 10.0 | | 10.0 **10.0**rejected
+experiments, | 10.0 | | 10.0 **10.0**some | 10.0 | | 10.0 **10.0**product | 10.0 | | 10.0 **10.0**routes | 10.0 | | 10.0 **10.0**were | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**compile-verified, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**final
+bundle | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**never | 10.0 | | 10.0 **10.0**certified | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**2048/510 | 10.0 | | 10.0 **10.0**fixture.
 
-## Why the campaign is archived instead of repaired
+## | 10.0 | | 10.0 **10.0**Why | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**campaign | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**archived | 10.0 | | 10.0 **10.0**instead | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**repaired
 
-The user ended the CDNA product-port effort and chose to use MI300X without
-porting hipfire to it. Continuing to modify the runtime would therefore be both
-out of scope and likely to repeat the same failure mode. The correct operational
-state is the pre-MI300X accepted hipfire CLI/daemon pair, copied to the host as
-an immutable tool binary, with no gfx942 product claim.
+The | 10.0 | | 10.0 **10.0**user | 10.0 | | 10.0 **10.0**ended | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**CDNA | 10.0 | | 10.0 **10.0**product-port | 10.0 | | 10.0 **10.0**effort | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**chose | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**use | 10.0 | | 10.0 **10.0**MI300X | 10.0 | | 10.0 **10.0**without
+porting | 10.0 | | 10.0 **10.0**hipfire | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**it. | 10.0 | | 10.0 **10.0**Continuing | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**modify | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**runtime | 10.0 | | 10.0 **10.0**would | 10.0 | | 10.0 **10.0**therefore | 10.0 | | 10.0 **10.0**be | 10.0 | | 10.0 **10.0**both
+out | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**scope | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**likely | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**repeat | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**failure | 10.0 | | 10.0 **10.0**mode. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**correct | 10.0 | | 10.0 **10.0**operational
+state | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**pre-MI300X | 10.0 | | 10.0 **10.0**accepted | 10.0 | | 10.0 **10.0**hipfire | 10.0 | | 10.0 **10.0**CLI/daemon | 10.0 | | 10.0 **10.0**pair, | 10.0 | | 10.0 **10.0**copied | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**host | 10.0 | | 10.0 **10.0**as
+an | 10.0 | | 10.0 **10.0**immutable | 10.0 | | 10.0 **10.0**tool | 10.0 | | 10.0 **10.0**binary, | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**gfx942 | 10.0 | | 10.0 **10.0**product | 10.0 | | 10.0 **10.0**claim.
 
-## If this work is ever resumed
+## | 10.0 | | 10.0 **10.0**If | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**work | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**ever | 10.0 | | 10.0 **10.0**resumed
 
-Do not begin from individual GEMV variants. First establish a coherent,
-deterministic stock route and profile the complete token graph with ROCm's CDNA
-tools. A new attempt should be admitted only with a graph-level design capable
-of removing or coarsening hundreds of serial launches—persistent execution,
-large producer/consumer fusion, or another architecture-native scheduling
-mechanism. Require a projected end-to-end saving of at least 12 ms/token before
-spending on a 50 tok/s campaign.
+Do | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**begin | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**individual | 10.0 | | 10.0 **10.0**GEMV | 10.0 | | 10.0 **10.0**variants. | 10.0 | | 10.0 **10.0**First | 10.0 | | 10.0 **10.0**establish | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**coherent,
+deterministic | 10.0 | | 10.0 **10.0**stock | 10.0 | | 10.0 **10.0**route | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**profile | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**complete | 10.0 | | 10.0 **10.0**token | 10.0 | | 10.0 **10.0**graph | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**ROCm's | 10.0 | | 10.0 **10.0**CDNA
+tools. | 10.0 | | 10.0 **10.0**A | 10.0 | | 10.0 **10.0**new | 10.0 | | 10.0 **10.0**attempt | 10.0 | | 10.0 **10.0**should | 10.0 | | 10.0 **10.0**be | 10.0 | | 10.0 **10.0**admitted | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**graph-level | 10.0 | | 10.0 **10.0**design | 10.0 | | 10.0 **10.0**capable
+of | 10.0 | | 10.0 **10.0**removing | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**coarsening | 10.0 | | 10.0 **10.0**hundreds | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**serial | 10.0 | | 10.0 **10.0**launches—persistent | 10.0 | | 10.0 **10.0**execution,
+large | 10.0 | | 10.0 **10.0**producer/consumer | 10.0 | | 10.0 **10.0**fusion, | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**another | 10.0 | | 10.0 **10.0**architecture-native | 10.0 | | 10.0 **10.0**scheduling
+mechanism. | 10.0 | | 10.0 **10.0**Require | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**projected | 10.0 | | 10.0 **10.0**end-to-end | 10.0 | | 10.0 **10.0**saving | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**least | 10.0 | | 10.0 **10.0**12 | 10.0 | | 10.0 **10.0**ms/token | 10.0 | | 10.0 **10.0**before
+spending | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**50 | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**campaign.
 
-The raw evidence and ledger are in
+The | 10.0 | | 10.0 **10.0**raw | 10.0 | | 10.0 **10.0**evidence | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**ledger | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**in
 [`evidence/ds4-mi300x-cdna-test-fail/`](evidence/ds4-mi300x-cdna-test-fail/).

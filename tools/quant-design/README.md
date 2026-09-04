@@ -26,7 +26,7 @@ stay in this directory (`tools/quant-design`).
 # 2. build and run from the repo/worktree root; argv[1] is the tail threshold
 #    (99th pct of |G|). Optional argv[2]/argv[3] override G/family fixture paths;
 #    defaults are the project-local fixtures above.
-/opt/rocm/core-7.14/bin/hipcc --offload-arch=gfx1201 -O3 \
+/opt/rocm/core-10.0/bin/hipcc --offload-arch=gfx1201 -O3 \
     tools/quant-design/sweep_mq4_header_allocation.hip \
     -o .codeinsight+research/quant-design/sweep_mq4
 .codeinsight+research/quant-design/sweep_mq4 2.869166e-02

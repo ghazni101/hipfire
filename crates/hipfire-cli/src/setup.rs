@@ -504,7 +504,7 @@ fn canonicalize_or_keep(path: &Path) -> PathBuf {
 /// Roots with a usable device compiler, canonicalized and deduped (first-seen order).
 ///
 /// Alias paths that resolve to the same filesystem location collapse to one entry
-/// (e.g. `/opt/rocm/core`, `core-7`, `core-7.14` → one root). Canonicalization
+/// (e.g. `/opt/rocm/core`, `core-7`, `core-10.0` → one root). Canonicalization
 /// failure keeps the original path rather than discarding a usable candidate.
 fn usable_rocm_roots(roots: impl IntoIterator<Item = PathBuf>) -> Vec<PathBuf> {
     let hipcc = std::env::var_os("HIPFIRE_HIPCC")
@@ -1166,7 +1166,7 @@ mod tests {
         assert_eq!(out, vec!["gfx1201", "gfx1100", "gfx1151"]);
     }
 
-    /// `/opt/rocm/core`, `core-7`, and `core-7.14` often share one real tree via
+    /// `/opt/rocm/core`, `core-7`, and `core-10.0` often share one real tree via
     /// symlinks; discovery must collapse them to a single canonical root.
     /// A compiler-only ROCm root must be rejected up front, naming the packages
     /// that supply what is missing. Before this the install ran three cargo
@@ -1226,10 +1226,10 @@ mod tests {
             nonce
         ));
         let _ = fs::remove_dir_all(&root);
-        fs::create_dir_all(root.join("core-7.14/bin")).unwrap();
-        fs::write(root.join("core-7.14/bin/hipcc"), b"#!/bin/sh\n").unwrap();
+        fs::create_dir_all(root.join("core-10.0/bin")).unwrap();
+        fs::write(root.join("core-10.0/bin/hipcc"), b"#!/bin/sh\n").unwrap();
 
-        let real = root.join("core-7.14");
+        let real = root.join("core-10.0");
         let alias_core = root.join("core");
         let alias_core7 = root.join("core-7");
         std::os::unix::fs::symlink(&real, &alias_core).unwrap();

@@ -1,191 +1,191 @@
-# DDTree D2D Stage 1 Results
+# | 10.0 | | 10.0 **10.0**DDTree | 10.0 | | 10.0 **10.0**D2D | 10.0 | | 10.0 **10.0**Stage | 10.0 | | 10.0 **10.0**1 | 10.0 | | 10.0 **10.0**Results
 
-**Date:** 2026-06-29  
-**Branch:** feature/speculator-ddtree  
-**HEAD at time of change:** ca6691b0  
-**Box:** gfx1151 (Strix Halo, UMA)  
-**Status:** COMPLETE — copies reduced, output byte-identical, gates PASS  
-
----
-
-## 1. Diff summary
-
-Two call sites modified in `crates/hipfire-arch-qwen35/src/speculative.rs`,
-function `spec_step_ddtree_batched`:
-
-### Empty-tree path (line ~5082)
-Added `scatter_hidden_block_to_interleaved` D2D scatter + `thlog.append_committed`
-before the existing `download_hidden_block` call. The download is kept for CPU Vec
-length invariant.
-
-### Section 11 — main hidden-state lifecycle (line ~5619)
-**Before:** single `download_hidden_block(gpu, hidden_rb, hidden_rows_written)` call
-downloaded `big_n` rows (fast-tape: up to 61 rows at budget=60) or `rows_to_keep`
-rows (slow-tape), followed by CPU gather/slice into `target_hidden_host`. No scatter.
-
-**After:** 
-- Fast-tape path: `scatter_hidden_block_to_interleaved(block_size=big_n, n_rows=rows_to_keep)`
-  scatters only the committed prefix into `draft_scratch.target_hidden` on GPU. Then
-  `thlog.append_committed(position, rows_to_keep, co)` marks them GPU-resident.
-  Finally `download_hidden_block(gpu, hidden_rb, rows_to_keep)` downloads only
-  `rows_to_keep` rows (not `big_n`) to maintain CPU Vec length invariant.
-- Slow-tape path: same pattern but `block_size = rows_to_keep` (no partial-slice needed).
-- Path B dead-code branch: unchanged (opt-in WIP, left on old path).
-
-**Effect:** next cycle's `draft_forward` call sees `thlog.uploaded_rows() == l`
-(prev==l condition) and skips the target_hidden H2D upload entirely.
+**Date:** | 10.0 | | 10.0 **10.0**2026-06-29 | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**
+**Branch:** | 10.0 | | 10.0 **10.0**feature/speculator-ddtree | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**
+**HEAD | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**time | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**change:** | 10.0 | | 10.0 **10.0**ca6691b0 | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**
+**Box:** | 10.0 | | 10.0 **10.0**gfx1151 | 10.0 | | 10.0 **10.0**(Strix | 10.0 | | 10.0 **10.0**Halo, | 10.0 | | 10.0 **10.0**UMA) | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**
+**Status:** | 10.0 | | 10.0 **10.0**COMPLETE | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**copies | 10.0 | | 10.0 **10.0**reduced, | 10.0 | | 10.0 **10.0**output | 10.0 | | 10.0 **10.0**byte-identical, | 10.0 | | 10.0 **10.0**gates | 10.0 | | 10.0 **10.0**PASS | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**
 
 ---
 
-## 2. Byte-identical verdict
+## | 10.0 | | 10.0 **10.0**1. | 10.0 | | 10.0 **10.0**Diff | 10.0 | | 10.0 **10.0**summary
 
-All 5 run pairs tested at temp=0.0 (greedy), `--no-chatml`, `--kv-mode q8`:
+Two | 10.0 | | 10.0 **10.0**call | 10.0 | | 10.0 **10.0**sites | 10.0 | | 10.0 **10.0**modified | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**`crates/hipfire-arch-qwen35/src/speculative.rs`,
+function | 10.0 | | 10.0 **10.0**`spec_step_ddtree_batched`:
 
-| Config | Prompt | Verdict |
+### | 10.0 | | 10.0 **10.0**Empty-tree | 10.0 | | 10.0 **10.0**path | 10.0 | | 10.0 **10.0**(line | 10.0 | | 10.0 **10.0**~5082)
+Added | 10.0 | | 10.0 **10.0**`scatter_hidden_block_to_interleaved` | 10.0 | | 10.0 **10.0**D2D | 10.0 | | 10.0 **10.0**scatter | 10.0 | | 10.0 **10.0**+ | 10.0 | | 10.0 **10.0**`thlog.append_committed`
+before | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**existing | 10.0 | | 10.0 **10.0**`download_hidden_block` | 10.0 | | 10.0 **10.0**call. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**download | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**kept | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**CPU | 10.0 | | 10.0 **10.0**Vec
+length | 10.0 | | 10.0 **10.0**invariant.
+
+### | 10.0 | | 10.0 **10.0**Section | 10.0 | | 10.0 **10.0**11 | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**main | 10.0 | | 10.0 **10.0**hidden-state | 10.0 | | 10.0 **10.0**lifecycle | 10.0 | | 10.0 **10.0**(line | 10.0 | | 10.0 **10.0**~5619)
+**Before:** | 10.0 | | 10.0 **10.0**single | 10.0 | | 10.0 **10.0**`download_hidden_block(gpu, | 10.0 | | 10.0 **10.0**hidden_rb, | 10.0 | | 10.0 **10.0**hidden_rows_written)` | 10.0 | | 10.0 **10.0**call
+downloaded | 10.0 | | 10.0 **10.0**`big_n` | 10.0 | | 10.0 **10.0**rows | 10.0 | | 10.0 **10.0**(fast-tape: | 10.0 | | 10.0 **10.0**up | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**61 | 10.0 | | 10.0 **10.0**rows | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**budget=60) | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**`rows_to_keep`
+rows | 10.0 | | 10.0 **10.0**(slow-tape), | 10.0 | | 10.0 **10.0**followed | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**CPU | 10.0 | | 10.0 **10.0**gather/slice | 10.0 | | 10.0 **10.0**into | 10.0 | | 10.0 **10.0**`target_hidden_host`. | 10.0 | | 10.0 **10.0**No | 10.0 | | 10.0 **10.0**scatter.
+
+**After:** | 10.0 | | 10.0 **10.0**
+- | 10.0 | | 10.0 **10.0**Fast-tape | 10.0 | | 10.0 **10.0**path: | 10.0 | | 10.0 **10.0**`scatter_hidden_block_to_interleaved(block_size=big_n, | 10.0 | | 10.0 **10.0**n_rows=rows_to_keep)`
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**scatters | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**committed | 10.0 | | 10.0 **10.0**prefix | 10.0 | | 10.0 **10.0**into | 10.0 | | 10.0 **10.0**`draft_scratch.target_hidden` | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**GPU. | 10.0 | | 10.0 **10.0**Then
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`thlog.append_committed(position, | 10.0 | | 10.0 **10.0**rows_to_keep, | 10.0 | | 10.0 **10.0**co)` | 10.0 | | 10.0 **10.0**marks | 10.0 | | 10.0 **10.0**them | 10.0 | | 10.0 **10.0**GPU-resident.
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**Finally | 10.0 | | 10.0 **10.0**`download_hidden_block(gpu, | 10.0 | | 10.0 **10.0**hidden_rb, | 10.0 | | 10.0 **10.0**rows_to_keep)` | 10.0 | | 10.0 **10.0**downloads | 10.0 | | 10.0 **10.0**only
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`rows_to_keep` | 10.0 | | 10.0 **10.0**rows | 10.0 | | 10.0 **10.0**(not | 10.0 | | 10.0 **10.0**`big_n`) | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**maintain | 10.0 | | 10.0 **10.0**CPU | 10.0 | | 10.0 **10.0**Vec | 10.0 | | 10.0 **10.0**length | 10.0 | | 10.0 **10.0**invariant.
+- | 10.0 | | 10.0 **10.0**Slow-tape | 10.0 | | 10.0 **10.0**path: | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**pattern | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**`block_size | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**rows_to_keep` | 10.0 | | 10.0 **10.0**(no | 10.0 | | 10.0 **10.0**partial-slice | 10.0 | | 10.0 **10.0**needed).
+- | 10.0 | | 10.0 **10.0**Path | 10.0 | | 10.0 **10.0**B | 10.0 | | 10.0 **10.0**dead-code | 10.0 | | 10.0 **10.0**branch: | 10.0 | | 10.0 **10.0**unchanged | 10.0 | | 10.0 **10.0**(opt-in | 10.0 | | 10.0 **10.0**WIP, | 10.0 | | 10.0 **10.0**left | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**old | 10.0 | | 10.0 **10.0**path).
+
+**Effect:** | 10.0 | | 10.0 **10.0**next | 10.0 | | 10.0 **10.0**cycle's | 10.0 | | 10.0 **10.0**`draft_forward` | 10.0 | | 10.0 **10.0**call | 10.0 | | 10.0 **10.0**sees | 10.0 | | 10.0 **10.0**`thlog.uploaded_rows() | 10.0 | | 10.0 **10.0**== | 10.0 | | 10.0 **10.0**l`
+(prev==l | 10.0 | | 10.0 **10.0**condition) | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**skips | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**target_hidden | 10.0 | | 10.0 **10.0**H2D | 10.0 | | 10.0 **10.0**upload | 10.0 | | 10.0 **10.0**entirely.
+
+---
+
+## | 10.0 | | 10.0 **10.0**2. | 10.0 | | 10.0 **10.0**Byte-identical | 10.0 | | 10.0 **10.0**verdict
+
+All | 10.0 | | 10.0 **10.0**5 | 10.0 | | 10.0 **10.0**run | 10.0 | | 10.0 **10.0**pairs | 10.0 | | 10.0 **10.0**tested | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**temp=0.0 | 10.0 | | 10.0 **10.0**(greedy), | 10.0 | | 10.0 **10.0**`--no-chatml`, | 10.0 | | 10.0 **10.0**`--kv-mode | 10.0 | | 10.0 **10.0**q8`:
+
+| | 10.0 | | 10.0 **10.0**Config | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Prompt | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Verdict | 10.0 | | 10.0 **10.0**|
 |--------|--------|---------|
-| budget=8 topk=2 | lru_cache_pep8_strict (code) | **BYTE-IDENTICAL** |
-| budget=12 topk=4 | lru_cache_pep8_strict (code) | **BYTE-IDENTICAL** |
-| budget=60 topk=4 | lru_cache_pep8_strict (code) | **BYTE-IDENTICAL** |
-| budget=8 topk=2 | prose_river_short (prose) | **BYTE-IDENTICAL** |
-| budget=8 topk=2 | trains-meet (reason) | **BYTE-IDENTICAL** |
+| | 10.0 | | 10.0 **10.0**budget=8 | 10.0 | | 10.0 **10.0**topk=2 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**lru_cache_pep8_strict | 10.0 | | 10.0 **10.0**(code) | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0****BYTE-IDENTICAL** | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**budget=12 | 10.0 | | 10.0 **10.0**topk=4 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**lru_cache_pep8_strict | 10.0 | | 10.0 **10.0**(code) | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0****BYTE-IDENTICAL** | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**budget=60 | 10.0 | | 10.0 **10.0**topk=4 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**lru_cache_pep8_strict | 10.0 | | 10.0 **10.0**(code) | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0****BYTE-IDENTICAL** | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**budget=8 | 10.0 | | 10.0 **10.0**topk=2 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**prose_river_short | 10.0 | | 10.0 **10.0**(prose) | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0****BYTE-IDENTICAL** | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**budget=8 | 10.0 | | 10.0 **10.0**topk=2 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**trains-meet | 10.0 | | 10.0 **10.0**(reason) | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0****BYTE-IDENTICAL** | 10.0 | | 10.0 **10.0**|
 
-Prompt md5 verification:
-- lru_cache_pep8_strict: `afc47d8840ea1f1476807728bd3ddef9`
-- prose_river_short: `7130ff9fff28ad51f212942979471b8b`
-- trains-meet: `fbfde41091a239530826a43b6b9b060b`
+Prompt | 10.0 | | 10.0 **10.0**md5 | 10.0 | | 10.0 **10.0**verification:
+- | 10.0 | | 10.0 **10.0**lru_cache_pep8_strict: | 10.0 | | 10.0 **10.0**`afc47d8840ea1f1476807728bd3ddef9`
+- | 10.0 | | 10.0 **10.0**prose_river_short: | 10.0 | | 10.0 **10.0**`7130ff9fff28ad51f212942979471b8b`
+- | 10.0 | | 10.0 **10.0**trains-meet: | 10.0 | | 10.0 **10.0**`fbfde41091a239530826a43b6b9b060b`
 
 ---
 
-## 3. Copy-count before/after (host-timing counters)
+## | 10.0 | | 10.0 **10.0**3. | 10.0 | | 10.0 **10.0**Copy-count | 10.0 | | 10.0 **10.0**before/after | 10.0 | | 10.0 **10.0**(host-timing | 10.0 | | 10.0 **10.0**counters)
 
-### Note on counter coverage
-`HIPFIRE_HOST_TIMING=1` tracks `memcpy_htod` calls (non-offset variant only).
-The target_hidden incremental H2D in `draft_forward` uses `memcpy_htod_offset`
-(dflash.rs:1282), which is NOT counted in the `h2d` counter. So the H2D elimination
-(from `thlog.append_committed` suppressing the upload) is real but not directly
-visible in the counter. The D2H reduction IS visible since `download_hidden_block`
-uses `memcpy_dtoh_at` which IS counted.
+### | 10.0 | | 10.0 **10.0**Note | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**counter | 10.0 | | 10.0 **10.0**coverage
+`HIPFIRE_HOST_TIMING=1` | 10.0 | | 10.0 **10.0**tracks | 10.0 | | 10.0 **10.0**`memcpy_htod` | 10.0 | | 10.0 **10.0**calls | 10.0 | | 10.0 **10.0**(non-offset | 10.0 | | 10.0 **10.0**variant | 10.0 | | 10.0 **10.0**only).
+The | 10.0 | | 10.0 **10.0**target_hidden | 10.0 | | 10.0 **10.0**incremental | 10.0 | | 10.0 **10.0**H2D | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**`draft_forward` | 10.0 | | 10.0 **10.0**uses | 10.0 | | 10.0 **10.0**`memcpy_htod_offset`
+(dflash.rs:1282), | 10.0 | | 10.0 **10.0**which | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**NOT | 10.0 | | 10.0 **10.0**counted | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**`h2d` | 10.0 | | 10.0 **10.0**counter. | 10.0 | | 10.0 **10.0**So | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**H2D | 10.0 | | 10.0 **10.0**elimination
+(from | 10.0 | | 10.0 **10.0**`thlog.append_committed` | 10.0 | | 10.0 **10.0**suppressing | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**upload) | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**real | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**directly
+visible | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**counter. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**D2H | 10.0 | | 10.0 **10.0**reduction | 10.0 | | 10.0 **10.0**IS | 10.0 | | 10.0 **10.0**visible | 10.0 | | 10.0 **10.0**since | 10.0 | | 10.0 **10.0**`download_hidden_block`
+uses | 10.0 | | 10.0 **10.0**`memcpy_dtoh_at` | 10.0 | | 10.0 **10.0**which | 10.0 | | 10.0 **10.0**IS | 10.0 | | 10.0 **10.0**counted.
 
-### D2H bytes per cycle (the measurable win)
+### | 10.0 | | 10.0 **10.0**D2H | 10.0 | | 10.0 **10.0**bytes | 10.0 | | 10.0 **10.0**per | 10.0 | | 10.0 **10.0**cycle | 10.0 | | 10.0 **10.0**(the | 10.0 | | 10.0 **10.0**measurable | 10.0 | | 10.0 **10.0**win)
 
-| Config | BEFORE | AFTER | Delta |
+| | 10.0 | | 10.0 **10.0**Config | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**BEFORE | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**AFTER | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Delta | 10.0 | | 10.0 **10.0**|
 |--------|--------|-------|-------|
-| b8k2 code | 1552 KB | 1246 KB | −19.7% |
-| b12k4 code | 1938 KB | 1595 KB | −17.7% |
-| b60k4 code | 3019 KB | 1695 KB | **−43.8%** |
-| b8k2 prose | 916 KB | 451 KB | **−50.8%** |
-| b8k2 reason | 881 KB | 620 KB | −29.6% |
+| | 10.0 | | 10.0 **10.0**b8k2 | 10.0 | | 10.0 **10.0**code | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1552 | 10.0 | | 10.0 **10.0**KB | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1246 | 10.0 | | 10.0 **10.0**KB | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**−19.7% | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**b12k4 | 10.0 | | 10.0 **10.0**code | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1938 | 10.0 | | 10.0 **10.0**KB | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1595 | 10.0 | | 10.0 **10.0**KB | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**−17.7% | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**b60k4 | 10.0 | | 10.0 **10.0**code | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**3019 | 10.0 | | 10.0 **10.0**KB | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1695 | 10.0 | | 10.0 **10.0**KB | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0****−43.8%** | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**b8k2 | 10.0 | | 10.0 **10.0**prose | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**916 | 10.0 | | 10.0 **10.0**KB | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**451 | 10.0 | | 10.0 **10.0**KB | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0****−50.8%** | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**b8k2 | 10.0 | | 10.0 **10.0**reason | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**881 | 10.0 | | 10.0 **10.0**KB | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**620 | 10.0 | | 10.0 **10.0**KB | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**−29.6% | 10.0 | | 10.0 **10.0**|
 
-The savings grow with budget and shrink with τ (higher τ = rows_to_keep closer
-to big_n). At budget=60 with τ≈6.3, the saving is −43.8% of D2H traffic.
+The | 10.0 | | 10.0 **10.0**savings | 10.0 | | 10.0 **10.0**grow | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**budget | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**shrink | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**τ | 10.0 | | 10.0 **10.0**(higher | 10.0 | | 10.0 **10.0**τ | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**rows_to_keep | 10.0 | | 10.0 **10.0**closer
+to | 10.0 | | 10.0 **10.0**big_n). | 10.0 | | 10.0 **10.0**At | 10.0 | | 10.0 **10.0**budget=60 | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**τ≈6.3, | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**saving | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**−43.8% | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**D2H | 10.0 | | 10.0 **10.0**traffic.
 
-### D2D calls added
+### | 10.0 | | 10.0 **10.0**D2D | 10.0 | | 10.0 **10.0**calls | 10.0 | | 10.0 **10.0**added
 
-| Config | BEFORE n | AFTER n | Added |
+| | 10.0 | | 10.0 **10.0**Config | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**BEFORE | 10.0 | | 10.0 **10.0**n | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**AFTER | 10.0 | | 10.0 **10.0**n | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Added | 10.0 | | 10.0 **10.0**|
 |--------|----------|---------|-------|
-| b8k2 code | 405 | 432 | +27 |
-| b12k4 code | 412 | 449 | +37 |
-| b60k4 code | 489 | 526 | +37 |
+| | 10.0 | | 10.0 **10.0**b8k2 | 10.0 | | 10.0 **10.0**code | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**405 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**432 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**+27 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**b12k4 | 10.0 | | 10.0 **10.0**code | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**412 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**449 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**+37 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**b60k4 | 10.0 | | 10.0 **10.0**code | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**489 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**526 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**+37 | 10.0 | | 10.0 **10.0**|
 
-Each scatter adds `ne × rows_to_keep = 5 × (τ+1)` D2D calls per cycle.
-At τ≈5, that's ~30 extra D2D enqueues per cycle (trivial overhead on UMA).
+Each | 10.0 | | 10.0 **10.0**scatter | 10.0 | | 10.0 **10.0**adds | 10.0 | | 10.0 **10.0**`ne | 10.0 | | 10.0 **10.0**× | 10.0 | | 10.0 **10.0**rows_to_keep | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**5 | 10.0 | | 10.0 **10.0**× | 10.0 | | 10.0 **10.0**(τ+1)` | 10.0 | | 10.0 **10.0**D2D | 10.0 | | 10.0 **10.0**calls | 10.0 | | 10.0 **10.0**per | 10.0 | | 10.0 **10.0**cycle.
+At | 10.0 | | 10.0 **10.0**τ≈5, | 10.0 | | 10.0 **10.0**that's | 10.0 | | 10.0 **10.0**~30 | 10.0 | | 10.0 **10.0**extra | 10.0 | | 10.0 **10.0**D2D | 10.0 | | 10.0 **10.0**enqueues | 10.0 | | 10.0 **10.0**per | 10.0 | | 10.0 **10.0**cycle | 10.0 | | 10.0 **10.0**(trivial | 10.0 | | 10.0 **10.0**overhead | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**UMA).
 
-### Raw host-timing lines (b60k4 — most visible savings)
+### | 10.0 | | 10.0 **10.0**Raw | 10.0 | | 10.0 **10.0**host-timing | 10.0 | | 10.0 **10.0**lines | 10.0 | | 10.0 **10.0**(b60k4 | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**most | 10.0 | | 10.0 **10.0**visible | 10.0 | | 10.0 **10.0**savings)
 
-**BEFORE (budget=60 topk=4, code prompt):**
+**BEFORE | 10.0 | | 10.0 **10.0**(budget=60 | 10.0 | | 10.0 **10.0**topk=4, | 10.0 | | 10.0 **10.0**code | 10.0 | | 10.0 **10.0**prompt):**
 ```
-host timing (mean over 23 cycles, µs): wall=...
-  h2d=544 (n=7)  d2h=61254 (n=9, 3019KB)  d2d=1250 (n=489)
-  dsync=44
+host | 10.0 | | 10.0 **10.0**timing | 10.0 | | 10.0 **10.0**(mean | 10.0 | | 10.0 **10.0**over | 10.0 | | 10.0 **10.0**23 | 10.0 | | 10.0 **10.0**cycles, | 10.0 | | 10.0 **10.0**µs): | 10.0 | | 10.0 **10.0**wall=...
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**h2d=544 | 10.0 | | 10.0 **10.0**(n=7) | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**d2h=61254 | 10.0 | | 10.0 **10.0**(n=9, | 10.0 | | 10.0 **10.0**3019KB) | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**d2d=1250 | 10.0 | | 10.0 **10.0**(n=489)
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**dsync=44
 ```
 
-**AFTER (budget=60 topk=4, code prompt):**
+**AFTER | 10.0 | | 10.0 **10.0**(budget=60 | 10.0 | | 10.0 **10.0**topk=4, | 10.0 | | 10.0 **10.0**code | 10.0 | | 10.0 **10.0**prompt):**
 ```
-host timing (mean over 23 cycles, µs): wall=...
-  h2d=616 (n=7)  d2h=61336 (n=9, 1695KB)  d2d=1382 (n=526)
-  dsync=39
+host | 10.0 | | 10.0 **10.0**timing | 10.0 | | 10.0 **10.0**(mean | 10.0 | | 10.0 **10.0**over | 10.0 | | 10.0 **10.0**23 | 10.0 | | 10.0 **10.0**cycles, | 10.0 | | 10.0 **10.0**µs): | 10.0 | | 10.0 **10.0**wall=...
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**h2d=616 | 10.0 | | 10.0 **10.0**(n=7) | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**d2h=61336 | 10.0 | | 10.0 **10.0**(n=9, | 10.0 | | 10.0 **10.0**1695KB) | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**d2d=1382 | 10.0 | | 10.0 **10.0**(n=526)
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**dsync=39
 ```
 
 ---
 
-## 4. Performance before/after
+## | 10.0 | | 10.0 **10.0**4. | 10.0 | | 10.0 **10.0**Performance | 10.0 | | 10.0 **10.0**before/after
 
-| Config | BEFORE tok/s | AFTER tok/s | Delta |
+| | 10.0 | | 10.0 **10.0**Config | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**BEFORE | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**AFTER | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Delta | 10.0 | | 10.0 **10.0**|
 |--------|-------------|------------|-------|
-| b8k2 code | 33.72 | 34.18 | +1.4% (noise) |
-| b12k4 code | 42.40 | 42.85 | +1.1% (noise) |
-| b60k4 code | 14.82 | 14.83 | neutral |
-| b8k2 prose | 22.09 | 22.18 | neutral |
-| b8k2 reason | 27.14 | 26.97 | −0.6% (noise) |
+| | 10.0 | | 10.0 **10.0**b8k2 | 10.0 | | 10.0 **10.0**code | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**33.72 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**34.18 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**+1.4% | 10.0 | | 10.0 **10.0**(noise) | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**b12k4 | 10.0 | | 10.0 **10.0**code | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**42.40 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**42.85 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**+1.1% | 10.0 | | 10.0 **10.0**(noise) | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**b60k4 | 10.0 | | 10.0 **10.0**code | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**14.82 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**14.83 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**neutral | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**b8k2 | 10.0 | | 10.0 **10.0**prose | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**22.09 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**22.18 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**neutral | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**b8k2 | 10.0 | | 10.0 **10.0**reason | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**27.14 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**26.97 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**−0.6% | 10.0 | | 10.0 **10.0**(noise) | 10.0 | | 10.0 **10.0**|
 
-All deltas are within the ±3% noise band (confirmed by matching τ and committed
-token counts between BEFORE and AFTER for all runs). No regression observed.
+All | 10.0 | | 10.0 **10.0**deltas | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**within | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**±3% | 10.0 | | 10.0 **10.0**noise | 10.0 | | 10.0 **10.0**band | 10.0 | | 10.0 **10.0**(confirmed | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**matching | 10.0 | | 10.0 **10.0**τ | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**committed
+token | 10.0 | | 10.0 **10.0**counts | 10.0 | | 10.0 **10.0**between | 10.0 | | 10.0 **10.0**BEFORE | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**AFTER | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**runs). | 10.0 | | 10.0 **10.0**No | 10.0 | | 10.0 **10.0**regression | 10.0 | | 10.0 **10.0**observed.
 
-**Expected outcome confirmed:** perf-neutral on UMA. The D2H savings (~20-44% fewer
-bytes/cycle) translate to <0.05% cycle-time improvement on gfx1151 UMA since the
-copies cross cache-coherent shared memory, not PCIe. On dedicated-VRAM GPUs
-(gfx1100/gfx1201) the savings would be real (PCIe D2H eliminated).
+**Expected | 10.0 | | 10.0 **10.0**outcome | 10.0 | | 10.0 **10.0**confirmed:** | 10.0 | | 10.0 **10.0**perf-neutral | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**UMA. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**D2H | 10.0 | | 10.0 **10.0**savings | 10.0 | | 10.0 **10.0**(~20-44% | 10.0 | | 10.0 **10.0**fewer
+bytes/cycle) | 10.0 | | 10.0 **10.0**translate | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**<0.05% | 10.0 | | 10.0 **10.0**cycle-time | 10.0 | | 10.0 **10.0**improvement | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**gfx1151 | 10.0 | | 10.0 **10.0**UMA | 10.0 | | 10.0 **10.0**since | 10.0 | | 10.0 **10.0**the
+copies | 10.0 | | 10.0 **10.0**cross | 10.0 | | 10.0 **10.0**cache-coherent | 10.0 | | 10.0 **10.0**shared | 10.0 | | 10.0 **10.0**memory, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**PCIe. | 10.0 | | 10.0 **10.0**On | 10.0 | | 10.0 **10.0**dedicated-VRAM | 10.0 | | 10.0 **10.0**GPUs
+(gfx1100/gfx1201) | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**savings | 10.0 | | 10.0 **10.0**would | 10.0 | | 10.0 **10.0**be | 10.0 | | 10.0 **10.0**real | 10.0 | | 10.0 **10.0**(PCIe | 10.0 | | 10.0 **10.0**D2H | 10.0 | | 10.0 **10.0**eliminated).
 
 ---
 
-## 5. Gate results
+## | 10.0 | | 10.0 **10.0**5. | 10.0 | | 10.0 **10.0**Gate | 10.0 | | 10.0 **10.0**results
 
-### DFlash coherence gate (`./scripts/coherence-gate-dflash.sh`)
+### | 10.0 | | 10.0 **10.0**DFlash | 10.0 | | 10.0 **10.0**coherence | 10.0 | | 10.0 **10.0**gate | 10.0 | | 10.0 **10.0**(`./scripts/coherence-gate-dflash.sh`)
 
-**PASS** — no hard errors, no soft flags.
+**PASS** | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**hard | 10.0 | | 10.0 **10.0**errors, | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**soft | 10.0 | | 10.0 **10.0**flags.
 
 ```
-== 27b-dflash-prose == OK  unique_ratio=0.68  gram_density=0.0
-== 27b-dflash-code == OK   unique_ratio=0.75  gram_density=0.0
-== 27b-ddtree-b12-prose == OK  unique_ratio=0.68  gram_density=0.032
-== 27b-ddtree-b12-code == OK   unique_ratio=0.75  gram_density=0.0
-no hard errors — review /tmp/coherence-dflash-20260629-153029.md for coherence, then commit if satisfied
+== | 10.0 | | 10.0 **10.0**27b-dflash-prose | 10.0 | | 10.0 **10.0**== | 10.0 | | 10.0 **10.0**OK | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**unique_ratio=0.68 | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**gram_density=0.0
+== | 10.0 | | 10.0 **10.0**27b-dflash-code | 10.0 | | 10.0 **10.0**== | 10.0 | | 10.0 **10.0**OK | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**unique_ratio=0.75 | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**gram_density=0.0
+== | 10.0 | | 10.0 **10.0**27b-ddtree-b12-prose | 10.0 | | 10.0 **10.0**== | 10.0 | | 10.0 **10.0**OK | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**unique_ratio=0.68 | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**gram_density=0.032
+== | 10.0 | | 10.0 **10.0**27b-ddtree-b12-code | 10.0 | | 10.0 **10.0**== | 10.0 | | 10.0 **10.0**OK | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**unique_ratio=0.75 | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**gram_density=0.0
+no | 10.0 | | 10.0 **10.0**hard | 10.0 | | 10.0 **10.0**errors | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**review | 10.0 | | 10.0 **10.0**/tmp/coherence-dflash-20260629-153029.md | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**coherence, | 10.0 | | 10.0 **10.0**then | 10.0 | | 10.0 **10.0**commit | 10.0 | | 10.0 **10.0**if | 10.0 | | 10.0 **10.0**satisfied
 ```
 
-The ddtree-code row produces byte-identical output to the chain-code row (same
-LRU cache completion), confirming the scatter produces the correct hidden states.
+The | 10.0 | | 10.0 **10.0**ddtree-code | 10.0 | | 10.0 **10.0**row | 10.0 | | 10.0 **10.0**produces | 10.0 | | 10.0 **10.0**byte-identical | 10.0 | | 10.0 **10.0**output | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**chain-code | 10.0 | | 10.0 **10.0**row | 10.0 | | 10.0 **10.0**(same
+LRU | 10.0 | | 10.0 **10.0**cache | 10.0 | | 10.0 **10.0**completion), | 10.0 | | 10.0 **10.0**confirming | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**scatter | 10.0 | | 10.0 **10.0**produces | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**correct | 10.0 | | 10.0 **10.0**hidden | 10.0 | | 10.0 **10.0**states.
 
-### Multi-turn serve gate (`./scripts/serve-multiturn-gate.sh`)
+### | 10.0 | | 10.0 **10.0**Multi-turn | 10.0 | | 10.0 **10.0**serve | 10.0 | | 10.0 **10.0**gate | 10.0 | | 10.0 **10.0**(`./scripts/serve-multiturn-gate.sh`)
 
 **PASS**
 
 ```
-== AR multi-request — qwen3.5-0.8b.mq4 ==
-== DFlash multi-request — qwen3.6-27b.mq4 + qwen36-27b-dflash-mq4.hfq ==
-serve-multiturn-gate: PASS — all requests coherent across the session
+== | 10.0 | | 10.0 **10.0**AR | 10.0 | | 10.0 **10.0**multi-request | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**qwen3.5-0.8b.mq4 | 10.0 | | 10.0 **10.0**==
+== | 10.0 | | 10.0 **10.0**DFlash | 10.0 | | 10.0 **10.0**multi-request | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**qwen3.6-27b.mq4 | 10.0 | | 10.0 **10.0**+ | 10.0 | | 10.0 **10.0**qwen36-27b-dflash-mq4.hfq | 10.0 | | 10.0 **10.0**==
+serve-multiturn-gate: | 10.0 | | 10.0 **10.0**PASS | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**requests | 10.0 | | 10.0 **10.0**coherent | 10.0 | | 10.0 **10.0**across | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**session
 ```
 
 ---
 
-## 6. Implementation notes
+## | 10.0 | | 10.0 **10.0**6. | 10.0 | | 10.0 **10.0**Implementation | 10.0 | | 10.0 **10.0**notes
 
-### Why target_hidden_host is still downloaded (not retired)
+### | 10.0 | | 10.0 **10.0**Why | 10.0 | | 10.0 **10.0**target_hidden_host | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**still | 10.0 | | 10.0 **10.0**downloaded | 10.0 | | 10.0 **10.0**(not | 10.0 | | 10.0 **10.0**retired)
 
-The CPU `target_hidden_host` Vec is still needed because:
-1. The `ctx_slice = Some(n)` diagnostic/windowed-context path reads it directly
-   to pass a sliced view to `draft_forward`.
-2. The cycle-entry assertion `target_hidden_host.len() == position * ne * h`
-   maintains an invariant that the callers (dflash_spec_demo, daemon) rely on.
+The | 10.0 | | 10.0 **10.0**CPU | 10.0 | | 10.0 **10.0**`target_hidden_host` | 10.0 | | 10.0 **10.0**Vec | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**still | 10.0 | | 10.0 **10.0**needed | 10.0 | | 10.0 **10.0**because:
+1. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**`ctx_slice | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**Some(n)` | 10.0 | | 10.0 **10.0**diagnostic/windowed-context | 10.0 | | 10.0 **10.0**path | 10.0 | | 10.0 **10.0**reads | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**directly
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**pass | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**sliced | 10.0 | | 10.0 **10.0**view | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**`draft_forward`.
+2. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**cycle-entry | 10.0 | | 10.0 **10.0**assertion | 10.0 | | 10.0 **10.0**`target_hidden_host.len() | 10.0 | | 10.0 **10.0**== | 10.0 | | 10.0 **10.0**position | 10.0 | | 10.0 **10.0*** | 10.0 | | 10.0 **10.0**ne | 10.0 | | 10.0 **10.0*** | 10.0 | | 10.0 **10.0**h`
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**maintains | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**invariant | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**callers | 10.0 | | 10.0 **10.0**(dflash_spec_demo, | 10.0 | | 10.0 **10.0**daemon) | 10.0 | | 10.0 **10.0**rely | 10.0 | | 10.0 **10.0**on.
 
-The download is now `rows_to_keep` rows (not `big_n` rows) in the fast-tape path,
-which is the same size as the slow-tape path always was. The CPU Vec content is
-correct and consistent with the GPU-resident `draft_scratch.target_hidden` buffer.
+The | 10.0 | | 10.0 **10.0**download | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**now | 10.0 | | 10.0 **10.0**`rows_to_keep` | 10.0 | | 10.0 **10.0**rows | 10.0 | | 10.0 **10.0**(not | 10.0 | | 10.0 **10.0**`big_n` | 10.0 | | 10.0 **10.0**rows) | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**fast-tape | 10.0 | | 10.0 **10.0**path,
+which | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**size | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**slow-tape | 10.0 | | 10.0 **10.0**path | 10.0 | | 10.0 **10.0**always | 10.0 | | 10.0 **10.0**was. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**CPU | 10.0 | | 10.0 **10.0**Vec | 10.0 | | 10.0 **10.0**content | 10.0 | | 10.0 **10.0**is
+correct | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**consistent | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**GPU-resident | 10.0 | | 10.0 **10.0**`draft_scratch.target_hidden` | 10.0 | | 10.0 **10.0**buffer.
 
-### H2D elimination mechanism
+### | 10.0 | | 10.0 **10.0**H2D | 10.0 | | 10.0 **10.0**elimination | 10.0 | | 10.0 **10.0**mechanism
 
-After `thlog.append_committed(position, rows_to_keep, co)` is called at the end
-of cycle N, the next cycle's `run_dflash_draft_for_topk_gpu` (cycle N+1) calls
-`dflash::draft_forward` with `l = position_N+1 = position_N + rows_to_keep_N`.
-Inside `draft_forward`, `prev = thlog.uploaded_rows() = position_N + rows_to_keep_N = l`,
-so the `prev == l` branch fires (line 1286 of dflash.rs) and the H2D is skipped.
+After | 10.0 | | 10.0 **10.0**`thlog.append_committed(position, | 10.0 | | 10.0 **10.0**rows_to_keep, | 10.0 | | 10.0 **10.0**co)` | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**called | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**end
+of | 10.0 | | 10.0 **10.0**cycle | 10.0 | | 10.0 **10.0**N, | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**next | 10.0 | | 10.0 **10.0**cycle's | 10.0 | | 10.0 **10.0**`run_dflash_draft_for_topk_gpu` | 10.0 | | 10.0 **10.0**(cycle | 10.0 | | 10.0 **10.0**N+1) | 10.0 | | 10.0 **10.0**calls
+`dflash::draft_forward` | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**`l | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**position_N+1 | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**position_N | 10.0 | | 10.0 **10.0**+ | 10.0 | | 10.0 **10.0**rows_to_keep_N`.
+Inside | 10.0 | | 10.0 **10.0**`draft_forward`, | 10.0 | | 10.0 **10.0**`prev | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**thlog.uploaded_rows() | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**position_N | 10.0 | | 10.0 **10.0**+ | 10.0 | | 10.0 **10.0**rows_to_keep_N | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**l`,
+so | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**`prev | 10.0 | | 10.0 **10.0**== | 10.0 | | 10.0 **10.0**l` | 10.0 | | 10.0 **10.0**branch | 10.0 | | 10.0 **10.0**fires | 10.0 | | 10.0 **10.0**(line | 10.0 | | 10.0 **10.0**1286 | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**dflash.rs) | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**H2D | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**skipped.
 
-This mirrors the chain path (`spec_step_dflash`, line 3161-3165) which passes
-`target_hidden = None` to `draft_forward` entirely, also bypassing the upload.
+This | 10.0 | | 10.0 **10.0**mirrors | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**chain | 10.0 | | 10.0 **10.0**path | 10.0 | | 10.0 **10.0**(`spec_step_dflash`, | 10.0 | | 10.0 **10.0**line | 10.0 | | 10.0 **10.0**3161-3165) | 10.0 | | 10.0 **10.0**which | 10.0 | | 10.0 **10.0**passes
+`target_hidden | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**None` | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**`draft_forward` | 10.0 | | 10.0 **10.0**entirely, | 10.0 | | 10.0 **10.0**also | 10.0 | | 10.0 **10.0**bypassing | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**upload.
 
-### Path B branch left unchanged
+### | 10.0 | | 10.0 **10.0**Path | 10.0 | | 10.0 **10.0**B | 10.0 | | 10.0 **10.0**branch | 10.0 | | 10.0 **10.0**left | 10.0 | | 10.0 **10.0**unchanged
 
-The `hidden_rows_written == big_n && !fast_tape_ok` branch (Path B WIP, opt-in via
-`HIPFIRE_DDTREE_PATH_B_CAPTURE=1`) is left on the original `download_hidden_block`
-path. This branch is dead by default (requires non-empty `pre_rope_k` scratch, which
-is gated on the same env var). Porting it to D2D scatter would require a GPU gather
-kernel for non-linear committed indices, which is Path B's own scope.
+The | 10.0 | | 10.0 **10.0**`hidden_rows_written | 10.0 | | 10.0 **10.0**== | 10.0 | | 10.0 **10.0**big_n | 10.0 | | 10.0 **10.0**&& | 10.0 | | 10.0 **10.0**!fast_tape_ok` | 10.0 | | 10.0 **10.0**branch | 10.0 | | 10.0 **10.0**(Path | 10.0 | | 10.0 **10.0**B | 10.0 | | 10.0 **10.0**WIP, | 10.0 | | 10.0 **10.0**opt-in | 10.0 | | 10.0 **10.0**via
+`HIPFIRE_DDTREE_PATH_B_CAPTURE=1`) | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**left | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**original | 10.0 | | 10.0 **10.0**`download_hidden_block`
+path. | 10.0 | | 10.0 **10.0**This | 10.0 | | 10.0 **10.0**branch | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**dead | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**default | 10.0 | | 10.0 **10.0**(requires | 10.0 | | 10.0 **10.0**non-empty | 10.0 | | 10.0 **10.0**`pre_rope_k` | 10.0 | | 10.0 **10.0**scratch, | 10.0 | | 10.0 **10.0**which
+is | 10.0 | | 10.0 **10.0**gated | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**env | 10.0 | | 10.0 **10.0**var). | 10.0 | | 10.0 **10.0**Porting | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**D2D | 10.0 | | 10.0 **10.0**scatter | 10.0 | | 10.0 **10.0**would | 10.0 | | 10.0 **10.0**require | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**GPU | 10.0 | | 10.0 **10.0**gather
+kernel | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**non-linear | 10.0 | | 10.0 **10.0**committed | 10.0 | | 10.0 **10.0**indices, | 10.0 | | 10.0 **10.0**which | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**Path | 10.0 | | 10.0 **10.0**B's | 10.0 | | 10.0 **10.0**own | 10.0 | | 10.0 **10.0**scope.

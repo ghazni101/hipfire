@@ -659,7 +659,7 @@ fn dispatch_kv_write(
 
 /// Default envelope for the gfx12 16-query Q8 WMMA prefill kernel.
 ///
-/// R9700/ROCm 7.14, `nh=8,nkv=2,hd=256`, fresh-process medians after three
+/// R9700/ROCm 10.0, `nh=8,nkv=2,hd=256`, fresh-process medians after three
 /// discarded warmups (five processes, eleven timed kernel iterations each):
 ///
 /// - ctx 8K:  #554 M4 5.670 ms, query16 2.836 ms (1.999x)
@@ -1287,7 +1287,7 @@ fn dispatch_attend(
             // "fits in 64 KB" (~16K tokens) is NOT the same question as "is still
             // faster", and the original 8192-for-margin comment conflated them.
             //
-            // Measured on gfx1201 (R9700, ROCm 7.14), --kv-mode q8, prefill tok/s,
+            // Measured on gfx1201 (R9700, ROCm 10.0), --kv-mode q8, prefill tok/s,
             // 3 fresh processes x 3 samples per context, per-rep VRAM verified
             // constant. Fixtures by digest: 27B `86a5f80f..`, 0.8b `aedfe31b..`.
             //

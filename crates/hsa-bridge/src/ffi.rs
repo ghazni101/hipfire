@@ -248,7 +248,7 @@ impl HsaLib {
     /// Candidates come from `hipfire_config::rocm`, which honours
     /// `HIPFIRE_ROCM_PATH` / `ROCM_PATH` / `HIP_PATH`, derives the root from a
     /// device compiler on `PATH`, and understands versioned layouts such as
-    /// `/opt/rocm/core-7.14`. Only one selected root is tried; version selection
+    /// `/opt/rocm/core-10.0`. Only one selected root is tried; version selection
     /// is never delegated to a bare loader soname. This previously hardcoded
     /// `/opt/rocm/lib`, which fails on every non-default install.
     pub fn load() -> crate::error::HsaResult<Self> {

@@ -1,88 +1,88 @@
-# DS4 beta staging golden performance rerun
+# | 10.0 | | 10.0 **10.0**DS4 | 10.0 | | 10.0 **10.0**beta | 10.0 | | 10.0 **10.0**staging | 10.0 | | 10.0 **10.0**golden | 10.0 | | 10.0 **10.0**performance | 10.0 | | 10.0 **10.0**rerun
 
-Date: 2026-08-05  
-Branch: `ds4-beta-staging`  
-Commit: `8e9d5f5eca828eaa26bd74b4046dd7aeb7f46855`  
-Host/device: `hipx`, Radeon 8060S, `gfx1151`, ROCm 7.14
+Date: | 10.0 | | 10.0 **10.0**2026-08-05 | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**
+Branch: | 10.0 | | 10.0 **10.0**`ds4-beta-staging` | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**
+Commit: | 10.0 | | 10.0 **10.0**`8e9d5f5eca828eaa26bd74b4046dd7aeb7f46855` | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**
+Host/device: | 10.0 | | 10.0 **10.0**`hipx`, | 10.0 | | 10.0 **10.0**Radeon | 10.0 | | 10.0 **10.0**8060S, | 10.0 | | 10.0 **10.0**`gfx1151`, | 10.0 | | 10.0 **10.0**ROCm | 10.0 | | 10.0 **10.0**10.0
 
-This rerun checks that the accumulated DS4 prefill work still reproduces the
-short-code golden decode waterlines established at `743a8d475`. It is a
-performance rerun, not a replacement for the 15-position correctness
-certification already recorded in
+This | 10.0 | | 10.0 **10.0**rerun | 10.0 | | 10.0 **10.0**checks | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**accumulated | 10.0 | | 10.0 **10.0**DS4 | 10.0 | | 10.0 **10.0**prefill | 10.0 | | 10.0 **10.0**work | 10.0 | | 10.0 **10.0**still | 10.0 | | 10.0 **10.0**reproduces | 10.0 | | 10.0 **10.0**the
+short-code | 10.0 | | 10.0 **10.0**golden | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**waterlines | 10.0 | | 10.0 **10.0**established | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**`743a8d475`. | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**a
+performance | 10.0 | | 10.0 **10.0**rerun, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**replacement | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**15-position | 10.0 | | 10.0 **10.0**correctness
+certification | 10.0 | | 10.0 **10.0**already | 10.0 | | 10.0 **10.0**recorded | 10.0 | | 10.0 **10.0**in
 `2026-08-04-ds4-beta-staging-golden-recert.md`.
 
-## Fixture
+## | 10.0 | | 10.0 **10.0**Fixture
 
-- Target: `deepseek-v4-flash-0731.mq2r`, preserved P3 artifact
-- DSpark sidecar: `deepseek-v4-flash-0731-dspark.mq2r`
-- Prompt: `benchmarks/prompts/ds4_dspark_genre_code.json`
-- Prompt bytes MD5: `d782138f5bc8bbbd234ca8e4b17cace9`
-- 25 prompt tokens, 128 generated tokens, batch 1, greedy
-- Q8 KV request, contiguous backend, top-k 6
-- Thinking, MTP, and DFlash off
-- One accepted fresh process per arm
-- DSpark explicitly forced to direct HIP
-- AR explicitly admitted to retained PM4 because automatic `.mq2r` admission
-  remains a separate open gate
+- | 10.0 | | 10.0 **10.0**Target: | 10.0 | | 10.0 **10.0**`deepseek-v4-flash-0731.mq2r`, | 10.0 | | 10.0 **10.0**preserved | 10.0 | | 10.0 **10.0**P3 | 10.0 | | 10.0 **10.0**artifact
+- | 10.0 | | 10.0 **10.0**DSpark | 10.0 | | 10.0 **10.0**sidecar: | 10.0 | | 10.0 **10.0**`deepseek-v4-flash-0731-dspark.mq2r`
+- | 10.0 | | 10.0 **10.0**Prompt: | 10.0 | | 10.0 **10.0**`benchmarks/prompts/ds4_dspark_genre_code.json`
+- | 10.0 | | 10.0 **10.0**Prompt | 10.0 | | 10.0 **10.0**bytes | 10.0 | | 10.0 **10.0**MD5: | 10.0 | | 10.0 **10.0**`d782138f5bc8bbbd234ca8e4b17cace9`
+- | 10.0 | | 10.0 **10.0**25 | 10.0 | | 10.0 **10.0**prompt | 10.0 | | 10.0 **10.0**tokens, | 10.0 | | 10.0 **10.0**128 | 10.0 | | 10.0 **10.0**generated | 10.0 | | 10.0 **10.0**tokens, | 10.0 | | 10.0 **10.0**batch | 10.0 | | 10.0 **10.0**1, | 10.0 | | 10.0 **10.0**greedy
+- | 10.0 | | 10.0 **10.0**Q8 | 10.0 | | 10.0 **10.0**KV | 10.0 | | 10.0 **10.0**request, | 10.0 | | 10.0 **10.0**contiguous | 10.0 | | 10.0 **10.0**backend, | 10.0 | | 10.0 **10.0**top-k | 10.0 | | 10.0 **10.0**6
+- | 10.0 | | 10.0 **10.0**Thinking, | 10.0 | | 10.0 **10.0**MTP, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**DFlash | 10.0 | | 10.0 **10.0**off
+- | 10.0 | | 10.0 **10.0**One | 10.0 | | 10.0 **10.0**accepted | 10.0 | | 10.0 **10.0**fresh | 10.0 | | 10.0 **10.0**process | 10.0 | | 10.0 **10.0**per | 10.0 | | 10.0 **10.0**arm
+- | 10.0 | | 10.0 **10.0**DSpark | 10.0 | | 10.0 **10.0**explicitly | 10.0 | | 10.0 **10.0**forced | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**direct | 10.0 | | 10.0 **10.0**HIP
+- | 10.0 | | 10.0 **10.0**AR | 10.0 | | 10.0 **10.0**explicitly | 10.0 | | 10.0 **10.0**admitted | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**retained | 10.0 | | 10.0 **10.0**PM4 | 10.0 | | 10.0 **10.0**because | 10.0 | | 10.0 **10.0**automatic | 10.0 | | 10.0 **10.0**`.mq2r` | 10.0 | | 10.0 **10.0**admission
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**remains | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**separate | 10.0 | | 10.0 **10.0**open | 10.0 | | 10.0 **10.0**gate
 
-## Results
+## | 10.0 | | 10.0 **10.0**Results
 
-| Route | Golden | Reproduced | Delta |
+| | 10.0 | | 10.0 **10.0**Route | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Golden | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Reproduced | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Delta | 10.0 | | 10.0 **10.0**|
 |---|---:|---:|---:|
-| DSpark direct HIP | 37.3264 tok/s | 37.3101 tok/s | -0.044% |
-| AR retained PM4 | 28.8678 tok/s | 28.7640 tok/s | -0.360% |
+| | 10.0 | | 10.0 **10.0**DSpark | 10.0 | | 10.0 **10.0**direct | 10.0 | | 10.0 **10.0**HIP | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**37.3264 | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**37.3101 | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**-0.044% | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**AR | 10.0 | | 10.0 **10.0**retained | 10.0 | | 10.0 **10.0**PM4 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**28.8678 | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**28.7640 | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**-0.360% | 10.0 | | 10.0 **10.0**|
 
-Both accepted arms emitted byte-identical decoded output, MD5
+Both | 10.0 | | 10.0 **10.0**accepted | 10.0 | | 10.0 **10.0**arms | 10.0 | | 10.0 **10.0**emitted | 10.0 | | 10.0 **10.0**byte-identical | 10.0 | | 10.0 **10.0**decoded | 10.0 | | 10.0 **10.0**output, | 10.0 | | 10.0 **10.0**MD5
 `e49b9893a207d8a698eb17fdca13db51`.
 
-DSpark retained the expected adaptive behavior: 42 verify windows,
-`tau=2.0238095`, and 67% acceptance. Its measured prefill was 353 ms.
+DSpark | 10.0 | | 10.0 **10.0**retained | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**expected | 10.0 | | 10.0 **10.0**adaptive | 10.0 | | 10.0 **10.0**behavior: | 10.0 | | 10.0 **10.0**42 | 10.0 | | 10.0 **10.0**verify | 10.0 | | 10.0 **10.0**windows,
+`tau=2.0238095`, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**67% | 10.0 | | 10.0 **10.0**acceptance. | 10.0 | | 10.0 **10.0**Its | 10.0 | | 10.0 **10.0**measured | 10.0 | | 10.0 **10.0**prefill | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**353 | 10.0 | | 10.0 **10.0**ms.
 
-The AR route retained the certified identity:
+The | 10.0 | | 10.0 **10.0**AR | 10.0 | | 10.0 **10.0**route | 10.0 | | 10.0 **10.0**retained | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**certified | 10.0 | | 10.0 **10.0**identity:
 
-- 2,320 launches
-- 32 unique symbols
-- 32/32 certified code-object contracts
-- zero fallback or unknown launches
-- 2,319/2,319 covered boundaries
-- sequence hash `c11845041c3101e7`
-- one PM4 packet on queue 3, 57,663 dwords
-- 126 retained replays for the measured request
+- | 10.0 | | 10.0 **10.0**2,320 | 10.0 | | 10.0 **10.0**launches
+- | 10.0 | | 10.0 **10.0**32 | 10.0 | | 10.0 **10.0**unique | 10.0 | | 10.0 **10.0**symbols
+- | 10.0 | | 10.0 **10.0**32/32 | 10.0 | | 10.0 **10.0**certified | 10.0 | | 10.0 **10.0**code-object | 10.0 | | 10.0 **10.0**contracts
+- | 10.0 | | 10.0 **10.0**zero | 10.0 | | 10.0 **10.0**fallback | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**unknown | 10.0 | | 10.0 **10.0**launches
+- | 10.0 | | 10.0 **10.0**2,319/2,319 | 10.0 | | 10.0 **10.0**covered | 10.0 | | 10.0 **10.0**boundaries
+- | 10.0 | | 10.0 **10.0**sequence | 10.0 | | 10.0 **10.0**hash | 10.0 | | 10.0 **10.0**`c11845041c3101e7`
+- | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**PM4 | 10.0 | | 10.0 **10.0**packet | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**queue | 10.0 | | 10.0 **10.0**3, | 10.0 | | 10.0 **10.0**57,663 | 10.0 | | 10.0 **10.0**dwords
+- | 10.0 | | 10.0 **10.0**126 | 10.0 | | 10.0 **10.0**retained | 10.0 | | 10.0 **10.0**replays | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**measured | 10.0 | | 10.0 **10.0**request
 
-## Excluded but preserved
+## | 10.0 | | 10.0 **10.0**Excluded | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**preserved
 
-The first DSpark process measured 37.0059 tok/s with the same decoded bytes and
-the same `tau`, but its 1,010 ms prefill was a cold-JIT outlier versus the
-historical 362 ms and the warm-cache 353 ms. Its JSON and serve log are
-preserved in the evidence directory and excluded from the accepted row.
+The | 10.0 | | 10.0 **10.0**first | 10.0 | | 10.0 **10.0**DSpark | 10.0 | | 10.0 **10.0**process | 10.0 | | 10.0 **10.0**measured | 10.0 | | 10.0 **10.0**37.0059 | 10.0 | | 10.0 **10.0**tok/s | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**decoded | 10.0 | | 10.0 **10.0**bytes | 10.0 | | 10.0 **10.0**and
+the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**`tau`, | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**1,010 | 10.0 | | 10.0 **10.0**ms | 10.0 | | 10.0 **10.0**prefill | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**cold-JIT | 10.0 | | 10.0 **10.0**outlier | 10.0 | | 10.0 **10.0**versus | 10.0 | | 10.0 **10.0**the
+historical | 10.0 | | 10.0 **10.0**362 | 10.0 | | 10.0 **10.0**ms | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**warm-cache | 10.0 | | 10.0 **10.0**353 | 10.0 | | 10.0 **10.0**ms. | 10.0 | | 10.0 **10.0**Its | 10.0 | | 10.0 **10.0**JSON | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**serve | 10.0 | | 10.0 **10.0**log | 10.0 | | 10.0 **10.0**are
+preserved | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**evidence | 10.0 | | 10.0 **10.0**directory | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**excluded | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**accepted | 10.0 | | 10.0 **10.0**row.
 
-## Binary identity
+## | 10.0 | | 10.0 **10.0**Binary | 10.0 | | 10.0 **10.0**identity
 
-- CLI SHA-256:
-  `3a1291b628427cb00c2651fc682cf4548e22fee785c9fb98497195a0a6f9162c`
-- Daemon SHA-256:
-  `547bd426819d4583d9dd35531066f62402421a4b4c0dafb7c27cc1d57a31a379`
+- | 10.0 | | 10.0 **10.0**CLI | 10.0 | | 10.0 **10.0**SHA-256:
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`3a1291b628427cb00c2651fc682cf4548e22fee785c9fb98497195a0a6f9162c`
+- | 10.0 | | 10.0 **10.0**Daemon | 10.0 | | 10.0 **10.0**SHA-256:
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`547bd426819d4583d9dd35531066f62402421a4b4c0dafb7c27cc1d57a31a379`
 
-## Evidence
+## | 10.0 | | 10.0 **10.0**Evidence
 
 `hipx:/home/kaden/ds4-gfx1151-evidence/2026-08-05-ds4-beta-staging-golden-rerun/`
 
-Accepted evidence hashes:
+Accepted | 10.0 | | 10.0 **10.0**evidence | 10.0 | | 10.0 **10.0**hashes:
 
-- `dspark-warm-result.json`:
-  `09b6d37a62d6fec3c9efafca60b566c97ae0dce075d3f54e5e00155be8b4bd86`
-- `dspark-warm-serve.log`:
-  `498f85d8a1950ff23ef5ed5025761b7c203c3a4864d892b19f4293098c113db3`
-- `ar-pm4-result.json`:
-  `f0be07f09682e675036409bdb0e22c84a2e053db7ec25186e5cd4d0c09ab7a3c`
-- `ar-pm4-serve.log`:
-  `801b69b10048bb214574e38c4298faae31e84a85c484353a52666dc585fe6881`
+- | 10.0 | | 10.0 **10.0**`dspark-warm-result.json`:
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`09b6d37a62d6fec3c9efafca60b566c97ae0dce075d3f54e5e00155be8b4bd86`
+- | 10.0 | | 10.0 **10.0**`dspark-warm-serve.log`:
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`498f85d8a1950ff23ef5ed5025761b7c203c3a4864d892b19f4293098c113db3`
+- | 10.0 | | 10.0 **10.0**`ar-pm4-result.json`:
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`f0be07f09682e675036409bdb0e22c84a2e053db7ec25186e5cd4d0c09ab7a3c`
+- | 10.0 | | 10.0 **10.0**`ar-pm4-serve.log`:
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`801b69b10048bb214574e38c4298faae31e84a85c484353a52666dc585fe6881`
 
-Skipped: no second 15-position shadow battery because the task was to
-remeasure the already-certified performance waterlines and the decode route
-identity did not change; no 2,048/512 product run, long-context run, thinking
-run, quant change, or automatic `.mq2r` admission change was included.
+Skipped: | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**second | 10.0 | | 10.0 **10.0**15-position | 10.0 | | 10.0 **10.0**shadow | 10.0 | | 10.0 **10.0**battery | 10.0 | | 10.0 **10.0**because | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**task | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**to
+remeasure | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**already-certified | 10.0 | | 10.0 **10.0**performance | 10.0 | | 10.0 **10.0**waterlines | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**decode | 10.0 | | 10.0 **10.0**route
+identity | 10.0 | | 10.0 **10.0**did | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**change; | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**2,048/512 | 10.0 | | 10.0 **10.0**product | 10.0 | | 10.0 **10.0**run, | 10.0 | | 10.0 **10.0**long-context | 10.0 | | 10.0 **10.0**run, | 10.0 | | 10.0 **10.0**thinking
+run, | 10.0 | | 10.0 **10.0**quant | 10.0 | | 10.0 **10.0**change, | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**automatic | 10.0 | | 10.0 **10.0**`.mq2r` | 10.0 | | 10.0 **10.0**admission | 10.0 | | 10.0 **10.0**change | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**included.
 
-Verdict: the DSpark and retained-PM4 AR golden waterlines both reproduce on the
-current accumulated branch within 0.4%, with byte-identical output and the
-unchanged retained route.
+Verdict: | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**DSpark | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**retained-PM4 | 10.0 | | 10.0 **10.0**AR | 10.0 | | 10.0 **10.0**golden | 10.0 | | 10.0 **10.0**waterlines | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**reproduce | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**the
+current | 10.0 | | 10.0 **10.0**accumulated | 10.0 | | 10.0 **10.0**branch | 10.0 | | 10.0 **10.0**within | 10.0 | | 10.0 **10.0**0.4%, | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**byte-identical | 10.0 | | 10.0 **10.0**output | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the
+unchanged | 10.0 | | 10.0 **10.0**retained | 10.0 | | 10.0 **10.0**route.

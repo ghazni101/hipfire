@@ -23,7 +23,7 @@
 // MI300X (gfx942) `__builtin_amdgcn_cvt_pk_fp8_f32` implements the *FNUZ*
 // encoding (max finite 240, NaN = 0x80), NOT OCP `float8_e4m3fn`
 // (max 448, NaN = 0x7F/0xFF). Empirically confirmed on this host's
-// mi300x ROCm 7.14: saturating 448/500 both encode as 0x80 under the
+// mi300x ROCm 10.0: saturating 448/500 both encode as 0x80 under the
 // bare builtin, and magnitudes past the FNUZ range collapse. HIP's
 // `__hip_cvt_float_to_fp8(..., __HIP_E4M3)` fast-path on this SKU still
 // routes through the same FNUZ builtin after a software clamp to ±448 —

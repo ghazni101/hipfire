@@ -32,7 +32,7 @@
 # TOOLCHAIN NOTE
 #
 # The engine currently probes `hipcc` only. hipcc is being wound down upstream
-# in favour of invoking amdclang++/clang++ directly, and on ROCm 7.14 hipcc is
+# in favour of invoking amdclang++/clang++ directly, and on ROCm 10.0 hipcc is
 # already just an ELF wrapper around amdclang++. This script therefore treats
 # the device compiler as a SET (see DEVICE_COMPILERS) rather than assuming
 # hipcc, so pinning keeps working after the engine moves off hipcc.
@@ -171,7 +171,7 @@ cmd_capture() {
     echo "kernel=$(uname -r)"
     echo "rocm_version=$(rocm_version)"
     # Record every device compiler on PATH. The engine fingerprints only the
-    # first line of `hipcc --version`, which on ROCm 7.14 is the HIP runtime
+    # first line of `hipcc --version`, which on ROCm 10.0 is the HIP runtime
     # version rather than the code generator — so capture both explicitly.
     for cc in "${DEVICE_COMPILERS[@]}"; do
       if command -v "$cc" >/dev/null 2>&1; then

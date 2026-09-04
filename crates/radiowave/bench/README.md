@@ -39,7 +39,7 @@ GPU architectures, set `ARCH` explicitly to match `HIP_VISIBLE_DEVICES`.
 
 ```bash
 HIP_VISIBLE_DEVICES=1 \
-ROCM_PATH=/opt/rocm/core-7.14 \
+ROCM_PATH=/opt/rocm/core-10.0 \
 OUT=/tmp/gfx1100-w7900.csv \
 ./scripts/bench_ocp_fp8_recipes.sh
 ```
@@ -50,7 +50,7 @@ four launches per trial, and a five-second cooldown between modes. `MODES`,
 
 ## Results
 
-ROCm 7.14 results collected on 2026-07-30:
+ROCm 10.0 results collected on 2026-07-30:
 
 | GPU | Mode | Median us | p10-p90 us | Relative to matching FP16 |
 |---|---:|---:|---:|---:|

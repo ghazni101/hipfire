@@ -5,7 +5,7 @@
 #include <hip/hip_runtime.h>
 
 // Graph-resident three/four-rank producer barrier for gfx1201 TP. hipStreamWriteValue
-// and hipStreamWaitValue instantiate inside HIP graphs on ROCm 7.14, but their
+// and hipStreamWaitValue instantiate inside HIP graphs on ROCm 10.0, but their
 // replay observes the prior epoch after the first launch. Kernel nodes do replay
 // correctly, so publish and consume the epoch through system-scope atomics.
 

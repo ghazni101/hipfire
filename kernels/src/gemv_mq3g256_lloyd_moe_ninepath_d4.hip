@@ -41,7 +41,7 @@
 // activation, which keeps the row loop completely barrier-free — the per-row
 // staging alternative costs two __syncthreads() per row (32 per CTA).
 //
-// LDS / occupancy, measured by compiling for gfx1201 (hipcc 7.14):
+// LDS / occupancy, measured by compiling for gfx1201 (hipcc 7.15):
 //   HFQ4 reference    lds 16896  occ 14 waves/SIMD  (no codebook to stage)
 //   MQ3 RPB=4         lds 18560  occ 14   <- default, matches the reference tier
 //   MQ3 RPB=8         lds 20736  occ 12

@@ -48,7 +48,7 @@ import subprocess
 import sys
 import time
 
-AMD_SMI = "/opt/rocm/core-7.14/bin/amd-smi"
+AMD_SMI = "/opt/rocm/core-10.0/bin/amd-smi"
 
 
 def vram_used_total_mib(devices: list[int]) -> int | None:

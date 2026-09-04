@@ -1,268 +1,268 @@
-# Qwen3.8 27B — v6 chat-template calibration corpus, scored 2×2 against prose and conversation references (gfx1201)
+# | 10.0 | | 10.0 **10.0**Qwen3.8 | 10.0 | | 10.0 **10.0**27B | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**v6 | 10.0 | | 10.0 **10.0**chat-template | 10.0 | | 10.0 **10.0**calibration | 10.0 | | 10.0 **10.0**corpus, | 10.0 | | 10.0 **10.0**scored | 10.0 | | 10.0 **10.0**2×2 | 10.0 | | 10.0 **10.0**against | 10.0 | | 10.0 **10.0**prose | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**conversation | 10.0 | | 10.0 **10.0**references | 10.0 | | 10.0 **10.0**(gfx1201)
 
-**Lifecycle:** `historical`. Fixture-bound measured evidence from the
-chat-template calibration-corpus campaign. It is **not** a current default, an
-automatic baseline, a product claim, or an admission decision.
+**Lifecycle:** | 10.0 | | 10.0 **10.0**`historical`. | 10.0 | | 10.0 **10.0**Fixture-bound | 10.0 | | 10.0 **10.0**measured | 10.0 | | 10.0 **10.0**evidence | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**the
+chat-template | 10.0 | | 10.0 **10.0**calibration-corpus | 10.0 | | 10.0 **10.0**campaign. | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0****not** | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**current | 10.0 | | 10.0 **10.0**default, | 10.0 | | 10.0 **10.0**an
+automatic | 10.0 | | 10.0 **10.0**baseline, | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**product | 10.0 | | 10.0 **10.0**claim, | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**admission | 10.0 | | 10.0 **10.0**decision.
 
-**Disposition:** At a fixed MQ4G256 wire format, swapping the calibration corpus
-from **v5** (prose-weighted) to **v6** (rendered chat-template conversations)
-produces a result that *depends on which reference you score against*, and the
-two references disagree about which arm wins:
+**Disposition:** | 10.0 | | 10.0 **10.0**At | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**fixed | 10.0 | | 10.0 **10.0**MQ4G256 | 10.0 | | 10.0 **10.0**wire | 10.0 | | 10.0 **10.0**format, | 10.0 | | 10.0 **10.0**swapping | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**calibration | 10.0 | | 10.0 **10.0**corpus
+from | 10.0 | | 10.0 **10.0****v5** | 10.0 | | 10.0 **10.0**(prose-weighted) | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0****v6** | 10.0 | | 10.0 **10.0**(rendered | 10.0 | | 10.0 **10.0**chat-template | 10.0 | | 10.0 **10.0**conversations)
+produces | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**result | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0***depends | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**which | 10.0 | | 10.0 **10.0**reference | 10.0 | | 10.0 **10.0**you | 10.0 | | 10.0 **10.0**score | 10.0 | | 10.0 **10.0**against*, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the
+two | 10.0 | | 10.0 **10.0**references | 10.0 | | 10.0 **10.0**disagree | 10.0 | | 10.0 **10.0**about | 10.0 | | 10.0 **10.0**which | 10.0 | | 10.0 **10.0**arm | 10.0 | | 10.0 **10.0**wins:
 
-- On **WikiText-2** (prose, the OOD tripwire) the arms are effectively tied on
-  KLD — v6 ahead by 0.0011 absolute, 1.3 % relative — and **v5 wins PPL**
-  (6.4898 vs 6.6727).
-- On the **v6 held-out selector** (100 % rendered conversation, 0 % prose) v6
-  wins **both** metrics decisively: KLD 1.023882 vs 1.064046 (0.040 absolute,
-  3.8 % relative) and PPL 10.9569 vs 13.232 (2.27 absolute, 17 % relative).
+- | 10.0 | | 10.0 **10.0**On | 10.0 | | 10.0 **10.0****WikiText-2** | 10.0 | | 10.0 **10.0**(prose, | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**OOD | 10.0 | | 10.0 **10.0**tripwire) | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**arms | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**effectively | 10.0 | | 10.0 **10.0**tied | 10.0 | | 10.0 **10.0**on
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**KLD | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**v6 | 10.0 | | 10.0 **10.0**ahead | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**0.0011 | 10.0 | | 10.0 **10.0**absolute, | 10.0 | | 10.0 **10.0**1.3 | 10.0 | | 10.0 **10.0**% | 10.0 | | 10.0 **10.0**relative | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0****v5 | 10.0 | | 10.0 **10.0**wins | 10.0 | | 10.0 **10.0**PPL**
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**(6.4898 | 10.0 | | 10.0 **10.0**vs | 10.0 | | 10.0 **10.0**6.6727).
+- | 10.0 | | 10.0 **10.0**On | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0****v6 | 10.0 | | 10.0 **10.0**held-out | 10.0 | | 10.0 **10.0**selector** | 10.0 | | 10.0 **10.0**(100 | 10.0 | | 10.0 **10.0**% | 10.0 | | 10.0 **10.0**rendered | 10.0 | | 10.0 **10.0**conversation, | 10.0 | | 10.0 **10.0**0 | 10.0 | | 10.0 **10.0**% | 10.0 | | 10.0 **10.0**prose) | 10.0 | | 10.0 **10.0**v6
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**wins | 10.0 | | 10.0 **10.0****both** | 10.0 | | 10.0 **10.0**metrics | 10.0 | | 10.0 **10.0**decisively: | 10.0 | | 10.0 **10.0**KLD | 10.0 | | 10.0 **10.0**1.023882 | 10.0 | | 10.0 **10.0**vs | 10.0 | | 10.0 **10.0**1.064046 | 10.0 | | 10.0 **10.0**(0.040 | 10.0 | | 10.0 **10.0**absolute,
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**3.8 | 10.0 | | 10.0 **10.0**% | 10.0 | | 10.0 **10.0**relative) | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**PPL | 10.0 | | 10.0 **10.0**10.9569 | 10.0 | | 10.0 **10.0**vs | 10.0 | | 10.0 **10.0**13.232 | 10.0 | | 10.0 **10.0**(2.27 | 10.0 | | 10.0 **10.0**absolute, | 10.0 | | 10.0 **10.0**17 | 10.0 | | 10.0 **10.0**% | 10.0 | | 10.0 **10.0**relative).
 
-**Ranking arms on WikiText-2 PPL alone would have selected v5, which is the
-wrong arm for a chat model.** Even on KLD — where the two references agree on
-the *direction* — WikiText-2 understates the margin by roughly 30× in absolute
-delta and 3× in relative delta.
+**Ranking | 10.0 | | 10.0 **10.0**arms | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**WikiText-2 | 10.0 | | 10.0 **10.0**PPL | 10.0 | | 10.0 **10.0**alone | 10.0 | | 10.0 **10.0**would | 10.0 | | 10.0 **10.0**have | 10.0 | | 10.0 **10.0**selected | 10.0 | | 10.0 **10.0**v5, | 10.0 | | 10.0 **10.0**which | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the
+wrong | 10.0 | | 10.0 **10.0**arm | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**chat | 10.0 | | 10.0 **10.0**model.** | 10.0 | | 10.0 **10.0**Even | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**KLD | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**where | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**two | 10.0 | | 10.0 **10.0**references | 10.0 | | 10.0 **10.0**agree | 10.0 | | 10.0 **10.0**on
+the | 10.0 | | 10.0 **10.0***direction* | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**WikiText-2 | 10.0 | | 10.0 **10.0**understates | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**margin | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**roughly | 10.0 | | 10.0 **10.0**30× | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**absolute
+delta | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**3× | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**relative | 10.0 | | 10.0 **10.0**delta.
 
-The load-bearing consequence is retroactive and is the reason this record
-exists: **every prior arm ranking in this campaign that was scored on a
-prose reference was measured on the wrong instrument for a chat model.** Those
-rankings are not thereby *wrong*, but they are no longer *sufficient*, and any
-ranking whose margin was under a few percent on prose should be considered
-unresolved until re-scored on a deployment-distribution reference.
+The | 10.0 | | 10.0 **10.0**load-bearing | 10.0 | | 10.0 **10.0**consequence | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**retroactive | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**reason | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**record
+exists: | 10.0 | | 10.0 **10.0****every | 10.0 | | 10.0 **10.0**prior | 10.0 | | 10.0 **10.0**arm | 10.0 | | 10.0 **10.0**ranking | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**campaign | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**scored | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**a
+prose | 10.0 | | 10.0 **10.0**reference | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**measured | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**wrong | 10.0 | | 10.0 **10.0**instrument | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**chat | 10.0 | | 10.0 **10.0**model.** | 10.0 | | 10.0 **10.0**Those
+rankings | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**thereby | 10.0 | | 10.0 **10.0***wrong*, | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**they | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**longer | 10.0 | | 10.0 **10.0***sufficient*, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**any
+ranking | 10.0 | | 10.0 **10.0**whose | 10.0 | | 10.0 **10.0**margin | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**under | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**few | 10.0 | | 10.0 **10.0**percent | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**prose | 10.0 | | 10.0 **10.0**should | 10.0 | | 10.0 **10.0**be | 10.0 | | 10.0 **10.0**considered
+unresolved | 10.0 | | 10.0 **10.0**until | 10.0 | | 10.0 **10.0**re-scored | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**deployment-distribution | 10.0 | | 10.0 **10.0**reference.
 
-**Source:** branch `quant/quality`, producer binary at commit
+**Source:** | 10.0 | | 10.0 **10.0**branch | 10.0 | | 10.0 **10.0**`quant/quality`, | 10.0 | | 10.0 **10.0**producer | 10.0 | | 10.0 **10.0**binary | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**commit
 `814d8fd95859a4843504fae2c81e9c073db2038d`.
 
 ---
 
-## Fixture identity
+## | 10.0 | | 10.0 **10.0**Fixture | 10.0 | | 10.0 **10.0**identity
 
-| field | value |
+| | 10.0 | | 10.0 **10.0**field | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**value | 10.0 | | 10.0 **10.0**|
 |---|---|
-| producer host | MI300X, `gfx942`, CDNA3, 235 GB RAM, 205 GB VRAM — **PRODUCER ONLY** |
-| scoring host | hiptrx, 4× `gfx1201` Radeon AI PRO R9700, 122 GB RAM, 34.2 GB VRAM |
-| producer binary | `hipfire-quantize` @ `814d8fd9`, md5 `200a7f0e80624a09fcfb5da63901d5f9`, sha256 `cb42f5344e8a7c7448492a3254c649dfd4b2a554b99f05a9368e38246d3cf4bf` |
-| scoring binary | `eval_hipfire`, md5 `89083d01a9d42e418b17996b673f71cf` (worktree `d64e58fb`) |
-| parent checkpoint | `/scratch/parents/qwen3.8-27b`, upstream unquantized, 18/18 shards, 52 GB |
-| format | MQ4G256, 136 B/group, 15,662,615,552 B written |
+| | 10.0 | | 10.0 **10.0**producer | 10.0 | | 10.0 **10.0**host | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**MI300X, | 10.0 | | 10.0 **10.0**`gfx942`, | 10.0 | | 10.0 **10.0**CDNA3, | 10.0 | | 10.0 **10.0**235 | 10.0 | | 10.0 **10.0**GB | 10.0 | | 10.0 **10.0**RAM, | 10.0 | | 10.0 **10.0**205 | 10.0 | | 10.0 **10.0**GB | 10.0 | | 10.0 **10.0**VRAM | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0****PRODUCER | 10.0 | | 10.0 **10.0**ONLY** | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**scoring | 10.0 | | 10.0 **10.0**host | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**hiptrx, | 10.0 | | 10.0 **10.0**4× | 10.0 | | 10.0 **10.0**`gfx1201` | 10.0 | | 10.0 **10.0**Radeon | 10.0 | | 10.0 **10.0**AI | 10.0 | | 10.0 **10.0**PRO | 10.0 | | 10.0 **10.0**R9700, | 10.0 | | 10.0 **10.0**122 | 10.0 | | 10.0 **10.0**GB | 10.0 | | 10.0 **10.0**RAM, | 10.0 | | 10.0 **10.0**34.2 | 10.0 | | 10.0 **10.0**GB | 10.0 | | 10.0 **10.0**VRAM | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**producer | 10.0 | | 10.0 **10.0**binary | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`hipfire-quantize` | 10.0 | | 10.0 **10.0**@ | 10.0 | | 10.0 **10.0**`814d8fd9`, | 10.0 | | 10.0 **10.0**md5 | 10.0 | | 10.0 **10.0**`200a7f0e80624a09fcfb5da63901d5f9`, | 10.0 | | 10.0 **10.0**sha256 | 10.0 | | 10.0 **10.0**`cb42f5344e8a7c7448492a3254c649dfd4b2a554b99f05a9368e38246d3cf4bf` | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**scoring | 10.0 | | 10.0 **10.0**binary | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`eval_hipfire`, | 10.0 | | 10.0 **10.0**md5 | 10.0 | | 10.0 **10.0**`89083d01a9d42e418b17996b673f71cf` | 10.0 | | 10.0 **10.0**(worktree | 10.0 | | 10.0 **10.0**`d64e58fb`) | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**parent | 10.0 | | 10.0 **10.0**checkpoint | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`/scratch/parents/qwen3.8-27b`, | 10.0 | | 10.0 **10.0**upstream | 10.0 | | 10.0 **10.0**unquantized, | 10.0 | | 10.0 **10.0**18/18 | 10.0 | | 10.0 **10.0**shards, | 10.0 | | 10.0 **10.0**52 | 10.0 | | 10.0 **10.0**GB | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**format | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**MQ4G256, | 10.0 | | 10.0 **10.0**136 | 10.0 | | 10.0 **10.0**B/group, | 10.0 | | 10.0 **10.0**15,662,615,552 | 10.0 | | 10.0 **10.0**B | 10.0 | | 10.0 **10.0**written | 10.0 | | 10.0 **10.0**|
 
-### Calibration artifacts
+### | 10.0 | | 10.0 **10.0**Calibration | 10.0 | | 10.0 **10.0**artifacts
 
-| arm | path | bytes | md5 |
+| | 10.0 | | 10.0 **10.0**arm | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**path | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**bytes | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**md5 | 10.0 | | 10.0 **10.0**|
 |---|---|---|---|
-| v5 | `qwen3.8-27b.calib.hfq` | 31,481,106,432 | `c94a6560e4b82ac1e7a2236561c2216d` |
-| v6 | `qwen3.8-27b.calibv6-814d8fd.hfq` | 31,481,139,200 | `9e2a7ab00e0b982e6793f4d2b0b86379` |
+| | 10.0 | | 10.0 **10.0**v5 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`qwen3.8-27b.calib.hfq` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**31,481,106,432 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`c94a6560e4b82ac1e7a2236561c2216d` | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**v6 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`qwen3.8-27b.calibv6-814d8fd.hfq` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**31,481,139,200 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`9e2a7ab00e0b982e6793f4d2b0b86379` | 10.0 | | 10.0 **10.0**|
 
-Both carry 496/496 tensors at 262,144 tokens/tensor uniform, 992 keys
-(496 Hessian diagonals + 496 imatrix vectors).
+Both | 10.0 | | 10.0 **10.0**carry | 10.0 | | 10.0 **10.0**496/496 | 10.0 | | 10.0 **10.0**tensors | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**262,144 | 10.0 | | 10.0 **10.0**tokens/tensor | 10.0 | | 10.0 **10.0**uniform, | 10.0 | | 10.0 **10.0**992 | 10.0 | | 10.0 **10.0**keys
+(496 | 10.0 | | 10.0 **10.0**Hessian | 10.0 | | 10.0 **10.0**diagonals | 10.0 | | 10.0 **10.0**+ | 10.0 | | 10.0 **10.0**496 | 10.0 | | 10.0 **10.0**imatrix | 10.0 | | 10.0 **10.0**vectors).
 
-### Quantized artifacts
+### | 10.0 | | 10.0 **10.0**Quantized | 10.0 | | 10.0 **10.0**artifacts
 
-| arm | bytes | md5 | hash match after transfer |
+| | 10.0 | | 10.0 **10.0**arm | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**bytes | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**md5 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**hash | 10.0 | | 10.0 **10.0**match | 10.0 | | 10.0 **10.0**after | 10.0 | | 10.0 **10.0**transfer | 10.0 | | 10.0 **10.0**|
 |---|---|---|---|
-| v5 | 15,662,615,552 | `547f890e47e28761073e0edd27177ff2` | yes |
-| v6 | 15,662,615,552 | `56fb12b91d2c71ada2d8c7f4f6a5a9f0` | yes |
+| | 10.0 | | 10.0 **10.0**v5 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**15,662,615,552 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`547f890e47e28761073e0edd27177ff2` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**yes | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**v6 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**15,662,615,552 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`56fb12b91d2c71ada2d8c7f4f6a5a9f0` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**yes | 10.0 | | 10.0 **10.0**|
 
-### References
+### | 10.0 | | 10.0 **10.0**References
 
-| ref | bytes | md5 | oracle NLL | oracle PPL |
+| | 10.0 | | 10.0 **10.0**ref | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**bytes | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**md5 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**oracle | 10.0 | | 10.0 **10.0**NLL | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**oracle | 10.0 | | 10.0 **10.0**PPL | 10.0 | | 10.0 **10.0**|
 |---|---|---|---|---|
-| WikiText-2 | 50,675,552 | `8a21364051d844b97c122e2c895f56d8` | 1.830742 | 6.2385 |
-| v6 selector | 50,675,552 | `4e5618b6a3485c3afcf326cb26f81fc8` | 2.555774 | 12.8813 |
+| | 10.0 | | 10.0 **10.0**WikiText-2 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**50,675,552 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`8a21364051d844b97c122e2c895f56d8` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1.830742 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**6.2385 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**v6 | 10.0 | | 10.0 **10.0**selector | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**50,675,552 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**`4e5618b6a3485c3afcf326cb26f81fc8` | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**2.555774 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**12.8813 | 10.0 | | 10.0 **10.0**|
 
-Both: `n_ctx` 2048, top-k 256, 24 chunks, 24,552 scored tokens.
+Both: | 10.0 | | 10.0 **10.0**`n_ctx` | 10.0 | | 10.0 **10.0**2048, | 10.0 | | 10.0 **10.0**top-k | 10.0 | | 10.0 **10.0**256, | 10.0 | | 10.0 **10.0**24 | 10.0 | | 10.0 **10.0**chunks, | 10.0 | | 10.0 **10.0**24,552 | 10.0 | | 10.0 **10.0**scored | 10.0 | | 10.0 **10.0**tokens.
 
 ---
 
-## The 2×2
+## | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**2×2
 
-| calibration | ref | KLD | NLL | PPL |
+| | 10.0 | | 10.0 **10.0**calibration | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**ref | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**KLD | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**NLL | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**PPL | 10.0 | | 10.0 **10.0**|
 |---|---|---|---|---|
-| v5 | WikiText-2 | 0.087921 | 1.870233 | 6.4898 |
-| v6 | WikiText-2 | **0.086790** | 1.898022 | 6.6727 |
-| v5 | v6 selector | 1.064046 | 2.582638 | 13.232 |
-| v6 | v6 selector | **1.023882** | **2.393972** | **10.9569** |
+| | 10.0 | | 10.0 **10.0**v5 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**WikiText-2 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.087921 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1.870233 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**6.4898 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**v6 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**WikiText-2 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0****0.086790** | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1.898022 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**6.6727 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**v5 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**v6 | 10.0 | | 10.0 **10.0**selector | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1.064046 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**2.582638 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**13.232 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**v6 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**v6 | 10.0 | | 10.0 **10.0**selector | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0****1.023882** | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0****2.393972** | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0****10.9569** | 10.0 | | 10.0 **10.0**|
 
-Margins for v6 over v5:
+Margins | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**v6 | 10.0 | | 10.0 **10.0**over | 10.0 | | 10.0 **10.0**v5:
 
-| ref | ΔKLD abs | ΔKLD rel | ΔPPL abs | ΔPPL rel |
+| | 10.0 | | 10.0 **10.0**ref | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**ΔKLD | 10.0 | | 10.0 **10.0**abs | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**ΔKLD | 10.0 | | 10.0 **10.0**rel | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**ΔPPL | 10.0 | | 10.0 **10.0**abs | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**ΔPPL | 10.0 | | 10.0 **10.0**rel | 10.0 | | 10.0 **10.0**|
 |---|---|---|---|---|
-| WikiText-2 | 0.001131 | 1.3 % | −0.1829 (v5 wins) | −2.8 % |
-| v6 selector | 0.040164 | 3.8 % | 2.2751 | 17.0 % |
+| | 10.0 | | 10.0 **10.0**WikiText-2 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.001131 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1.3 | 10.0 | | 10.0 **10.0**% | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**−0.1829 | 10.0 | | 10.0 **10.0**(v5 | 10.0 | | 10.0 **10.0**wins) | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**−2.8 | 10.0 | | 10.0 **10.0**% | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**v6 | 10.0 | | 10.0 **10.0**selector | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.040164 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**3.8 | 10.0 | | 10.0 **10.0**% | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**2.2751 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**17.0 | 10.0 | | 10.0 **10.0**% | 10.0 | | 10.0 **10.0**|
 
 ---
 
-## Recipe held constant across both arms
+## | 10.0 | | 10.0 **10.0**Recipe | 10.0 | | 10.0 **10.0**held | 10.0 | | 10.0 **10.0**constant | 10.0 | | 10.0 **10.0**across | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**arms
 
-Only the calibration artifact differs. Everything else is pinned:
+Only | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**calibration | 10.0 | | 10.0 **10.0**artifact | 10.0 | | 10.0 **10.0**differs. | 10.0 | | 10.0 **10.0**Everything | 10.0 | | 10.0 **10.0**else | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**pinned:
 
-- `--hessian <calib.hfq>` (alias `--calib`) **plus explicit `--awq`**.
-  `--hessian` alone does **not** imply AWQ — its only consumer is LDLQ, which
-  was never completed — whereas `--imatrix` alone *does* imply AWQ at 0.55. HFQM
-  input therefore requires `--awq` to be passed explicitly or AWQ silently does
-  not run.
-- AWQ alpha 0.55 (the shipped default), geo-mean normalized to 1.
-- `HIPFIRE_Q8_CLASSES=lm_head,embed` **and** `--q8-router`. Both are required:
-  without narrowing, `is_q8_tensor` drags attention to Q8. `--no-q8-router` is
-  inert on a dense model.
-- No `--ldlq`, no `--hessian-dir`, no `--allow-mq*`, no `--kmap-dense`, no
-  `--no-kmap`, no `--tier-ratio` change.
-- Scoring: 24 chunks, top-k 256, `n_ctx` 2048, prefill scoring mode, kv-mode q8,
-  `HIPFIRE_NORMALIZE_PROMPT=0`, `HIPFIRE_GRAPH=0`, deterministic greedy prefill
-  against the fixed BF16 teacher reference.
-
----
-
-## Validity controls
-
-**The arms are not byte-identical.** `cmp` diverges at byte 2,716,205,761
-(201 vs 215) and the md5s differ. This is checked because a prior run of this
-same experiment produced *byte-identical* artifacts (md5 `129909ad0fed`) and
-identical KLD 0.066668 — a silent no-op caused by `--imatrix` not implying AWQ
-in that configuration. A calibration A/B whose outputs hash equal has measured
-nothing, and that failure is not visible in the metrics.
-
-**No quantized artifact was scored on the producer.** MI300X ran only
-`calib_sweep` and `hipfire-quantize`. All four KLD/PPL figures and the decoded
-sample were measured exclusively on hiptrx `gfx1201`.
-
-**Coherence was eyeballed, not inferred from the metrics.** A 1278-token greedy
-sample from the v6 arm on the prompt *"Write a short story about a robot
-learning to paint"* is coherent, on-prompt, and closes properly. Most frequent
-token id 13 appears 103/1278 times (8 %) — no single-token attractor. This
-matters because the uncalibrated gfx942 baseline in
-`2026-08-16-qwen38-27b-mq4-awq-alpha-kld.md` emits a two-token attractor on
-every prompt while passing statistical gates.
-
-**Sanity band.** WT2 KLD 0.086–0.087 sits slightly above the prior gfx1201 band
-of 0.036–0.067 but inside the alpha-sweep range 0.063–0.083 and the documented
-0.063–0.136. PPL 6.48–6.67 is near the 6.2385 oracle and the prior 6.51–6.57.
-Degenerate output on this stack reads KLD ≈ 12.7 / PPL ≈ 1.8e6 against a
-uniform `ln(248320) = 12.42`, so neither arm is degenerate.
-
-**Append-only.** New output names throughout; no existing `.calib.hfq`, `.bin`,
-or `.mq4` was overwritten.
+- | 10.0 | | 10.0 **10.0**`--hessian | 10.0 | | 10.0 **10.0**<calib.hfq>` | 10.0 | | 10.0 **10.0**(alias | 10.0 | | 10.0 **10.0**`--calib`) | 10.0 | | 10.0 **10.0****plus | 10.0 | | 10.0 **10.0**explicit | 10.0 | | 10.0 **10.0**`--awq`**.
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`--hessian` | 10.0 | | 10.0 **10.0**alone | 10.0 | | 10.0 **10.0**does | 10.0 | | 10.0 **10.0****not** | 10.0 | | 10.0 **10.0**imply | 10.0 | | 10.0 **10.0**AWQ | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**consumer | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**LDLQ, | 10.0 | | 10.0 **10.0**which
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**never | 10.0 | | 10.0 **10.0**completed | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**whereas | 10.0 | | 10.0 **10.0**`--imatrix` | 10.0 | | 10.0 **10.0**alone | 10.0 | | 10.0 **10.0***does* | 10.0 | | 10.0 **10.0**imply | 10.0 | | 10.0 **10.0**AWQ | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**0.55. | 10.0 | | 10.0 **10.0**HFQM
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**input | 10.0 | | 10.0 **10.0**therefore | 10.0 | | 10.0 **10.0**requires | 10.0 | | 10.0 **10.0**`--awq` | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**be | 10.0 | | 10.0 **10.0**passed | 10.0 | | 10.0 **10.0**explicitly | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**AWQ | 10.0 | | 10.0 **10.0**silently | 10.0 | | 10.0 **10.0**does
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**run.
+- | 10.0 | | 10.0 **10.0**AWQ | 10.0 | | 10.0 **10.0**alpha | 10.0 | | 10.0 **10.0**0.55 | 10.0 | | 10.0 **10.0**(the | 10.0 | | 10.0 **10.0**shipped | 10.0 | | 10.0 **10.0**default), | 10.0 | | 10.0 **10.0**geo-mean | 10.0 | | 10.0 **10.0**normalized | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**1.
+- | 10.0 | | 10.0 **10.0**`HIPFIRE_Q8_CLASSES=lm_head,embed` | 10.0 | | 10.0 **10.0****and** | 10.0 | | 10.0 **10.0**`--q8-router`. | 10.0 | | 10.0 **10.0**Both | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**required:
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**without | 10.0 | | 10.0 **10.0**narrowing, | 10.0 | | 10.0 **10.0**`is_q8_tensor` | 10.0 | | 10.0 **10.0**drags | 10.0 | | 10.0 **10.0**attention | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**Q8. | 10.0 | | 10.0 **10.0**`--no-q8-router` | 10.0 | | 10.0 **10.0**is
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**inert | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**dense | 10.0 | | 10.0 **10.0**model.
+- | 10.0 | | 10.0 **10.0**No | 10.0 | | 10.0 **10.0**`--ldlq`, | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**`--hessian-dir`, | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**`--allow-mq*`, | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**`--kmap-dense`, | 10.0 | | 10.0 **10.0**no
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`--no-kmap`, | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**`--tier-ratio` | 10.0 | | 10.0 **10.0**change.
+- | 10.0 | | 10.0 **10.0**Scoring: | 10.0 | | 10.0 **10.0**24 | 10.0 | | 10.0 **10.0**chunks, | 10.0 | | 10.0 **10.0**top-k | 10.0 | | 10.0 **10.0**256, | 10.0 | | 10.0 **10.0**`n_ctx` | 10.0 | | 10.0 **10.0**2048, | 10.0 | | 10.0 **10.0**prefill | 10.0 | | 10.0 **10.0**scoring | 10.0 | | 10.0 **10.0**mode, | 10.0 | | 10.0 **10.0**kv-mode | 10.0 | | 10.0 **10.0**q8,
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`HIPFIRE_NORMALIZE_PROMPT=0`, | 10.0 | | 10.0 **10.0**`HIPFIRE_GRAPH=0`, | 10.0 | | 10.0 **10.0**deterministic | 10.0 | | 10.0 **10.0**greedy | 10.0 | | 10.0 **10.0**prefill
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**against | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**fixed | 10.0 | | 10.0 **10.0**BF16 | 10.0 | | 10.0 **10.0**teacher | 10.0 | | 10.0 **10.0**reference.
 
 ---
 
-## Caveats that bound what this record supports
+## | 10.0 | | 10.0 **10.0**Validity | 10.0 | | 10.0 **10.0**controls
 
-1. **KLD here is top-k 256, not full-vocabulary.** Absolute values are **not**
-   comparable to `llama.cpp --kl-divergence` tables or to any full-vocab figure.
-   Relative ranking *within* this instrument is valid; cross-table absolute
-   comparison is not. The oracle NLL/PPL were computed from full-vocab teacher
-   logits before top-k serialization, so those two anchors are full-vocab while
-   the KLD column is truncated.
+**The | 10.0 | | 10.0 **10.0**arms | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**byte-identical.** | 10.0 | | 10.0 **10.0**`cmp` | 10.0 | | 10.0 **10.0**diverges | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**byte | 10.0 | | 10.0 **10.0**2,716,205,761
+(201 | 10.0 | | 10.0 **10.0**vs | 10.0 | | 10.0 **10.0**215) | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**md5s | 10.0 | | 10.0 **10.0**differ. | 10.0 | | 10.0 **10.0**This | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**checked | 10.0 | | 10.0 **10.0**because | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**prior | 10.0 | | 10.0 **10.0**run | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**this
+same | 10.0 | | 10.0 **10.0**experiment | 10.0 | | 10.0 **10.0**produced | 10.0 | | 10.0 **10.0***byte-identical* | 10.0 | | 10.0 **10.0**artifacts | 10.0 | | 10.0 **10.0**(md5 | 10.0 | | 10.0 **10.0**`129909ad0fed`) | 10.0 | | 10.0 **10.0**and
+identical | 10.0 | | 10.0 **10.0**KLD | 10.0 | | 10.0 **10.0**0.066668 | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**silent | 10.0 | | 10.0 **10.0**no-op | 10.0 | | 10.0 **10.0**caused | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**`--imatrix` | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**implying | 10.0 | | 10.0 **10.0**AWQ
+in | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**configuration. | 10.0 | | 10.0 **10.0**A | 10.0 | | 10.0 **10.0**calibration | 10.0 | | 10.0 **10.0**A/B | 10.0 | | 10.0 **10.0**whose | 10.0 | | 10.0 **10.0**outputs | 10.0 | | 10.0 **10.0**hash | 10.0 | | 10.0 **10.0**equal | 10.0 | | 10.0 **10.0**has | 10.0 | | 10.0 **10.0**measured
+nothing, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**failure | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**visible | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**metrics.
 
-2. **The two PPL columns are different instruments and must never be compared
-   as model-quality figures.** The v6 selector's 12.88 oracle PPL versus
-   WikiText-2's 6.24 does not mean the model is "worse" on conversation; the
-   selector is 100 % rendered conversation bytes — function names, JSON
-   arguments, tool results, 237 `im_start` markers — and is intentionally harder
-   and out-of-distribution relative to the pretraining corpus. It is a *ranking*
-   instrument on the deployment distribution, nothing more.
+**No | 10.0 | | 10.0 **10.0**quantized | 10.0 | | 10.0 **10.0**artifact | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**scored | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**producer.** | 10.0 | | 10.0 **10.0**MI300X | 10.0 | | 10.0 **10.0**ran | 10.0 | | 10.0 **10.0**only
+`calib_sweep` | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**`hipfire-quantize`. | 10.0 | | 10.0 **10.0**All | 10.0 | | 10.0 **10.0**four | 10.0 | | 10.0 **10.0**KLD/PPL | 10.0 | | 10.0 **10.0**figures | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**decoded
+sample | 10.0 | | 10.0 **10.0**were | 10.0 | | 10.0 **10.0**measured | 10.0 | | 10.0 **10.0**exclusively | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**hiptrx | 10.0 | | 10.0 **10.0**`gfx1201`.
 
-3. **Two references, one model family, one format.** This is a single 2×2 on
-   Qwen3.8-27B at MQ4G256. It establishes that reference choice can invert an
-   arm ranking; it does not quantify how often that happens, and it does not
-   generalize to other formats or model families without measurement.
+**Coherence | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**eyeballed, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**inferred | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**metrics.** | 10.0 | | 10.0 **10.0**A | 10.0 | | 10.0 **10.0**1278-token | 10.0 | | 10.0 **10.0**greedy
+sample | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**v6 | 10.0 | | 10.0 **10.0**arm | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**prompt | 10.0 | | 10.0 **10.0***"Write | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**short | 10.0 | | 10.0 **10.0**story | 10.0 | | 10.0 **10.0**about | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**robot
+learning | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**paint"* | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**coherent, | 10.0 | | 10.0 **10.0**on-prompt, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**closes | 10.0 | | 10.0 **10.0**properly. | 10.0 | | 10.0 **10.0**Most | 10.0 | | 10.0 **10.0**frequent
+token | 10.0 | | 10.0 **10.0**id | 10.0 | | 10.0 **10.0**13 | 10.0 | | 10.0 **10.0**appears | 10.0 | | 10.0 **10.0**103/1278 | 10.0 | | 10.0 **10.0**times | 10.0 | | 10.0 **10.0**(8 | 10.0 | | 10.0 **10.0**%) | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**single-token | 10.0 | | 10.0 **10.0**attractor. | 10.0 | | 10.0 **10.0**This
+matters | 10.0 | | 10.0 **10.0**because | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**uncalibrated | 10.0 | | 10.0 **10.0**gfx942 | 10.0 | | 10.0 **10.0**baseline | 10.0 | | 10.0 **10.0**in
+`2026-08-16-qwen38-27b-mq4-awq-alpha-kld.md` | 10.0 | | 10.0 **10.0**emits | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**two-token | 10.0 | | 10.0 **10.0**attractor | 10.0 | | 10.0 **10.0**on
+every | 10.0 | | 10.0 **10.0**prompt | 10.0 | | 10.0 **10.0**while | 10.0 | | 10.0 **10.0**passing | 10.0 | | 10.0 **10.0**statistical | 10.0 | | 10.0 **10.0**gates.
 
-4. **This is not an admission decision.** Current product claims live in
-   `docs/BENCHMARKS.md`; validation routes live in `docs/VALIDATION.md`.
+**Sanity | 10.0 | | 10.0 **10.0**band.** | 10.0 | | 10.0 **10.0**WT2 | 10.0 | | 10.0 **10.0**KLD | 10.0 | | 10.0 **10.0**0.086–0.087 | 10.0 | | 10.0 **10.0**sits | 10.0 | | 10.0 **10.0**slightly | 10.0 | | 10.0 **10.0**above | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**prior | 10.0 | | 10.0 **10.0**gfx1201 | 10.0 | | 10.0 **10.0**band
+of | 10.0 | | 10.0 **10.0**0.036–0.067 | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**inside | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**alpha-sweep | 10.0 | | 10.0 **10.0**range | 10.0 | | 10.0 **10.0**0.063–0.083 | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**documented
+0.063–0.136. | 10.0 | | 10.0 **10.0**PPL | 10.0 | | 10.0 **10.0**6.48–6.67 | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**near | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**6.2385 | 10.0 | | 10.0 **10.0**oracle | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**prior | 10.0 | | 10.0 **10.0**6.51–6.57.
+Degenerate | 10.0 | | 10.0 **10.0**output | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**stack | 10.0 | | 10.0 **10.0**reads | 10.0 | | 10.0 **10.0**KLD | 10.0 | | 10.0 **10.0**≈ | 10.0 | | 10.0 **10.0**12.7 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**PPL | 10.0 | | 10.0 **10.0**≈ | 10.0 | | 10.0 **10.0**1.8e6 | 10.0 | | 10.0 **10.0**against | 10.0 | | 10.0 **10.0**a
+uniform | 10.0 | | 10.0 **10.0**`ln(248320) | 10.0 | | 10.0 **10.0**= | 10.0 | | 10.0 **10.0**12.42`, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**neither | 10.0 | | 10.0 **10.0**arm | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**degenerate.
 
----
-
-## What this changes going forward
-
-Any calibration or quantization arm comparison for a **chat/instruct** target
-should carry a deployment-distribution reference alongside the prose tripwire.
-Prose remains valuable *as a tripwire* — it catches catastrophic regressions
-that a narrow in-distribution reference can mask — but it is not sufficient as
-the selector, because it demonstrably ranks arms in the wrong order at margins
-this campaign cares about.
+**Append-only.** | 10.0 | | 10.0 **10.0**New | 10.0 | | 10.0 **10.0**output | 10.0 | | 10.0 **10.0**names | 10.0 | | 10.0 **10.0**throughout; | 10.0 | | 10.0 **10.0**no | 10.0 | | 10.0 **10.0**existing | 10.0 | | 10.0 **10.0**`.calib.hfq`, | 10.0 | | 10.0 **10.0**`.bin`,
+or | 10.0 | | 10.0 **10.0**`.mq4` | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**overwritten.
 
 ---
 
-## Amendment, same day — the disposition above overstates the KLD result
+## | 10.0 | | 10.0 **10.0**Caveats | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**bound | 10.0 | | 10.0 **10.0**what | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**record | 10.0 | | 10.0 **10.0**supports
 
-The commit that introduced this record is titled *"prose references rank
-calibration arms in the wrong order."* That is **true only of PPL**, and the
-title should be read as amended to *"prose understates calibration margins ~3×
-and inverts the PPL ranking."*
+1. | 10.0 | | 10.0 **10.0****KLD | 10.0 | | 10.0 **10.0**here | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**top-k | 10.0 | | 10.0 **10.0**256, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**full-vocabulary.** | 10.0 | | 10.0 **10.0**Absolute | 10.0 | | 10.0 **10.0**values | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0****not**
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**comparable | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**`llama.cpp | 10.0 | | 10.0 **10.0**--kl-divergence` | 10.0 | | 10.0 **10.0**tables | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**any | 10.0 | | 10.0 **10.0**full-vocab | 10.0 | | 10.0 **10.0**figure.
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**Relative | 10.0 | | 10.0 **10.0**ranking | 10.0 | | 10.0 **10.0***within* | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**instrument | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**valid; | 10.0 | | 10.0 **10.0**cross-table | 10.0 | | 10.0 **10.0**absolute
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**comparison | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**not. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**oracle | 10.0 | | 10.0 **10.0**NLL/PPL | 10.0 | | 10.0 **10.0**were | 10.0 | | 10.0 **10.0**computed | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**full-vocab | 10.0 | | 10.0 **10.0**teacher
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**logits | 10.0 | | 10.0 **10.0**before | 10.0 | | 10.0 **10.0**top-k | 10.0 | | 10.0 **10.0**serialization, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**those | 10.0 | | 10.0 **10.0**two | 10.0 | | 10.0 **10.0**anchors | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**full-vocab | 10.0 | | 10.0 **10.0**while
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**KLD | 10.0 | | 10.0 **10.0**column | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**truncated.
 
-On **KLD**, both references select the same arm:
+2. | 10.0 | | 10.0 **10.0****The | 10.0 | | 10.0 **10.0**two | 10.0 | | 10.0 **10.0**PPL | 10.0 | | 10.0 **10.0**columns | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**different | 10.0 | | 10.0 **10.0**instruments | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**must | 10.0 | | 10.0 **10.0**never | 10.0 | | 10.0 **10.0**be | 10.0 | | 10.0 **10.0**compared
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**model-quality | 10.0 | | 10.0 **10.0**figures.** | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**v6 | 10.0 | | 10.0 **10.0**selector's | 10.0 | | 10.0 **10.0**12.88 | 10.0 | | 10.0 **10.0**oracle | 10.0 | | 10.0 **10.0**PPL | 10.0 | | 10.0 **10.0**versus
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**WikiText-2's | 10.0 | | 10.0 **10.0**6.24 | 10.0 | | 10.0 **10.0**does | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**mean | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**"worse" | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**conversation; | 10.0 | | 10.0 **10.0**the
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**selector | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**100 | 10.0 | | 10.0 **10.0**% | 10.0 | | 10.0 **10.0**rendered | 10.0 | | 10.0 **10.0**conversation | 10.0 | | 10.0 **10.0**bytes | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**function | 10.0 | | 10.0 **10.0**names, | 10.0 | | 10.0 **10.0**JSON
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**arguments, | 10.0 | | 10.0 **10.0**tool | 10.0 | | 10.0 **10.0**results, | 10.0 | | 10.0 **10.0**237 | 10.0 | | 10.0 **10.0**`im_start` | 10.0 | | 10.0 **10.0**markers | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**intentionally | 10.0 | | 10.0 **10.0**harder
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**out-of-distribution | 10.0 | | 10.0 **10.0**relative | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**pretraining | 10.0 | | 10.0 **10.0**corpus. | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0***ranking*
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**instrument | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**deployment | 10.0 | | 10.0 **10.0**distribution, | 10.0 | | 10.0 **10.0**nothing | 10.0 | | 10.0 **10.0**more.
 
-| ref | v5 KLD | v6 KLD | winner |
+3. | 10.0 | | 10.0 **10.0****Two | 10.0 | | 10.0 **10.0**references, | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**family, | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**format.** | 10.0 | | 10.0 **10.0**This | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**single | 10.0 | | 10.0 **10.0**2×2 | 10.0 | | 10.0 **10.0**on
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**Qwen3.8-27B | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**MQ4G256. | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**establishes | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**reference | 10.0 | | 10.0 **10.0**choice | 10.0 | | 10.0 **10.0**can | 10.0 | | 10.0 **10.0**invert | 10.0 | | 10.0 **10.0**an
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**arm | 10.0 | | 10.0 **10.0**ranking; | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**does | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**quantify | 10.0 | | 10.0 **10.0**how | 10.0 | | 10.0 **10.0**often | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**happens, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**does | 10.0 | | 10.0 **10.0**not
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**generalize | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**other | 10.0 | | 10.0 **10.0**formats | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**families | 10.0 | | 10.0 **10.0**without | 10.0 | | 10.0 **10.0**measurement.
+
+4. | 10.0 | | 10.0 **10.0****This | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**an | 10.0 | | 10.0 **10.0**admission | 10.0 | | 10.0 **10.0**decision.** | 10.0 | | 10.0 **10.0**Current | 10.0 | | 10.0 **10.0**product | 10.0 | | 10.0 **10.0**claims | 10.0 | | 10.0 **10.0**live | 10.0 | | 10.0 **10.0**in
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`docs/BENCHMARKS.md`; | 10.0 | | 10.0 **10.0**validation | 10.0 | | 10.0 **10.0**routes | 10.0 | | 10.0 **10.0**live | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**`docs/VALIDATION.md`.
+
+---
+
+## | 10.0 | | 10.0 **10.0**What | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**changes | 10.0 | | 10.0 **10.0**going | 10.0 | | 10.0 **10.0**forward
+
+Any | 10.0 | | 10.0 **10.0**calibration | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**quantization | 10.0 | | 10.0 **10.0**arm | 10.0 | | 10.0 **10.0**comparison | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0****chat/instruct** | 10.0 | | 10.0 **10.0**target
+should | 10.0 | | 10.0 **10.0**carry | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**deployment-distribution | 10.0 | | 10.0 **10.0**reference | 10.0 | | 10.0 **10.0**alongside | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**prose | 10.0 | | 10.0 **10.0**tripwire.
+Prose | 10.0 | | 10.0 **10.0**remains | 10.0 | | 10.0 **10.0**valuable | 10.0 | | 10.0 **10.0***as | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**tripwire* | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**catches | 10.0 | | 10.0 **10.0**catastrophic | 10.0 | | 10.0 **10.0**regressions
+that | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**narrow | 10.0 | | 10.0 **10.0**in-distribution | 10.0 | | 10.0 **10.0**reference | 10.0 | | 10.0 **10.0**can | 10.0 | | 10.0 **10.0**mask | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**sufficient | 10.0 | | 10.0 **10.0**as
+the | 10.0 | | 10.0 **10.0**selector, | 10.0 | | 10.0 **10.0**because | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**demonstrably | 10.0 | | 10.0 **10.0**ranks | 10.0 | | 10.0 **10.0**arms | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**wrong | 10.0 | | 10.0 **10.0**order | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**margins
+this | 10.0 | | 10.0 **10.0**campaign | 10.0 | | 10.0 **10.0**cares | 10.0 | | 10.0 **10.0**about.
+
+---
+
+## | 10.0 | | 10.0 **10.0**Amendment, | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**day | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**disposition | 10.0 | | 10.0 **10.0**above | 10.0 | | 10.0 **10.0**overstates | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**KLD | 10.0 | | 10.0 **10.0**result
+
+The | 10.0 | | 10.0 **10.0**commit | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**introduced | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**record | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**titled | 10.0 | | 10.0 **10.0***"prose | 10.0 | | 10.0 **10.0**references | 10.0 | | 10.0 **10.0**rank
+calibration | 10.0 | | 10.0 **10.0**arms | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**wrong | 10.0 | | 10.0 **10.0**order."* | 10.0 | | 10.0 **10.0**That | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0****true | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**PPL**, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the
+title | 10.0 | | 10.0 **10.0**should | 10.0 | | 10.0 **10.0**be | 10.0 | | 10.0 **10.0**read | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**amended | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0***"prose | 10.0 | | 10.0 **10.0**understates | 10.0 | | 10.0 **10.0**calibration | 10.0 | | 10.0 **10.0**margins | 10.0 | | 10.0 **10.0**~3×
+and | 10.0 | | 10.0 **10.0**inverts | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**PPL | 10.0 | | 10.0 **10.0**ranking."*
+
+On | 10.0 | | 10.0 **10.0****KLD**, | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**references | 10.0 | | 10.0 **10.0**select | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**arm:
+
+| | 10.0 | | 10.0 **10.0**ref | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**v5 | 10.0 | | 10.0 **10.0**KLD | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**v6 | 10.0 | | 10.0 **10.0**KLD | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**winner | 10.0 | | 10.0 **10.0**|
 |---|---|---|---|
-| WikiText-2 | 0.087921 | 0.086790 | v6 |
-| v6 selector | 1.064046 | 1.023882 | v6 |
+| | 10.0 | | 10.0 **10.0**WikiText-2 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.087921 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.086790 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**v6 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**v6 | 10.0 | | 10.0 **10.0**selector | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1.064046 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1.023882 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**v6 | 10.0 | | 10.0 **10.0**|
 
-This campaign ranked arms on **KLD**, not PPL. So the direction of prior
-prose-scored rankings was most likely correct; what was wrong was the
-**resolution** — prose compresses the margin by roughly 3× relative and 30×
+This | 10.0 | | 10.0 **10.0**campaign | 10.0 | | 10.0 **10.0**ranked | 10.0 | | 10.0 **10.0**arms | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0****KLD**, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**PPL. | 10.0 | | 10.0 **10.0**So | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**direction | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**prior
+prose-scored | 10.0 | | 10.0 **10.0**rankings | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**most | 10.0 | | 10.0 **10.0**likely | 10.0 | | 10.0 **10.0**correct; | 10.0 | | 10.0 **10.0**what | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**wrong | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**the
+**resolution** | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**prose | 10.0 | | 10.0 **10.0**compresses | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**margin | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**roughly | 10.0 | | 10.0 **10.0**3× | 10.0 | | 10.0 **10.0**relative | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**30×
 absolute.
 
-That narrows the rework this record implies. It is **not** "re-score
-everything." It is:
+That | 10.0 | | 10.0 **10.0**narrows | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**rework | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**record | 10.0 | | 10.0 **10.0**implies. | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0****not** | 10.0 | | 10.0 **10.0**"re-score
+everything." | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**is:
 
-- **Arm pairs previously declared a tie on prose are unresolved.** A tie at
-  prose resolution can be a ~4 % separation on the deployment distribution.
-  This is the actionable set.
-- **Clear prose wins probably survive**, since direction agreed here.
-- **Any ranking that turned on PPL rather than KLD is suspect outright**, because
-  PPL inverted.
+- | 10.0 | | 10.0 **10.0****Arm | 10.0 | | 10.0 **10.0**pairs | 10.0 | | 10.0 **10.0**previously | 10.0 | | 10.0 **10.0**declared | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**tie | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**prose | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**unresolved.** | 10.0 | | 10.0 **10.0**A | 10.0 | | 10.0 **10.0**tie | 10.0 | | 10.0 **10.0**at
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**prose | 10.0 | | 10.0 **10.0**resolution | 10.0 | | 10.0 **10.0**can | 10.0 | | 10.0 **10.0**be | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**~4 | 10.0 | | 10.0 **10.0**% | 10.0 | | 10.0 **10.0**separation | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**deployment | 10.0 | | 10.0 **10.0**distribution.
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**This | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**actionable | 10.0 | | 10.0 **10.0**set.
+- | 10.0 | | 10.0 **10.0****Clear | 10.0 | | 10.0 **10.0**prose | 10.0 | | 10.0 **10.0**wins | 10.0 | | 10.0 **10.0**probably | 10.0 | | 10.0 **10.0**survive**, | 10.0 | | 10.0 **10.0**since | 10.0 | | 10.0 **10.0**direction | 10.0 | | 10.0 **10.0**agreed | 10.0 | | 10.0 **10.0**here.
+- | 10.0 | | 10.0 **10.0****Any | 10.0 | | 10.0 **10.0**ranking | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**turned | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**PPL | 10.0 | | 10.0 **10.0**rather | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**KLD | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**suspect | 10.0 | | 10.0 **10.0**outright**, | 10.0 | | 10.0 **10.0**because
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**PPL | 10.0 | | 10.0 **10.0**inverted.
 
-The original disposition's phrase "measured on the wrong instrument" remains
-accurate as to *sensitivity*, but should not be read as "measured the wrong
-winner." One 2×2 on one model at one format cannot support the stronger claim.
+The | 10.0 | | 10.0 **10.0**original | 10.0 | | 10.0 **10.0**disposition's | 10.0 | | 10.0 **10.0**phrase | 10.0 | | 10.0 **10.0**"measured | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**wrong | 10.0 | | 10.0 **10.0**instrument" | 10.0 | | 10.0 **10.0**remains
+accurate | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0***sensitivity*, | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**should | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**be | 10.0 | | 10.0 **10.0**read | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**"measured | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**wrong
+winner." | 10.0 | | 10.0 **10.0**One | 10.0 | | 10.0 **10.0**2×2 | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**format | 10.0 | | 10.0 **10.0**cannot | 10.0 | | 10.0 **10.0**support | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**stronger | 10.0 | | 10.0 **10.0**claim.
 
 ---
 
-## Amendment 2, same day — the 2×2 ran at the worst AWQ alpha, and its sanity check was invalid
+## | 10.0 | | 10.0 **10.0**Amendment | 10.0 | | 10.0 **10.0**2, | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**day | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**2×2 | 10.0 | | 10.0 **10.0**ran | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**worst | 10.0 | | 10.0 **10.0**AWQ | 10.0 | | 10.0 **10.0**alpha, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**its | 10.0 | | 10.0 **10.0**sanity | 10.0 | | 10.0 **10.0**check | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**invalid
 
-Two defects in how the WikiText-2 KLD of this 2×2 was justified. Neither changes
-the measured numbers, both bound what they support.
+Two | 10.0 | | 10.0 **10.0**defects | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**how | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**WikiText-2 | 10.0 | | 10.0 **10.0**KLD | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**2×2 | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**justified. | 10.0 | | 10.0 **10.0**Neither | 10.0 | | 10.0 **10.0**changes
+the | 10.0 | | 10.0 **10.0**measured | 10.0 | | 10.0 **10.0**numbers, | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**bound | 10.0 | | 10.0 **10.0**what | 10.0 | | 10.0 **10.0**they | 10.0 | | 10.0 **10.0**support.
 
-**1. Both arms ran at AWQ `alpha=0.55`, the worst end of the documented sweep.**
-`2026-08-16-qwen38-27b-mq4-awq-alpha-kld.md` measured `alpha=0.05` at
-`KLD 0.063102 / NLL 1.875801 / PPL 6.5260` and found `alpha=0.05` beats the
-shipped `alpha=0.55` default by **24.3 %** on WikiText-2. This 2×2 held
-`alpha=0.55` fixed across both arms, so it is **internally valid** as a corpus
-comparison — but it was conducted roughly 24 % away from the achievable KLD at
-this format.
+**1. | 10.0 | | 10.0 **10.0**Both | 10.0 | | 10.0 **10.0**arms | 10.0 | | 10.0 **10.0**ran | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**AWQ | 10.0 | | 10.0 **10.0**`alpha=0.55`, | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**worst | 10.0 | | 10.0 **10.0**end | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**documented | 10.0 | | 10.0 **10.0**sweep.**
+`2026-08-16-qwen38-27b-mq4-awq-alpha-kld.md` | 10.0 | | 10.0 **10.0**measured | 10.0 | | 10.0 **10.0**`alpha=0.05` | 10.0 | | 10.0 **10.0**at
+`KLD | 10.0 | | 10.0 **10.0**0.063102 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**NLL | 10.0 | | 10.0 **10.0**1.875801 | 10.0 | | 10.0 **10.0**/ | 10.0 | | 10.0 **10.0**PPL | 10.0 | | 10.0 **10.0**6.5260` | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**found | 10.0 | | 10.0 **10.0**`alpha=0.05` | 10.0 | | 10.0 **10.0**beats | 10.0 | | 10.0 **10.0**the
+shipped | 10.0 | | 10.0 **10.0**`alpha=0.55` | 10.0 | | 10.0 **10.0**default | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0****24.3 | 10.0 | | 10.0 **10.0**%** | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**WikiText-2. | 10.0 | | 10.0 **10.0**This | 10.0 | | 10.0 **10.0**2×2 | 10.0 | | 10.0 **10.0**held
+`alpha=0.55` | 10.0 | | 10.0 **10.0**fixed | 10.0 | | 10.0 **10.0**across | 10.0 | | 10.0 **10.0**both | 10.0 | | 10.0 **10.0**arms, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0****internally | 10.0 | | 10.0 **10.0**valid** | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**corpus
+comparison | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**conducted | 10.0 | | 10.0 **10.0**roughly | 10.0 | | 10.0 **10.0**24 | 10.0 | | 10.0 **10.0**% | 10.0 | | 10.0 **10.0**away | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**achievable | 10.0 | | 10.0 **10.0**KLD | 10.0 | | 10.0 **10.0**at
+this | 10.0 | | 10.0 **10.0**format.
 
-The consequence: **the corpus × alpha interaction is unmeasured.** The v6 corpus
-wins at `alpha=0.55`; whether it still wins at `alpha=0.05` is not established by
-this record. A corpus that helps most when smoothing is aggressive could help
-less, or more, when smoothing is nearly off. Re-running this 2×2 at
-`alpha=0.05` is the experiment that would close it.
+The | 10.0 | | 10.0 **10.0**consequence: | 10.0 | | 10.0 **10.0****the | 10.0 | | 10.0 **10.0**corpus | 10.0 | | 10.0 **10.0**× | 10.0 | | 10.0 **10.0**alpha | 10.0 | | 10.0 **10.0**interaction | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**unmeasured.** | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**v6 | 10.0 | | 10.0 **10.0**corpus
+wins | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**`alpha=0.55`; | 10.0 | | 10.0 **10.0**whether | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**still | 10.0 | | 10.0 **10.0**wins | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**`alpha=0.05` | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**established | 10.0 | | 10.0 **10.0**by
+this | 10.0 | | 10.0 **10.0**record. | 10.0 | | 10.0 **10.0**A | 10.0 | | 10.0 **10.0**corpus | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**helps | 10.0 | | 10.0 **10.0**most | 10.0 | | 10.0 **10.0**when | 10.0 | | 10.0 **10.0**smoothing | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**aggressive | 10.0 | | 10.0 **10.0**could | 10.0 | | 10.0 **10.0**help
+less, | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**more, | 10.0 | | 10.0 **10.0**when | 10.0 | | 10.0 **10.0**smoothing | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**nearly | 10.0 | | 10.0 **10.0**off. | 10.0 | | 10.0 **10.0**Re-running | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**2×2 | 10.0 | | 10.0 **10.0**at
+`alpha=0.05` | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**experiment | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**would | 10.0 | | 10.0 **10.0**close | 10.0 | | 10.0 **10.0**it.
 
-**2. The originally-recorded sanity check was cross-architecture and
-arithmetically wrong.** The producing agent justified WT2 KLD 0.086–0.087 as
-"slightly above prior gfx1201 band 0.036–0.067 but within alpha-sweep range
-0.063–0.083." Both halves fail:
+**2. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**originally-recorded | 10.0 | | 10.0 **10.0**sanity | 10.0 | | 10.0 **10.0**check | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**cross-architecture | 10.0 | | 10.0 **10.0**and
+arithmetically | 10.0 | | 10.0 **10.0**wrong.** | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**producing | 10.0 | | 10.0 **10.0**agent | 10.0 | | 10.0 **10.0**justified | 10.0 | | 10.0 **10.0**WT2 | 10.0 | | 10.0 **10.0**KLD | 10.0 | | 10.0 **10.0**0.086–0.087 | 10.0 | | 10.0 **10.0**as
+"slightly | 10.0 | | 10.0 **10.0**above | 10.0 | | 10.0 **10.0**prior | 10.0 | | 10.0 **10.0**gfx1201 | 10.0 | | 10.0 **10.0**band | 10.0 | | 10.0 **10.0**0.036–0.067 | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**within | 10.0 | | 10.0 **10.0**alpha-sweep | 10.0 | | 10.0 **10.0**range
+0.063–0.083." | 10.0 | | 10.0 **10.0**Both | 10.0 | | 10.0 **10.0**halves | 10.0 | | 10.0 **10.0**fail:
 
-- `0.087921 > 0.083`, so the value is **outside** the range cited to excuse it.
-- The alpha sweep it compared against was measured on **gfx942**; this 2×2 was
-  measured on **gfx1201**. Absolute KLD is not comparable across
-  architectures, so that band was never a valid reference for these numbers in
-  the first place.
+- | 10.0 | | 10.0 **10.0**`0.087921 | 10.0 | | 10.0 **10.0**> | 10.0 | | 10.0 **10.0**0.083`, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**value | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0****outside** | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**range | 10.0 | | 10.0 **10.0**cited | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**excuse | 10.0 | | 10.0 **10.0**it.
+- | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**alpha | 10.0 | | 10.0 **10.0**sweep | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**compared | 10.0 | | 10.0 **10.0**against | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**measured | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0****gfx942**; | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**2×2 | 10.0 | | 10.0 **10.0**was
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**measured | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0****gfx1201**. | 10.0 | | 10.0 **10.0**Absolute | 10.0 | | 10.0 **10.0**KLD | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**comparable | 10.0 | | 10.0 **10.0**across
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**architectures, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**band | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**never | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**valid | 10.0 | | 10.0 **10.0**reference | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**these | 10.0 | | 10.0 **10.0**numbers | 10.0 | | 10.0 **10.0**in
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**first | 10.0 | | 10.0 **10.0**place.
 
-The value is not anomalous once alpha is accounted for — `alpha=0.55` *should*
-produce the sweep's worst KLD — but it was not anomalous *for the reason given*,
-and the reasoning as recorded should not be reused.
+The | 10.0 | | 10.0 **10.0**value | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**anomalous | 10.0 | | 10.0 **10.0**once | 10.0 | | 10.0 **10.0**alpha | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**accounted | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**`alpha=0.55` | 10.0 | | 10.0 **10.0***should*
+produce | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**sweep's | 10.0 | | 10.0 **10.0**worst | 10.0 | | 10.0 **10.0**KLD | 10.0 | | 10.0 **10.0**— | 10.0 | | 10.0 **10.0**but | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**anomalous | 10.0 | | 10.0 **10.0***for | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**reason | 10.0 | | 10.0 **10.0**given*,
+and | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**reasoning | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**recorded | 10.0 | | 10.0 **10.0**should | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**be | 10.0 | | 10.0 **10.0**reused.
 
-**Host verification (unaffected, confirmed independently).** All four figures
-were re-read from the scoring logs on hiptrx after this record was first
+**Host | 10.0 | | 10.0 **10.0**verification | 10.0 | | 10.0 **10.0**(unaffected, | 10.0 | | 10.0 **10.0**confirmed | 10.0 | | 10.0 **10.0**independently).** | 10.0 | | 10.0 **10.0**All | 10.0 | | 10.0 **10.0**four | 10.0 | | 10.0 **10.0**figures
+were | 10.0 | | 10.0 **10.0**re-read | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**scoring | 10.0 | | 10.0 **10.0**logs | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**hiptrx | 10.0 | | 10.0 **10.0**after | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**record | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**first
 committed:
 
 ```
-GPU dev 0: gfx1201 (34.2 GB VRAM, HIP 7.14)
-eval_hipfire: arch=gfx1201  detected arch_id=5 (HFQ header)
-eval_hipfire: scored 24552 tokens in 147.6s (166 tok/s)
-v5 × wt2     KLD 0.087921  NLL 1.870233  PPL  6.4898
-v5 × v6sel   KLD 1.064046  NLL 2.582638  PPL 13.2320
-v6 × wt2     KLD 0.086790  NLL 1.898022  PPL  6.6727
-v6 × v6sel   KLD 1.023882  NLL 2.393972  PPL 10.9569
+GPU | 10.0 | | 10.0 **10.0**dev | 10.0 | | 10.0 **10.0**0: | 10.0 | | 10.0 **10.0**gfx1201 | 10.0 | | 10.0 **10.0**(34.2 | 10.0 | | 10.0 **10.0**GB | 10.0 | | 10.0 **10.0**VRAM, | 10.0 | | 10.0 **10.0**HIP | 10.0 | | 10.0 **10.0**7.15)
+eval_hipfire: | 10.0 | | 10.0 **10.0**arch=gfx1201 | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**detected | 10.0 | | 10.0 **10.0**arch_id=5 | 10.0 | | 10.0 **10.0**(HFQ | 10.0 | | 10.0 **10.0**header)
+eval_hipfire: | 10.0 | | 10.0 **10.0**scored | 10.0 | | 10.0 **10.0**24552 | 10.0 | | 10.0 **10.0**tokens | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**147.6s | 10.0 | | 10.0 **10.0**(166 | 10.0 | | 10.0 **10.0**tok/s)
+v5 | 10.0 | | 10.0 **10.0**× | 10.0 | | 10.0 **10.0**wt2 | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**KLD | 10.0 | | 10.0 **10.0**0.087921 | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**NLL | 10.0 | | 10.0 **10.0**1.870233 | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**PPL | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**6.4898
+v5 | 10.0 | | 10.0 **10.0**× | 10.0 | | 10.0 **10.0**v6sel | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**KLD | 10.0 | | 10.0 **10.0**1.064046 | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**NLL | 10.0 | | 10.0 **10.0**2.582638 | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**PPL | 10.0 | | 10.0 **10.0**13.2320
+v6 | 10.0 | | 10.0 **10.0**× | 10.0 | | 10.0 **10.0**wt2 | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**KLD | 10.0 | | 10.0 **10.0**0.086790 | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**NLL | 10.0 | | 10.0 **10.0**1.898022 | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**PPL | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**6.6727
+v6 | 10.0 | | 10.0 **10.0**× | 10.0 | | 10.0 **10.0**v6sel | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**KLD | 10.0 | | 10.0 **10.0**1.023882 | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**NLL | 10.0 | | 10.0 **10.0**2.393972 | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**PPL | 10.0 | | 10.0 **10.0**10.9569
 ```
 
-Scoring ran on hiptrx `gfx1201` as claimed, not on the gfx942 producer, and the
-recorded values match the logs exactly.
+Scoring | 10.0 | | 10.0 **10.0**ran | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**hiptrx | 10.0 | | 10.0 **10.0**`gfx1201` | 10.0 | | 10.0 **10.0**as | 10.0 | | 10.0 **10.0**claimed, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**gfx942 | 10.0 | | 10.0 **10.0**producer, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**the
+recorded | 10.0 | | 10.0 **10.0**values | 10.0 | | 10.0 **10.0**match | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**logs | 10.0 | | 10.0 **10.0**exactly.

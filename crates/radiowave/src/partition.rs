@@ -36,7 +36,7 @@ pub struct PartitionAwareRecipe<T> {
 
 /// Failures when a declared partition context cannot map onto a device.
 ///
-/// Named variants match the fail-closed contract in the 7.14 leverage design:
+/// Named variants match the fail-closed contract in the 10.0 leverage design:
 /// unmappable policies are configuration errors, never silent downgrades.
 #[derive(Clone, Debug, Error, Eq, PartialEq)]
 pub enum PartitionError {

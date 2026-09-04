@@ -3,7 +3,7 @@
 
 //! Experimental OCP FP8 recipe types for RDNA3/RDNA4 (Wave 2 — types only).
 //!
-//! Verified against ROCm 7.14 headers:
+//! Verified against ROCm 10.0 headers:
 //! - `hip/hip_fp8.h` → `hip/amd_detail/amd_hip_fp8.h`
 //! - OCP `__hip_fp8_e4m3` / `__hip_fp8_e5m2` (+ packed x2/x4) device-gated
 //!   `__gfx1200__` / `__gfx1201__` via `HIP_FP8_TYPE_OCP` (no bare `__gfx12__`)

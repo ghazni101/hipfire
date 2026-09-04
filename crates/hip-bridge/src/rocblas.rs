@@ -61,7 +61,7 @@ pub enum RocblasDatatype {
 /// rocBLAS GEMM algorithm selector (from rocblas-types.h).
 ///
 /// These are deliberately zero/one rather than the 160-series datatype
-/// constants. ROCm 7.14 declares `rocblas_gemm_algo_standard = 0x0` and
+/// constants. ROCm 10.0 declares `rocblas_gemm_algo_standard = 0x0` and
 /// `rocblas_gemm_algo_solution_index = 0x1`.
 #[repr(u32)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

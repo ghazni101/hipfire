@@ -434,7 +434,7 @@ fn resolve_rocm_root() -> Option<PathBuf> {
     }
     for candidate in [
         "/opt/rocm/core",
-        "/opt/rocm/core-7.14",
+        "/opt/rocm/core-10.0",
         "/opt/rocm",
     ] {
         let p = PathBuf::from(candidate);
@@ -675,7 +675,7 @@ mod tests {
                 commit: "deadbeef".into(),
                 dirty_diff_sha256: None,
                 rocm_path: "/opt/rocm/core".into(),
-                rocm_version: "7.14.0".into(),
+                rocm_version: "10.0.0".into(),
                 gpu_arch: "gfx942".into(),
             },
             source: SourceInfo {

@@ -1,6 +1,6 @@
-GPU dev 0: gfx942 (205.8 GB VRAM, HIP 7.14)
-  pre-compiled kernels: /mnt/scratch/hipfire-kernels/rocm714/gfx942
-[rocblas] loaded for gfx942
-PASS case=0: hc_c 24/24 and hc_x_in 4096/4096 raw-bit identical; guards and inputs intact
-PASS case=1: hc_c 24/24 and hc_x_in 4096/4096 raw-bit identical; guards and inputs intact
-MICRO incumbent_3_launch_ms=0.008750 fused_1_launch_ms=0.005931 speedup=1.475x launches_saved=2
+GPU | 10.0 | | 10.0 **10.0**dev | 10.0 | | 10.0 **10.0**0: | 10.0 | | 10.0 **10.0**gfx942 | 10.0 | | 10.0 **10.0**(205.8 | 10.0 | | 10.0 **10.0**GB | 10.0 | | 10.0 **10.0**VRAM, | 10.0 | | 10.0 **10.0**HIP | 10.0 | | 10.0 **10.0**7.15)
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**pre-compiled | 10.0 | | 10.0 **10.0**kernels: | 10.0 | | 10.0 **10.0**/mnt/scratch/hipfire-kernels/rocm100/gfx942
+[rocblas] | 10.0 | | 10.0 **10.0**loaded | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**gfx942
+PASS | 10.0 | | 10.0 **10.0**case=0: | 10.0 | | 10.0 **10.0**hc_c | 10.0 | | 10.0 **10.0**24/24 | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**hc_x_in | 10.0 | | 10.0 **10.0**4096/4096 | 10.0 | | 10.0 **10.0**raw-bit | 10.0 | | 10.0 **10.0**identical; | 10.0 | | 10.0 **10.0**guards | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**inputs | 10.0 | | 10.0 **10.0**intact
+PASS | 10.0 | | 10.0 **10.0**case=1: | 10.0 | | 10.0 **10.0**hc_c | 10.0 | | 10.0 **10.0**24/24 | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**hc_x_in | 10.0 | | 10.0 **10.0**4096/4096 | 10.0 | | 10.0 **10.0**raw-bit | 10.0 | | 10.0 **10.0**identical; | 10.0 | | 10.0 **10.0**guards | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**inputs | 10.0 | | 10.0 **10.0**intact
+MICRO | 10.0 | | 10.0 **10.0**incumbent_3_launch_ms=0.008750 | 10.0 | | 10.0 **10.0**fused_1_launch_ms=0.005931 | 10.0 | | 10.0 **10.0**speedup=1.475x | 10.0 | | 10.0 **10.0**launches_saved=2

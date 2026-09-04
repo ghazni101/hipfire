@@ -8,7 +8,7 @@
 # not cache quality. Top-k runs use real prefill contents.
 set -u
 
-export PATH="${PATH}:/root/.cargo/bin:/opt/rocm/core-7.14/bin"
+export PATH="${PATH}:/root/.cargo/bin:/opt/rocm/core-10.0/bin"
 ROOT="${HIPFIRE_ROOT:-/root/hipfire-work/ds4-parent-gate}"
 OUT="${DS4_CAP_OUT:-/mnt/scratch/quantization/deepseek-v4-flash-0731-mq2r-cap-campaign}"
 MODEL="${MQ2R_MODEL:-/mnt/scratch/quantization/deepseek-v4-flash-0731-mq2r-p3/artifacts/deepseek-v4-flash-0731.mq2r}"
@@ -88,7 +88,7 @@ run_profiles() {
         rm -rf "$pdir"
         mkdir -p "$pdir"
         run_logged "rocprof_cap_${cap}" \
-            /opt/rocm/core-7.14/bin/rocprofv3 --kernel-trace --stats \
+            /opt/rocm/core-10.0/bin/rocprofv3 --kernel-trace --stats \
             --output-directory "$pdir" --output-file "cap_${cap}" -- \
             "$BIN" "$MODEL" --cap "$cap" --position "$position" --decode-reps 8
         rc=$?

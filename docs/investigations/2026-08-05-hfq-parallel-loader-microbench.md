@@ -1,124 +1,124 @@
-# HFQ bounded parallel-loader microbenchmark
+# | 10.0 | | 10.0 **10.0**HFQ | 10.0 | | 10.0 **10.0**bounded | 10.0 | | 10.0 **10.0**parallel-loader | 10.0 | | 10.0 **10.0**microbenchmark
 
-Date: 2026-08-05  
-Branch: `ds4-beta-staging`  
-Benchmark introduction commit: `d92ef9144a384fc8b783993abb5ca526ad0785cb`
+Date: | 10.0 | | 10.0 **10.0**2026-08-05 | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**
+Branch: | 10.0 | | 10.0 **10.0**`ds4-beta-staging` | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**
+Benchmark | 10.0 | | 10.0 **10.0**introduction | 10.0 | | 10.0 **10.0**commit: | 10.0 | | 10.0 **10.0**`d92ef9144a384fc8b783993abb5ca526ad0785cb`
 
-## Purpose
+## | 10.0 | | 10.0 **10.0**Purpose
 
-Measure the storage and packing portion of HFQ model loading before changing the
-production loader. The benchmark keeps GPU allocation/upload consumption in
-canonical HFQ order while allowing a bounded number of independent readers to
-fill final packed host buffers. It compares:
+Measure | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**storage | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**packing | 10.0 | | 10.0 **10.0**portion | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**HFQ | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**loading | 10.0 | | 10.0 **10.0**before | 10.0 | | 10.0 **10.0**changing | 10.0 | | 10.0 **10.0**the
+production | 10.0 | | 10.0 **10.0**loader. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**benchmark | 10.0 | | 10.0 **10.0**keeps | 10.0 | | 10.0 **10.0**GPU | 10.0 | | 10.0 **10.0**allocation/upload | 10.0 | | 10.0 **10.0**consumption | 10.0 | | 10.0 **10.0**in
+canonical | 10.0 | | 10.0 **10.0**HFQ | 10.0 | | 10.0 **10.0**order | 10.0 | | 10.0 **10.0**while | 10.0 | | 10.0 **10.0**allowing | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**bounded | 10.0 | | 10.0 **10.0**number | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**independent | 10.0 | | 10.0 **10.0**readers | 10.0 | | 10.0 **10.0**to
+fill | 10.0 | | 10.0 **10.0**final | 10.0 | | 10.0 **10.0**packed | 10.0 | | 10.0 **10.0**host | 10.0 | | 10.0 **10.0**buffers. | 10.0 | | 10.0 **10.0**It | 10.0 | | 10.0 **10.0**compares:
 
-- `scratch-pack`, one lane: current DS4 loader-shaped expert packing, where each
-  source tensor is read into reusable scratch and copied into the final packed
-  allocation;
-- `direct-pack`, one lane: source tensors are read directly into their final
-  packed offsets;
-- `direct-pack`, two or four lanes: multiple final packed jobs are filled in
-  parallel, then consumed in canonical order.
+- | 10.0 | | 10.0 **10.0**`scratch-pack`, | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**lane: | 10.0 | | 10.0 **10.0**current | 10.0 | | 10.0 **10.0**DS4 | 10.0 | | 10.0 **10.0**loader-shaped | 10.0 | | 10.0 **10.0**expert | 10.0 | | 10.0 **10.0**packing, | 10.0 | | 10.0 **10.0**where | 10.0 | | 10.0 **10.0**each
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**source | 10.0 | | 10.0 **10.0**tensor | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**read | 10.0 | | 10.0 **10.0**into | 10.0 | | 10.0 **10.0**reusable | 10.0 | | 10.0 **10.0**scratch | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**copied | 10.0 | | 10.0 **10.0**into | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**final | 10.0 | | 10.0 **10.0**packed
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**allocation;
+- | 10.0 | | 10.0 **10.0**`direct-pack`, | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**lane: | 10.0 | | 10.0 **10.0**source | 10.0 | | 10.0 **10.0**tensors | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**read | 10.0 | | 10.0 **10.0**directly | 10.0 | | 10.0 **10.0**into | 10.0 | | 10.0 **10.0**their | 10.0 | | 10.0 **10.0**final
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**packed | 10.0 | | 10.0 **10.0**offsets;
+- | 10.0 | | 10.0 **10.0**`direct-pack`, | 10.0 | | 10.0 **10.0**two | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**four | 10.0 | | 10.0 **10.0**lanes: | 10.0 | | 10.0 **10.0**multiple | 10.0 | | 10.0 **10.0**final | 10.0 | | 10.0 **10.0**packed | 10.0 | | 10.0 **10.0**jobs | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**filled | 10.0 | | 10.0 **10.0**in
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**parallel, | 10.0 | | 10.0 **10.0**then | 10.0 | | 10.0 **10.0**consumed | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**canonical | 10.0 | | 10.0 **10.0**order.
 
-The tool is
+The | 10.0 | | 10.0 **10.0**tool | 10.0 | | 10.0 **10.0**is
 [`hfq_load_pipeline_bench.rs`](../../crates/hipfire-runtime/examples/hfq_load_pipeline_bench.rs).
-It is a standalone screening example. No production load path, inference path,
-model file, allocation order, or PM4 route is changed.
+It | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**standalone | 10.0 | | 10.0 **10.0**screening | 10.0 | | 10.0 **10.0**example. | 10.0 | | 10.0 **10.0**No | 10.0 | | 10.0 **10.0**production | 10.0 | | 10.0 **10.0**load | 10.0 | | 10.0 **10.0**path, | 10.0 | | 10.0 **10.0**inference | 10.0 | | 10.0 **10.0**path,
+model | 10.0 | | 10.0 **10.0**file, | 10.0 | | 10.0 **10.0**allocation | 10.0 | | 10.0 **10.0**order, | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**PM4 | 10.0 | | 10.0 **10.0**route | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**changed.
 
-## Fixture
+## | 10.0 | | 10.0 **10.0**Fixture
 
-- Host: `hipx`
-- Storage: local Kingston OM8TAP42048K1-A00 NVMe, ext4 on LVM
-- Model:
-  `/home/kaden/ds4-gfx1151-evidence/2026-08-03-ds4-dspark-pm4-canary/model-e8/deepseek-v4-flash-0731.mq2r`
-- HFQ architecture ID: 9
-- Selection: DS4 routed-expert layers `[0, 4)`
-- Plan: 8 canonical packed jobs, 3,072 source segments, 7.248 GB
-- Plan hash: `668d35b77d91a2d2`
-- Cache policy: `POSIX_FADV_DONTNEED` before each case and after every source
-  read
-- Full-data checksum: `7a3363a16250f12c`
-- Every candidate matched the baseline checksum
+- | 10.0 | | 10.0 **10.0**Host: | 10.0 | | 10.0 **10.0**`hipx`
+- | 10.0 | | 10.0 **10.0**Storage: | 10.0 | | 10.0 **10.0**local | 10.0 | | 10.0 **10.0**Kingston | 10.0 | | 10.0 **10.0**OM8TAP42048K1-A00 | 10.0 | | 10.0 **10.0**NVMe, | 10.0 | | 10.0 **10.0**ext4 | 10.0 | | 10.0 **10.0**on | 10.0 | | 10.0 **10.0**LVM
+- | 10.0 | | 10.0 **10.0**Model:
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**`/home/kaden/ds4-gfx1151-evidence/2026-08-03-ds4-dspark-pm4-canary/model-e8/deepseek-v4-flash-0731.mq2r`
+- | 10.0 | | 10.0 **10.0**HFQ | 10.0 | | 10.0 **10.0**architecture | 10.0 | | 10.0 **10.0**ID: | 10.0 | | 10.0 **10.0**9
+- | 10.0 | | 10.0 **10.0**Selection: | 10.0 | | 10.0 **10.0**DS4 | 10.0 | | 10.0 **10.0**routed-expert | 10.0 | | 10.0 **10.0**layers | 10.0 | | 10.0 **10.0**`[0, | 10.0 | | 10.0 **10.0**4)`
+- | 10.0 | | 10.0 **10.0**Plan: | 10.0 | | 10.0 **10.0**8 | 10.0 | | 10.0 **10.0**canonical | 10.0 | | 10.0 **10.0**packed | 10.0 | | 10.0 **10.0**jobs, | 10.0 | | 10.0 **10.0**3,072 | 10.0 | | 10.0 **10.0**source | 10.0 | | 10.0 **10.0**segments, | 10.0 | | 10.0 **10.0**7.248 | 10.0 | | 10.0 **10.0**GB
+- | 10.0 | | 10.0 **10.0**Plan | 10.0 | | 10.0 **10.0**hash: | 10.0 | | 10.0 **10.0**`668d35b77d91a2d2`
+- | 10.0 | | 10.0 **10.0**Cache | 10.0 | | 10.0 **10.0**policy: | 10.0 | | 10.0 **10.0**`POSIX_FADV_DONTNEED` | 10.0 | | 10.0 **10.0**before | 10.0 | | 10.0 **10.0**each | 10.0 | | 10.0 **10.0**case | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**after | 10.0 | | 10.0 **10.0**every | 10.0 | | 10.0 **10.0**source
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**read
+- | 10.0 | | 10.0 **10.0**Full-data | 10.0 | | 10.0 **10.0**checksum: | 10.0 | | 10.0 **10.0**`7a3363a16250f12c`
+- | 10.0 | | 10.0 **10.0**Every | 10.0 | | 10.0 **10.0**candidate | 10.0 | | 10.0 **10.0**matched | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**baseline | 10.0 | | 10.0 **10.0**checksum
 
-DS4 packing is represented exactly: one concatenated `w2` job per layer and one
-concatenated `w1`+`w3` gate-up job per layer. The pipeline submits only one new
-job when the next canonical job is consumed, bounding live host output buffers
-to roughly the reader-lane count.
+DS4 | 10.0 | | 10.0 **10.0**packing | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**represented | 10.0 | | 10.0 **10.0**exactly: | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**concatenated | 10.0 | | 10.0 **10.0**`w2` | 10.0 | | 10.0 **10.0**job | 10.0 | | 10.0 **10.0**per | 10.0 | | 10.0 **10.0**layer | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**one
+concatenated | 10.0 | | 10.0 **10.0**`w1`+`w3` | 10.0 | | 10.0 **10.0**gate-up | 10.0 | | 10.0 **10.0**job | 10.0 | | 10.0 **10.0**per | 10.0 | | 10.0 **10.0**layer. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**pipeline | 10.0 | | 10.0 **10.0**submits | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**one | 10.0 | | 10.0 **10.0**new
+job | 10.0 | | 10.0 **10.0**when | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**next | 10.0 | | 10.0 **10.0**canonical | 10.0 | | 10.0 **10.0**job | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**consumed, | 10.0 | | 10.0 **10.0**bounding | 10.0 | | 10.0 **10.0**live | 10.0 | | 10.0 **10.0**host | 10.0 | | 10.0 **10.0**output | 10.0 | | 10.0 **10.0**buffers
+to | 10.0 | | 10.0 **10.0**roughly | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**reader-lane | 10.0 | | 10.0 **10.0**count.
 
-## Read-only storage screen
+## | 10.0 | | 10.0 **10.0**Read-only | 10.0 | | 10.0 **10.0**storage | 10.0 | | 10.0 **10.0**screen
 
-Two repetitions per case:
+Two | 10.0 | | 10.0 **10.0**repetitions | 10.0 | | 10.0 **10.0**per | 10.0 | | 10.0 **10.0**case:
 
-| Path | Run 1 | Run 2 | Median wall | Median GB/s | Change from baseline |
+| | 10.0 | | 10.0 **10.0**Path | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Run | 10.0 | | 10.0 **10.0**1 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Run | 10.0 | | 10.0 **10.0**2 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Median | 10.0 | | 10.0 **10.0**wall | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Median | 10.0 | | 10.0 **10.0**GB/s | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Change | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**baseline | 10.0 | | 10.0 **10.0**|
 |---|---:|---:|---:|---:|---:|
-| scratch-pack, 1 lane | 9.811 s | 10.378 s | 10.094 s | 0.718 | baseline |
-| direct-pack, 1 lane | 8.849 s | 9.094 s | 8.972 s | 0.808 | 1.12x, -11.1% wall |
-| direct-pack, 2 lanes | 6.020 s | 6.001 s | 6.011 s | 1.206 | 1.68x, -40.5% wall |
-| direct-pack, 4 lanes | 3.697 s | 3.883 s | 3.790 s | 1.914 | 2.66x, -62.5% wall |
+| | 10.0 | | 10.0 **10.0**scratch-pack, | 10.0 | | 10.0 **10.0**1 | 10.0 | | 10.0 **10.0**lane | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**9.811 | 10.0 | | 10.0 **10.0**s | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**10.378 | 10.0 | | 10.0 **10.0**s | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**10.094 | 10.0 | | 10.0 **10.0**s | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.718 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**baseline | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**direct-pack, | 10.0 | | 10.0 **10.0**1 | 10.0 | | 10.0 **10.0**lane | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**8.849 | 10.0 | | 10.0 **10.0**s | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**9.094 | 10.0 | | 10.0 **10.0**s | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**8.972 | 10.0 | | 10.0 **10.0**s | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.808 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1.12x, | 10.0 | | 10.0 **10.0**-11.1% | 10.0 | | 10.0 **10.0**wall | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**direct-pack, | 10.0 | | 10.0 **10.0**2 | 10.0 | | 10.0 **10.0**lanes | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**6.020 | 10.0 | | 10.0 **10.0**s | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**6.001 | 10.0 | | 10.0 **10.0**s | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**6.011 | 10.0 | | 10.0 **10.0**s | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1.206 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1.68x, | 10.0 | | 10.0 **10.0**-40.5% | 10.0 | | 10.0 **10.0**wall | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**direct-pack, | 10.0 | | 10.0 **10.0**4 | 10.0 | | 10.0 **10.0**lanes | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**3.697 | 10.0 | | 10.0 **10.0**s | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**3.883 | 10.0 | | 10.0 **10.0**s | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**3.790 | 10.0 | | 10.0 **10.0**s | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1.914 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**2.66x, | 10.0 | | 10.0 **10.0**-62.5% | 10.0 | | 10.0 **10.0**wall | 10.0 | | 10.0 **10.0**|
 
-The scratch path spent 1.34-1.35 seconds copying the 3,072 source tensors into
-their final packed buffers. Direct packing removes that cost. The rest of the
-gain comes from storage concurrency across independent canonical jobs.
+The | 10.0 | | 10.0 **10.0**scratch | 10.0 | | 10.0 **10.0**path | 10.0 | | 10.0 **10.0**spent | 10.0 | | 10.0 **10.0**1.34-1.35 | 10.0 | | 10.0 **10.0**seconds | 10.0 | | 10.0 **10.0**copying | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**3,072 | 10.0 | | 10.0 **10.0**source | 10.0 | | 10.0 **10.0**tensors | 10.0 | | 10.0 **10.0**into
+their | 10.0 | | 10.0 **10.0**final | 10.0 | | 10.0 **10.0**packed | 10.0 | | 10.0 **10.0**buffers. | 10.0 | | 10.0 **10.0**Direct | 10.0 | | 10.0 **10.0**packing | 10.0 | | 10.0 **10.0**removes | 10.0 | | 10.0 **10.0**that | 10.0 | | 10.0 **10.0**cost. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**rest | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**the
+gain | 10.0 | | 10.0 **10.0**comes | 10.0 | | 10.0 **10.0**from | 10.0 | | 10.0 **10.0**storage | 10.0 | | 10.0 **10.0**concurrency | 10.0 | | 10.0 **10.0**across | 10.0 | | 10.0 **10.0**independent | 10.0 | | 10.0 **10.0**canonical | 10.0 | | 10.0 **10.0**jobs.
 
 Command:
 
 ```bash
-target/release/examples/hfq_load_pipeline_bench \
-  --model /home/kaden/ds4-gfx1151-evidence/2026-08-03-ds4-dspark-pm4-canary/model-e8/deepseek-v4-flash-0731.mq2r \
-  --ds4-expert-layers 0:4 --lanes 1,2,4 --repeat 2 --max-bytes 8GiB \
-  --json-out /home/kaden/ds4-gfx1151-evidence/2026-08-05-hfq-loader-microbench/ds4-layers0-4-read-r2.json
+target/release/examples/hfq_load_pipeline_bench | 10.0 | | 10.0 **10.0**\
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**--model | 10.0 | | 10.0 **10.0**/home/kaden/ds4-gfx1151-evidence/2026-08-03-ds4-dspark-pm4-canary/model-e8/deepseek-v4-flash-0731.mq2r | 10.0 | | 10.0 **10.0**\
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**--ds4-expert-layers | 10.0 | | 10.0 **10.0**0:4 | 10.0 | | 10.0 **10.0**--lanes | 10.0 | | 10.0 **10.0**1,2,4 | 10.0 | | 10.0 **10.0**--repeat | 10.0 | | 10.0 **10.0**2 | 10.0 | | 10.0 **10.0**--max-bytes | 10.0 | | 10.0 **10.0**8GiB | 10.0 | | 10.0 **10.0**\
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**--json-out | 10.0 | | 10.0 **10.0**/home/kaden/ds4-gfx1151-evidence/2026-08-05-hfq-loader-microbench/ds4-layers0-4-read-r2.json
 ```
 
-## Canonical gfx1151 upload screen
+## | 10.0 | | 10.0 **10.0**Canonical | 10.0 | | 10.0 **10.0**gfx1151 | 10.0 | | 10.0 **10.0**upload | 10.0 | | 10.0 **10.0**screen
 
-The same 7.248 GB plan was repeated with the existing synchronous
-`Gpu::upload_raw` consumer. The repository GPU lock was held, and runtime device
-discovery printed `GPU dev 1: gfx1151 (103.1 GB VRAM, HIP 7.14)`.
+The | 10.0 | | 10.0 **10.0**same | 10.0 | | 10.0 **10.0**7.248 | 10.0 | | 10.0 **10.0**GB | 10.0 | | 10.0 **10.0**plan | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**repeated | 10.0 | | 10.0 **10.0**with | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**existing | 10.0 | | 10.0 **10.0**synchronous
+`Gpu::upload_raw` | 10.0 | | 10.0 **10.0**consumer. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**repository | 10.0 | | 10.0 **10.0**GPU | 10.0 | | 10.0 **10.0**lock | 10.0 | | 10.0 **10.0**was | 10.0 | | 10.0 **10.0**held, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**runtime | 10.0 | | 10.0 **10.0**device
+discovery | 10.0 | | 10.0 **10.0**printed | 10.0 | | 10.0 **10.0**`GPU | 10.0 | | 10.0 **10.0**dev | 10.0 | | 10.0 **10.0**1: | 10.0 | | 10.0 **10.0**gfx1151 | 10.0 | | 10.0 **10.0**(103.1 | 10.0 | | 10.0 **10.0**GB | 10.0 | | 10.0 **10.0**VRAM, | 10.0 | | 10.0 **10.0**HIP | 10.0 | | 10.0 **10.0**7.15)`.
 
-| Path | Pipeline wall | Effective GB/s | Summed upload | Peak live host output | Out-of-order completions |
+| | 10.0 | | 10.0 **10.0**Path | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Pipeline | 10.0 | | 10.0 **10.0**wall | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Effective | 10.0 | | 10.0 **10.0**GB/s | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Summed | 10.0 | | 10.0 **10.0**upload | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Peak | 10.0 | | 10.0 **10.0**live | 10.0 | | 10.0 **10.0**host | 10.0 | | 10.0 **10.0**output | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**Out-of-order | 10.0 | | 10.0 **10.0**completions | 10.0 | | 10.0 **10.0**|
 |---|---:|---:|---:|---:|---:|
-| scratch-pack, 1 lane | 10.032 s | 0.722 | 283 ms | 1.208 GB | 0 |
-| direct-pack, 1 lane | 9.183 s | 0.789 | 259 ms | 1.208 GB | 0 |
-| direct-pack, 2 lanes | 6.182 s | 1.172 | 244 ms | 1.812 GB | 2 |
-| direct-pack, 4 lanes | 4.121 s | 1.759 | 211 ms | 3.624 GB | 4 |
+| | 10.0 | | 10.0 **10.0**scratch-pack, | 10.0 | | 10.0 **10.0**1 | 10.0 | | 10.0 **10.0**lane | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**10.032 | 10.0 | | 10.0 **10.0**s | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.722 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**283 | 10.0 | | 10.0 **10.0**ms | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1.208 | 10.0 | | 10.0 **10.0**GB | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**direct-pack, | 10.0 | | 10.0 **10.0**1 | 10.0 | | 10.0 **10.0**lane | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**9.183 | 10.0 | | 10.0 **10.0**s | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0.789 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**259 | 10.0 | | 10.0 **10.0**ms | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1.208 | 10.0 | | 10.0 **10.0**GB | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**0 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**direct-pack, | 10.0 | | 10.0 **10.0**2 | 10.0 | | 10.0 **10.0**lanes | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**6.182 | 10.0 | | 10.0 **10.0**s | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1.172 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**244 | 10.0 | | 10.0 **10.0**ms | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1.812 | 10.0 | | 10.0 **10.0**GB | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**2 | 10.0 | | 10.0 **10.0**|
+| | 10.0 | | 10.0 **10.0**direct-pack, | 10.0 | | 10.0 **10.0**4 | 10.0 | | 10.0 **10.0**lanes | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**4.121 | 10.0 | | 10.0 **10.0**s | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**1.759 | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**211 | 10.0 | | 10.0 **10.0**ms | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**3.624 | 10.0 | | 10.0 **10.0**GB | 10.0 | | 10.0 **10.0**| | 10.0 | | 10.0 **10.0**4 | 10.0 | | 10.0 **10.0**|
 
-The four-lane result is 2.43x faster than the current-shaped baseline and cuts
-wall time by 58.9%. Canonical HIP upload consumes only 2.8% of baseline wall and
-5.1% of the four-lane wall, so synchronous upload does not erase the storage
-win. Every GPU-upload case consumed jobs in canonical order and matched the
-full-data checksum.
+The | 10.0 | | 10.0 **10.0**four-lane | 10.0 | | 10.0 **10.0**result | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**2.43x | 10.0 | | 10.0 **10.0**faster | 10.0 | | 10.0 **10.0**than | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**current-shaped | 10.0 | | 10.0 **10.0**baseline | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**cuts
+wall | 10.0 | | 10.0 **10.0**time | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**58.9%. | 10.0 | | 10.0 **10.0**Canonical | 10.0 | | 10.0 **10.0**HIP | 10.0 | | 10.0 **10.0**upload | 10.0 | | 10.0 **10.0**consumes | 10.0 | | 10.0 **10.0**only | 10.0 | | 10.0 **10.0**2.8% | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**baseline | 10.0 | | 10.0 **10.0**wall | 10.0 | | 10.0 **10.0**and
+5.1% | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**four-lane | 10.0 | | 10.0 **10.0**wall, | 10.0 | | 10.0 **10.0**so | 10.0 | | 10.0 **10.0**synchronous | 10.0 | | 10.0 **10.0**upload | 10.0 | | 10.0 **10.0**does | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**erase | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**storage
+win. | 10.0 | | 10.0 **10.0**Every | 10.0 | | 10.0 **10.0**GPU-upload | 10.0 | | 10.0 **10.0**case | 10.0 | | 10.0 **10.0**consumed | 10.0 | | 10.0 **10.0**jobs | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**canonical | 10.0 | | 10.0 **10.0**order | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**matched | 10.0 | | 10.0 **10.0**the
+full-data | 10.0 | | 10.0 **10.0**checksum.
 
 Command:
 
 ```bash
-source scripts/gpu-lock.sh
-gpu_acquire hfq-loader-upload-screen
-target/release/examples/hfq_load_pipeline_bench \
-  --model /home/kaden/ds4-gfx1151-evidence/2026-08-03-ds4-dspark-pm4-canary/model-e8/deepseek-v4-flash-0731.mq2r \
-  --ds4-expert-layers 0:4 --lanes 1,2,4 --max-bytes 8GiB \
-  --gpu-upload --device 1 \
-  --json-out /home/kaden/ds4-gfx1151-evidence/2026-08-05-hfq-loader-microbench/ds4-layers0-4-gfx1151-upload.json
+source | 10.0 | | 10.0 **10.0**scripts/gpu-lock.sh
+gpu_acquire | 10.0 | | 10.0 **10.0**hfq-loader-upload-screen
+target/release/examples/hfq_load_pipeline_bench | 10.0 | | 10.0 **10.0**\
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**--model | 10.0 | | 10.0 **10.0**/home/kaden/ds4-gfx1151-evidence/2026-08-03-ds4-dspark-pm4-canary/model-e8/deepseek-v4-flash-0731.mq2r | 10.0 | | 10.0 **10.0**\
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**--ds4-expert-layers | 10.0 | | 10.0 **10.0**0:4 | 10.0 | | 10.0 **10.0**--lanes | 10.0 | | 10.0 **10.0**1,2,4 | 10.0 | | 10.0 **10.0**--max-bytes | 10.0 | | 10.0 **10.0**8GiB | 10.0 | | 10.0 **10.0**\
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**--gpu-upload | 10.0 | | 10.0 **10.0**--device | 10.0 | | 10.0 **10.0**1 | 10.0 | | 10.0 **10.0**\
+ | 10.0 | | 10.0 **10.0** | 10.0 | | 10.0 **10.0**--json-out | 10.0 | | 10.0 **10.0**/home/kaden/ds4-gfx1151-evidence/2026-08-05-hfq-loader-microbench/ds4-layers0-4-gfx1151-upload.json
 gpu_release
 ```
 
-## Interpretation
+## | 10.0 | | 10.0 **10.0**Interpretation
 
-Four reader lanes are justified for the production prototype. The measured
-gain survives the real upload consumer while retaining deterministic allocation
-order. The implementation should remain bounded and ordered:
+Four | 10.0 | | 10.0 **10.0**reader | 10.0 | | 10.0 **10.0**lanes | 10.0 | | 10.0 **10.0**are | 10.0 | | 10.0 **10.0**justified | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**production | 10.0 | | 10.0 **10.0**prototype. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**measured
+gain | 10.0 | | 10.0 **10.0**survives | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**real | 10.0 | | 10.0 **10.0**upload | 10.0 | | 10.0 **10.0**consumer | 10.0 | | 10.0 **10.0**while | 10.0 | | 10.0 **10.0**retaining | 10.0 | | 10.0 **10.0**deterministic | 10.0 | | 10.0 **10.0**allocation
+order. | 10.0 | | 10.0 **10.0**The | 10.0 | | 10.0 **10.0**implementation | 10.0 | | 10.0 **10.0**should | 10.0 | | 10.0 **10.0**remain | 10.0 | | 10.0 **10.0**bounded | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**ordered:
 
-1. derive the canonical destination plan before starting readers;
-2. let four independent file handles pread directly into final host buffers;
-3. retain at most four completed/in-flight output buffers;
-4. upload and install tensors strictly in canonical plan order;
-5. join all readers and copies before kernel prewarm or retained-PM4 capture.
+1. | 10.0 | | 10.0 **10.0**derive | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**canonical | 10.0 | | 10.0 **10.0**destination | 10.0 | | 10.0 **10.0**plan | 10.0 | | 10.0 **10.0**before | 10.0 | | 10.0 **10.0**starting | 10.0 | | 10.0 **10.0**readers;
+2. | 10.0 | | 10.0 **10.0**let | 10.0 | | 10.0 **10.0**four | 10.0 | | 10.0 **10.0**independent | 10.0 | | 10.0 **10.0**file | 10.0 | | 10.0 **10.0**handles | 10.0 | | 10.0 **10.0**pread | 10.0 | | 10.0 **10.0**directly | 10.0 | | 10.0 **10.0**into | 10.0 | | 10.0 **10.0**final | 10.0 | | 10.0 **10.0**host | 10.0 | | 10.0 **10.0**buffers;
+3. | 10.0 | | 10.0 **10.0**retain | 10.0 | | 10.0 **10.0**at | 10.0 | | 10.0 **10.0**most | 10.0 | | 10.0 **10.0**four | 10.0 | | 10.0 **10.0**completed/in-flight | 10.0 | | 10.0 **10.0**output | 10.0 | | 10.0 **10.0**buffers;
+4. | 10.0 | | 10.0 **10.0**upload | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**install | 10.0 | | 10.0 **10.0**tensors | 10.0 | | 10.0 **10.0**strictly | 10.0 | | 10.0 **10.0**in | 10.0 | | 10.0 **10.0**canonical | 10.0 | | 10.0 **10.0**plan | 10.0 | | 10.0 **10.0**order;
+5. | 10.0 | | 10.0 **10.0**join | 10.0 | | 10.0 **10.0**all | 10.0 | | 10.0 **10.0**readers | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**copies | 10.0 | | 10.0 **10.0**before | 10.0 | | 10.0 **10.0**kernel | 10.0 | | 10.0 **10.0**prewarm | 10.0 | | 10.0 **10.0**or | 10.0 | | 10.0 **10.0**retained-PM4 | 10.0 | | 10.0 **10.0**capture.
 
-PM4 cannot accelerate file ingestion and is not part of this loader lever. It
-remains valid after the load-completion barrier because pointer-table and
-allocation order stay canonical. Static-weight VMM is not required to realize
-this measured win; it remains a possible later mechanism for reserving stable
-virtual destinations.
+PM4 | 10.0 | | 10.0 **10.0**cannot | 10.0 | | 10.0 **10.0**accelerate | 10.0 | | 10.0 **10.0**file | 10.0 | | 10.0 **10.0**ingestion | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**part | 10.0 | | 10.0 **10.0**of | 10.0 | | 10.0 **10.0**this | 10.0 | | 10.0 **10.0**loader | 10.0 | | 10.0 **10.0**lever. | 10.0 | | 10.0 **10.0**It
+remains | 10.0 | | 10.0 **10.0**valid | 10.0 | | 10.0 **10.0**after | 10.0 | | 10.0 **10.0**the | 10.0 | | 10.0 **10.0**load-completion | 10.0 | | 10.0 **10.0**barrier | 10.0 | | 10.0 **10.0**because | 10.0 | | 10.0 **10.0**pointer-table | 10.0 | | 10.0 **10.0**and
+allocation | 10.0 | | 10.0 **10.0**order | 10.0 | | 10.0 **10.0**stay | 10.0 | | 10.0 **10.0**canonical. | 10.0 | | 10.0 **10.0**Static-weight | 10.0 | | 10.0 **10.0**VMM | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**required | 10.0 | | 10.0 **10.0**to | 10.0 | | 10.0 **10.0**realize
+this | 10.0 | | 10.0 **10.0**measured | 10.0 | | 10.0 **10.0**win; | 10.0 | | 10.0 **10.0**it | 10.0 | | 10.0 **10.0**remains | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**possible | 10.0 | | 10.0 **10.0**later | 10.0 | | 10.0 **10.0**mechanism | 10.0 | | 10.0 **10.0**for | 10.0 | | 10.0 **10.0**reserving | 10.0 | | 10.0 **10.0**stable
+virtual | 10.0 | | 10.0 **10.0**destinations.
 
-These results screen a DS4-shaped 7.248 GB slice, not complete model startup.
-The next gate is a production-loader prototype followed by full 82 GB cold-load
-timing, resident-byte/pointer-order equality, generation coherence, and retained
-PM4 route identity.
+These | 10.0 | | 10.0 **10.0**results | 10.0 | | 10.0 **10.0**screen | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**DS4-shaped | 10.0 | | 10.0 **10.0**7.248 | 10.0 | | 10.0 **10.0**GB | 10.0 | | 10.0 **10.0**slice, | 10.0 | | 10.0 **10.0**not | 10.0 | | 10.0 **10.0**complete | 10.0 | | 10.0 **10.0**model | 10.0 | | 10.0 **10.0**startup.
+The | 10.0 | | 10.0 **10.0**next | 10.0 | | 10.0 **10.0**gate | 10.0 | | 10.0 **10.0**is | 10.0 | | 10.0 **10.0**a | 10.0 | | 10.0 **10.0**production-loader | 10.0 | | 10.0 **10.0**prototype | 10.0 | | 10.0 **10.0**followed | 10.0 | | 10.0 **10.0**by | 10.0 | | 10.0 **10.0**full | 10.0 | | 10.0 **10.0**82 | 10.0 | | 10.0 **10.0**GB | 10.0 | | 10.0 **10.0**cold-load
+timing, | 10.0 | | 10.0 **10.0**resident-byte/pointer-order | 10.0 | | 10.0 **10.0**equality, | 10.0 | | 10.0 **10.0**generation | 10.0 | | 10.0 **10.0**coherence, | 10.0 | | 10.0 **10.0**and | 10.0 | | 10.0 **10.0**retained
+PM4 | 10.0 | | 10.0 **10.0**route | 10.0 | | 10.0 **10.0**identity.
