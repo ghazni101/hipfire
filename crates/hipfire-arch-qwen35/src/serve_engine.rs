@@ -264,6 +264,14 @@ struct Rig {
     /// pointers uploaded into `pbs.ext_emb_row_ptr`. None until the slot's
     /// request has run vision_forward; also cleared when the slot is.
     vl_ext_devs: Vec<Option<GpuTensor>>,
+    /// Per-slot in-flight vision-tower jobs (batched VL path). The engine
+    /// advances each live job ONE tower layer per serve iteration so a
+    /// big-image encode (~9.7 s of GPU work at a 78×78 grid, even Q-tiled)
+    /// interleaves with the other slots' decode steps instead of stalling
+    /// them for the whole encode. None when no encode is in flight for the
+    /// slot; cleared wherever `vl_ext_devs` is.
+    vl_tower_jobs:
+        Vec<Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionTowerJob>>,
     /// Serve VL requests on the legacy sequential per-token path instead of
     /// the batched one (HIPFIRE_VL_SEQUENTIAL=1; batched is the default and
     /// the only paged-compatible mode).
@@ -819,9 +827,12 @@ impl Rig {
             })
             .collect::<Result<Vec<_>, _>>()?;
         // Per-slot vision-embedding matrices, populated lazily when a batched
-        // VL request runs vision_forward. Replaced (leaking the old matrix to
-        // the allocator) on each new request — bounded by n_slots images.
+        // VL request runs vision_forward. The previous matrix is explicitly
+        // freed on replacement (see `admit` — dropping a GpuTensor without
+        // free_tensor leaks its VRAM; it is neither pooled nor hipFree'd).
         let vl_ext_devs: Vec<Option<GpuTensor>> = (0..cfg.n_slots).map(|_| None).collect();
+        let vl_tower_jobs: Vec<Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionTowerJob>> =
+            (0..cfg.n_slots).map(|_| None).collect();
         let vl_sequential = hipfire_config::developer_var("HIPFIRE_VL_SEQUENTIAL")
             .ok()
             .is_some_and(|v| v == "1" || v == "on" || v == "true");
@@ -957,6 +968,7 @@ impl Rig {
             sample_params,
             repeat_windows,
             vl_ext_devs,
+            vl_tower_jobs,
             vl_sequential,
             sessions: SessionTable::default(),
             adm,
@@ -991,6 +1003,8 @@ impl Rig {
             scratch,
             logits_out,
             out_tokens,
+            vl_ext_devs,
+            vl_tower_jobs,
             ..
         } = self;
 
@@ -1044,6 +1058,13 @@ impl Rig {
         note_hip(gpu.free_tensor(mtp_prefill_hidden));
         if let Some(vw) = vision_weights {
             vw.free_gpu(&mut gpu);
+        }
+        // Per-slot VL matrices + any tower job still mid-encode at teardown.
+        for dev in vl_ext_devs.into_iter().flatten() {
+            note_hip(gpu.free_tensor(dev));
+        }
+        for job in vl_tower_jobs.into_iter().flatten() {
+            note_hip(job.free(&mut gpu));
         }
         gpu.invalidate_weight_caches();
         gpu.invalidate_graph_state();
@@ -1237,6 +1258,115 @@ fn vl_forward_remaining(
         min_p: None,
     };
     Ok(hipfire_runtime::sampler::sample_cpu(&mut logits, &[], &cfg))
+}
+
+/// Advance slot `s`'s batched-VL vision-tower encode by ONE layer, starting
+/// the [`VisionTowerJob`] on the first call and finishing it (merger epilogue
+/// + ext-embedding upload) on the last.
+///
+/// Why one layer at a time: this engine thread is the GPU's exclusive owner,
+/// so a monolithic `vision_forward` wedges every OTHER slot's decode step for
+/// the whole tower pass — measured ~9.7 s at a 78×78 grid (6084 patches) even
+/// on the Q-tiled attention kernel, i.e. the whole serve freezes for the
+/// duration of one big image request. One tower layer (~0.4 s at that grid)
+/// is the largest GPU chunk a VL slot adds between other slots' steps, and
+/// the scheduler already holds the VL slot's rows back until its embeddings
+/// exist (`vl_slots_waiting_on_vision_forward_are_skipped`).
+///
+/// `job` is the caller-owned per-slot job slot. Contract on return:
+/// `Ok(false)` → `job` is `Some` (encode continues next iteration);
+/// `Ok(true)` → encode finished, embeddings spliced, `job` is `None`;
+/// `Err` → the job was freed, `job` is `None`.
+fn vision_tower_step(
+    rig: &mut Rig,
+    s: usize,
+    job: &mut Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionTowerJob>,
+    vl: &mut VlPrefill,
+) -> Result<bool, String> {
+    let Rig {
+        gpu,
+        vision_weights,
+        vision_config,
+        vl_ext_devs,
+        config,
+        ..
+    } = rig;
+    if job.is_none() {
+        let weights = vision_weights
+            .as_ref()
+            .ok_or("VL request but model has no vision encoder")?;
+        let vconfig = vision_config
+            .as_ref()
+            .ok_or("VL request but model has no vision config")?;
+        let started = hipfire_arch_qwen35_vl::qwen35_vl::VisionTowerJob::new(
+            gpu,
+            weights,
+            vconfig,
+            &vl.patches,
+            vl.grid_h,
+            vl.grid_w,
+        )
+        .map_err(|e| format!("vision_forward: {e}"))?;
+        *job = Some(started);
+        // Patches now live on-device for the rest of the encode; free the
+        // host copy (~48 MB at the 2 MP budget).
+        vl.patches = Vec::new();
+    }
+    let weights = vision_weights
+        .as_ref()
+        .ok_or("VL request but model has no vision encoder")?;
+    let vconfig = vision_config
+        .as_ref()
+        .ok_or("VL request but model has no vision config")?;
+    let done = match job
+        .as_mut()
+        .expect("vision tower job present")
+        .step_layer(gpu, weights, vconfig)
+    {
+        Ok(done) => done,
+        Err(e) => {
+            let reason = format!("vision_forward: {e}");
+            if let Some(j) = job.take() {
+                let _ = j.free(gpu);
+            }
+            return Err(reason);
+        }
+    };
+    if !done {
+        return Ok(false);
+    }
+    let j = job.take().expect("vision tower job present");
+    // The merger output stays on GPU — handed straight to the scatter kernel
+    // via `vl_ext_devs` with no D2H+H2D roundtrip. The old monolithic path
+    // downloaded the merged embeddings (forcing a device_synchronize that
+    // waited on the whole tower) and immediately re-uploaded them; that sync
+    // stalled every other slot's decode for the full encode. `finish` now
+    // returns the GpuTensor directly (zero-copy spatial-merge reshape on GPU).
+    let dev = j
+        .finish(gpu, weights, vconfig)
+        .map_err(|e| format!("vision_forward: {e}"))?;
+    let n_emb = dev.numel() / vconfig.out_hidden_size;
+    *vl_ext_devs.get_mut(s).expect("vl_ext_devs slot") = Some(dev);
+    // `vl.embeddings` is the scheduler's readiness flag (non-empty ⇒ the
+    // matrix exists on device); the batched scatter kernel reads `vl_ext_devs`,
+    // not this Vec, so a zero placeholder of the right length is all that's
+    // needed here.
+    vl.embeddings = vec![0.0f32; n_emb * vconfig.out_hidden_size];
+    vl.dim = config.dim;
+    Ok(true)
+}
+
+/// Free slot `s`'s VL GPU state (ext-embedding matrix + any tower job still
+/// mid-encode). For every site that clears a slot's work: dropping either
+/// without freeing leaks VRAM — the buffers are neither pooled nor hipFree'd
+/// by Drop.
+fn clear_slot_vl_state(rig: &mut Rig, s: usize) {
+    if let Some(dev) = rig.vl_ext_devs[s].take() {
+        let _ = rig.gpu.free_tensor(dev);
+    }
+    if let Some(job) = rig.vl_tower_jobs[s].take() {
+        let _ = job.free(&mut rig.gpu);
+    }
 }
 
 /// MTP head-KV fill for one scheduler prefill chunk, post-forward.
@@ -1708,6 +1838,7 @@ fn commit_sampled_token(
         let _ = send_event(&f.reply, Event::Done { reason, generated });
         slots[s] = None;
         clear_work_slot(&mut work[s]);
+        clear_slot_vl_state(rig, s);
         if matches!(reason, DoneReason::ClientGone) {
             rig.swap.forget(session.0);
             rig.sessions.close(&mut rig.pool, &mut rig.adm, session);
@@ -1784,6 +1915,7 @@ fn run_loop(
                 rig.swap.forget(f.session.0);
                 rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
                 clear_work_slot(&mut work[s]);
+                clear_slot_vl_state(rig, s);
             }
         }
     };
@@ -1841,6 +1973,7 @@ fn run_loop(
                         rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
                     }
                     clear_work_slot(&mut work[s]);
+                    clear_slot_vl_state(&mut rig, s);
                 }
             }
         }
@@ -1892,23 +2025,21 @@ fn run_loop(
                                 rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
                             }
                             clear_work_slot(&mut work[s]);
+                            clear_slot_vl_state(&mut rig, s);
                         }
                     }
                 }
             }
         }
 
-        // ── VL phase: run the vision tower for batched VL slots ────────────
-        // Runs once per request, on this thread (the GPU's exclusive owner),
-        // before the slot's first batched chunk. The output matrix becomes
-        // the slot's external-embedding source; until it exists the
-        // scheduler holds the slot's rows back (image pads would otherwise
-        // embed as the raw pad token).
-        //
-        // All pending vision forwards run in the same iteration so their
-        // prefills batch together in the scheduler's next_batch — splitting
-        // them across iterations would serialize the prefills and cause
-        // inter-token freezes on the slot that prefilled first.
+        // ── VL phase: advance the vision tower for batched VL slots ────────
+        // Each live encode takes ONE tower layer per serve iteration (see
+        // `vision_tower_step`) so the loop returns to the scheduler — and to
+        // the other slots' decode steps — between layers instead of wedging
+        // them for the whole multi-second encode. The finished matrix becomes
+        // the slot's external-embedding source; until it exists the scheduler
+        // holds the slot's rows back (image pads would otherwise embed as the
+        // raw pad token).
         if !rig.vl_sequential {
             for s in 0..n {
                 if slots[s].is_none() {
@@ -1920,32 +2051,10 @@ fn run_loop(
                 if !vl.embeddings.is_empty() || vl.n_visual_tokens == 0 {
                     continue;
                 }
-                let prepared = (|| -> Result<(), String> {
-                    let weights = rig
-                        .vision_weights
-                        .as_ref()
-                        .ok_or("VL request but model has no vision encoder")?;
-                    let vconfig = rig
-                        .vision_config
-                        .as_ref()
-                        .ok_or("VL request but model has no vision config")?;
-                    let dev = hipfire_arch_qwen35_vl::qwen35_vl::vision_forward_gpu(
-                        &mut rig.gpu,
-                        weights,
-                        vconfig,
-                        &vl.patches,
-                        vl.grid_h,
-                        vl.grid_w,
-                    )
-                    .map_err(|e| format!("vision_forward_gpu: {e}"))?;
-                    let n_emb = dev.numel() / vconfig.out_hidden_size;
-                    rig.vl_ext_devs[s] = Some(dev);
-                    vl.embeddings = vec![0.0f32; n_emb * vconfig.out_hidden_size];
-                    vl.dim = rig.config.dim;
-                    vl.patches.clear();
-                    Ok(())
-                })();
-                if let Err(reason) = prepared {
+                let mut job = rig.vl_tower_jobs[s].take();
+                let outcome = vision_tower_step(&mut rig, s, &mut job, vl);
+                rig.vl_tower_jobs[s] = job;
+                if let Err(reason) = outcome {
                     if let Some(f) = slots[s].take() {
                         let _ = send_event(&f.reply, Event::Rejected {
                             reason: reason.clone(),
@@ -1954,7 +2063,7 @@ fn run_loop(
                         rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
                     }
                     clear_work_slot(&mut work[s]);
-                    rig.vl_ext_devs[s] = None;
+                    clear_slot_vl_state(&mut rig, s);
                 }
             }
         }
@@ -2255,6 +2364,7 @@ fn run_loop(
                             rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
                         }
                         clear_work_slot(&mut work[s]);
+                        clear_slot_vl_state(&mut rig, s);
                     }
                 }
                 continue;
@@ -2308,6 +2418,7 @@ fn run_loop(
                             rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
                         }
                         clear_work_slot(&mut work[s]);
+                        clear_slot_vl_state(&mut rig, s);
                     }
                 }
                 continue;
@@ -2371,6 +2482,7 @@ fn run_loop(
                 let _ = send_event(&f.reply, Event::Done { reason, generated });
                 slots[s] = None;
                 clear_work_slot(&mut work[s]);
+                clear_slot_vl_state(&mut rig, s);
                 if matches!(reason, DoneReason::ClientGone) {
                     // Nobody will follow up on a vanished client, so hand the
                     // slot back at once.
@@ -2442,6 +2554,7 @@ fn handle_command(
                     drop(inflight.reply);
                 }
                 clear_work_slot(&mut work[idx]);
+                clear_slot_vl_state(rig, idx);
             }
             rig.swap.forget(session);
             rig.sessions.close(&mut rig.pool, &mut rig.adm, sid);
@@ -2887,10 +3000,12 @@ fn admit(
         work[slot.0].remaining_prompt = req.prompt_tokens.clone();
         work[slot.0].next_pos = 0;
         work[slot.0].pos3_delta = 0; // phases come from the VL table below
-        // Drop any previous request's vision matrix: the new request's
+        // Drop any previous request's vision state: the new request's
         // embeddings are not produced until its first batched chunk, and the
-        // scheduler holds the slot's rows until then.
-        rig.vl_ext_devs[slot.0] = None;
+        // scheduler holds the slot's rows until then. Free the old matrix +
+        // job explicitly — dropping them unfreed leaks VRAM (the buffers are
+        // neither pooled nor hipFree'd by Drop).
+        clear_slot_vl_state(rig, slot.0);
         work[slot.0].vl_prefill = Some(VlPrefill {
             patches: vd.patches,
             grid_h: vd.grid_h,
