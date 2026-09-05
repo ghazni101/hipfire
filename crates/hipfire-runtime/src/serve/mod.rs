@@ -74,6 +74,13 @@ pub struct SubmitRequest {
     pub min_p: f32,
     /// Visual embeddings + M-RoPE for VL requests. None for text-only.
     pub visual_data: Option<VisualData>,
+    /// JSON Schema for structured output (spec §7 G1/G2). When present, the
+    /// engine compiles it into a `SchemaMatcher` and applies a pre-sampling
+    /// token mask so every emitted token conforms to the schema. None for
+    /// unconstrained requests. The schema object is CLI-validated and
+    /// compiled at `validate_generate_caps` before submit; the engine
+    /// recompiles on admit to build the per-request cursor.
+    pub json_schema: Option<serde_json::Value>,
     /// Canonical pending-input bytes charged to the HTTP admission queue
     /// (spec §5.3). The unified permit carries this from HTTP through daemon
     /// to slots so bytes are charged once and released exactly once. Zero

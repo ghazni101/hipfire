@@ -846,6 +846,21 @@ impl SlotBackend {
             let _ = stdout.flush();
             return Ok(());
         }
+        // Extract JSON Schema for structured output (spec §7 G1/G2). The
+        // schema was already compiled and validated in validate_generate_caps;
+        // here we extract the raw schema Value to pass to the engine, which
+        // recompiles it into a per-request SchemaMatcher on admit.
+        let json_schema = msg
+            .get("response_format")
+            .and_then(|v| v.get("type"))
+            .and_then(|v| v.as_str())
+            .filter(|&t| t == "json_schema")
+            .and_then(|_| {
+                msg.get("response_format")
+                    .and_then(|v| v.get("json_schema"))
+                    .and_then(|v| v.get("schema"))
+                    .cloned()
+            });
         let continuation = if visual_data.is_some() {
             Continuation::Cold
         } else if convo.len() >= 3 {
@@ -872,7 +887,6 @@ impl SlotBackend {
         }
         // Transition queued (stdin reader announced). Bind will happen after Accepted.
         let _ = batch_transition_to_queued(id, attempt_id);
-
         let (tx, rx) = mpsc::channel::<Event>();
         let req = SubmitRequest {
             prompt_tokens,
@@ -889,6 +903,7 @@ impl SlotBackend {
             frequency_penalty,
             min_p,
             visual_data,
+            json_schema,
             queue_bytes: 0,
             reply: tx,
         };
@@ -1487,25 +1502,35 @@ pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
     {
         return Some("logprobs not supported in experimental multi-slot".to_string());
     }
-    // response_format (json_schema) is forwarded by the CLI but the slot
-    // engine cannot yet apply pre-sampling grammar masks: the saddle-core
-    // CompiledGrammar artifact (spec §7.1 G1) and the tokenizer's lossless
-    // token-byte table (spec §7.2 G2) are not yet available. Refuse with a
-    // typed error rather than silently dropping the constraint or building
-    // masks on lossy decode (spec §7.2: "Never build strict constraints on
-    // replacement-character artifacts").
+    // response_format json_schema: compile the schema with the saddle-core
+    // JSON Schema subset compiler (spec §7 G1). Unsupported keywords, refs,
+    // regex, recursion, and combinators are rejected here before the request
+    // is submitted — no GPU work, no cache/session mutation (spec §5.4 S4).
+    // A valid subset schema passes; the engine recompiles on admit to build
+    // the per-request SchemaMatcher cursor (spec §7.2 G2).
     if msg
         .get("response_format")
         .and_then(|v| v.get("type"))
         .and_then(|v| v.as_str())
         == Some("json_schema")
     {
-        return Some(
-            "structured output (response_format json_schema) is not yet supported \
-             on the multi-slot path: grammar compiler artifact and lossless \
-             token-byte table are unavailable (spec §7 G1/G2)"
-                .to_string(),
-        );
+        let schema = msg
+            .get("response_format")
+            .and_then(|v| v.get("json_schema"))
+            .and_then(|v| v.get("schema"));
+        let schema = match schema {
+            Some(s) => s,
+            None => {
+                return Some(
+                    "response_format json_schema requires a schema object \
+                     (spec §7 G1)"
+                        .to_string(),
+                );
+            }
+        };
+        if let Err(e) = saddle_core::grammar::json::json_schema::CompiledSchema::compile(schema) {
+            return Some(format!("response_format json_schema: {e}"));
+        }
     }
     // Token penalties and min_p are implemented by the slot sampler (in-kernel
     // repeat/presence/frequency over a per-slot recent-token window; min_p in
@@ -2078,25 +2103,45 @@ mod tests {
         let m5 = json!({"max_think_tokens": 1, "experimental_multi_slot": true});
         assert!(validate_generate_caps(&m5).is_none());
     }
-
     #[test]
-    fn generate_caps_rejects_response_format_json_schema() {
-        // json_schema response_format is refused on the multi-slot path
-        // because the saddle-core CompiledGrammar artifact and lossless
-        // token-byte table are not yet available (spec §7 G1/G2).
+    fn generate_caps_accepts_valid_json_schema_rejects_unsupported() {
+        // A valid subset schema (object with typed properties) is accepted at
+        // validate_generate_caps — the saddle-core CompiledSchema compiler
+        // succeeds (spec §7 G1).
         let m = json!({
-            "response_format": {"type": "json_schema", "json_schema": {"name": "test", "schema": {"type": "object"}}},
+            "response_format": {"type": "json_schema", "json_schema": {"name": "test", "schema": {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]}}},
             "experimental_multi_slot": true
         });
-        let reason = validate_generate_caps(&m);
-        assert!(reason.is_some(), "json_schema response_format must be rejected");
-        assert!(reason.unwrap().contains("response_format json_schema"));
+        assert!(
+            validate_generate_caps(&m).is_none(),
+            "valid json_schema response_format should be accepted"
+        );
         // Non-json_schema response_format (text) is not rejected by this guard.
         let m2 = json!({
             "response_format": {"type": "text"},
             "experimental_multi_slot": true
         });
         assert!(validate_generate_caps(&m2).is_none(), "text response_format should not be rejected here");
+        // Unsupported $ref is rejected before submit (spec §7 G1, §5.4 S4).
+        let m3 = json!({
+            "response_format": {"type": "json_schema", "json_schema": {"name": "test", "schema": {"$ref": "#/$defs/foo"}}},
+            "experimental_multi_slot": true
+        });
+        let reason = validate_generate_caps(&m3);
+        assert!(reason.is_some(), "unsupported $ref must be rejected");
+        assert!(
+            reason.unwrap().contains("response_format json_schema"),
+            "rejection must be typed as a json_schema error"
+        );
+        // Missing schema object is rejected.
+        let m4 = json!({
+            "response_format": {"type": "json_schema", "json_schema": {"name": "test"}},
+            "experimental_multi_slot": true
+        });
+        assert!(
+            validate_generate_caps(&m4).is_some(),
+            "json_schema without a schema object must be rejected"
+        );
     }
 
     #[test]

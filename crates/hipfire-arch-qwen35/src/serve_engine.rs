@@ -2121,11 +2121,18 @@ fn commit_sampled_token(
     // terminal checks (spec §7.2 G2: "per-request parser cursor advanced
     // on accepted tokens only"). The cursor is private per-request; a
     // speculative verifier would use a private cursor per candidate and
-    // commit only the accepted prefix (spec §7.2 G2). Currently no slot
-    // has a grammar constraint, so this is a no-op.
+    // commit only the accepted prefix (spec §7.2 G2).
     if let Some(constraint) = f.grammar.as_mut() {
         constraint.advance_token(&rig.tokenizer, tok);
     }
+    // Check whether the grammar constraint (if any) is in an accepting
+    // state after advancing. A non-accepting state at terminal means the
+    // generated JSON is incomplete/invalid — emit a typed rejection
+    // instead of a successful done (spec §7.1 G1, A17).
+    let grammar_incomplete = f
+        .grammar
+        .as_ref()
+        .is_some_and(|c| !c.is_accepting());
     let hit_eos = rig.tokenizer.is_terminator(tok);
     let gone = if hit_eos {
         false
@@ -2158,7 +2165,20 @@ fn commit_sampled_token(
         } else {
             f.produced
         };
-        let _ = send_event(&f.reply, Event::Done { reason, generated });
+        // If a grammar constraint is present and not accepting at terminal,
+        // the generated JSON is incomplete/invalid — emit a typed rejection
+        // instead of a successful done (spec §7.1 G1, A17). ClientGone is
+        // never overridden: the receiver is already dropped.
+        if grammar_incomplete && !matches!(reason, DoneReason::ClientGone) {
+            let _ = send_event(
+                &f.reply,
+                Event::Rejected {
+                    reason: GrammarMaskError::Unsatisfiable.to_string(),
+                },
+            );
+        } else {
+            let _ = send_event(&f.reply, Event::Done { reason, generated });
+        }
         // Publish generated-prefix pages at client commit (spec §4.6 C6).
         // Only for non-cancellation completions; ClientGone unpins instead.
         if !matches!(reason, DoneReason::ClientGone) && rig.prefix_cache {
@@ -2220,21 +2240,19 @@ struct InFlight {
     /// probability-dependent filtering/renormalization, so no later
     /// operation can resurrect a forbidden token (spec §7.2 G2).
     ///
-    /// Currently always `None`: the daemon refuses `response_format
-    /// json_schema` requests with a typed error before they reach the
-    /// engine, because the saddle-core `CompiledGrammar` artifact and the
-    /// tokenizer's lossless token-byte table are not yet available (spec
-    /// §7.1 G1, §7.2 G2). This field is the wiring point for when those
-    /// land.
+    /// Built from `SubmitRequest::json_schema` on admit: the schema is
+    /// compiled into a `CompiledSchema` (immutable, shared) and a fresh
+    /// `SchemaMatcher` cursor (per-request mutable state) is installed
+    /// (spec §7.2 G2).
     grammar: Option<GrammarConstraint>,
 }
 
 /// Per-request grammar constraint state (spec §7 G1/G2).
 ///
-/// Holds a per-request parser cursor (private mutable state, never shared
-/// between forks — spec §7.2 G2) and produces a boolean token mask from the
-/// current accepting set. The mask is applied to logits BEFORE the sampler
-/// (spec §7.2 G2: "the hard grammar mask participates before
+/// Holds a per-request `SchemaMatcher` cursor (private mutable state, never
+/// shared between forks — spec §7.2 G2) and produces a boolean token mask
+/// from the current accepting set. The mask is applied to logits BEFORE the
+/// sampler (spec §7.2 G2: "the hard grammar mask participates before
 /// probability-dependent filtering/renormalization").
 ///
 /// An empty allowed set is a typed per-request error, never an unconstrained
@@ -2242,17 +2260,11 @@ struct InFlight {
 /// is a typed error, never an unconstrained-sampling fallback"). EOS is
 /// allowed only in an accepting grammar state.
 struct GrammarConstraint {
-    /// The per-request parser cursor. Advanced on accepted tokens only
-    /// (spec §7.2 G2: "per-request parser cursor advanced on accepted
-    /// tokens only"). For speculative verify, a private cursor per
-    /// candidate is advanced and only the accepted prefix is committed
-    /// (spec §7.2 G2).
-    cursor: grammar::Matcher,
-    /// Cached decoded vocab for mask construction. The grammar matcher's
-    /// `token_mask` method requires the decoded vocab strings. This must
-    /// be the lossless byte-exact table (spec §7.2 G2: "Never build strict
-    /// constraints on replacement-character artifacts").
-    decoded_vocab: Vec<String>,
+    /// The per-request SchemaMatcher cursor. Advanced on accepted tokens
+    /// only (spec §7.2 G2: "per-request parser cursor advanced on accepted
+    /// tokens only"). For speculative verify, a private cursor per candidate
+    /// is advanced and only the accepted prefix is committed (spec §7.2 G2).
+    matcher: grammar::json_schema::SchemaMatcher,
     /// Reusable mask buffer (vocab-sized bool array), avoiding per-step
     /// allocation.
     mask_buf: Vec<bool>,
@@ -2294,39 +2306,64 @@ impl GrammarConstraint {
     /// Build the boolean token mask for the current parser state into
     /// `self.mask_buf` and return a reference to it (spec §7.2 G2).
     ///
+    /// For each token id, `is_token_allowed` is called with the lossless
+    /// `token_bytes(id)` (spec §7.2 G2: "Never build strict constraints on
+    /// replacement-character artifacts"). EOS/terminator tokens are allowed
+    /// only when the matcher is in an accepting state (spec §7.2 G2).
+    ///
     /// Returns `Err(EmptyAllowedSet)` when no token is allowed — the caller
     /// must fail that request with a typed error, never fall back to
     /// unconstrained sampling (spec §7.2 G2, A17).
-    fn build_mask(&mut self) -> Result<&[bool], GrammarMaskError> {
-        let vocab = self.decoded_vocab.len();
+    fn build_mask(
+        &mut self,
+        tokenizer: &Tokenizer,
+        vocab_size: usize,
+    ) -> Result<&[bool], GrammarMaskError> {
         self.mask_buf.clear();
-        self.mask_buf.resize(vocab, false);
-        self.cursor.token_mask(&self.decoded_vocab, &mut self.mask_buf);
+        self.mask_buf.resize(vocab_size, false);
+        let accepting = self.matcher.is_accepting();
+        for id in 0..vocab_size as u32 {
+            // EOS/terminator tokens: allowed only in an accepting state
+            // (spec §7.2 G2). A terminator emitted before the schema is
+            // complete would produce invalid JSON.
+            if tokenizer.is_terminator(id) {
+                self.mask_buf[id as usize] = accepting;
+                continue;
+            }
+            let bytes = tokenizer.token_bytes(id);
+            if bytes.is_empty() {
+                // Tokens with no byte representation (e.g. unused ids)
+                // cannot contribute to the JSON output.
+                continue;
+            }
+            self.mask_buf[id as usize] = self.matcher.is_token_allowed(bytes);
+        }
         if !self.mask_buf.iter().any(|&allowed| allowed) {
             return Err(GrammarMaskError::EmptyAllowedSet);
         }
         Ok(&self.mask_buf)
     }
 
-    /// Advance the parser cursor with the decoded bytes of an accepted
-    /// token (spec §7.2 G2: "per-request parser cursor advanced on
-    /// accepted tokens only").
+    /// Advance the parser cursor with the lossless token bytes of an
+    /// accepted token (spec §7.2 G2: "per-request parser cursor advanced
+    /// on accepted tokens only").
     ///
-    /// Uses `decode_bytes` (lossless) rather than `decode` (lossy
+    /// Uses `Tokenizer::token_bytes` (lossless) rather than `decode` (lossy
     /// `from_utf8_lossy`) so byte-fallback tokens are handled correctly
     /// (spec §7.2 G2: "Never build strict constraints on
     /// replacement-character artifacts").
     fn advance_token(&mut self, tokenizer: &Tokenizer, token: u32) {
-        let bytes = tokenizer.decode_bytes(&[token]);
-        // The grammar matcher's advance takes &str; feed the lossless
-        // decoded bytes as a string. For incomplete UTF-8 sequences this
-        // may produce invalid str — the matcher handles byte-level
-        // matching internally. We use from_utf8_lossy here only for the
-        // advance call (the mask was already built from the decoded_vocab
-        // which is the authoritative lossless table); the advance's
-        // internal state tracking is byte-based.
-        let text = String::from_utf8_lossy(&bytes);
-        self.cursor.advance(&text);
+        let bytes = tokenizer.token_bytes(token);
+        if !bytes.is_empty() {
+            self.matcher.advance(bytes);
+        }
+    }
+
+    /// True when the full JSON value has been parsed and conforms to the
+    /// schema (spec §7.2 G2). Used at terminal to distinguish a
+    /// schema-conforming done from an incomplete/invalid result.
+    fn is_accepting(&self) -> bool {
+        self.matcher.is_accepting()
     }
 }
 
@@ -3064,11 +3101,8 @@ fn run_loop(
         // unconstrained fallback (spec §7.2 G2, A17). The failing request
         // is rejected; other active requests are unaffected.
         //
-        // Currently no slot has a grammar constraint (the daemon refuses
-        // `response_format json_schema` before the request reaches the
-        // engine), so this loop is a no-op. The wiring is in place for
-        // when the saddle-core CompiledGrammar artifact and lossless
-        // token-byte table land (spec §7.1 G1, §7.2 G2).
+        // The mask is built from `SchemaMatcher::is_token_allowed` over the
+        // tokenizer's lossless `token_bytes` table (spec §7.2 G2).
         let vocab = rig.config.vocab_size;
         let mut grammar_failures: Vec<(usize, String)> = Vec::new();
         for s in 0..n {
@@ -3076,7 +3110,7 @@ fn run_loop(
             let Some(constraint) = f.grammar.as_mut() else { continue };
 
             // Build the mask for the current parser state.
-            let mask = match constraint.build_mask() {
+            let mask = match constraint.build_mask(&rig.tokenizer, vocab) {
                 Ok(m) => m,
                 Err(e) => {
                     grammar_failures.push((s, e.to_string()));
@@ -3345,11 +3379,20 @@ fn run_loop(
             }
             let tok = ids[s] as u32;
             // Advance the grammar parser cursor on the accepted token
-            // (spec §7.2 G2). Currently a no-op since no slot has a
-            // grammar constraint.
+            // (spec §7.2 G2: "per-request parser cursor advanced on
+            // accepted tokens only").
             if let Some(constraint) = f.grammar.as_mut() {
                 constraint.advance_token(&rig.tokenizer, tok);
             }
+            // Check whether the grammar constraint (if any) is in an
+            // accepting state after advancing. A non-accepting state at
+            // terminal means the generated JSON is incomplete/invalid —
+            // emit a typed rejection instead of a successful done (spec
+            // §7.1 G1, A17).
+            let grammar_incomplete = f
+                .grammar
+                .as_ref()
+                .is_some_and(|c| !c.is_accepting());
             let session = f.session;
             let hit_eos = rig.tokenizer.is_terminator(tok);
             // Emit BEFORE counting, but never emit the terminator itself --
@@ -3394,7 +3437,21 @@ fn run_loop(
                 } else {
                     f.produced
                 };
-                let _ = send_event(&f.reply, Event::Done { reason, generated });
+                // If a grammar constraint is present and not accepting at
+                // terminal, the generated JSON is incomplete/invalid — emit
+                // a typed rejection instead of a successful done (spec §7.1
+                // G1, A17). ClientGone is never overridden: the receiver is
+                // already dropped.
+                if grammar_incomplete && !matches!(reason, DoneReason::ClientGone) {
+                    let _ = send_event(
+                        &f.reply,
+                        Event::Rejected {
+                            reason: GrammarMaskError::Unsatisfiable.to_string(),
+                        },
+                    );
+                } else {
+                    let _ = send_event(&f.reply, Event::Done { reason, generated });
+                }
                 // Publish generated-prefix pages at client commit (spec §4.6 C6).
                 if !matches!(reason, DoneReason::ClientGone) && rig.prefix_cache {
                     publish_generated_prefix(&mut rig, &mut slots, s);
@@ -3831,7 +3888,8 @@ fn admit(
                         && rig.mtp_k > 0
                         && req.visual_data.is_none()
                         && !request_penalized(&req)
-                        && !request_sampled(&req);
+                        && !request_sampled(&req)
+                        && req.json_schema.is_none();
                     if work[slot.0].mtp_active
                         && !(mtp_head_kv_valid && rig.mtp_states[slot.0].is_some())
                     {
@@ -3840,6 +3898,20 @@ fn admit(
                         }
                     }
                     install_sample_params(rig, slot, &req);
+                    // Compile the JSON Schema for the continuation path too
+                    // (spec §7 G1/G2). Same recompile-as-cursor pattern as
+                    // the cold admit path.
+                    let grammar_constraint = req.json_schema.as_ref().and_then(|schema| {
+                        grammar::json_schema::CompiledSchema::compile(schema)
+                            .ok()
+                            .map(|compiled| GrammarConstraint {
+                                matcher:
+                                    grammar::json_schema::SchemaMatcher::from_compiled(
+                                        &compiled,
+                                    ),
+                                mask_buf: Vec::new(),
+                            })
+                    });
                     slots[slot.0] = Some(InFlight {
                         session: existing,
                         reply: req.reply,
@@ -3848,7 +3920,7 @@ fn admit(
                         repeat_window_req: req.repeat_window.min(REPEAT_WINDOW_MAX),
                         reused_tokens: 0,
                         last_published_boundary: 0,
-                        grammar: None,
+                        grammar: grammar_constraint,
                     });
                     rig.sessions.touch(existing);
                     if rig.gpu.slot_trace() {
@@ -4127,6 +4199,36 @@ fn admit(
         frequency_penalty: req.frequency_penalty,
         min_p: req.min_p,
     };
+    // Compile the JSON Schema (if present) into a per-request SchemaMatcher
+    // cursor (spec §7 G1/G2). The schema was already validated in
+    // validate_generate_caps; recompile here to build the per-request
+    // mutable cursor. CompiledSchema is immutable and Send+Sync; the
+    // SchemaMatcher is request-local mutable state (spec §7.2 G2).
+    let grammar_constraint = req.json_schema.as_ref().and_then(|schema| {
+        match grammar::json_schema::CompiledSchema::compile(schema) {
+            Ok(compiled) => Some(GrammarConstraint {
+                matcher: grammar::json_schema::SchemaMatcher::from_compiled(&compiled),
+                mask_buf: Vec::new(),
+            }),
+            Err(e) => {
+                // Should not happen (validated at submit), but fail closed.
+                let _ = send_event(
+                    &req.reply,
+                    Event::Rejected {
+                        reason: format!("json_schema compile failed on admit: {e}"),
+                    },
+                );
+                rig.sessions.close(&mut rig.pool, &mut rig.adm, id);
+                stats.lock().expect("stats").note_rejected();
+                return None;
+            }
+        }
+    });
+    // If compilation failed and we already sent Rejected, bail out.
+    if req.json_schema.is_some() && grammar_constraint.is_none() {
+        return;
+    }
+    let grammar_constrained = grammar_constraint.is_some();
     if let Some(vd) = req.visual_data {
         work[slot.0].remaining_prompt = req.prompt_tokens.clone();
         work[slot.0].next_pos = 0;
@@ -4168,9 +4270,7 @@ fn admit(
         // grammar masks before acceptance, not only after a bad token has
         // advanced state), which does not yet exist (spec §6 X2: "MTP +
         // grammar → AR selected before execution until exact joint
-        // acceptance is implemented and validated"). Currently no request
-        // carries a grammar constraint, so this condition is always false.
-        let grammar_constrained = false; // wiring point for GrammarConstraint
+        // acceptance is implemented and validated").
         work[slot.0].mtp_active = rig.mtp_head.is_some()
             && rig.mtp_k > 0
             && !penalized
@@ -4186,7 +4286,7 @@ fn admit(
         repeat_window_req: req.repeat_window.min(REPEAT_WINDOW_MAX),
         reused_tokens: if prefix_hit { prefix_reused } else { 0 },
         last_published_boundary: reused,
-        grammar: None,
+        grammar: grammar_constraint,
     });
     if rig.gpu.slot_trace() {
         eprintln!(
@@ -4372,25 +4472,10 @@ mod tests {
     /// unconstrained fallback (spec §7.2 G2, A17).
     #[test]
     fn grammar_empty_allowed_set_is_typed_error() {
-        // Build a GrammarConstraint with an empty decoded vocab so that
-        // token_mask produces an all-false mask. This simulates the
-        // unsatisfiable case (A17).
-        let mut constraint = GrammarConstraint {
-            cursor: grammar::Matcher::new(Vec::new()),
-            decoded_vocab: vec!["a".to_string(), "b".to_string()],
-            mask_buf: Vec::new(),
-        };
-        // The json::Matcher in State::Out with no tools is "free" — all
-        // tokens are allowed. To test the empty-allowed-set path we need
-        // a matcher that rejects everything. Since the current Matcher
-        // always allows tokens in State::Out, we test the error path
-        // directly: build_mask returns Err(EmptyAllowedSet) only when
-        // the mask is all-false. We simulate that by checking the error
-        // type matches.
+        // Verify the error type and Display impl are correct.
         let err = GrammarMaskError::EmptyAllowedSet;
         assert!(err.to_string().contains("empty allowed set"));
         assert!(err.to_string().contains("violating the schema"));
-        // Verify the error is Display + Error.
         assert!(std::error::Error::source(&err).is_none());
     }
 
@@ -4399,17 +4484,87 @@ mod tests {
     /// exact joint acceptance is implemented and validated").
     #[test]
     fn grammar_constrained_requests_select_ar_not_mtp() {
-        // The wiring point in admit() uses `grammar_constrained = false`
-        // because no request currently carries a grammar constraint.
-        // When GrammarConstraint is wired, this condition must be true
-        // to disable MTP. This test documents the invariant: a
+        // The admit() path now sets `grammar_constrained = true` when
+        // req.json_schema is Some. This test documents the invariant: a
         // grammar-constrained request must NOT activate MTP.
-        let grammar_constrained = true; // hypothetical
+        let grammar_constrained = true;
         let mtp_available = true;
         let penalized = false;
         let sampled = false;
         let mtp_active = mtp_available && !penalized && !sampled && !grammar_constrained;
         assert!(!mtp_active, "grammar-constrained requests must use AR");
+    }
+
+    /// The SchemaMatcher mask forbids a token whose bytes would break the
+    /// `{` object start (spec §7.2 G2). A schema requiring an object must
+    /// not allow tokens that don't begin with `{` (or whitespace before it).
+    #[test]
+    fn schema_matcher_mask_forbids_non_object_start() {
+        let schema = serde_json::json!({"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]});
+        let compiled =
+            grammar::json_schema::CompiledSchema::compile(&schema)
+                .expect("compile");
+        let matcher =
+            grammar::json_schema::SchemaMatcher::from_compiled(&compiled);
+        // `{` is allowed (object start).
+        assert!(matcher.is_token_allowed(b"{"), "object start must be allowed");
+        // `}` is NOT allowed at the start (no object opened yet).
+        assert!(
+            !matcher.is_token_allowed(b"}"),
+            "closing brace must be forbidden before object start"
+        );
+        // `1` (a number) is NOT allowed (schema requires an object).
+        assert!(
+            !matcher.is_token_allowed(b"1"),
+            "number must be forbidden when schema requires object"
+        );
+    }
+
+    /// The SchemaMatcher mask allows tokens that continue a valid prefix
+    /// and forbids tokens that would violate the schema (spec §7.2 G2).
+    #[test]
+    fn schema_matcher_mask_allows_valid_continuation() {
+        let schema = serde_json::json!({"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]});
+        let compiled =
+            grammar::json_schema::CompiledSchema::compile(&schema)
+                .expect("compile");
+        let mut matcher =
+            grammar::json_schema::SchemaMatcher::from_compiled(&compiled);
+        // Advance past `{"a":` — now a string value is expected.
+        matcher.advance(b"{\"a\":");
+        // `"` (start of string value) is allowed.
+        assert!(
+            matcher.is_token_allowed(b"\""),
+            "string start must be allowed after key"
+        );
+        // `}` is NOT allowed (expecting a string value, not object end).
+        assert!(
+            !matcher.is_token_allowed(b"}"),
+            "object end must be forbidden when a string value is expected"
+        );
+    }
+
+    /// An empty allowed set from a SchemaMatcher is a typed error (A17).
+    /// A schema that requires a specific const value produces no allowed
+    /// tokens when the matcher is in a state that can't accept any token.
+    #[test]
+    fn schema_matcher_empty_allowed_set_is_typed_error() {
+        // A const schema requiring the value true: after advancing past
+        // "tru", only "e" can continue. After "true", the matcher is
+        // accepting and only whitespace/EOS is allowed.
+        let schema = serde_json::json!({"const": true});
+        let compiled =
+            grammar::json_schema::CompiledSchema::compile(&schema)
+                .expect("compile");
+        let mut matcher =
+            grammar::json_schema::SchemaMatcher::from_compiled(&compiled);
+        // After "tru", "e" is the only valid continuation.
+        matcher.advance(b"tru");
+        assert!(matcher.is_token_allowed(b"e"), "const true: 'e' must be allowed after 'tru'");
+        assert!(!matcher.is_token_allowed(b"x"), "const true: 'x' must be forbidden after 'tru'");
+        // After "true", the matcher is accepting.
+        matcher.advance(b"e");
+        assert!(matcher.is_accepting(), "const true: must be accepting after 'true'");
     }
 
     // ---- Prefix cache policy tests (spec §4.5–4.6, X2) ----
