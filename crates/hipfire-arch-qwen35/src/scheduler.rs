@@ -140,6 +140,27 @@ impl Scheduler {
         remaining_rows: usize,
         prefill_min_tokens: usize,
     ) -> SlotBatch {
+        // No FairQueue in scope (unit tests, single-slot carriers): every
+        // slot is eligible. The serve engine calls `next_batch_eligible`
+        // directly with the FairQueue's grant mask (spec §5.3 S3).
+        let all = vec![true; work.len()];
+        self.next_batch_eligible(work, remaining_rows, prefill_min_tokens, &all)
+    }
+
+    /// Same as [`next_batch`](Self::next_batch) but only slots `s` with
+    /// `eligible[s] == true` may contribute rows. An un-granted slot
+    /// contributes 0 rows and its `remaining_prompt` is left untouched (it
+    /// is NOT drained) so no tokens are lost. The serve engine uses this to
+    /// enforce FairQueue grants (spec §5.3 S3): the FairQueue decides WHO is
+    /// eligible this tick; this scheduler still decides HOW MANY rows each
+    /// eligible slot gets under `remaining_rows`.
+    pub fn next_batch_eligible(
+        &mut self,
+        work: &mut [PendingWork],
+        remaining_rows: usize,
+        prefill_min_tokens: usize,
+        eligible: &[bool],
+    ) -> SlotBatch {
         let n = work.len();
         // A step carrying VL rows runs the batched M-RoPE kernel for EVERY
         // row (text rows take [p, p, p], bit-identical to 1D RoPE), so the
@@ -155,11 +176,12 @@ impl Scheduler {
         // ---- Phase 1: decode (1 row per runnable decode slot, slot order) ----
         // Admit decode lanes in slot order until the budget is exhausted; a
         // step that cannot afford every decode lane serves a prefix of them
-        // rather than overflowing (spec §5.2 S2).
+        // rather than overflowing (spec §5.2 S2). A slot not in the FairQueue
+        // grant mask (`eligible[s] == false`) is skipped entirely.
         let mut alloc = vec![0usize; n];
         let mut used = 0usize;
         for i in 0..n {
-            if !is_runnable_decode(&work[i], self.vl_sequential) {
+            if !is_runnable_decode(&work[i], self.vl_sequential) || !eligible.get(i).copied().unwrap_or(false) {
                 continue;
             }
             if used + 1 > remaining_rows {
@@ -178,7 +200,7 @@ impl Scheduler {
         let mut avail = remaining_rows.saturating_sub(used);
         if avail > 0 {
             let prefill_slots: Vec<usize> = (0..n)
-                .filter(|&i| is_runnable_prefill(&work[i], self.vl_sequential))
+                .filter(|&i| is_runnable_prefill(&work[i], self.vl_sequential) && eligible.get(i).copied().unwrap_or(false))
                 .collect();
             if !prefill_slots.is_empty() {
                 let n_pr = prefill_slots.len();
@@ -283,19 +305,19 @@ impl Scheduler {
 // prompt suffix.
 
 /// Sequential VL or decoding MTP: owned elsewhere, never batched here.
-fn skip_entirely(w: &PendingWork, vl_sequential: bool) -> bool {
+pub(crate) fn skip_entirely(w: &PendingWork, vl_sequential: bool) -> bool {
     (w.vl_prefill.is_some() && vl_sequential) || (w.mtp_active && w.decoding)
 }
 
 /// Batched VL slot whose vision-tower embeddings have not landed yet.
-fn vl_waiting(w: &PendingWork) -> bool {
+pub(crate) fn vl_waiting(w: &PendingWork) -> bool {
     w.vl_prefill
         .as_ref()
         .is_some_and(|vl| vl.embeddings.is_empty() && vl.n_visual_tokens > 0)
 }
 
 /// A decoding slot that contributes one ordinary decode row this step.
-fn is_runnable_decode(w: &PendingWork, vl_sequential: bool) -> bool {
+pub(crate) fn is_runnable_decode(w: &PendingWork, vl_sequential: bool) -> bool {
     if skip_entirely(w, vl_sequential) || vl_waiting(w) {
         return false;
     }
@@ -303,7 +325,7 @@ fn is_runnable_decode(w: &PendingWork, vl_sequential: bool) -> bool {
 }
 
 /// A prefilling slot with prompt tokens left to feed.
-fn is_runnable_prefill(w: &PendingWork, vl_sequential: bool) -> bool {
+pub(crate) fn is_runnable_prefill(w: &PendingWork, vl_sequential: bool) -> bool {
     if skip_entirely(w, vl_sequential) || vl_waiting(w) {
         return false;
     }
@@ -763,5 +785,39 @@ mod tests {
             b.m_per_slot[1]
         );
         assert!(b.total_rows() <= 5);
+    }
+
+    /// An ineligible slot contributes 0 rows and its `remaining_prompt` is
+    /// NOT drained — no tokens are lost. This is the contract the serve
+    /// engine relies on when it passes the FairQueue grant mask: an
+    /// un-granted slot must contribute 0 rows (spec §5.3 S3).
+    #[test]
+    fn ineligible_slot_contributes_zero_rows_and_keeps_its_prompt() {
+        let mut s = Scheduler { chunk_size: 256, vl_sequential: false, prefill_cursor: 0 };
+        let mut work = vec![
+            PendingWork {
+                slot: SlotId(0),
+                remaining_prompt: prompt(100),
+                next_pos: 0,
+                decoding: false,
+                vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0, pos3_delta: 0,
+            },
+            PendingWork {
+                slot: SlotId(1),
+                remaining_prompt: prompt(100),
+                next_pos: 0,
+                decoding: false,
+                vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0, pos3_delta: 0,
+            },
+        ];
+        // Only slot 0 is eligible (FairQueue granted it); slot 1 is not.
+        let eligible = [true, false];
+        let b = s.next_batch_eligible(&mut work, 4096, 1, &eligible);
+        assert_eq!(b.m_per_slot, vec![100, 0], "ineligible slot contributes 0 rows");
+        // Slot 1's prompt is untouched (not drained).
+        assert_eq!(work[1].remaining_prompt.len(), 100, "ineligible slot keeps its prompt");
+        assert_eq!(work[1].next_pos, 0);
+        // Slot 0's prompt was consumed.
+        assert!(work[0].remaining_prompt.is_empty());
     }
 }
