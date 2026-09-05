@@ -17,10 +17,10 @@
 | 2 P1 pool/admission + P4 grammar core | done | `b6b4a6a30`, `3f024ec4c` |
 | 3 P2 prefix cache | done, default off | `0f648d091`, `d4faba38b`, `21f202f3d` |
 | 4 P3 scheduler + wait + jump-forward planner | done; wait on; jump-forward default off | `4e2ed2423`–`f3222d63d` |
-| 5 composition | **composed for advertised text cells** | MTP sidecar probe finds `qwen3.5-4b.mtp` next to `qwen3.5-4b.mq4v2.hfq`. GPU `test_serve_prefix_cache --mtp-k 4` PASS on gfx1101 / ROCm 10: greedy MTP cold 0 / warm 256 / branch 256 matching tokens; sampled AR reuse 256/256 deterministic seed; grammar AR reuse 256 and `{"city":"Rome"}`; 4-hit soak then `reset` → reused=0. `serve_harness.py --mode chain` cached_tokens 0→89→192→265→346. Vision+prefix off (X2); tools/stop/logprobs refused; no A19 fault injection; no `admissions.yml` row. |
+| 5 composition | **composed for advertised text cells** | Slot engine *and* single-slot loader probe `qwen3.5-4b.mtp` next to `qwen3.5-4b.mq4v2.hfq`. GPU `test_serve_prefix_cache --mtp-k 4` PASS on gfx1101 / ROCm 10: greedy MTP cold 0 / warm 256 / branch 256 matching tokens; sampled AR reuse 256/256 deterministic seed; grammar AR reuse 256 and `{"city":"Rome"}`; 4-hit soak then `reset` → reused=0. `serve_harness.py --mode chain` cached_tokens 0→89→192→265→346. `hipfire run --spec mtp` logs `MTP head loaded (sidecar .../qwen3.5-4b.mtp)`. Vision+prefix off (X2); tools/stop/logprobs refused; no A19 fault injection; full A20 (model swap/idle spill) not run; no `admissions.yml` row. |
 | 6 overlap | **open, stays off** | `serve.scheduler_overlap` is a registered flag only — no host-prep overlap path exists, so there is no host-gap to measure. Spec §10: leave off. |
 
-Host tests: sidecar_probe 2. GPU: `test_serve_prefix_cache --mtp-k 4` PASS. Pre-existing `oversized_pool_is_refused_not_allocated` fails when OOM guard is inactive.
+Host tests: sidecar_probe 3 + loader stem probe 1. GPU: `test_serve_prefix_cache --mtp-k 4` PASS; single-slot `hipfire run --spec mtp` loads `qwen3.5-4b.mtp`. Pre-existing `oversized_pool_is_refused_not_allocated` fails when OOM guard is inactive.
 
 ## 1. What already exists (do not rebuild)
 

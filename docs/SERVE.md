@@ -305,7 +305,8 @@ start cost on that first switched request).
 `serve.prefix_cache` is **off by default**. On the multi-slot engine
 (`serve.multi_slot=true`) it enables cross-session radix reuse of sealed
 128-token KV pages plus Qwen hybrid checkpoints. `.mtp` sidecars are
-probed as both `foo.mq4v2.mtp` and `foo.mtp`. Verified on gfx1101 /
+probed as both `foo.mq4v2.mtp` and `foo.mtp` on the slot engine and the
+single-slot loader (`hipfire run --spec mtp`). Verified on gfx1101 /
 ROCm 10 (`test_serve_prefix_cache --mtp-k 4`): greedy MTP, sampled AR,
 and JSON-Schema AR all reuse ≥256 tokens; `reset` forces a cold miss.
 Vision+prefix reuse stays off. Tools/stop/logprobs stay refused on slots.

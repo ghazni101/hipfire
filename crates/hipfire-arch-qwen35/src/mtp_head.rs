@@ -2677,4 +2677,25 @@ mod sidecar_probe_tests {
             "{c:?}"
         );
     }
+
+    #[test]
+    fn find_mtp_sidecar_uses_stem_when_last_extension_missing() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-mtp-probe-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let trunk = dir.join("qwen3.5-4b.mq4v2.hfq");
+        let stem = dir.join("qwen3.5-4b.mtp");
+        std::fs::write(&trunk, b"trunk").expect("trunk");
+        std::fs::write(&stem, b"mtp").expect("stem sidecar");
+        let found = find_mtp_sidecar(&trunk).expect("stem sidecar exists");
+        assert_eq!(found, stem);
+        assert!(
+            find_mtp_sidecar(&dir.join("missing.mq4v2.hfq")).is_none(),
+            "absent sidecars must miss"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
