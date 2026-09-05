@@ -74,6 +74,11 @@ pub struct SubmitRequest {
     pub min_p: f32,
     /// Visual embeddings + M-RoPE for VL requests. None for text-only.
     pub visual_data: Option<VisualData>,
+    /// Canonical pending-input bytes charged to the HTTP admission queue
+    /// (spec §5.3). The unified permit carries this from HTTP through daemon
+    /// to slots so bytes are charged once and released exactly once. Zero
+    /// when the request did not pass through the byte-bounded queue.
+    pub queue_bytes: u64,
     pub reply: Sender<Event>,
 }
 
