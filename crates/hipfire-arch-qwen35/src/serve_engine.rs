@@ -14,6 +14,7 @@
 // `SlotPool`, the arenas or the DeltaNet states. All interaction is by message,
 // which is what makes "no lock" safe rather than merely fast.
 
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc::{channel, Receiver, Sender, TryRecvError};
 use std::sync::{Arc, Mutex};
@@ -33,11 +34,11 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::forward_slots::{forward_batch_slots_graphed_opts, SlotDecodeGraph, SlotDescStaging};
 use crate::grammar;
+use crate::scheduler::{is_runnable_decode, is_runnable_prefill, PendingWork, Scheduler, VlPrefill};
 use crate::slot_batch::SlotBatch;
 use crate::qwen35::{
     self, DeltaNetState, LayerType, PrefillBatchScratch, Qwen35Scratch, Qwen35Weights,
 };
-use crate::scheduler::{PendingWork, Scheduler, VlPrefill};
 use hipfire_runtime::llama::{KvCache, VMode};
 use hipfire_runtime::tokenizer::Tokenizer;
 use crate::speculative::DeltaNetSnapshot;
@@ -46,6 +47,7 @@ use hipfire_runtime::prefix_index::{Handle, PrefixIndex};
 use hipfire_runtime::serve_contract::{
     CacheDomain, DrafterDecision, PrefixLookup, PrefixLookupResult,
 };
+use hipfire_runtime::serve_fairness::{FairQueue, Grant, Selection};
 
 /// Internal control plane for the engine thread. Public methods map onto these
 /// messages; the GPU rig stays exclusively on that thread.
@@ -347,6 +349,11 @@ struct Rig {
     /// shadows the index's handle storage so the admit Hit path can
     /// retrieve the physical pages to share into a new slot.
     published_handles: std::collections::HashMap<u64, Vec<hipfire_runtime::prefix_index::Handle>>,
+    /// Host-side fairness queue (spec §5.3 S3). Admits/needs/select are
+    /// driven from the engine loop each step; the granted ids become the
+    /// scheduler's eligibility mask so an un-granted slot contributes 0
+    /// rows. Pure policy — no GPU state.
+    fair_queue: FairQueue,
 }
 
 fn dn_buffers(dn: &DeltaNetState) -> Vec<&GpuTensor> {
@@ -1083,6 +1090,18 @@ impl Rig {
         };
 
         let vocab_size = config.vocab_size;
+        // FairQueue (spec §5.3 S3): constructed from the same budget knobs the
+        // scheduler enforces. An invalid config (max_batch_tokens < n_slots +
+        // prefill_min_tokens) fails build rather than silently disabling
+        // fairness — the policy would otherwise deadlock.
+        let max_batch_tokens = cfg.max_batch_tokens.max(1);
+        let prefill_min_tokens = cfg.prefill_min_tokens.max(1);
+        let fair_queue = FairQueue::new(
+            max_batch_tokens as u64,
+            cfg.n_slots as u64,
+            prefill_min_tokens as u64,
+        )
+        .map_err(|e| format!("fairness queue: {e}"))?;
         Ok(Rig {
             gpu,
             weights,
@@ -1118,8 +1137,8 @@ impl Rig {
             n_slots: cfg.n_slots,
             cap_tokens: cfg.cap_tokens,
             prefill_chunk,
-            max_batch_tokens: cfg.max_batch_tokens.max(1),
-            prefill_min_tokens: cfg.prefill_min_tokens.max(1),
+            max_batch_tokens,
+            prefill_min_tokens,
             logits_host: vec![0.0f32; cfg.n_slots * vocab_size],
             prefix_index,
             checkpoint_pool,
@@ -1128,6 +1147,7 @@ impl Rig {
             lookup_count: 0,
             cow_plan_count: 0,
             published_handles: std::collections::HashMap::new(),
+            fair_queue,
         })
     }
 
@@ -2145,6 +2165,9 @@ fn commit_sampled_token(
             publish_generated_prefix(rig, slots, s);
         }
         slots[s] = None;
+        // FairQueue: the request is done — drop it so it stops consuming
+        // the fairness budget (spec §5.3 S3). Idempotent (NotFound ignored).
+        let _ = rig.fair_queue.remove(session.0);
         clear_work_slot(&mut work[s]);
         clear_slot_vl_state(rig, s);
         if matches!(reason, DoneReason::ClientGone) {
@@ -2351,7 +2374,9 @@ fn run_loop(
                     },
                 );
                 rig.swap.forget(f.session.0);
-                rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
+                let sid = f.session;
+                rig.sessions.close(&mut rig.pool, &mut rig.adm, sid);
+                let _ = rig.fair_queue.remove(sid.0);
                 clear_work_slot(&mut work[s]);
                 clear_slot_vl_state(rig, s);
             }
@@ -2408,6 +2433,7 @@ fn run_loop(
                             },
                         );
                         rig.swap.forget(f.session.0);
+                        let _ = rig.fair_queue.remove(f.session.0);
                         rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
                     }
                     clear_work_slot(&mut work[s]);
@@ -2460,6 +2486,7 @@ fn run_loop(
                                     },
                                 );
                                 rig.swap.forget(f.session.0);
+                                let _ = rig.fair_queue.remove(f.session.0);
                                 rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
                             }
                             clear_work_slot(&mut work[s]);
@@ -2498,6 +2525,7 @@ fn run_loop(
                             reason: reason.clone(),
                         });
                         rig.swap.forget(f.session.0);
+                        let _ = rig.fair_queue.remove(f.session.0);
                         rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
                     }
                     clear_work_slot(&mut work[s]);
@@ -2535,7 +2563,58 @@ fn run_loop(
         let remaining_for_sched = max_batch_tokens
             .saturating_sub(verify_rows as usize)
             .max(0);
-        let sched_batch = sched.next_batch(&mut work, remaining_for_sched, prefill_min_tokens);
+        // ── FairQueue select (spec §5.3 S3) ─────────────────────────────
+        // The FairQueue decides WHO is eligible this tick (aged-first,
+        // backfill, prefill cursor); the scheduler still decides HOW MANY
+        // rows each granted slot gets. Sync each active slot's per-step
+        // needs from slot state, then select grants under the same remaining
+        // budget the scheduler will use. The granted ids become the
+        // scheduler's eligibility mask; starved_oldest triggers bounded
+        // backfill (only the oldest stays eligible so younger prefill/decode
+        // is skipped this tick, giving the starved oldest the next budget).
+        let vl_sequential = rig.vl_sequential;
+        let mtp_k = rig.mtp_k;
+        for s in 0..n {
+            let Some(f) = slots[s].as_ref() else { continue };
+            let id = f.session.0;
+            let wants_decode = is_runnable_decode(&work[s], vl_sequential);
+            let verify = if mtp_drafts[s].is_some() { (mtp_k + 1) as u64 } else { 0 };
+            let uncached = if is_runnable_prefill(&work[s], vl_sequential) {
+                work[s].remaining_prompt.len() as u64
+            } else {
+                0
+            };
+            sync_fair_needs(&mut rig.fair_queue, id, wants_decode, verify, uncached);
+        }
+        let sel = rig.fair_queue.select(
+            n as u64,
+            prefill_min_tokens as u64,
+            remaining_for_sched as u64,
+        );
+        // After the admission round: mark requests not served since the last
+        // round as aged (spec §5.3 S3.3). select already advanced the tick;
+        // skip_round_complete sets the round boundary so the next select
+        // prefers aged (starved) requests before cache-locality tie-breaks.
+        rig.fair_queue.skip_round_complete();
+        let granted_ids = if sel.starved_oldest {
+            oldest_active_session(&rig.fair_queue, &slots)
+                .map(|oid| apply_starved_backfill(&sel, oid))
+                .unwrap_or_else(|| eligible_ids_from_selection(&sel))
+        } else {
+            eligible_ids_from_selection(&sel)
+        };
+        let mut eligible = vec![false; n];
+        for s in 0..n {
+            if let Some(f) = &slots[s] {
+                eligible[s] = granted_ids.contains(&f.session.0);
+            }
+        }
+        let sched_batch = sched.next_batch_eligible(
+            &mut work,
+            remaining_for_sched,
+            prefill_min_tokens,
+            &eligible,
+        );
 
         // Count prefill + decode rows the scheduler emitted.
         let prefill_rows: u64 = (0..n)
@@ -2724,6 +2803,7 @@ fn run_loop(
                     let reason = "COW reservation failed for this slot".to_string();
                     let _ = send_event(&f.reply, Event::Rejected { reason });
                     rig.swap.forget(f.session.0);
+                    let _ = rig.fair_queue.remove(f.session.0);
                     rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
                     clear_work_slot(&mut work[s]);
                     clear_slot_vl_state(&mut rig, s);
@@ -2923,6 +3003,7 @@ fn run_loop(
                         },
                     );
                     rig.swap.forget(f.session.0);
+                    let _ = rig.fair_queue.remove(f.session.0);
                     rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
                     work[s].remaining_prompt.clear();
                     work[s].decoding = false;
@@ -3056,6 +3137,7 @@ fn run_loop(
             if let Some(f) = slots[s].take() {
                 let _ = send_event(&f.reply, Event::Rejected { reason: reason.clone() });
                 rig.swap.forget(f.session.0);
+                let _ = rig.fair_queue.remove(f.session.0);
                 rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
                 clear_work_slot(&mut work[s]);
                 clear_slot_vl_state(&mut rig, s);
@@ -3186,6 +3268,7 @@ fn run_loop(
                                 },
                             );
                             rig.swap.forget(f.session.0);
+                            let _ = rig.fair_queue.remove(f.session.0);
                             rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
                         }
                         clear_work_slot(&mut work[s]);
@@ -3240,6 +3323,7 @@ fn run_loop(
                                 },
                             );
                             rig.swap.forget(f.session.0);
+                            let _ = rig.fair_queue.remove(f.session.0);
                             rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
                         }
                         clear_work_slot(&mut work[s]);
@@ -3316,6 +3400,7 @@ fn run_loop(
                     publish_generated_prefix(&mut rig, &mut slots, s);
                 }
                 slots[s] = None;
+                let _ = rig.fair_queue.remove(session.0);
                 clear_work_slot(&mut work[s]);
                 clear_slot_vl_state(&mut rig, s);
                 if matches!(reason, DoneReason::ClientGone) {
@@ -3396,6 +3481,7 @@ fn handle_command(
                 }
                 clear_work_slot(&mut work[idx]);
                 clear_slot_vl_state(rig, idx);
+                let _ = rig.fair_queue.remove(session);
             }
             rig.swap.forget(session);
             rig.sessions.close(&mut rig.pool, &mut rig.adm, sid);
@@ -3453,6 +3539,74 @@ fn reused_tokens_from_plan(boundary: usize, prompt_len: usize) -> usize {
     } else {
         0
     }
+}
+
+// ---- FairQueue integration helpers (spec §5.3 S3) ----
+
+/// Extract the set of request ids that received any grant this step.
+///
+/// Pure projection over a [`Selection`]: the FairQueue decides WHO is
+/// eligible (aged-first, backfill, prefill cursor); the scheduler decides
+/// HOW MANY rows each granted slot gets. This set becomes the scheduler's
+/// eligibility mask so an un-granted slot contributes 0 rows and its
+/// `remaining_prompt` is not drained (no tokens lost).
+fn eligible_ids_from_selection(sel: &Selection) -> HashSet<u64> {
+    sel.grants.iter().map(|g| g.id()).collect()
+}
+
+/// Bounded backfill (spec §5.3 S3.4): when the oldest request is starved,
+/// drop younger grants so the oldest receives the budget it needs. Returns
+/// a set containing only `oldest_id` when `starved_oldest` is set; otherwise
+/// returns every granted id. The oldest is force-included even if it
+/// received no grant this tick — the backfill exists precisely to give a
+/// starved oldest request the next step's budget.
+fn apply_starved_backfill(sel: &Selection, oldest_id: u64) -> HashSet<u64> {
+    if sel.starved_oldest {
+        let mut set = HashSet::new();
+        set.insert(oldest_id);
+        set
+    } else {
+        eligible_ids_from_selection(sel)
+    }
+}
+
+/// Find the session id of the oldest admitted request currently in flight,
+/// by lowest `admission_tick` (ties broken by lowest id). Returns `None`
+/// when no active slot is tracked by the FairQueue.
+fn oldest_active_session(
+    q: &FairQueue,
+    slots: &[Option<InFlight>],
+) -> Option<u64> {
+    let mut best: Option<(u64, u64)> = None; // (admission_tick, session_id)
+    for f in slots.iter().flatten() {
+        let Some(req) = q.get(f.session.0) else { continue };
+        match best {
+            None => best = Some((req.admission_tick, f.session.0)),
+            Some((bt, bid)) => {
+                if (req.admission_tick, f.session.0) < (bt, bid) {
+                    best = Some((req.admission_tick, f.session.0));
+                }
+            }
+        }
+    }
+    best.map(|(_, id)| id)
+}
+
+/// Sync a request's per-step needs into the FairQueue from slot state.
+/// `wants_decode` tracks a runnable decode row; `verify_rows` carries MTP
+/// verify rows (k+1) when a draft was produced this step; `uncached` is the
+/// remaining prefill suffix length (0 for decoding slots). Errors are
+/// ignored defensively — every active slot is admitted to the queue, so a
+/// `NotFound` only indicates a transient race at retirement.
+fn sync_fair_needs(
+    q: &mut FairQueue,
+    id: u64,
+    wants_decode: bool,
+    verify_rows: u64,
+    uncached: u64,
+) {
+    let _ = q.set_needs(id, wants_decode, verify_rows, 0);
+    let _ = q.set_uncached_prefill(id, uncached);
 }
 
 /// Admit one request, evicting an idle session if that is what it takes.
@@ -3705,6 +3859,10 @@ fn admit(
                             extended.len()
                         );
                     }
+                    // FairQueue: admit the continued request with its
+                    // remaining prefill suffix as the cache-locality weight.
+                    let uncached = work[slot.0].remaining_prompt.len() as u64;
+                    let _ = rig.fair_queue.admit(existing.0, "default", uncached);
                     let mut st = stats.lock().expect("stats");
                     st.note_admitted();
                     st.note_prefix_hit();
@@ -4038,6 +4196,10 @@ fn admit(
             req.prompt_tokens.len()
         );
     }
+    // FairQueue: admit the cold request with its prefill suffix as the
+    // cache-locality weight (0 for a fully-reused prefix-cache hit).
+    let uncached = work[slot.0].remaining_prompt.len() as u64;
+    let _ = rig.fair_queue.admit(id.0, "default", uncached);
     if prefix_hit {
         stats.lock().expect("stats").note_reused_tokens(prefix_reused);
     }
@@ -4336,4 +4498,102 @@ mod tests {
         // Same epoch → equal (sanity).
         assert_eq!(mk(0), mk(0));
     }
+
+    // ---- FairQueue integration tests (spec §5.3 S3) ----
+
+    /// `eligible_ids_from_selection` projects a Selection's grants into the
+    /// id set that becomes the scheduler's eligibility mask.
+    #[test]
+    fn eligible_ids_from_selection_collects_granted_ids() {
+        let sel = Selection {
+            grants: vec![
+                Grant::Decode { id: 7 },
+                Grant::Prefill { id: 3, rows: 16 },
+                Grant::Verify { id: 9, rows: 4 },
+            ],
+            starved_oldest: false,
+        };
+        let ids = eligible_ids_from_selection(&sel);
+        assert_eq!(ids.len(), 3, "one entry per granted id");
+        assert!(ids.contains(&7), "decode grant id 7");
+        assert!(ids.contains(&3), "prefill grant id 3");
+        assert!(ids.contains(&9), "verify grant id 9");
+        // An empty selection yields no eligible ids.
+        assert!(eligible_ids_from_selection(&Selection::default()).is_empty());
+    }
+
+    /// Bounded backfill (spec §5.3 S3.4): when starved_oldest is set,
+    /// `apply_starved_backfill` yields ONLY the oldest id, dropping every
+    /// younger grant so the starved oldest receives the next step's budget.
+    #[test]
+    fn starved_oldest_backfill_yields_only_oldest_id() {
+        // A selection where younger work (ids 3, 9) was granted but the
+        // oldest (id 7) is starved. The backfill keeps only id 7.
+        let sel = Selection {
+            grants: vec![
+                Grant::Prefill { id: 3, rows: 16 },
+                Grant::Verify { id: 9, rows: 4 },
+            ],
+            starved_oldest: true,
+        };
+        let ids = apply_starved_backfill(&sel, 7);
+        assert_eq!(ids.len(), 1, "backfill keeps only the oldest");
+        assert!(ids.contains(&7), "the starved oldest is force-eligible");
+        assert!(!ids.contains(&3) && !ids.contains(&9), "younger work dropped");
+    }
+
+    /// End-to-end FairQueue consultation: a real queue with an oldest
+    /// prefill request starved by younger decode lanes produces a
+    /// starved_oldest selection, and the backfill reduces eligibility to
+    /// only the oldest id (spec §5.3 S3.4).
+    #[test]
+    fn fairqueue_starved_oldest_select_then_backfill() {
+        // Budget 10, 4 decode lanes, prefill_min 5 (4 + 5 = 9 <= 10, valid).
+        let mut q = FairQueue::new(10, 4, 5).expect("valid config");
+        // Oldest: wants prefill, 5 uncached tokens (individually feasible:
+        // 5 <= max_batch_tokens 10).
+        q.admit(1, "s1", 5).unwrap();
+        // Younger: four decode lanes.
+        q.admit(2, "s2", 0).unwrap();
+        q.admit(3, "s3", 0).unwrap();
+        q.admit(4, "s4", 0).unwrap();
+        q.admit(5, "s5", 0).unwrap();
+        q.set_needs(1, false, 0, 0).unwrap();
+        q.set_needs(2, true, 0, 0).unwrap();
+        q.set_needs(3, true, 0, 0).unwrap();
+        q.set_needs(4, true, 0, 0).unwrap();
+        q.set_needs(5, true, 0, 0).unwrap();
+        // remaining_rows = 8: 4 decode rows, 4 left. prefill_min 5 > 4 → no
+        // prefill grant for the oldest. It is feasible (5 <= 10) but starved.
+        let sel = q.select(4, 10, 8);
+        assert!(
+            sel.starved_oldest,
+            "oldest is feasible but starved, starved_oldest must be set"
+        );
+        // The oldest (id 1) received no grant this tick.
+        assert!(
+            !sel.grants.iter().any(|g| g.id() == 1),
+            "starved oldest received no grant"
+        );
+        // Backfill: only the oldest id (1) stays eligible.
+        let ids = apply_starved_backfill(&sel, 1);
+        assert_eq!(ids.len(), 1);
+        assert!(ids.contains(&1));
+    }
+
+    /// A non-starved selection passes all granted ids through unchanged.
+    #[test]
+    fn non_starved_selection_passes_all_grants() {
+        let mut q = FairQueue::new(4096, 4, 1).expect("valid config");
+        q.admit(1, "s1", 0).unwrap();
+        q.admit(2, "s2", 0).unwrap();
+        q.set_needs(1, true, 0, 0).unwrap();
+        q.set_needs(2, true, 0, 0).unwrap();
+        let sel = q.select(4, 0, 4096);
+        assert!(!sel.starved_oldest, "both served, not starved");
+        let ids = eligible_ids_from_selection(&sel);
+        assert_eq!(ids.len(), 2, "both decode grants eligible");
+        assert!(ids.contains(&1) && ids.contains(&2));
+    }
+
 }
