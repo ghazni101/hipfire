@@ -1200,7 +1200,11 @@ impl SlotBackend {
             min_p,
             visual_data,
             json_schema,
-            queue_bytes: 0,
+            // Canonical pending-input bytes (spec §5.3): the engine's wait
+            // queue charges its byte cap against this, so daemon-side
+            // waiters must carry the real prompt weight — a hardcoded 0
+            // (floored to 1 downstream) made the byte cap unbindable.
+            queue_bytes: canonical_prompt_bytes(msg),
             reply: tx,
         };
         if let Err(e) = self.engine.submit(req) {
@@ -1858,34 +1862,49 @@ pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
     {
         return Some("logprobs not supported in experimental multi-slot".to_string());
     }
-    // response_format json_schema: compile the schema with the saddle-core
-    // JSON Schema subset compiler (spec §7 G1). Unsupported keywords, refs,
-    // regex, recursion, and combinators are rejected here before the request
-    // is submitted — no GPU work, no cache/session mutation (spec §5.4 S4).
-    // A valid subset schema passes; the engine recompiles on admit to build
-    // the per-request SchemaMatcher cursor (spec §7.2 G2).
-    if msg
+    // response_format: the ONLY supported type is json_schema (spec §7.1:
+    // "reject missing requested semantics. An optimization bypass is
+    // allowed, a silent semantic downgrade is not"). Any other type — e.g.
+    // json_object — used to fall through validation and run unconstrained.
+    let rf_type = msg
         .get("response_format")
         .and_then(|v| v.get("type"))
-        .and_then(|v| v.as_str())
-        == Some("json_schema")
-    {
-        let schema = msg
-            .get("response_format")
-            .and_then(|v| v.get("json_schema"))
-            .and_then(|v| v.get("schema"));
-        let schema = match schema {
-            Some(s) => s,
-            None => {
-                return Some(
-                    "response_format json_schema requires a schema object \
-                     (spec §7 G1)"
-                        .to_string(),
-                );
+        .and_then(|v| v.as_str());
+    match rf_type {
+        None => {}
+        Some("json_schema") => {
+            // Compile the schema with the saddle-core JSON Schema subset
+            // compiler (spec §7 G1). Unsupported keywords, refs, regex,
+            // recursion, and combinators are rejected here before the
+            // request is submitted — no GPU work, no cache/session mutation
+            // (spec §5.4 S4). A valid subset schema passes; the engine
+            // recompiles on admit to build the per-request SchemaMatcher
+            // cursor (spec §7.2 G2).
+            let schema = msg
+                .get("response_format")
+                .and_then(|v| v.get("json_schema"))
+                .and_then(|v| v.get("schema"));
+            let schema = match schema {
+                Some(s) => s,
+                None => {
+                    return Some(
+                        "response_format json_schema requires a schema object \
+                         (spec §7 G1)"
+                            .to_string(),
+                    );
+                }
+            };
+            if let Err(e) =
+                saddle_core::grammar::json::json_schema::CompiledSchema::compile(schema)
+            {
+                return Some(format!("response_format json_schema: {e}"));
             }
-        };
-        if let Err(e) = saddle_core::grammar::json::json_schema::CompiledSchema::compile(schema) {
-            return Some(format!("response_format json_schema: {e}"));
+        }
+        Some(other) => {
+            return Some(format!(
+                "response_format type '{other}' is not supported in \
+                 experimental multi-slot (only json_schema)"
+            ));
         }
     }
     // Token penalties and min_p are implemented by the slot sampler (in-kernel
@@ -1925,6 +1944,27 @@ pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
 }
 
 // ── Message projection (pure) ────────────────────────────────────────────────
+
+/// Canonical pending-input byte weight for a generate request (spec §5.3):
+/// the sum of user-visible text the request carries — every message
+/// content plus a bare `prompt` fallback. This is the byte charge the
+/// engine's bounded wait queue sees; it is a floor, not an upper bound
+/// (template framing and image bytes are additive on the wire but a
+/// monotone prompt-derived charge is what the queue bound needs).
+pub fn canonical_prompt_bytes(msg: &serde_json::Value) -> u64 {
+    let mut total: u64 = 0;
+    if let Some(arr) = msg.get("messages").and_then(|v| v.as_array()) {
+        for m in arr {
+            if let Some(text) = m.get("content").and_then(|v| v.as_str()) {
+                total = total.saturating_add(text.len() as u64);
+            }
+        }
+    }
+    if let Some(prompt) = msg.get("prompt").and_then(|v| v.as_str()) {
+        total = total.saturating_add(prompt.len() as u64);
+    }
+    total
+}
 
 /// FNV-1a 64 hash of user turn text.
 pub fn turn_hash(s: &str) -> u64 {

@@ -71,6 +71,9 @@ struct CheckpointBoundary {
 struct Node {
     /// Monotonic insertion order for leaf-first, oldest-first eviction.
     insert_seq: u64,
+    /// Parent node (None for the root). Lets eviction unlink a leaf without
+    /// an O(nodes) parent scan.
+    parent: Option<NodeId>,
     /// Immutable token span of the incoming edge (empty for root).
     edge_tokens: Vec<u32>,
     /// Page handles for the full pages covering this node's span.
@@ -87,6 +90,7 @@ impl Node {
     fn root() -> Self {
         Node {
             insert_seq: 0,
+            parent: None,
             edge_tokens: Vec::new(),
             pages: Vec::new(),
             checkpoints: Vec::new(),
@@ -95,9 +99,10 @@ impl Node {
         }
     }
 
-    fn new(insert_seq: u64, edge_tokens: Vec<u32>, pages: Vec<PageHandle>) -> Self {
+    fn new(insert_seq: u64, parent: NodeId, edge_tokens: Vec<u32>, pages: Vec<PageHandle>) -> Self {
         Node {
             insert_seq,
+            parent: Some(parent),
             edge_tokens,
             pages,
             checkpoints: Vec::new(),
@@ -404,17 +409,14 @@ impl PrefixIndex {
         let mut query_pos: usize = 0;
         let mut matched_tokens: u64 = 0;
         let mut resident_kv_tokens: u64 = 0;
+        // Largest token offset B such that EVERY page below B is resident.
+        // A checkpoint at boundary b is only usable when b <= this value —
+        // counting valid pages above a gap would bless a boundary whose
+        // underlying KV rows are gone (spec §4.5: a boundary is resumable
+        // only when every required state component exists at it).
+        let mut contiguous_resident_tokens: u64 = 0;
         let mut resumable_tokens: u64 = 0;
         let mut pages: Vec<Handle> = Vec::new();
-
-        // Check root checkpoints (token_offset 0 → resumable boundary 0,
-        // which is trivially true but not useful).
-        let root = tree.nodes.get(&tree.root).unwrap();
-        for cb in &root.checkpoints {
-            if cb.token_offset == 0 && resident_kv_tokens >= 0 {
-                resumable_tokens = resumable_tokens.max(0);
-            }
-        }
 
         loop {
             if query_pos >= tokens.len() {
@@ -451,9 +453,12 @@ impl PrefixIndex {
             // begins. Compute it BEFORE adding edge_match to matched_tokens.
             let child_base = matched_tokens;
 
-            // Count resident pages for the matched portion of this edge.
-            // Each page covers PAGE_TOKENS tokens.
+            // Walk pages in order; extend the contiguous prefix only while
+            // every page below it validates. Metrics count all valid pages
+            // (resident_kv_tokens), but resumability follows the gap-free
+            // prefix.
             let matched_full_pages = edge_match / PAGE_TOKENS;
+            let mut contig = contiguous_resident_tokens;
             for i in 0..matched_full_pages {
                 if let Some(ph) = child.pages.get(i) {
                     if pool.validate_handle(ph).is_ok() {
@@ -462,16 +467,20 @@ impl PrefixIndex {
                             handle: *ph,
                             token_offset: child_base + (i * PAGE_TOKENS) as u64,
                         });
+                        if contig == child_base + (i * PAGE_TOKENS) as u64 {
+                            contig += PAGE_TOKENS as u64;
+                        }
                     }
                 }
             }
+            contiguous_resident_tokens = contig;
 
             matched_tokens += edge_match as u64;
 
             for cb in &child.checkpoints {
                 if cb.token_offset <= edge_match as u64 {
                     let boundary = child_base + cb.token_offset;
-                    if resident_kv_tokens >= boundary {
+                    if boundary <= contiguous_resident_tokens {
                         resumable_tokens = resumable_tokens.max(boundary);
                     }
                 }
@@ -590,6 +599,30 @@ impl PrefixIndex {
 
     // ── Eviction ──────────────────────────────────────────────────────
 
+    /// Remove EVERY entry and release its cache lease into `pool`.
+    ///
+    /// Model reset / lifecycle teardown path (spec §4.6): dropping the radix
+    /// alone orphans the cache refs the publisher took at publication, which
+    /// strands pages in CacheOnly and drains the pool to zero free pages
+    /// within a few reset cycles (A20). Lookup visibility is removed first,
+    /// then each page's cache ref is released (spec §4.4). Returns the
+    /// number of page handles released.
+    pub fn release_all(&mut self, pool: &mut PagePool) -> usize {
+        let mut released = 0usize;
+        let trees = std::mem::take(&mut self.trees);
+        for (_, mut tree) in trees {
+            for (_, node) in tree.nodes.drain() {
+                for ph in &node.pages {
+                    if pool.release_cache_ref(ph.phys).is_ok() {
+                        released += 1;
+                    }
+                }
+            }
+        }
+        self.total_nodes = 0;
+        released
+    }
+
     /// Evict oldest unpinned leaves, releasing up to `max_bytes` of device
     /// memory (spec §4.4 C4).
     ///
@@ -641,16 +674,8 @@ impl PrefixIndex {
             let pages = node.pages.clone();
             let first_token = node.edge_tokens.first().copied();
 
-            // Find and unlink from parent.
-            let parent_id = tree.nodes.iter()
-                .find(|(_, n)| {
-                    if let Some(ft) = first_token {
-                        n.children.get(&ft) == Some(&nid)
-                    } else {
-                        false
-                    }
-                })
-                .map(|(pid, _)| *pid);
+            // Unlink from the parent via the stored back-pointer.
+            let parent_id = node.parent;
 
             if let Some(pid) = parent_id {
                 if let Some(parent) = tree.nodes.get_mut(&pid) {
@@ -883,6 +908,11 @@ fn insert_into_tree(
 
 /// Create a chain of nodes for a new token span. Each node covers one full
 /// page. Returns the number of nodes added.
+///
+/// Transactional (spec §4.3): if the CPU node bound is hit partway through,
+/// every node this call created is removed and unlinked again, so the tree
+/// and the caller's node-count accounting stay consistent — the insert is
+/// refused whole, not half-applied.
 fn create_chain(
     tree: &mut DomainTree,
     parent: NodeId,
@@ -896,6 +926,8 @@ fn create_chain(
     let mut token_pos = 0usize;
     let mut handle_idx = 0usize;
     let mut added: i32 = 0;
+    // (node_id, first_token) for every node created by this call, for rollback.
+    let mut created: Vec<(NodeId, u32)> = Vec::new();
 
     while token_pos + PAGE_TOKENS <= tokens.len() {
         let chunk = &tokens[token_pos..token_pos + PAGE_TOKENS];
@@ -907,7 +939,7 @@ fn create_chain(
 
         let is_last_full_page = token_pos + PAGE_TOKENS + PAGE_TOKENS > tokens.len();
 
-        let mut new_node = Node::new(insert_seq, chunk.to_vec(), vec![page_handle]);
+        let mut new_node = Node::new(insert_seq, current_parent, chunk.to_vec(), vec![page_handle]);
 
         if is_last_full_page {
             if let Some(ckpt) = checkpoint {
@@ -922,8 +954,19 @@ fn create_chain(
 
         let new_total = current_total + added as usize + 1;
         if new_total > max_cpu_nodes {
-            // Don't insert — return error. The node_id was allocated but
-            // never inserted, so no cleanup needed.
+            // Roll the partial chain back. Only the FIRST created node was
+            // linked into `parent` — later nodes hang off earlier created
+            // nodes, which `tree.nodes.remove` makes unreachable. Unlinking
+            // later nodes by first_token could otherwise remove an unrelated
+            // pre-existing sibling of `parent`.
+            if let Some((_, first_ft)) = created.first().copied() {
+                tree.nodes.get_mut(&parent).unwrap().children.remove(&first_ft);
+            }
+            for (id, _) in created.into_iter().rev() {
+                tree.nodes.remove(&id);
+            }
+            // The unused node id stays allocated (monotonic ids may have
+            // gaps — harmless).
             return Err(InsertError::CpuNodeBoundExceeded {
                 current: current_total + added as usize,
                 max: max_cpu_nodes,
@@ -931,6 +974,7 @@ fn create_chain(
         }
 
         tree.nodes.insert(node_id, new_node);
+        created.push((node_id, first_token));
         added += 1;
 
         tree.nodes.get_mut(&current_parent).unwrap().children.insert(first_token, node_id);
@@ -1000,7 +1044,7 @@ fn split_edge(
         })
         .collect();
 
-    let mut split_node = Node::new(child_insert_seq, split_edge_tokens, split_pages_vec);
+    let mut split_node = Node::new(child_insert_seq, parent, split_edge_tokens, split_pages_vec);
     split_node.checkpoints = split_checkpoints;
 
     tree.nodes.insert(split_node_id, split_node);
@@ -1012,6 +1056,8 @@ fn split_edge(
     remaining_child.edge_tokens = remaining_edge_tokens;
     remaining_child.pages = remaining_pages;
     remaining_child.checkpoints = remaining_checkpoints;
+    // The remaining child now hangs off the split node, not the old parent.
+    remaining_child.parent = Some(split_node_id);
 
     tree.nodes.get_mut(&parent).unwrap().children.insert(first_token, split_node_id);
     let remaining_first_token = tree.nodes.get(&child_id).unwrap().edge_tokens[0];
@@ -1726,5 +1772,124 @@ mod tests {
             ha[0].handle.phys, hb[0].handle.phys,
             "equal-length prefixes must return distinct physical pages"
         );
+    }
+
+    // ── A8: a gap below a boundary must make that boundary unresumable ──
+
+    #[test]
+    fn a8_gap_below_boundary_is_not_resumable() {
+        // Pins the contiguous-residency invariant: a checkpoint boundary is
+        // resumable only while EVERY page below it stays resident. The walk
+        // tracks the gap-free resident prefix (contiguous_resident_tokens)
+        // rather than a cumulative count of valid pages, so a partial
+        // invalidation below a boundary can never bless a hit — today and
+        // for any future finer-boundary checkpoint placement.
+        //
+        // Layout: 2-page prefix published with a checkpoint at 256, split
+        // at 128, then page 0 freed. Page 1 is still resident; the lookup
+        // must return an honest NoCheckpoint with zero handles.
+        let mut pool = PagePool::new_with_strides(8, 128, 128).unwrap();
+        let mut table = BlockTable::new();
+        let allocated = pool.alloc_pages(&mut table, 2);
+        assert_eq!(allocated, 2);
+        let phys0 = table.physical(0).unwrap();
+        let phys1 = table.physical(1).unwrap();
+        pool.seal(phys0).unwrap();
+        pool.add_cache_ref(phys0).unwrap();
+        pool.seal(phys1).unwrap();
+        pool.add_cache_ref(phys1).unwrap();
+        let handles = vec![
+            Handle {
+                handle: PageHandle { phys: phys0, epoch: 0, generation: pool.page_generation(phys0) },
+                token_offset: 0,
+            },
+            Handle {
+                handle: PageHandle { phys: phys1, epoch: 0, generation: pool.page_generation(phys1) },
+                token_offset: PAGE_TOKENS as u64,
+            },
+        ];
+
+        let mut index = PrefixIndex::new(1000);
+        let domain = sample_domain(1);
+        let tokens = make_tokens(PAGE_TOKENS * 2);
+        index
+            .publish_sealed_pages(&domain, &tokens, &handles, Some(CheckpointId(1)), &pool)
+            .unwrap();
+
+        // Split so the checkpoint moves into the second node at offset 128.
+        index.split(&domain, tokens[0], PAGE_TOKENS).unwrap();
+
+        // Sanity: full 2-page lookup hits at 256.
+        let (r, h) = index.lookup_with_pages(&domain, &tokens, &pool, None);
+        match r {
+            PrefixLookupResult::Hit(lk) => {
+                assert_eq!(lk.resumable_tokens, (PAGE_TOKENS * 2) as u64);
+                assert_eq!(h.len(), 2);
+            }
+            other => panic!("expected Hit before invalidation, got {other:?}"),
+        }
+        index.unpin(&domain);
+
+        // Invalidate page 0: drop its cache ref, then drop the table ref —
+        // it frees (generation bumps) while page 1 stays cache-resident.
+        pool.release_cache_ref(phys0).unwrap();
+        pool.release_table(&mut table).unwrap();
+        assert_eq!(pool.page_state(phys0), rdna_compute::page_pool::PageState::Free);
+        assert_eq!(pool.page_state(phys1), rdna_compute::page_pool::PageState::CacheOnly);
+
+        // The boundary below the gap must NOT be resumable anymore.
+        let (r, h) = index.lookup_with_pages(&domain, &tokens, &pool, None);
+        assert!(
+            matches!(r, PrefixLookupResult::Miss(MissReason::NoCheckpoint)),
+            "gap below the 128 boundary must force NoCheckpoint, got {r:?}"
+        );
+        assert!(h.is_empty(), "no handles may be issued for an unresumable boundary");
+    }
+
+    // ── CPU node bound: failed inserts leave accounting whole ──────────
+
+    #[test]
+    fn cpu_node_bound_rollback_keeps_accounting_consistent() {
+        // Regression: a chain insert that hit the bound partway used to
+        // leave its already-inserted nodes in the tree WITHOUT adding them
+        // to total_nodes — the bound silently stopped binding.
+        let (pool, handles) = setup_big_pool(4);
+        let mut idx = PrefixIndex::new(3); // root + 2 nodes
+        let domain = sample_domain(1);
+
+        let tokens_a = make_tokens(PAGE_TOKENS);
+        idx.insert(&domain, &tokens_a, &handles[..1], Some(CheckpointId(1)), &pool)
+            .unwrap();
+        assert_eq!(idx.total_nodes(), 2);
+
+        // 3-page chain: first node fits (3 total), second trips the bound.
+        let tokens_c = make_tokens_from(2000, PAGE_TOKENS * 3);
+        // handles must cover 3 pages — reuse three distinct valid handles.
+        let result = idx.insert(
+            &domain,
+            &tokens_c,
+            &handles[..3],
+            Some(CheckpointId(3)),
+            &pool,
+        );
+        assert!(matches!(result, Err(InsertError::CpuNodeBoundExceeded { .. })));
+
+        // Accounting must still match reality: the rolled-back chain left
+        // exactly root + A behind.
+        assert_eq!(idx.total_nodes(), 2, "failed insert must not change node accounting");
+
+        // The rolled-back prefix must be gone: its first page misses.
+        let r = idx.lookup(&domain, &tokens_c, &pool, None);
+        assert!(matches!(r, PrefixLookupResult::Miss(_)));
+
+        // And the bound still binds: exactly one more 1-page insert fits.
+        let tokens_b = make_tokens_from(1000, PAGE_TOKENS);
+        idx.insert(&domain, &tokens_b, &handles[1..2], Some(CheckpointId(2)), &pool)
+            .unwrap();
+        assert_eq!(idx.total_nodes(), 3);
+        let tokens_d = make_tokens_from(3000, PAGE_TOKENS);
+        let result = idx.insert(&domain, &tokens_d, &handles[2..3], Some(CheckpointId(4)), &pool);
+        assert!(matches!(result, Err(InsertError::CpuNodeBoundExceeded { .. })));
+        assert_eq!(idx.total_nodes(), 3);
     }
 }

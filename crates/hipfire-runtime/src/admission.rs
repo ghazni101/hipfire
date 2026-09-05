@@ -66,7 +66,8 @@ impl AdmissionController {
     }
 
     /// Bytes currently committed: weights once (if anything is admitted) plus
-    /// each session's KV.
+    /// each session's KV. Checked arithmetic; overflow saturates (a sum this
+    /// large cannot be admitted anyway) rather than wrapping.
     pub fn used_bytes(&self) -> u64 {
         if self.admitted.is_empty() {
             return 0;
@@ -74,9 +75,9 @@ impl AdmissionController {
         let kv: u64 = self
             .admitted
             .iter()
-            .map(|&ctx| ctx as u64 * self.footprint.kv_bytes_per_token)
-            .sum();
-        self.footprint.weights_bytes + kv
+            .map(|&ctx| (ctx as u64).checked_mul(self.footprint.kv_bytes_per_token).unwrap_or(u64::MAX))
+            .fold(0u64, |a, b| a.saturating_add(b));
+        self.footprint.weights_bytes.saturating_add(kv)
     }
 
     /// Admit a session at `requested_ctx` tokens, or explain why not.
@@ -84,14 +85,22 @@ impl AdmissionController {
     /// Rejects rather than silently capping: a caller that asked for 128K and
     /// silently got 8K would produce baffling truncation far from here.
     pub fn admit(&mut self, requested_ctx: usize) -> Result<usize, AdmitError> {
-        let kv_need = requested_ctx as u64 * self.footprint.kv_bytes_per_token;
+        let kv_need = (requested_ctx as u64)
+            .checked_mul(self.footprint.kv_bytes_per_token)
+            .ok_or(AdmitError::WouldExceedBudget {
+                need: u64::MAX,
+                available: 0,
+            })?;
         // Weights are charged once, on the first admission.
         let weights_need = if self.admitted.is_empty() {
             self.footprint.weights_bytes
         } else {
             0
         };
-        let need = kv_need + weights_need;
+        let need = kv_need.checked_add(weights_need).ok_or(AdmitError::WouldExceedBudget {
+            need: u64::MAX,
+            available: 0,
+        })?;
         let available = self.budget_bytes.saturating_sub(self.used_bytes());
         // >= rather than >: an admission that would consume the LAST byte of
         // budget is refused too, not just one that overflows it. On this
@@ -270,8 +279,17 @@ impl ServeCapacityAccount {
     }
 
     /// Release `bytes` of resident page bytes back to the pool.
-    pub fn release_resident(&mut self, bytes: u64) {
-        self.resident_page_bytes = self.resident_page_bytes.saturating_sub(bytes);
+    ///
+    /// Errors on underflow (spec §4.3: "Refcount underflow/overflow and
+    /// duplicate release are errors, not wraparound") — a double release
+    /// here would silently inflate free capacity and over-admit later.
+    pub fn release_resident(&mut self, bytes: u64) -> Result<(), CapacityError> {
+        let new_resident = self
+            .resident_page_bytes
+            .checked_sub(bytes)
+            .ok_or(CapacityError::ArithmeticOverflow)?;
+        self.resident_page_bytes = new_resident;
+        Ok(())
     }
 
     /// Reserve `bytes` of unmaterialized growth/COW credits (spec §5.1).
@@ -298,18 +316,51 @@ impl ServeCapacityAccount {
     }
 
     /// Release `bytes` of growth credits (e.g. request cancelled before
-    /// materializing its growth).
-    pub fn release_growth(&mut self, bytes: u64) {
-        self.growth_credits_bytes = self.growth_credits_bytes.saturating_sub(bytes);
+    /// materializing its growth). Errors on underflow — a duplicate release
+    /// would silently inflate available capacity.
+    pub fn release_growth(&mut self, bytes: u64) -> Result<(), CapacityError> {
+        let new_credits = self
+            .growth_credits_bytes
+            .checked_sub(bytes)
+            .ok_or(CapacityError::ArithmeticOverflow)?;
+        self.growth_credits_bytes = new_credits;
+        Ok(())
     }
 
     /// Materialize `bytes` of growth credits into resident page bytes
-/// (spec §5.1: "Credits turn into allocated private pages as work
-/// advances"). The credits are released and the bytes are charged as
-/// resident in one checked operation.
+    /// (spec §5.1: "Credits turn into allocated private pages as work
+    /// advances"). Atomic: either the credits exist AND the pool can take
+    /// the resident bytes — in which case both sides update — or nothing
+    /// mutates and the error explains why. The previous release-then-charge
+    /// sequence could discard other requests' credits on over-materialize
+    /// and leave credits released when the charge failed (spec §5.4 S4:
+    /// a failed reservation leaves state unchanged).
     pub fn materialize_growth(&mut self, bytes: u64) -> Result<(), CapacityError> {
-        self.release_growth(bytes);
-        self.charge_resident(bytes)
+        if self.growth_credits_bytes < bytes {
+            return Err(CapacityError::WouldExceedPool {
+                need: bytes,
+                available: self.available_bytes(),
+            });
+        }
+        let new_resident = self
+            .resident_page_bytes
+            .checked_add(bytes)
+            .ok_or(CapacityError::ArithmeticOverflow)?;
+        let new_credits = self
+            .growth_credits_bytes
+            .checked_sub(bytes)
+            .ok_or(CapacityError::ArithmeticOverflow)?;
+        if new_resident.checked_add(new_credits).ok_or(CapacityError::ArithmeticOverflow)?
+            > self.pool_capacity_bytes
+        {
+            return Err(CapacityError::WouldExceedPool {
+                need: bytes,
+                available: self.available_bytes(),
+            });
+        }
+        self.resident_page_bytes = new_resident;
+        self.growth_credits_bytes = new_credits;
+        Ok(())
     }
 
     /// Check whether `bytes` would fit under the pool capacity invariant
@@ -496,7 +547,7 @@ mod tests {
         assert!(acct.charge_resident(400).is_ok());
         assert_eq!(acct.resident_page_bytes(), 400);
         assert_eq!(acct.available_bytes(), 624);
-        acct.release_resident(200);
+        acct.release_resident(200).unwrap();
         assert_eq!(acct.resident_page_bytes(), 200);
         assert_eq!(acct.available_bytes(), 824);
     }
@@ -518,8 +569,35 @@ mod tests {
         // Resident + growth must not exceed pool.
         assert!(acct.charge_resident(800).is_err());
         assert!(acct.charge_resident(600).is_ok());
-        acct.release_growth(200);
+        acct.release_growth(200).unwrap();
         assert_eq!(acct.growth_credits_bytes(), 100);
+    }
+
+    #[test]
+    fn capacity_account_materialize_growth_is_atomic() {
+        // Over-materializing (more than the granted credits) must fail
+        // WITHOUT touching state — the old release-then-charge sequence
+        // discarded other requests' credits and charged the bytes anyway.
+        let mut acct = ServeCapacityAccount::new(1000, 8192);
+        assert!(acct.reserve_growth(300).is_ok());
+        assert_eq!(acct.growth_credits_bytes(), 300);
+        let err = acct.materialize_growth(400).unwrap_err();
+        assert!(matches!(err, CapacityError::WouldExceedPool { .. }));
+        assert_eq!(acct.growth_credits_bytes(), 300, "credits must be untouched");
+        assert_eq!(acct.resident_page_bytes(), 0, "nothing charged on failure");
+
+        // An exactly-credited materialize succeeds and converts the bytes.
+        assert!(acct.materialize_growth(300).is_ok());
+        assert_eq!(acct.growth_credits_bytes(), 0);
+        assert_eq!(acct.resident_page_bytes(), 300);
+    }
+
+    #[test]
+    fn capacity_account_release_underflow_is_typed_error() {
+        let mut acct = ServeCapacityAccount::new(1000, 8192);
+        assert!(acct.release_resident(1).is_err(), "duplicate release must error");
+        assert!(acct.release_growth(1).is_err(), "duplicate release must error");
+        assert_eq!(acct.available_bytes(), 1000, "underflow must not inflate capacity");
     }
 
     #[test]
