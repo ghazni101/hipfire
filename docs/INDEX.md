@@ -106,6 +106,7 @@ Exactly one canonical owner (or explicit `BLOCKED`) per concern.
 | Design-time architecture drafts | [`docs/design/`](design/) | planned | Directory policy is planned intent. Member exceptions: some branch-implemented LFM/Redline designs and measured baseline notes may coexist; none are product defaults. Historical member bodies stay disposition-only. |
 | Implementation plans and PRDs | [`docs/plans/`](plans/) | planned | Directory policy is planned intent. Member exceptions: measured results ledgers may appear; recency ≠ authority. |
 | Narrow specs | [`docs/specs/`](specs/) | planned | Intent/spec records; promote only via shipped owners. |
+| Shared-prefix serving integration | [`docs/specs/2026-09-05-serving-cache-scheduler-spec.md`](specs/2026-09-05-serving-cache-scheduler-spec.md) | planned | vLLM/SGLang-inspired paged ownership, hybrid-state reuse, fair scheduling and structured generation; extends the multi-slot spec, not a runtime admission. |
 | Investigations | [`docs/investigations/`](investigations/) | historical | Discovery trails including measured research; not product defaults. |
 | Reviews | [`docs/reviews/`](reviews/) | historical | Review archives. |
 | Lessons learned | [`docs/lessons_learned/`](lessons_learned/) | historical | Postmortems. |
