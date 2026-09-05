@@ -58,6 +58,7 @@ pub mod sampler;
 pub mod serve;
 pub mod serve_contract;
 pub mod serve_fairness;
+pub mod serve_wait;
 pub mod spec;
 
 pub mod ngram_mod;
