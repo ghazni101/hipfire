@@ -3,10 +3,24 @@
 # Serving cache scheduler — implementation plan
 
 - **Date:** 2026-09-05
-- **Status:** supervisor plan; execution delegated per waves below.
+- **Status:** waves 0–4 implemented on `feat/serving-cache-scheduler` (HEAD `f3222d63d`); P5 composition/docs/GPU oracles and P6 overlap remain. Defaults stay off (`serve.prefix_cache`, `serve.structured_jump_forward`, `serve.scheduler_overlap`).
 - **Spec:** [2026-09-05-serving-cache-scheduler-spec.md](2026-09-05-serving-cache-scheduler-spec.md) — this plan implements it; it repeats no guarantees the spec owns.
 - **Base branch:** `feat/serving-cache-scheduler`, forked from `patch/oom-guard-multislot-tip` HEAD `d995164b8` (the spec's grounding checkout) with `feat/multislot-vision-mtp` tip `6f85c5da5` merged in. All slices branch from and PR back to this branch.
 - **Recon:** four source-grounded inventories taken this date over the working tree; cited file:line below is from that recon, re-verify before editing (index drift).
+
+## 0. Progress (2026-09-05)
+
+| Wave | State | Tip commits |
+|---|---|---|
+| 0 merge | done | `6b07ef415` (layer-chunk + no D2H/H2D roundtrip) |
+| 1 P0 contracts+bench | done | `f6904c85b`, `9d7110d46` |
+| 2 P1 pool/admission + P4 grammar core | done | `b6b4a6a30`, `3f024ec4c` |
+| 3 P2 prefix cache | done, default off | `0f648d091`, `d4faba38b`, `21f202f3d` |
+| 4 P3 scheduler + wait + jump-forward planner | done; wait on; jump-forward default off | `4e2ed2423`–`f3222d63d` |
+| 5 composition | **open** | GPU serve_harness blocked (`libamdhip64.so` unresolved); C1 tokenizer/template digests stubbed; tools/stop/logprobs still refused; vision+prefix reuse off; CONFIG/SERVE docs not updated; no admission |
+| 6 overlap | **open, stays off** | `serve.scheduler_overlap=false` |
+
+Host tests at last wave: saddle-core json_schema 42; hipfire-runtime serve_wait 16 + prefix_index 26 + serve_fairness 15 + serve_contract 11; hipfire-arch-qwen35 255. Pre-existing `oversized_pool_is_refused_not_allocated` fails when OOM guard is inactive.
 
 ## 1. What already exists (do not rebuild)
 
