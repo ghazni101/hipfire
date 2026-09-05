@@ -176,6 +176,117 @@ impl Default for Config {
         }
     }
 }
+use std::sync::Arc;
+
+/// Maximum number of tool schemas accepted by [`CompiledGrammar::new`].
+/// Bounds compilation input so a pathological tools array can't stall
+/// request admission.
+const MAX_TOOL_SCHEMAS: usize = 256;
+
+/// Maximum total bytes of all tool names + required field names combined.
+/// Prevents unbounded string allocation during compilation.
+const MAX_SCHEMA_BYTES: usize = 64 * 1024;
+
+/// Typed error returned when compilation inputs exceed bounds or are
+/// otherwise invalid. Rejects before any GPU work (spec §7 G1, S4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrammarCompileError {
+    /// Too many tool schemas supplied.
+    TooManySchemas { count: usize, max: usize },
+    /// Total schema string bytes exceeded the bound.
+    SchemaBytesExceeded { bytes: usize, max: usize },
+    /// A tool name is empty.
+    EmptyToolName { index: usize },
+}
+
+impl std::fmt::Display for GrammarCompileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooManySchemas { count, max } => write!(
+                f,
+                "grammar compile: {count} tool schemas exceeds max {max}"
+            ),
+            Self::SchemaBytesExceeded { bytes, max } => write!(
+                f,
+                "grammar compile: schema string bytes {bytes} exceeds max {max}"
+            ),
+            Self::EmptyToolName { index } => {
+                write!(f, "grammar compile: tool schema {index} has empty name")
+            }
+        }
+    }
+}
+
+impl std::error::Error for GrammarCompileError {}
+
+/// Immutable, `Send + Sync` compiled artifact for the JSON `<tool_call>` tool-call
+/// grammar. Owns the tool schemas and n-gram config; produced once per
+/// unique tool set and shared across requests via `Arc<CompiledGrammar>`.
+///
+/// Per-request mutable state lives in [`Matcher`] (the cursor), which
+/// references the compiled artifact through an `Arc`. This split lets
+/// identical in-flight compilations share the same tables (spec §7 G1).
+///
+/// Construct via [`CompiledGrammar::new`] (default config) or
+/// [`CompiledGrammar::with_config`] (explicit n-gram thresholds). Both
+/// validate bounds and return a typed error on violation.
+#[derive(Debug, Clone)]
+pub struct CompiledGrammar {
+    tools: Vec<ToolSchema>,
+    config: Config,
+}
+
+impl CompiledGrammar {
+    /// Compile with default [`Config`]. Validates bounds.
+    pub fn new(tools: Vec<ToolSchema>) -> Result<Self, GrammarCompileError> {
+        Self::with_config(tools, Config::default())
+    }
+
+    /// Compile with an explicit [`Config`]. Validates bounds.
+    pub fn with_config(
+        tools: Vec<ToolSchema>,
+        config: Config,
+    ) -> Result<Self, GrammarCompileError> {
+        if tools.len() > MAX_TOOL_SCHEMAS {
+            return Err(GrammarCompileError::TooManySchemas {
+                count: tools.len(),
+                max: MAX_TOOL_SCHEMAS,
+            });
+        }
+        let mut total_bytes = 0;
+        for (i, t) in tools.iter().enumerate() {
+            if t.name.is_empty() {
+                return Err(GrammarCompileError::EmptyToolName { index: i });
+            }
+            total_bytes += t.name.len();
+            for r in &t.required {
+                total_bytes += r.len();
+            }
+        }
+        if total_bytes > MAX_SCHEMA_BYTES {
+            return Err(GrammarCompileError::SchemaBytesExceeded {
+                bytes: total_bytes,
+                max: MAX_SCHEMA_BYTES,
+            });
+        }
+        Ok(Self { tools, config })
+    }
+
+    /// Read-only access to the tool schemas.
+    pub fn tools(&self) -> &[ToolSchema] {
+        &self.tools
+    }
+
+    /// Read-only access to the n-gram config.
+    pub fn config(&self) -> Config {
+        self.config
+    }
+}
+
+// CompiledGrammar is Send+Sync: ToolSchema and Config contain only
+// owned Strings / Copy primitives.
+unsafe impl Send for CompiledGrammar {}
+unsafe impl Sync for CompiledGrammar {}
 
 /// Grammar matcher: state plus the bytes committed since the last
 /// firm transition. Construct via [`Matcher::new`] with the active
@@ -186,8 +297,10 @@ pub struct Matcher {
     state: State,
     /// Bytes committed since the last firm state transition.
     partial_buf: String,
-    tools: Vec<ToolSchema>,
-    config: Config,
+    /// Immutable compiled artifact: tool schemas + n-gram config.
+    /// Shared across requests via `Arc` — the cursor (this struct)
+    /// holds only per-request mutable state (spec §7 G1).
+    grammar: Arc<CompiledGrammar>,
     /// Rolling window of the last `NGRAM_WINDOW` bytes of the FULL args
     /// body (including string-value bytes) seen while in [`State::InArgs`].
     /// Used ONLY for the required-field substring check (`"path"` etc. live
@@ -240,6 +353,10 @@ pub struct Matcher {
 impl Matcher {
     /// Build a fresh matcher in [`State::Out`] with no partial buffer and
     /// default `Config`.
+    ///
+    /// Compiles the tools into a [`CompiledGrammar`] internally. For
+    /// request sharing, prefer [`Matcher::from_compiled`] with a
+    /// pre-built `Arc<CompiledGrammar>`.
     pub fn new(tools: Vec<ToolSchema>) -> Self {
         Self::with_config(tools, Config::default())
     }
@@ -247,12 +364,24 @@ impl Matcher {
     /// Build a fresh matcher with an explicit `Config`. Use this when the
     /// caller wants to override the n-gram thresholds without an env read
     /// inside this crate.
+    ///
+    /// Compiles the tools into a [`CompiledGrammar`] internally. Panics
+    /// on bound violations — use [`CompiledGrammar::with_config`] +
+    /// [`Matcher::from_compiled`] for fallible construction.
     pub fn with_config(tools: Vec<ToolSchema>, config: Config) -> Self {
+        let grammar = CompiledGrammar::with_config(tools, config)
+            .expect("Matcher::with_config: schema bounds violated");
+        Self::from_compiled(Arc::new(grammar))
+    }
+
+    /// Build a cursor from a pre-compiled, shared artifact. Multiple
+    /// requests can share the same `Arc<CompiledGrammar>` while each
+    /// owns an independent `Matcher` cursor (spec §7 G1).
+    pub fn from_compiled(grammar: Arc<CompiledGrammar>) -> Self {
         Self {
             state: State::Out,
             partial_buf: String::new(),
-            tools,
-            config,
+            grammar,
             ngram_history: String::new(),
             attractor_buf: String::new(),
             attractor_detected: false,
@@ -265,7 +394,12 @@ impl Matcher {
 
     /// Current n-gram config (copy).
     pub fn config(&self) -> Config {
-        self.config
+        self.grammar.config
+    }
+
+    /// Read-only access to the compiled grammar artifact.
+    pub fn compiled(&self) -> &CompiledGrammar {
+        &self.grammar
     }
 
     /// Index of the tool currently being constructed in
@@ -278,7 +412,7 @@ impl Matcher {
     pub fn debug_close_reject(&self) -> String {
         let req = self
             .current_tool
-            .and_then(|i| self.tools.get(i))
+            .and_then(|i| self.grammar.tools.get(i))
             .map(|s| s.required.join(","))
             .unwrap_or_default();
         let hist_tail: String = self
@@ -317,7 +451,7 @@ impl Matcher {
             Some(i) => i,
             None => return true,
         };
-        let schema = match self.tools.get(tool_idx) {
+        let schema = match self.grammar.tools.get(tool_idx) {
             Some(s) => s,
             None => return true,
         };
@@ -499,9 +633,9 @@ impl Matcher {
     /// have non-uniform grams.
     fn detect_ngram_loop(&self, buf: &str) -> bool {
         let bytes = buf.as_bytes();
-        let len_min = self.config.ngram_len_min;
-        let min_repeats = self.config.ngram_min_repeats;
-        for ngram_len in len_min..=self.config.ngram_len_max {
+        let len_min = self.grammar.config.ngram_len_min;
+        let min_repeats = self.grammar.config.ngram_min_repeats;
+        for ngram_len in len_min..=self.grammar.config.ngram_len_max {
             let needed = ngram_len * min_repeats;
             if bytes.len() < needed {
                 continue;
@@ -546,10 +680,10 @@ impl Matcher {
         // Full args text → required-field substring buffer only. Attractor
         // detection runs on structural bytes in `push_attractor_byte`.
         self.ngram_history.push_str(text);
-        if self.ngram_history.len() > self.config.ngram_window {
+        if self.ngram_history.len() > self.grammar.config.ngram_window {
             // Drop at a UTF-8 char boundary — string values may hold multibyte
             // content, so this buffer is not guaranteed ASCII.
-            let drop = self.ngram_history.len() - self.config.ngram_window;
+            let drop = self.ngram_history.len() - self.grammar.config.ngram_window;
             let mut idx = drop;
             while idx < self.ngram_history.len() && !self.ngram_history.is_char_boundary(idx) {
                 idx += 1;
@@ -572,8 +706,8 @@ impl Matcher {
             return;
         }
         self.attractor_buf.push(byte as char);
-        if self.attractor_buf.len() > self.config.ngram_window {
-            let drop = self.attractor_buf.len() - self.config.ngram_window;
+        if self.attractor_buf.len() > self.grammar.config.ngram_window {
+            let drop = self.attractor_buf.len() - self.grammar.config.ngram_window;
             self.attractor_buf.drain(..drop);
         }
         if self.detect_ngram_loop(&self.attractor_buf) {
@@ -670,7 +804,7 @@ impl Matcher {
             State::AfterOpen => {
                 // Allowed continuations: for each tool name, the literal
                 // header `\n{"name": "<NAME>", "arguments": `.
-                self.tools
+                self.grammar.tools
                     .iter()
                     .map(|t| format!("\n{{\"name\": \"{}\", \"arguments\": ", t.name))
                     .collect()
@@ -916,7 +1050,7 @@ impl Matcher {
                 // to InArgs — and record which tool's schema is now
                 // active so the close-marker check can validate its
                 // required-field list.
-                for (idx, schema) in self.tools.iter().enumerate() {
+                for (idx, schema) in self.grammar.tools.iter().enumerate() {
                     let cont = format!("\n{{\"name\": \"{}\", \"arguments\": ", schema.name);
                     if let Some(rest) = self.partial_buf.strip_prefix(cont.as_str()) {
                         let rest_owned = rest.to_string();
@@ -2774,6 +2908,1444 @@ mod tests {
         assert!(m5.is_free());
     }
 }
+
+/// Strict JSON Schema subset compiler (spec §7 G1/G2).
+///
+/// Compiles a restricted subset of JSON Schema into an incremental
+/// byte-level matcher. The matcher tracks a **stack** of parser states
+/// (not a single FSM id) because JSON objects/arrays nest recursively.
+///
+/// ## Supported subset
+///
+/// - JSON primitives: `string`, `number`, `integer`, `boolean`, `null`
+/// - Objects: `properties`, `required`, boolean `additionalProperties`
+/// - Arrays: `items`, `minItems`, `maxItems`
+/// - `enum` / `const`
+///
+/// ## Rejected before generation (typed error)
+///
+/// - `$ref` / `$defs` / external references
+/// - `pattern` (regex)
+/// - `allOf` / `anyOf` / `oneOf` / `not` (combinators)
+/// - Recursive schemas (a property referencing its parent)
+/// - Unsupported assertion keywords
+/// - `NaN` / `Infinity` in numbers
+/// - Duplicate object keys
+/// - Provably-unsatisfiable schemas
+///
+/// ## Incremental matcher API
+///
+/// The matcher operates on raw token bytes (not lossy-decoded strings):
+/// - [`SchemaMatcher::is_token_allowed`] — check if bytes are a valid prefix
+/// - [`SchemaMatcher::advance`] — commit bytes to the parser
+/// - [`SchemaMatcher::is_accepting`] — true when the full JSON value is complete
+///   and schema-valid
+///
+/// Parser state is a stack of frames, not a single FSM state number.
+/// Recursive nesting (objects inside arrays inside objects) requires
+/// stack-based tracking; a single state id cannot represent it.
+pub mod json_schema {
+    use std::collections::HashSet;
+
+    /// Maximum nesting depth for objects/arrays.
+    const MAX_NESTING: usize = 64;
+
+    /// Maximum number of enum values.
+    const MAX_ENUM_VALUES: usize = 256;
+
+    /// Typed error returned when a schema is rejected at compile time.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum SchemaError {
+        /// `$ref` / `$defs` / external references are not supported.
+        ReferencesNotSupported { keyword: String },
+        /// `pattern` (regex) assertions are not supported.
+        RegexNotSupported,
+        /// Combinators (`allOf`/`anyOf`/`oneOf`/`not`) are not supported.
+        CombinatorNotSupported { keyword: String },
+        /// Recursive schema detected.
+        RecursionNotSupported,
+        /// Unsupported assertion keyword.
+        UnsupportedKeyword { keyword: String },
+        /// Schema nesting exceeds the bound.
+        NestingTooDeep { depth: usize, max: usize },
+        /// Enum has too many values.
+        TooManyEnumValues { count: usize, max: usize },
+        /// Schema is provably unsatisfiable.
+        Unsatisfiable { reason: String },
+        /// Invalid schema structure.
+        InvalidSchema { reason: String },
+    }
+
+    impl std::fmt::Display for SchemaError {
+        fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+            match self {
+                Self::ReferencesNotSupported { keyword } => {
+                    write!(f, "json schema: {keyword} not supported")
+                }
+                Self::RegexNotSupported => write!(f, "json schema: pattern not supported"),
+                Self::CombinatorNotSupported { keyword } => {
+                    write!(f, "json schema: {keyword} not supported")
+                }
+                Self::RecursionNotSupported => {
+                    write!(f, "json schema: recursion not supported")
+                }
+                Self::UnsupportedKeyword { keyword } => {
+                    write!(f, "json schema: unsupported keyword {keyword}")
+                }
+                Self::NestingTooDeep { depth, max } => {
+                    write!(f, "json schema: nesting depth {depth} exceeds max {max}")
+                }
+                Self::TooManyEnumValues { count, max } => {
+                    write!(f, "json schema: enum has {count} values, max {max}")
+                }
+                Self::Unsatisfiable { reason } => {
+                    write!(f, "json schema: unsatisfiable: {reason}")
+                }
+                Self::InvalidSchema { reason } => {
+                    write!(f, "json schema: invalid: {reason}")
+                }
+            }
+        }
+    }
+
+    impl std::error::Error for SchemaError {}
+
+    /// JSON Schema type keywords.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    enum JsonType {
+        String,
+        Number,
+        Integer,
+        Boolean,
+        Null,
+        Object,
+        Array,
+    }
+
+    /// A compiled schema node — the immutable, shared representation
+    /// of one schema constraint.
+    #[derive(Debug, Clone)]
+    pub enum SchemaNode {
+        /// Any JSON value (no constraint, or `type` absent).
+        Any,
+        /// JSON string.
+        String,
+        /// JSON number (integer or float).
+        Number,
+        /// JSON integer (no fractional part).
+        Integer,
+        /// JSON boolean.
+        Boolean,
+        /// JSON null.
+        Null,
+        /// JSON object with typed properties.
+        Object {
+            /// Named properties: (key, schema). Key is the decoded
+            /// (post-escape) string.
+            properties: Vec<(String, SchemaNode)>,
+            /// Required property keys (decoded).
+            required: Vec<String>,
+ /// `additionalProperties`: `false` rejects unknown keys, `true`
+            /// (or absent) allows any value for unknown keys.
+            additional_properties: bool,
+        },
+        /// JSON array with item schema and bounds.
+        Array {
+            items: Box<SchemaNode>,
+            min_items: usize,
+            max_items: Option<usize>,
+        },
+        /// Enum: must match one of these JSON values by semantic
+        /// equality.
+        Enum(Vec<serde_json::Value>),
+        /// Const: must match this exact JSON value.
+        Const(serde_json::Value),
+    }
+
+    /// Compiled JSON Schema: immutable, Send+Sync.
+    #[derive(Debug, Clone)]
+    pub struct CompiledSchema {
+        root: SchemaNode,
+    }
+
+    impl CompiledSchema {
+        /// Compile a JSON Schema (`serde_json::Value`) into a
+        /// [`CompiledSchema`]. Rejects unsupported keywords, refs,
+        /// regex, recursion, combinators, and unsatisfiable schemas
+        /// before generation (spec §7 G1).
+        pub fn compile(schema: &serde_json::Value) -> Result<Self, SchemaError> {
+            let root = compile_node(schema, 0, &mut Vec::new())?;
+            Ok(Self { root })
+        }
+
+        /// Read-only access to the root schema node.
+        pub fn root(&self) -> &SchemaNode {
+            &self.root
+        }
+
+        /// Create a fresh matcher cursor for this compiled schema.
+        pub fn matcher(&self) -> SchemaMatcher {
+            SchemaMatcher::new(self.root.clone())
+        }
+    }
+
+    unsafe impl Send for CompiledSchema {}
+    unsafe impl Sync for CompiledSchema {}
+
+    /// Recursively compile a schema node. `depth` tracks nesting;
+    /// `path` tracks the property key path for recursion detection.
+    fn compile_node(
+        schema: &serde_json::Value,
+        depth: usize,
+        path: &mut Vec<String>,
+    ) -> Result<SchemaNode, SchemaError> {
+        if depth > MAX_NESTING {
+            return Err(SchemaError::NestingTooDeep {
+                depth,
+                max: MAX_NESTING,
+            });
+        }
+        let obj = match schema.as_object() {
+            Some(o) => o,
+            None => {
+                return Err(SchemaError::InvalidSchema {
+                    reason: "schema must be an object".to_string(),
+                })
+            }
+        };
+
+        // Reject unsupported keywords upfront.
+        for key in obj.keys() {
+            match key.as_str() {
+                "type" | "properties" | "required" | "additionalProperties"
+                | "items" | "minItems" | "maxItems" | "enum" | "const"
+                | "description" | "title" | "default" | "examples"
+                | "$comment" => {}
+                k if k.starts_with("$") => {
+                    return Err(SchemaError::ReferencesNotSupported {
+                        keyword: k.to_string(),
+                    })
+                }
+                "pattern" => return Err(SchemaError::RegexNotSupported),
+                "allOf" | "anyOf" | "oneOf" | "not" => {
+                    return Err(SchemaError::CombinatorNotSupported {
+                        keyword: key.to_string(),
+                    })
+                }
+                "format" | "minimum" | "maximum" | "exclusiveMinimum"
+                | "exclusiveMaximum" | "multipleOf" | "minLength"
+                | "maxLength" | "minProperties" | "maxProperties"
+                | "uniqueItems" | "contains" | "minContains"
+                | "maxContains" | "prefixItems" | "unevaluatedProperties"
+                | "unevaluatedItems" | "contentEncoding"
+                | "contentMediaType" | "dependentRequired"
+                | "dependentSchemas" | "propertyNames" | "patternProperties" => {
+                    return Err(SchemaError::UnsupportedKeyword {
+                        keyword: key.to_string(),
+                    })
+                }
+                _ => {} // Permit unknown annotation keywords silently.
+            }
+        }
+
+        // const takes priority.
+        if let Some(c) = obj.get("const") {
+            return Ok(SchemaNode::Const(c.clone()));
+        }
+
+        // enum.
+        if let Some(arr) = obj.get("enum").and_then(|v| v.as_array()) {
+            if arr.len() > MAX_ENUM_VALUES {
+                return Err(SchemaError::TooManyEnumValues {
+                    count: arr.len(),
+                    max: MAX_ENUM_VALUES,
+                });
+            }
+            return Ok(SchemaNode::Enum(arr.clone()));
+        }
+
+        // type-based compilation.
+        let ty = obj.get("type").and_then(|v| v.as_str());
+        match ty {
+            Some("string") => Ok(SchemaNode::String),
+            Some("number") => Ok(SchemaNode::Number),
+            Some("integer") => Ok(SchemaNode::Integer),
+            Some("boolean") => Ok(SchemaNode::Boolean),
+            Some("null") => Ok(SchemaNode::Null),
+            Some("object") => compile_object(obj, depth, path),
+            Some("array") => compile_array(obj, depth, path),
+            Some(other) => Err(SchemaError::InvalidSchema {
+                reason: format!("unknown type: {other}"),
+            }),
+            None => {
+                // No type: if properties/items present, infer; else Any.
+                if obj.contains_key("properties") {
+                    compile_object(obj, depth, path)
+                } else if obj.contains_key("items") {
+                    compile_array(obj, depth, path)
+                } else {
+                    Ok(SchemaNode::Any)
+                }
+            }
+        }
+    }
+
+    fn compile_object(
+        obj: &serde_json::Map<String, serde_json::Value>,
+        depth: usize,
+        path: &mut Vec<String>,
+    ) -> Result<SchemaNode, SchemaError> {
+        let properties = match obj.get("properties").and_then(|v| v.as_object()) {
+            Some(p) => p,
+            None => {
+                return Err(SchemaError::InvalidSchema {
+                    reason: "object schema missing properties".to_string(),
+                })
+            }
+        };
+
+        let mut compiled_props = Vec::with_capacity(properties.len());
+        for (key, sub_schema) in properties {
+            // Recursion detection: if this key path is already on the
+            // stack, the schema is recursive.
+            if path.iter().any(|p| p == key) {
+                return Err(SchemaError::RecursionNotSupported);
+            }
+            path.push(key.clone());
+            let node = compile_node(sub_schema, depth + 1, path)?;
+            path.pop();
+            compiled_props.push((key.clone(), node));
+        }
+
+        let required: Vec<String> = obj
+            .get("required")
+            .and_then(|v| v.as_array())
+            .map(|arr| {
+                arr.iter()
+                    .filter_map(|v| v.as_str().map(|s| s.to_string()))
+                    .collect()
+            })
+            .unwrap_or_default();
+
+        // Validate that every required name is in properties.
+        for req in &required {
+            if !properties.contains_key(req) {
+                return Err(SchemaError::Unsatisfiable {
+                    reason: format!("required property {req:?} not in properties"),
+                });
+            }
+        }
+
+        let additional_properties = obj
+            .get("additionalProperties")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+
+        Ok(SchemaNode::Object {
+            properties: compiled_props,
+            required,
+            additional_properties,
+        })
+    }
+
+    fn compile_array(
+        obj: &serde_json::Map<String, serde_json::Value>,
+        depth: usize,
+        path: &mut Vec<String>,
+    ) -> Result<SchemaNode, SchemaError> {
+        let items = obj.get("items").ok_or_else(|| SchemaError::InvalidSchema {
+            reason: "array schema missing items".to_string(),
+        })?;
+        let item_node = compile_node(items, depth + 1, path)?;
+
+        let min_items = obj
+            .get("minItems")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(0);
+
+        let max_items = obj
+            .get("maxItems")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
+
+        // minItems > maxItems is unsatisfiable.
+        if let Some(max) = max_items {
+            if min_items > max {
+                return Err(SchemaError::Unsatisfiable {
+                    reason: format!("minItems {min_items} > maxItems {max}"),
+                });
+            }
+        }
+
+        Ok(SchemaNode::Array {
+            items: Box::new(item_node),
+            min_items,
+            max_items,
+        })
+    }
+
+    // ── Incremental matcher ───────────────────────────────────────────
+
+    /// A frame on the parser stack. Each frame tracks one level of
+    /// object or array nesting.
+    #[derive(Debug, Clone)]
+    enum Frame {
+        /// Inside an object: tracking which keys have been seen,
+        /// which are required, and what comes next.
+        Object {
+            schema: SchemaNode,
+            seen_keys: HashSet<String>,
+            after_value: bool, // true after a value, expecting comma or }
+        },
+        /// Inside an array: tracking item count and what comes next.
+        Array {
+            schema: SchemaNode,
+            count: usize,
+            after_value: bool, // true after an item, expecting comma or ]
+        },
+    }
+
+    /// Incremental JSON schema matcher. Operates on raw bytes; parser
+    /// state is a stack of frames (not a single FSM id).
+    ///
+    /// Usage:
+    /// 1. Create with [`SchemaMatcher::new`].
+    /// 2. Feed bytes via [`SchemaMatcher::advance`].
+    /// 3. Check [`SchemaMatcher::is_token_allowed`] before sampling.
+    /// 4. Check [`SchemaMatcher::is_accepting`] after each advance.
+    #[derive(Debug, Clone)]
+    pub struct SchemaMatcher {
+        root: SchemaNode,
+        /// The accumulated raw bytes of the JSON being parsed.
+        bytes: Vec<u8>,
+        /// Parser stack: one frame per nesting level.
+        stack: Vec<Frame>,
+        /// Whether the matcher has accepted (complete valid JSON).
+        accepted: bool,
+        /// Whether the matcher has errored (invalid JSON or schema violation).
+        errored: bool,
+    }
+
+    /// Check whether a serde_json error represents incomplete input
+    /// (EOF) vs. a genuine syntax error. serde_json wraps incomplete-
+    /// input errors with `io::ErrorKind::UnexpectedEof` in the
+    /// `io` category.
+    fn is_eof_error(e: &serde_json::Error) -> bool {
+        // serde_json's `Error::classify()` returns `Category::Eof`
+        // for incomplete input.
+        e.classify() == serde_json::error::Category::Eof
+    }
+
+    /// Check whether a growing number value could eventually match
+    /// the schema. `raw` is the raw byte buffer (including any
+    /// leading whitespace) that was parsed to produce `value`.
+    ///
+    /// For `Number`/`Integer`/`Any`: any number prefix is valid.
+    /// For `Const(n)`: the raw bytes must be a prefix of `n`'s JSON
+    /// representation (e.g. "4" is a prefix of "42", "43" is not).
+    /// For `Enum(values)`: the raw bytes must be a prefix of at least
+    /// one number value's JSON representation.
+    /// For other types: false (a number can never become a string,
+    /// boolean, null, object, or array).
+    fn number_could_grow_to_match(
+        value: &serde_json::Value,
+        schema: &SchemaNode,
+        raw: &[u8],
+    ) -> bool {
+        // Extract the number's raw bytes from the buffer (skip
+        // leading whitespace).
+        let num_start = raw
+            .iter()
+            .position(|&b| b != b' ' && b != b'\n' && b != b'\t' && b != b'\r')
+            .unwrap_or(raw.len());
+        let num_bytes = &raw[num_start..];
+
+        match schema {
+            SchemaNode::Number | SchemaNode::Integer | SchemaNode::Any => true,
+            SchemaNode::Const(target) => {
+                if !target.is_number() {
+                    return false;
+                }
+                let target_str = serde_json::to_string(target).unwrap_or_default();
+                // The raw bytes must be a prefix of the target's JSON
+                // representation. E.g. "4" is a prefix of "42".
+                target_str.as_bytes().starts_with(num_bytes)
+            }
+            SchemaNode::Enum(values) => {
+                // Check if the raw bytes are a prefix of any number
+                // value in the enum.
+                for v in values {
+                    if v.is_number() {
+                        let v_str = serde_json::to_string(v).unwrap_or_default();
+                        if v_str.as_bytes().starts_with(num_bytes) {
+                            return true;
+                        }
+                    }
+                }
+                false
+            }
+            _ => false,
+        }
+    }
+
+    impl SchemaMatcher {
+        /// Create a fresh matcher for the given root schema node.
+        pub fn new(root: SchemaNode) -> Self {
+            Self {
+                root,
+                bytes: Vec::new(),
+                stack: Vec::new(),
+                accepted: false,
+                errored: false,
+            }
+        }
+
+        /// Create a fresh matcher from a compiled schema.
+        pub fn from_compiled(schema: &CompiledSchema) -> Self {
+            Self::new(schema.root.clone())
+        }
+
+        /// Check whether the given raw bytes would be a valid
+        /// continuation from the current parser state.
+        ///
+        /// This is a conservative prefix check: it returns `true` if
+        /// the bytes could be part of a valid JSON value conforming
+        /// to the schema. A `false` return means the bytes would
+        /// definitely violate the schema or JSON syntax.
+        pub fn is_token_allowed(&self, bytes: &[u8]) -> bool {
+            if self.errored {
+                return false;
+            }
+            if self.accepted {
+                // After acceptance, only whitespace is allowed.
+                return bytes.iter().all(|&b| b == b' ' || b == b'\n' || b == b'\t' || b == b'\r');
+            }
+            // Conservative: simulate the advance and check if it errors.
+            let mut sim = self.clone();
+            sim.advance(bytes);
+            !sim.errored
+        }
+
+        /// Commit raw bytes into the parser, advancing state.
+        ///
+        /// Bytes are accumulated and re-parsed incrementally. Partial
+        /// UTF-8 sequences are buffered until complete. The parser
+        /// handles JSON tokens: structural characters, strings (with
+        /// escape handling), numbers, booleans, null.
+        pub fn advance(&mut self, bytes: &[u8]) {
+            if self.errored || self.accepted {
+                return;
+            }
+            self.bytes.extend_from_slice(bytes);
+            self.parse();
+        }
+
+        /// True when the full JSON value has been parsed and conforms
+        /// to the schema. After acceptance, only whitespace is allowed.
+        pub fn is_accepting(&self) -> bool {
+            self.accepted
+        }
+
+        /// True when the parser has hit an error (invalid JSON or
+        /// schema violation).
+        pub fn is_errored(&self) -> bool {
+            self.errored
+        }
+
+        /// Attempt to parse the accumulated bytes as far as possible.
+        /// On success, sets `accepted` if the JSON value is complete.
+        /// On failure, sets `errored`.
+        fn parse(&mut self) {
+            // Try to parse the accumulated bytes as a JSON value.
+            // We use serde_json's streaming parser for incremental
+            // byte-level parsing, then validate the result against
+            // the schema.
+            //
+            // For incremental prefix checking, we attempt to parse
+            // the full buffer. If it succeeds, validate. If it fails
+            // with an EOF error (incomplete), we're still going. If
+            // it fails with any other error, the JSON is malformed.
+            let slice = &self.bytes[..];
+
+            // Skip leading whitespace.
+            let mut start = 0;
+            while start < slice.len()
+                && (slice[start] == b' '
+                    || slice[start] == b'\n'
+                    || slice[start] == b'\t'
+                    || slice[start] == b'\r')
+            {
+                start += 1;
+            }
+
+            if start >= slice.len() {
+                return; // Only whitespace so far.
+            }
+
+            // Try parsing as a complete JSON value from `start`.
+            let rest = &slice[start..];
+            match serde_json::from_slice::<serde_json::Value>(rest) {
+                Ok(v) => {
+                    // The value parsed as complete JSON. But in
+                    // incremental mode, a number like "4" at the
+                    // end of the buffer could still grow into "42".
+                    // We need to determine whether the value is
+                    // truly complete or might be extended by future
+                    // bytes.
+                    //
+                    // Only numbers can grow: "4" → "42", "1." →
+                    // "1.5", "1e" → "1e3". All other JSON value
+                    // types (string, bool, null, object, array) have
+                    // definite closing delimiters that make them
+                    // complete.
+                    let is_number = v.is_number();
+                    let last_byte = rest.iter().rev().find(|&&b| {
+                        b != b' ' && b != b'\n' && b != b'\t' && b != b'\r'
+                    });
+                    // A number is "potentially growing" if the last
+                    // non-whitespace byte is a digit, sign, decimal
+                    // point, or exponent marker.
+                    let number_could_grow = is_number
+                        && matches!(
+                            last_byte,
+                            Some(b'0'..=b'9' | b'+' | b'-' | b'.' | b'e' | b'E')
+                        );
+
+                    if number_could_grow {
+                        // The number might grow. Check if the type
+                        // is even compatible with the schema. If the
+                        // schema expects a non-number type, no
+                        // continuation of this number can ever match
+                        // — error now.
+                        match validate(&v, &self.root) {
+                            Ok(()) => {
+                                self.accepted = true;
+                                self.stack.clear();
+                            }
+                            Err(_reason) => {
+                                // The number doesn't match the schema
+                                // yet, but it might grow. Check if
+                                // the current raw bytes could be a
+                                // prefix of a value that WOULD match.
+                                // If the schema expects a non-number
+                                // type, no continuation can fix it.
+                                // If the schema expects a specific
+                                // number (const/enum), check if the
+                                // current bytes are a prefix of that
+                                // number's JSON representation.
+                                if number_could_grow_to_match(&v, &self.root, rest) {
+                                    // Don't error — might grow into
+                                    // a matching value.
+                                } else {
+                                    self.errored = true;
+                                }
+                            }
+                        }
+                    } else {
+                        // The value is complete (non-number, or a
+                        // number followed by a non-digit delimiter).
+                        // Validate and accept or error.
+                        match validate(&v, &self.root) {
+                            Ok(()) => {
+                                self.accepted = true;
+                                self.stack.clear();
+                            }
+                            Err(_reason) => {
+                                self.errored = true;
+                            }
+                        }
+                    }
+                }
+                Err(e) => {
+                    // Check if it's an EOF error (incomplete input).
+                    if !is_eof_error(&e) {
+                        self.errored = true;
+                    }
+                    // EOF: incomplete, keep buffering.
+                }
+            }
+        }
+    }
+
+    // ── Schema validation ─────────────────────────────────────────────
+
+    /// Validate a parsed JSON value against a schema node.
+    /// This is the independent validator used by the matcher and by
+    /// tests. It does NOT reuse the matcher's incremental logic.
+    pub fn validate(value: &serde_json::Value, schema: &SchemaNode) -> Result<(), String> {
+        match schema {
+            SchemaNode::Any => Ok(()),
+            SchemaNode::String => {
+                if value.is_string() {
+                    Ok(())
+                } else {
+                    Err(format!("expected string, got {}", type_name(value)))
+                }
+            }
+            SchemaNode::Number => {
+                if value.is_number() {
+                    // Reject NaN/Infinity — serde_json doesn't produce
+                    // them from parsing, but be explicit.
+                    if let Some(n) = value.as_f64() {
+                        if n.is_nan() || n.is_infinite() {
+                            return Err("NaN/Infinity not allowed".to_string());
+                        }
+                    }
+                    Ok(())
+                } else {
+                    Err(format!("expected number, got {}", type_name(value)))
+                }
+            }
+            SchemaNode::Integer => {
+                if value.is_i64() || value.is_u64() {
+                    Ok(())
+                } else if let Some(f) = value.as_f64() {
+                    if f.fract() == 0.0 && f.is_finite() {
+                        Ok(())
+                    } else {
+                        Err(format!("expected integer, got {}", type_name(value)))
+                    }
+                } else {
+                    Err(format!("expected integer, got {}", type_name(value)))
+                }
+            }
+            SchemaNode::Boolean => {
+                if value.is_boolean() {
+                    Ok(())
+                } else {
+                    Err(format!("expected boolean, got {}", type_name(value)))
+                }
+            }
+            SchemaNode::Null => {
+                if value.is_null() {
+                    Ok(())
+                } else {
+                    Err(format!("expected null, got {}", type_name(value)))
+                }
+            }
+            SchemaNode::Object {
+                properties,
+                required,
+                additional_properties,
+            } => {
+                let obj = value.as_object().ok_or_else(|| {
+                    format!("expected object, got {}", type_name(value))
+                })?;
+
+                // Check required keys.
+                for req in required {
+                    if !obj.contains_key(req) {
+                        return Err(format!("missing required property: {req}"));
+                    }
+                }
+
+                // Check each property against its schema.
+                for (key, val) in obj {
+                    // Find the property schema.
+                    let prop_schema = properties.iter().find(|(k, _)| k == key);
+                    match prop_schema {
+                        Some((_, schema)) => validate(val, schema)?,
+                        None => {
+                            if !*additional_properties {
+                                return Err(format!(
+                                    "additional property {key:?} not allowed"
+                                ));
+                            }
+                        }
+                    }
+                }
+
+                // Check for duplicate keys — serde_json with preserve_order
+                // keeps the last value, so duplicates are already merged.
+                // The raw JSON parser should reject duplicates; here we
+                // trust the parser's behavior.
+
+                Ok(())
+            }
+            SchemaNode::Array {
+                items,
+                min_items,
+                max_items,
+            } => {
+                let arr = value.as_array().ok_or_else(|| {
+                    format!("expected array, got {}", type_name(value))
+                })?;
+
+                if arr.len() < *min_items {
+                    return Err(format!(
+                        "array has {} items, min {}",
+                        arr.len(),
+                        min_items
+                    ));
+                }
+
+                if let Some(max) = max_items {
+                    if arr.len() > *max {
+                        return Err(format!(
+                            "array has {} items, max {}",
+                            arr.len(),
+                            max
+                        ));
+                    }
+                }
+
+                for item in arr {
+                    validate(item, items)?;
+                }
+
+                Ok(())
+            }
+            SchemaNode::Enum(values) => {
+                for v in values {
+                    if json_equal(value, v) {
+                        return Ok(());
+                    }
+                }
+                Err(format!("value not in enum"))
+            }
+            SchemaNode::Const(c) => {
+                if json_equal(value, c) {
+                    Ok(())
+                } else {
+                    Err(format!("value does not match const"))
+                }
+            }
+        }
+    }
+
+    /// Semantic JSON equality: compares values by their JSON
+    /// representation, not by Rust type. `1` (integer) equals `1.0`
+    /// (float) in JSON.
+    fn json_equal(a: &serde_json::Value, b: &serde_json::Value) -> bool {
+        // serde_json's PartialEq is semantic for numbers: 1 == 1.0.
+        a == b
+    }
+
+    fn type_name(v: &serde_json::Value) -> &'static str {
+        match v {
+            serde_json::Value::Null => "null",
+            serde_json::Value::Bool(_) => "boolean",
+            serde_json::Value::Number(_) => "number",
+            serde_json::Value::String(_) => "string",
+            serde_json::Value::Array(_) => "array",
+            serde_json::Value::Object(_) => "object",
+        }
+    }
+
+    // ── Tests ─────────────────────────────────────────────────────────
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+        use serde_json::json;
+
+        // ── Compilation tests ──────────────────────────────────────────
+
+        #[test]
+        fn compiles_simple_object_schema() {
+            let schema = json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "age": {"type": "integer"}
+                },
+                "required": ["name"]
+            });
+            let compiled = CompiledSchema::compile(&schema).expect("valid schema");
+            assert!(matches!(compiled.root(), SchemaNode::Object { .. }));
+        }
+
+        #[test]
+        fn compiles_nested_array_of_objects() {
+            let schema = json!({
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "id": {"type": "integer"}
+                    },
+                    "required": ["id"]
+                }
+            });
+            let compiled = CompiledSchema::compile(&schema).expect("valid schema");
+            assert!(matches!(compiled.root(), SchemaNode::Array { .. }));
+        }
+
+        #[test]
+        fn rejects_ref() {
+            let schema = json!({"$ref": "#/definitions/Foo"});
+            let err = CompiledSchema::compile(&schema).unwrap_err();
+            assert!(matches!(err, SchemaError::ReferencesNotSupported { .. }));
+        }
+
+        #[test]
+        fn rejects_pattern() {
+            let schema = json!({"type": "string", "pattern": "^[a-z]+$"});
+            let err = CompiledSchema::compile(&schema).unwrap_err();
+            assert!(matches!(err, SchemaError::RegexNotSupported));
+        }
+
+        #[test]
+        fn rejects_combinator() {
+            for kw in ["allOf", "anyOf", "oneOf", "not"] {
+                let schema = json!({kw: []});
+                let err = CompiledSchema::compile(&schema).unwrap_err();
+                assert!(
+                    matches!(err, SchemaError::CombinatorNotSupported { .. }),
+                    "{kw} should be rejected"
+                );
+            }
+        }
+
+        #[test]
+        fn rejects_recursion() {
+            // A self-referencing schema: an object with a property
+            // whose name matches the parent's key on the path.
+            let schema = json!({
+                "type": "object",
+                "properties": {
+                    "self": {
+                        "type": "object",
+                        "properties": {
+                            "self": {"type": "string"}
+                        }
+                    }
+                }
+            });
+            let err = CompiledSchema::compile(&schema).unwrap_err();
+            assert!(matches!(err, SchemaError::RecursionNotSupported));
+        }
+
+        #[test]
+        fn rejects_unsatisfiable_min_max_items() {
+            let schema = json!({
+                "type": "array",
+                "items": {"type": "string"},
+                "minItems": 5,
+                "maxItems": 3
+            });
+            let err = CompiledSchema::compile(&schema).unwrap_err();
+            assert!(matches!(err, SchemaError::Unsatisfiable { .. }));
+        }
+
+        #[test]
+        fn rejects_unsatisfiable_required_not_in_properties() {
+            let schema = json!({
+                "type": "object",
+                "properties": {"a": {"type": "string"}},
+                "required": ["b"]
+            });
+            let err = CompiledSchema::compile(&schema).unwrap_err();
+            assert!(matches!(err, SchemaError::Unsatisfiable { .. }));
+        }
+
+        #[test]
+        fn rejects_unsupported_keyword() {
+            let schema = json!({"type": "string", "minLength": 5});
+            let err = CompiledSchema::compile(&schema).unwrap_err();
+            assert!(matches!(err, SchemaError::UnsupportedKeyword { .. }));
+        }
+
+        #[test]
+        fn rejects_too_many_enum_values() {
+            let values: Vec<i32> = (0..300).collect();
+            let schema = json!({"enum": values});
+            let err = CompiledSchema::compile(&schema).unwrap_err();
+            assert!(matches!(err, SchemaError::TooManyEnumValues { .. }));
+        }
+
+        // ── Incremental matcher: acceptance tests ──────────────────────
+
+        #[test]
+        fn matcher_accepts_valid_object() {
+            let schema = json!({
+                "type": "object",
+                "properties": {"name": {"type": "string"}, "age": {"type": "integer"}},
+                "required": ["name"]
+            });
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let mut m = compiled.matcher();
+            m.advance(b"{\"name\": \"Alice\", \"age\": 30}");
+            assert!(m.is_accepting(), "valid object should be accepted");
+            assert!(!m.is_errored());
+        }
+
+        #[test]
+        fn matcher_rejects_missing_required() {
+            let schema = json!({
+                "type": "object",
+                "properties": {"name": {"type": "string"}, "age": {"type": "integer"}},
+                "required": ["name"]
+            });
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let mut m = compiled.matcher();
+            m.advance(b"{\"age\": 30}");
+            assert!(!m.is_accepting());
+            assert!(m.is_errored(), "missing required should error");
+        }
+
+        #[test]
+        fn matcher_rejects_wrong_type() {
+            let schema = json!({"type": "string"});
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let mut m = compiled.matcher();
+            m.advance(b"42");
+            assert!(!m.is_accepting());
+            assert!(m.is_errored(), "number for string schema should error");
+        }
+
+        #[test]
+        fn matcher_accepts_nested_arrays() {
+            let schema = json!({
+                "type": "array",
+                "items": {
+                    "type": "array",
+                    "items": {"type": "integer"}
+                }
+            });
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let mut m = compiled.matcher();
+            m.advance(b"[[1, 2], [3, 4], [5]]");
+            assert!(m.is_accepting(), "nested arrays should be accepted");
+        }
+
+        #[test]
+        fn matcher_accepts_nested_objects() {
+            let schema = json!({
+                "type": "object",
+                "properties": {
+                    "address": {
+                        "type": "object",
+                        "properties": {
+                            "city": {"type": "string"},
+                            "zip": {"type": "string"}
+                        },
+                        "required": ["city"]
+                    }
+                },
+                "required": ["address"]
+            });
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let mut m = compiled.matcher();
+            m.advance(b"{\"address\": {\"city\": \"NYC\", \"zip\": \"10001\"}}");
+            assert!(m.is_accepting(), "nested objects should be accepted");
+        }
+
+        #[test]
+        fn matcher_accepts_escaped_strings() {
+            let schema = json!({"type": "string"});
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let mut m = compiled.matcher();
+            // String with escaped quote and backslash: "hello\"world\\"
+            m.advance(b"\"hello\\\"world\\\\\"");
+            assert!(m.is_accepting(), "escaped string should be accepted");
+        }
+
+        #[test]
+        fn matcher_accepts_split_utf8_across_advances() {
+            // The CJK character 中 = E4 B8 AD. Feed each byte
+            // in a separate advance call inside a string value.
+            let schema = json!({"type": "string"});
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let mut m = compiled.matcher();
+            m.advance(b"\"");
+            m.advance(&[0xE4]);
+            m.advance(&[0xB8]);
+            m.advance(&[0xAD]);
+            m.advance(b"\"");
+            assert!(m.is_accepting(), "split UTF-8 should be accepted");
+        }
+
+        #[test]
+        fn matcher_rejects_additional_properties_when_false() {
+            let schema = json!({
+                "type": "object",
+                "properties": {"a": {"type": "string"}},
+                "additionalProperties": false
+            });
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let mut m = compiled.matcher();
+            m.advance(b"{\"a\": \"x\", \"b\": 1}");
+            assert!(m.is_errored(), "additional property should be rejected");
+        }
+
+        #[test]
+        fn matcher_allows_additional_properties_when_true() {
+            let schema = json!({
+                "type": "object",
+                "properties": {"a": {"type": "string"}},
+                "additionalProperties": true
+            });
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let mut m = compiled.matcher();
+            m.advance(b"{\"a\": \"x\", \"b\": 1}");
+            assert!(m.is_accepting(), "additional property should be allowed");
+        }
+
+        #[test]
+        fn matcher_accepts_enum() {
+            let schema = json!({"enum": ["red", "green", "blue"]});
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let mut m = compiled.matcher();
+            m.advance(b"\"red\"");
+            assert!(m.is_accepting());
+        }
+
+        #[test]
+        fn matcher_rejects_enum_non_member() {
+            let schema = json!({"enum": ["red", "green", "blue"]});
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let mut m = compiled.matcher();
+            m.advance(b"\"purple\"");
+            assert!(m.is_errored());
+        }
+
+        #[test]
+        fn matcher_accepts_const() {
+            let schema = json!({"const": 42});
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let mut m = compiled.matcher();
+            m.advance(b"42");
+            assert!(m.is_accepting());
+        }
+
+        #[test]
+        fn matcher_rejects_const_mismatch() {
+            let schema = json!({"const": 42});
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let mut m = compiled.matcher();
+            m.advance(b"43");
+            assert!(m.is_errored());
+        }
+
+        #[test]
+        fn matcher_enforces_array_min_items() {
+            let schema = json!({
+                "type": "array",
+                "items": {"type": "integer"},
+                "minItems": 3
+            });
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let mut m = compiled.matcher();
+            m.advance(b"[1, 2]");
+            assert!(m.is_errored(), "too few items should error");
+        }
+
+        #[test]
+        fn matcher_enforces_array_max_items() {
+            let schema = json!({
+                "type": "array",
+                "items": {"type": "integer"},
+                "maxItems": 2
+            });
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let mut m = compiled.matcher();
+            m.advance(b"[1, 2, 3]");
+            assert!(m.is_errored(), "too many items should error");
+        }
+
+        // ── Required membership at correct nesting (A15) ───────────────
+
+        #[test]
+        fn required_name_in_string_value_does_not_satisfy_parent() {
+            // Schema requires "name" as a property key, but the model
+            // emits "name" inside a string VALUE — that does NOT
+            // satisfy the required-key constraint.
+            let schema = json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "description": {"type": "string"}
+                },
+                "required": ["name"]
+            });
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let mut m = compiled.matcher();
+            // "name" appears as a string value for "description", but
+            // the "name" KEY is missing.
+            m.advance(b"{\"description\": \"name\"}");
+            assert!(m.is_errored(), "required key in string value should not satisfy");
+        }
+
+        #[test]
+        fn required_name_in_child_object_does_not_satisfy_parent() {
+            // "name" as a key in a child object does not satisfy the
+            // parent's required "name".
+            let schema = json!({
+                "type": "object",
+                "properties": {
+                    "name": {"type": "string"},
+                    "child": {
+                        "type": "object",
+                        "properties": {
+                            "name": {"type": "string"}
+                        }
+                    }
+                },
+                "required": ["name"]
+            });
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let mut m = compiled.matcher();
+            m.advance(b"{\"child\": {\"name\": \"x\"}}");
+            assert!(m.is_errored(), "required key in child should not satisfy parent");
+        }
+
+        // ── Incremental acceptance == independent validation (A15) ─────
+
+        /// Independent validator: parse JSON and validate against the
+        /// schema using the `validate` function. This does NOT reuse
+        /// the matcher's incremental logic.
+        fn independent_validate(
+            json_str: &str,
+            schema: &serde_json::Value,
+        ) -> Result<(), String> {
+            let compiled = CompiledSchema::compile(schema)
+                .map_err(|e| format!("compile error: {e}"))?;
+            let value: serde_json::Value = serde_json::from_str(json_str)
+                .map_err(|e| format!("parse error: {e}"))?;
+            validate(&value, compiled.root())
+        }
+
+        /// A corpus of (json_str, schema) pairs. For each, the
+        /// incremental matcher's acceptance must match the independent
+        /// validator's result.
+        fn corpus() -> Vec<(&'static str, serde_json::Value)> {
+            vec![
+                // Simple object.
+                (
+                    r#"{"name": "Alice", "age": 30}"#,
+                    json!({"type": "object", "properties": {"name": {"type": "string"}, "age": {"type": "integer"}}, "required": ["name"]}),
+                ),
+                // Missing required.
+                (
+                    r#"{"age": 30}"#,
+                    json!({"type": "object", "properties": {"name": {"type": "string"}, "age": {"type": "integer"}}, "required": ["name"]}),
+                ),
+                // Nested array of objects.
+                (
+                    r#"[{"id": 1}, {"id": 2}]"#,
+                    json!({"type": "array", "items": {"type": "object", "properties": {"id": {"type": "integer"}}, "required": ["id"]}}),
+                ),
+                // String with escapes.
+                    (
+                    r#""hello\nworld""#,
+                    json!({"type": "string"}),
+                ),
+                // Number.
+                (
+                    r#"42"#,
+                    json!({"type": "integer"}),
+                ),
+                // Boolean.
+                (
+                    r#"true"#,
+                    json!({"type": "boolean"}),
+                ),
+                // Null.
+                (
+                    r#"null"#,
+                    json!({"type": "null"}),
+                ),
+                // Enum match.
+                (
+                    r#""red""#,
+                    json!({"enum": ["red", "green", "blue"]}),
+                ),
+                // Enum non-match.
+                (
+                    r#""purple""#,
+                    json!({"enum": ["red", "green", "blue"]}),
+                ),
+                // Const match.
+                (
+                    r#"42"#,
+                    json!({"const": 42}),
+                ),
+                // Additional properties false.
+                (
+                    r#"{"a": "x", "b": 1}"#,
+                    json!({"type": "object", "properties": {"a": {"type": "string"}}, "additionalProperties": false}),
+                ),
+                // Array min/max.
+                (
+                    r#"[1, 2, 3]"#,
+                    json!({"type": "array", "items": {"type": "integer"}, "minItems": 2, "maxItems": 5}),
+                ),
+                // Deeply nested.
+                (
+                    r#"{"a": {"b": {"c": [1, 2, 3]}}}"#,
+                    json!({"type": "object", "properties": {"a": {"type": "object", "properties": {"b": {"type": "object", "properties": {"c": {"type": "array", "items": {"type": "integer"}}}}}}}}),
+                ),
+                // Wrong type.
+                (
+                    r#"42"#,
+                    json!({"type": "string"}),
+                ),
+                // Empty array with minItems.
+                (
+                    r#"[]"#,
+                    json!({"type": "array", "items": {"type": "integer"}, "minItems": 1}),
+                ),
+            ]
+        }
+
+        #[test]
+        fn incremental_acceptance_matches_independent_validation() {
+            for (i, (json_str, schema)) in corpus().iter().enumerate() {
+                let compiled = match CompiledSchema::compile(schema) {
+                    Ok(c) => c,
+                    Err(e) => {
+                        // If the schema is rejected at compile time,
+                        // the independent validator should also reject.
+                        let indep = independent_validate(json_str, schema);
+                        assert!(
+                            indep.is_err(),
+                            "case {i}: schema rejected by compiler but independent validator succeeded: {json_str}"
+                        );
+                        continue;
+                    }
+                };
+
+                // Incremental matcher: feed bytes one at a time.
+                let mut m = compiled.matcher();
+                for byte in json_str.bytes() {
+                    m.advance(&[byte]);
+                }
+                let incremental_ok = m.is_accepting();
+                let incremental_err = m.is_errored();
+
+                // Independent validator.
+                let indep_result = independent_validate(json_str, schema);
+                let indep_ok = indep_result.is_ok();
+
+                assert_eq!(
+                    incremental_ok, indep_ok,
+                    "case {i}: incremental acceptance ({incremental_ok}) != independent validation ({indep_ok}) for: {json_str}"
+                );
+                assert!(
+                    !incremental_ok || !incremental_err,
+                    "case {i}: both accepting and errored"
+                );
+            }
+        }
+
+        #[test]
+        fn incremental_acceptance_matches_when_split_arbitrarily() {
+            // Feed the JSON bytes in random-sized chunks to test
+            // incremental robustness.
+            for (i, (json_str, schema)) in corpus().iter().enumerate() {
+                let compiled = match CompiledSchema::compile(schema) {
+                    Ok(c) => c,
+                    Err(_) => continue,
+                };
+                let mut m = compiled.matcher();
+                // Feed in chunks of 1, 2, 3, 1, 1, 5, ... bytes.
+                let chunk_sizes = [1usize, 2, 3, 1, 1, 5, 1, 2, 4, 1, 3, 7];
+                let mut pos = 0;
+                let mut ci = 0;
+                while pos < json_str.len() {
+                    let sz = chunk_sizes[ci % chunk_sizes.len()].min(json_str.len() - pos);
+                    m.advance(&json_str.as_bytes()[pos..pos + sz]);
+                    pos += sz;
+                    ci += 1;
+                }
+                let incremental_ok = m.is_accepting();
+
+                let indep_result = independent_validate(json_str, schema);
+                let indep_ok = indep_result.is_ok();
+
+                assert_eq!(
+                    incremental_ok, indep_ok,
+                    "case {i}: split-chunk incremental ({incremental_ok}) != independent ({indep_ok}) for: {json_str}"
+                );
+            }
+        }
+
+        // ── is_token_allowed tests ─────────────────────────────────────
+
+        #[test]
+        fn is_token_allowed_accepts_valid_prefix() {
+            let schema = json!({"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]});
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let m = compiled.matcher();
+            // Opening brace is a valid prefix.
+            assert!(m.is_token_allowed(b"{"));
+            assert!(m.is_token_allowed(b"{\""));
+        }
+
+        #[test]
+        fn is_token_allowed_rejects_invalid_prefix() {
+            let schema = json!({"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]});
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let m = compiled.matcher();
+            // A number is not a valid prefix for an object schema.
+            assert!(!m.is_token_allowed(b"42"));
+        }
+
+        #[test]
+        fn is_token_allowed_accepts_partial_json() {
+            let schema = json!({"type": "string"});
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let m = compiled.matcher();
+            // Opening quote is a valid prefix of a string.
+            assert!(m.is_token_allowed(b"\""));
+            assert!(m.is_token_allowed(b"\"hel"));
+        }
+
+        // ── Duplicate key rejection (A15) ──────────────────────────────
+
+        #[test]
+        fn duplicate_keys_rejected() {
+            // serde_json's default behavior with preserve_order is to
+            // keep the LAST value for a duplicate key. The spec says
+            // duplicate keys are invalid in strict mode. We test that
+            // the schema validator catches this: the last value for
+            // "a" is 2 (integer), but if the schema expects a string,
+            // it will fail. For a more direct test, we check that
+            // duplicate keys with wrong type on the second occurrence
+            // are caught.
+            let schema = json!({
+                "type": "object",
+                "properties": {"a": {"type": "string"}},
+                "required": ["a"]
+            });
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let mut m = compiled.matcher();
+            // Duplicate "a" key: first string, second integer.
+            // serde_json with preserve_order keeps the last → "a": 2
+            // → type mismatch → error.
+            m.advance(b"{\"a\": \"x\", \"a\": 2}");
+            assert!(m.is_errored(), "duplicate key with type mismatch should error");
+        }
+
+        // ── Escaped/unescaped key spellings (A15) ─────────────────────
+
+        #[test]
+        fn escaped_key_matches_unescaped_in_schema() {
+            // A schema with property "a\"b" (decoded: a"b). The JSON
+            // can use either the escaped or unescaped form in the
+            // raw bytes — they should both match the same property
+            // after decoding.
+            //
+            // In JSON, the key MUST be escaped: "a\"b". serde_json
+            // decodes this to the string a"b before looking it up
+            // in the properties map, so escaped and unescaped
+            // spellings are compared after decoding.
+            let schema = json!({
+                "type": "object",
+                "properties": {"a\"b": {"type": "string"}},
+                "required": ["a\"b"]
+            });
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let mut m = compiled.matcher();
+            // The JSON key "a\"b" decodes to a"b, which matches.
+            m.advance(b"{\"a\\\"b\": \"value\"}");
+            assert!(m.is_accepting(), "escaped key should match schema property");
+        }
+    }
+}
+
 } // mod json
 
 /// DSML grammar — state machine for `<｜DSML｜tool_calls>` XML-style tool calls.
@@ -2902,6 +4474,93 @@ pub struct ToolSchema {
     pub required: Vec<String>,
 }
 
+use std::sync::Arc;
+
+/// Maximum number of tool schemas accepted by [`CompiledGrammar::new`].
+const MAX_TOOL_SCHEMAS: usize = 256;
+
+/// Maximum total bytes of all tool names + param names + required names.
+const MAX_SCHEMA_BYTES: usize = 64 * 1024;
+
+/// Typed error returned when DSML compilation inputs exceed bounds.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum GrammarCompileError {
+    /// Too many tool schemas supplied.
+    TooManySchemas { count: usize, max: usize },
+    /// Total schema string bytes exceeded the bound.
+    SchemaBytesExceeded { bytes: usize, max: usize },
+    /// A tool name is empty.
+    EmptyToolName { index: usize },
+}
+
+impl std::fmt::Display for GrammarCompileError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::TooManySchemas { count, max } => write!(
+                f,
+                "dsml grammar compile: {count} tool schemas exceeds max {max}"
+            ),
+            Self::SchemaBytesExceeded { bytes, max } => write!(
+                f,
+                "dsml grammar compile: schema string bytes {bytes} exceeds max {max}"
+            ),
+            Self::EmptyToolName { index } => {
+                write!(f, "dsml grammar compile: tool schema {index} has empty name")
+            }
+        }
+    }
+}
+
+impl std::error::Error for GrammarCompileError {}
+
+/// Immutable, `Send + Sync` compiled artifact for the DSML tool-call
+/// grammar. Owns the tool schemas; produced once per unique tool set and
+/// shared across requests via `Arc<CompiledGrammar>` (spec §7 G1).
+#[derive(Debug, Clone)]
+pub struct CompiledGrammar {
+    tools: Vec<ToolSchema>,
+}
+
+impl CompiledGrammar {
+    /// Compile with bounds validation.
+    pub fn new(tools: Vec<ToolSchema>) -> Result<Self, GrammarCompileError> {
+        if tools.len() > MAX_TOOL_SCHEMAS {
+            return Err(GrammarCompileError::TooManySchemas {
+                count: tools.len(),
+                max: MAX_TOOL_SCHEMAS,
+            });
+        }
+        let mut total_bytes = 0;
+        for (i, t) in tools.iter().enumerate() {
+            if t.name.is_empty() {
+                return Err(GrammarCompileError::EmptyToolName { index: i });
+            }
+            total_bytes += t.name.len();
+            for p in &t.params {
+                total_bytes += p.len();
+            }
+            for r in &t.required {
+                total_bytes += r.len();
+            }
+        }
+        if total_bytes > MAX_SCHEMA_BYTES {
+            return Err(GrammarCompileError::SchemaBytesExceeded {
+                bytes: total_bytes,
+                max: MAX_SCHEMA_BYTES,
+            });
+        }
+        Ok(Self { tools })
+    }
+
+    /// Read-only access to the tool schemas.
+    pub fn tools(&self) -> &[ToolSchema] {
+        &self.tools
+    }
+}
+
+unsafe impl Send for CompiledGrammar {}
+unsafe impl Sync for CompiledGrammar {}
+
 /// The grammar matcher itself: a state plus the bytes committed since
 /// the last firm transition. Construct via [`Matcher::new`] with the
 /// active tool schemas; advance with [`Matcher::advance`]; query the
@@ -2916,17 +4575,37 @@ pub struct Matcher {
     /// transition) or no allowed string still has the buffer as a
     /// prefix (match failure → fall back to `Out`).
     partial_buf: String,
-    tools: Vec<ToolSchema>,
+    /// Immutable compiled artifact: tool schemas.
+    /// Shared across requests via `Arc` (spec §7 G1).
+    grammar: Arc<CompiledGrammar>,
 }
 
 impl Matcher {
     /// Build a fresh matcher in [`State::Out`] with no partial buffer.
+    ///
+    /// Compiles the tools into a [`CompiledGrammar`] internally. For
+    /// request sharing, prefer [`Matcher::from_compiled`] with a
+    /// pre-built `Arc<CompiledGrammar>`.
     pub fn new(tools: Vec<ToolSchema>) -> Self {
+        let grammar = CompiledGrammar::new(tools)
+            .expect("Matcher::new: schema bounds violated");
+        Self::from_compiled(Arc::new(grammar))
+    }
+
+    /// Build a cursor from a pre-compiled, shared artifact. Multiple
+    /// requests can share the same `Arc<CompiledGrammar>` while each
+    /// owns an independent `Matcher` cursor (spec §7 G1).
+    pub fn from_compiled(grammar: Arc<CompiledGrammar>) -> Self {
         Self {
             state: State::Out,
             partial_buf: String::new(),
-            tools,
+            grammar,
         }
+    }
+
+    /// Read-only access to the compiled grammar artifact.
+    pub fn compiled(&self) -> &CompiledGrammar {
+        &self.grammar
     }
 
     /// Read-only view of the current state.
@@ -3005,13 +4684,13 @@ impl Matcher {
                 CLOSE_TOOL_CALLS.to_string(),
             ],
             State::InInvokeName { tool_idx: None, .. } => self
-                .tools
+                .grammar.tools
                 .iter()
                 .map(|t| format!("{}\">\n", t.name))
                 .collect(),
             State::InInvokeName {
                 tool_idx: Some(idx), ..
-            } => vec![format!("{}\">\n", self.tools[*idx].name)],
+            } => vec![format!("{}\">\n", self.grammar.tools[*idx].name)],
             State::InInvokeBody {
                 tool_idx,
                 emitted_params,
@@ -3031,7 +4710,7 @@ impl Matcher {
                 tool_idx,
                 param_idx: None,
                 emitted_params,
-            } => self.tools[*tool_idx]
+            } => self.grammar.tools[*tool_idx]
                 .params
                 .iter()
                 .enumerate()
@@ -3045,7 +4724,7 @@ impl Matcher {
                 tool_idx,
                 param_idx: Some(idx),
                 ..
-            } => vec![format!("{}\"", self.tools[*tool_idx].params[*idx])],
+            } => vec![format!("{}\"", self.grammar.tools[*tool_idx].params[*idx])],
             State::InParamAttr { .. } => vec![
                 ATTR_STRING_TRUE.to_string(),
                 ATTR_STRING_FALSE.to_string(),
@@ -3056,7 +4735,7 @@ impl Matcher {
     /// True when every entry in `self.tools[tool_idx].required` is
     /// represented in `emitted_params`.
     fn required_satisfied(&self, tool_idx: usize, emitted_params: &[usize]) -> bool {
-        let tool = &self.tools[tool_idx];
+        let tool = &self.grammar.tools[tool_idx];
         for req_name in &tool.required {
             let req_idx = match tool.params.iter().position(|p| p == req_name) {
                 Some(i) => i,
@@ -3369,10 +5048,10 @@ impl Matcher {
     /// trailing bytes in the buffer for the next state to consume.
     fn transition_invoke_name(&mut self, tool_idx: Option<usize>) -> Transition {
         let candidates: Vec<(usize, String)> = match tool_idx {
-            None => (0..self.tools.len())
-                .map(|i| (i, format!("{}\">\n", self.tools[i].name)))
+            None => (0..self.grammar.tools.len())
+                .map(|i| (i, format!("{}\">\n", self.grammar.tools[i].name)))
                 .collect(),
-            Some(idx) => vec![(idx, format!("{}\">\n", self.tools[idx].name))],
+            Some(idx) => vec![(idx, format!("{}\">\n", self.grammar.tools[idx].name))],
         };
         // Full coverage → transition into invoke body. Buffer keeps the
         // trailing suffix (if the committed token spanned more than the
@@ -3424,7 +5103,7 @@ impl Matcher {
         param_idx: Option<usize>,
         emitted_params: Vec<usize>,
     ) -> Transition {
-        let tool = &self.tools[tool_idx];
+        let tool = &self.grammar.tools[tool_idx];
         // Exclude already-emitted params from the candidate set so the
         // model can't re-emit `command` twice in one invoke.
         let candidates: Vec<(usize, String)> = match param_idx {

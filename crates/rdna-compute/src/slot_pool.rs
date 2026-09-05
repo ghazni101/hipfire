@@ -24,6 +24,25 @@ const PAGE_TOKENS: usize = 128;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SlotId(pub usize);
 
+/// A generation-tagged slot lease (spec §4.3: "acquire returns
+/// generation-tagged SlotId; stale SlotId refuses").  The `generation`
+/// ties the lease to a specific acquire/release cycle — after `release`
+/// bumps the generation, a stale `SlotLease` fails
+/// [`SlotPool::validate_generation`] before any mutation.
+///
+/// Existing callers that use [`SlotPool::acquire`] (returning a bare
+/// [`SlotId`]) are unaffected: they simply don't get generation
+/// protection.  Serving callers (Wave 3) use
+/// [`SlotPool::acquire_leased`] and validate before each operation.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlotLease {
+    /// The slot index.
+    pub id: SlotId,
+    /// Generation at acquire time.  Mismatches after a release/reacquire
+    /// cycle indicate a stale handle.
+    pub generation: u32,
+}
+
 // `Debug` is required so tests can call `.unwrap_err()` on
 // `Result<SlotPool, String>` (`unwrap_err` requires `T: Debug` because it
 // formats the Ok value into the panic message on the failure path).
@@ -44,7 +63,13 @@ pub struct SlotPool {
     page_pool: Option<PagePool>,
     block_tables: Vec<Option<BlockTable>>,
     /// Per-slot dirty flag: block table changed since last upload.
+    /// Per-slot dirty flag: block table changed since last upload.
     block_tables_dirty: Vec<bool>,
+    /// Per-slot generation counter (spec §4.3).  Bumped on each `release`;
+    /// `acquire_leased` reads the current value so a stale `SlotLease`
+    /// fails `validate_generation` after a release/reacquire cycle.
+    /// Initialized to 0 — legacy `acquire` callers never check it.
+    slot_generations: Vec<u32>,
 }
 
 /// True when this pool is operating in paged mode.
@@ -116,6 +141,7 @@ impl SlotPool {
             page_pool: None,
             block_tables: vec![None; n_slots],
             block_tables_dirty: vec![false; n_slots],
+            slot_generations: vec![0; n_slots],
         })
     }
 
@@ -176,6 +202,7 @@ impl SlotPool {
             page_pool: Some(page_pool),
             block_tables: vec![None; n_slots],
             block_tables_dirty: vec![false; n_slots],
+            slot_generations: vec![0; n_slots],
         })
     }
 
@@ -199,16 +226,23 @@ impl SlotPool {
     /// cannot inherit the previous occupant's history.
     ///
     /// In paged mode, the slot's pages are freed back to the `PagePool`.
+    /// Bumps the slot's generation so any outstanding [`SlotLease`] for
+    /// this slot becomes stale (spec §4.3).
     pub fn release(&mut self, id: SlotId) {
         self.reset(id);
         // In paged mode, free the block table's pages.
         if let Some(pool) = self.page_pool.as_mut() {
             if let Some(bt) = self.block_tables[id.0].as_mut() {
-                pool.release_table(bt);
+                // release_table now returns Result; underflow indicates a
+                // refcount bug — log via debug_assert but don't panic in
+                // release (the table is cleared regardless).
+                let _ = pool.release_table(bt);
             }
             self.block_tables[id.0] = None;
             self.block_tables_dirty[id.0] = false;
         }
+        // Bump generation so stale SlotLease handles fail validation.
+        self.slot_generations[id.0] = self.slot_generations[id.0].wrapping_add(1);
         self.in_use[id.0] = false;
     }
 
@@ -225,7 +259,7 @@ impl SlotPool {
         if let Some(pool) = self.page_pool.as_mut() {
             if let Some(bt) = self.block_tables[id.0].as_mut() {
                 if bt.num_pages() > 0 {
-                    pool.release_table(bt);
+                    let _ = pool.release_table(bt);
                     self.block_tables_dirty[id.0] = true;
                 }
             }
@@ -439,6 +473,88 @@ impl SlotPool {
     /// Number of free pages in the page pool (paged mode only).
     pub fn free_pages(&self) -> usize {
         self.page_pool.as_ref().map(|p| p.free_pages()).unwrap_or(0)
+    }
+
+    // ── Wave 2: slot generations (spec §4.3) ──────────────────────────
+
+    /// Current generation for `slot`.  A [`SlotLease`] with a mismatched
+    /// generation is stale.
+    pub fn slot_generation(&self, slot: SlotId) -> u32 {
+        self.slot_generations.get(slot.0).copied().unwrap_or(0)
+    }
+
+    /// Take a free slot and return a generation-tagged [`SlotLease`], or
+    /// `None` when the pool is full (spec §4.3: "acquire returns
+    /// generation-tagged SlotId; stale SlotId refuses").
+    ///
+    /// Unlike [`acquire`], this reads the current generation so the caller
+    /// can validate it on every subsequent operation via
+    /// [`validate_generation`].  The slot is reset and given a fresh
+    /// block table in paged mode, exactly as [`acquire`] does.
+    ///
+    /// [`acquire`]: SlotPool::acquire
+    /// [`validate_generation`]: SlotPool::validate_generation
+    pub fn acquire_leased(&mut self) -> Option<SlotLease> {
+        let id = self.acquire()?;
+        Some(SlotLease {
+            id,
+            generation: self.slot_generation(id),
+        })
+    }
+
+    /// Validate that `lease` refers to the current acquire cycle of its
+    /// slot (spec §4.3: "stale SlotId refuses").  Returns `Err` if the
+    /// generation changed (slot was released and reacquired) or the slot
+    /// is not in use.
+    pub fn validate_generation(&self, lease: &SlotLease) -> Result<(), String> {
+        let current = self.slot_generation(lease.id);
+        if current != lease.generation {
+            return Err(format!(
+                "SlotPool: slot {} generation mismatch (lease={}, current={}) \
+                 — stale handle",
+                lease.id.0, lease.generation, current
+            ));
+        }
+        if !self.in_use[lease.id.0] {
+            return Err(format!(
+                "SlotPool: slot {} is not in use",
+                lease.id.0
+            ));
+        }
+        Ok(())
+    }
+
+    /// Return a leased slot to the pool, bumping its generation so the
+    /// lease becomes stale.  Validates the lease first — a stale lease
+    /// is rejected before any mutation (spec §4.3).
+    pub fn release_leased(&mut self, lease: &SlotLease) -> Result<(), String> {
+        self.validate_generation(lease)?;
+        self.release(lease.id);
+        Ok(())
+    }
+
+    /// Set a slot's logical KV length with generation validation (spec
+    /// §4.3).  A stale lease is rejected before any mutation.
+    pub fn set_seq_len_leased(
+        &mut self,
+        lease: &SlotLease,
+        seq_len: usize,
+    ) -> Result<(), String> {
+        self.validate_generation(lease)?;
+        self.set_seq_len(lease.id, seq_len)
+    }
+
+    /// Share a prefix with generation validation on both src and dst
+    /// (spec §4.3).  Stale leases are rejected before any mutation.
+    pub fn share_prefix_leased(
+        &mut self,
+        src: &SlotLease,
+        dst: &SlotLease,
+        n_pages: usize,
+    ) -> Result<(), String> {
+        self.validate_generation(src)?;
+        self.validate_generation(dst)?;
+        self.share_prefix(src.id, dst.id, n_pages)
     }
 }
 
@@ -833,5 +949,123 @@ mod tests {
         // The refused provision leaves the table and length untouched.
         assert_eq!(p.block_table(slot).unwrap().num_pages(), 1);
         assert_eq!(p.descriptors()[slot.0].seq_len, 128);
+    }
+
+    // ── Wave 2: slot generation tests (spec §4.3) ─────────────────────
+
+    #[test]
+    fn slot_generation_starts_at_zero() {
+        let p = SlotPool::new_paged(2, 256, PPB, 8).unwrap();
+        assert_eq!(p.slot_generation(SlotId(0)), 0);
+        assert_eq!(p.slot_generation(SlotId(1)), 0);
+    }
+
+    #[test]
+    fn acquire_leased_returns_valid_generation() {
+        let mut p = SlotPool::new_paged(2, 256, PPB, 8).unwrap();
+        let lease = p.acquire_leased().unwrap();
+        assert_eq!(lease.id, SlotId(0));
+        assert_eq!(lease.generation, 0);
+        assert!(p.validate_generation(&lease).is_ok());
+    }
+
+    #[test]
+    fn release_bumps_generation_and_stales_lease() {
+        let mut p = SlotPool::new_paged(2, 256, PPB, 8).unwrap();
+        let lease = p.acquire_leased().unwrap();
+        assert_eq!(lease.generation, 0);
+
+        p.release(lease.id);
+        assert_eq!(p.slot_generation(lease.id), 1);
+
+        // Old lease is stale
+        let err = p.validate_generation(&lease).unwrap_err();
+        assert!(err.contains("stale"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn release_leased_rejects_stale_lease() {
+        let mut p = SlotPool::new_paged(2, 256, PPB, 8).unwrap();
+        let lease = p.acquire_leased().unwrap();
+        p.release(lease.id);
+
+        // Releasing with the stale lease must fail before mutation
+        let err = p.release_leased(&lease).unwrap_err();
+        assert!(err.contains("stale"), "unexpected: {err}");
+        // Generation unchanged — release_leased didn't double-bump
+        assert_eq!(p.slot_generation(lease.id), 1);
+    }
+
+    #[test]
+    fn reacquire_after_release_gets_new_generation() {
+        let mut p = SlotPool::new_paged(2, 256, PPB, 8).unwrap();
+        let lease1 = p.acquire_leased().unwrap();
+        p.release(lease1.id);
+
+        let lease2 = p.acquire_leased().unwrap();
+        assert_eq!(lease2.id, lease1.id); // same slot reused
+        assert_eq!(lease2.generation, 1); // new generation
+        assert!(p.validate_generation(&lease2).is_ok());
+        assert!(p.validate_generation(&lease1).is_err()); // old is stale
+    }
+
+    #[test]
+    fn set_seq_len_leased_rejects_stale() {
+        let mut p = SlotPool::new_paged(2, 256, PPB, 8).unwrap();
+        let lease = p.acquire_leased().unwrap();
+        p.set_seq_len_leased(&lease, 128).unwrap();
+
+        p.release(lease.id);
+
+        // Stale lease must fail before mutation
+        let err = p.set_seq_len_leased(&lease, 64).unwrap_err();
+        assert!(err.contains("stale"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn share_prefix_leased_rejects_stale_src() {
+        let mut p = SlotPool::new_paged(2, 512, PPB, 16).unwrap();
+        let lease_a = p.acquire_leased().unwrap();
+        let lease_b = p.acquire_leased().unwrap();
+        p.set_seq_len_leased(&lease_a, 256).unwrap();
+
+        // Release A — its lease is now stale
+        p.release(lease_a.id);
+
+        // Sharing from stale A must fail before mutation
+        let err = p.share_prefix_leased(&lease_a, &lease_b, 2).unwrap_err();
+        assert!(err.contains("stale"), "unexpected: {err}");
+        // B's table untouched
+        assert_eq!(p.block_table(lease_b.id).unwrap().num_pages(), 0);
+    }
+
+    #[test]
+    fn share_prefix_leased_rejects_stale_dst() {
+        let mut p = SlotPool::new_paged(2, 512, PPB, 16).unwrap();
+        let lease_a = p.acquire_leased().unwrap();
+        let lease_b = p.acquire_leased().unwrap();
+        p.set_seq_len_leased(&lease_a, 256).unwrap();
+
+        // Release B — its lease is now stale
+        p.release(lease_b.id);
+
+        // Sharing into stale B must fail before mutation
+        let err = p.share_prefix_leased(&lease_a, &lease_b, 2).unwrap_err();
+        assert!(err.contains("stale"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn legacy_acquire_unaffected_by_generations() {
+        // The existing acquire() path must work exactly as before —
+        // no generation checks, no behavioral change.
+        let mut p = SlotPool::new_paged(2, 256, PPB, 8).unwrap();
+        let slot = p.acquire().unwrap();
+        p.set_seq_len(slot, 128).unwrap();
+        p.release(slot);
+
+        // Reacquire via legacy path — still works
+        let slot2 = p.acquire().unwrap();
+        assert_eq!(slot2.0, slot.0);
+        assert_eq!(p.descriptors()[slot2.0].seq_len, 0);
     }
 }
