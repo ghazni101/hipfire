@@ -689,6 +689,41 @@ pub enum ReleaseDisposition {
 }
 
 // =========================================================================
+// Checkpoint identity — C5 (spec §4.5)
+// =========================================================================
+
+/// Opaque identifier for a recurrent-state checkpoint captured at a
+/// page-aligned boundary (spec §4.5).  Minted by the family adapter (e.g.
+/// the Qwen DeltaNet snapshot pool) as a monotonic `u64` starting at 1.
+/// The value `0` is reserved for "no checkpoint" (spec §4.2: a prefix match
+/// that lacks a recurrent checkpoint is a miss in usage accounting).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
+pub struct CheckpointId(pub u64);
+
+impl CheckpointId {
+    /// Sentinel meaning "no checkpoint exists at this boundary".
+    pub const NONE: CheckpointId = CheckpointId(0);
+
+    /// Returns `true` if this is the "no checkpoint" sentinel.
+    #[inline]
+    pub fn is_none(&self) -> bool {
+        self.0 == 0
+    }
+
+    /// Returns `true` if a real checkpoint id is present.
+    #[inline]
+    pub fn is_some(&self) -> bool {
+        self.0 != 0
+    }
+}
+
+impl fmt::Display for CheckpointId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "ckpt#{}", self.0)
+    }
+}
+
+// =========================================================================
 // Tests
 // =========================================================================
 
