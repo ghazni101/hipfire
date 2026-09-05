@@ -141,6 +141,184 @@ impl AdmissionController {
     }
 }
 
+
+// =========================================================================
+// S1 physical capacity accounting (spec §5.1)
+// =========================================================================
+
+/// Page size in tokens. Matches `rdna-compute::page_pool::PAGE_TOKENS`.
+pub const PAGE_TOKENS: u64 = 128;
+
+/// KV bytes for one 128-token page bundle (spec §5.1).
+///
+/// `page_bytes = sum_attention_layers B * (k_stride_bytes[layer] + v_stride_bytes[layer])`
+/// where `B = 128` (`PAGE_TOKENS`). Strides include quant scales/headers.
+/// Returns `None` on stride-length mismatch or arithmetic overflow (checked
+/// arithmetic, spec §5.1: "Use checked arithmetic").
+pub fn page_bytes(k_strides: &[u64], v_strides: &[u64]) -> Option<u64> {
+    if k_strides.len() != v_strides.len() {
+        return None;
+    }
+    let mut total: u64 = 0;
+    for (&k, &v) in k_strides.iter().zip(v_strides.iter()) {
+        let per_layer = PAGE_TOKENS.checked_mul(k.checked_add(v)?)?;
+        total = total.checked_add(per_layer)?;
+    }
+    Some(total)
+}
+
+/// Typed capacity error for the serving admission path (spec §5.1/S1, §5.4/S4).
+///
+/// Distinguishes pool exhaustion from arithmetic overflow so a caller can
+/// fail closed on an accounting fault rather than busy-loop retrying.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CapacityError {
+    /// The requested bytes would exceed the remaining pool capacity.
+    WouldExceedPool { need: u64, available: u64 },
+    /// Checked arithmetic overflowed during accounting.
+    ArithmeticOverflow,
+}
+
+impl std::fmt::Display for CapacityError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::WouldExceedPool { need, available } => write!(
+                f,
+                "capacity exceeded: needs {need} bytes but {available} remain"
+            ),
+            Self::ArithmeticOverflow => write!(f, "capacity accounting overflow"),
+        }
+    }
+}
+
+impl std::error::Error for CapacityError {}
+
+/// Physical capacity accounting for the serving cache/scheduler (spec §5.1/S1).
+///
+/// Tracks four separate quantities that must not be conflated:
+/// - **allocated pool capacity** — total bytes the page pool can hold
+/// - **uniquely resident page bytes** — shared pages counted once, not per ref
+/// - **unmaterialized growth/COW credits** — reserved for future private suffix
+///   and copy-on-write tail, not yet allocated as physical pages
+/// - **logical context limits** — per-request max token grants (not physical
+///   bytes; `max_seq` is not proof of physical allocation)
+///
+/// Invariant (spec §5.1): `resident_page_bytes + growth_credits_bytes ≤
+/// pool_capacity_bytes`. All arithmetic is checked; overflow is a
+/// [`CapacityError::ArithmeticOverflow`], not silent wraparound.
+#[derive(Debug, Clone)]
+pub struct ServeCapacityAccount {
+    pool_capacity_bytes: u64,
+    resident_page_bytes: u64,
+    growth_credits_bytes: u64,
+    logical_ctx_limit_tokens: usize,
+}
+
+impl ServeCapacityAccount {
+    pub fn new(pool_capacity_bytes: u64, logical_ctx_limit_tokens: usize) -> Self {
+        Self {
+            pool_capacity_bytes,
+            resident_page_bytes: 0,
+            growth_credits_bytes: 0,
+            logical_ctx_limit_tokens,
+        }
+    }
+
+    /// Bytes remaining under the pool capacity invariant.
+    pub fn available_bytes(&self) -> u64 {
+        self.pool_capacity_bytes
+            .saturating_sub(self.resident_page_bytes)
+            .saturating_sub(self.growth_credits_bytes)
+    }
+
+    pub fn pool_capacity_bytes(&self) -> u64 {
+        self.pool_capacity_bytes
+    }
+
+    pub fn resident_page_bytes(&self) -> u64 {
+        self.resident_page_bytes
+    }
+
+    pub fn growth_credits_bytes(&self) -> u64 {
+        self.growth_credits_bytes
+    }
+
+    pub fn logical_ctx_limit_tokens(&self) -> usize {
+        self.logical_ctx_limit_tokens
+    }
+
+    /// Charge `bytes` of uniquely resident page bytes (spec §5.1).
+///
+/// Shared physical prefix pages count once; the request's future private
+/// suffix and recurrent state count separately via [`Self::reserve_growth`].
+    pub fn charge_resident(&mut self, bytes: u64) -> Result<(), CapacityError> {
+        let new_resident = self
+            .resident_page_bytes
+            .checked_add(bytes)
+            .ok_or(CapacityError::ArithmeticOverflow)?;
+        let committed = new_resident
+            .checked_add(self.growth_credits_bytes)
+            .ok_or(CapacityError::ArithmeticOverflow)?;
+        if committed > self.pool_capacity_bytes {
+            return Err(CapacityError::WouldExceedPool {
+                need: bytes,
+                available: self.available_bytes(),
+            });
+        }
+        self.resident_page_bytes = new_resident;
+        Ok(())
+    }
+
+    /// Release `bytes` of resident page bytes back to the pool.
+    pub fn release_resident(&mut self, bytes: u64) {
+        self.resident_page_bytes = self.resident_page_bytes.saturating_sub(bytes);
+    }
+
+    /// Reserve `bytes` of unmaterialized growth/COW credits (spec §5.1).
+///
+/// Credits turn into allocated private pages as work advances. Allocation
+/// must not exceed the already granted credits.
+    pub fn reserve_growth(&mut self, bytes: u64) -> Result<(), CapacityError> {
+        let new_credits = self
+            .growth_credits_bytes
+            .checked_add(bytes)
+            .ok_or(CapacityError::ArithmeticOverflow)?;
+        let committed = self
+            .resident_page_bytes
+            .checked_add(new_credits)
+            .ok_or(CapacityError::ArithmeticOverflow)?;
+        if committed > self.pool_capacity_bytes {
+            return Err(CapacityError::WouldExceedPool {
+                need: bytes,
+                available: self.available_bytes(),
+            });
+        }
+        self.growth_credits_bytes = new_credits;
+        Ok(())
+    }
+
+    /// Release `bytes` of growth credits (e.g. request cancelled before
+    /// materializing its growth).
+    pub fn release_growth(&mut self, bytes: u64) {
+        self.growth_credits_bytes = self.growth_credits_bytes.saturating_sub(bytes);
+    }
+
+    /// Materialize `bytes` of growth credits into resident page bytes
+/// (spec §5.1: "Credits turn into allocated private pages as work
+/// advances"). The credits are released and the bytes are charged as
+/// resident in one checked operation.
+    pub fn materialize_growth(&mut self, bytes: u64) -> Result<(), CapacityError> {
+        self.release_growth(bytes);
+        self.charge_resident(bytes)
+    }
+
+    /// Check whether `bytes` would fit under the pool capacity invariant
+/// without mutating state.
+    pub fn fits(&self, bytes: u64) -> bool {
+        self.available_bytes().checked_sub(bytes).is_some()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -273,5 +451,106 @@ mod tests {
         a.release_host(600);
         assert_eq!(a.host_used_bytes(), 0);
         assert!(a.admit_host(600), "released budget must be reusable");
+    }
+
+    // ---- page_bytes helper (spec §5.1) ----
+
+    #[test]
+    fn page_bytes_computes_sum_over_layers() {
+        // 2 layers, k_stride=128, v_stride=64 → per layer: 128*(128+64) = 24576
+        // total: 2 * 24576 = 49152
+        let k = [128u64, 128];
+        let v = [64u64, 64];
+        assert_eq!(page_bytes(&k, &v), Some(49152));
+    }
+
+    #[test]
+    fn page_bytes_single_layer() {
+        // 1 layer, k=256, v=128 → 128*(256+128) = 49152
+        assert_eq!(page_bytes(&[256], &[128]), Some(49152));
+    }
+
+    #[test]
+    fn page_bytes_mismatched_strides_returns_none() {
+        assert_eq!(page_bytes(&[128, 128], &[64]), None);
+        assert_eq!(page_bytes(&[128], &[64, 64]), None);
+    }
+
+    #[test]
+    fn page_bytes_overflow_returns_none() {
+        // u64::MAX stride would overflow when multiplied by PAGE_TOKENS.
+        assert_eq!(page_bytes(&[u64::MAX], &[1]), None);
+    }
+
+    #[test]
+    fn page_bytes_empty_layers_is_zero() {
+        assert_eq!(page_bytes(&[], &[]), Some(0));
+    }
+
+    // ---- ServeCapacityAccount (spec §5.1/S1) ----
+
+    #[test]
+    fn capacity_account_charges_and_releases_resident() {
+        let mut acct = ServeCapacityAccount::new(1024, 8192);
+        assert_eq!(acct.available_bytes(), 1024);
+        assert!(acct.charge_resident(400).is_ok());
+        assert_eq!(acct.resident_page_bytes(), 400);
+        assert_eq!(acct.available_bytes(), 624);
+        acct.release_resident(200);
+        assert_eq!(acct.resident_page_bytes(), 200);
+        assert_eq!(acct.available_bytes(), 824);
+    }
+
+    #[test]
+    fn capacity_account_rejects_resident_over_pool() {
+        let mut acct = ServeCapacityAccount::new(1000, 8192);
+        assert!(acct.charge_resident(600).is_ok());
+        let err = acct.charge_resident(500).unwrap_err();
+        assert_eq!(err, CapacityError::WouldExceedPool { need: 500, available: 400 });
+    }
+
+    #[test]
+    fn capacity_account_reserves_and_releases_growth_credits() {
+        let mut acct = ServeCapacityAccount::new(1000, 8192);
+        assert!(acct.reserve_growth(300).is_ok());
+        assert_eq!(acct.growth_credits_bytes(), 300);
+        assert_eq!(acct.available_bytes(), 700);
+        // Resident + growth must not exceed pool.
+        assert!(acct.charge_resident(800).is_err());
+        assert!(acct.charge_resident(600).is_ok());
+        acct.release_growth(200);
+        assert_eq!(acct.growth_credits_bytes(), 100);
+    }
+
+    #[test]
+    fn capacity_account_materialize_growth_converts_credit_to_resident() {
+        let mut acct = ServeCapacityAccount::new(1000, 8192);
+        assert!(acct.reserve_growth(500).is_ok());
+        assert_eq!(acct.growth_credits_bytes(), 500);
+        assert_eq!(acct.resident_page_bytes(), 0);
+        assert!(acct.materialize_growth(300).is_ok());
+        assert_eq!(acct.growth_credits_bytes(), 200);
+        assert_eq!(acct.resident_page_bytes(), 300);
+    }
+
+    #[test]
+    fn capacity_account_overflow_is_typed_error() {
+        let mut acct = ServeCapacityAccount::new(u64::MAX, 8192);
+        // Charge near-max to set up overflow on the next add.
+        acct.charge_resident(u64::MAX - 10).ok();
+        let err = acct.charge_resident(20).unwrap_err();
+        assert_eq!(err, CapacityError::ArithmeticOverflow);
+    }
+
+    #[test]
+    fn capacity_account_fits_is_non_mutating() {
+        let mut acct = ServeCapacityAccount::new(1000, 8192);
+        assert!(acct.fits(500));
+        assert!(!acct.fits(1500));
+        // fits must not mutate state.
+        assert_eq!(acct.available_bytes(), 1000);
+        acct.charge_resident(500).ok();
+        assert!(acct.fits(500));
+        assert!(!acct.fits(501));
     }
 }

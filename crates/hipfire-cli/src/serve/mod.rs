@@ -113,6 +113,14 @@ pub(crate) struct ServeShared {
     /// Prometheus counters and histograms for `/metrics`. Lock-free, so a
     /// scrape never contends with a request.
     pub(crate) metrics: metrics::Metrics,
+    /// Per-request bounded pending-event budget (spec §5.4
+    /// `serve.stream_buffer_bytes`). A stalled consumer is stopped before
+    /// its event buffer fills past this bound.
+    pub(crate) stream_buffer_bytes: u64,
+    /// Maximum stalled-consumer interval (spec §5.4
+    /// `serve.stream_stall_timeout_ms`). The request is aborted after this
+    /// deadline on the multi-slot route.
+    pub(crate) stream_stall_timeout: Duration,
 }
 
 #[derive(Debug, Default)]
@@ -123,7 +131,28 @@ pub(crate) struct AdmissionState {
     /// A batch-ineligible request holds the backend exclusively.
     ineligible_busy: bool,
     queued: usize,
+    /// Total canonical pending-input bytes held by queued requests (spec §5.3).
+    /// A queue count alone is insufficient; this bounds total bytes so a few
+    /// large prompts cannot exhaust memory while staying under `max_queue`.
+    queued_bytes: u64,
     batch_model: Option<String>,
+}
+
+/// Typed overload classification for admission rejection (spec §5.3/S3).
+///
+/// HTTP 429 = bounded-queue rejection (queue full or byte budget exceeded);
+/// HTTP 503 = unavailable/poisoned backend or cancellation. The HTTP layer
+/// maps this to the correct status code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdmissionErrorKind {
+    /// Queue depth or byte budget exceeded → HTTP 429.
+    QueueFull,
+    /// Queue wait timed out → HTTP 429.
+    QueueTimeout,
+    /// Request cancelled before admission → HTTP 503.
+    Cancelled,
+    /// Backend unavailable or poisoned → HTTP 503.
+    Unavailable,
 }
 
 pub(crate) struct Admission {
@@ -132,6 +161,11 @@ pub(crate) struct Admission {
     notify: Notify,
     max_queue: usize,
     timeout: Duration,
+    /// Aggregate canonical pending-input byte budget (spec §5.3
+    /// `serve.max_queue_bytes`). Zero disables the byte cap (only valid when
+    /// multi-slot is off; the startup guard rejects `max_queue==0` for
+    /// multi-slot, and this field is positive from config validation).
+    max_queue_bytes: u64,
     /// How many batch-eligible requests may be in flight at once. One for the
     /// single-daemon backend -- this gate is what protects it -- and the slot
     /// count when the multi-slot engine is active, which has its own admission
@@ -145,6 +179,7 @@ impl std::fmt::Debug for Admission {
         f.debug_struct("Admission")
             .field("state", &*state)
             .field("max_queue", &self.max_queue)
+            .field("max_queue_bytes", &self.max_queue_bytes)
             .field("timeout", &self.timeout)
             .field("capacity", &self.capacity)
             .finish()
@@ -155,6 +190,18 @@ impl std::fmt::Debug for Admission {
 pub(crate) struct AdmissionError {
     message: String,
     retry_after_seconds: u64,
+    kind: AdmissionErrorKind,
+}
+
+impl AdmissionError {
+    pub(crate) fn kind(&self) -> AdmissionErrorKind {
+        self.kind
+    }
+
+    /// True when the error is a client-side cancellation (spec §5.3).
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.kind == AdmissionErrorKind::Cancelled
+    }
 }
 
 impl std::fmt::Display for AdmissionError {
@@ -170,11 +217,30 @@ pub(crate) struct AdmissionGuard {
     admission: Arc<Admission>,
     is_eligible: bool,
     model: Option<String>,
+    /// Canonical pending-input bytes this request charged to the queue
+    /// (spec §5.3). Released exactly once on Drop so a queued request's
+    /// bytes are charged once and released once across cancel/timeout/normal
+    /// paths. Zero when the request was admitted immediately (never queued).
+    queue_bytes: u64,
+}
+
+impl AdmissionGuard {
+    /// Canonical pending-input bytes carried by this permit (spec §5.3).
+    /// The daemon submit path reads this to propagate the unified permit.
+    pub(crate) fn queue_bytes(&self) -> u64 {
+        self.queue_bytes
+    }
+
+    pub(crate) fn is_eligible(&self) -> bool {
+        self.is_eligible
+    }
 }
 
 struct AdmissionWaiter {
     admission: Arc<Admission>,
     active: bool,
+    /// Bytes this waiter charged to `queued_bytes`; released on drop if active.
+    bytes: u64,
 }
 
 impl AdmissionWaiter {
@@ -194,6 +260,7 @@ impl Drop for AdmissionWaiter {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         state.queued = state.queued.saturating_sub(1);
+        state.queued_bytes = state.queued_bytes.saturating_sub(self.bytes);
         drop(state);
         self.admission.available.notify_all();
         self.admission.notify.notify_waiters();
@@ -202,15 +269,32 @@ impl Drop for AdmissionWaiter {
 
 impl Admission {
     pub(crate) fn new(max_queue: usize, timeout: Duration) -> Self {
-        Self::new_with_capacity(max_queue, timeout, 1)
+        Self::new_with_capacity_and_bytes(max_queue, timeout, 1, 0)
     }
-    pub(crate) fn new_with_capacity(max_queue: usize, timeout: Duration, capacity: usize) -> Self {
+    pub(crate) fn new_with_capacity(
+        max_queue: usize,
+        timeout: Duration,
+        capacity: usize,
+    ) -> Self {
+        Self::new_with_capacity_and_bytes(max_queue, timeout, capacity, 0)
+    }
+
+    /// Construct with an aggregate queue byte budget (spec §5.3
+    /// `serve.max_queue_bytes`). `max_queue_bytes == 0` disables the byte
+    /// cap (only valid when multi-slot is off).
+    pub(crate) fn new_with_capacity_and_bytes(
+        max_queue: usize,
+        timeout: Duration,
+        capacity: usize,
+        max_queue_bytes: u64,
+    ) -> Self {
         Self {
             state: Mutex::new(AdmissionState::default()),
             available: Condvar::new(),
             notify: Notify::new(),
             max_queue,
             timeout,
+            max_queue_bytes,
             capacity: capacity.max(1),
         }
     }
@@ -227,6 +311,39 @@ impl Admission {
         self.capacity
     }
 
+    /// Total canonical pending-input bytes currently held by queued
+    /// requests (spec §5.3).
+    pub(crate) fn queued_bytes(&self) -> u64 {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .queued_bytes
+    }
+
+    pub(crate) fn max_queue_bytes(&self) -> u64 {
+        self.max_queue_bytes
+    }
+
+    /// Check the aggregate byte budget before queuing (spec §5.3).
+    /// Returns `Ok(())` if the bytes fit, or a typed `QueueFull` error.
+    fn check_byte_budget(&self, state: &AdmissionState, bytes: u64) -> Result<(), AdmissionError> {
+        if self.max_queue_bytes == 0 {
+            return Ok(());
+        }
+        let new_total = state.queued_bytes.saturating_add(bytes);
+        if new_total > self.max_queue_bytes {
+            return Err(AdmissionError {
+                message: format!(
+                    "serve queue byte budget exceeded ({}+{} > {})",
+                    state.queued_bytes, bytes, self.max_queue_bytes
+                ),
+                retry_after_seconds: self.retry_after_seconds(),
+                kind: AdmissionErrorKind::QueueFull,
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) fn acquire(self: &Arc<Self>) -> std::result::Result<AdmissionGuard, AdmissionError> {
         self.acquire_for(false, None)
     }
@@ -235,6 +352,18 @@ impl Admission {
         self: &Arc<Self>,
         is_eligible: bool,
         model: Option<&str>,
+    ) -> std::result::Result<AdmissionGuard, AdmissionError> {
+        self.acquire_for_with_bytes(is_eligible, model, 0)
+    }
+
+    /// Synchronous acquire with a canonical pending-input byte charge
+    /// (spec §5.3). `request_bytes` is charged to the aggregate queue byte
+    /// budget while waiting and released on the guard's Drop.
+    pub(crate) fn acquire_for_with_bytes(
+        self: &Arc<Self>,
+        is_eligible: bool,
+        model: Option<&str>,
+        request_bytes: u64,
     ) -> std::result::Result<AdmissionGuard, AdmissionError> {
         let model_owned = model.map(|s| s.to_owned());
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
@@ -253,6 +382,7 @@ impl Admission {
                     admission: Arc::clone(self),
                     is_eligible: true,
                     model: model_owned,
+                    queue_bytes: 0,
                 });
             }
         } else if state.eligible == 0 && !state.ineligible_busy && state.queued == 0 {
@@ -261,6 +391,7 @@ impl Admission {
                 admission: Arc::clone(self),
                 is_eligible: false,
                 model: None,
+                queue_bytes: 0,
             });
         }
         if self.max_queue != 0 && state.queued >= self.max_queue {
@@ -270,9 +401,12 @@ impl Admission {
                     state.queued, self.max_queue
                 ),
                 retry_after_seconds: self.retry_after_seconds(),
+                kind: AdmissionErrorKind::QueueFull,
             });
         }
+        self.check_byte_budget(&state, request_bytes)?;
         state.queued = state.queued.saturating_add(1);
+        state.queued_bytes = state.queued_bytes.saturating_add(request_bytes);
         let started = Instant::now();
         loop {
             if self.timeout.is_zero() {
@@ -284,12 +418,14 @@ impl Admission {
                 let remaining = self.timeout.saturating_sub(started.elapsed());
                 if remaining.is_zero() {
                     state.queued = state.queued.saturating_sub(1);
+                    state.queued_bytes = state.queued_bytes.saturating_sub(request_bytes);
                     return Err(AdmissionError {
                         message: format!(
                             "serve queue wait exceeded {}ms",
                             self.timeout.as_millis()
                         ),
                         retry_after_seconds: self.retry_after_seconds(),
+                        kind: AdmissionErrorKind::QueueTimeout,
                     });
                 }
                 let (next, wait) = self
@@ -307,12 +443,15 @@ impl Admission {
                     };
                     if !can_acquire {
                         state.queued = state.queued.saturating_sub(1);
+                        state.queued_bytes =
+                            state.queued_bytes.saturating_sub(request_bytes);
                         return Err(AdmissionError {
                             message: format!(
                                 "serve queue wait exceeded {}ms",
                                 self.timeout.as_millis()
                             ),
                             retry_after_seconds: self.retry_after_seconds(),
+                            kind: AdmissionErrorKind::QueueTimeout,
                         });
                     }
                 }
@@ -326,6 +465,7 @@ impl Admission {
             };
             if can_acquire {
                 state.queued = state.queued.saturating_sub(1);
+                state.queued_bytes = state.queued_bytes.saturating_sub(request_bytes);
                 if is_eligible {
                     state.eligible += 1;
                     if state.batch_model.is_none() {
@@ -335,6 +475,7 @@ impl Admission {
                         admission: Arc::clone(self),
                         is_eligible: true,
                         model: model_owned.clone(),
+                        queue_bytes: request_bytes,
                     });
                 } else {
                     state.ineligible_busy = true;
@@ -342,6 +483,7 @@ impl Admission {
                         admission: Arc::clone(self),
                         is_eligible: false,
                         model: None,
+                        queue_bytes: request_bytes,
                     });
                 }
             }
@@ -373,11 +515,28 @@ impl Admission {
         model: Option<&str>,
         cancel: CancellationToken,
     ) -> std::result::Result<AdmissionGuard, AdmissionError> {
+        self.acquire_for_async_with_bytes(is_eligible, model, 0, cancel)
+            .await
+    }
+
+    /// Async acquire with a canonical pending-input byte charge (spec §5.3).
+    /// `request_bytes` is charged to the aggregate queue byte budget while
+    /// waiting and released exactly once — on `AdmissionWaiter::drop` if the
+    /// wait is cancelled/timed-out, or on `AdmissionGuard::drop` after
+    /// successful admission.
+    pub(crate) async fn acquire_for_async_with_bytes(
+        self: &Arc<Self>,
+        is_eligible: bool,
+        model: Option<&str>,
+        request_bytes: u64,
+        cancel: CancellationToken,
+    ) -> std::result::Result<AdmissionGuard, AdmissionError> {
         let model_owned = model.map(str::to_owned);
         if cancel.is_cancelled() {
             return Err(AdmissionError {
                 message: "cancelled".to_string(),
                 retry_after_seconds: self.retry_after_seconds(),
+                kind: AdmissionErrorKind::Cancelled,
             });
         }
         {
@@ -400,6 +559,7 @@ impl Admission {
                         admission: Arc::clone(self),
                         is_eligible: true,
                         model: model_owned,
+                        queue_bytes: 0,
                     });
                 }
                 state.ineligible_busy = true;
@@ -407,6 +567,7 @@ impl Admission {
                     admission: Arc::clone(self),
                     is_eligible: false,
                     model: None,
+                    queue_bytes: 0,
                 });
             }
             if self.max_queue != 0 && state.queued >= self.max_queue {
@@ -416,13 +577,17 @@ impl Admission {
                         state.queued, self.max_queue
                     ),
                     retry_after_seconds: self.retry_after_seconds(),
+                    kind: AdmissionErrorKind::QueueFull,
                 });
             }
+            self.check_byte_budget(&state, request_bytes)?;
             state.queued = state.queued.saturating_add(1);
+            state.queued_bytes = state.queued_bytes.saturating_add(request_bytes);
         }
         let mut queued = AdmissionWaiter {
             admission: Arc::clone(self),
             active: true,
+            bytes: request_bytes,
         };
 
         let started = Instant::now();
@@ -434,6 +599,7 @@ impl Admission {
                 return Err(AdmissionError {
                     message: "cancelled".to_string(),
                     retry_after_seconds: self.retry_after_seconds(),
+                    kind: AdmissionErrorKind::Cancelled,
                 });
             }
             {
@@ -447,6 +613,8 @@ impl Admission {
                 };
                 if can_acquire {
                     state.queued = state.queued.saturating_sub(1);
+                    state.queued_bytes =
+                        state.queued_bytes.saturating_sub(request_bytes);
                     queued.disarm();
                     if is_eligible {
                         state.eligible += 1;
@@ -457,6 +625,7 @@ impl Admission {
                             admission: Arc::clone(self),
                             is_eligible: true,
                             model: model_owned.clone(),
+                            queue_bytes: request_bytes,
                         });
                     }
                     state.ineligible_busy = true;
@@ -464,6 +633,7 @@ impl Admission {
                         admission: Arc::clone(self),
                         is_eligible: false,
                         model: None,
+                        queue_bytes: request_bytes,
                     });
                 }
             }
@@ -473,6 +643,7 @@ impl Admission {
                 return Err(AdmissionError {
                     message: format!("serve queue wait exceeded {}ms", self.timeout.as_millis()),
                     retry_after_seconds: self.retry_after_seconds(),
+                    kind: AdmissionErrorKind::QueueTimeout,
                 });
             }
             if self.timeout.is_zero() {
@@ -859,9 +1030,29 @@ pub(crate) fn serve_foreground(
     let multi_slot_ctx = config_u64(&global, "serve.multi_slot_ctx").unwrap_or(8192);
     let multi_slot_prefill_chunk =
         config_u64(&global, "serve.multi_slot_prefill_chunk").unwrap_or(1024);
+    // Serving cache/scheduler contract keys (spec §9.1). Read here for
+    // startup validation only; the runtime does not yet consume them.
+    let max_batch_tokens = config_u64(&global, "serve.max_batch_tokens")?;
+    let prefill_min_tokens = config_u64(&global, "serve.prefill_min_tokens")?;
+    // Aggregate queue byte budget and stream backpressure bounds (spec §5.3,
+    // §5.4). Read here and threaded into ServeShared/Admission so the HTTP
+    // layer enforces them; the runtime does not yet consume them directly.
+    let max_queue_bytes = config_u64(&global, "serve.max_queue_bytes")?;
+    let stream_buffer_bytes = config_u64(&global, "serve.stream_buffer_bytes")?;
+    let stream_stall_timeout =
+        Duration::from_millis(config_u64(&global, "serve.stream_stall_timeout_ms")?);
     // Multi-slot is an alternate daemon-owned Qwen35 mode, not continuous batching.
-    // Combining them is rejected until a future integration lands.
-    if let Err(message) = validate_multi_slot_startup(multi_slot_enabled, continuous_batch_size) {
+    // Combining them is rejected until a future integration lands. The robust
+    // multi-slot mode also rejects an uncapped queue (serve.max_queue=0) rather
+    // than reinterpreting zero (spec §5.3), and the global trunk-row budget must
+    // be at least the minimum prefill quantum (spec §5.2, §5.3).
+    if let Err(message) = validate_multi_slot_startup(
+        multi_slot_enabled,
+        continuous_batch_size,
+        max_queue as u64,
+        max_batch_tokens,
+        prefill_min_tokens,
+    ) {
         bail!("{message}");
     }
     let retry_enabled = config_bool(&global, "serve.retry_enabled")?;
@@ -924,15 +1115,18 @@ pub(crate) fn serve_foreground(
             last_activity: Instant::now(),
         }),
         max_request_bytes,
-        admission: Arc::new(Admission::new_with_capacity(
+        admission: Arc::new(Admission::new_with_capacity_and_bytes(
             max_queue,
             queue_timeout,
             slot_concurrency.max(continuous_batch_size as usize),
+            max_queue_bytes,
         )),
         idle_timeout,
         retry_enabled,
         retry_backoff,
         backoff_hook: Mutex::new(None),
+        stream_buffer_bytes,
+        stream_stall_timeout,
     });
     let bind = format_bind(host, port);
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1215,21 +1409,50 @@ impl ServeRuntime {
     }
 }
 
-/// Reject experimental multi-slot combined with continuous batching.
+/// Startup validation for the serving admission path (spec §5.2, §5.3, §9.1).
 ///
-/// Multi-slot is an alternate daemon-owned Qwen35 mode with one weight copy.
-/// Continuous batch integration is deferred; enabling both would imply a
-/// capability the daemon does not implement yet.
+/// Rejects: (1) `serve.max_batch_tokens < serve.prefill_min_tokens` so a
+/// nonzero prefill quantum always fits the global trunk-row budget; (2)
+/// experimental multi-slot combined with `continuous_batch_size > 1`; (3)
+/// `serve.max_queue == 0` when multi-slot is enabled — an uncapped queue is
+/// rejected rather than reinterpreted in robust multi-slot mode.
 pub(crate) fn validate_multi_slot_startup(
     multi_slot_enabled: bool,
     continuous_batch_size: u64,
+    max_queue: u64,
+    max_batch_tokens: u64,
+    prefill_min_tokens: u64,
 ) -> Result<(), String> {
-    if multi_slot_enabled && continuous_batch_size > 1 {
-        return Err(
-            "serve.multi_slot cannot be combined with continuous_batch_size > 1; \
-             continuous batching integration is deferred"
-                .to_owned(),
-        );
+    // The global trunk-row budget must be at least the minimum prefill quantum
+    // so a nonzero prefill service quantum can always be allocated (spec §5.2,
+    // §5.3). This holds regardless of multi-slot mode.
+    if max_batch_tokens < prefill_min_tokens {
+        return Err(format!(
+            "serve.max_batch_tokens ({max_batch_tokens}) must be >= \
+             serve.prefill_min_tokens ({prefill_min_tokens}); the global trunk-row \
+             budget cannot be smaller than the minimum prefill quantum"
+        ));
+    }
+    if multi_slot_enabled {
+        if continuous_batch_size > 1 {
+            return Err(
+                "serve.multi_slot cannot be combined with continuous_batch_size > 1; \
+                 continuous batching integration is deferred"
+                    .to_owned(),
+            );
+        }
+        // The robust multi-slot mode rejects an uncapped queue rather than
+        // reinterpreting zero or silently inheriting an unbounded queue (spec
+        // §5.3). serve.max_queue=0 historically means uncapped; that is no
+        // longer acceptable when multi-slot admission can overlap work.
+        if max_queue == 0 {
+            return Err(
+                "serve.max_queue must be non-zero when serve.multi_slot is enabled; \
+                 an uncapped queue is rejected rather than reinterpreted in robust \
+                 multi-slot mode (spec §5.3)"
+                    .to_owned(),
+            );
+        }
     }
     Ok(())
 }
@@ -2104,13 +2327,260 @@ mod tests {
 
     #[test]
     fn multi_slot_startup_rejects_continuous_batch_gt_one() {
-        assert!(validate_multi_slot_startup(false, 1).is_ok());
-        assert!(validate_multi_slot_startup(false, 8).is_ok());
-        assert!(validate_multi_slot_startup(true, 1).is_ok());
-        let err = validate_multi_slot_startup(true, 2).unwrap_err();
+        // Args: (multi_slot, continuous_batch_size, max_queue, max_batch_tokens, prefill_min_tokens)
+        assert!(validate_multi_slot_startup(false, 1, 64, 4096, 1).is_ok());
+        assert!(validate_multi_slot_startup(false, 8, 64, 4096, 1).is_ok());
+        assert!(validate_multi_slot_startup(true, 1, 64, 4096, 1).is_ok());
+        let err = validate_multi_slot_startup(true, 2, 64, 4096, 1).unwrap_err();
         assert!(err.contains("continuous_batch_size > 1"), "{err}");
         assert!(err.contains("deferred"), "{err}");
-        let err = validate_multi_slot_startup(true, 16).unwrap_err();
+        let err = validate_multi_slot_startup(true, 16, 64, 4096, 1).unwrap_err();
         assert!(err.contains("serve.multi_slot"), "{err}");
+    }
+
+    #[test]
+    fn multi_slot_startup_rejects_uncapped_queue() {
+        // serve.max_queue=0 is uncapped historically; robust multi-slot rejects it.
+        let err = validate_multi_slot_startup(true, 1, 0, 4096, 1).unwrap_err();
+        assert!(err.contains("serve.max_queue"), "{err}");
+        assert!(err.contains("non-zero"), "{err}");
+        // Off multi-slot, an uncapped queue is still accepted (old behavior preserved).
+        assert!(validate_multi_slot_startup(false, 1, 0, 4096, 1).is_ok());
+    }
+
+    #[test]
+    fn multi_slot_startup_rejects_budget_below_prefill_min() {
+        // max_batch_tokens < prefill_min_tokens is rejected regardless of multi-slot.
+        let err = validate_multi_slot_startup(false, 1, 64, 0, 1).unwrap_err();
+        assert!(err.contains("serve.max_batch_tokens"), "{err}");
+        assert!(err.contains("serve.prefill_min_tokens"), "{err}");
+        let err = validate_multi_slot_startup(true, 1, 64, 1, 2).unwrap_err();
+        assert!(err.contains("serve.max_batch_tokens"), "{err}");
+        // Equal values are accepted.
+        assert!(validate_multi_slot_startup(true, 1, 64, 4, 4).is_ok());
+    }
+
+    // ---- Queue byte budget (spec §5.3) ----
+
+    #[test]
+    fn queue_byte_budget_rejects_with_typed_429_error() {
+        // max_queue_bytes = 100; a request with 60 bytes fits, but two don't.
+        let admission = Arc::new(Admission::new_with_capacity_and_bytes(
+            10,
+            Duration::from_secs(5),
+            1,
+            100,
+        ));
+        let _holder = admission.acquire().unwrap();
+        // Second request with 60 bytes queues (0 + 60 ≤ 100).
+        let adm2 = Arc::clone(&admission);
+        let handle = thread::spawn(move || {
+            adm2.acquire_for_with_bytes(true, Some("m"), 60).unwrap()
+        });
+        // Wait for it to queue.
+        for _ in 0..100 {
+            if admission.queued_bytes() > 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(admission.queued_bytes(), 60);
+        // Now a third request with 60 bytes: 60 + 60 = 120 > 100 → reject.
+        let err = admission
+            .acquire_for_with_bytes(true, Some("m"), 60)
+            .unwrap_err();
+        assert_eq!(err.kind(), AdmissionErrorKind::QueueFull);
+        assert!(err.message.contains("byte budget"));
+        drop(_holder);
+        drop(handle.join().unwrap());
+    }
+
+    #[test]
+    fn queue_byte_budget_zero_disables_byte_cap() {
+        // max_queue_bytes = 0 means no byte cap (old behavior preserved
+        // when multi-slot is off).
+        let admission = Arc::new(Admission::new_with_capacity_and_bytes(
+            2,
+            Duration::from_millis(10),
+            1,
+            0,
+        ));
+        let _holder = admission.acquire().unwrap();
+        // Large bytes should not be rejected by the byte budget.
+        let err = admission.acquire_for_with_bytes(true, Some("m"), 999_999_999).unwrap_err();
+        // Should be a timeout (queue wait), not a QueueFull byte error.
+        assert_eq!(err.kind(), AdmissionErrorKind::QueueTimeout);
+    }
+
+    // ---- Permit released exactly once (spec §5.3) ----
+
+    #[test]
+    fn permit_released_exactly_once_on_normal_path() {
+        let admission = Arc::new(Admission::new_with_capacity_and_bytes(
+            4,
+            Duration::from_secs(5),
+            2,
+            1024,
+        ));
+        let guard = admission.acquire_for_with_bytes(true, Some("m"), 100).unwrap();
+        assert_eq!(admission.inflight(), 1);
+        assert_eq!(admission.queued_bytes(), 0); // bytes released from queue on admit
+        drop(guard);
+        assert_eq!(admission.inflight(), 0);
+    }
+
+    #[test]
+    fn permit_released_exactly_once_on_cancel_path() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let admission = Arc::new(Admission::new_with_capacity_and_bytes(
+                4,
+                Duration::from_secs(5),
+                1,
+                1024,
+            ));
+            let _holder = admission.acquire().unwrap();
+            let cancel = CancellationToken::new();
+            let adm = Arc::clone(&admission);
+            let waiter_cancel = cancel.clone();
+            let waiter = tokio::spawn(async move {
+                adm.acquire_for_async_with_bytes(true, Some("m"), 200, waiter_cancel)
+                    .await
+            });
+            // Wait for the waiter to queue.
+            for _ in 0..100 {
+                if admission.queued_bytes() == 200 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(admission.queued_bytes(), 200);
+            cancel.cancel();
+            let err = tokio::time::timeout(Duration::from_millis(500), waiter)
+                .await
+                .expect("cancelled waiter completes")
+                .expect("waiter task")
+                .expect_err("cancelled admission fails");
+            assert!(err.is_cancelled());
+            // Queued bytes must be released by AdmissionWaiter::drop.
+            assert_eq!(admission.queued_bytes(), 0);
+            assert_eq!(admission.inflight(), 1); // only the holder
+        });
+    }
+
+    #[test]
+    fn permit_released_exactly_once_on_timeout_path() {
+        let admission = Arc::new(Admission::new_with_capacity_and_bytes(
+            4,
+            Duration::from_millis(10),
+            1,
+            1024,
+        ));
+        let _holder = admission.acquire().unwrap();
+        let err = admission
+            .acquire_for_with_bytes(true, Some("m"), 300)
+            .unwrap_err();
+        assert_eq!(err.kind(), AdmissionErrorKind::QueueTimeout);
+        // Queued bytes must be released on timeout.
+        assert_eq!(admission.queued_bytes(), 0);
+        assert_eq!(admission.inflight(), 1);
+    }
+
+    #[test]
+    fn admission_guard_carries_queue_bytes() {
+        let admission = Arc::new(Admission::new_with_capacity_and_bytes(
+            4,
+            Duration::from_secs(5),
+            1,
+            1024,
+        ));
+        // Fast path: no queueing, queue_bytes = 0.
+        let guard = admission.acquire_for_with_bytes(true, Some("m"), 500).unwrap();
+        assert_eq!(guard.queue_bytes(), 0);
+        assert!(guard.is_eligible());
+        drop(guard);
+
+        // Queued path: queue_bytes = charged bytes.
+        let holder = admission.acquire_for_with_bytes(true, Some("m"), 0).unwrap();
+        let adm2 = Arc::clone(&admission);
+        let handle = thread::spawn(move || {
+            adm2.acquire_for_with_bytes(true, Some("m"), 400).unwrap()
+        });
+        // Wait for queue, then release holder so the waiter acquires.
+        for _ in 0..100 {
+            if admission.queued_bytes() == 400 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        drop(holder);
+        let guard2 = handle.join().unwrap();
+        assert_eq!(guard2.queue_bytes(), 400);
+        drop(guard2);
+        assert_eq!(admission.queued_bytes(), 0);
+    }
+
+    // ---- Typed error taxonomy (spec §5.3: 429 vs 503) ----
+
+    #[test]
+    fn queue_full_error_is_typed_429() {
+        // max_queue=1: one holder + one queued = full. Third gets QueueFull.
+        let admission = Arc::new(Admission::new_with_capacity_and_bytes(
+            1,
+            Duration::from_secs(5),
+            1,
+            0,
+        ));
+        let _holder = admission.acquire().unwrap();
+        // Spawn a waiter that fills the queue slot.
+        let adm2 = Arc::clone(&admission);
+        let handle = thread::spawn(move || {
+            let _g = adm2.acquire().unwrap();
+        });
+        // Wait for the waiter to queue.
+        for _ in 0..100 {
+            if admission.inflight() == 2 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        // Now the queue is full (1 holder + 1 queued). Third gets QueueFull.
+        let err = admission.acquire().unwrap_err();
+        assert_eq!(err.kind(), AdmissionErrorKind::QueueFull);
+        drop(_holder);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn queue_timeout_error_is_typed_429() {
+        let admission = Arc::new(Admission::new_with_capacity_and_bytes(
+            1,
+            Duration::from_millis(5),
+            1,
+            0,
+        ));
+        let _holder = admission.acquire().unwrap();
+        let err = admission.acquire().unwrap_err();
+        assert_eq!(err.kind(), AdmissionErrorKind::QueueTimeout);
+    }
+
+    #[test]
+    fn cancelled_error_is_typed_503() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let admission = Arc::new(Admission::new(1, Duration::from_secs(5)));
+            let _holder = admission.acquire().unwrap();
+            let cancel = CancellationToken::new();
+            cancel.cancel();
+            let err = admission.acquire_async(cancel).await.unwrap_err();
+            assert_eq!(err.kind(), AdmissionErrorKind::Cancelled);
+            assert!(err.is_cancelled());
+        });
     }
 }

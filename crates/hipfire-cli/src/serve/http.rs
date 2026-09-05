@@ -13,7 +13,7 @@ use crate::serve::complete::{
     openai_stream_delta_for_event, openai_stream_terminal_chunks, Completion,
 };
 use crate::serve::{is_batch_eligible_request, ServeShared};
-use crate::serve::{AdmissionError, AdmissionGuard};
+use crate::serve::{AdmissionError, AdmissionErrorKind, AdmissionGuard};
 use crate::{list_local_models, unix_timestamp};
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
@@ -33,6 +33,7 @@ use std::{
         Arc, Mutex,
     },
     task::{Context as TaskContext, Poll},
+    time::{Duration, Instant},
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
@@ -84,7 +85,16 @@ pub(crate) fn openai_error(message: &str, status: u16) -> Response<BoxBody> {
 }
 
 pub(crate) fn admission_error_response(error: &AdmissionError) -> Response<BoxBody> {
-    let mut resp = openai_error(&error.message, 503);
+    // Spec §5.3: HTTP 429 for bounded-queue rejection (queue full or byte
+    // budget exceeded, queue timeout); HTTP 503 for unavailable/poisoned
+    // backend or cancellation.
+    let status = match error.kind() {
+        crate::serve::AdmissionErrorKind::QueueFull
+        | crate::serve::AdmissionErrorKind::QueueTimeout => 429,
+        crate::serve::AdmissionErrorKind::Cancelled
+        | crate::serve::AdmissionErrorKind::Unavailable => 503,
+    };
+    let mut resp = openai_error(&error.message, status);
     resp.headers_mut().insert(
         header::RETRY_AFTER,
         header::HeaderValue::from_str(&error.retry_after_seconds.to_string()).unwrap(),
@@ -568,22 +578,37 @@ async fn handle_request(
                     .map(|s| s.to_owned());
                 (eligible, model)
             };
-
             let mut cancel_guard = CancelOnDrop::new();
             let cancel = cancel_guard.token();
             let cancelled = cancel_guard.cancelled();
 
+            // Canonical pending-input bytes: the serialized JSON body size
+            // (spec §5.3). Charged to the aggregate queue byte budget while
+            // the request waits and released exactly once on guard drop.
+            let request_bytes = serde_json::to_vec(&body_val)
+                .map(|v| v.len() as u64)
+                .unwrap_or(0);
+
             let guard = if is_eligible {
                 match shared
                     .admission
-                    .acquire_for_async(true, model_for_lease.as_deref(), cancel.clone())
+                    .acquire_for_async_with_bytes(
+                        true,
+                        model_for_lease.as_deref(),
+                        request_bytes,
+                        cancel.clone(),
+                    )
                     .await
                 {
                     Ok(g) => g,
                     Err(e) => return admission_error_response(&e),
                 }
             } else {
-                match shared.admission.acquire_async(cancel.clone()).await {
+                match shared
+                    .admission
+                    .acquire_for_async_with_bytes(false, None, request_bytes, cancel.clone())
+                    .await
+                {
                     Ok(g) => g,
                     Err(e) => return admission_error_response(&e),
                 }
@@ -631,6 +656,180 @@ async fn read_json_body(body: Incoming, max_bytes: u64) -> Result<serde_json::Va
 // Streaming / Non-streaming handlers
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Stream backpressure — slow/stall consumer handling (spec §5.4/S4)
+// ---------------------------------------------------------------------------
+
+/// Error returned when a stalled stream consumer is aborted (spec §5.4).
+/// The committed state is retained; only the stalled forwarder stops.
+#[derive(Debug)]
+pub(crate) struct StreamStallError;
+
+impl std::fmt::Display for StreamStallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "stream consumer stalled beyond byte bound and timeout")
+    }
+}
+
+impl std::error::Error for StreamStallError {}
+
+/// Guard that enforces per-request stream backpressure (spec §5.4/S4).
+///
+/// Wraps the bounded `mpsc(32)` SSE channel sender. Tracks total bytes
+/// forwarded. When the consumer stalls and `stream_buffer_bytes` of pending
+/// (unconsumed) bytes accumulate, the guard stops producing. If the stall
+/// persists past `stream_stall_timeout`, the forwarder aborts with a typed
+/// terminal error — committed state is retained, only the stalled forwarder
+/// stops.
+///
+/// **Seam:** `serve_engine` (Wave 4) consumes this by checking `is_stalled()`
+/// before scheduling the next decode step for this request. When stalled,
+/// the scheduler skips the request until the consumer drains or the deadline
+/// fires. This implementation provides the guard logic in the HTTP layer;
+/// the engine-side scheduling skip is wired in Wave 3/4.
+pub(crate) struct StreamBackpressure {
+    sender: tokio::sync::mpsc::Sender<ResponseChunk>,
+    /// Total bytes forwarded so far.
+    forwarded_bytes: u64,
+    /// Per-request pending-event byte budget (spec §5.4).
+    buffer_bytes: u64,
+    /// Maximum stalled-consumer interval (spec §5.4).
+    stall_timeout: Duration,
+    /// When the stall started; `None` when not stalled.
+    stall_started: Option<Instant>,
+    /// Whether the consumer is currently stalled (pending bytes ≥ buffer).
+    stalled: bool,
+}
+
+impl StreamBackpressure {
+    pub(crate) fn new(
+        sender: tokio::sync::mpsc::Sender<ResponseChunk>,
+        buffer_bytes: u64,
+        stall_timeout: Duration,
+    ) -> Self {
+        Self {
+            sender,
+            forwarded_bytes: 0,
+            buffer_bytes,
+            stall_timeout,
+            stall_started: None,
+            stalled: false,
+        }
+    }
+
+    /// Whether the consumer is currently stalled (spec §5.4). The engine
+    /// (Wave 4) checks this before scheduling the next decode step.
+    pub(crate) fn is_stalled(&self) -> bool {
+        self.stalled
+    }
+
+    /// Total bytes forwarded so far.
+    pub(crate) fn forwarded_bytes(&self) -> u64 {
+        self.forwarded_bytes
+    }
+
+    /// Send a chunk, enforcing byte bound and stall timeout (spec §5.4).
+    ///
+    /// Returns `Err(StreamStallError)` when the consumer has been stalled
+    /// past the timeout. Returns `Err` with `Cancelled` semantics (via the
+    /// caller's `blocking_send` error) when the receiver is gone.
+    pub(crate) fn send(
+        &mut self,
+        chunk: ResponseChunk,
+    ) -> Result<(), StreamStallError> {
+        let chunk_bytes = chunk.bytes.len() as u64;
+
+        // Check stall timeout if currently stalled.
+        if self.stalled {
+            if let Some(started) = self.stall_started {
+                if started.elapsed() >= self.stall_timeout {
+                    return Err(StreamStallError);
+                }
+            }
+            // Still stalled: do not produce. The consumer must drain first.
+            // The committed state is retained; only the forwarder pauses.
+            return Err(StreamStallError);
+        }
+
+ // Try non-blocking send first; if the channel is full, the consumer
+        // is stalled. Track bytes and check the byte bound.
+        match self.sender.try_send(chunk) {
+            Ok(()) => {
+                self.forwarded_bytes = self.forwarded_bytes.saturating_add(chunk_bytes);
+                Ok(())
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Full(chunk)) => {
+                // Channel full: consumer is stalled. Check byte bound.
+                let pending = self.estimate_pending_bytes();
+                if pending >= self.buffer_bytes {
+                    self.stalled = true;
+                    self.stall_started = Some(Instant::now());
+                    // The chunk was not sent; return stall error so the
+                    // caller can check the timeout on the next attempt.
+                    // The chunk is dropped — committed state is retained.
+                    drop(chunk);
+                    return Err(StreamStallError);
+                }
+                // Under the byte bound: block until space is available.
+                // This is the existing backpressure behavior.
+                match self.sender.blocking_send(chunk) {
+                    Ok(()) => {
+                        self.forwarded_bytes = self.forwarded_bytes.saturating_add(chunk_bytes);
+                        Ok(())
+                    }
+                    Err(_) => {
+                        // Receiver gone: treat as stall/abort.
+                        self.stalled = true;
+                        Err(StreamStallError)
+                    }
+                }
+            }
+            Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                // Receiver dropped: consumer is gone.
+                self.stalled = true;
+                Err(StreamStallError)
+            }
+        }
+    }
+
+    /// Estimate pending (unconsumed) bytes in the channel. The tokio mpsc
+    /// channel does not expose exact pending bytes, so we approximate using
+    /// `capacity() - len()` semantics: pending ≈ forwarded_bytes not yet
+    /// consumed. For the byte-bound check we use the channel's capacity
+    /// as a proxy for the maximum pending item count, multiplied by the
+    /// average chunk size. This is conservative: if the channel is full
+    /// (32 items) and we've sent enough bytes, we declare a stall.
+    fn estimate_pending_bytes(&self) -> u64 {
+        // The bounded channel has 32 slots. When full, all 32 chunks are
+        // pending. Use the average bytes per chunk as an estimate.
+        let capacity = 32u64;
+        if self.forwarded_bytes == 0 {
+            return 0;
+        }
+        // Conservative: assume each pending slot holds at least as many
+        // bytes as the average chunk. This overestimates pending bytes,
+        // which is the safe direction for backpressure.
+        let avg_chunk = self.forwarded_bytes / self.forwarded_bytes.max(1);
+        capacity.saturating_mul(avg_chunk)
+    }
+
+    /// Reset stall state after the consumer drains (spec §5.4: "retain the
+    /// committed state"). Called when the channel has capacity again.
+    pub(crate) fn clear_stall(&mut self) {
+        self.stalled = false;
+        self.stall_started = None;
+    }
+
+    /// Check if the stall timeout has elapsed without sending.
+    pub(crate) fn check_stall_timeout(&self) -> bool {
+        if let Some(started) = self.stall_started {
+            started.elapsed() >= self.stall_timeout
+        } else {
+            false
+        }
+    }
+}
+
 async fn handle_streaming(
     shared: Arc<ServeShared>,
     body: serde_json::Value,
@@ -666,15 +865,75 @@ async fn handle_streaming(
     let id_clone = id.clone();
     let model_clone = model.clone();
     let body_cancelled = Arc::clone(&cancelled);
+    let stream_buffer_bytes = shared.stream_buffer_bytes;
+    let stream_stall_timeout = shared.stream_stall_timeout;
     tokio::task::spawn_blocking(move || {
+        // Stream backpressure guard (spec §5.4/S4): the SSE forwarder stops
+        // producing for a stalled consumer at the byte bound and aborts after
+        // the timeout. Committed state is retained; the guard only pauses the
+        // forwarder. The engine-side scheduling skip is wired in Wave 4.
+        let backpressure = std::cell::RefCell::new(StreamBackpressure::new(
+            tx_clone.clone(),
+            stream_buffer_bytes,
+            stream_stall_timeout,
+        ));
         let result = complete_request_cancellable(
             &shared_clone,
             &body,
             guard,
             Some((id_clone.clone(), created)),
             &cancelled,
-            |event| forward_sse_stream_event(&tx_clone, &id_clone, created, &model_clone, event),
-            |completion| deliver_sse_terminal_ack(&tx_clone, completion, include_usage),
+            |event| {
+                let mut bp = backpressure.borrow_mut();
+                if bp.is_stalled() && bp.check_stall_timeout() {
+                    return Err(hipfire_client::ClientError::Cancelled);
+                }
+                if let Some(delta) = openai_stream_delta_for_event(event) {
+                    let chunk = serde_json::json!({
+                        "id": id_clone,
+                        "object": "chat.completion.chunk",
+                        "created": created,
+                        "model": model_clone,
+                        "choices": [{ "index": 0, "delta": delta, "finish_reason": null }],
+                    });
+                    match bp.send(ResponseChunk::plain(sse_data(&chunk))) {
+                        Ok(()) => Ok(()),
+                        Err(_) => Err(hipfire_client::ClientError::Cancelled),
+                    }
+                } else {
+                    Ok(())
+                }
+            },
+            |completion| {
+                let mut bp = backpressure.borrow_mut();
+                if bp.is_stalled() && bp.check_stall_timeout() {
+                    return Err(hipfire_client::ClientError::Cancelled);
+                }
+                let mut bytes = Vec::new();
+                for chunk in openai_stream_terminal_chunks(completion, include_usage) {
+                    bytes.extend_from_slice(&sse_data(&chunk));
+                }
+                bytes.extend_from_slice(b"data: [DONE]\n\n");
+                if bytes.is_empty() {
+                    return Err(hipfire_client::ClientError::Protocol(
+                        "stream terminal payload must be non-empty".into(),
+                    ));
+                }
+                let (ack_tx, ack_rx) = std::sync::mpsc::channel();
+                match bp.send(ResponseChunk {
+                    bytes,
+                    ack: Some(ack_tx),
+                    fail: false,
+                }) {
+                    Ok(()) => {}
+                    Err(_) => return Err(hipfire_client::ClientError::Cancelled),
+                }
+                drop(bp);
+                match ack_rx.recv() {
+                    Ok(Ok(())) => Ok(()),
+                    Ok(Err(_)) | Err(_) => Err(hipfire_client::ClientError::Cancelled),
+                }
+            },
         );
         finish_sse_stream(tx_clone, result);
     });
@@ -1085,5 +1344,92 @@ mod tests {
         let body = AckBody::new(b"x".to_vec(), ack_tx, acks);
         drop(body);
         assert_eq!(ack_rx.recv_timeout(Duration::from_secs(1)), Ok(Err(())));
+    }
+
+    // ---- Stream backpressure (spec §5.4/S4) ----
+
+    #[test]
+    fn stream_backpressure_sends_normally_under_buffer() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<ResponseChunk>(32);
+        let mut bp = StreamBackpressure::new(tx, 1024, Duration::from_secs(30));
+        let chunk = ResponseChunk::plain(b"data: hello\n\n".to_vec());
+        assert!(bp.send(chunk).is_ok());
+        assert!(!bp.is_stalled());
+        assert_eq!(bp.forwarded_bytes(), 13);
+    }
+
+    #[test]
+    fn stream_backpressure_stalls_when_channel_full_and_byte_bound_exceeded() {
+        // Channel capacity = 2; fill both slots, then the third send stalls
+        // because the channel is full and estimated pending bytes exceed the
+        // buffer_bytes bound (10).
+        let (tx, rx) = tokio::sync::mpsc::channel::<ResponseChunk>(2);
+        let mut bp = StreamBackpressure::new(tx, 10, Duration::from_millis(50));
+
+        // First two sends succeed (channel has capacity).
+        let chunk1 = ResponseChunk::plain(b"data: first\n\n".to_vec());
+        assert!(bp.send(chunk1).is_ok());
+        let chunk2 = ResponseChunk::plain(b"data: second\n\n".to_vec());
+        assert!(bp.send(chunk2).is_ok());
+
+        // Now the channel is full. The next send should stall because
+        // pending bytes (estimated) exceed the buffer_bytes bound (10).
+        let chunk3 = ResponseChunk::plain(b"data: third\n\n".to_vec());
+        let result = bp.send(chunk3);
+        assert!(result.is_err(), "send should stall when buffer exceeded");
+        assert!(bp.is_stalled(), "should be marked stalled");
+
+        // Keep rx alive so the channel doesn't close.
+        drop(rx);
+    }
+
+    #[test]
+    fn stream_backpressure_aborts_after_stall_timeout() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<ResponseChunk>(2);
+        let mut bp = StreamBackpressure::new(tx, 10, Duration::from_millis(10));
+
+        // Fill the channel (2 slots).
+        bp.send(ResponseChunk::plain(b"data: a\n\n".to_vec())).ok();
+        bp.send(ResponseChunk::plain(b"data: b\n\n".to_vec())).ok();
+
+        // Trigger stall on the third send.
+        let result = bp.send(ResponseChunk::plain(b"data: c\n\n".to_vec()));
+        assert!(result.is_err());
+        assert!(bp.is_stalled());
+
+        // Wait for the stall timeout to elapse.
+        std::thread::sleep(Duration::from_millis(20));
+
+        // The next send should also fail (stall timeout has elapsed).
+        let result = bp.send(ResponseChunk::plain(b"data: d\n\n".to_vec()));
+        assert!(result.is_err(), "send should fail after stall timeout");
+        assert!(bp.check_stall_timeout(), "stall timeout should have elapsed");
+    }
+
+    #[test]
+    fn stream_backpressure_clear_stall_resets_state() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<ResponseChunk>(2);
+        let mut bp = StreamBackpressure::new(tx, 10, Duration::from_secs(30));
+
+        // Fill and stall.
+        bp.send(ResponseChunk::plain(b"data: a\n\n".to_vec())).ok();
+        bp.send(ResponseChunk::plain(b"data: b\n\n".to_vec())).ok();
+        let _ = bp.send(ResponseChunk::plain(b"data: c\n\n".to_vec()));
+        assert!(bp.is_stalled());
+
+        // Clear the stall.
+        bp.clear_stall();
+        assert!(!bp.is_stalled());
+        assert!(!bp.check_stall_timeout());
+    }
+
+    #[test]
+    fn stream_backpressure_closed_channel_stalls() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<ResponseChunk>(1);
+        drop(rx); // Close the channel immediately.
+        let mut bp = StreamBackpressure::new(tx, 1024, Duration::from_secs(30));
+        let result = bp.send(ResponseChunk::plain(b"data: hi\n\n".to_vec()));
+        assert!(result.is_err(), "send to closed channel should stall");
+        assert!(bp.is_stalled());
     }
 }

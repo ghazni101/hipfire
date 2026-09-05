@@ -1072,6 +1072,119 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_SERVE_RETRY_BACKOFF_MS",
         "Backoff before the single serve retry; slept outside runtime and admission locks."
     ),
+    // --- Serving cache/scheduler contract keys (spec §9.1) -----------------
+    // All experimental: the cache/scheduler route is planned and has not
+    // passed release gates (spec §9.1). Defaults are conservative
+    // planner-derived constants, not universal GPU tuning constants; the
+    // memory planner resolves final per-route values later (spec §9.1).
+    field!(
+        "serve.prefix_cache",
+        "prefix_cache",
+        Serve,
+        Process,
+        DefaultValue::Bool(false),
+        ValueRule::Bool,
+        true,
+        true,
+        Some("HIPFIRE_SERVE_PREFIX_CACHE"),
+        "Experimental: select cross-session shared-prefix cache reuse; off until the exact route passes release gates (spec §4.1, §9.1)."
+    ),
+    field!(
+        "serve.prefix_cache_max_bytes",
+        "prefix_cache_max_bytes",
+        Serve,
+        Process,
+        DefaultValue::Integer(0),
+        ValueRule::Integer { min: 0, max: 1099511627776 },
+        true,
+        true,
+        Some("HIPFIRE_SERVE_PREFIX_CACHE_MAX_BYTES"),
+        "Experimental: retained shared-prefix cache ceiling including hybrid snapshots; 0 means no retained cache, never unlimited (spec §4.4, §9.1)."
+    ),
+    field!(
+        "serve.max_batch_tokens",
+        "max_batch_tokens",
+        Serve,
+        Process,
+        DefaultValue::Integer(4096),
+        ValueRule::Integer { min: 1, max: 1048576 },
+        true,
+        true,
+        Some("HIPFIRE_SERVE_MAX_BATCH_TOKENS"),
+        "Experimental: global trunk-row budget enforced per step (sum of prefill + decode + verify + forced rows); 4096 is a conservative planner-derived default, validate against slot count and scratch limits (spec §5.2, §9.1)."
+    ),
+    field!(
+        "serve.prefill_min_tokens",
+        "prefill_min_tokens",
+        Serve,
+        Process,
+        DefaultValue::Integer(1),
+        ValueRule::Integer { min: 1, max: 1048576 },
+        true,
+        true,
+        Some("HIPFIRE_SERVE_PREFILL_MIN_TOKENS"),
+        "Experimental: minimum service quantum when prefill is runnable; positive in mixed mode so an endless decode stream cannot starve prefill (spec §5.3, §9.1)."
+    ),
+    field!(
+        "serve.max_queue_bytes",
+        "max_queue_bytes",
+        Serve,
+        Process,
+        DefaultValue::Integer(268435456),
+        ValueRule::Integer { min: 1, max: 1099511627776 },
+        true,
+        true,
+        Some("HIPFIRE_SERVE_MAX_QUEUE_BYTES"),
+        "Experimental: total canonical pending-input byte budget; positive and finite so queue count alone cannot admit unbounded bytes (spec §5.3, §9.1)."
+    ),
+    field!(
+        "serve.stream_buffer_bytes",
+        "stream_buffer_bytes",
+        Serve,
+        Process,
+        DefaultValue::Integer(16777216),
+        ValueRule::Integer { min: 1, max: 1073741824 },
+        true,
+        true,
+        Some("HIPFIRE_SERVE_STREAM_BUFFER_BYTES"),
+        "Experimental: per-request bounded pending-event budget; a stalled consumer is stopped before this fills (spec §5.4, §9.1)."
+    ),
+    field!(
+        "serve.stream_stall_timeout_ms",
+        "stream_stall_timeout_ms",
+        Serve,
+        Process,
+        DefaultValue::Integer(30000),
+        ValueRule::Integer { min: 0, max: 3600000 },
+        true,
+        true,
+        Some("HIPFIRE_SERVE_STREAM_STALL_TIMEOUT_MS"),
+        "Experimental: maximum stalled-consumer interval; the request is aborted after this deadline (spec §5.4, §9.1)."
+    ),
+    field!(
+        "serve.scheduler_overlap",
+        "scheduler_overlap",
+        Serve,
+        Process,
+        DefaultValue::Bool(false),
+        ValueRule::Bool,
+        true,
+        true,
+        Some("HIPFIRE_SERVE_SCHEDULER_OVERLAP"),
+        "Experimental: overlap independent CPU preparation with GPU execution; off until race/lifetime and profile evidence exist (spec §1, §9.1)."
+    ),
+    field!(
+        "serve.structured_jump_forward",
+        "structured_jump_forward",
+        Serve,
+        Process,
+        DefaultValue::Bool(false),
+        ValueRule::Bool,
+        true,
+        true,
+        Some("HIPFIRE_SERVE_STRUCTURED_JUMP_FORWARD"),
+        "Experimental: token-safe jump-forward for provably forced output; off until scalar constrained-equivalence gates pass (spec §1, §9.1)."
+    ),
     field!(
         "experimental.budget_alert",
         "experimental_budget_alert",
