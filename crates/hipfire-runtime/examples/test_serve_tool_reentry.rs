@@ -102,6 +102,7 @@ fn main() {
                 frequency_penalty: 0.0,
                 min_p: 0.0,
                 visual_data: None,
+                queue_bytes: 0,
                 reply: tx,
             })
             .expect("submit");
