@@ -60,6 +60,7 @@ pub mod sampler;
 pub mod sealed_moe;
 pub mod serve;
 pub mod serve_contract;
+pub mod serve_fairness;
 pub mod spec;
 
 pub mod ngram_mod;
