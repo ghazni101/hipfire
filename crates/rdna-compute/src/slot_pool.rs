@@ -470,6 +470,118 @@ impl SlotPool {
         Ok(())
     }
 
+    /// Borrow the page pool (paged mode only).
+    pub fn page_pool(&self) -> Option<&PagePool> {
+        self.page_pool.as_ref()
+    }
+
+    /// Mutably borrow the page pool (paged mode only).
+    pub fn page_pool_mut(&mut self) -> Option<&mut PagePool> {
+        self.page_pool.as_mut()
+    }
+
+    /// Share published cache pages (from the prefix index) into `dst` slot's
+    /// block table. Each physical page is refcounted and sealed. The slot's
+    /// live_tokens is set to `phys_pages.len() * PAGE_TOKENS`.
+    ///
+    /// Unlike [`share_prefix`], the source is not another slot's block table
+    /// but a list of physical page indices from the prefix cache's published
+    /// handles. The caller must have already sealed those pages and taken
+    /// cache refs via `PagePool::seal` + `PagePool::add_cache_ref`.
+    pub fn share_published_pages(
+        &mut self,
+        dst: SlotId,
+        phys_pages: &[u32],
+    ) -> Result<(), String> {
+        let pool = self
+            .page_pool
+            .as_mut()
+            .ok_or_else(|| "share_published_pages: pool is not in paged mode".to_string())?;
+        let bt = self
+            .block_tables
+            .get_mut(dst.0)
+            .and_then(|bt| bt.as_mut())
+            .ok_or_else(|| "share_published_pages: dst slot has no block table".to_string())?;
+        if bt.num_pages() != 0 {
+            return Err(format!(
+                "share_published_pages: dst already holds {} pages — sharing is only \
+                 defined into an empty table",
+                bt.num_pages()
+            ));
+        }
+        for &phys in phys_pages {
+            pool.refcount_inc(phys)?;
+            bt.push_page(phys);
+        }
+        let live = phys_pages.len() * PAGE_TOKENS;
+        if live > self.cap_tokens {
+            return Err(format!(
+                "share_published_pages: {} pages ({live} tokens) exceed dst cap {}",
+                phys_pages.len(),
+                self.cap_tokens
+            ));
+        }
+        bt.set_live_tokens(live);
+        self.descs[dst.0].seq_len = live as i32;
+        self.block_tables_dirty[dst.0] = true;
+        self.dirty = true;
+        Ok(())
+    }
+
+    // ── COW write barrier (spec §4.6) ────────────────────────────────
+
+    /// Plan copy-on-write for `slot`'s block table over `[write_start, write_end)`.
+    /// Sealed/CacheOnly pages in the interval are scheduled for copy to private
+    /// pages; private pages are a no-op. Returns a [`CowPlan`] that must be
+    /// committed or aborted.
+    pub fn plan_cow_for_slot(
+        &mut self,
+        slot: SlotId,
+        write_start: usize,
+        write_end: usize,
+    ) -> Result<crate::page_pool::CowPlan, String> {
+        let pool = self
+            .page_pool
+            .as_mut()
+            .ok_or_else(|| "plan_cow: not in paged mode".to_string())?;
+        let bt = self
+            .block_tables
+            .get(slot.0)
+            .and_then(|bt| bt.as_ref())
+            .ok_or_else(|| "plan_cow: slot has no block table".to_string())?;
+        pool.plan_cow(bt, write_start, write_end)
+    }
+
+    /// Commit a COW plan: rebinds the block table to the private copy pages
+    /// and marks the table dirty for re-upload.
+    pub fn commit_cow_for_slot(
+        &mut self,
+        slot: SlotId,
+        plan: &crate::page_pool::CowPlan,
+    ) -> Result<(), String> {
+        let pool = self
+            .page_pool
+            .as_mut()
+            .ok_or_else(|| "commit_cow: not in paged mode".to_string())?;
+        let bt = self
+            .block_tables
+            .get_mut(slot.0)
+            .and_then(|bt| bt.as_mut())
+            .ok_or_else(|| "commit_cow: slot has no block table".to_string())?;
+        pool.commit_cow(bt, plan)?;
+        self.block_tables_dirty[slot.0] = true;
+        self.dirty = true;
+        Ok(())
+    }
+
+    /// Abort a COW plan: releases the reserved private pages without
+    /// mutating the block table.
+    pub fn abort_cow_for_slot(&mut self, plan: &crate::page_pool::CowPlan) {
+        if let Some(pool) = self.page_pool.as_mut() {
+            pool.abort_cow(plan);
+        }
+    }
+
     /// Number of free pages in the page pool (paged mode only).
     pub fn free_pages(&self) -> usize {
         self.page_pool.as_ref().map(|p| p.free_pages()).unwrap_or(0)
