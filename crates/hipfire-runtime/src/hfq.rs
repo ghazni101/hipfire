@@ -1160,6 +1160,34 @@ impl HfqFile {
         &self.tensors
     }
 
+    /// SHA-256 of architecture, metadata JSON, ordered tensor manifest, and
+    /// file length (spec §4.1 C1). Path, inode and mtime are excluded so a
+    /// byte-identical copy at another path is the same content. Computed
+    /// once at load for cache-domain identity.
+    pub fn content_digest(&self) -> Vec<u8> {
+        use sha2::{Digest as Sha256Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(self.arch_id.to_le_bytes());
+        h.update((self.metadata_json.len() as u64).to_le_bytes());
+        h.update(self.metadata_json.as_bytes());
+        h.update((self.tensors.len() as u64).to_le_bytes());
+        for t in &self.tensors {
+            h.update((t.name.len() as u64).to_le_bytes());
+            h.update(t.name.as_bytes());
+            h.update([t.quant_type]);
+            h.update((t.shape.len() as u64).to_le_bytes());
+            for d in &t.shape {
+                h.update(d.to_le_bytes());
+            }
+            h.update(t.group_size.to_le_bytes());
+            h.update((t.data_offset as u64).to_le_bytes());
+            h.update((t.data_size as u64).to_le_bytes());
+        }
+        let len = std::fs::metadata(&self.path).map(|m| m.len()).unwrap_or(0);
+        h.update(len.to_le_bytes());
+        h.finalize().to_vec()
+    }
+
     /// Compute the exact immutable source identity for this opened HFQ file.
     ///
     /// Equality is over canonical path, platform file identity (dev/ino on

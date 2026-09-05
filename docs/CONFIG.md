@@ -8,7 +8,7 @@
 - Compact runtime snapshots: `hipfire_runtime::config::RuntimeConfig` and
   `rdna_compute::feature_flags::FeatureFlags`
 
-**Last checked:** 2026-07-21.
+**Last checked:** 2026-09-05.
 
 Persistent stores under `~/.hipfire/`:
 
@@ -428,6 +428,13 @@ runtime PFlash module — not restated here.
 | `max_request_bytes` | `67108864` (64 MiB) | int 4096–4GiB |
 | `serve_max_queue` | `64` | int 0–100000 (`0` = uncapped depth) |
 | `serve_queue_timeout_ms` | `30000` | int 0–3600000 (`0` = no wait timeout) |
+| `serve.max_queue_bytes` | `268435456` | int 1–1TiB (multi-slot waiting-room byte cap) |
+| `serve.max_batch_tokens` | `4096` | int 1–1048576 (global trunk-row budget) |
+| `serve.prefill_min_tokens` | `1` | int 1–1048576 (prefill quantum) |
+| `serve.prefix_cache` | `false` | bool — experimental; off until route admission |
+| `serve.prefix_cache_max_bytes` | `0` | int 0–1TiB (0 = no retained cache) |
+| `serve.structured_jump_forward` | `false` | bool — experimental |
+| `serve.scheduler_overlap` | `false` | bool — experimental, stays off |
 | `experimental_budget_alert` | `false` | bool |
 
 Serve HTTP surface: [`SERVE.md`](SERVE.md). The corresponding `HIPFIRE_MODEL`,

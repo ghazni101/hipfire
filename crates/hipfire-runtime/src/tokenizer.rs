@@ -1263,6 +1263,46 @@ impl Tokenizer {
         &self.special_tokens
     }
 
+    /// SHA-256 of the decoded vocabulary table in id order (spec §4.1 C1).
+    /// Computed once at load for cache-domain identity; never per request.
+    pub fn vocab_digest(&self) -> Vec<u8> {
+        use sha2::{Digest as Sha256Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update((self.vocab.len() as u64).to_le_bytes());
+        for tok in &self.vocab {
+            h.update((tok.len() as u64).to_le_bytes());
+            h.update(tok.as_bytes());
+        }
+        h.finalize().to_vec()
+    }
+
+    /// SHA-256 of tokenizer configuration that affects encoding: merge
+    /// ranks, special tokens, BOS/EOS/EOT, and the GPT-2 / SentencePiece
+    /// flags (spec §4.1 C1). Independent of [`Self::vocab_digest`].
+    pub fn config_digest(&self) -> Vec<u8> {
+        use sha2::{Digest as Sha256Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update((self.merges.len() as u64).to_le_bytes());
+        for m in &self.merges {
+            h.update(m.to_le_bytes());
+        }
+        h.update((self.special_tokens.len() as u64).to_le_bytes());
+        for (s, id) in &self.special_tokens {
+            h.update((s.len() as u64).to_le_bytes());
+            h.update(s.as_bytes());
+            h.update(id.to_le_bytes());
+        }
+        h.update(self.bos_id.to_le_bytes());
+        h.update(self.eos_id.to_le_bytes());
+        h.update(self.eot_id.unwrap_or(u32::MAX).to_le_bytes());
+        h.update([
+            u8::from(self.add_bos),
+            u8::from(self.is_gpt2_bpe),
+            u8::from(self.sp_dummy_prefix),
+        ]);
+        h.finalize().to_vec()
+    }
+
     /// Stable 64-bit signature derived from the full vocab + every special
     /// token + bos/eos/eot ids. Two tokenizers with equal signatures are
     /// guaranteed to produce identical encodings for any input drawn from
@@ -2902,5 +2942,34 @@ mod token_bytes_tests {
         let b2 = tok.token_bytes(0);
         // Same pointer (cached).
         assert!(std::ptr::eq(b1, b2));
+    }
+}
+
+#[cfg(test)]
+mod cache_identity_digest_tests {
+    use super::*;
+
+    fn sp_meta(vocab: &[&str]) -> serde_json::Value {
+        serde_json::json!({
+            "tokenizer.ggml.tokens": vocab,
+            "tokenizer.ggml.merges": [],
+            "tokenizer.ggml.model": "llama",
+        })
+    }
+
+    #[test]
+    fn vocab_digest_changes_when_vocab_changes() {
+        let a = Tokenizer::from_gguf_meta_json(&sp_meta(&["a", "b"])).expect("a");
+        let b = Tokenizer::from_gguf_meta_json(&sp_meta(&["a", "c"])).expect("b");
+        assert_ne!(a.vocab_digest(), b.vocab_digest());
+        assert_eq!(a.vocab_digest(), a.vocab_digest());
+    }
+
+    #[test]
+    fn config_digest_stable_for_same_tokenizer() {
+        let t = Tokenizer::from_gguf_meta_json(&sp_meta(&["hello"])).expect("t");
+        assert_eq!(t.config_digest(), t.config_digest());
+        assert_eq!(t.vocab_digest().len(), 32);
+        assert_eq!(t.config_digest().len(), 32);
     }
 }

@@ -257,6 +257,8 @@ struct WalkResult {
     path: Vec<NodeId>,
     /// Whether the walk consumed all query tokens.
     exhausted_query: bool,
+    /// Resident full-page handles along the matched prefix, in token order.
+    pages: Vec<Handle>,
 }
 
 impl PrefixIndex {
@@ -308,30 +310,59 @@ impl PrefixIndex {
         pool: &PagePool,
         policy: Option<&CachePolicy>,
     ) -> PrefixLookupResult {
+        self.lookup_with_pages(domain, tokens, pool, policy).0
+    }
+
+    /// Lookup plus the sealed page handles covering the resumable
+    /// boundary. The engine shares these into an empty destination slot
+    /// instead of a length-keyed side map (spec §4.2: two prefixes of
+    /// equal length are distinct).
+    pub fn lookup_with_pages(
+        &mut self,
+        domain: &CacheDomain,
+        tokens: &[u32],
+        pool: &PagePool,
+        policy: Option<&CachePolicy>,
+    ) -> (PrefixLookupResult, Vec<Handle>) {
         let walk = self.walk(domain, tokens, pool);
 
         if walk.matched_tokens == 0 {
-            return PrefixLookupResult::Miss(MissReason::NoMatch);
+            return (PrefixLookupResult::Miss(MissReason::NoMatch), Vec::new());
         }
 
         if walk.resumable_tokens == 0 {
-            return PrefixLookupResult::Miss(MissReason::NoCheckpoint);
+            return (
+                PrefixLookupResult::Miss(MissReason::NoCheckpoint),
+                Vec::new(),
+            );
         }
 
         if let Some(p) = policy {
             if !p.allow_partial && walk.resumable_tokens < walk.matched_tokens {
-                return PrefixLookupResult::Miss(MissReason::IncompatiblePolicy);
+                return (
+                    PrefixLookupResult::Miss(MissReason::IncompatiblePolicy),
+                    Vec::new(),
+                );
             }
         }
 
         // Pin nodes along the path so eviction cannot drop them (spec §4.4).
         self.pin_path(domain, &walk.path);
 
-        PrefixLookupResult::Hit(PrefixLookup {
-            matched_tokens: walk.matched_tokens,
-            resident_kv_tokens: walk.resident_kv_tokens,
-            resumable_tokens: walk.resumable_tokens,
-        })
+        let resumable = walk.resumable_tokens;
+        let handles: Vec<Handle> = walk
+            .pages
+            .into_iter()
+            .filter(|h| h.token_offset + PAGE_TOKENS as u64 <= resumable)
+            .collect();
+        (
+            PrefixLookupResult::Hit(PrefixLookup {
+                matched_tokens: walk.matched_tokens,
+                resident_kv_tokens: walk.resident_kv_tokens,
+                resumable_tokens: walk.resumable_tokens,
+            }),
+            handles,
+        )
     }
 
     /// Inspect the index for the three token counts without claiming a Hit
@@ -363,6 +394,7 @@ impl PrefixIndex {
                     resumable_tokens: 0,
                     path: Vec::new(),
                     exhausted_query: false,
+                    pages: Vec::new(),
                 };
             }
         };
@@ -373,6 +405,7 @@ impl PrefixIndex {
         let mut matched_tokens: u64 = 0;
         let mut resident_kv_tokens: u64 = 0;
         let mut resumable_tokens: u64 = 0;
+        let mut pages: Vec<Handle> = Vec::new();
 
         // Check root checkpoints (token_offset 0 → resumable boundary 0,
         // which is trivially true but not useful).
@@ -414,6 +447,10 @@ impl PrefixIndex {
                 edge_match += 1;
             }
 
+            // child_base is the global token offset where this child's edge
+            // begins. Compute it BEFORE adding edge_match to matched_tokens.
+            let child_base = matched_tokens;
+
             // Count resident pages for the matched portion of this edge.
             // Each page covers PAGE_TOKENS tokens.
             let matched_full_pages = edge_match / PAGE_TOKENS;
@@ -421,14 +458,14 @@ impl PrefixIndex {
                 if let Some(ph) = child.pages.get(i) {
                     if pool.validate_handle(ph).is_ok() {
                         resident_kv_tokens += PAGE_TOKENS as u64;
+                        pages.push(Handle {
+                            handle: *ph,
+                            token_offset: child_base + (i * PAGE_TOKENS) as u64,
+                        });
                     }
                 }
             }
 
-            // Check checkpoints on the child for the matched portion.
-            // child_base is the global token offset where this child's edge
-            // begins. Compute it BEFORE adding edge_match to matched_tokens.
-            let child_base = matched_tokens;
             matched_tokens += edge_match as u64;
 
             for cb in &child.checkpoints {
@@ -457,6 +494,7 @@ impl PrefixIndex {
             resumable_tokens,
             path,
             exhausted_query: query_pos >= tokens.len(),
+            pages,
         }
     }
 
@@ -1654,5 +1692,39 @@ mod tests {
         // Lookup should still find the full prefix.
         let result = index.lookup(&domain, &tokens, &pool, None);
         assert!(matches!(result, PrefixLookupResult::Hit(_)));
+    }
+
+    #[test]
+    fn lookup_with_pages_isolates_equal_length_prefixes() {
+        // Two 128-token prefixes of equal length must not share handles
+        // (the length-keyed side map this replaces would collide).
+        let (pool, handles) = setup_big_pool(2);
+        let mut index = PrefixIndex::new(1000);
+        let domain = sample_domain(1);
+        let a = make_tokens_from(1, PAGE_TOKENS);
+        let b = make_tokens_from(10_000, PAGE_TOKENS);
+        index
+            .insert(&domain, &a, &handles[..1], Some(CheckpointId(1)), &pool)
+            .unwrap();
+        index
+            .insert(
+                &domain,
+                &b,
+                &handles[1..2],
+                Some(CheckpointId(2)),
+                &pool,
+            )
+            .unwrap();
+
+        let (ra, ha) = index.lookup_with_pages(&domain, &a, &pool, None);
+        let (rb, hb) = index.lookup_with_pages(&domain, &b, &pool, None);
+        assert!(matches!(ra, PrefixLookupResult::Hit(_)));
+        assert!(matches!(rb, PrefixLookupResult::Hit(_)));
+        assert_eq!(ha.len(), 1);
+        assert_eq!(hb.len(), 1);
+        assert_ne!(
+            ha[0].handle.phys, hb[0].handle.phys,
+            "equal-length prefixes must return distinct physical pages"
+        );
     }
 }

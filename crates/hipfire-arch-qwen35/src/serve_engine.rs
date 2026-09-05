@@ -366,11 +366,6 @@ struct Rig {
     /// Debug counter: total plan_cow calls (for test assertions that the
     /// COW write barrier fires on paged steps).
     cow_plan_count: u64,
-    /// Side map: boundary → published page handles. The PrefixIndex stores
-    /// handles internally but does not expose them from `lookup`; this map
-    /// shadows the index's handle storage so the admit Hit path can
-    /// retrieve the physical pages to share into a new slot.
-    published_handles: std::collections::HashMap<u64, Vec<hipfire_runtime::prefix_index::Handle>>,
     /// Host-side fairness queue (spec §5.3 S3). Admits/needs/select are
     /// driven from the engine loop each step; the granted ids become the
     /// scheduler's eligibility mask so an un-granted slot contributes 0
@@ -1074,26 +1069,55 @@ impl Rig {
                 ArchPolicy, CacheDomain, DeviceTopology, KvLayout, SharingNamespace,
                 TemplateIdentity, TokenizerIdentity,
             };
-            // C1 identity stubs: tokenizer and template digests are not yet
-            // computable from the loaded Tokenizer (no vocab hash API). Use
-            // the model file size as a proxy for model_content_digest — it
-            // changes when the model file changes, which is the property that
-            // matters for invalidating stale cache entries on model swap.
-            // The tokenizer/template placeholders are stable constants that
-            // still change when the model file changes (via
-            // model_content_digest). Filling these from real data requires
-            // a Tokenizer::vocab_digest() API — a C1 gap to report.
+            // C1 identity: SHA-256 of HFQ content, tokenizer vocab/config,
+            // and the rendered chat-template program (spec §4.1). Sidecars
+            // (MTP, optional VL) are hashed independently so a changed
+            // adapter cannot hit a trunk-only cache entry.
+            let chat_template = hfq.chat_template().unwrap_or_default();
+            let template_digest = hipfire_runtime::serve_contract::sha256_len_prefixed(&[
+                chat_template.as_bytes(),
+            ]);
+            let mut sidecar_digests = Vec::new();
+            if mtp_head.is_some() {
+                let sidecar = cfg.model_path.with_extension("mtp");
+                if sidecar.exists() {
+                    match HfqFile::open(&sidecar) {
+                        Ok(mtp_hfq) => sidecar_digests.push(mtp_hfq.content_digest()),
+                        Err(_) => {
+                            if let Ok(d) = hipfire_runtime::serve_contract::sha256_file(&sidecar) {
+                                sidecar_digests.push(d);
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(vl) = cfg.vl_path.as_ref() {
+                if vl.exists() {
+                    match HfqFile::open(vl) {
+                        Ok(vl_hfq) => sidecar_digests.push(vl_hfq.content_digest()),
+                        Err(_) => {
+                            if let Ok(d) = hipfire_runtime::serve_contract::sha256_file(vl) {
+                                sidecar_digests.push(d);
+                            }
+                        }
+                    }
+                }
+            }
             let domain = CacheDomain {
-                model_content_digest: weight_bytes.to_le_bytes().to_vec(),
+                model_content_digest: hfq.content_digest(),
                 model_load_epoch: 1,
-                sidecar_digests: vec![],
+                sidecar_digests,
                 tokenizer: TokenizerIdentity {
-                    vocab_digest: vec![0u8; 16],
-                    config_digest: vec![0u8; 16],
+                    vocab_digest: tokenizer.vocab_digest(),
+                    config_digest: tokenizer.config_digest(),
                 },
                 template: TemplateIdentity {
-                    template_digest: vec![0u8; 16],
-                    normalization_tag: "qwen35-chat".to_string(),
+                    template_digest,
+                    normalization_tag: if chat_template.is_empty() {
+                        "prompt-frame".to_string()
+                    } else {
+                        "jinja".to_string()
+                    },
                 },
                 arch_policy: ArchPolicy {
                     arch_tag: "qwen35-deltanet".to_string(),
@@ -1199,7 +1223,6 @@ impl Rig {
             prefix_cache,
             lookup_count: 0,
             cow_plan_count: 0,
-            published_handles: std::collections::HashMap::new(),
             fair_queue,
             wait_queue,
             parked_requests: std::collections::HashMap::new(),
@@ -2154,7 +2177,6 @@ fn publish_generated_prefix(rig: &mut Rig, slots: &mut [Option<InFlight>], s: us
     if let Err(e) = idx.publish_sealed_pages(domain, &tokens, &handles, checkpoint, pp) {
         eprintln!("[prefix-cache] generated-prefix publish_sealed_pages failed: {e:?}");
     } else {
-        rig.published_handles.insert(new_boundary as u64, handles);
         if let Some(f) = slots[s].as_mut() {
             f.last_published_boundary = new_boundary;
         }
@@ -3109,7 +3131,6 @@ fn run_loop(
                     if let Err(e) = idx.publish_sealed_pages(domain, &tokens, &handles, checkpoint, pp) {
                         eprintln!("[prefix-cache] publish_sealed_pages failed: {e:?}");
                     } else {
-                        rig.published_handles.insert(new_boundary as u64, handles);
                         if let Some(f) = slots[s].as_mut() {
                             f.last_published_boundary = new_boundary;
                         }
@@ -3763,8 +3784,6 @@ fn handle_command(
                         blob.free_gpu(&mut rig.gpu);
                     }
                 }
-                // Clear the published-handles side map.
-                rig.published_handles.clear();
                 // Bump the allocation epoch so stale CacheDomain lookups miss.
                 if let Some(domain) = rig.cache_domain.as_mut() {
                     domain.device.allocation_epoch += 1;
@@ -3785,14 +3804,14 @@ fn should_lookup_prefix(prefix_cache: bool, has_visual: bool) -> bool {
 /// Pure policy: how many prompt tokens are reused (skipped) given a resume
 /// plan boundary and the total prompt length.
 ///
-/// Returns 0 when the boundary covers the entire prompt (no prefill needed)
-/// or is zero (no checkpoint). Returns `boundary` when it's a partial match
-/// that leaves tokens to prefill.
+/// Returns 0 when there is no checkpoint. A boundary that covers the entire
+/// prompt is a full hit: every prompt token is reused and prefill is empty
+/// (spec §4.2 / A1 exact match).
 fn reused_tokens_from_plan(boundary: usize, prompt_len: usize) -> usize {
-    if boundary > 0 && boundary < prompt_len {
-        boundary
-    } else {
+    if boundary == 0 {
         0
+    } else {
+        boundary.min(prompt_len)
     }
 }
 
@@ -4307,7 +4326,7 @@ fn admit(
     if should_lookup_prefix(rig.prefix_cache, req.visual_data.is_some()) {
         rig.lookup_count += 1;
         let domain = rig.cache_domain.as_ref().unwrap();
-        let lookup_result = {
+        let (lookup_result, hit_handles) = {
             let pp = rig
                 .pool
                 .page_pool()
@@ -4315,7 +4334,7 @@ fn admit(
             rig.prefix_index
                 .as_mut()
                 .unwrap()
-                .lookup(domain, &req.prompt_tokens, pp, None)
+                .lookup_with_pages(domain, &req.prompt_tokens, pp, None)
         };
         if let PrefixLookupResult::Hit(lookup) = &lookup_result {
             let ckpt_pool = rig.checkpoint_pool.as_ref().unwrap();
@@ -4329,12 +4348,13 @@ fn admit(
                 Ok(plan) => {
                     let boundary = plan.boundary as usize;
                     if reused_tokens_from_plan(boundary, req.prompt_tokens.len()) > 0 {
-                        // Retrieve published handles for this boundary.
-                        if let Some(handles) =
-                            rig.published_handles.get(&(boundary as u64))
-                        {
-                            let phys_pages: Vec<u32> =
-                                handles.iter().map(|h| h.handle.phys).collect();
+                        let n_pages = boundary / PAGE_TOKENS;
+                        let phys_pages: Vec<u32> = hit_handles
+                            .iter()
+                            .take(n_pages)
+                            .map(|h| h.handle.phys)
+                            .collect();
+                        if n_pages > 0 && phys_pages.len() == n_pages {
                             if rig.pool.share_published_pages(slot, &phys_pages).is_ok() {
                                 // Restore DN state from the checkpoint pool
                                 // (peek + restore_to: one D2D copy from the
@@ -4831,9 +4851,9 @@ mod tests {
     }
 
     #[test]
-    fn reused_tokens_zero_when_boundary_covers_entire_prompt() {
-        // boundary == prompt_len → no suffix to prefill → 0 reused.
-        assert_eq!(reused_tokens_from_plan(100, 100), 0);
+    fn reused_tokens_full_when_boundary_covers_entire_prompt() {
+        // boundary == prompt_len is an exact match: every prompt token is reused.
+        assert_eq!(reused_tokens_from_plan(100, 100), 100);
     }
 
     #[test]

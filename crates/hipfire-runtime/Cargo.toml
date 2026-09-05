@@ -96,6 +96,7 @@ minijinja = { version = "2", features = ["loop_controls", "json", "preserve_orde
 # template which uses these throughout.
 minijinja-contrib = { version = "2", features = ["pycompat"] }
 tracing = "0.1"
+sha2 = "0.10"
 
 # Examples in this crate (bench_qwen35_mq4, dflash_spec_demo, etc.)
 # consume the arch crates. These are dev-dependencies — cargo refuses
@@ -541,6 +542,10 @@ required-features = ["lab"]
 
 [[example]]
 name = "test_serve_tool_reentry"
+required-features = ["lab"]
+
+[[example]]
+name = "test_serve_prefix_cache"
 required-features = ["lab"]
 
 [[example]]

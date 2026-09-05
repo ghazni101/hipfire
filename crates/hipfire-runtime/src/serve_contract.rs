@@ -28,6 +28,37 @@ use std::fmt;
 /// non-cryptographic hash collision is never treated as equality (spec §4.1).
 pub type Digest = Vec<u8>;
 
+/// SHA-256 over length-prefixed byte parts. Equal parts produce equal
+/// digests; a single-field change produces a different digest. Used by
+/// tokenizer/template/HFQ identity constructors (spec §4.1).
+pub fn sha256_len_prefixed(parts: &[&[u8]]) -> Digest {
+    use sha2::{Digest as Sha256Digest, Sha256};
+    let mut h = Sha256::new();
+    for p in parts {
+        h.update((*p).len().to_le_bytes());
+        h.update(*p);
+    }
+    h.finalize().to_vec()
+}
+
+/// SHA-256 of a file's contents. Used for sidecar/adapter identity when
+/// the sidecar is not an HFQ (spec §4.1). Load-time only.
+pub fn sha256_file(path: &std::path::Path) -> std::io::Result<Digest> {
+    use sha2::{Digest as Sha256Digest, Sha256};
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut h = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        h.update(&buf[..n]);
+    }
+    Ok(h.finalize().to_vec())
+}
+
 // =========================================================================
 // C1 — Cache domain identity (spec §4.1)
 // =========================================================================

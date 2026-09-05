@@ -12,7 +12,8 @@ configuration ([CONFIG.md](CONFIG.md)); the HTTP surface is implemented by
 | Pre-warm model | `serve.default_model = "qwen3.5:9b"` or a positional model arg |
 | Idle unload | `serve.idle_timeout_seconds = 300` (`0` = never) |
 | Max request body | `serve.max_request_bytes = 67108864` (64 MiB) |
-| Admission queue | `serve.max_queue = 64`, `serve.queue_timeout_ms = 30000` |
+| Admission queue | `serve.max_queue = 64`, `serve.queue_timeout_ms = 30000`, `serve.max_queue_bytes = 268435456` |
+| Prefix cache | `serve.prefix_cache = false` (opt-in; text AR greedy paged slots only) |
 | Pid / log | `~/.hipfire/serve.pid`, `~/.hipfire/serve.log` |
 
 Truth state: **shipped / ref-pinned** for the HTTP contract and lifecycle
@@ -298,6 +299,20 @@ but the request fails, `run` exits rather than colliding on the GPU lock.
 
 Model mismatch: serve reloads to the requested model on the chat path (cold
 start cost on that first switched request).
+
+## Experimental prefix cache (multi-slot)
+
+`serve.prefix_cache` is **off by default**. On the multi-slot engine
+(`serve.multi_slot=true`) it enables cross-session radix reuse of sealed
+128-token KV pages plus Qwen hybrid checkpoints. Verified on gfx1101 /
+ROCm 10 for greedy text AR (`test_serve_prefix_cache` + `serve_harness.py --mode chain`).
+Vision+prefix reuse stays off. Tools/stop/logprobs stay refused on slots.
+This is not a registry admission.
+
+```bash
+HIPFIRE_SERVE_MULTI_SLOT=true HIPFIRE_SERVE_PREFIX_CACHE=true \
+  hipfire serve 127.0.0.1:11435 <model.hfq>
+```
 
 ## Production smoke (GPU)
 
