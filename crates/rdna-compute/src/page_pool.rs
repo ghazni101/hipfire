@@ -18,6 +18,25 @@
 // device address is stored in KvSlotDesc.block_table. The attention
 // kernels use kv_offset_for_k/v() to translate logical positions to
 // physical byte offsets via the block table — no kernel is touched.
+//
+// ── Wave 2: ownership, COW, and deferred reclaim (spec §4.3 C3, §4.4 C4)
+//
+// Each physical page carries a `PageMeta` tracking:
+//   - `PageState`: Free → Private → Sealed → CacheOnly → ReclaimPending → Free
+//   - Checked refcounts separated by `LeaseClass` (table, cache, in-flight)
+//   - A per-page `generation` so stale `PageHandle`s fail before dereference
+//
+// Copy-on-write (`CowPlan`/`plan_cow`/`commit_cow`/`abort_cow`) lets a
+// session rewrite a shared (Sealed) page by reserving a private
+// destination and copying the valid prefix — raw bytes, no dequant/requant
+// — before rebinding the block table. Failed reservations release only
+// newly reserved resources (spec §4.3).
+//
+// Deferred reclaim: when all table/cache refs drop to zero but in-flight
+// device reads remain, the page enters `ReclaimPending` and is NOT
+// immediately reusable. `drain_completed()` is the synchronous step-fence
+// that frees confirmed-complete pages. The upgrade seam to HIP-event-based
+// completion is documented at that method.
 
 use crate::kv_slots::{preflight_alloc, KvSlotDesc, R9700_VRAM_BYTES};
 
@@ -28,6 +47,164 @@ pub const PAGE_TOKENS: usize = 128;
 /// A physical page index in the shared arena.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct PageId(pub u32);
+
+// =========================================================================
+// Wave 2 — physical ownership types (spec §4.3 C3, §4.4 C4)
+//
+// rdna-compute owns these *physical* types; hipfire-runtime's
+// serve_contract.rs owns the matching *logical* types (CacheDomain,
+// StepTicket, ReleaseDisposition, …).
+// =========================================================================
+
+/// A validated handle to a physical page (spec §4.3). The host validates
+/// `generation` (and `epoch`) before table upload; a stale handle — the
+/// page was freed and re-allocated to another session — fails before
+/// dereference, preventing use-after-free on the device.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct PageHandle {
+    /// Physical page index.
+    pub phys: u32,
+    /// Pool allocation epoch (bumped on device reload; spec §4.1
+    /// "allocation epoch").  In this implementation the epoch is always 0
+    /// and never bumped — the field and check exist so the upgrade path is
+    /// non-breaking.
+    pub epoch: u32,
+    /// Per-page generation.  Bumped each time the page transitions
+    /// Free → allocated and again on Free → re-alloc, so a handle from a
+    /// prior allocation cycle mismatches and is rejected.
+    pub generation: u32,
+}
+
+/// Lifecycle state of a physical page (spec §4.3 C3).
+///
+/// ```text
+///   Free ──alloc──▶ Private ──seal/share──▶ Sealed
+///    ▲                  │                       │
+///    │                  │ release (rc→0)        │ release (rc→0)
+///    │                  ▼                       │
+///    │                 Free              CacheOnly
+///    │                                    │
+///    │                              release (rc→0, inflight>0)
+///    │                                    │
+///    │                                    ▼
+///    └──────────── drain_completed ◀── ReclaimPending
+/// ```
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PageState {
+    /// In the free list; no refs; generation already bumped.
+    Free,
+    /// Owned by exactly one block table; mutable (writes allowed).
+    Private,
+    /// Shared (≥2 table refs) or cache-pinned; immutable — any write
+    /// intention must trigger copy-on-write (spec §4.3).
+    Sealed,
+    /// No active table ref but cache-owned; still immutable, still
+    /// resident.  Can be re-attached (table ref added) or evicted.
+    CacheOnly,
+    /// All table/cache refs released but in-flight device/transport reads
+    /// remain; NOT in the free list until `drain_completed` confirms
+    /// completion (spec §4.4).
+    ReclaimPending,
+}
+
+/// Lease class identifying *why* a page is pinned (spec §4.3: "Separate
+/// active/table refs, cache ownership, in-flight/transfer leases; physical
+/// bytes charged once").  The total refcount is the sum across classes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum LeaseClass {
+    /// A live session's block table references this page.
+    Table,
+    /// The prefix cache owns this page (it may outlive any single session).
+    Cache,
+    /// A device kernel or transport reader is still accessing this page;
+    /// reuse is deferred until completion (spec §4.4).
+    InFlight,
+}
+
+/// Per-page metadata (internal).  Replaces the flat `refcounts: Vec<u32>`
+/// from Wave 1 with checked, class-separated refcounts and the state
+/// machine.
+#[derive(Debug, Clone, Copy)]
+struct PageMeta {
+    state: PageState,
+    generation: u32,
+    table_refs: u32,
+    cache_refs: u32,
+    inflight_refs: u32,
+}
+
+impl PageMeta {
+    const fn free() -> Self {
+        Self {
+            state: PageState::Free,
+            generation: 0,
+            table_refs: 0,
+            cache_refs: 0,
+            inflight_refs: 0,
+        }
+    }
+
+    /// Total references across all lease classes.
+    fn total_refs(&self) -> u32 {
+        self.table_refs + self.cache_refs + self.inflight_refs
+    }
+}
+
+/// One copy-on-write operation planned by [`PagePool::plan_cow`].
+///
+/// The caller must raw-copy `valid_prefix_tokens` positions' worth of K
+/// and V bytes from `src_phys` to `dst_phys` (spec §4.3: "copy valid
+/// prefix in every K/V layer arena … preserve encoded bytes/quant/
+/// strides, no dequant/requant").  `k_copy_bytes` / `v_copy_bytes` are
+/// pre-computed for the caller's convenience.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CowCopy {
+    /// Logical page index in the block table being rebound.
+    pub logical_page: usize,
+    /// Source physical page (Sealed or CacheOnly — being COWed away from).
+    pub src_phys: u32,
+    /// Destination physical page (Private — the COW copy).
+    pub dst_phys: u32,
+    /// Valid tokens before the write start in this page (0 when the write
+    /// begins at the page boundary).
+    pub valid_prefix_tokens: usize,
+    /// K-arena bytes to copy (`valid_prefix_tokens × k_per_pos_bytes`).
+    pub k_copy_bytes: usize,
+    /// V-arena bytes to copy (`valid_prefix_tokens × v_per_pos_bytes`).
+    pub v_copy_bytes: usize,
+}
+
+/// A copy-on-write plan produced by [`PagePool::plan_cow`] and consumed by
+/// [`PagePool::commit_cow`] or [`PagePool::abort_cow`].
+///
+/// `plan_cow` reserves private destination pages for every Sealed or
+/// CacheOnly page in the write interval **without** modifying the block
+/// table.  The caller executes the GPU memcpys, then calls `commit_cow`
+/// to rebind the table and adjust refcounts, or `abort_cow` to release
+/// the reserved pages on failure.  This ordering ensures a failed
+/// reservation leaves the original table and pool state intact (spec §4.3:
+/// "transactional failure releases only newly reserved resources").
+#[derive(Debug, Clone)]
+pub struct CowPlan {
+    copies: Vec<CowCopy>,
+}
+
+impl CowPlan {
+    /// The individual copy operations this plan requires.
+    pub fn copies(&self) -> &[CowCopy] {
+        &self.copies
+    }
+
+    /// True when no COW is needed (the write interval touches no
+    /// Sealed/CacheOnly pages).
+    pub fn is_empty(&self) -> bool {
+        self.copies.is_empty()
+    }
+}
+
+// =========================================================================
+// BlockTable — unchanged from Wave 1
+// =========================================================================
 
 /// A session's block table: logical page index -> physical page index.
 /// Uploaded to the GPU as a flat i32 array; its device address goes into
@@ -73,6 +250,14 @@ impl BlockTable {
         self.pages.push(page);
     }
 
+    /// Rebind logical page `lp` to physical page `phys`.  Used by
+    /// `commit_cow` after the GPU memcpy is issued.
+    pub(crate) fn set_page(&mut self, lp: usize, phys: u32) {
+        if lp < self.pages.len() {
+            self.pages[lp] = phys;
+        }
+    }
+
     /// Truncate to exactly `n_pages` pages, returning the freed pages.
     /// Used when trimming a session's KV (e.g. on eviction).
     fn truncate(&mut self, n_pages: usize) -> Vec<u32> {
@@ -111,6 +296,10 @@ impl Default for BlockTable {
     }
 }
 
+// =========================================================================
+// PagePool
+// =========================================================================
+
 /// Free-list page allocator for a shared KV arena.
 ///
 /// The arena is a single contiguous buffer per layer (K and V each).
@@ -118,8 +307,8 @@ impl Default for BlockTable {
 /// which session. Pages are `PAGE_TOKENS * per_pos_bytes` bytes each.
 ///
 /// Prefix sharing: when two sessions share the same token prefix, they
-/// share the physical pages for that prefix. Shared pages are refcounted
-/// and only freed when the last session releases them.
+/// share the physical pages for that prefix. Shared pages are refcounted,
+/// sealed (immutable), and only freed when the last session releases them.
 #[derive(Debug)]
 pub struct PagePool {
     /// Total number of physical pages in the arena.
@@ -132,10 +321,18 @@ pub struct PagePool {
     k_per_pos_bytes: usize,
     v_per_pos_bytes: usize,
     /// Free list of physical page indices. Pages are popped from the end.
+    /// Does NOT include ReclaimPending pages.
     free_pages: Vec<u32>,
-    /// Reference count per physical page. 0 = free, >0 = allocated.
+    /// Per-page metadata (state, generation, class-separated refcounts).
     /// Index is physical page index.
-    refcounts: Vec<u32>,
+    page_meta: Vec<PageMeta>,
+    /// Pages pending reclaim: table/cache refs released but in-flight
+    /// device reads remain. Freed by `drain_completed`.
+    reclaim_pending: Vec<u32>,
+    /// Pool allocation epoch (spec §4.1). Always 0 in this implementation;
+    /// the field and `PageHandle.epoch` check exist so a future device-reload
+    /// upgrade is non-breaking.
+    epoch: u32,
 }
 
 impl PagePool {
@@ -172,7 +369,9 @@ impl PagePool {
             k_per_pos_bytes,
             v_per_pos_bytes,
             free_pages,
-            refcounts: vec![0; n_pages],
+            page_meta: vec![PageMeta::free(); n_pages],
+            reclaim_pending: Vec::new(),
+            epoch: 0,
         })
     }
 
@@ -233,7 +432,8 @@ impl PagePool {
         self.n_pages * self.v_page_bytes()
     }
 
-    /// Number of free pages available for allocation.
+    /// Number of free pages available for allocation (excludes
+    /// ReclaimPending).
     pub fn free_pages(&self) -> usize {
         self.free_pages.len()
     }
@@ -243,6 +443,108 @@ impl PagePool {
         self.n_pages * PAGE_TOKENS
     }
 
+    // ── Wave 2: per-page metadata accessors ───────────────────────────
+
+    /// Total refcount (all lease classes) for physical page `phys`.
+    pub(crate) fn refcount(&self, phys: u32) -> u32 {
+        self.page_meta[phys as usize].total_refs()
+    }
+
+    /// Current [`PageState`] of physical page `phys`.
+    pub fn page_state(&self, phys: u32) -> PageState {
+        self.page_meta[phys as usize].state
+    }
+
+    /// Current generation of physical page `phys`.  A [`PageHandle`]
+    /// carrying a mismatched generation is stale.
+    pub fn page_generation(&self, phys: u32) -> u32 {
+        self.page_meta[phys as usize].generation
+    }
+
+    /// Pool allocation epoch (spec §4.1).
+    pub fn epoch(&self) -> u32 {
+        self.epoch
+    }
+
+    /// Number of pages in the ReclaimPending queue.
+    pub fn reclaim_pending_count(&self) -> usize {
+        self.reclaim_pending.len()
+    }
+
+    // ── Wave 2: handle validation ─────────────────────────────────────
+
+    /// Validate that `handle` refers to the current allocation of its
+    /// physical page (spec §4.3: "stale handles fail before dereference").
+    ///
+    /// Returns `Err` if the epoch changed (device reload), the generation
+    /// changed (page was freed and re-allocated), or the page is Free
+    /// (use-after-free).
+    pub fn validate_handle(&self, handle: &PageHandle) -> Result<(), String> {
+        if handle.epoch != self.epoch {
+            return Err(format!(
+                "PageHandle: epoch mismatch (handle={}, pool={}) — device reloaded?",
+                handle.epoch, self.epoch
+            ));
+        }
+        let meta = &self.page_meta[handle.phys as usize];
+        if meta.generation != handle.generation {
+            return Err(format!(
+                "PageHandle: generation mismatch for phys {} (handle={}, \
+                 current={}) — stale handle",
+                handle.phys, handle.generation, meta.generation
+            ));
+        }
+        if meta.state == PageState::Free {
+            return Err(format!(
+                "PageHandle: phys {} is Free (generation={}) — use-after-free",
+                handle.phys, handle.generation
+            ));
+        }
+        Ok(())
+    }
+
+    // ── Wave 2: internal refcount helpers ─────────────────────────────
+
+    /// Decrement the table refcount for `phys`, transitioning state when
+    /// it reaches zero.  Returns `Err` on underflow (spec §4.3: checked
+    /// arithmetic, no wraparound).
+    fn dec_table_ref(&mut self, phys: u32) -> Result<(), String> {
+        let meta = &mut self.page_meta[phys as usize];
+        if meta.table_refs == 0 {
+            return Err(format!(
+                "dec_table_ref: table_refs underflow for phys {} (state={:?})",
+                phys, meta.state
+            ));
+        }
+        meta.table_refs -= 1;
+        if meta.table_refs == 0 {
+            if meta.cache_refs > 0 {
+                meta.state = PageState::CacheOnly;
+            } else if meta.inflight_refs > 0 {
+                meta.state = PageState::ReclaimPending;
+                self.reclaim_pending.push(phys);
+            } else {
+                meta.state = PageState::Free;
+                meta.generation = meta.generation.wrapping_add(1);
+                self.free_pages.push(phys);
+            }
+        }
+        Ok(())
+    }
+
+    /// Free a just-reserved page back to the free list (used by COW
+    /// rollback).  Bumps generation so any handle obtained during the
+    /// failed reservation is stale.
+    fn release_reserved(&mut self, phys: u32) {
+        let meta = &mut self.page_meta[phys as usize];
+        meta.state = PageState::Free;
+        meta.table_refs = 0;
+        meta.generation = meta.generation.wrapping_add(1);
+        self.free_pages.push(phys);
+    }
+
+    // ── Allocation ────────────────────────────────────────────────────
+
     /// Allocate `n_pages` fresh pages and append them to `table`.
     /// Returns the number of pages actually allocated (may be less than
     /// requested if the pool is nearly full).
@@ -250,21 +552,64 @@ impl PagePool {
         let can_alloc = n_pages.min(self.free_pages.len());
         for _ in 0..can_alloc {
             let page = self.free_pages.pop().expect("free_pages non-empty");
-            self.refcounts[page as usize] = 1;
+            let meta = &mut self.page_meta[page as usize];
+            meta.state = PageState::Private;
+            meta.generation = meta.generation.wrapping_add(1);
+            meta.table_refs = 1;
             table.push_page(page);
         }
         can_alloc
     }
+
+    /// Allocate `n_pages` fresh pages and append them to `table`, returning
+    /// [`PageHandle`]s carrying the current generation for each page (spec
+    /// §4.3).  Unlike [`alloc_pages`], this returns `Err` on insufficient
+    /// free pages rather than silently allocating fewer.
+    pub fn alloc_pages_checked(
+        &mut self,
+        table: &mut BlockTable,
+        n_pages: usize,
+    ) -> Result<Vec<PageHandle>, String> {
+        if n_pages > self.free_pages.len() {
+            return Err(format!(
+                "PagePool: need {} pages but only {} free",
+                n_pages,
+                self.free_pages.len()
+            ));
+        }
+        let mut handles = Vec::with_capacity(n_pages);
+        for _ in 0..n_pages {
+            let page = self.free_pages.pop().expect("free_pages non-empty");
+            let meta = &mut self.page_meta[page as usize];
+            meta.state = PageState::Private;
+            meta.generation = meta.generation.wrapping_add(1);
+            meta.table_refs = 1;
+            handles.push(PageHandle {
+                phys: page,
+                epoch: self.epoch,
+                generation: meta.generation,
+            });
+            table.push_page(page);
+        }
+        Ok(handles)
+    }
+
+    // ── Prefix sharing (existing contract preserved) ──────────────────
 
     /// Share the first `n_pages` pages of `src` with `dst` by pushing the
     /// same physical indices into `dst` and incrementing their refcounts.
     /// Used for prefix sharing: the shared prefix pages persist until the
     /// last session releases them.
     ///
+    /// After sharing, the shared pages are marked [`PageState::Sealed`]
+    /// (immutable).  Any subsequent write intention against a Sealed page
+    /// must go through copy-on-write ([`plan_cow`]/[`commit_cow`]).
+    ///
     /// # The copy-on-write-free contract (must hold or KV corrupts silently)
     ///
-    /// There is NO copy-on-write in this pool. Sharing is only safe at a
-    /// page-aligned fork point, which this method enforces on both sides:
+    /// There is NO copy-on-write in this *sharing* path. Sharing is only
+    /// safe at a page-aligned fork point, which this method enforces on
+    /// both sides:
     ///
     /// - **Every shared page must be FULL in `src`** (`n_pages *
     ///   PAGE_TOKENS <= src.live_tokens()`). A full page is never written
@@ -281,6 +626,9 @@ impl PagePool {
     /// the other's cache with no error raised.
     ///
     /// Panics if `src` has fewer than `n_pages` pages.
+    ///
+    /// [`plan_cow`]: PagePool::plan_cow
+    /// [`commit_cow`]: PagePool::commit_cow
     pub fn share_prefix(
         &mut self,
         src: &BlockTable,
@@ -314,48 +662,75 @@ impl PagePool {
         }
         for lp in 0..n_pages {
             let phys = src.physical(lp).expect("src page exists");
-            self.refcounts[phys as usize] =
-                self.refcounts[phys as usize].saturating_add(1);
+            let meta = &mut self.page_meta[phys as usize];
+            meta.table_refs = meta
+                .table_refs
+                .checked_add(1)
+                .ok_or_else(|| format!("share_prefix: refcount overflow for phys {}", phys))?;
+            // Shared pages are immutable (spec §4.3: "cached pages immutable
+            // even with one owner").
+            meta.state = PageState::Sealed;
             dst.push_page(phys);
         }
         Ok(())
     }
 
-    /// Increment the refcount for physical page `phys`. Used when sharing
-    /// pages between sessions (prefix sharing).
-    pub fn refcount_inc(&mut self, phys: u32) {
-        self.refcounts[phys as usize] = self.refcounts[phys as usize].saturating_add(1);
+    /// Increment the table refcount for physical page `phys` and seal it
+    /// if currently Private (spec §4.3: shared pages are immutable).
+    ///
+    /// Uses checked arithmetic — returns `Err` on overflow or if the page
+    /// is Free.
+    pub fn refcount_inc(&mut self, phys: u32) -> Result<(), String> {
+        let meta = &mut self.page_meta[phys as usize];
+        if meta.state == PageState::Free {
+            return Err(format!("refcount_inc: phys {} is Free", phys));
+        }
+        meta.table_refs = meta
+            .table_refs
+            .checked_add(1)
+            .ok_or_else(|| format!("refcount_inc: overflow for phys {}", phys))?;
+        if meta.state == PageState::Private {
+            meta.state = PageState::Sealed;
+        }
+        Ok(())
     }
 
-    /// Free all pages in `table`, decrementing refcounts. Pages with
-    /// refcount reaching 0 are returned to the free list.
-    pub fn release_table(&mut self, table: &mut BlockTable) {
+    // ── Release / free ────────────────────────────────────────────────
+
+    /// Free all pages in `table`, decrementing table refcounts with
+    /// checked arithmetic.  Pages whose refs reach zero are returned to
+    /// the free list (or to the ReclaimPending queue if in-flight refs
+    /// remain).  Returns `Err` if any page had a zero table refcount
+    /// (underflow / duplicate release); the table is still cleared.
+    pub fn release_table(&mut self, table: &mut BlockTable) -> Result<(), String> {
+        let mut had_error = false;
         for &phys in table.page_indices() {
-            let rc = &mut self.refcounts[phys as usize];
-            if *rc > 0 {
-                *rc -= 1;
-                if *rc == 0 {
-                    self.free_pages.push(phys);
-                }
+            if let Err(_) = self.dec_table_ref(phys) {
+                had_error = true;
             }
         }
         table.pages.clear();
         table.live_tokens = 0;
+        if had_error {
+            Err("release_table: refcount underflow on one or more pages".to_string())
+        } else {
+            Ok(())
+        }
     }
 
-    /// Free the last `n_pages` pages from `table`, decrementing refcounts.
-    /// Used when trimming a session's KV (e.g. sliding window eviction).
-    pub fn free_pages_from_tail(&mut self, table: &mut BlockTable, n_pages: usize) {
+    /// Free the last `n_pages` pages from `table`, decrementing table
+    /// refcounts with checked arithmetic.  Used when trimming a session's
+    /// KV (e.g. sliding window eviction).  Returns `Err` on underflow.
+    pub fn free_pages_from_tail(
+        &mut self,
+        table: &mut BlockTable,
+        n_pages: usize,
+    ) -> Result<(), String> {
         let freed = table.truncate(table.num_pages().saturating_sub(n_pages));
         for phys in freed {
-            let rc = &mut self.refcounts[phys as usize];
-            if *rc > 0 {
-                *rc -= 1;
-                if *rc == 0 {
-                    self.free_pages.push(phys);
-                }
-            }
+            self.dec_table_ref(phys)?;
         }
+        Ok(())
     }
 
     /// Ensure `table` has enough pages to hold `n_tokens` positions,
@@ -386,6 +761,271 @@ impl PagePool {
         table.set_live_tokens(n_tokens);
         Ok(allocated)
     }
+
+    // ── Seal ──────────────────────────────────────────────────────────
+
+    /// Mark a full page as [`PageState::Sealed`] (immutable).  Idempotent
+    /// on already-Sealed pages.  Returns `Err` if the page is Free,
+    /// CacheOnly, or ReclaimPending (spec §4.3).
+    pub fn seal(&mut self, phys: u32) -> Result<(), String> {
+        let meta = &mut self.page_meta[phys as usize];
+        match meta.state {
+            PageState::Private => {
+                meta.state = PageState::Sealed;
+                Ok(())
+            }
+            PageState::Sealed => Ok(()),
+            _ => Err(format!(
+                "seal: phys {} is {:?}, cannot seal",
+                phys, meta.state
+            )),
+        }
+    }
+
+    // ── Copy-on-write (spec §4.3 C3) ──────────────────────────────────
+
+    /// Inspect the write interval `[write_start, write_end)` and reserve
+    /// private destination pages for every [`PageState::Sealed`] or
+    /// [`PageState::CacheOnly`] page in that interval.  Returns a
+    /// [`CowPlan`] describing the copies the caller must perform.
+    ///
+    /// **Does NOT modify the block table** — the caller executes the GPU
+    /// memcpys, then calls [`commit_cow`] to rebind the table, or
+    /// [`abort_cow`] to release the reserved pages on failure.
+    ///
+    /// If any reservation fails (OOM), all reserved pages are released
+    /// and `Err` is returned — the original table and pool state are
+    /// untouched (spec §4.3: "transactional failure releases only newly
+    /// reserved resources").
+    ///
+    /// [`commit_cow`]: PagePool::commit_cow
+    /// [`abort_cow`]: PagePool::abort_cow
+    pub fn plan_cow(
+        &mut self,
+        table: &BlockTable,
+        write_start: usize,
+        write_end: usize,
+    ) -> Result<CowPlan, String> {
+        if write_end < write_start {
+            return Err("plan_cow: write_end < write_start".to_string());
+        }
+        if write_end == write_start {
+            return Ok(CowPlan {
+                copies: Vec::new(),
+            });
+        }
+
+        let first_lp = write_start / PAGE_TOKENS;
+        let last_lp = (write_end - 1) / PAGE_TOKENS;
+
+        let mut copies = Vec::new();
+        let mut reserved: Vec<u32> = Vec::new();
+
+        for lp in first_lp..=last_lp {
+            let phys = match table.physical(lp) {
+                Some(p) => p,
+                None => continue, // page not yet allocated — no COW needed
+            };
+            let state = self.page_meta[phys as usize].state;
+            match state {
+                PageState::Sealed | PageState::CacheOnly => {
+                    // Reserve a private destination.
+                    let dst = match self.free_pages.pop() {
+                        Some(p) => p,
+                        None => {
+                            // OOM — rollback all reservations.
+                            for &d in &reserved {
+                                self.release_reserved(d);
+                            }
+                            return Err(format!(
+                                "plan_cow: OOM — need COW page for logical {} \
+                                 (phys {}, state={:?}) but no free pages",
+                                lp, phys, state
+                            ));
+                        }
+                    };
+                    let dst_meta = &mut self.page_meta[dst as usize];
+                    dst_meta.state = PageState::Private;
+                    dst_meta.generation = dst_meta.generation.wrapping_add(1);
+                    dst_meta.table_refs = 1;
+
+                    // Valid prefix: tokens in this page before write_start.
+                    let page_start = lp * PAGE_TOKENS;
+                    let valid_prefix_tokens =
+                        write_start.saturating_sub(page_start).min(PAGE_TOKENS);
+
+                    copies.push(CowCopy {
+                        logical_page: lp,
+                        src_phys: phys,
+                        dst_phys: dst,
+                        valid_prefix_tokens,
+                        k_copy_bytes: valid_prefix_tokens * self.k_per_pos_bytes,
+                        v_copy_bytes: valid_prefix_tokens * self.v_per_pos_bytes,
+                    });
+                    reserved.push(dst);
+                }
+                _ => {} // Private — mutable, no COW needed
+            }
+        }
+
+        Ok(CowPlan { copies })
+    }
+
+    /// Rebind the block table entries per `plan` and adjust refcounts on
+    /// the old (Sealed/CacheOnly) pages.  Call this **after** the GPU
+    /// memcpys described by the plan have been issued (spec §4.3: "rebind
+    /// table only after copy ordering established").
+    ///
+    /// Old pages whose table refs reach zero transition to Free,
+    /// CacheOnly, or ReclaimPending as appropriate.
+    pub fn commit_cow(&mut self, table: &mut BlockTable, plan: &CowPlan) -> Result<(), String> {
+        for c in plan.copies() {
+            // Rebind the table entry to the private copy.
+            table.set_page(c.logical_page, c.dst_phys);
+            // Decrement the old page's table ref (this table no longer
+            // references it).
+            self.dec_table_ref(c.src_phys)?;
+        }
+        Ok(())
+    }
+
+    /// Release all pages reserved by `plan_cow` without rebinding the
+    /// table.  Call this when the GPU memcpy failed or the step was
+    /// cancelled (spec §4.3: "transactional failure releases only newly
+    /// reserved resources").
+    pub fn abort_cow(&mut self, plan: &CowPlan) {
+        for c in plan.copies() {
+            self.release_reserved(c.dst_phys);
+        }
+    }
+
+    // ── Deferred reclaim (spec §4.4 C4) ───────────────────────────────
+
+    /// Add an in-flight lease to `phys`, preventing immediate reuse even
+    /// after all table/cache refs are released (spec §4.4: "rc==0 ≠ GPU
+    /// completion; free/reuse requires all leases released").
+    ///
+    /// Returns `Err` if the page is Free or on overflow.
+    pub fn add_inflight_ref(&mut self, phys: u32) -> Result<(), String> {
+        let meta = &mut self.page_meta[phys as usize];
+        if meta.state == PageState::Free {
+            return Err(format!("add_inflight_ref: phys {} is Free", phys));
+        }
+        meta.inflight_refs = meta
+            .inflight_refs
+            .checked_add(1)
+            .ok_or_else(|| format!("add_inflight_ref: overflow for phys {}", phys))?;
+        Ok(())
+    }
+
+    /// Release an in-flight lease from `phys`.  The page is NOT freed
+    /// here — it remains [`PageState::ReclaimPending`] until
+    /// [`drain_completed`] confirms completion (spec §4.4).
+    ///
+    /// Returns `Err` on underflow.
+    ///
+    /// [`drain_completed`]: PagePool::drain_completed
+    pub fn release_inflight_ref(&mut self, phys: u32) -> Result<(), String> {
+        let meta = &mut self.page_meta[phys as usize];
+        if meta.inflight_refs == 0 {
+            return Err(format!(
+                "release_inflight_ref: underflow for phys {}",
+                phys
+            ));
+        }
+        meta.inflight_refs -= 1;
+        Ok(())
+    }
+
+    /// Synchronous step-fence drain: free every [`PageState::ReclaimPending`]
+    /// page whose in-flight refs have all been released (spec §4.4:
+    /// "drain_completed(now/lease-proof)").
+    ///
+    /// Returns the physical page indices that were freed.
+    ///
+    /// # HIP-event upgrade seam
+    ///
+    /// This initial implementation uses a **synchronous fence**: the
+    /// caller is expected to have completed a `hipStreamSynchronize` (or
+    /// equivalent) before calling `drain_completed`, so any page with
+    /// `inflight_refs == 0` is safe to free.  The upgrade path is:
+    ///
+    /// 1. `add_inflight_ref` records the HIP event/stream associated with
+    ///    the device read (stored alongside `inflight_refs` in `PageMeta`).
+    /// 2. `drain_completed` queries `hipEventQuery` for each pending page
+    ///    and frees only those whose event is signaled — no global sync
+    ///    needed.
+    /// 3. A `drain_completed_timeout` variant may wait on events with a
+    ///    deadline for back-pressure.
+    ///
+    /// The current API (`add_inflight_ref` / `release_inflight_ref` /
+    /// `drain_completed`) is structured so this upgrade is non-breaking:
+    /// only the internal completion check changes.
+    pub fn drain_completed(&mut self) -> Vec<u32> {
+        let mut freed = Vec::new();
+        let mut still_pending = Vec::new();
+        for &phys in &self.reclaim_pending {
+            if self.page_meta[phys as usize].inflight_refs == 0 {
+                let meta = &mut self.page_meta[phys as usize];
+                meta.state = PageState::Free;
+                meta.generation = meta.generation.wrapping_add(1);
+                self.free_pages.push(phys);
+                freed.push(phys);
+            } else {
+                still_pending.push(phys);
+            }
+        }
+        self.reclaim_pending = still_pending;
+        freed
+    }
+
+    // ── Cache leases ──────────────────────────────────────────────────
+
+    /// Add a cache ownership lease to `phys`.  A page with a cache lease
+    /// is immutable: if it was Private, it transitions to Sealed (spec
+    /// §4.3: "cached pages immutable even with one owner").
+    ///
+    /// Returns `Err` if the page is Free or on overflow.
+    pub fn add_cache_ref(&mut self, phys: u32) -> Result<(), String> {
+        let meta = &mut self.page_meta[phys as usize];
+        if meta.state == PageState::Free {
+            return Err(format!("add_cache_ref: phys {} is Free", phys));
+        }
+        meta.cache_refs = meta
+            .cache_refs
+            .checked_add(1)
+            .ok_or_else(|| format!("add_cache_ref: overflow for phys {}", phys))?;
+        if meta.state == PageState::Private {
+            meta.state = PageState::Sealed;
+        }
+        Ok(())
+    }
+
+    /// Release a cache ownership lease from `phys`.  If all refs are now
+    /// zero, the page is freed (or enters ReclaimPending if in-flight refs
+    /// remain).  Returns `Err` on underflow.
+    pub fn release_cache_ref(&mut self, phys: u32) -> Result<(), String> {
+        let need_free = {
+            let meta = &mut self.page_meta[phys as usize];
+            if meta.cache_refs == 0 {
+                return Err(format!(
+                    "release_cache_ref: underflow for phys {}",
+                    phys
+                ));
+            }
+            meta.cache_refs -= 1;
+            meta.table_refs == 0 && meta.cache_refs == 0 && meta.inflight_refs == 0
+        };
+        if need_free {
+            let meta = &mut self.page_meta[phys as usize];
+            meta.state = PageState::Free;
+            meta.generation = meta.generation.wrapping_add(1);
+            self.free_pages.push(phys);
+        }
+        Ok(())
+    }
+
+    // ── Descriptor construction (unchanged from Wave 1) ───────────────
 
     /// Build a KvSlotDesc for a session with the given block table.
     /// `block_table_dev_addr` is the GPU address of the uploaded page
@@ -419,6 +1059,8 @@ impl PagePool {
 mod tests {
     use super::*;
 
+    // ── Existing tests (updated for Wave 2 API) ───────────────────────
+
     #[test]
     fn alloc_and_release_roundtrip() {
         let mut pool = PagePool::new(16, 1088).unwrap();
@@ -430,12 +1072,13 @@ mod tests {
         assert_eq!(table.num_pages(), 4);
         assert_eq!(pool.free_pages(), 12);
 
-        // Each allocated page should have refcount 1
+        // Each allocated page should have refcount 1 and be Private
         for &phys in table.page_indices() {
-            assert_eq!(pool.refcounts[phys as usize], 1);
+            assert_eq!(pool.refcount(phys), 1);
+            assert_eq!(pool.page_state(phys), PageState::Private);
         }
 
-        pool.release_table(&mut table);
+        pool.release_table(&mut table).unwrap();
         assert_eq!(table.num_pages(), 0);
         assert_eq!(pool.free_pages(), 16);
     }
@@ -487,25 +1130,29 @@ mod tests {
         pool.share_prefix(&table_a, &mut table_b, 3).unwrap();
 
         assert_eq!(table_b.num_pages(), 3);
-        // Shared pages should have refcount 2
+        // Shared pages should have refcount 2 and be Sealed
         for lp in 0..3 {
             let phys = table_a.physical(lp).unwrap();
-            assert_eq!(pool.refcounts[phys as usize], 2);
+            assert_eq!(pool.refcount(phys), 2);
+            assert_eq!(pool.page_state(phys), PageState::Sealed);
         }
-        // Non-shared page should still have refcount 1
+        // Non-shared page should still have refcount 1 and be Private
         let phys_4 = table_a.physical(3).unwrap();
-        assert_eq!(pool.refcounts[phys_4 as usize], 1);
+        assert_eq!(pool.refcount(phys_4), 1);
+        assert_eq!(pool.page_state(phys_4), PageState::Private);
 
         // Releasing table_a should free only the non-shared page
-        pool.release_table(&mut table_a);
+        pool.release_table(&mut table_a).unwrap();
         assert_eq!(pool.free_pages(), 16 - 3); // only 1 page freed, 3 still shared
         for lp in 0..3 {
             let phys = table_b.physical(lp).unwrap();
-            assert_eq!(pool.refcounts[phys as usize], 1);
+            assert_eq!(pool.refcount(phys), 1);
+            // Still Sealed — "cached pages immutable even with one owner"
+            assert_eq!(pool.page_state(phys), PageState::Sealed);
         }
 
         // Releasing table_b frees the remaining shared pages
-        pool.release_table(&mut table_b);
+        pool.release_table(&mut table_b).unwrap();
         assert_eq!(pool.free_pages(), 16);
     }
 
@@ -517,7 +1164,7 @@ mod tests {
         table.set_live_tokens(600);
 
         // Free last 2 pages
-        pool.free_pages_from_tail(&mut table, 2);
+        pool.free_pages_from_tail(&mut table, 2).unwrap();
         assert_eq!(table.num_pages(), 4);
         assert_eq!(pool.free_pages(), 16 - 4);
     }
@@ -538,7 +1185,7 @@ mod tests {
         assert_eq!(dst.num_pages(), 0, "refused share must not touch dst");
         for lp in 0..3 {
             let phys = src.physical(lp).unwrap();
-            assert_eq!(pool.refcounts[phys as usize], 1, "refcounts untouched");
+            assert_eq!(pool.refcount(phys), 1, "refcounts untouched");
         }
         // Sharing only the full pages is fine.
         pool.share_prefix(&src, &mut dst, 2).unwrap();
@@ -560,7 +1207,7 @@ mod tests {
         // And the refused attempt must not have bumped refcounts.
         for lp in 0..2 {
             let phys = src.physical(lp).unwrap();
-            assert_eq!(pool.refcounts[phys as usize], 1);
+            assert_eq!(pool.refcount(phys), 1);
         }
     }
 
@@ -575,9 +1222,9 @@ mod tests {
         let mut dst = BlockTable::new();
         assert!(pool.share_prefix(&src, &mut dst, 2).is_err());
 
-        pool.release_table(&mut src);
+        pool.release_table(&mut src).unwrap();
         assert_eq!(pool.free_pages(), 8);
-        pool.release_table(&mut dst); // empty — no-op
+        pool.release_table(&mut dst).unwrap(); // empty — no-op
         assert_eq!(pool.free_pages(), 8);
     }
 
@@ -606,5 +1253,540 @@ mod tests {
         assert_eq!(desc.legacy_v_base, 0x1000);
         assert_eq!(desc.seq_len, 42);
         assert_eq!(desc.page_tokens, 0);
+    }
+
+    // ── Wave 2: PageHandle / generation tests ──────────────────────────
+
+    #[test]
+    fn alloc_pages_checked_returns_valid_handles() {
+        let mut pool = PagePool::new(8, 1088).unwrap();
+        let mut table = BlockTable::new();
+        let handles = pool.alloc_pages_checked(&mut table, 3).unwrap();
+        assert_eq!(handles.len(), 3);
+        for h in &handles {
+            assert!(pool.validate_handle(h).is_ok());
+            assert_eq!(pool.page_state(h.phys), PageState::Private);
+        }
+        assert_eq!(pool.free_pages(), 5);
+    }
+
+    #[test]
+    fn stale_handle_after_release_fails_validation() {
+        let mut pool = PagePool::new(8, 1088).unwrap();
+        let mut table = BlockTable::new();
+        let handles = pool.alloc_pages_checked(&mut table, 2).unwrap();
+
+        // Release the table — pages are freed, generations bumped.
+        pool.release_table(&mut table).unwrap();
+
+        // All handles should now be stale (page is Free, generation changed).
+        for h in &handles {
+            assert!(
+                pool.validate_handle(h).is_err(),
+                "handle must be stale after release"
+            );
+        }
+    }
+
+    #[test]
+    fn handle_still_valid_while_page_referenced() {
+        let mut pool = PagePool::new(8, 1088).unwrap();
+        let mut table_a = BlockTable::new();
+        let handles_a = pool.alloc_pages_checked(&mut table_a, 2);
+        let handles_a = handles_a.unwrap();
+        table_a.set_live_tokens(2 * PAGE_TOKENS);
+
+        // Share with table_b
+        let mut table_b = BlockTable::new();
+        pool.share_prefix(&table_a, &mut table_b, 2).unwrap();
+
+        // Release table_a — shared pages still referenced by table_b
+        pool.release_table(&mut table_a).unwrap();
+
+        // Handles for shared pages should still be valid (page not freed,
+        // generation unchanged — only table_refs decremented).
+        for h in &handles_a {
+            assert_eq!(pool.page_state(h.phys), PageState::Sealed);
+            assert!(
+                pool.validate_handle(h).is_ok(),
+                "handle for still-referenced page should be valid"
+            );
+        }
+
+        // Release table_b — now pages are freed
+        pool.release_table(&mut table_b).unwrap();
+        for h in &handles_a {
+            assert!(
+                pool.validate_handle(h).is_err(),
+                "handle must be stale after all refs released"
+            );
+        }
+    }
+
+    // ── Wave 2: seal / PageState tests ────────────────────────────────
+
+    #[test]
+    fn seal_marks_private_page_as_sealed() {
+        let mut pool = PagePool::new(4, 1088).unwrap();
+        let mut table = BlockTable::new();
+        pool.alloc_pages(&mut table, 1);
+        let phys = table.physical(0).unwrap();
+        assert_eq!(pool.page_state(phys), PageState::Private);
+
+        pool.seal(phys).unwrap();
+        assert_eq!(pool.page_state(phys), PageState::Sealed);
+
+        // Idempotent
+        pool.seal(phys).unwrap();
+        assert_eq!(pool.page_state(phys), PageState::Sealed);
+    }
+
+    #[test]
+    fn seal_refuses_free_page() {
+        let mut pool = PagePool::new(4, 1088).unwrap();
+        let err = pool.seal(0).unwrap_err();
+        assert!(err.contains("Free"));
+    }
+
+    #[test]
+    fn shared_page_is_sealed_and_stays_sealed_after_partial_release() {
+        let mut pool = PagePool::new(8, 1088).unwrap();
+        let mut table_a = BlockTable::new();
+        pool.alloc_pages(&mut table_a, 2);
+        table_a.set_live_tokens(2 * PAGE_TOKENS);
+
+        let mut table_b = BlockTable::new();
+        pool.share_prefix(&table_a, &mut table_b, 2).unwrap();
+
+        let phys = table_a.physical(0).unwrap();
+        assert_eq!(pool.page_state(phys), PageState::Sealed);
+        assert_eq!(pool.refcount(phys), 2);
+
+        // Release one table — page still Sealed (immutable even with one owner)
+        pool.release_table(&mut table_a).unwrap();
+        assert_eq!(pool.refcount(phys), 1);
+        assert_eq!(pool.page_state(phys), PageState::Sealed);
+
+        pool.release_table(&mut table_b).unwrap();
+        assert_eq!(pool.page_state(phys), PageState::Free);
+    }
+
+    // ── Wave 2: COW tests (A2, A4) ────────────────────────────────────
+
+    #[test]
+    fn a2_branch_share_then_cow_isolation() {
+        let mut pool = PagePool::new(16, 1088).unwrap();
+
+        // Branch A: 4 full pages (512 tokens)
+        let mut table_a = BlockTable::new();
+        pool.alloc_pages(&mut table_a, 4);
+        table_a.set_live_tokens(4 * PAGE_TOKENS);
+
+        // Share first 2 pages with branch B
+        let mut table_b = BlockTable::new();
+        pool.share_prefix(&table_a, &mut table_b, 2).unwrap();
+        table_b.set_live_tokens(2 * PAGE_TOKENS);
+
+        // Shared pages are Sealed and have identical physical indices
+        for lp in 0..2 {
+            let phys = table_a.physical(lp).unwrap();
+            assert_eq!(pool.page_state(phys), PageState::Sealed);
+            assert_eq!(table_a.physical(lp), table_b.physical(lp));
+        }
+
+        // Both branches append: allocate new private pages
+        pool.alloc_pages(&mut table_a, 1);
+        table_a.set_live_tokens(5 * PAGE_TOKENS);
+        pool.alloc_pages(&mut table_b, 1);
+        table_b.set_live_tokens(3 * PAGE_TOKENS);
+
+        // Private tails differ and are Private
+        assert_ne!(table_a.physical(4), table_b.physical(2));
+        assert_eq!(
+            pool.page_state(table_a.physical(4).unwrap()),
+            PageState::Private
+        );
+        assert_eq!(
+            pool.page_state(table_b.physical(2).unwrap()),
+            PageState::Private
+        );
+
+        // Branch B rewinds and wants to write page 0 (Sealed → COW needed)
+        let plan = pool.plan_cow(&table_b, 0, PAGE_TOKENS).unwrap();
+        assert_eq!(plan.copies().len(), 1);
+        assert_eq!(plan.copies()[0].logical_page, 0);
+        assert_eq!(plan.copies()[0].src_phys, table_b.physical(0).unwrap());
+        assert_eq!(plan.copies()[0].valid_prefix_tokens, 0); // write from pos 0
+
+        // Commit COW: rebind table B's page 0 to the private copy
+        pool.commit_cow(&mut table_b, &plan).unwrap();
+
+        // Branch B's page 0 is now private (different from A's)
+        assert_ne!(table_b.physical(0), table_a.physical(0));
+        assert_eq!(
+            pool.page_state(table_b.physical(0).unwrap()),
+            PageState::Private
+        );
+
+        // Branch A's page 0 is still the original shared page (unchanged)
+        let original_phys = table_a.physical(0).unwrap();
+        assert_eq!(pool.page_state(original_phys), PageState::Sealed);
+        assert_eq!(pool.refcount(original_phys), 1); // only A references it now
+
+        // Page conservation: 16 total
+        // A: [orig0, orig1, orig2, orig3, new_a] = 5 pages
+        // B: [cow0, orig1, new_b] = 3 pages
+        // Unique: orig0, orig1, orig2, orig3, new_a, cow0, new_b = 7
+        // Free: 16 - 7 = 9
+        assert_eq!(pool.free_pages(), 9);
+    }
+
+    #[test]
+    fn cow_plan_with_valid_prefix() {
+        // Write starts mid-page: the valid prefix (tokens before write_start
+        // in that page) must be copied.
+        let mut pool = PagePool::new(8, 1088).unwrap();
+        let mut table = BlockTable::new();
+        pool.alloc_pages(&mut table, 2);
+        table.set_live_tokens(2 * PAGE_TOKENS);
+
+        // Seal page 0 so COW is triggered
+        pool.seal(table.physical(0).unwrap()).unwrap();
+
+        // Write at positions [64, 128) — page 0 has 64 valid prefix tokens
+        let plan = pool.plan_cow(&table, 64, 128).unwrap();
+        assert_eq!(plan.copies().len(), 1);
+        assert_eq!(plan.copies()[0].valid_prefix_tokens, 64);
+        assert_eq!(plan.copies()[0].k_copy_bytes, 64 * 1088);
+        assert_eq!(plan.copies()[0].v_copy_bytes, 64 * 1088);
+    }
+
+    #[test]
+    fn cow_plan_skips_private_pages() {
+        let mut pool = PagePool::new(8, 1088).unwrap();
+        let mut table = BlockTable::new();
+        pool.alloc_pages(&mut table, 2);
+        table.set_live_tokens(2 * PAGE_TOKENS);
+
+        // No pages are Sealed — plan should be empty
+        let plan = pool.plan_cow(&table, 0, 2 * PAGE_TOKENS).unwrap();
+        assert!(plan.is_empty());
+    }
+
+    #[test]
+    fn cow_abort_releases_reserved_pages() {
+        let mut pool = PagePool::new(8, 1088).unwrap();
+        let mut table = BlockTable::new();
+        pool.alloc_pages(&mut table, 2);
+        table.set_live_tokens(2 * PAGE_TOKENS);
+        pool.seal(table.physical(0).unwrap()).unwrap();
+
+        let free_before = pool.free_pages();
+        let plan = pool.plan_cow(&table, 0, PAGE_TOKENS).unwrap();
+        assert_eq!(pool.free_pages(), free_before - 1); // one page reserved
+
+        // Abort — reserved page released
+        pool.abort_cow(&plan);
+        assert_eq!(pool.free_pages(), free_before);
+
+        // Table unchanged
+        assert_eq!(table.num_pages(), 2);
+    }
+
+    #[test]
+    fn a4_cow_oom_leaves_tables_intact() {
+        let mut pool = PagePool::new(8, 1088).unwrap();
+
+        // Branch A: 4 full pages
+        let mut table_a = BlockTable::new();
+        pool.alloc_pages(&mut table_a, 4);
+        table_a.set_live_tokens(4 * PAGE_TOKENS);
+
+        // Share all 4 pages with branch B
+        let mut table_b = BlockTable::new();
+        pool.share_prefix(&table_a, &mut table_b, 4).unwrap();
+        table_b.set_live_tokens(4 * PAGE_TOKENS);
+
+        // Exhaust remaining pages with branch C
+        let mut table_c = BlockTable::new();
+        pool.alloc_pages(&mut table_c, 4);
+        table_c.set_live_tokens(4 * PAGE_TOKENS);
+        assert_eq!(pool.free_pages(), 0);
+
+        // COW on table_b fails — no free pages
+        let err = pool.plan_cow(&table_b, 0, PAGE_TOKENS).unwrap_err();
+        assert!(err.contains("OOM"), "unexpected: {err}");
+
+        // Table B is unchanged (plan_cow doesn't modify the table on failure)
+        assert_eq!(table_b.num_pages(), 4);
+        for lp in 0..4 {
+            assert_eq!(
+                table_b.physical(lp),
+                table_a.physical(lp),
+                "table B must be unchanged after failed COW"
+            );
+        }
+
+        // Pool state unchanged — no pages leaked
+        assert_eq!(pool.free_pages(), 0);
+
+        // Unrelated request: release C, then COW succeeds
+        pool.release_table(&mut table_c).unwrap();
+        assert_eq!(pool.free_pages(), 4);
+
+        let plan = pool.plan_cow(&table_b, 0, PAGE_TOKENS).unwrap();
+        pool.commit_cow(&mut table_b, &plan).unwrap();
+        assert_ne!(table_b.physical(0), table_a.physical(0));
+        assert_eq!(
+            pool.page_state(table_b.physical(0).unwrap()),
+            PageState::Private
+        );
+    }
+
+    // ── Wave 2: checked refcount / underflow tests (A3) ───────────────
+
+    #[test]
+    fn a3_release_underflow_detected() {
+        let mut pool = PagePool::new(8, 1088).unwrap();
+        let mut table = BlockTable::new();
+        pool.alloc_pages(&mut table, 2);
+        let phys0 = table.physical(0).unwrap();
+
+        // Release normally
+        pool.release_table(&mut table).unwrap();
+        assert_eq!(pool.refcount(phys0), 0);
+        assert_eq!(pool.page_state(phys0), PageState::Free);
+
+        // Construct a stale table referencing the freed page
+        let mut stale_table = BlockTable::new();
+        stale_table.push_page(phys0);
+
+        // Releasing the stale table must detect underflow
+        let result = pool.release_table(&mut stale_table);
+        assert!(result.is_err(), "releasing freed page must error");
+        assert!(result.unwrap_err().contains("underflow"));
+    }
+
+    #[test]
+    fn a3_property_page_conservation_and_stale_handle_rejection() {
+        let mut pool = PagePool::new(16, 1088).unwrap();
+
+        // Allocate 4 pages for table A
+        let mut table_a = BlockTable::new();
+        let handles_a = pool.alloc_pages_checked(&mut table_a, 4).unwrap();
+        table_a.set_live_tokens(4 * PAGE_TOKENS);
+        assert_eq!(pool.free_pages(), 12);
+
+        // Share first 2 pages with table B
+        let mut table_b = BlockTable::new();
+        pool.share_prefix(&table_a, &mut table_b, 2).unwrap();
+        assert_eq!(pool.refcount(handles_a[0].phys), 2);
+        assert_eq!(pool.page_state(handles_a[0].phys), PageState::Sealed);
+
+        // Page conservation invariant
+        let n_alloc: usize = (0..pool.n_pages())
+            .filter(|&i| pool.page_state(i as u32) != PageState::Free)
+            .count();
+        assert_eq!(n_alloc + pool.free_pages(), pool.n_pages());
+
+        // Release table A — shared pages survive, private pages freed
+        pool.release_table(&mut table_a).unwrap();
+        assert_eq!(pool.page_state(handles_a[0].phys), PageState::Sealed); // shared
+        assert_eq!(pool.page_state(handles_a[2].phys), PageState::Free); // freed
+
+        // Stale handle for freed page fails
+        assert!(pool.validate_handle(&handles_a[2]).is_err());
+
+        // Handle for still-referenced page is valid
+        assert!(pool.validate_handle(&handles_a[0]).is_ok());
+
+        // Release table B — all pages freed
+        pool.release_table(&mut table_b).unwrap();
+        assert_eq!(pool.free_pages(), 16);
+
+        // All handles stale
+        for h in &handles_a {
+            assert!(pool.validate_handle(h).is_err());
+        }
+
+        // Final conservation check
+        let n_alloc: usize = (0..pool.n_pages())
+            .filter(|&i| pool.page_state(i as u32) != PageState::Free)
+            .count();
+        assert_eq!(n_alloc + pool.free_pages(), pool.n_pages());
+        assert_eq!(pool.reclaim_pending_count(), 0);
+    }
+
+    #[test]
+    fn a3_checked_refcount_no_overflow() {
+        let mut pool = PagePool::new(2, 1088).unwrap();
+        let mut table_a = BlockTable::new();
+        pool.alloc_pages(&mut table_a, 1);
+        table_a.set_live_tokens(PAGE_TOKENS);
+
+        // Share the same page many times — refcount increments
+        let mut tables = Vec::new();
+        for _ in 0..10 {
+            let mut dst = BlockTable::new();
+            pool.share_prefix(&table_a, &mut dst, 1).unwrap();
+            tables.push(dst);
+        }
+        assert_eq!(pool.refcount(table_a.physical(0).unwrap()), 11);
+
+        // Release all — page eventually freed
+        pool.release_table(&mut table_a).unwrap();
+        for mut t in tables {
+            pool.release_table(&mut t).unwrap();
+        }
+        assert_eq!(pool.free_pages(), 2);
+    }
+
+    // ── Wave 2: deferred reclaim tests (A5) ───────────────────────────
+
+    #[test]
+    fn a5_reuse_while_reclaim_pending_fails_until_drain() {
+        let mut pool = PagePool::new(4, 1088).unwrap();
+
+        // Allocate a page
+        let mut table = BlockTable::new();
+        pool.alloc_pages(&mut table, 1);
+        let phys = table.physical(0).unwrap();
+        let gen = pool.page_generation(phys);
+        assert_eq!(pool.page_state(phys), PageState::Private);
+
+        // Pin with an in-flight lease (simulating a GPU read in progress)
+        pool.add_inflight_ref(phys).unwrap();
+
+        // Release the table ref — page goes to ReclaimPending (not Free)
+        pool.release_table(&mut table).unwrap();
+        assert_eq!(pool.page_state(phys), PageState::ReclaimPending);
+        assert_eq!(pool.free_pages(), 3); // NOT in free list
+        assert_eq!(pool.reclaim_pending_count(), 1);
+
+        // Allocation must not reuse the reclaim-pending page
+        let mut table2 = BlockTable::new();
+        pool.alloc_pages(&mut table2, 1);
+        assert_ne!(
+            table2.physical(0).unwrap(),
+            phys,
+            "must not reuse reclaim-pending page"
+        );
+        assert_eq!(pool.free_pages(), 2);
+
+        // Release the new table
+        pool.release_table(&mut table2).unwrap();
+        assert_eq!(pool.free_pages(), 3);
+
+        // Release the in-flight ref — page still ReclaimPending
+        pool.release_inflight_ref(phys).unwrap();
+        assert_eq!(pool.page_state(phys), PageState::ReclaimPending);
+        assert_eq!(pool.free_pages(), 3);
+
+        // Drain — page freed
+        let freed = pool.drain_completed();
+        assert_eq!(freed, vec![phys]);
+        assert_eq!(pool.page_state(phys), PageState::Free);
+        assert_eq!(pool.free_pages(), 4);
+        assert_eq!(pool.reclaim_pending_count(), 0);
+
+        // Now the page is allocatable again
+        let mut table3 = BlockTable::new();
+        pool.alloc_pages(&mut table3, 1);
+        assert_eq!(pool.free_pages(), 3);
+
+        // Generation was bumped — old handle is stale
+        let new_gen = pool.page_generation(phys);
+        assert_ne!(new_gen, gen, "generation must change after free/realloc");
+        let old_handle = PageHandle {
+            phys,
+            epoch: 0,
+            generation: gen,
+        };
+        assert!(
+            pool.validate_handle(&old_handle).is_err(),
+            "stale handle with old generation must fail"
+        );
+    }
+
+    #[test]
+    fn drain_completed_skips_pages_with_active_inflight() {
+        let mut pool = PagePool::new(4, 1088).unwrap();
+        let mut table = BlockTable::new();
+        pool.alloc_pages(&mut table, 1);
+        let phys = table.physical(0).unwrap();
+
+        // Two in-flight refs
+        pool.add_inflight_ref(phys).unwrap();
+        pool.add_inflight_ref(phys).unwrap();
+
+        // Release table — ReclaimPending
+        pool.release_table(&mut table).unwrap();
+        assert_eq!(pool.page_state(phys), PageState::ReclaimPending);
+
+        // Release one in-flight — still pending (one ref remains)
+        pool.release_inflight_ref(phys).unwrap();
+        let freed = pool.drain_completed();
+        assert!(freed.is_empty(), "page with active in-flight must not drain");
+        assert_eq!(pool.page_state(phys), PageState::ReclaimPending);
+
+        // Release last in-flight — now drainable
+        pool.release_inflight_ref(phys).unwrap();
+        let freed = pool.drain_completed();
+        assert_eq!(freed, vec![phys]);
+        assert_eq!(pool.page_state(phys), PageState::Free);
+    }
+
+    #[test]
+    fn inflight_underflow_detected() {
+        let mut pool = PagePool::new(4, 1088).unwrap();
+        let err = pool.release_inflight_ref(0).unwrap_err();
+        assert!(err.contains("underflow"));
+    }
+
+    // ── Wave 2: cache lease tests ─────────────────────────────────────
+
+    #[test]
+    fn cache_ref_makes_private_page_sealed() {
+        let mut pool = PagePool::new(4, 1088).unwrap();
+        let mut table = BlockTable::new();
+        pool.alloc_pages(&mut table, 1);
+        let phys = table.physical(0).unwrap();
+        assert_eq!(pool.page_state(phys), PageState::Private);
+
+        pool.add_cache_ref(phys).unwrap();
+        assert_eq!(pool.page_state(phys), PageState::Sealed);
+
+        // Release table ref — page goes to CacheOnly (not Free)
+        pool.release_table(&mut table).unwrap();
+        assert_eq!(pool.page_state(phys), PageState::CacheOnly);
+        assert_eq!(pool.free_pages(), 3);
+
+        // Release cache ref — page freed
+        pool.release_cache_ref(phys).unwrap();
+        assert_eq!(pool.page_state(phys), PageState::Free);
+        assert_eq!(pool.free_pages(), 4);
+    }
+
+    #[test]
+    fn cow_on_cacheonly_page() {
+        let mut pool = PagePool::new(8, 1088).unwrap();
+        let mut table = BlockTable::new();
+        pool.alloc_pages(&mut table, 2);
+        table.set_live_tokens(2 * PAGE_TOKENS);
+
+        // Add cache ref and release table — page becomes CacheOnly
+        let phys0 = table.physical(0).unwrap();
+        pool.add_cache_ref(phys0).unwrap();
+        // Page is now Sealed (Private + cache ref)
+        assert_eq!(pool.page_state(phys0), PageState::Sealed);
+
+        // plan_cow should detect Sealed page and plan a copy
+        let plan = pool.plan_cow(&table, 0, PAGE_TOKENS).unwrap();
+        assert_eq!(plan.copies().len(), 1);
+        assert_eq!(plan.copies()[0].src_phys, phys0);
+
+        // Commit COW
+        pool.commit_cow(&mut table, &plan).unwrap();
+        assert_ne!(table.physical(0).unwrap(), phys0);
     }
 }
