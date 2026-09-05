@@ -3,7 +3,7 @@
 # Serving cache scheduler — implementation plan
 
 - **Date:** 2026-09-05
-- **Status:** waves 0–4 landed; P5 text-AR greedy prefix cache verified on gfx1101 / ROCm 10. Defaults stay off (`serve.prefix_cache`, `serve.structured_jump_forward`, `serve.scheduler_overlap`). Not admitted.
+- **Status:** waves 0–5 advertised text cells composed on gfx1101 / ROCm 10. Defaults stay off (`serve.prefix_cache`, `serve.structured_jump_forward`, `serve.scheduler_overlap`). Not admitted. Vision+prefix stays off.
 - **Spec:** [2026-09-05-serving-cache-scheduler-spec.md](2026-09-05-serving-cache-scheduler-spec.md) — this plan implements it; it repeats no guarantees the spec owns.
 - **Base branch:** `feat/serving-cache-scheduler`, forked from `patch/oom-guard-multislot-tip` HEAD `d995164b8` (the spec's grounding checkout) with `feat/multislot-vision-mtp` tip `6f85c5da5` merged in. All slices branch from and PR back to this branch.
 - **Recon:** four source-grounded inventories taken this date over the working tree; cited file:line below is from that recon, re-verify before editing (index drift).
@@ -17,10 +17,10 @@
 | 2 P1 pool/admission + P4 grammar core | done | `b6b4a6a30`, `3f024ec4c` |
 | 3 P2 prefix cache | done, default off | `0f648d091`, `d4faba38b`, `21f202f3d` |
 | 4 P3 scheduler + wait + jump-forward planner | done; wait on; jump-forward default off | `4e2ed2423`–`f3222d63d` |
-| 5 composition | **partial** | C1 SHA-256 tokenizer/template/HFQ digests; lookup returns token-keyed page handles (not length-keyed). GPU oracle `test_serve_prefix_cache` PASS on gfx1101 / ROCm 10 (qwen3.5-4b.mq4v2.hfq): cold reused=0, warm identical reused=256 matching tokens, branch reused=256. `serve_harness.py --mode chain` cached_tokens 0→89→192→265→346. Vision+prefix off; tools/stop/logprobs refused; MTP sidecar path `.mq4v2.mtp` still missing; A20 soak not run; no `admissions.yml` row. CONFIG/SERVE document opt-in only. |
-| 6 overlap | **open, stays off** | `serve.scheduler_overlap=false`; no host-gap measurement, no overlap implementation beyond the flag. |
+| 5 composition | **composed for advertised text cells** | MTP sidecar probe finds `qwen3.5-4b.mtp` next to `qwen3.5-4b.mq4v2.hfq`. GPU `test_serve_prefix_cache --mtp-k 4` PASS on gfx1101 / ROCm 10: greedy MTP cold 0 / warm 256 / branch 256 matching tokens; sampled AR reuse 256/256 deterministic seed; grammar AR reuse 256 and `{"city":"Rome"}`; 4-hit soak then `reset` → reused=0. `serve_harness.py --mode chain` cached_tokens 0→89→192→265→346. Vision+prefix off (X2); tools/stop/logprobs refused; no A19 fault injection; no `admissions.yml` row. |
+| 6 overlap | **open, stays off** | `serve.scheduler_overlap` is a registered flag only — no host-prep overlap path exists, so there is no host-gap to measure. Spec §10: leave off. |
 
-Host tests: prefix_index 27 + C1 digest 2 + qwen35 policy 7. GPU: `test_serve_prefix_cache` PASS. Pre-existing `oversized_pool_is_refused_not_allocated` fails when OOM guard is inactive.
+Host tests: sidecar_probe 2. GPU: `test_serve_prefix_cache --mtp-k 4` PASS. Pre-existing `oversized_pool_is_refused_not_allocated` fails when OOM guard is inactive.
 
 ## 1. What already exists (do not rebuild)
 

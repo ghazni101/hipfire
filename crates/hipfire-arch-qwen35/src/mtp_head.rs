@@ -69,7 +69,7 @@ use hipfire_runtime::llama::{
     rotate_x_mq_for, weight_gemv, EmbeddingFormat, WeightTensor,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // ─── Config ──────────────────────────────────────────────────────────────
 
@@ -806,6 +806,47 @@ pub fn load_mtp_head_bundled(
     };
     let head = load_mtp_head_at_offset(path, gpu, max_seq, mtp_offset)?;
     Ok(Some(head))
+}
+
+/// Candidate `.mtp` sidecar paths for a trunk weight file.
+///
+/// `Path::with_extension("mtp")` only replaces the last extension, so
+/// `qwen3.5-4b.mq4v2.hfq` becomes `qwen3.5-4b.mq4v2.mtp`. Product extracts
+/// sit next to the trunk as `qwen3.5-4b.mtp`. Probe both, plus the no-`.hfq`
+/// sibling (`qwen3.5-4b.mq4` → `qwen3.5-4b.mtp`).
+pub fn mtp_sidecar_candidates(trunk: &Path) -> Vec<PathBuf> {
+    let mut out = Vec::new();
+    let mut push = |p: PathBuf| {
+        if !out.iter().any(|e| e == &p) {
+            out.push(p);
+        }
+    };
+    push(trunk.with_extension("mtp"));
+    let name = trunk.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let parent = trunk.parent().unwrap_or_else(|| Path::new("."));
+    let stem = name.strip_suffix(".hfq").unwrap_or(name);
+    const QUANTS: &[&str] = &[
+        ".mq4v2", ".mq6v2", ".mq5v2", ".mq3v2", ".mq2v2", ".mq4cg256", ".mq4",
+        ".mq6", ".mq8", ".q8", ".q4", ".bf16",
+    ];
+    for q in QUANTS {
+        if let Some(base) = stem.strip_suffix(*q) {
+            push(parent.join(format!("{base}.mtp")));
+        }
+    }
+    if let Some((base, rest)) = stem.rsplit_once('.') {
+        if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphanumeric()) {
+            push(parent.join(format!("{base}.mtp")));
+        }
+    }
+    out
+}
+
+/// First candidate that exists on disk, if any.
+pub fn find_mtp_sidecar(trunk: &Path) -> Option<PathBuf> {
+    mtp_sidecar_candidates(trunk)
+        .into_iter()
+        .find(|p| p.exists())
 }
 
 // ─── Loader ──────────────────────────────────────────────────────────────
@@ -2608,4 +2649,32 @@ pub fn mtp_head_forward_block_batched(
     )?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod sidecar_probe_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn mq4v2_hfq_also_probes_stem_mtp() {
+        let c = mtp_sidecar_candidates(Path::new("/models/qwen3.5-4b.mq4v2.hfq"));
+        assert!(
+            c.iter().any(|p| p.ends_with("qwen3.5-4b.mq4v2.mtp")),
+            "{c:?}"
+        );
+        assert!(
+            c.iter().any(|p| p.ends_with("qwen3.5-4b.mtp")),
+            "{c:?}"
+        );
+    }
+
+    #[test]
+    fn mq4_probes_stem_mtp() {
+        let c = mtp_sidecar_candidates(Path::new("/models/qwen3.5-4b.mq4"));
+        assert!(
+            c.iter().any(|p| p.ends_with("qwen3.5-4b.mtp")),
+            "{c:?}"
+        );
+    }
 }

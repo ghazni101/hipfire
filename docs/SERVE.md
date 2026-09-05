@@ -13,7 +13,7 @@ configuration ([CONFIG.md](CONFIG.md)); the HTTP surface is implemented by
 | Idle unload | `serve.idle_timeout_seconds = 300` (`0` = never) |
 | Max request body | `serve.max_request_bytes = 67108864` (64 MiB) |
 | Admission queue | `serve.max_queue = 64`, `serve.queue_timeout_ms = 30000`, `serve.max_queue_bytes = 268435456` |
-| Prefix cache | `serve.prefix_cache = false` (opt-in; text AR greedy paged slots only) |
+| Prefix cache | `serve.prefix_cache = false` (opt-in; paged slots, text only) |
 | Pid / log | `~/.hipfire/serve.pid`, `~/.hipfire/serve.log` |
 
 Truth state: **shipped / ref-pinned** for the HTTP contract and lifecycle
@@ -304,10 +304,13 @@ start cost on that first switched request).
 
 `serve.prefix_cache` is **off by default**. On the multi-slot engine
 (`serve.multi_slot=true`) it enables cross-session radix reuse of sealed
-128-token KV pages plus Qwen hybrid checkpoints. Verified on gfx1101 /
-ROCm 10 for greedy text AR (`test_serve_prefix_cache` + `serve_harness.py --mode chain`).
+128-token KV pages plus Qwen hybrid checkpoints. `.mtp` sidecars are
+probed as both `foo.mq4v2.mtp` and `foo.mtp`. Verified on gfx1101 /
+ROCm 10 (`test_serve_prefix_cache --mtp-k 4`): greedy MTP, sampled AR,
+and JSON-Schema AR all reuse ≥256 tokens; `reset` forces a cold miss.
 Vision+prefix reuse stays off. Tools/stop/logprobs stay refused on slots.
-This is not a registry admission.
+`serve.scheduler_overlap` stays off (no overlap implementation, no
+host-gap to measure). This is not a registry admission.
 
 ```bash
 HIPFIRE_SERVE_MULTI_SLOT=true HIPFIRE_SERVE_PREFIX_CACHE=true \
