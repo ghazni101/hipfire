@@ -2387,11 +2387,30 @@ fn main() {
                 // mode owns exactly one SlotEngine/weight set with no ordinary-model fallback.
                 // Spawn a bounded request worker so the main loop continues accepting independent generates.
                 if let Some(slot) = slot_backend.clone() {
+                    // Bound thread creation BEFORE spawning (spec §5.3:
+                    // "a guard acquired inside an already spawned thread
+                    // does not bound thread creation"). The worker's own
+                    // acquire_guard remains the hard atomic bound; this
+                    // pre-check keeps an arrival burst from spawning a
+                    // thread per rejected request.
+                    if slot.active_count() >= 32 {
+                        hipfire_engine::emit::emit_active_attempt_error(
+                            &mut stdout,
+                            Some(id),
+                            "too many concurrent slot requests (bounded worker limit hit)",
+                            "validation",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        batch_clear_terminal(id, gen_attempt_id);
+                        continue;
+                    }
                     let msg_clone = msg.clone();
                     let id_owned = id.to_string();
                     let slot_clone = slot.clone();
                     let admission = admission;
-                    // Bounded: refuse if too many active? The backend's active counter bounds concurrency;
+                    // Bounded: the backend's active counter bounds concurrency;
                     // engine itself is the only GPU worker, so workers serialize on engine submit.
                     std::thread::spawn(move || {
                         // Each worker uses its own stdout handle; every event is one serde JSON line.

@@ -1631,15 +1631,16 @@ pub(crate) fn project_request_contract(
 ///
 /// Accepts:
 /// - `None` / null / absent → no constraint.
-/// - `{"type": "json_object"}` → no schema-level constraint (the model is
-///   asked to emit valid JSON; the existing tool-call grammar handles this
-///   on the non-slot path). Returns `None` so the slot path does not treat
-///   it as a strict schema.
 /// - `{"type": "json_schema", "json_schema": {"schema": {...}, ...}}` →
 ///   validates the schema against the supported strict subset and returns
 ///   a [`ResponseFormat``.
 ///
 /// Rejects (HTTP 400 via `bail!`):
+/// - `{"type": "json_object"}`: the multi-slot serve route has no
+///   json_object enforcement — silently dropping the requested constraint
+///   and returning 200 would be exactly the "silent semantic downgrade"
+///   the spec forbids (§7.1/X2). A future change may supply enforcement
+///   and re-enable it with its own oracle.
 /// - Unknown `type` values.
 /// - Missing/malformed `json_schema` wrapper or `schema` object.
 /// - Unsupported JSON Schema keywords (external refs, regex, recursion,
@@ -1660,10 +1661,11 @@ pub(crate) fn validate_response_format(
         .ok_or_else(|| anyhow!("response_format.type is required"))?;
     match ty {
         "json_object" => {
-            // json_object is a weak constraint (valid JSON, no schema). The
-            // existing tool-call / DSML grammar handles this on the non-slot
-            // path; no strict schema to forward.
-            Ok(None)
+            bail!(
+                "response_format type 'json_object' is not supported on this \
+                 serve route (no enforcement exists; only json_schema strict \
+                 output is supported)"
+            );
         }
         "json_schema" => {
             let js = value
@@ -1705,6 +1707,12 @@ const SUPPORTED_TYPE_VALUES: &[&str] = &[
 /// Assertion keywords that are NOT supported in the strict subset (spec
 /// §7.1 G1: reject unsupported assertion keywords, external references,
 /// regex assertions, recursion and combinators before generation).
+///
+/// MUST stay a superset of what the saddle-core compiler rejects
+/// (`grammar::json_schema::compile_node` default-deny): this validator is
+/// the operator-facing pre-flight, and the two layers must refuse the same
+/// schemas or a schema rejected here could compile to something else
+/// server-side (or vice versa).
 const REJECTED_ASSERTION_KEYWORDS: &[&str] = &[
     "$ref",
     "$id",
@@ -1717,7 +1725,9 @@ const REJECTED_ASSERTION_KEYWORDS: &[&str] = &[
     "if",
     "then",
     "else",
+    "additionalItems",
     "dependentSchemas",
+    "dependentRequired",
     "prefixItems",
     "contains",
     "maxContains",
@@ -1726,11 +1736,19 @@ const REJECTED_ASSERTION_KEYWORDS: &[&str] = &[
     "propertyNames",
     "uniqueItems",
     "multipleOf",
+    "minimum",
+    "maximum",
     "exclusiveMinimum",
     "exclusiveMaximum",
+    "minLength",
+    "maxLength",
+    "minProperties",
+    "maxProperties",
     "contentEncoding",
     "contentMediaType",
     "format",
+    "unevaluatedProperties",
+    "unevaluatedItems",
 ];
 
 /// Recursively validate a JSON Schema object against the strict subset
@@ -1738,16 +1756,17 @@ const REJECTED_ASSERTION_KEYWORDS: &[&str] = &[
 ///
 /// Supported:
 /// - `type`: string, number, integer, boolean, null, object, array
-/// - `properties`, `required`, `additionalProperties` (object)
+/// - `properties`, `required`, `additionalProperties` (boolean only)
 /// - `items`, `minItems`, `maxItems` (array)
 /// - `enum`, `const`
-/// - `minimum`, `maximum` (numeric bounds)
-/// - `minLength`, `maxLength` (string bounds)
-/// - `description` (annotation, ignored)
+/// - `description`, `title`, `default`, `examples`, `$comment` (annotations)
 ///
-/// Rejected: external references (`$ref`), regex (`pattern`), recursion,
-/// combinators (`allOf`/`anyOf`/`oneOf`/`not`), and other unsupported
-/// assertion keywords.
+/// Rejected: external references (`$ref`), regex (`pattern`),
+/// combinators (`allOf`/`anyOf`/`oneOf`/`not`), conditional assertion
+/// (`if`/`then`/`else`), numeric/string bounds, and every other unknown
+/// keyword — the validator and the saddle-core compiler must refuse the
+/// same schemas (default-deny), or a "supported" schema would compile to
+/// different constraints server-side.
 fn validate_json_schema_subset(schema: &serde_json::Value, path: &str) -> Result<()> {
     if !schema.is_object() {
         bail!("schema at {path} must be an object");
@@ -1764,14 +1783,24 @@ fn validate_json_schema_subset(schema: &serde_json::Value, path: &str) -> Result
         }
     }
 
-    // Validate `type` if present.
-    let ty = obj.get("type").and_then(|v| v.as_str());
-    if let Some(ty) = ty {
-        if !SUPPORTED_TYPE_VALUES.contains(&ty) {
-            bail!(
-                "unsupported JSON Schema type '{ty}' at {path} \
-                 (supported: {SUPPORTED_TYPE_VALUES:?})"
-            );
+    // Validate `type` if present. A non-string, non-null `type` (the union
+    // form `["integer","null"]`) is outside the strict subset — it must be
+    // rejected, not silently skipped into the inference path (the compiler
+    // would fall through to an unconstrained Any).
+    if let Some(tv) = obj.get("type") {
+        match tv.as_str() {
+            Some(ty) => {
+                if !SUPPORTED_TYPE_VALUES.contains(&ty) {
+                    bail!(
+                        "unsupported JSON Schema type '{ty}' at {path} \
+                         (supported: {SUPPORTED_TYPE_VALUES:?})"
+                    );
+                }
+            }
+            None => bail!(
+                "unsupported JSON Schema 'type' at {path}: union/array forms \
+                 are outside the strict subset"
+            ),
         }
     }
 
@@ -1790,14 +1819,14 @@ fn validate_json_schema_subset(schema: &serde_json::Value, path: &str) -> Result
         }
     }
     if let Some(ap) = obj.get("additionalProperties") {
-        // `additionalProperties: false` is supported (no extra keys).
-        // `additionalProperties: true` is supported (extra keys allowed).
-        // `additionalProperties: <schema>` is supported (extra keys must
-        // match the schema).
-        if ap.is_object() {
-            validate_json_schema_subset(ap, &format!("{path}.additionalProperties"))?;
-        } else if !ap.is_boolean() {
-            bail!("additionalProperties at {path} must be a boolean or schema object");
+        // Boolean only (spec §7.1 subset). The schema form is rejected here
+        // AND in the compiler — it used to be accepted by this validator
+        // while the compiler silently flattened it to `true`.
+        if !ap.is_boolean() {
+            bail!(
+                "additionalProperties at {path} must be a boolean (schema form \
+                 is outside the strict subset)"
+            );
         }
     }
     if let Some(req) = obj.get("required").and_then(|v| v.as_array()) {
@@ -1824,23 +1853,10 @@ fn validate_json_schema_subset(schema: &serde_json::Value, path: &str) -> Result
         }
     }
 
-    // Numeric bounds: check minimum <= maximum.
-    if let Some(min) = obj.get("minimum").and_then(|v| v.as_f64()) {
-        if let Some(max) = obj.get("maximum").and_then(|v| v.as_f64()) {
-            if min > max {
-                bail!("minimum ({min}) > maximum ({max}) at {path}: contradictory schema");
-            }
-        }
-    }
-
-    // String bounds: check minLength <= maxLength.
-    if let Some(min) = obj.get("minLength").and_then(|v| v.as_u64()) {
-        if let Some(max) = obj.get("maxLength").and_then(|v| v.as_u64()) {
-            if min > max {
-                bail!("minLength ({min}) > maxLength ({max}) at {path}: contradictory schema");
-            }
-        }
-    }
+    // Numeric bounds (`minimum`/`maximum`) and string bounds
+    // (`minLength`/`maxLength`) are rejected outright by the keyword
+    // policy above — the compiler enforces the same subset, so there is
+    // no bounds cross-check to perform here anymore.
 
     Ok(())
 }
@@ -7124,12 +7140,13 @@ mod tests {
                 .is_none()
         );
 
-        // json_object → None (weak constraint, no strict schema).
-        assert!(
-            validate_response_format(Some(&serde_json::json!({"type": "json_object"})))
-                .unwrap()
-                .is_none()
-        );
+        // json_object → REJECTED (typed error). This serve route has no
+        // json_object enforcement; silently dropping the requested
+        // constraint and returning success would be the "silent semantic
+        // downgrade" the spec forbids (§7.1/X2). It used to pass through as
+        // None — an unconstrained 200.
+        assert!(validate_response_format(Some(&serde_json::json!({"type": "json_object"})))
+            .is_err());
 
         // Valid json_schema with a simple object schema.
         let rf = validate_response_format(Some(&serde_json::json!({
@@ -7140,7 +7157,7 @@ mod tests {
                     "type": "object",
                     "properties": {
                         "name": {"type": "string"},
-                        "age": {"type": "integer", "minimum": 0}
+                        "age": {"type": "integer"}
                     },
                     "required": ["name"],
                     "additionalProperties": false

@@ -341,10 +341,12 @@ impl FairQueue {
         self.requests.iter().find(|r| r.id == id)
     }
 
-    /// Mark requests that were not served since the last round as aged (spec
-    /// §5.3 S3.3). The caller invokes this after one complete admission round.
-    /// Aged requests are selected before cache-locality tie-breaks in
-    /// subsequent [`select`](Self::select) calls.
+    /// Mark requests that were not served since the last round as aged, and
+    /// clear the flag from requests that WERE served (spec §5.3 S3.3).
+    /// Age is a property of "skipped for one complete round", not a permanent
+    /// promotion: a request returns to the normal band once serviced and can
+    /// be re-aged by a later skipped round. The caller invokes this after one
+    /// complete admission round.
     pub fn skip_round_complete(&mut self) {
         for req in &mut self.requests {
             let not_served_since_round = match req.last_served_tick {
@@ -352,9 +354,7 @@ impl FairQueue {
                 Some(t) => t < self.last_round_tick,
             };
             let admitted_at_or_before_round = req.admission_tick <= self.last_round_tick;
-            if not_served_since_round && admitted_at_or_before_round {
-                req.aged = true;
-            }
+            req.aged = not_served_since_round && admitted_at_or_before_round;
         }
         self.last_round_tick = self.tick;
     }
@@ -516,9 +516,15 @@ impl FairQueue {
                     Some(idx) => {
                         let uncached = self.requests[idx].uncached_prefill_tokens;
                         let rows = min(min(prefill_quantum, uncached), avail);
-                        if rows < self.prefill_min_tokens {
-                            // Not enough budget for minimum — advance cursor
-                            // past this request and try the next.
+                        if rows < self.prefill_min_tokens && rows < uncached {
+                            // Below the minimum quantum AND this grant would
+                            // not finish the request's prompt: skip so the
+                            // budget isn't frittered into slivers. A grant
+                            // that COMPLETES the prompt (rows == uncached)
+                            // is always allowed — refusing it would livelock
+                            // any request whose final chunk is smaller than
+                            // the minimum quantum (spec §5.3: prefill must
+                            // remain runnable in mixed mode).
                             self.prefill_cursor = (idx + 1) % n;
                             picked += 1;
                             continue;
@@ -983,5 +989,62 @@ mod tests {
         let sel = q.select(4, 64, remaining);
         let total: u64 = sel.grants.iter().map(|g| g.rows()).sum();
         assert!(total <= remaining, "total {total} exceeds remaining {remaining}");
+    }
+
+    /// Prefill tail smaller than the minimum quantum must still be granted
+    /// (it completes the prompt). Regression: refusing grants below
+    /// prefill_min_tokens livelocked any request whose final chunk was
+    /// smaller than the quantum — the slot never finished prefill.
+    #[test]
+    fn prefill_tail_below_min_quantum_completes() {
+        let mut q = queue(4096, 0, 512);
+        q.admit(1, "s1", 3).unwrap(); // only 3 uncached tokens left
+        q.set_needs(1, false, 0, 0).unwrap();
+
+        // quantum = prefill_min = 512; avail is plentiful.
+        let sel = q.select(0, 512, 4096);
+        assert_eq!(sel.grants.len(), 1, "final sliver must be granted");
+        assert!(
+            matches!(sel.grants[0], Grant::Prefill { id: 1, rows: 3 }),
+            "expected the 3-row completing grant, got {:?}",
+            sel.grants[0]
+        );
+        assert_eq!(q.get(1).unwrap().uncached_prefill_tokens, 0);
+
+        // The same rule under a tight budget: avail=2 < uncached=3 < min=512.
+        // The grant doesn't complete the prompt and is below the quantum, so
+        // it may be skipped (sliver control still applies).
+        let mut q = queue(4096, 0, 512);
+        q.admit(1, "s1", 3).unwrap();
+        q.set_needs(1, false, 0, 0).unwrap();
+        let sel = q.select(0, 512, 2);
+        assert!(sel.grants.is_empty(), "2-row non-completing sliver stays refused");
+    }
+
+    /// Age is recomputed per round: a served request leaves the aged band
+    /// and can be re-aged by a later skipped round (spec §5.3 S3.3).
+    #[test]
+    fn aged_band_is_recomputed_not_permanent() {
+        let mut q = queue(4096, 0, 1);
+        q.admit(1, "s1", 100).unwrap();
+        q.admit(2, "s2", 100).unwrap();
+        q.set_needs(1, false, 0, 0).unwrap();
+        q.set_needs(2, false, 0, 0).unwrap();
+
+        // Round 1: id 1 wins (same tick, same locality — stable order).
+        let sel = q.select(0, 10, 10);
+        assert!(matches!(sel.grants[0], Grant::Prefill { id: 1, .. }));
+        q.skip_round_complete();
+        assert!(q.get(2).unwrap().aged, "skipped request ages");
+
+        // Round 2: aged id 2 wins.
+        let sel = q.select(0, 10, 10);
+        assert!(matches!(sel.grants[0], Grant::Prefill { id: 2, .. }));
+        q.skip_round_complete();
+        assert!(
+            !q.get(2).unwrap().aged,
+            "served request must leave the aged band"
+        );
+        assert!(q.get(1).unwrap().aged, "now-starved request ages in turn");
     }
 }

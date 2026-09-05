@@ -155,10 +155,15 @@ impl<B: CheckpointBlob> QwenCheckpointPool<B> {
     /// an earlier state").
     ///
     /// If the pool cannot afford the new capture, the oldest **unpinned**
-    /// checkpoint is evicted repeatedly until the pool fits or no unpinned
-    /// entries remain (spec §4.5: "drop the oldest unpinned checkpoint").
+    /// checkpoint is evicted repeatedly until the pool fits. If every
+    /// remaining entry is pinned and the capture still does not fit, the NEW
+    /// capture is dropped and [`CheckpointId::NONE`] is returned — the byte
+    /// ceiling is a hard bound (spec §4.4, §9.1: "a cache-retention limit is
+    /// a ceiling"), never oversubscribed; the caller simply publishes
+    /// without a checkpoint and the boundary stays honestly unresumable.
     ///
-    /// Returns the minted [`CheckpointId`] for the radix index to store.
+    /// Returns the minted [`CheckpointId`] for the radix index to store, or
+    /// [`CheckpointId::NONE`] when the capture was refused.
     pub fn insert(&mut self, domain: CacheDomain, p: u64, blob: B) -> CheckpointId {
         if !Self::is_aligned(p) {
             return CheckpointId::NONE;
@@ -182,7 +187,12 @@ impl<B: CheckpointBlob> QwenCheckpointPool<B> {
                 Some(evict_key) => {
                     self.evict_internal(evict_key);
                 }
-                None => break, // all remaining are pinned; insert anyway
+                None => {
+                    // Everything left is pinned and the ceiling cannot be
+                    // honored. Refuse the capture (dropping the blob) rather
+                    // than exceeding the ceiling.
+                    return CheckpointId::NONE;
+                }
             }
         }
 

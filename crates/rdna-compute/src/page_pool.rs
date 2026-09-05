@@ -685,6 +685,13 @@ impl PagePool {
         if meta.state == PageState::Free {
             return Err(format!("refcount_inc: phys {} is Free", phys));
         }
+        if meta.state == PageState::ReclaimPending {
+            return Err(format!(
+                "refcount_inc: phys {} is ReclaimPending — cannot attach a \
+                 table to a page queued for reclaim",
+                phys
+            ));
+        }
         meta.table_refs = meta
             .table_refs
             .checked_add(1)
@@ -911,6 +918,16 @@ impl PagePool {
         if meta.state == PageState::Free {
             return Err(format!("add_inflight_ref: phys {} is Free", phys));
         }
+        if meta.state == PageState::ReclaimPending {
+            // A reclaim-pending page is awaiting device completion; taking a
+            // new lease would let `drain_completed` free it out from under
+            // the new reader once its OLD inflight refs drain.
+            return Err(format!(
+                "add_inflight_ref: phys {} is ReclaimPending — re-pinning a \
+                 page queued for reclaim is refused",
+                phys
+            ));
+        }
         meta.inflight_refs = meta
             .inflight_refs
             .checked_add(1)
@@ -965,7 +982,11 @@ impl PagePool {
         let mut freed = Vec::new();
         let mut still_pending = Vec::new();
         for &phys in &self.reclaim_pending {
-            if self.page_meta[phys as usize].inflight_refs == 0 {
+            let meta = &self.page_meta[phys as usize];
+            // Defensive: a page must not regain owners while queued. If it
+            // somehow did, keep it queued and let the underflow-checked
+            // release paths reconcile it instead of freeing live data.
+            if meta.inflight_refs == 0 && meta.table_refs == 0 && meta.cache_refs == 0 {
                 let meta = &mut self.page_meta[phys as usize];
                 meta.state = PageState::Free;
                 meta.generation = meta.generation.wrapping_add(1);
@@ -991,6 +1012,16 @@ impl PagePool {
         if meta.state == PageState::Free {
             return Err(format!("add_cache_ref: phys {} is Free", phys));
         }
+        if meta.state == PageState::ReclaimPending {
+            // See add_inflight_ref: a page queued for reclaim must not gain
+            // a new owner — drain_completed frees it once inflight hits 0,
+            // regardless of cache_refs.
+            return Err(format!(
+                "add_cache_ref: phys {} is ReclaimPending — re-pinning a \
+                 page queued for reclaim is refused",
+                phys
+            ));
+        }
         meta.cache_refs = meta
             .cache_refs
             .checked_add(1)
@@ -1001,11 +1032,13 @@ impl PagePool {
         Ok(())
     }
 
-    /// Release a cache ownership lease from `phys`.  If all refs are now
-    /// zero, the page is freed (or enters ReclaimPending if in-flight refs
-    /// remain).  Returns `Err` on underflow.
+    /// Release a cache ownership lease from `phys`.  If all table/cache
+    /// refs are now zero the page is freed — or enters ReclaimPending when
+    /// in-flight refs remain, mirroring `dec_table_ref` (a page here used to
+    /// leak: it was neither freed nor enqueued, so `drain_completed` could
+    /// never see it).  Returns `Err` on underflow.
     pub fn release_cache_ref(&mut self, phys: u32) -> Result<(), String> {
-        let need_free = {
+        let disposition = {
             let meta = &mut self.page_meta[phys as usize];
             if meta.cache_refs == 0 {
                 return Err(format!(
@@ -1014,13 +1047,29 @@ impl PagePool {
                 ));
             }
             meta.cache_refs -= 1;
-            meta.table_refs == 0 && meta.cache_refs == 0 && meta.inflight_refs == 0
+            if meta.table_refs == 0 && meta.cache_refs == 0 {
+                if meta.inflight_refs > 0 {
+                    Some(true)
+                } else {
+                    Some(false)
+                }
+            } else {
+                None
+            }
         };
-        if need_free {
-            let meta = &mut self.page_meta[phys as usize];
-            meta.state = PageState::Free;
-            meta.generation = meta.generation.wrapping_add(1);
-            self.free_pages.push(phys);
+        match disposition {
+            Some(true) => {
+                let meta = &mut self.page_meta[phys as usize];
+                meta.state = PageState::ReclaimPending;
+                self.reclaim_pending.push(phys);
+            }
+            Some(false) => {
+                let meta = &mut self.page_meta[phys as usize];
+                meta.state = PageState::Free;
+                meta.generation = meta.generation.wrapping_add(1);
+                self.free_pages.push(phys);
+            }
+            None => {}
         }
         Ok(())
     }
@@ -1788,5 +1837,85 @@ mod tests {
         // Commit COW
         pool.commit_cow(&mut table, &plan).unwrap();
         assert_ne!(table.physical(0).unwrap(), phys0);
+    }
+
+    // ── A5: cache-ref release with in-flight readers must not leak ────
+
+    #[test]
+    fn a5_cache_ref_release_with_inflight_enters_reclaim_pending() {
+        // Regression: release_cache_ref used to leave a page with zero
+        // table/cache refs but active in-flight refs in limbo — neither in
+        // the free list nor in reclaim_pending — leaking it permanently.
+        let mut pool = PagePool::new(4, 1088).unwrap();
+        let mut table = BlockTable::new();
+        pool.alloc_pages(&mut table, 1);
+        let phys = table.physical(0).unwrap();
+
+        pool.add_cache_ref(phys).unwrap();
+        pool.add_inflight_ref(phys).unwrap();
+
+        // Drop the table ref, then the cache ref while the in-flight lease
+        // is still held (device reader outstanding).
+        pool.release_table(&mut table).unwrap();
+        assert_eq!(pool.page_state(phys), PageState::CacheOnly);
+        pool.release_cache_ref(phys).unwrap();
+
+        // Must be ReclaimPending and NOT allocatable, not silently leaked.
+        assert_eq!(pool.page_state(phys), PageState::ReclaimPending);
+        assert_eq!(pool.free_pages(), 3);
+        assert_eq!(pool.reclaim_pending_count(), 1);
+
+        // Completion arrives → drain frees it.
+        pool.release_inflight_ref(phys).unwrap();
+        let freed = pool.drain_completed();
+        assert_eq!(freed, vec![phys]);
+        assert_eq!(pool.page_state(phys), PageState::Free);
+        assert_eq!(pool.free_pages(), 4);
+    }
+
+    #[test]
+    fn a5_reclaim_pending_page_refuses_new_leases() {
+        let mut pool = PagePool::new(4, 1088).unwrap();
+        let mut table = BlockTable::new();
+        pool.alloc_pages(&mut table, 1);
+        let phys = table.physical(0).unwrap();
+
+        pool.add_inflight_ref(phys).unwrap();
+        pool.release_table(&mut table).unwrap();
+        assert_eq!(pool.page_state(phys), PageState::ReclaimPending);
+
+        // A stale handle's page must not regain table/cache/inflight leases
+        // while queued for reclaim — drain_completed would free it out from
+        // under the new owner.
+        assert!(pool.refcount_inc(phys).is_err());
+        assert!(pool.add_cache_ref(phys).is_err());
+        assert!(pool.add_inflight_ref(phys).is_err());
+
+        // After drain the page is Free; leases are still refused (Free).
+        pool.release_inflight_ref(phys).unwrap();
+        pool.drain_completed();
+        assert!(pool.refcount_inc(phys).is_err());
+        assert!(pool.add_cache_ref(phys).is_err());
+    }
+
+    #[test]
+    fn drain_completed_keeps_pages_that_regained_owners() {
+        // Defensive: a page in the reclaim queue must not be freed while it
+        // carries any live ref, even if inflight drained to zero first.
+        let mut pool = PagePool::new(4, 1088).unwrap();
+        let mut table = BlockTable::new();
+        pool.alloc_pages(&mut table, 1);
+        let phys = table.physical(0).unwrap();
+
+        pool.add_inflight_ref(phys).unwrap();
+        pool.release_table(&mut table).unwrap();
+        assert_eq!(pool.page_state(phys), PageState::ReclaimPending);
+
+        // (The public API now refuses new leases on ReclaimPending pages, so
+        // the only way refs reappear is via the internal paths; the drain
+        // guard is the backstop that keeps such a page queued instead of
+        // freed.) A clean drain still works.
+        pool.release_inflight_ref(phys).unwrap();
+        assert_eq!(pool.drain_completed(), vec![phys]);
     }
 }

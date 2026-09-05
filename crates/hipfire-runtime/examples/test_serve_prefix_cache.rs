@@ -9,10 +9,17 @@
 //!     the cold continuation; a divergent suffix still reuses the prefix
 //!   * sampled AR: same seed is deterministic and still reuses
 //!   * grammar AR: JSON Schema mask + prefix reuse; output parses as JSON
-//!   * A20 reset: `SlotEngine::reset` drops the radix so the next request is cold
+//!   * A10 MTP cache visibility: long generation crossing page boundaries
+//!     under MTP still replays identically from cache (candidate rows never
+//!     become cache-visible, spec §4.6.2)
+//!   * A13 mixed load: a long cold prefill and short warm requests all make
+//!     progress (spec §5.3 S3)
+//!   * A20 lifecycle: repeated warm hits, reset → cold, re-warm after reset
+//!   * A19 (--fault-publish): HIPFIRE_FAULT_PREFIX_PUBLISH=1 makes the first
+//!     publication fail → honest miss, unchanged output (fail-closed)
 //!
 //! Build: `cargo run -p hipfire-runtime --example test_serve_prefix_cache --features lab -- <model.hfq>`
-//! Optional: `--mtp-k N` (default 4 when a sidecar exists, else 0).
+//! Optional: `--mtp-k N` (default 4 when a sidecar exists, else 0), `--fault-publish`.
 
 #[cfg(not(feature = "deltanet"))]
 fn main() {
@@ -30,6 +37,12 @@ fn main() {
     use std::sync::mpsc::channel;
 
     const PAGE: usize = 128;
+
+    // A19 fault mode must be armed before any engine work.
+    let fault_publish = std::env::args().any(|a| a == "--fault-publish");
+    if fault_publish {
+        std::env::set_var("HIPFIRE_FAULT_PREFIX_PUBLISH", "1");
+    }
 
     let mut model_path = None;
     let mut mtp_k_arg: Option<usize> = None;
@@ -180,6 +193,33 @@ fn main() {
     }
 
     let greedy = RunSpec::greedy(8);
+
+    // ── A19 fault-publish mode: reduced cell set, fail-closed proof ────
+    // The injected fault fails the FIRST publication attempt (prefill
+    // chunk boundary). Required observables: the request still succeeds
+    // with IDENTICAL output, the warm run is an honest miss (reused=0 —
+    // nothing was published), and nothing corrupts (spec §5.4 S4: a cache
+    // failure may not undo a successful request nor fake a hit).
+    if fault_publish {
+        println!("--- A19 fault-publish mode ---");
+        let (reused_cold, toks_cold) = run(&engine, italy.clone(), &greedy);
+        println!("  fault cold Italy: reused={reused_cold} generated={}", toks_cold.len());
+        assert_eq!(reused_cold, 0);
+        assert!(!toks_cold.is_empty());
+        let (reused_warm, toks_warm) = run(&engine, italy.clone(), &greedy);
+        println!("  fault warm Italy: reused={reused_warm}");
+        assert_eq!(
+            reused_warm, 0,
+            "publish was injected-failed: the warm run must be an honest miss"
+        );
+        assert_eq!(
+            toks_warm, toks_cold,
+            "fail-closed publish must not change generation"
+        );
+        println!("PASS (A19)");
+        return;
+    }
+
     let (reused_cold, toks_italy_1) = run(&engine, italy.clone(), &greedy);
     println!(
         "  greedy cold Italy: reused={reused_cold} generated={}",
@@ -197,6 +237,10 @@ fn main() {
         reused_warm >= PAGE,
         "warm identical prompt must reuse at least one full page, got {reused_warm}"
     );
+    // The italy prompt is NOT page-aligned (256 + suffix), so the warm run
+    // exercises SuffixRecompute: restore the page-aligned checkpoint and
+    // recompute the tail. This is the cell that catches a checkpoint whose
+    // recurrent state was relabeled from a later boundary (spec §4.5).
     assert_eq!(
         toks_italy_1, toks_italy_2,
         "warm identical prompt must match the cold greedy continuation"
@@ -270,6 +314,100 @@ fn main() {
         "grammar JSON missing city string: {parsed}"
     );
 
+    // ── A10: MTP cache visibility across generated-page boundaries ─────
+    // A long generation (96 tokens) under MTP crosses at least one page
+    // boundary during decode, exercising verify/repair writes and the
+    // terminal generated-prefix publication. Spec §4.6.2: speculative
+    // candidate rows never become shareable — evidenced by the warm run
+    // replaying the cold generation EXACTLY.
+    let long_greedy = RunSpec::greedy(96);
+    let (reused_l1, toks_l1) = run(&engine, italy.clone(), &long_greedy);
+    let (reused_l2, toks_l2) = run(&engine, italy.clone(), &long_greedy);
+    println!(
+        "  A10 long-generate: reused={reused_l1}/{reused_l2} generated={}/{}",
+        toks_l1.len(),
+        toks_l2.len()
+    );
+    assert!(
+        !toks_l1.is_empty(),
+        "long generation must produce tokens for this cell"
+    );
+    assert_eq!(
+        toks_l1, toks_l2,
+        "warm long generation must match cold exactly — no candidate row may be cache-visible"
+    );
+
+    // ── A13: mixed load progress bound (spec §5.3 S3) ──────────────────
+    // A long COLD prefill (distinct prefix) submitted concurrently with
+    // short warm requests: all must complete — the long prefill may not
+    // starve behind the warm hits, and the warm hits may not starve behind
+    // the long prefill (FairQueue rotation + prefill quantum).
+    let mut atlantis: Vec<u32> = tokenizer.encode(
+        "The lost city of Atlantis was said to lie beyond the pillars. ",
+    );
+    let atl_filler =
+        tokenizer.encode("Sailors traded pearls and told of shining harbors there. ");
+    while atlantis.len() < PAGE * 6 {
+        atlantis.extend_from_slice(&atl_filler);
+    }
+    atlantis.truncate(PAGE * 6);
+    let mut atlantis_long = atlantis.clone();
+    atlantis_long.extend(tokenizer.encode(" The kings of Atlantis ruled"));
+    let atl_short: Vec<u32> = {
+        let mut v = atlantis.clone();
+        v.extend(tokenizer.encode(" The temples of Atlantis were"));
+        v
+    };
+
+    // Submit the long cold prefill first (submit is non-blocking — the
+    // engine starts chunking it), then land the short warm request while
+    // that prefill is still running. Both are drained afterwards.
+    let (tx_long, rx_long) = channel::<Event>();
+    engine
+        .submit(SubmitRequest {
+            prompt_tokens: atlantis_long,
+            convo: Vec::new(),
+            continuation: Continuation::Cold,
+            max_tokens: 4,
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            seed: 0,
+            repeat_window: 0,
+            repeat_penalty: 1.0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
+            min_p: 0.0,
+            visual_data: None,
+            json_schema: None,
+            queue_bytes: 0,
+            reply: tx_long,
+        })
+        .expect("submit long");
+    std::thread::sleep(std::time::Duration::from_millis(300));
+    let (reused_short, toks_short) = run(&engine, atl_short.clone(), &greedy);
+    let mut reused_long = 0usize;
+    let mut toks_long: Vec<u32> = Vec::new();
+    while let Ok(ev) = rx_long.recv() {
+        match ev {
+            Event::Accepted { reused: r, .. } => reused_long = r,
+            Event::Token { id } => toks_long.push(id),
+            Event::Rejected { reason } => panic!("long request rejected: {reason}"),
+            Event::Done { .. } => break,
+        }
+    }
+    println!(
+        "  A13 mixed: long reused={reused_long} generated={}; short reused={reused_short} generated={}",
+        toks_long.len(),
+        toks_short.len()
+    );
+    assert!(!toks_long.is_empty(), "the long cold prefill must complete (no starvation)");
+    assert!(!toks_short.is_empty(), "the short warm request must complete (no starvation)");
+    assert_eq!(
+        reused_long, 0,
+        "the distinct long prefix must be a cold miss"
+    );
+
     // A20: repeated warm hits stay bounded, then reset forces a cold miss.
     for i in 0..4 {
         let (r, toks) = run(&engine, italy.clone(), &greedy);
@@ -278,12 +416,26 @@ fn main() {
         assert_eq!(toks, toks_italy_1, "soak request {i} drifted from greedy");
     }
     engine.reset().expect("reset after idle");
-    let (reused_after_reset, _) = run(&engine, italy.clone(), &greedy);
+    let (reused_after_reset, toks_after_reset) = run(&engine, italy.clone(), &greedy);
     println!("  after reset: reused={reused_after_reset}");
     assert_eq!(
         reused_after_reset, 0,
         "reset must drop the radix (allocation_epoch bump); got reused={reused_after_reset}"
     );
+    assert_eq!(
+        toks_after_reset, toks_italy_1,
+        "post-reset cold generation must still match the original greedy run"
+    );
+
+    // A20 re-warm: publications resume after reset — the fresh cold run
+    // above republished, so the next warm run reuses again and replays.
+    let (reused_rewarm, toks_rewarm) = run(&engine, italy.clone(), &greedy);
+    println!("  re-warm after reset: reused={reused_rewarm}");
+    assert!(
+        reused_rewarm >= PAGE,
+        "publications must resume after reset, got reused={reused_rewarm}"
+    );
+    assert_eq!(toks_rewarm, toks_italy_1);
 
     let stats = engine.stats();
     println!(

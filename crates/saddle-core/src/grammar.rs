@@ -3114,7 +3114,12 @@ pub mod json_schema {
             }
         };
 
-        // Reject unsupported keywords upfront.
+        // Keyword policy: allowlist + explicit rejects + DEFAULT-DENY. An
+        // unknown keyword must be refused, never silently permitted — the
+        // silent fall-through used to admit assertion keywords like
+        // if/then/else and additionalItems, whose constraints were then
+        // ignored (spec §7.1: "reject unsupported assertion keywords ...
+        // Permit only documented annotation keywords").
         for key in obj.keys() {
             match key.as_str() {
                 "type" | "properties" | "required" | "additionalProperties"
@@ -3132,6 +3137,11 @@ pub mod json_schema {
                         keyword: key.to_string(),
                     })
                 }
+                "if" | "then" | "else" | "additionalItems" => {
+                    return Err(SchemaError::UnsupportedKeyword {
+                        keyword: key.to_string(),
+                    })
+                }
                 "format" | "minimum" | "maximum" | "exclusiveMinimum"
                 | "exclusiveMaximum" | "multipleOf" | "minLength"
                 | "maxLength" | "minProperties" | "maxProperties"
@@ -3144,7 +3154,11 @@ pub mod json_schema {
                         keyword: key.to_string(),
                     })
                 }
-                _ => {} // Permit unknown annotation keywords silently.
+                other => {
+                    return Err(SchemaError::UnsupportedKeyword {
+                        keyword: other.to_string(),
+                    })
+                }
             }
         }
 
@@ -3164,7 +3178,20 @@ pub mod json_schema {
             return Ok(SchemaNode::Enum(arr.clone()));
         }
 
-        // type-based compilation.
+        // type-based compilation. A non-string `type` (e.g. the union form
+        // `["integer","null"]`) is OUTSIDE the supported subset — falling
+        // through to the inference path would compile it to an unconstrained
+        // `Any` (spec §7.1: unions are rejected before generation).
+        if let Some(tv) = obj.get("type") {
+            if tv.as_str().is_none() {
+                return Err(SchemaError::UnsupportedKeyword {
+                    keyword: format!(
+                        "type (union/array forms are outside the supported subset: {})",
+                        tv
+                    ),
+                });
+            }
+        }
         let ty = obj.get("type").and_then(|v| v.as_str());
         match ty {
             Some("string") => Ok(SchemaNode::String),
@@ -3206,11 +3233,10 @@ pub mod json_schema {
 
         let mut compiled_props = Vec::with_capacity(properties.len());
         for (key, sub_schema) in properties {
-            // Recursion detection: if this key path is already on the
-            // stack, the schema is recursive.
-            if path.iter().any(|p| p == key) {
-                return Err(SchemaError::RecursionNotSupported);
-            }
+            // Recursion requires `$ref`, which the keyword gate above already
+            // rejects — a repeated property NAME at different nesting depths
+            // is ordinary finite JSON Schema ({"meta":{"meta":{"type":
+            // "string"}}}) and must compile. No path-name heuristic here.
             path.push(key.clone());
             let node = compile_node(sub_schema, depth + 1, path)?;
             path.pop();
@@ -3227,22 +3253,44 @@ pub mod json_schema {
             })
             .unwrap_or_default();
 
-        // Validate that every required name is in properties.
+        // `additionalProperties` must be boolean in this subset; the schema
+        // form (validation rules for unknown keys) is unsupported and used
+        // to be silently flattened to `true`.
+        let additional_properties = match obj.get("additionalProperties") {
+            None => true,
+            Some(v) if v.is_boolean() => v.as_bool().unwrap_or(true),
+            Some(_) => {
+                return Err(SchemaError::UnsupportedKeyword {
+                    keyword: "additionalProperties (schema form is outside the \
+                               supported subset; use true/false)"
+                        .to_string(),
+                })
+            }
+        };
+
+        // A required name without a `properties` entry is satisfiable when
+        // unknown properties are allowed (any value satisfies it): compile
+        // it as an unconstrained property instead of refusing the whole
+        // schema. With additionalProperties:false it genuinely is
+        // unsatisfiable (spec §7.1: reject when compilation proves it).
+        let mut all_props = compiled_props;
         for req in &required {
-            if !properties.contains_key(req) {
-                return Err(SchemaError::Unsatisfiable {
-                    reason: format!("required property {req:?} not in properties"),
-                });
+            if !all_props.iter().any(|(k, _)| k == req) {
+                if additional_properties {
+                    all_props.push((req.clone(), SchemaNode::Any));
+                } else {
+                    return Err(SchemaError::Unsatisfiable {
+                        reason: format!(
+                            "required property {req:?} has no properties entry \
+                             and additionalProperties is false"
+                        ),
+                    });
+                }
             }
         }
 
-        let additional_properties = obj
-            .get("additionalProperties")
-            .and_then(|v| v.as_bool())
-            .unwrap_or(true);
-
         Ok(SchemaNode::Object {
-            properties: compiled_props,
+            properties: all_props,
             required,
             additional_properties,
         })
@@ -3325,6 +3373,292 @@ pub mod json_schema {
         accepted: bool,
         /// Whether the matcher has errored (invalid JSON or schema violation).
         errored: bool,
+        /// Raw byte-scan state refreshed by [`SchemaMatcher::advance`]:
+        /// duplicate-key detection plus the cheap first-byte/string context
+        /// used by `is_token_allowed` to avoid a full clone+reparse per
+        /// vocabulary candidate (spec §9.2: mask time must be bounded).
+        scan: RawScan,
+    }
+
+    /// Raw byte-scan result over the accumulated buffer.
+    #[derive(Debug, Clone, Default)]
+    struct RawScan {
+        /// A decoded object key repeated within the same object (strict mode
+        /// rejects duplicates; serde_json silently merges them).
+        duplicate_keys: bool,
+        /// The buffer currently ends inside a JSON string literal.
+        in_string: bool,
+        /// The buffer ends immediately after a backslash inside a string.
+        escape_pending: bool,
+        /// The buffer ends inside (or immediately after) a literal or number
+        /// run (`tru`, `12.`, `1e` …) — any literal continuation byte may be
+        /// legal next, so the structural first-byte fast path must stand
+        /// down and let the simulation decide.
+        literal_tail: bool,
+        /// Legal first bytes for the next structural token when NOT inside
+        /// a string (conservative value-start / continuation sets).
+        structural_next: Vec<u8>,
+    }
+
+    /// Scan raw JSON bytes once for duplicate keys, string state, and the
+    /// legal next structural bytes. O(n) per call; the matcher calls it
+    /// once per `advance` (same order as the serde reparse it sits next to).
+    fn scan_raw(bytes: &[u8]) -> RawScan {
+        #[derive(Clone, Copy, PartialEq)]
+        enum Phase {
+            /// Object: a key string comes next.
+            Key,
+            /// A value comes next (root, after `:`, after `[` or `,`).
+            Value,
+            /// After a complete value: `,` or the closing bracket.
+            Cont,
+        }
+        enum Frame {
+            Object {
+                keys: std::collections::HashSet<String>,
+                phase: Phase,
+            },
+            Array {
+                phase: Phase,
+            },
+        }
+
+        let mut frames: Vec<Frame> = Vec::new();
+        let mut duplicate_keys = false;
+        let mut in_string = false;
+        let mut escape_pending = false;
+        let mut literal_tail = false;
+        let mut i = 0usize;
+
+        // Value-start bytes for a phase:Value position.
+        const VALUE_START: &[u8] = b"\"-{0123456789tfn[";
+
+        while i < bytes.len() {
+            let b = bytes[i];
+            match b {
+                b'"' => {
+                    // Scan the string, decoding escapes for key equality.
+                    let is_key = match frames.last() {
+                        Some(Frame::Object { phase: Phase::Key, .. }) => true,
+                        _ => false,
+                    };
+                    let mut s = String::new();
+                    i += 1;
+                    loop {
+                        if i >= bytes.len() {
+                            // Buffer ends inside the string.
+                            in_string = true;
+                            break;
+                        }
+                        match bytes[i] {
+                            b'"' => {
+                                i += 1;
+                                break;
+                            }
+                            b'\\' => {
+                                i += 1;
+                                if i >= bytes.len() {
+                                    in_string = true;
+                                    escape_pending = true;
+                                    break;
+                                }
+                                match bytes[i] {
+                                    b'"' => s.push('"'),
+                                    b'\\' => s.push('\\'),
+                                    b'/' => s.push('/'),
+                                    b'b' => s.push('\u{0008}'),
+                                    b'f' => s.push('\u{000C}'),
+                                    b'n' => s.push('\n'),
+                                    b'r' => s.push('\r'),
+                                    b't' => s.push('\t'),
+                                    b'u' => {
+                                        let hex = |slice: &[u8]| -> Option<u32> {
+                                            if slice.len() < 4 {
+                                                return None;
+                                            }
+                                            u32::from_str_radix(
+                                                std::str::from_utf8(slice).ok()?,
+                                                16,
+                                            )
+                                            .ok()
+                                        };
+                                        match bytes.get(i + 1..i + 5).and_then(hex) {
+                                            Some(hi) => {
+                                                i += 4;
+                                                let ch =
+                                                    if (0xD800..0xDC00).contains(&hi) {
+                                                        let lo = bytes
+                                                            .get(i + 3..i + 7)
+                                                            .and_then(hex);
+                                                        match lo {
+                                                            Some(lo)
+                                                                if (0xDC00..0xE000)
+                                                                    .contains(&lo) =>
+                                                            {
+                                                                i += 6;
+                                                                char::from_u32(
+                                                                    0x10000
+                                                                        + ((hi - 0xD800)
+                                                                            << 10)
+                                                                        + (lo - 0xDC00),
+                                                                )
+                                                                .unwrap_or('\u{FFFD}')
+                                                            }
+                                                            _ => '\u{FFFD}',
+                                                        }
+                                                    } else {
+                                                        char::from_u32(hi)
+                                                            .unwrap_or('\u{FFFD}')
+                                                    };
+                                                s.push(ch);
+                                            }
+                                            None => {
+                                                // Truncated escape at buffer end.
+                                                in_string = true;
+                                                escape_pending = true;
+                                                i = bytes.len();
+                                                break;
+                                            }
+                                        }
+                                    }
+                                    _ => {}
+                                }
+                                i += 1;
+                                continue;
+                            }
+                            c => {
+                                let len = match c {
+                                    c if c < 0x80 => 1,
+                                    c if c & 0xE0 == 0xC0 => 2,
+                                    c if c & 0xF0 == 0xE0 => 3,
+                                    _ => 4,
+                                };
+                                let end = (i + len).min(bytes.len());
+                                s.push_str(
+                                    &String::from_utf8_lossy(&bytes[i..end]),
+                                );
+                                i = end;
+                                continue;
+                            }
+                        }
+                    }
+                    if in_string {
+                        break;
+                    }
+                    if is_key {
+                        match frames.last_mut() {
+                            Some(Frame::Object { keys, phase }) => {
+                                if !keys.insert(s) {
+                                    duplicate_keys = true;
+                                }
+                                *phase = Phase::Cont; // colon then value
+                            }
+                            _ => {}
+                        }
+                    } else if let Some(frame) = frames.last_mut() {
+                        match frame {
+                            Frame::Object { phase, .. } | Frame::Array { phase } => {
+                                *phase = Phase::Cont;
+                            }
+                        }
+                    }
+                }
+                b'{' => {
+                    frames.push(Frame::Object {
+                        keys: std::collections::HashSet::new(),
+                        phase: Phase::Key,
+                    });
+                    i += 1;
+                }
+                b'[' => {
+                    frames.push(Frame::Array { phase: Phase::Value });
+                    i += 1;
+                }
+                b'}' | b']' => {
+                    frames.pop();
+                    if let Some(frame) = frames.last_mut() {
+                        match frame {
+                            Frame::Object { phase, .. } | Frame::Array { phase } => {
+                                *phase = Phase::Cont;
+                            }
+                        }
+                    }
+                    i += 1;
+                }
+                b',' => {
+                    match frames.last_mut() {
+                        Some(Frame::Object { phase, .. }) => *phase = Phase::Key,
+                        Some(Frame::Array { phase }) => *phase = Phase::Value,
+                        None => {}
+                    }
+                    i += 1;
+                }
+                b':' => {
+                    if let Some(Frame::Object { phase, .. }) = frames.last_mut() {
+                        *phase = Phase::Value;
+                    }
+                    i += 1;
+                }
+                _ => {
+                    // Literal (true/false/null) or number: consume its bytes
+                    // as one value token.
+                    let start = i;
+                    while i < bytes.len()
+                        && !matches!(
+                            bytes[i],
+                            b'"' | b'{' | b'[' | b'}' | b']' | b',' | b':' | b' '
+                                | b'\n' | b'\t' | b'\r'
+                        )
+                    {
+                        i += 1;
+                    }
+                    if i > start {
+                        if let Some(frame) = frames.last_mut() {
+                            match frame {
+                                Frame::Object { phase, .. } | Frame::Array { phase } => {
+                                    *phase = Phase::Cont;
+                                }
+                            }
+                        }
+                        // The literal ran to the buffer end: it may be an
+                        // incomplete `true`/`false`/`null`/number — any
+                        // literal continuation byte can be legal next.
+                        if i >= bytes.len() {
+                            literal_tail = true;
+                        }
+                    } else {
+                        i += 1; // whitespace
+                        literal_tail = false;
+                    }
+                }
+            }
+        }
+
+        // Legal next structural bytes from the final frame phase.
+        let structural_next: Vec<u8> = if in_string {
+            Vec::new()
+        } else {
+            let phase = match frames.last() {
+                Some(Frame::Object { phase, .. }) | Some(Frame::Array { phase }) => *phase,
+                None => Phase::Value,
+            };
+            match phase {
+                Phase::Key => vec![b'"'],
+                Phase::Value => VALUE_START.to_vec(),
+                Phase::Cont => match frames.last() {
+                    Some(Frame::Object { .. }) => vec![b',', b'}'],
+                    _ => vec![b',', b']'],
+                },
+            }
+        };
+
+        RawScan {
+            duplicate_keys,
+            in_string,
+            escape_pending,
+            literal_tail,
+            structural_next,
+        }
     }
 
     /// Check whether a serde_json error represents incomplete input
@@ -3367,26 +3701,38 @@ pub mod json_schema {
                 if !target.is_number() {
                     return false;
                 }
-                let target_str = serde_json::to_string(target).unwrap_or_default();
-                // The raw bytes must be a prefix of the target's JSON
-                // representation. E.g. "4" is a prefix of "42".
-                target_str.as_bytes().starts_with(num_bytes)
+                number_text_could_match(num_bytes, target)
             }
             SchemaNode::Enum(values) => {
-                // Check if the raw bytes are a prefix of any number
+                // Check if the raw bytes could still match any number
                 // value in the enum.
                 for v in values {
-                    if v.is_number() {
-                        let v_str = serde_json::to_string(v).unwrap_or_default();
-                        if v_str.as_bytes().starts_with(num_bytes) {
-                            return true;
-                        }
+                    if v.is_number() && number_text_could_match(num_bytes, v) {
+                        return true;
                     }
                 }
                 false
             }
             _ => false,
         }
+    }
+
+    /// Whether a partially-emitted number's raw text could still resolve to
+    /// `target`: either the raw text is a byte-prefix of some valid JSON
+    /// spelling of `target` (it may grow), or the raw text already parses to
+    /// a number that is SEMANTICALLY equal to `target` (`"1.0"` equals `1`
+    /// even though it is not a text prefix of `"1"`, spec §7.1).
+    fn number_text_could_match(raw: &[u8], target: &serde_json::Value) -> bool {
+        let target_str = serde_json::to_string(target).unwrap_or_default();
+        if target_str.as_bytes().starts_with(raw) {
+            return true;
+        }
+        if let Ok(parsed) = serde_json::from_slice::<serde_json::Value>(raw) {
+            if parsed.is_number() && json_equal(&parsed, target) {
+                return true;
+            }
+        }
+        false
     }
 
     impl SchemaMatcher {
@@ -3398,6 +3744,9 @@ pub mod json_schema {
                 stack: Vec::new(),
                 accepted: false,
                 errored: false,
+                // An empty buffer scans to the root value-start set, so the
+                // first-token fast path works before any advance().
+                scan: scan_raw(&[]),
             }
         }
 
@@ -3413,6 +3762,16 @@ pub mod json_schema {
         /// the bytes could be part of a valid JSON value conforming
         /// to the schema. A `false` return means the bytes would
         /// definitely violate the schema or JSON syntax.
+        ///
+        /// Cheap fast paths (bounded mask time, spec §9.2) consult the
+        /// raw scan taken at the last `advance`:
+        /// - Structural positions: a token whose FIRST byte cannot start
+        ///   any legal next token is refused without a clone+reparse.
+        /// - Inside a plain string (no pending escape): a token of valid
+        ///   UTF-8 with no quote, backslash or unescaped control byte is
+        ///   inert string content and is allowed without simulation.
+        /// Everything else falls through to the full clone+simulate,
+        /// which remains the authority.
         pub fn is_token_allowed(&self, bytes: &[u8]) -> bool {
             if self.errored {
                 return false;
@@ -3421,7 +3780,29 @@ pub mod json_schema {
                 // After acceptance, only whitespace is allowed.
                 return bytes.iter().all(|&b| b == b' ' || b == b'\n' || b == b'\t' || b == b'\r');
             }
-            // Conservative: simulate the advance and check if it errors.
+            if self.scan.in_string {
+                // Plain string content: inert UTF-8 without quotes,
+                // backslashes or control bytes is allowed without
+                // simulation (a pending escape needs the simulation).
+                if !self.scan.escape_pending
+                    && std::str::from_utf8(bytes).is_ok()
+                    && !bytes.contains(&b'"')
+                    && !bytes.contains(&b'\\')
+                    && bytes.iter().all(|&b| b >= 0x20)
+                {
+                    return true;
+                }
+            } else if !self.scan.literal_tail {
+                // Structural position: a token whose FIRST byte cannot start
+                // any legal next token is refused without a clone+reparse.
+                if let Some(first) = bytes.first() {
+                    if !self.scan.structural_next.contains(first) {
+                        return false;
+                    }
+                }
+            }
+            // Literal tails (and everything not fast-pathed) fall through:
+            // simulate the advance and check if it errors.
             let mut sim = self.clone();
             sim.advance(bytes);
             !sim.errored
@@ -3438,6 +3819,9 @@ pub mod json_schema {
                 return;
             }
             self.bytes.extend_from_slice(bytes);
+            // Refresh the raw scan BEFORE parsing so accept-time duplicate
+            // detection (strict mode, spec §7.1) sees the current buffer.
+            self.scan = scan_raw(&self.bytes);
             self.parse();
         }
 
@@ -3518,27 +3902,35 @@ pub mod json_schema {
                         // schema expects a non-number type, no
                         // continuation of this number can ever match
                         // — error now.
-                        match validate(&v, &self.root) {
-                            Ok(()) => {
-                                self.accepted = true;
-                                self.stack.clear();
-                            }
-                            Err(_reason) => {
-                                // The number doesn't match the schema
-                                // yet, but it might grow. Check if
-                                // the current raw bytes could be a
-                                // prefix of a value that WOULD match.
-                                // If the schema expects a non-number
-                                // type, no continuation can fix it.
-                                // If the schema expects a specific
-                                // number (const/enum), check if the
-                                // current bytes are a prefix of that
-                                // number's JSON representation.
-                                if number_could_grow_to_match(&v, &self.root, rest) {
-                                    // Don't error — might grow into
-                                    // a matching value.
-                                } else {
-                                    self.errored = true;
+                        if self.scan.duplicate_keys {
+                            // Strict mode: duplicate decoded keys anywhere
+                            // in the raw buffer are invalid (serde_json
+                            // silently merges them, so this is the only
+                            // honest check, spec §7.1).
+                            self.errored = true;
+                        } else {
+                            match validate(&v, &self.root) {
+                                Ok(()) => {
+                                    self.accepted = true;
+                                    self.stack.clear();
+                                }
+                                Err(_reason) => {
+                                    // The number doesn't match the schema
+                                    // yet, but it might grow. Check if
+                                    // the current raw bytes could be a
+                                    // prefix of a value that WOULD match.
+                                    // If the schema expects a non-number
+                                    // type, no continuation can fix it.
+                                    // If the schema expects a specific
+                                    // number (const/enum), check if the
+                                    // current bytes are a prefix of that
+                                    // number's JSON representation.
+                                    if number_could_grow_to_match(&v, &self.root, rest) {
+                                        // Don't error — might grow into
+                                        // a matching value.
+                                    } else {
+                                        self.errored = true;
+                                    }
                                 }
                             }
                         }
@@ -3546,13 +3938,17 @@ pub mod json_schema {
                         // The value is complete (non-number, or a
                         // number followed by a non-digit delimiter).
                         // Validate and accept or error.
-                        match validate(&v, &self.root) {
-                            Ok(()) => {
-                                self.accepted = true;
-                                self.stack.clear();
-                            }
-                            Err(_reason) => {
-                                self.errored = true;
+                        if self.scan.duplicate_keys {
+                            self.errored = true;
+                        } else {
+                            match validate(&v, &self.root) {
+                                Ok(()) => {
+                                    self.accepted = true;
+                                    self.stack.clear();
+                                }
+                                Err(_reason) => {
+                                    self.errored = true;
+                                }
                             }
                         }
                     }
@@ -3714,12 +4110,36 @@ pub mod json_schema {
         }
     }
 
-    /// Semantic JSON equality: compares values by their JSON
-    /// representation, not by Rust type. `1` (integer) equals `1.0`
-    /// (float) in JSON.
+    /// Semantic JSON equality. serde_json's `PartialEq` is variant-strict
+    /// for numbers (`Number::PosInt(1) != Number::Float(1.0)`), which is NOT
+    /// JSON semantics and used to strand a matcher mid-generation on
+    /// `{"enum":[1, 1.5]}` when the model emitted `1.0`. Numbers compare by
+    /// value (integer-exact when both sides are integers, f64 otherwise);
+    /// composites compare element-wise.
     fn json_equal(a: &serde_json::Value, b: &serde_json::Value) -> bool {
-        // serde_json's PartialEq is semantic for numbers: 1 == 1.0.
-        a == b
+        fn num_eq(x: &serde_json::Number, y: &serde_json::Number) -> bool {
+            if let (Some(i), Some(j)) = (x.as_i64(), y.as_i64()) {
+                return i == j;
+            }
+            if let (Some(u), Some(v)) = (x.as_u64(), y.as_u64()) {
+                return u == v;
+            }
+            match (x.as_f64(), y.as_f64()) {
+                (Some(f), Some(g)) => f == g,
+                _ => false,
+            }
+        }
+        match (a, b) {
+            (serde_json::Value::Number(x), serde_json::Value::Number(y)) => num_eq(x, y),
+            (serde_json::Value::Array(x), serde_json::Value::Array(y)) => {
+                x.len() == y.len() && x.iter().zip(y.iter()).all(|(i, j)| json_equal(i, j))
+            }
+            (serde_json::Value::Object(x), serde_json::Value::Object(y)) => {
+                x.len() == y.len()
+                    && x.iter().all(|(k, v)| y.get(k).is_some_and(|w| json_equal(v, w)))
+            }
+            _ => a == b,
+        }
     }
 
     fn type_name(v: &serde_json::Value) -> &'static str {
@@ -3968,8 +4388,10 @@ pub mod json_schema {
 
         #[test]
         fn rejects_recursion() {
-            // A self-referencing schema: an object with a property
-            // whose name matches the parent's key on the path.
+            // The ONLY recursion vector in JSON Schema is `$ref`, which the
+            // reference gate rejects. A repeated property NAME at different
+            // nesting depths is finite and compiles (see
+            // accepts_repeated_property_name_at_depth).
             let schema = json!({
                 "type": "object",
                 "properties": {
@@ -3981,8 +4403,18 @@ pub mod json_schema {
                     }
                 }
             });
-            let err = CompiledSchema::compile(&schema).unwrap_err();
-            assert!(matches!(err, SchemaError::RecursionNotSupported));
+            let compiled = CompiledSchema::compile(&schema).expect("finite schema compiles");
+
+            // $ref is the recursion vector and stays rejected.
+            let ref_schema = json!({
+                "type": "object",
+                "properties": {
+                    "next": {"$ref": "#"}
+                }
+            });
+            let err = CompiledSchema::compile(&ref_schema).unwrap_err();
+            assert!(matches!(err, SchemaError::ReferencesNotSupported { .. }));
+            let _ = compiled;
         }
 
         #[test]
@@ -3998,11 +4430,32 @@ pub mod json_schema {
         }
 
         #[test]
-        fn rejects_unsatisfiable_required_not_in_properties() {
+        fn required_not_in_properties_satisfiable_when_open() {
+            // Spec §7.1: {required:["b"]} with default additionalProperties
+            // (true) is SATISFIABLE — b may be any value — so it compiles.
+            // (This used to be rejected wholesale, over-refusing valid
+            // schemas the CLI validator accepted.)
             let schema = json!({
                 "type": "object",
                 "properties": {"a": {"type": "string"}},
                 "required": ["b"]
+            });
+            let compiled = CompiledSchema::compile(&schema).expect("satisfiable");
+            let mut m = compiled.matcher();
+            m.advance(b"{\"b\": true}");
+            assert!(m.is_accepting(), "any value satisfies the open required key");
+            assert!(!m.is_errored());
+        }
+
+        #[test]
+        fn rejects_unsatisfiable_required_closed_object() {
+            // required without a properties entry AND additionalProperties:
+            // false can never emit the required key — genuinely unsatisfiable.
+            let schema = json!({
+                "type": "object",
+                "properties": {"a": {"type": "string"}},
+                "required": ["b"],
+                "additionalProperties": false
             });
             let err = CompiledSchema::compile(&schema).unwrap_err();
             assert!(matches!(err, SchemaError::Unsatisfiable { .. }));
@@ -4013,6 +4466,67 @@ pub mod json_schema {
             let schema = json!({"type": "string", "minLength": 5});
             let err = CompiledSchema::compile(&schema).unwrap_err();
             assert!(matches!(err, SchemaError::UnsupportedKeyword { .. }));
+        }
+
+        #[test]
+        fn rejects_unknown_keyword_default_deny() {
+            // Default-deny (spec §7.1): an unknown keyword must refuse the
+            // schema, never fall through to "annotation, ignore". The old
+            // `_ => {}` fall-through silently admitted if/then/else and
+            // additionalItems, whose constraints were then ignored.
+            for kw in ["if", "then", "else", "additionalItems", "dependsOn", "x-custom"] {
+                let mut schema = json!({"type": "string"});
+                schema[kw] = json!({});
+                let err = CompiledSchema::compile(&schema).unwrap_err();
+                assert!(
+                    matches!(err, SchemaError::UnsupportedKeyword { .. }),
+                    "keyword {kw} must be rejected, got {err:?}"
+                );
+            }
+        }
+
+        #[test]
+        fn rejects_union_type_form() {
+            // {"type": ["integer","null"]} used to fall into the inference
+            // path and compile to an unconstrained Any.
+            let schema = json!({"type": ["integer", "null"]});
+            let err = CompiledSchema::compile(&schema).unwrap_err();
+            assert!(matches!(err, SchemaError::UnsupportedKeyword { .. }));
+        }
+
+        #[test]
+        fn rejects_schema_form_additional_properties() {
+            // The schema form used to be silently flattened to `true`.
+            let schema = json!({
+                "type": "object",
+                "properties": {"a": {"type": "string"}},
+                "additionalProperties": {"type": "string"}
+            });
+            let err = CompiledSchema::compile(&schema).unwrap_err();
+            assert!(matches!(err, SchemaError::UnsupportedKeyword { .. }));
+        }
+
+        #[test]
+        fn accepts_repeated_property_name_at_depth() {
+            // A repeated property NAME at different nesting depths is
+            // ordinary finite JSON Schema, not recursion — recursion needs
+            // $ref, which the keyword gate already rejects.
+            let schema = json!({
+                "type": "object",
+                "properties": {
+                    "meta": {
+                        "type": "object",
+                        "properties": {
+                            "meta": {"type": "string"}
+                        }
+                    }
+                },
+                "required": ["meta"]
+            });
+            let compiled = CompiledSchema::compile(&schema).expect("finite schema compiles");
+            let mut m = compiled.matcher();
+            m.advance(b"{\"meta\": {\"meta\": \"deep\"}}");
+            assert!(m.is_accepting());
         }
 
         #[test]
@@ -4167,6 +4681,107 @@ pub mod json_schema {
             let mut m = compiled.matcher();
             m.advance(b"\"purple\"");
             assert!(m.is_errored());
+        }
+
+        // ── Duplicate object keys (strict mode, A15) ───────────────────
+
+        #[test]
+        fn matcher_rejects_duplicate_object_keys() {
+            // serde_json merges duplicates silently (last wins), so the
+            // incremental parse alone accepted {"a":1,"a":2}. Strict mode
+            // rejects them (spec §7.1).
+            let schema = json!({
+                "type": "object",
+                "properties": {"a": {"type": "integer"}},
+                "required": ["a"]
+            });
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let mut m = compiled.matcher();
+            m.advance(b"{\"a\": 1, \"a\": 2}");
+            assert!(m.is_errored(), "duplicate keys must be invalid in strict mode");
+        }
+
+        #[test]
+        fn matcher_rejects_escaped_key_duplicate() {
+            // Escaped and unescaped spellings of the same decoded key are
+            // the SAME key: {"a":1,"\u0061":2} is a duplicate.
+            let schema = json!({
+                "type": "object",
+                "properties": {"a": {"type": "integer"}},
+                "required": ["a"]
+            });
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let mut m = compiled.matcher();
+            m.advance(b"{\"a\": 1, \"\\u0061\": 2}");
+            assert!(m.is_errored(), "escaped spelling of the same key is a duplicate");
+        }
+
+        #[test]
+        fn matcher_allows_same_key_in_sibling_objects() {
+            // The same key at different nesting levels is fine.
+            let schema = json!({
+                "type": "object",
+                "properties": {
+                    "a": {
+                        "type": "object",
+                        "properties": {"b": {"type": "integer"}},
+                        "required": ["b"]
+                    },
+                    "b": {"type": "integer"}
+                },
+                "required": ["a"]
+            });
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let mut m = compiled.matcher();
+            m.advance(b"{\"a\": {\"b\": 1}, \"b\": 2}");
+            assert!(m.is_accepting());
+        }
+
+        // ── Semantic numeric equality (A15) ────────────────────────────
+
+        #[test]
+        fn matcher_accepts_float_spelling_of_integer_enum() {
+            // serde_json's PartialEq is variant-strict (1 != 1.0), which
+            // used to strand the matcher: "1.0" passed the prefix check but
+            // failed the completion equality. JSON numbers compare by value.
+            let schema = json!({"enum": [1, 1.5]});
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let mut m = compiled.matcher();
+            m.advance(b"1.0");
+            assert!(m.is_accepting(), "1.0 is semantically the enum member 1");
+            assert!(!m.is_errored());
+        }
+
+        #[test]
+        fn matcher_accepts_integer_spelling_of_float_const() {
+            let schema = json!({"const": 2.5});
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let mut m = compiled.matcher();
+            m.advance(b"2.5");
+            assert!(m.is_accepting());
+        }
+
+        // ── Mask fast paths (bounded mask time, spec §9.2) ─────────────
+
+        #[test]
+        fn fast_path_allows_inert_string_content_and_refuses_structural_mismatch() {
+            let schema = json!({
+                "type": "object",
+                "properties": {"name": {"type": "string"}},
+                "required": ["name"]
+            });
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let mut m = compiled.matcher();
+
+            // Structural position: `{` is legal, `x` is not (fast-fail).
+            assert!(m.is_token_allowed(b"{"));
+            assert!(!m.is_token_allowed(b"x"));
+            m.advance(b"{\"name\": \"Al");
+
+            // Plain string content: inert UTF-8 without quotes/backslashes
+            // is allowed without simulation; a control byte is not.
+            assert!(m.is_token_allowed(b"ice "));
+            assert!(!m.is_token_allowed("\u{7}bolt".as_bytes()));
         }
 
         #[test]
