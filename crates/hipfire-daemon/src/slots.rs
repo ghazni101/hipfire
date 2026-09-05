@@ -69,6 +69,12 @@ struct EngineSpawnParams {
     /// Checkpoint pool max bytes. Read from `serve.prefix_cache_max_bytes`;
     /// default 0.
     prefix_cache_max_bytes: u64,
+    /// Global trunk-row budget (spec §5.2 S2). Read from
+    /// `serve.max_batch_tokens`; default 4096.
+    max_batch_tokens: usize,
+    /// Minimum prefill quantum (spec §5.2 S2 / §5.3 S3). Read from
+    /// `serve.prefill_min_tokens`; default 1.
+    prefill_min_tokens: usize,
 }
 
 /// The per-arch multi-slot engine behind the four-method surface
@@ -113,6 +119,13 @@ impl AnySlotEngine {
                         // Default false/0 — product defaults stay unchanged.
                         prefix_cache: p.prefix_cache,
                         prefix_cache_max_bytes: p.prefix_cache_max_bytes,
+                        // Global trunk-row budget and minimum prefill quantum
+                        // (spec §5.2 S2 / §5.3 S3). Read from
+                        // serve.max_batch_tokens / serve.prefill_min_tokens
+                        // config keys. Defaults 4096/1 (the registered config
+                        // defaults).
+                        max_batch_tokens: p.max_batch_tokens,
+                        prefill_min_tokens: p.prefill_min_tokens,
                     },
                 )
                 .map_err(|e| format!("SlotEngine spawn: {e}"))?,
@@ -199,6 +212,21 @@ impl SlotBackend {
             .get("serve.prefix_cache_max_bytes")
             .and_then(|v| if let hipfire_config::ConfigValue::Integer(i) = v { Some(*i as u64) } else { None })
             .unwrap_or(0);
+        // Read the global trunk-row budget and minimum prefill quantum (spec
+        // §5.2 S2 / §5.3 S3). Keys are registered in hipfire-config as
+        // serve.max_batch_tokens / serve.prefill_min_tokens with env
+        // HIPFIRE_SERVE_MAX_BATCH_TOKENS / HIPFIRE_SERVE_PREFILL_MIN_TOKENS.
+        // Defaults 4096/1 (the registered config defaults).
+        let max_batch_tokens = hipfire_config::active_or_local_process_config()
+            .values
+            .get("serve.max_batch_tokens")
+            .and_then(|v| if let hipfire_config::ConfigValue::Integer(i) = v { Some(*i as usize) } else { None })
+            .unwrap_or(4096);
+        let prefill_min_tokens = hipfire_config::active_or_local_process_config()
+            .values
+            .get("serve.prefill_min_tokens")
+            .and_then(|v| if let hipfire_config::ConfigValue::Integer(i) = v { Some(*i as usize) } else { None })
+            .unwrap_or(1);
 
         let vl_path = preflight.vl_path;
 
@@ -221,6 +249,8 @@ impl SlotBackend {
                 kv_mode_raw: kv_mode_raw.to_string(),
                 prefix_cache,
                 prefix_cache_max_bytes,
+                max_batch_tokens,
+                prefill_min_tokens,
             },
         )?;
 

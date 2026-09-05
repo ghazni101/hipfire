@@ -102,6 +102,18 @@ pub struct EngineConfig {
     /// inserts (lookups still work for already-published entries from a
     /// prior epoch, but no new captures are stored).
     pub prefix_cache_max_bytes: u64,
+    /// Global trunk-row budget per step (spec §5.2 S2): the sum of prefill +
+    /// decode + verify rows a step emits must not exceed this. The scheduler
+    /// enforces it in `next_batch` (prefill + decode) and the engine subtracts
+    /// verify rows before calling the scheduler, so the forward panic-assert
+    /// (`n <= pbs.max_batch`) is a fail-closed backstop, not the throttle.
+    /// Default 4096 (the registered config default for `serve.max_batch_tokens`).
+    pub max_batch_tokens: usize,
+    /// Minimum prefill quantum guaranteed to one prefilling slot per step when
+    /// space remains after decode allocation (spec §5.2 S2 / §5.3 S3). The
+    /// scheduler rotates which prefilling slot gets it across ticks. Default 1
+    /// (the registered config default for `serve.prefill_min_tokens`).
+    pub prefill_min_tokens: usize,
 }
 
 pub struct SlotEngine {
@@ -300,6 +312,11 @@ struct Rig {
     n_slots: usize,
     cap_tokens: usize,
     prefill_chunk: usize,
+    /// Global trunk-row budget (spec §5.2 S2). Enforced in `next_batch` and
+    /// the MTP verify injection path; the forward assert is a backstop.
+    max_batch_tokens: usize,
+    /// Minimum prefill quantum (spec §5.2 S2 / §5.3 S3).
+    prefill_min_tokens: usize,
     /// Reusable host-side logits buffer for grammar mask application (spec
     /// §7.2 G2). When a slot has a grammar constraint, its logits row is
     /// copied D2H, masked (disallowed tokens set to NEG_INFINITY), then
@@ -1101,6 +1118,8 @@ impl Rig {
             n_slots: cfg.n_slots,
             cap_tokens: cfg.cap_tokens,
             prefill_chunk,
+            max_batch_tokens: cfg.max_batch_tokens.max(1),
+            prefill_min_tokens: cfg.prefill_min_tokens.max(1),
             logits_host: vec![0.0f32; cfg.n_slots * vocab_size],
             prefix_index,
             checkpoint_pool,
@@ -1874,6 +1893,48 @@ fn clear_work_slot(work: &mut PendingWork) {
     work.mtp_retire_fails = 0;
 }
 
+/// Rebuild a `SlotBatch`'s flat arrays to exclude rows belonging to failed
+/// slots (spec §5.4/S4: per-slot provision failure isolates the failing
+/// request). The flat arrays (tokens, positions, row_slot, pos3, ext_emb) are
+/// packed in slot order by `m_per_slot`; zeroing a slot's count without
+/// removing its flat rows would misalign every subsequent slot. This rebuilds
+/// them from the surviving `m_per_slot` entries.
+fn rebuild_batch_excluding_failed(batch: &mut SlotBatch, failed: &[usize]) {
+    let failed_set: std::collections::HashSet<usize> = failed.iter().copied().collect();
+    let mut new_tokens = Vec::new();
+    let mut new_positions = Vec::new();
+    let mut new_row_slot = Vec::new();
+    let mut new_pos3 = Vec::new();
+    let mut new_ext_emb = Vec::new();
+    let has_pos3 = !batch.pos3.is_empty();
+    let has_ext = !batch.ext_emb.is_empty();
+    let mut off = 0usize;
+    for (s, &m) in batch.m_per_slot.iter().enumerate() {
+        if m == 0 || failed_set.contains(&s) {
+            off += m;
+            continue;
+        }
+        new_tokens.extend_from_slice(&batch.tokens[off..off + m]);
+        new_positions.extend_from_slice(&batch.positions[off..off + m]);
+        new_row_slot.extend_from_slice(&batch.row_slot[off..off + m]);
+        if has_pos3 {
+            new_pos3.extend_from_slice(&batch.pos3[off..off + m]);
+        }
+        if has_ext {
+            new_ext_emb.extend_from_slice(&batch.ext_emb[off..off + m]);
+        }
+        off += m;
+    }
+    for &s in failed {
+        batch.m_per_slot[s] = 0;
+    }
+    batch.tokens = new_tokens;
+    batch.positions = new_positions;
+    batch.row_slot = new_row_slot;
+    batch.pos3 = new_pos3;
+    batch.ext_emb = new_ext_emb;
+}
+
 /// True when an MTP verify batch — `mtp_k + 1` rows at positions
 /// `next_pos..next_pos + mtp_k` — fits inside the slot's token cap. The
 /// batched forward provisions `set_seq_len(max_pos + 1)` before its KV write
@@ -2270,6 +2331,7 @@ fn run_loop(
     let mut sched = Scheduler {
         chunk_size: rig.prefill_chunk,
         vl_sequential: rig.vl_sequential,
+        prefill_cursor: 0,
     };
     let mut graph = SlotDecodeGraph::new();
     let mut poison: Option<String> = None;
@@ -2443,9 +2505,105 @@ fn run_loop(
                 }
             }
         }
-        // produced draft outputs.
-        let sched_batch = sched.next_batch(&mut work);
-        let batch = if mtp_drafts.iter().any(|d| d.is_some()) {
+        // ── Step reservation (spec §5.1/S1, §5.2/S2) ────────────────────
+        // The scheduler enforces the global trunk-row budget for prefill +
+        // decode; MTP verify rows (injected below) are subtracted first so
+        // the full step never exceeds `max_batch_tokens`. The forward
+        // panic-assert (`n <= pbs.max_batch`) stays as a fail-closed
+        // backstop, not the throttle.
+        let max_batch_tokens = rig.max_batch_tokens;
+        let prefill_min_tokens = rig.prefill_min_tokens;
+
+        // MTP verify rows: each drafting slot contributes `mtp_k + 1` rows.
+        // A verify slot must not also keep an ordinary decode row (spec §5.2
+        // S2), so the scheduler already skipped decoding MTP slots. If the
+        // verify rows would not fit the remaining quota after decode+prefill
+        // allocation, skip MTP for that slot this cycle (drop the draft; the
+        // seed stays in `remaining_prompt` for a regular decode row next
+        // step) rather than overflowing the budget.
+        let mut verify_rows: u64 = 0;
+        if mtp_drafts.iter().any(|d| d.is_some()) {
+            for s in 0..n {
+                if mtp_drafts[s].is_some() {
+                    verify_rows = verify_rows
+                        .checked_add((rig.mtp_k + 1) as u64)
+                        .unwrap_or(u64::MAX);
+                }
+            }
+        }
+
+        let remaining_for_sched = max_batch_tokens
+            .saturating_sub(verify_rows as usize)
+            .max(0);
+        let sched_batch = sched.next_batch(&mut work, remaining_for_sched, prefill_min_tokens);
+
+        // Count prefill + decode rows the scheduler emitted.
+        let prefill_rows: u64 = (0..n)
+            .filter(|&s| !work[s].decoding && sched_batch.m_per_slot.get(s).copied().unwrap_or(0) > 0)
+            .map(|s| sched_batch.m_per_slot[s] as u64)
+            .sum();
+        let decode_rows: u64 = (0..n)
+            .filter(|&s| {
+                work[s].decoding
+                    && !work[s].mtp_active
+                    && sched_batch.m_per_slot.get(s).copied().unwrap_or(0) > 0
+            })
+            .map(|s| sched_batch.m_per_slot[s] as u64)
+            .sum();
+
+        // Build a StepReservation and validate against the global budget
+        // (spec §5.2 S2: `fits(max_batch_tokens)`). If it does not fit
+        // (e.g. verify_rows overestimated because a draft was dropped
+        // above), shrink by dropping verify slots first, then decode, then
+        // prefill — never panic.
+        let mut reservation = hipfire_runtime::serve_contract::StepReservation {
+            prefill_rows,
+            decode_rows,
+            verify_rows,
+            forced_rows: 0,
+            page_growth_credits: 0,
+            cow_destinations: 0,
+            needs: hipfire_runtime::serve_contract::StepNeeds {
+                scratch_bytes: 0,
+                snapshot_bytes: 0,
+                output_bytes: 0,
+            },
+        };
+        match reservation.fits(max_batch_tokens as u64) {
+            Ok(true) => {}
+            _ => {
+                // Shrink: drop MTP verify slots until it fits, then drop
+                // prefill rows from the tail. The scheduler already capped
+                // prefill+decode at `remaining_for_sched`, so this only
+                // fires if verify_rows was over-counted or the budget is
+                // smaller than the scheduler's view.
+                while reservation.fits(max_batch_tokens as u64) != Ok(true) {
+                    let slot = mtp_drafts.iter().position(|x| x.is_some());
+                    if let Some(s) = slot {
+                        mtp_drafts[s] = None;
+                        let vk = (rig.mtp_k + 1) as u64;
+                        reservation.verify_rows = reservation.verify_rows.saturating_sub(vk);
+                        // The seed stays in remaining_prompt for regular
+                        // decode next step; no state mutation needed here.
+                    } else {
+                        // No verify slots left to drop: trim prefill from
+                        // the tail until it fits.
+                        if reservation.prefill_rows > 0 {
+                            reservation.prefill_rows -= 1;
+                        } else if reservation.decode_rows > 0 {
+                            reservation.decode_rows -= 1;
+                        } else {
+                            break;
+                        }
+                    }
+                }
+            }
+        }
+
+        // Re-inject MTP verify tokens for the surviving drafts. A slot whose
+        // draft was dropped above does not get verify rows; its seed stays in
+        // `remaining_prompt` for a regular decode row next step.
+        let mut batch = if mtp_drafts.iter().any(|d| d.is_some()) {
             let pos3_deltas: Vec<i32> = work.iter().map(|w| w.pos3_delta).collect();
             // Work-level M-RoPE need — the same predicate the scheduler's
             // `any_pos3` uses — NOT derived from `sched_batch.pos3`, which is
@@ -2505,11 +2663,9 @@ fn run_loop(
                 break 'serve;
             }
         }
-        // Slots with verify drafts skip the per-slot last-row lm_head GEMV
-        // inside the forward: their logits come from the batched verify
-        // lm_head over all k+1 rows instead, so the single-row GEMV (a full
-        let lm_head_skip: Vec<bool> = (0..n).map(|s| mtp_drafts[s].is_some()).collect();
-        let any_verify = lm_head_skip.iter().any(|&b| b);
+        // lm_head_skip and any_verify are computed AFTER the COW failure
+        // isolation (below), so a slot whose draft was dropped there is not
+        // marked as a verify slot.
         // ── COW write barrier (spec §4.6) ──────────────────────────────
         // Before KV write kernels: plan copy-on-write for each active slot's
         // block table over the write interval. Sealed/CacheOnly pages (shared
@@ -2517,8 +2673,12 @@ fn run_loop(
         // pages are a no-op. Always-on — correct even when prefix_cache is
         // off (no sealed pages exist, so plan_cow returns an empty plan).
         let mut cow_plans: Vec<Option<(usize, rdna_compute::page_pool::CowPlan)>> = Vec::with_capacity(n);
-        let mut cow_ok = true;
         let mut row_offset = 0usize;
+        // Per-slot COW provision (spec §5.4/S4): a plan_cow failure for one
+        // slot drops ONLY that slot from this step (its request is failed),
+        // not every active slot. Prior plans are aborted so no half-installed
+        // COW mappings survive (spec §4.3: abort_cow before continuing).
+        let mut failed_slots: Vec<usize> = Vec::new();
         for s in 0..n {
             let m = batch.m_per_slot[s];
             if m == 0 {
@@ -2533,35 +2693,63 @@ fn run_loop(
                     cow_plans.push(Some((s, plan)));
                 }
                 Err(e) => {
-                    // Reservation failure: abort all prior plans and fail the step.
                     eprintln!("[cow] plan_cow failed for slot {s}: {e}");
-                    cow_ok = false;
+                    // plan_cow failed: nothing was installed for this slot,
+                    // so no abort is needed. Record the failure and continue
+                    // — other slots' plans survive (spec §5.4/S4).
+                    failed_slots.push(s);
                     cow_plans.push(None);
-                    // Abort plans already created.
-                    for (_, p) in cow_plans.iter().flatten() {
-                        rig.pool.abort_cow_for_slot(p);
-                    }
-                    break;
                 }
             }
             row_offset += m;
         }
-        if !cow_ok {
-            // Treat as a forward failure — reject all active slots.
-            let reason = "COW reservation failed".to_string();
-            for (s, f) in slots.iter_mut().enumerate() {
-                if let Some(f) = f.take() {
-                    let _ = send_event(&f.reply, Event::Rejected { reason: reason.clone() });
+        // Fail the isolated slots: reject their requests, clear their work,
+        // and zero their batch rows so the forward skips them. Their COW
+        // plans (none, since plan_cow failed) need no abort.
+        if !failed_slots.is_empty() {
+            for &s in &failed_slots {
+                // Abort any COW plan that WAS created for this slot before
+                // the failure (shouldn't happen since plan_cow failed, but
+                // be safe).
+                if let Some((_, p)) = cow_plans.get(s).and_then(|o| o.as_ref()) {
+                    rig.pool.abort_cow_for_slot(p);
+                }
+                cow_plans[s] = None;
+                // Zero the slot's batch rows so the forward does not write
+                // through a slot whose COW plan failed.
+                let m = batch.m_per_slot[s];
+                batch.m_per_slot[s] = 0;
+                let _ = m; // rows are dropped from the flat arrays below
+                if let Some(f) = slots[s].take() {
+                    let reason = "COW reservation failed for this slot".to_string();
+                    let _ = send_event(&f.reply, Event::Rejected { reason });
                     rig.swap.forget(f.session.0);
                     rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
-                    work[s].remaining_prompt.clear();
-                    work[s].decoding = false;
-                    work[s].next_pos = 0;
-                    work[s].mtp_active = false;
+                    clear_work_slot(&mut work[s]);
+                    clear_slot_vl_state(&mut rig, s);
                 }
             }
-            continue;
+            // Rebuild the flat arrays to drop the failed slots' rows. The
+            // forward reads tokens/positions/row_slot/pos3/ext_emb as flat
+            // arrays packed by m_per_slot, so zeroing m_per_slot without
+            // removing the flat rows would misalign every subsequent slot.
+            rebuild_batch_excluding_failed(&mut batch, &failed_slots);
+            // Also drop MTP drafts for failed slots so the verify path
+            // does not try to read their hidden rows.
+            for &s in &failed_slots {
+                mtp_drafts[s] = None;
+            }
+            if batch.is_empty() {
+                continue;
+            }
         }
+        // Slots with verify drafts skip the per-slot last-row lm_head GEMV
+        // inside the forward: their logits come from the batched verify
+        // lm_head over all k+1 rows instead, so the single-row GEMV (a full
+        // vocab projection) is redundant for them. Computed after COW failure
+        // isolation so a dropped draft is not counted as a verify slot.
+        let lm_head_skip: Vec<bool> = (0..n).map(|s| mtp_drafts[s].is_some()).collect();
+        let any_verify = lm_head_skip.iter().any(|&b| b);
 
         let fwd = (|| {
             let mut capture = any_verify.then(|| {
