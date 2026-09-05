@@ -40,6 +40,12 @@ use crate::qwen35::{
 use crate::scheduler::{PendingWork, Scheduler, VlPrefill};
 use hipfire_runtime::llama::{KvCache, VMode};
 use hipfire_runtime::tokenizer::Tokenizer;
+use crate::speculative::DeltaNetSnapshot;
+use crate::checkpoint::{capture_checkpoint, plan_resume, CheckpointId, QwenCheckpointPool};
+use hipfire_runtime::prefix_index::{Handle, PrefixIndex};
+use hipfire_runtime::serve_contract::{
+    CacheDomain, DrafterDecision, PrefixLookup, PrefixLookupResult,
+};
 
 /// Internal control plane for the engine thread. Public methods map onto these
 /// messages; the GPU rig stays exclusively on that thread.
@@ -86,6 +92,16 @@ pub struct EngineConfig {
     /// back to `HIPFIRE_KV_MODE` / config, resolved through the slots site
     /// policy (full static ladder; q8 default).
     pub kv_mode_raw: String,
+    /// Cross-session prefix cache (radix index + checkpoint pool). Default
+    /// false: the existing session-local continuation path (convo hashes)
+    /// is unchanged. When true, cold admits consult a PrefixIndex for
+    /// reusable KV pages and a QwenCheckpointPool for recurrent state
+    /// (spec §4.5–4.6). Requires paged KV (PagePool).
+    pub prefix_cache: bool,
+    /// Maximum device bytes for the checkpoint pool. 0 = pool that refuses
+    /// inserts (lookups still work for already-published entries from a
+    /// prior epoch, but no new captures are stored).
+    pub prefix_cache_max_bytes: u64,
 }
 
 pub struct SlotEngine {
@@ -292,6 +308,28 @@ struct Rig {
     /// filtering/renormalization (spec §7.2 G2). Allocated once; reused
     /// across steps. Sized to `n_slots * vocab_size` f32 elements.
     logits_host: Vec<f32>,
+    /// Cross-session prefix cache: CPU-resident radix index over published
+    /// token spans (spec §4.2 C2). None when `prefix_cache` is off.
+    prefix_index: Option<hipfire_runtime::prefix_index::PrefixIndex>,
+    /// Cross-session recurrent-state checkpoint pool (spec §4.5 C5).
+    /// None when `prefix_cache` is off.
+    checkpoint_pool: Option<crate::checkpoint::QwenCheckpointPool<DeltaNetSnapshot>>,
+    /// Cache domain identity built once at Rig::build (spec §4.1 C1).
+    /// None when `prefix_cache` is off.
+    cache_domain: Option<hipfire_runtime::serve_contract::CacheDomain>,
+    /// True when cross-session prefix reuse is enabled.
+    prefix_cache: bool,
+    /// Debug counter: total prefix cache lookups (for test assertions that
+    /// vision requests never call lookup).
+    lookup_count: u64,
+    /// Debug counter: total plan_cow calls (for test assertions that the
+    /// COW write barrier fires on paged steps).
+    cow_plan_count: u64,
+    /// Side map: boundary → published page handles. The PrefixIndex stores
+    /// handles internally but does not expose them from `lookup`; this map
+    /// shadows the index's handle storage so the admit Hit path can
+    /// retrieve the physical pages to share into a new slot.
+    published_handles: std::collections::HashMap<u64, Vec<hipfire_runtime::prefix_index::Handle>>,
 }
 
 fn dn_buffers(dn: &DeltaNetState) -> Vec<&GpuTensor> {
@@ -387,37 +425,51 @@ impl Rig {
         // set_seq_len errors before any kernel writes through the missing
         // page); a larger count over-subscribes physical VRAM and is the
         // operator's call.
-        let paged_pages = match hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED")
-            .ok()
-            .as_deref()
-        {
-            Some("1") | Some("on") | Some("true") => {
-                // Batched VL is paged-capable (block-table indirection all
-                // the way down), so paged is refused only when the operator
-                // forced the legacy sequential VL path — that path writes
-                // through a flat contiguous slab view which aliases every
-                // slot onto the arena prefix in paged mode.
-                let sequential_vl = hipfire_config::developer_var("HIPFIRE_VL_SEQUENTIAL")
+        // Prefix cache requires paged KV: the radix index shares physical
+        // pages across sessions via PagePool refcounting, which is only
+        // available in paged mode. Force it on when prefix_cache is enabled.
+        let prefix_cache = cfg.prefix_cache;
+        let paged_pages = if prefix_cache {
+            let legacy_equivalent = cfg.n_slots * cfg.cap_tokens.div_ceil(PAGE_TOKENS);
+            Some(
+                hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED_PAGES")
                     .ok()
-                    .is_some_and(|v| v == "1" || v == "on" || v == "true");
-                if cfg.is_vl && sequential_vl {
-                    eprintln!(
-                        "  [hipfire] paged KV disabled: HIPFIRE_VL_SEQUENTIAL=1 \
-                         requires contiguous KV slots"
-                    );
-                    None
-                } else {
-                    let legacy_equivalent =
-                        cfg.n_slots * cfg.cap_tokens.div_ceil(PAGE_TOKENS);
-                    Some(
-                        hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED_PAGES")
-                            .ok()
-                            .and_then(|v| v.trim().parse::<usize>().ok())
-                            .unwrap_or(legacy_equivalent),
-                    )
+                    .and_then(|v| v.trim().parse::<usize>().ok())
+                    .unwrap_or(legacy_equivalent),
+            )
+        } else {
+            match hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED")
+                .ok()
+                .as_deref()
+            {
+                Some("1") | Some("on") | Some("true") => {
+                    // Batched VL is paged-capable (block-table indirection all
+                    // the way down), so paged is refused only when the operator
+                    // forced the legacy sequential VL path — that path writes
+                    // through a flat contiguous slab view which aliases every
+                    // slot onto the arena prefix in paged mode.
+                    let sequential_vl = hipfire_config::developer_var("HIPFIRE_VL_SEQUENTIAL")
+                        .ok()
+                        .is_some_and(|v| v == "1" || v == "on" || v == "true");
+                    if cfg.is_vl && sequential_vl {
+                        eprintln!(
+                            "  [hipfire] paged KV disabled: HIPFIRE_VL_SEQUENTIAL=1 \
+                             requires contiguous KV slots"
+                        );
+                        None
+                    } else {
+                        let legacy_equivalent =
+                            cfg.n_slots * cfg.cap_tokens.div_ceil(PAGE_TOKENS);
+                        Some(
+                            hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED_PAGES")
+                                .ok()
+                                .and_then(|v| v.trim().parse::<usize>().ok())
+                                .unwrap_or(legacy_equivalent),
+                        )
+                    }
                 }
+                _ => None,
             }
-            _ => None,
         };
 
         let weight_bytes = std::fs::metadata(&cfg.model_path)
@@ -949,7 +1001,69 @@ impl Rig {
         let mtp_prefill_hidden = gpu
             .zeros(&[prefill_chunk.max(1) * config.dim], DType::F32)
             .map_err(|e| format!("mtp prefill hidden staging: {e}"))?;
-        // g now committed and empty; Drop is no-op.
+        // ── Prefix cache (spec §4.1–4.6) ──────────────────────────────────
+        // Build the CacheDomain ONCE from available identities. When
+        // prefix_cache is off, all three are None and the existing path is
+        // bitwise unchanged.
+        let (prefix_index, checkpoint_pool, cache_domain) = if prefix_cache {
+            use hipfire_runtime::serve_contract::{
+                ArchPolicy, CacheDomain, DeviceTopology, KvLayout, SharingNamespace,
+                TemplateIdentity, TokenizerIdentity,
+            };
+            // C1 identity stubs: tokenizer and template digests are not yet
+            // computable from the loaded Tokenizer (no vocab hash API). Use
+            // the model file size as a proxy for model_content_digest — it
+            // changes when the model file changes, which is the property that
+            // matters for invalidating stale cache entries on model swap.
+            // The tokenizer/template placeholders are stable constants that
+            // still change when the model file changes (via
+            // model_content_digest). Filling these from real data requires
+            // a Tokenizer::vocab_digest() API — a C1 gap to report.
+            let domain = CacheDomain {
+                model_content_digest: weight_bytes.to_le_bytes().to_vec(),
+                model_load_epoch: 1,
+                sidecar_digests: vec![],
+                tokenizer: TokenizerIdentity {
+                    vocab_digest: vec![0u8; 16],
+                    config_digest: vec![0u8; 16],
+                },
+                template: TemplateIdentity {
+                    template_digest: vec![0u8; 16],
+                    normalization_tag: "qwen35-chat".to_string(),
+                },
+                arch_policy: ArchPolicy {
+                    arch_tag: "qwen35-deltanet".to_string(),
+                    state_abi_tag: "dn-q8".to_string(),
+                    position_attention_tag: "causal-mrope".to_string(),
+                },
+                kv_layout: KvLayout {
+                    k_stride_bytes: vec![per_pos_bytes as u64],
+                    v_stride_bytes: vec![per_pos_v_bytes as u64],
+                    layout_tag: format!("{:?}", kv_mode),
+                },
+                device: DeviceTopology {
+                    device_id: format!("gpu-{}", gpu.device_id),
+                    topology_id: "single".to_string(),
+                    allocation_epoch: 1,
+                },
+                namespace: SharingNamespace {
+                    domain_id: "default".to_string(),
+                },
+            };
+            let idx = hipfire_runtime::prefix_index::PrefixIndex::new(1 << 16);
+            let pool = crate::checkpoint::QwenCheckpointPool::<DeltaNetSnapshot>::new(
+                cfg.prefix_cache_max_bytes,
+            );
+            eprintln!(
+                "  [hipfire] prefix cache enabled: radix max {} nodes, \
+                 checkpoint pool {} bytes",
+                1 << 16,
+                cfg.prefix_cache_max_bytes
+            );
+            (Some(idx), Some(pool), Some(domain))
+        } else {
+            (None, None, None)
+        };
 
         let vocab_size = config.vocab_size;
         Ok(Rig {
@@ -988,6 +1102,13 @@ impl Rig {
             cap_tokens: cfg.cap_tokens,
             prefill_chunk,
             logits_host: vec![0.0f32; cfg.n_slots * vocab_size],
+            prefix_index,
+            checkpoint_pool,
+            cache_domain,
+            prefix_cache,
+            lookup_count: 0,
+            cow_plan_count: 0,
+            published_handles: std::collections::HashMap::new(),
         })
     }
 
@@ -1016,6 +1137,7 @@ impl Rig {
             out_tokens,
             vl_ext_devs,
             vl_tower_jobs,
+            checkpoint_pool,
             ..
         } = self;
 
@@ -1076,6 +1198,12 @@ impl Rig {
         }
         for job in vl_tower_jobs.into_iter().flatten() {
             note_hip(job.free(&mut gpu));
+        }
+        // Free checkpoint pool snapshots (DeltaNetSnapshot device buffers).
+        if let Some(mut pool) = checkpoint_pool {
+            for blob in pool.drain_blobs() {
+                blob.free_gpu(&mut gpu);
+            }
         }
         gpu.invalidate_weight_caches();
         gpu.invalidate_graph_state();
@@ -1805,6 +1933,100 @@ fn install_sample_params(rig: &mut Rig, slot: SlotId, req: &SubmitRequest) {
     };
 }
 
+/// Publish generated-prefix pages at the client-commit boundary (Done event
+/// for non-cancellation reasons). Seals and publishes any full pages beyond
+/// the last prefill-boundary publish, capturing a checkpoint at the new
+/// boundary (spec §4.6 C6).
+fn publish_generated_prefix(rig: &mut Rig, slots: &mut [Option<InFlight>], s: usize) {
+    if !rig.prefix_cache {
+        return;
+    }
+    let Some(f) = slots[s].as_ref() else { return };
+    let session = f.session;
+    let last_pub = f.last_published_boundary;
+    let sess = match rig.sessions.get(session) {
+        Some(s) => s,
+        None => return,
+    };
+    let total_tokens = sess.tokens.len();
+    // Only publish full page-aligned boundaries beyond what was already published.
+    let new_boundary = (total_tokens / PAGE_TOKENS) * PAGE_TOKENS;
+    if new_boundary <= last_pub || new_boundary == 0 {
+        return;
+    }
+    let n_old_pages = last_pub / PAGE_TOKENS;
+    let n_new_pages = new_boundary / PAGE_TOKENS;
+    let page_indices: Vec<u32> = match rig.pool.block_table(SlotId(s)) {
+        Some(bt) => bt.page_indices().to_vec(),
+        None => return,
+    };
+    if page_indices.len() < n_new_pages {
+        return;
+    }
+    // Seal and add cache refs for the newly written pages.
+    if let Some(pp) = rig.pool.page_pool_mut() {
+        for p in n_old_pages..n_new_pages {
+            let phys = page_indices[p];
+            let _ = pp.seal(phys);
+            let _ = pp.add_cache_ref(phys);
+        }
+    }
+    // Build handles for all pages up to the new boundary.
+    let handles: Vec<Handle> = page_indices[..n_new_pages]
+        .iter()
+        .enumerate()
+        .map(|(i, &phys)| Handle {
+            handle: rdna_compute::page_pool::PageHandle {
+                phys,
+                epoch: 0,
+                generation: rig.pool.page_pool().map(|p| p.page_generation(phys)).unwrap_or(0),
+            },
+            token_offset: (i * PAGE_TOKENS) as u64,
+        })
+        .collect();
+    let tokens: Vec<u32> = rig
+        .sessions
+        .get(session)
+        .map(|sess| sess.tokens[..new_boundary].to_vec())
+        .unwrap_or_default();
+    if tokens.len() != new_boundary {
+        return;
+    }
+    let domain = rig.cache_domain.as_ref().unwrap();
+    let idx = rig.prefix_index.as_mut().unwrap();
+    let pp = rig.pool.page_pool().unwrap();
+    let checkpoint = if let Some(ckpt_pool) = rig.checkpoint_pool.as_mut() {
+        match capture_checkpoint(
+            &mut rig.gpu,
+            ckpt_pool,
+            domain,
+            new_boundary as u64,
+            &rig.dn_states[s],
+        ) {
+            Ok(id) => Some(id),
+            Err(e) => {
+                eprintln!("[prefix-cache] generated-prefix capture_checkpoint failed: {e}");
+                None
+            }
+        }
+    } else {
+        None
+    };
+    if let Err(e) = idx.publish_sealed_pages(domain, &tokens, &handles, checkpoint, pp) {
+        eprintln!("[prefix-cache] generated-prefix publish_sealed_pages failed: {e:?}");
+    } else {
+        rig.published_handles.insert(new_boundary as u64, handles);
+        if let Some(f) = slots[s].as_mut() {
+            f.last_published_boundary = new_boundary;
+        }
+        if rig.gpu.slot_trace() {
+            eprintln!(
+                "[slot-trace] generated-prefix published {n_new_pages} pages at boundary {new_boundary}"
+            );
+        }
+    }
+}
+
 fn commit_sampled_token(
     rig: &mut Rig,
     slots: &mut [Option<InFlight>],
@@ -1856,10 +2078,21 @@ fn commit_sampled_token(
             f.produced
         };
         let _ = send_event(&f.reply, Event::Done { reason, generated });
+        // Publish generated-prefix pages at client commit (spec §4.6 C6).
+        // Only for non-cancellation completions; ClientGone unpins instead.
+        if !matches!(reason, DoneReason::ClientGone) && rig.prefix_cache {
+            publish_generated_prefix(rig, slots, s);
+        }
         slots[s] = None;
         clear_work_slot(&mut work[s]);
         clear_slot_vl_state(rig, s);
         if matches!(reason, DoneReason::ClientGone) {
+            // Cancellation: unpin prefix cache domain pins (spec §4.4).
+            if rig.prefix_cache {
+                if let (Some(idx), Some(domain)) = (rig.prefix_index.as_mut(), rig.cache_domain.as_ref()) {
+                    idx.unpin(domain);
+                }
+            }
             rig.swap.forget(session.0);
             rig.sessions.close(&mut rig.pool, &mut rig.adm, session);
         } else {
@@ -1888,6 +2121,15 @@ struct InFlight {
     /// "requested" value — freezing the window at the first step's session
     /// length for the whole generation.
     repeat_window_req: usize,
+    /// Tokens reused from the cross-session prefix cache (spec §4.5).
+    /// 0 when prefix_cache is off or the lookup missed. Reported to
+    /// EngineStats.reused_tokens when the request completes.
+    reused_tokens: usize,
+    /// Last page-aligned boundary published to the prefix cache for this
+    /// request (spec §4.6 C6). Initialized to `reused` at admit time so
+    /// that shared pages from a prefix cache hit are not re-published.
+    /// 0 when prefix_cache is off.
+    last_published_boundary: usize,
     /// Per-request grammar constraint for structured output (spec §7 G1/G2).
     /// `None` for unconstrained requests. When present, a grammar mask is
     /// applied to the slot's logits row BEFORE the GPU sampler's
@@ -2266,9 +2508,61 @@ fn run_loop(
         // Slots with verify drafts skip the per-slot last-row lm_head GEMV
         // inside the forward: their logits come from the batched verify
         // lm_head over all k+1 rows instead, so the single-row GEMV (a full
-        // lm_head weight re-read) would be discarded work.
         let lm_head_skip: Vec<bool> = (0..n).map(|s| mtp_drafts[s].is_some()).collect();
         let any_verify = lm_head_skip.iter().any(|&b| b);
+        // ── COW write barrier (spec §4.6) ──────────────────────────────
+        // Before KV write kernels: plan copy-on-write for each active slot's
+        // block table over the write interval. Sealed/CacheOnly pages (shared
+        // via prefix cache) are scheduled for copy to private pages; private
+        // pages are a no-op. Always-on — correct even when prefix_cache is
+        // off (no sealed pages exist, so plan_cow returns an empty plan).
+        let mut cow_plans: Vec<Option<(usize, rdna_compute::page_pool::CowPlan)>> = Vec::with_capacity(n);
+        let mut cow_ok = true;
+        let mut row_offset = 0usize;
+        for s in 0..n {
+            let m = batch.m_per_slot[s];
+            if m == 0 {
+                cow_plans.push(None);
+                continue;
+            }
+            let write_start = batch.positions[row_offset] as usize;
+            let write_end = batch.positions[row_offset + m - 1] as usize + 1;
+            match rig.pool.plan_cow_for_slot(SlotId(s), write_start, write_end) {
+                Ok(plan) => {
+                    rig.cow_plan_count += 1;
+                    cow_plans.push(Some((s, plan)));
+                }
+                Err(e) => {
+                    // Reservation failure: abort all prior plans and fail the step.
+                    eprintln!("[cow] plan_cow failed for slot {s}: {e}");
+                    cow_ok = false;
+                    cow_plans.push(None);
+                    // Abort plans already created.
+                    for (_, p) in cow_plans.iter().flatten() {
+                        rig.pool.abort_cow_for_slot(p);
+                    }
+                    break;
+                }
+            }
+            row_offset += m;
+        }
+        if !cow_ok {
+            // Treat as a forward failure — reject all active slots.
+            let reason = "COW reservation failed".to_string();
+            for (s, f) in slots.iter_mut().enumerate() {
+                if let Some(f) = f.take() {
+                    let _ = send_event(&f.reply, Event::Rejected { reason: reason.clone() });
+                    rig.swap.forget(f.session.0);
+                    rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
+                    work[s].remaining_prompt.clear();
+                    work[s].decoding = false;
+                    work[s].next_pos = 0;
+                    work[s].mtp_active = false;
+                }
+            }
+            continue;
+        }
+
         let fwd = (|| {
             let mut capture = any_verify.then(|| {
                 let tape = rig
@@ -2301,6 +2595,126 @@ fn run_loop(
                 capture.as_mut(),
             )
         })();
+        // Commit COW plans after the forward succeeded — rebinds block
+        // tables to private copy pages. On forward failure, abort instead.
+        match &fwd {
+            Ok(()) => {
+                for (s, plan) in cow_plans.iter().flatten() {
+                    if let Err(e) = rig.pool.commit_cow_for_slot(SlotId(*s), plan) {
+                        eprintln!("[cow] commit_cow failed for slot {s}: {e}");
+                    }
+                }
+            }
+            Err(_) => {
+                for (_, plan) in cow_plans.iter().flatten() {
+                    rig.pool.abort_cow_for_slot(plan);
+                }
+            }
+        }
+        // ── Publication (spec §4.6 C6) ──────────────────────────────────
+        // After a successful prefill chunk, publish sealed full pages at
+        // committed page-aligned boundaries. Only when prefix_cache is on.
+        // Generated-prefix pages are published at the Done event (client commit).
+        if rig.prefix_cache {
+            let mut row_offset = 0usize;
+            for s in 0..n {
+                let m = batch.m_per_slot[s];
+                if m == 0 {
+                    continue;
+                }
+                row_offset += m;
+                // Only publish for prefilling slots (not decoding).
+                if work[s].decoding {
+                    continue;
+                }
+                // Vision requests skip the radix (spec X2).
+                if work[s].vl_prefill.is_some() {
+                    continue;
+                }
+                let new_boundary = (work[s].next_pos / PAGE_TOKENS) * PAGE_TOKENS;
+                let last_pub = slots[s].as_ref().map(|f| f.last_published_boundary).unwrap_or(0);
+                if new_boundary <= last_pub || new_boundary == 0 {
+                    continue;
+                }
+                // Publish pages [last_published, new_boundary).
+                let n_old_pages = last_pub / PAGE_TOKENS;
+                let n_new_pages = new_boundary / PAGE_TOKENS;
+                let page_indices: Vec<u32> = match rig.pool.block_table(SlotId(s)) {
+                    Some(bt) => bt.page_indices().to_vec(),
+                    None => continue,
+                };
+                if page_indices.len() < n_new_pages {
+                    continue;
+                }
+                // Seal and add cache refs for the newly written pages.
+                if let Some(pp) = rig.pool.page_pool_mut() {
+                    for p in n_old_pages..n_new_pages {
+                        let phys = page_indices[p];
+                        let _ = pp.seal(phys);
+                        let _ = pp.add_cache_ref(phys);
+                    }
+                }
+                // Build handles for all pages up to the new boundary.
+                let handles: Vec<Handle> = page_indices[..n_new_pages]
+                    .iter()
+                    .enumerate()
+                    .map(|(i, &phys)| Handle {
+                        handle: rdna_compute::page_pool::PageHandle {
+                            phys,
+                            epoch: 0,
+                            generation: rig.pool.page_pool().map(|p| p.page_generation(phys)).unwrap_or(0),
+                        },
+                        token_offset: (i * PAGE_TOKENS) as u64,
+                    })
+                    .collect();
+                // Get the session's tokens up to the boundary.
+                let session = match slots[s].as_ref().map(|f| f.session) {
+                    Some(sid) => sid,
+                    None => continue,
+                };
+                let tokens: Vec<u32> = rig
+                    .sessions
+                    .get(session)
+                    .map(|sess| sess.tokens[..new_boundary].to_vec())
+                    .unwrap_or_default();
+                if tokens.len() == new_boundary {
+                    let domain = rig.cache_domain.as_ref().unwrap();
+                    let idx = rig.prefix_index.as_mut().unwrap();
+                    let pp = rig.pool.page_pool().unwrap();
+                    // Capture checkpoint at the boundary.
+                    let checkpoint = if let Some(ckpt_pool) = rig.checkpoint_pool.as_mut() {
+                        match capture_checkpoint(
+                            &mut rig.gpu,
+                            ckpt_pool,
+                            domain,
+                            new_boundary as u64,
+                            &rig.dn_states[s],
+                        ) {
+                            Ok(id) => Some(id),
+                            Err(e) => {
+                                eprintln!("[prefix-cache] capture_checkpoint failed: {e}");
+                                None
+                            }
+                        }
+                    } else {
+                        None
+                    };
+                    if let Err(e) = idx.publish_sealed_pages(domain, &tokens, &handles, checkpoint, pp) {
+                        eprintln!("[prefix-cache] publish_sealed_pages failed: {e:?}");
+                    } else {
+                        rig.published_handles.insert(new_boundary as u64, handles);
+                        if let Some(f) = slots[s].as_mut() {
+                            f.last_published_boundary = new_boundary;
+                        }
+                        if rig.gpu.slot_trace() {
+                            eprintln!(
+                                "[slot-trace] published {n_new_pages} pages at boundary {new_boundary}"
+                            );
+                        }
+                    }
+                }
+            }
+        }
         if let Err(e) = fwd {
             // A forward failure is not recoverable per-request. Report it as a
             // REJECTION carrying the reason, not as a normal Done: an
@@ -2709,10 +3123,20 @@ fn run_loop(
                     f.produced
                 };
                 let _ = send_event(&f.reply, Event::Done { reason, generated });
+                // Publish generated-prefix pages at client commit (spec §4.6 C6).
+                if !matches!(reason, DoneReason::ClientGone) && rig.prefix_cache {
+                    publish_generated_prefix(&mut rig, &mut slots, s);
+                }
                 slots[s] = None;
                 clear_work_slot(&mut work[s]);
                 clear_slot_vl_state(&mut rig, s);
                 if matches!(reason, DoneReason::ClientGone) {
+                    // Cancellation: unpin prefix cache domain pins (spec §4.4).
+                    if rig.prefix_cache {
+                        if let (Some(idx), Some(domain)) = (rig.prefix_index.as_mut(), rig.cache_domain.as_ref()) {
+                            idx.unpin(domain);
+                        }
+                    }
                     // Nobody will follow up on a vanished client, so hand the
                     // slot back at once.
                     rig.swap.forget(session.0);
@@ -2800,8 +3224,46 @@ fn handle_command(
                 rig.sessions
                     .close(&mut rig.pool, &mut rig.adm, SessionId(id));
             }
+            // Drop prefix cache state so subsequent lookups miss (spec §4.6).
+            if rig.prefix_cache {
+                // Replace the radix index with a fresh empty one.
+                rig.prefix_index = Some(hipfire_runtime::prefix_index::PrefixIndex::new(1 << 16));
+                // Drain and free GPU blobs from the checkpoint pool.
+                if let Some(pool) = rig.checkpoint_pool.as_mut() {
+                    for blob in pool.drain_blobs() {
+                        blob.free_gpu(&mut rig.gpu);
+                    }
+                }
+                // Clear the published-handles side map.
+                rig.published_handles.clear();
+                // Bump the allocation epoch so stale CacheDomain lookups miss.
+                if let Some(domain) = rig.cache_domain.as_mut() {
+                    domain.device.allocation_epoch += 1;
+                }
+            }
             let _ = reply.send(Ok(()));
         }
+    }
+}
+/// Pure policy: should the admit path attempt a prefix-cache lookup?
+///
+/// Returns true only when prefix caching is enabled and the request carries
+/// no vision data (spec X2: Vision+prefix reuse OFF).
+fn should_lookup_prefix(prefix_cache: bool, has_visual: bool) -> bool {
+    prefix_cache && !has_visual
+}
+
+/// Pure policy: how many prompt tokens are reused (skipped) given a resume
+/// plan boundary and the total prompt length.
+///
+/// Returns 0 when the boundary covers the entire prompt (no prefill needed)
+/// or is zero (no checkpoint). Returns `boundary` when it's a partial match
+/// that leaves tokens to prefill.
+fn reused_tokens_from_plan(boundary: usize, prompt_len: usize) -> usize {
+    if boundary > 0 && boundary < prompt_len {
+        boundary
+    } else {
+        0
     }
 }
 
@@ -3042,6 +3504,8 @@ fn admit(
                         produced: 0,
                         max_tokens: req.max_tokens.max(1),
                         repeat_window_req: req.repeat_window.min(REPEAT_WINDOW_MAX),
+                        reused_tokens: 0,
+                        last_published_boundary: 0,
                         grammar: None,
                     });
                     rig.sessions.touch(existing);
@@ -3173,19 +3637,110 @@ fn admit(
         let _ = state.reset(&mut rig.gpu);
     }
 
-    // Prefix reuse: a fresh session reuses nothing, a continued one reuses its
-    // common prefix. Either way the suffix is what gets prefilled.
-    let plan = match rig
-        .sessions
-        .begin_turn(&mut rig.pool, id, &req.prompt_tokens)
-    {
-        Ok(p) => p,
-        Err(e) => {
-            let _ = send_event(&req.reply, Event::Rejected { reason: e });
-            rig.sessions.close(&mut rig.pool, &mut rig.adm, id);
-            stats.lock().expect("stats").note_rejected();
-            return;
+    // ── Prefix cache lookup (spec §4.5–4.6) ──────────────────────────────
+    // Cross-session prefix reuse: consult the radix index for reusable KV
+    // pages and the checkpoint pool for recurrent state. This is SEPARATE
+    // from the session-local continuation path (convo hashes) — the radix
+    // index is keyed by exact token sequences across sessions. Vision
+    // requests skip the radix entirely (spec X2: Vision+prefix reuse OFF).
+    let mut prefix_reused: usize = 0;
+    let mut prefix_hit = false;
+    if should_lookup_prefix(rig.prefix_cache, req.visual_data.is_some()) {
+        rig.lookup_count += 1;
+        let domain = rig.cache_domain.as_ref().unwrap();
+        let lookup_result = {
+            let pp = rig
+                .pool
+                .page_pool()
+                .expect("prefix_cache requires paged pool");
+            rig.prefix_index
+                .as_mut()
+                .unwrap()
+                .lookup(domain, &req.prompt_tokens, pp, None)
+        };
+        if let PrefixLookupResult::Hit(lookup) = &lookup_result {
+            let ckpt_pool = rig.checkpoint_pool.as_ref().unwrap();
+            match plan_resume(
+                ckpt_pool,
+                domain,
+                req.prompt_tokens.len() as u64,
+                lookup,
+                DrafterDecision::Ar,
+            ) {
+                Ok(plan) => {
+                    let boundary = plan.boundary as usize;
+                    if reused_tokens_from_plan(boundary, req.prompt_tokens.len()) > 0 {
+                        // Retrieve published handles for this boundary.
+                        if let Some(handles) =
+                            rig.published_handles.get(&(boundary as u64))
+                        {
+                            let phys_pages: Vec<u32> =
+                                handles.iter().map(|h| h.handle.phys).collect();
+                            if rig.pool.share_published_pages(slot, &phys_pages).is_ok() {
+                                // Restore DN state from the checkpoint pool
+                                // (peek + restore_to: one D2D copy from the
+                                // pool's immutable snapshot into the live
+                                // slot state).
+                                let ckpt_pool = rig.checkpoint_pool.as_ref().unwrap();
+                                if let Some(snapshot) =
+                                    ckpt_pool.peek(domain, boundary as u64)
+                                {
+                                    let _ = snapshot
+                                        .restore_to(&mut rig.dn_states[slot.0], &mut rig.gpu);
+                                }
+                                prefix_reused = boundary;
+                                prefix_hit = true;
+                                if rig.gpu.slot_trace() {
+                                    eprintln!(
+                                        "[slot-trace] prefix cache HIT: \
+                                         reused {}/{} tokens",
+                                        boundary,
+                                        req.prompt_tokens.len()
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+                Err(_) => {} // No checkpoint at any boundary: cold prefill
+            }
         }
+        // Unpin on miss — lookup pins the radix path; a miss means we
+        // won't use those pages, so release the pins to allow eviction.
+        if !prefix_hit {
+            if let (Some(idx), Some(domain)) =
+                (rig.prefix_index.as_mut(), rig.cache_domain.as_ref())
+            {
+                idx.unpin(domain);
+            }
+        }
+    }
+
+    // Session-local prefix reuse (convo hash continuation) OR prefix cache
+    // hit. When the prefix cache hit, begin_turn is skipped because it
+    // would reset seq_len to 0, undoing the shared pages.
+    let reused = if prefix_hit {
+        if let Some(sess) = rig.sessions.get_mut(id) {
+            sess.next_pos = prefix_reused;
+        }
+        prefix_reused
+    } else {
+        // Prefix reuse: a fresh session reuses nothing, a continued one
+        // reuses its common prefix. Either way the suffix is what gets
+        // prefilled.
+        let plan = match rig
+            .sessions
+            .begin_turn(&mut rig.pool, id, &req.prompt_tokens)
+        {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = send_event(&req.reply, Event::Rejected { reason: e });
+                rig.sessions.close(&mut rig.pool, &mut rig.adm, id);
+                stats.lock().expect("stats").note_rejected();
+                return;
+            }
+        };
+        plan.reused
     };
     if let Some(sess) = rig.sessions.get_mut(id) {
         sess.tokens = req.prompt_tokens.clone();
@@ -3201,8 +3756,8 @@ fn admit(
         &req.reply,
         Event::Accepted {
             session: id.0,
-            reused: plan.reused,
-            prefill: req.prompt_tokens.len() - plan.reused,
+            reused: reused,
+            prefill: req.prompt_tokens.len() - reused,
         },
     )
     .is_err()
@@ -3254,8 +3809,8 @@ fn admit(
         });
         work[slot.0].mtp_active = false;
     } else {
-        work[slot.0].remaining_prompt = req.prompt_tokens[plan.reused..].to_vec();
-        work[slot.0].next_pos = plan.reused;
+        work[slot.0].remaining_prompt = req.prompt_tokens[reused..].to_vec();
+        work[slot.0].next_pos = reused;
         work[slot.0].vl_prefill = None;
         work[slot.0].pos3_delta = 0; // fresh session: no image-turn offset
         // Activate MTP for text-only requests when the head is loaded.
@@ -3283,6 +3838,8 @@ fn admit(
         produced: 0,
         max_tokens: req.max_tokens.max(1),
         repeat_window_req: req.repeat_window.min(REPEAT_WINDOW_MAX),
+        reused_tokens: if prefix_hit { prefix_reused } else { 0 },
+        last_published_boundary: reused,
         grammar: None,
     });
     if rig.gpu.slot_trace() {
@@ -3292,6 +3849,9 @@ fn admit(
             slot.0,
             req.prompt_tokens.len()
         );
+    }
+    if prefix_hit {
+        stats.lock().expect("stats").note_reused_tokens(prefix_reused);
     }
     stats.lock().expect("stats").note_admitted();
 }
@@ -3500,5 +4060,92 @@ mod tests {
         let sampled = false;
         let mtp_active = mtp_available && !penalized && !sampled && !grammar_constrained;
         assert!(!mtp_active, "grammar-constrained requests must use AR");
+    }
+
+    // ---- Prefix cache policy tests (spec §4.5–4.6, X2) ----
+
+    #[test]
+    fn should_lookup_prefix_off_never_lookups() {
+        // prefix_cache off → never lookup, regardless of visual data.
+        assert!(!should_lookup_prefix(false, false));
+        assert!(!should_lookup_prefix(false, true));
+    }
+
+    #[test]
+    fn should_lookup_prefix_vision_skips_even_when_enabled() {
+        // Vision requests skip the radix entirely (spec X2: Vision+prefix
+        // reuse OFF).
+        assert!(!should_lookup_prefix(true, true));
+    }
+
+    #[test]
+    fn should_lookup_prefix_text_request_lookups_when_enabled() {
+        // Text request with prefix_cache on → lookup.
+        assert!(should_lookup_prefix(true, false));
+    }
+
+    #[test]
+    fn reused_tokens_zero_when_boundary_covers_entire_prompt() {
+        // boundary == prompt_len → no suffix to prefill → 0 reused.
+        assert_eq!(reused_tokens_from_plan(100, 100), 0);
+    }
+
+    #[test]
+    fn reused_tokens_zero_when_boundary_is_zero() {
+        // No checkpoint → boundary 0 → 0 reused.
+        assert_eq!(reused_tokens_from_plan(0, 100), 0);
+    }
+
+    #[test]
+    fn reused_tokens_returns_boundary_on_partial_match() {
+        // Partial match: boundary < prompt_len → boundary tokens reused.
+        assert_eq!(reused_tokens_from_plan(64, 128), 64);
+        assert_eq!(reused_tokens_from_plan(1, 2), 1);
+    }
+
+    #[test]
+    fn reset_epoch_bump_makes_cache_domain_unequal() {
+        // After Reset, allocation_epoch is bumped. A CacheDomain with a
+        // bumped epoch must differ from the pre-reset domain (spec §4.6:
+        // "unload/reload advances the epoch and invalidates lookups").
+        use hipfire_runtime::serve_contract::{
+            CacheDomain, DeviceTopology, SharingNamespace,
+        };
+        let mk = |epoch: u64| CacheDomain {
+            model_content_digest: vec![1, 2, 3],
+            model_load_epoch: 0,
+            sidecar_digests: Vec::new(),
+            tokenizer: hipfire_runtime::serve_contract::TokenizerIdentity {
+                vocab_digest: vec![0; 32],
+                config_digest: vec![0; 32],
+            },
+            template: hipfire_runtime::serve_contract::TemplateIdentity {
+                template_digest: vec![0; 32],
+                normalization_tag: "default".to_owned(),
+            },
+            arch_policy: hipfire_runtime::serve_contract::ArchPolicy {
+                arch_tag: "qwen35-deltanet".to_owned(),
+                state_abi_tag: "dn-q8".to_owned(),
+                position_attention_tag: "mrope".to_owned(),
+            },
+            kv_layout: hipfire_runtime::serve_contract::KvLayout {
+                k_stride_bytes: vec![128],
+                v_stride_bytes: vec![128],
+                layout_tag: "q8".to_owned(),
+            },
+            device: DeviceTopology {
+                device_id: "gpu0".to_owned(),
+                topology_id: "single".to_owned(),
+                allocation_epoch: epoch,
+            },
+            namespace: SharingNamespace {
+                domain_id: "owner".to_owned(),
+            },
+        };
+        let before = mk(0);
+        let after = mk(1);
+        assert_ne!(before, after, "epoch bump must invalidate domain equality");
+        // Same epoch → equal (sanity).
+        assert_eq!(mk(0), mk(0));
     }
 }

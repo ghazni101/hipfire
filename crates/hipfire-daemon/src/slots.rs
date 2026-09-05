@@ -63,6 +63,12 @@ struct EngineSpawnParams {
     /// Raw KV-mode string from the load request (empty = resolve from env /
     /// config in the engine, via the slots policy).
     kv_mode_raw: String,
+    /// Cross-session prefix cache enabled (spec §4.5–4.6). Read from
+    /// `serve.prefix_cache` config key; default false.
+    prefix_cache: bool,
+    /// Checkpoint pool max bytes. Read from `serve.prefix_cache_max_bytes`;
+    /// default 0.
+    prefix_cache_max_bytes: u64,
 }
 
 /// The per-arch multi-slot engine behind the four-method surface
@@ -100,7 +106,13 @@ impl AnySlotEngine {
                         is_vl: p.is_vl,
                         vl_path: p.vl_path,
                         mtp_k: p.mtp_k,
-                        kv_mode_raw: p.kv_mode_raw,
+                        kv_mode_raw: p.kv_mode_raw.clone(),
+                        // Cross-session prefix cache (spec §4.5–4.6).
+                        // Read from serve.prefix_cache / serve.prefix_cache_max_bytes
+                        // config keys (env HIPFIRE_SERVE_PREFIX_CACHE*).
+                        // Default false/0 — product defaults stay unchanged.
+                        prefix_cache: p.prefix_cache,
+                        prefix_cache_max_bytes: p.prefix_cache_max_bytes,
                     },
                 )
                 .map_err(|e| format!("SlotEngine spawn: {e}"))?,
@@ -174,6 +186,20 @@ impl SlotBackend {
         let tokenizer = preflight.tokenizer;
         let is_vl = preflight.is_vl;
         let vision_config = preflight.vision_config;
+        // Read prefix cache config (spec §4.5–4.6). Keys are registered in
+        // hipfire-config as serve.prefix_cache / serve.prefix_cache_max_bytes
+        // with env HIPFIRE_SERVE_PREFIX_CACHE*. Default false/0.
+        let prefix_cache = hipfire_config::active_or_local_process_config()
+            .values
+            .get("serve.prefix_cache")
+            .and_then(|v| if let hipfire_config::ConfigValue::Bool(b) = v { Some(*b) } else { None })
+            .unwrap_or(false);
+        let prefix_cache_max_bytes = hipfire_config::active_or_local_process_config()
+            .values
+            .get("serve.prefix_cache_max_bytes")
+            .and_then(|v| if let hipfire_config::ConfigValue::Integer(i) = v { Some(*i as u64) } else { None })
+            .unwrap_or(0);
+
         let vl_path = preflight.vl_path;
 
         let n_slots = n_slots.max(1);
@@ -193,6 +219,8 @@ impl SlotBackend {
                 is_vl,
                 vl_path,
                 kv_mode_raw: kv_mode_raw.to_string(),
+                prefix_cache,
+                prefix_cache_max_bytes,
             },
         )?;
 

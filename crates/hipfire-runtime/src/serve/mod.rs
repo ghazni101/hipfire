@@ -169,6 +169,11 @@ pub struct EngineStats {
     /// from `restores`: a hit on a still-resident session restores nothing, and
     /// conflating the two makes a gate that never restores look like it did.
     pub prefix_hits: usize,
+    /// Total tokens served from the cross-session prefix cache (spec §4.5).
+    /// Distinct from `prefix_hits` (session-local continuation) and
+    /// `restores` (swap-in): these are tokens skipped because a prior
+    /// session published the same prefix to the radix index.
+    pub reused_tokens: usize,
 }
 
 impl EngineStats {
@@ -183,6 +188,10 @@ impl EngineStats {
     }
     pub fn note_restore(&mut self) {
         self.restores += 1;
+    }
+
+    pub fn note_reused_tokens(&mut self, n: usize) {
+        self.reused_tokens += n;
     }
     pub fn note_prefix_hit(&mut self) {
         self.prefix_hits += 1;

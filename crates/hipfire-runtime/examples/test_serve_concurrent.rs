@@ -71,7 +71,8 @@ fn main() {
         is_vl: false,
         vl_path: None,
         mtp_k: 0,
-        kv_mode_raw: String::new(),
+        prefix_cache: false,
+        prefix_cache_max_bytes: 0,
     })
     .expect("SlotEngine::spawn");
     println!("engine up: {N_SLOTS} slots, {n_clients} clients, {MAX_TOKENS} tokens each");

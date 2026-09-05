@@ -55,7 +55,8 @@ fn main() {
         is_vl: false,
         vl_path: None,
         mtp_k: 0,
-        kv_mode_raw: String::new(),
+        prefix_cache: false,
+        prefix_cache_max_bytes: 0,
     })
     .expect("engine");
 
