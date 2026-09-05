@@ -4598,13 +4598,18 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
     // weights and KV arenas, so leaving this scope is what actually frees the
     // first model before the daemon loads the second.
     if matches!(backend_sel, BackendSel::Slots | BackendSel::Both) {
-        let registry = load_registry(&paths.registry).registry;
-        let model_path = find_model_path(paths, &registry, &args.model)
-            .ok_or_else(|| anyhow!("model not found: {}", args.model))?;
+        preflight_headroom_for_model(paths, &args.model)?;
+        let mut slot_args = args.clone();
+        slot_args.concurrency = None;
         // 2048-token slots, not the serve default of 8192: the sweep's prompts
         // are one short turn and --max-tokens is small, so a larger arena buys
         // nothing and multiplies per-slot KV by four.
-        match SlotDriver::start(&model_path, max_k, 2048) {
+        let (engine, loaded, _, _) = open_bench_engine_slots(paths, &slot_args, max_k, 2048)?;
+        let slot_capable = loaded
+            .get("experimental_multi_slot")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false);
+        match SlotDriver::start(engine, max_k, slot_capable) {
             Ok(mut d) => {
                 eprintln!("  slots backend up ({max_k} slots)");
                 let r = sweep_backend(
@@ -4746,6 +4751,30 @@ fn open_bench_engine_batched(
     r
 }
 
+/// Spawn a daemon and load the model with `experimental_multi_slot=true` so
+/// the slot backend owns the GPU. The slot count and per-slot context cap are
+/// fixed per load, which is why the sweep holds them at max.
+fn open_bench_engine_slots(
+    paths: &Paths,
+    args: &BenchArgs,
+    slots: usize,
+    ctx: usize,
+) -> Result<(
+    Engine,
+    serde_json::Value,
+    serde_json::Value,
+    serde_json::Value,
+)> {
+    std::env::set_var("HIPFIRE_BENCH_MULTI_SLOT", "1");
+    std::env::set_var("HIPFIRE_BENCH_MULTI_SLOT_SLOTS", slots.to_string());
+    std::env::set_var("HIPFIRE_BENCH_MULTI_SLOT_CTX", ctx.to_string());
+    let r = open_bench_engine(paths, args, None);
+    std::env::remove_var("HIPFIRE_BENCH_MULTI_SLOT");
+    std::env::remove_var("HIPFIRE_BENCH_MULTI_SLOT_SLOTS");
+    std::env::remove_var("HIPFIRE_BENCH_MULTI_SLOT_CTX");
+    r
+}
+
 fn open_bench_engine(
     paths: &Paths,
     args: &BenchArgs,
@@ -4841,6 +4870,19 @@ fn open_bench_engine(
     }
     if let Some(tp) = args.tp.filter(|&tp| tp > 1) {
         params["tp"] = serde_json::json!(tp);
+    }
+    if std::env::var("HIPFIRE_BENCH_MULTI_SLOT").is_ok() {
+        params["experimental_multi_slot"] = serde_json::json!(true);
+        if let Ok(n) = std::env::var("HIPFIRE_BENCH_MULTI_SLOT_SLOTS") {
+            if let Ok(n) = n.parse::<u64>() {
+                params["experimental_multi_slot_slots"] = serde_json::json!(n);
+            }
+        }
+        if let Ok(n) = std::env::var("HIPFIRE_BENCH_MULTI_SLOT_CTX") {
+            if let Ok(n) = n.parse::<u64>() {
+                params["experimental_multi_slot_ctx"] = serde_json::json!(n);
+            }
+        }
     }
     let loaded = engine.load(&path, params)?;
     let post_diag = engine.request(&serde_json::json!({ "type": "diag" }))?;
@@ -10145,6 +10187,8 @@ mod tests {
                 retry_enabled,
                 retry_backoff,
                 backoff_hook: Mutex::new(None),
+                stream_buffer_bytes: 16 * 1024 * 1024,
+                stream_stall_timeout: Duration::from_secs(30),
             });
 
             let std_listener =
