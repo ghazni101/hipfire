@@ -79,6 +79,12 @@ pub mod serve_engine;
 #[cfg(feature = "deltanet")]
 mod spec_impl;
 pub mod speculative;
+/// Qwen3.5 hybrid-state checkpoint pool for serving prefix-cache resume
+/// (spec §4.5 C5). Byte-bounded LRU of immutable `DeltaNetSnapshot`
+/// bundles keyed by `(CacheDomain, boundary_p)`, with `plan_resume`
+/// last-token semantics and GPU-backed capture/restore paths.
+#[cfg(feature = "deltanet")]
+pub mod checkpoint;
 
 /// Grammar-guided decoding for tool-call format — re-exported from `saddle_core::grammar::json`.
 ///

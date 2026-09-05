@@ -1271,6 +1271,47 @@ impl DeltaNetSnapshot {
             let _ = gpu.hip.free(b);
         }
     }
+
+    /// Total device bytes across all backup buffers (S matrices + scales +
+    /// conv rings + EF residuals). Used by the checkpoint pool for
+    /// byte-bounded LRU accounting (spec §4.5 C5).
+    pub fn bytes_len(&self) -> u64 {
+        let mut total: u64 = 0;
+        for b in &self.s_matrix_bufs {
+            total += b.size() as u64;
+        }
+        for b in &self.s_scale_bufs {
+            total += b.size() as u64;
+        }
+        for b in &self.conv_state_bufs {
+            total += b.size() as u64;
+        }
+        for b in &self.s_ef_residual_bufs {
+            total += b.size() as u64;
+        }
+        total
+    }
+
+    /// Copy this snapshot's device buffers into `dst` (device-to-device).
+    /// `dst` must have been allocated with matching shapes (e.g. via
+    /// [`DeltaNetSnapshot::new_for`] against the same state). Used by the
+    /// checkpoint pool's `restore_private` to copy an immutable cached
+    /// snapshot into a caller-owned private snapshot (spec §4.5 C5).
+    pub fn copy_to(&self, dst: &mut DeltaNetSnapshot, gpu: &mut Gpu) -> HipResult<()> {
+        for (src, d) in self.s_matrix_bufs.iter().zip(dst.s_matrix_bufs.iter()) {
+            gpu.hip.memcpy_dtod(d, src, src.size())?;
+        }
+        for (src, d) in self.s_scale_bufs.iter().zip(dst.s_scale_bufs.iter()) {
+            gpu.hip.memcpy_dtod(d, src, src.size())?;
+        }
+        for (src, d) in self.conv_state_bufs.iter().zip(dst.conv_state_bufs.iter()) {
+            gpu.hip.memcpy_dtod(d, src, src.size())?;
+        }
+        for (src, d) in self.s_ef_residual_bufs.iter().zip(dst.s_ef_residual_bufs.iter()) {
+            gpu.hip.memcpy_dtod(d, src, src.size())?;
+        }
+        Ok(())
+    }
 }
 
 /// A series of `n_slots` `DeltaNetSnapshot` slots, used by the tape-replay
