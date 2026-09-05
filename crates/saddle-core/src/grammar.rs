@@ -3733,6 +3733,174 @@ pub mod json_schema {
         }
     }
 
+    // ── Conservative jump-forward (spec §7.3 G3) ──────────────────────
+
+    /// Hard upper bound on the length of a forced-token run. A caller
+    /// may pass a larger `max_run`, but it is clamped to this value to
+    /// keep the vocabulary scan bounded regardless of caller input.
+    const FORCED_RUN_HARD_CAP: usize = 64;
+
+    /// Why a [`forced_token_run`] stopped.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum ForcedStop {
+        /// More than one legal next token ID exists at this step — a
+        /// branch point. The run ends before the branch; ordinary
+        /// constrained decode must decide.
+        Branch,
+        /// The unique legal next token is an EOS/stop id. The EOS
+        /// token is **not** included in the run; generation stops
+        /// before it so the caller can apply stop-sequence policy.
+        EosBoundary,
+        /// The run reached `max_run` (clamped to
+        /// [`FORCED_RUN_HARD_CAP`]) without encountering a branch,
+        /// EOS boundary, or proof failure.
+        Cap,
+        /// No legal next token ID exists — the schema and vocabulary
+        /// cannot produce valid output from the current parser state.
+        /// Ordinary constrained decode is the correct fallback.
+        ProofFailed,
+    }
+
+    /// Result of a [`forced_token_run`]: the provably-forced token IDs
+    /// and the reason the run stopped.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct ForcedRun {
+        /// Token IDs that are provably forced, in order. Empty when
+        /// the run stopped at the first step.
+        pub token_ids: Vec<u32>,
+        /// Why the run stopped.
+        pub stop: ForcedStop,
+    }
+
+    /// Fill `out` with `true` at each index whose token bytes are
+    /// allowed by `matcher` ([`SchemaMatcher::is_token_allowed`]).
+    ///
+    /// `out` is filled up to `min(token_bytes.len(), out.len())`.
+    /// This is the vocabulary-scan primitive used by
+    /// [`forced_token_run`]; it is also useful for callers that need
+    /// a token mask without running the full planner.
+    pub fn token_mask_bytes(
+        matcher: &SchemaMatcher,
+        token_bytes: &[impl AsRef<[u8]>],
+        out: &mut [bool],
+    ) {
+        let n = token_bytes.len().min(out.len());
+        for i in 0..n {
+            out[i] = matcher.is_token_allowed(token_bytes[i].as_ref());
+        }
+    }
+
+    /// Conservative jump-forward planner (spec §7.3 G3).
+    ///
+    /// On a **private clone** of `matcher`, finds a bounded run of
+    /// token IDs for which there is exactly one legal next token at
+    /// each step under the schema's hard output constraints.
+    ///
+    /// # Algorithm
+    ///
+    /// 1. Clone `matcher` as a private cursor. For each step until
+    ///    `max_run` (clamped to [`FORCED_RUN_HARD_CAP`]):
+    /// 2. Scan all vocab IDs; collect IDs where
+    ///    [`SchemaMatcher::is_token_allowed`] is `true` **and** the
+    ///    ID is not an EOS id unless the cursor is accepting.
+    /// 3. If exactly one legal next token ID, append it, advance the
+    ///    cursor with those bytes, and continue.
+    /// 4. If zero legal IDs → [`ForcedStop::ProofFailed`] (or
+    ///    [`ForcedStop::EosBoundary`] if an EOS id was the only
+    ///    allowed token but filtered because the cursor is not
+    ///    accepting). If more than one → [`ForcedStop::Branch`]. If
+    ///    the unique ID is an EOS/stop id →
+    ///    [`ForcedStop::EosBoundary`] without including it (stop
+    ///    **before** EOS).
+    ///
+    /// Unique characters are insufficient: this function compares
+    /// token **IDs**, not decoded strings — two IDs with the same
+    /// byte representation both being allowed is a branch.
+    ///
+    /// This is a pure planner: it does not re-tokenize, does not
+    /// touch GPU state, and does not claim a speedup. The caller is
+    /// responsible for feeding the returned IDs through the existing
+    /// forward path.
+    pub fn forced_token_run(
+        matcher: &SchemaMatcher,
+        token_bytes: &[impl AsRef<[u8]>],
+        eos_ids: &[u32],
+        max_run: usize,
+    ) -> ForcedRun {
+        let max_run = max_run.min(FORCED_RUN_HARD_CAP);
+        let eos_set: HashSet<u32> = eos_ids.iter().copied().collect();
+        let vocab_len = token_bytes.len();
+
+        let mut cursor = matcher.clone();
+        let mut token_ids = Vec::with_capacity(max_run);
+        let mut mask = vec![false; vocab_len];
+
+        for _ in 0..max_run {
+            token_mask_bytes(&cursor, token_bytes, &mut mask);
+
+            let accepting = cursor.is_accepting();
+
+            // Collect legal IDs: allowed AND (not EOS OR accepting).
+            let mut legal: Vec<u32> = Vec::new();
+            let mut had_allowed_eos = false;
+            for id in 0..vocab_len as u32 {
+                if !mask[id as usize] {
+                    continue;
+                }
+                let is_eos = eos_set.contains(&id);
+                if is_eos && !accepting {
+                    had_allowed_eos = true;
+                    continue;
+                }
+                legal.push(id);
+            }
+
+            match legal.len() {
+                0 => {
+                    // No legal non-EOS token. If an EOS id was the
+                    // only allowed token (filtered because the
+                    // cursor is not accepting), stop before it.
+                    if had_allowed_eos {
+                        return ForcedRun {
+                            token_ids,
+                            stop: ForcedStop::EosBoundary,
+                        };
+                    }
+                    return ForcedRun {
+                        token_ids,
+                        stop: ForcedStop::ProofFailed,
+                    };
+                }
+                1 => {
+                    let id = legal[0];
+                    // If the unique legal token is an EOS id (only
+                    // possible when accepting), stop before it.
+                    if eos_set.contains(&id) {
+                        return ForcedRun {
+                            token_ids,
+                            stop: ForcedStop::EosBoundary,
+                        };
+                    }
+                    // Unique non-EOS token: append and advance.
+                    let bytes = token_bytes[id as usize].as_ref();
+                    cursor.advance(bytes);
+                    token_ids.push(id);
+                }
+                _ => {
+                    return ForcedRun {
+                        token_ids,
+                        stop: ForcedStop::Branch,
+                    };
+                }
+            }
+        }
+
+        ForcedRun {
+            token_ids,
+            stop: ForcedStop::Cap,
+        }
+    }
+
     // ── Tests ─────────────────────────────────────────────────────────
 
     #[cfg(test)]
@@ -4342,6 +4510,139 @@ pub mod json_schema {
             // The JSON key "a\"b" decodes to a"b, which matches.
             m.advance(b"{\"a\\\"b\": \"value\"}");
             assert!(m.is_accepting(), "escaped key should match schema property");
+        }
+
+        // ── Conservative jump-forward (A16/A17) ───────────────────────
+
+        #[test]
+        fn forced_run_unique_token_then_accepting_stop() {
+            // Schema {"enum":["hello"]}: valid JSON is "hello" (with
+            // quotes). A vocab where exactly one token ID forms the
+            // complete JSON yields a unique run.
+            let schema = json!({"enum":["hello"]});
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let m = compiled.matcher();
+            // id 0 = "hello" (complete JSON), id 1 = "he" (prefix of
+            // the string content, NOT a valid JSON start), id 2 = "llo"
+            // (unrelated), id 3 = "" (EOS, empty bytes).
+            let vocab: &[&[u8]] = &[b"\"hello\"", b"he", b"llo", b""];
+            let run = forced_token_run(&m, vocab, &[3], 64);
+            // Step 0: only id 0 is a valid JSON prefix → unique.
+            // Step 1: cursor is accepting; only EOS (empty bytes) is
+            // allowed → EosBoundary.
+            assert_eq!(run.token_ids, vec![0]);
+            assert_eq!(run.stop, ForcedStop::EosBoundary);
+        }
+
+        #[test]
+        fn forced_run_branch_on_two_tokenizations() {
+            // Two token IDs that are both valid continuations of the
+            // same forced text → Branch immediately, empty run.
+            let schema = json!({"enum":["hello"]});
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let mut m = compiled.matcher();
+            m.advance(b"\""); // Now inside the string.
+            // id 0 = "he", id 1 = "hello" — both valid string
+            // continuations → Branch.
+            let vocab: &[&[u8]] = &[b"he", b"hello", b"llo\"", b""];
+            let run = forced_token_run(&m, vocab, &[3], 64);
+            assert!(run.token_ids.is_empty());
+            assert_eq!(run.stop, ForcedStop::Branch);
+        }
+
+        #[test]
+        fn forced_run_empty_allowed_set_proof_failed() {
+            // No token is a valid continuation → ProofFailed, empty run.
+            let schema = json!({"type":"null"});
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let m = compiled.matcher();
+            // Neither "xyz" nor "hello" is valid JSON.
+            let vocab: &[&[u8]] = &[b"xyz", b"hello"];
+            let run = forced_token_run(&m, vocab, &[], 64);
+            assert!(run.token_ids.is_empty());
+            assert_eq!(run.stop, ForcedStop::ProofFailed);
+        }
+
+        #[test]
+        fn forced_run_eos_unique_when_not_accepting() {
+            // EOS (empty bytes) is the only allowed token, but the
+            // cursor is not accepting → EosBoundary, empty run.
+            let schema = json!({"type":"null"});
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let m = compiled.matcher();
+            // id 0 = "xyz" (not valid JSON), id 1 = "" (EOS).
+            let vocab: &[&[u8]] = &[b"xyz", b""];
+            let run = forced_token_run(&m, vocab, &[1], 64);
+            assert!(run.token_ids.is_empty());
+            assert_eq!(run.stop, ForcedStop::EosBoundary);
+        }
+
+        #[test]
+        fn forced_run_max_run_cap_respected() {
+            // A const number with single-digit tokens: each step has
+            // exactly one legal next digit. With max_run < number of
+            // digits, the run is capped.
+            let schema = json!({"const":12345});
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let m = compiled.matcher();
+            // id 0='1', 1='2', 2='3', 3='4', 4='5', 5='6', 6='' (EOS)
+            let vocab: &[&[u8]] = &[b"1", b"2", b"3", b"4", b"5", b"6", b""];
+            // max_run=3: run is [0,1,2], stop=Cap.
+            let run = forced_token_run(&m, vocab, &[6], 3);
+            assert_eq!(run.token_ids, vec![0, 1, 2]);
+            assert_eq!(run.stop, ForcedStop::Cap);
+
+            // max_run=64 (full): run completes all 5 digits, then
+            // accepting + EOS → EosBoundary.
+            let run_full = forced_token_run(&m, vocab, &[6], 64);
+            assert_eq!(run_full.token_ids, vec![0, 1, 2, 3, 4]);
+            assert_eq!(run_full.stop, ForcedStop::EosBoundary);
+        }
+
+        #[test]
+        fn forced_run_clamps_huge_max_run() {
+            // max_run=usize::MAX is clamped to 64; the run still
+            // completes normally (5 digits + EosBoundary).
+            let schema = json!({"const":12345});
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let m = compiled.matcher();
+            let vocab: &[&[u8]] = &[b"1", b"2", b"3", b"4", b"5", b"6", b""];
+            let run = forced_token_run(&m, vocab, &[6], usize::MAX);
+            assert_eq!(run.token_ids, vec![0, 1, 2, 3, 4]);
+            assert_eq!(run.stop, ForcedStop::EosBoundary);
+        }
+
+        #[test]
+        fn forced_run_two_ids_same_bytes_is_branch() {
+            // Two different token IDs with the same byte string both
+            // being allowed is a branch — unique characters are
+            // insufficient; token IDs must be compared.
+            let schema = json!({"type":"string"});
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let m = compiled.matcher();
+            // id 0 = `"`, id 1 = `"` (same bytes, different ID).
+            let vocab: &[&[u8]] = &[b"\"", b"\"", b""];
+            let run = forced_token_run(&m, vocab, &[2], 64);
+            assert!(run.token_ids.is_empty());
+            assert_eq!(run.stop, ForcedStop::Branch);
+        }
+
+        #[test]
+        fn token_mask_bytes_fills_correctly() {
+            let schema = json!({"type":"string"});
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let m = compiled.matcher();
+            let vocab: &[&[u8]] = &[b"\"", b"42", b"hello", b""];
+            let mut mask = [false; 4];
+            token_mask_bytes(&m, vocab, &mut mask);
+            // `"` is a valid prefix of a string → true.
+            assert!(mask[0]);
+            // `42` is not valid JSON for a string schema → false.
+            assert!(!mask[1]);
+            // `hello` is not valid JSON → false.
+            assert!(!mask[2]);
+            // Empty bytes are always allowed (vacuous) → true.
+            assert!(mask[3]);
         }
     }
 }
