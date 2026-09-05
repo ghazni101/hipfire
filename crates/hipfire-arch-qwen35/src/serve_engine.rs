@@ -1067,6 +1067,19 @@ impl Rig {
         // prefix_cache is off, all three are None and the existing path is
         // bitwise unchanged.
         let (prefix_index, checkpoint_pool, cache_domain) = if prefix_cache {
+            // `prefix_cache_max_bytes` is a hard retention ceiling including
+            // hybrid snapshots; zero means NO retained cache, never
+            // unlimited (spec §9.1). A zero ceiling cannot retain a
+            // checkpoint, so reuse can never satisfy the hybrid resumability
+            // requirement — refuse the combination instead of running a
+            // churn cache that publishes pages it can never resume.
+            if cfg.prefix_cache_max_bytes == 0 {
+                return Err(
+                    "serve.prefix_cache requires serve.prefix_cache_max_bytes > 0 \
+                     (0 means no retained cache, never unlimited)"
+                        .to_string(),
+                );
+            }
             use hipfire_runtime::serve_contract::{
                 ArchPolicy, CacheDomain, DeviceTopology, KvLayout, SharingNamespace,
                 TemplateIdentity, TokenizerIdentity,
@@ -2094,11 +2107,39 @@ fn install_sample_params(rig: &mut Rig, slot: SlotId, req: &SubmitRequest) {
     };
 }
 
+/// A19 fault seam (host tests only): when `HIPFIRE_FAULT_PREFIX_PUBLISH=1`,
+/// the first prefix publication attempt fails so the orphaned-cache-ref
+/// rollback and honest-miss behavior can be exercised end to end. Fires at
+/// most once per process; unset by default.
+fn inject_publish_fault() -> bool {
+    use std::sync::atomic::{AtomicBool, Ordering};
+    static ARMED: AtomicBool = AtomicBool::new(true);
+    static CHECKED: AtomicBool = AtomicBool::new(false);
+    if !CHECKED.load(Ordering::Relaxed) {
+        CHECKED.store(true, Ordering::Relaxed);
+        if std::env::var("HIPFIRE_FAULT_PREFIX_PUBLISH").as_deref() != Ok("1") {
+            ARMED.store(false, Ordering::Relaxed);
+        }
+    }
+    ARMED.swap(false, Ordering::Relaxed)
+}
+
 /// Publish generated-prefix pages at the client-commit boundary (Done event
 /// for non-cancellation reasons). Seals and publishes any full pages beyond
 /// the last prefill-boundary publish, capturing a checkpoint at the new
 /// boundary (spec §4.6 C6).
-fn publish_generated_prefix(rig: &mut Rig, slots: &mut [Option<InFlight>], s: usize) {
+///
+/// `state_boundary` is the request's processed-row frontier (`next_pos`): a
+/// checkpoint is captured only when the published boundary equals it. The
+/// session's token count can exceed the state boundary by one unforwarded
+/// terminal token, and relabeling the live recurrent state as an earlier
+/// boundary would corrupt every resume (spec §4.5).
+fn publish_generated_prefix(
+    rig: &mut Rig,
+    slots: &mut [Option<InFlight>],
+    s: usize,
+    state_boundary: usize,
+) {
     if !rig.prefix_cache {
         return;
     }
@@ -2110,7 +2151,9 @@ fn publish_generated_prefix(rig: &mut Rig, slots: &mut [Option<InFlight>], s: us
         None => return,
     };
     let total_tokens = sess.tokens.len();
-    // Only publish full page-aligned boundaries beyond what was already published.
+    // Only publish full page-aligned boundaries beyond what was already
+    // published. Pages strictly below the committed materialized frontier —
+    // speculative candidate rows never cross into them (spec §4.6.2).
     let new_boundary = (total_tokens / PAGE_TOKENS) * PAGE_TOKENS;
     if new_boundary <= last_pub || new_boundary == 0 {
         return;
@@ -2156,25 +2199,41 @@ fn publish_generated_prefix(rig: &mut Rig, slots: &mut [Option<InFlight>], s: us
     let domain = rig.cache_domain.as_ref().unwrap();
     let idx = rig.prefix_index.as_mut().unwrap();
     let pp = rig.pool.page_pool().unwrap();
-    let checkpoint = if let Some(ckpt_pool) = rig.checkpoint_pool.as_mut() {
-        match capture_checkpoint(
-            &mut rig.gpu,
-            ckpt_pool,
-            domain,
-            new_boundary as u64,
-            &rig.dn_states[s],
-        ) {
-            Ok(id) => Some(id),
-            Err(e) => {
-                eprintln!("[prefix-cache] generated-prefix capture_checkpoint failed: {e}");
-                None
+    // Capture a checkpoint only when the published boundary is exactly the
+    // recurrent-state boundary (spec §4.5). A ceiling-refused capture
+    // (CheckpointId::NONE) publishes pages without a checkpoint — the
+    // boundary stays honestly unresumable.
+    let checkpoint = if new_boundary == state_boundary {
+        if let Some(ckpt_pool) = rig.checkpoint_pool.as_mut() {
+            match capture_checkpoint(
+                &mut rig.gpu,
+                ckpt_pool,
+                domain,
+                new_boundary as u64,
+                &rig.dn_states[s],
+            ) {
+                Ok(id) if id.is_some() => Some(id),
+                Ok(_) => None,
+                Err(e) => {
+                    eprintln!("[prefix-cache] generated-prefix capture_checkpoint failed: {e}");
+                    None
+                }
             }
+        } else {
+            None
         }
     } else {
         None
     };
     if let Err(e) = idx.publish_sealed_pages(domain, &tokens, &handles, checkpoint, pp) {
         eprintln!("[prefix-cache] generated-prefix publish_sealed_pages failed: {e:?}");
+        // Orphaned cache refs (see the prefill publish site): roll back so
+        // the pages stay reclaimable.
+        if let Some(pp) = rig.pool.page_pool_mut() {
+            for p in n_old_pages..n_new_pages {
+                let _ = pp.release_cache_ref(page_indices[p]);
+            }
+        }
     } else {
         if let Some(f) = slots[s].as_mut() {
             f.last_published_boundary = new_boundary;
@@ -2261,7 +2320,7 @@ fn commit_sampled_token(
         // Publish generated-prefix pages at client commit (spec §4.6 C6).
         // Only for non-cancellation completions; ClientGone unpins instead.
         if !matches!(reason, DoneReason::ClientGone) && rig.prefix_cache {
-            publish_generated_prefix(rig, slots, s);
+            publish_generated_prefix(rig, slots, s, work[s].next_pos);
         }
         slots[s] = None;
         // FairQueue: the request is done — drop it so it stops consuming
@@ -2811,30 +2870,37 @@ fn run_loop(
         match reservation.fits(max_batch_tokens as u64) {
             Ok(true) => {}
             _ => {
-                // Shrink: drop MTP verify slots until it fits, then drop
-                // prefill rows from the tail. The scheduler already capped
-                // prefill+decode at `remaining_for_sched`, so this only
-                // fires if verify_rows was over-counted or the budget is
-                // smaller than the scheduler's view.
+                // Shrink: drop MTP verify slots until it fits. The scheduler
+                // already capped prefill+decode at `remaining_for_sched`
+                // (= budget − verify_rows), so after draft dropping the
+                // reservation MUST fit — verify_rows was over-counted.
                 while reservation.fits(max_batch_tokens as u64) != Ok(true) {
                     let slot = mtp_drafts.iter().position(|x| x.is_some());
-                    if let Some(s) = slot {
-                        mtp_drafts[s] = None;
-                        let vk = (rig.mtp_k + 1) as u64;
-                        reservation.verify_rows = reservation.verify_rows.saturating_sub(vk);
-                        // The seed stays in remaining_prompt for regular
-                        // decode next step; no state mutation needed here.
-                    } else {
-                        // No verify slots left to drop: trim prefill from
-                        // the tail until it fits.
-                        if reservation.prefill_rows > 0 {
-                            reservation.prefill_rows -= 1;
-                        } else if reservation.decode_rows > 0 {
-                            reservation.decode_rows -= 1;
-                        } else {
-                            break;
+                    match slot {
+                        Some(s) => {
+                            mtp_drafts[s] = None;
+                            let vk = (rig.mtp_k + 1) as u64;
+                            reservation.verify_rows = reservation.verify_rows.saturating_sub(vk);
+                            // The seed stays in remaining_prompt for regular
+                            // decode next step; no state mutation needed here.
                         }
+                        None => break,
                     }
+                }
+                if reservation.fits(max_batch_tokens as u64) != Ok(true) {
+                    // Spec §5.4/S4: an allocation invariant violated despite
+                    // reservation is an engine/accounting fault — fail closed
+                    // rather than execute an over-budget step (or pretend the
+                    // reservation shrank when the batch did not).
+                    let reason = format!(
+                        "step reservation invariant violated: {} rows reserved \
+                         against a {} token budget with no verify slots left to drop",
+                        reservation.total_rows().unwrap_or(u64::MAX),
+                        max_batch_tokens
+                    );
+                    fail_all_active(&mut rig, &mut slots, &mut work, reason.clone());
+                    poison = Some(reason);
+                    break 'serve;
                 }
             }
         }
@@ -3109,26 +3175,57 @@ fn run_loop(
                     let domain = rig.cache_domain.as_ref().unwrap();
                     let idx = rig.prefix_index.as_mut().unwrap();
                     let pp = rig.pool.page_pool().unwrap();
-                    // Capture checkpoint at the boundary.
-                    let checkpoint = if let Some(ckpt_pool) = rig.checkpoint_pool.as_mut() {
-                        match capture_checkpoint(
-                            &mut rig.gpu,
-                            ckpt_pool,
-                            domain,
-                            new_boundary as u64,
-                            &rig.dn_states[s],
-                        ) {
-                            Ok(id) => Some(id),
-                            Err(e) => {
-                                eprintln!("[prefix-cache] capture_checkpoint failed: {e}");
-                                None
+                    // Capture a checkpoint at the boundary — ONLY when the
+                    // published boundary is exactly the recurrent-state
+                    // boundary (`next_pos`). The live DeltaNetState sits at
+                    // next_pos; a state captured there cannot be relabelled
+                    // as an earlier boundary (spec §4.5: "a state at the end
+                    // of a chunk cannot be relabeled as an earlier state").
+                    // Mid-page chunk tails publish pages without a
+                    // checkpoint, so lookups fall back to an earlier aligned
+                    // checkpoint or an honest cold recompute.
+                    let checkpoint = if new_boundary == work[s].next_pos {
+                        if let Some(ckpt_pool) = rig.checkpoint_pool.as_mut() {
+                            match capture_checkpoint(
+                                &mut rig.gpu,
+                                ckpt_pool,
+                                domain,
+                                new_boundary as u64,
+                                &rig.dn_states[s],
+                            ) {
+                                Ok(id) if id.is_some() => Some(id),
+                                Ok(_) => None, // pool at ceiling: publish pages only
+                                Err(e) => {
+                                    eprintln!("[prefix-cache] capture_checkpoint failed: {e}");
+                                    None
+                                }
                             }
+                        } else {
+                            None
                         }
                     } else {
                         None
                     };
-                    if let Err(e) = idx.publish_sealed_pages(domain, &tokens, &handles, checkpoint, pp) {
+                    // A19 fault injection (host test seam): with
+                    // HIPFIRE_FAULT_PREFIX_PUBLISH=1 the first publish
+                    // attempt fails so the orphaned-cache-ref rollback and
+                    // the honest-miss behavior can be verified end to end.
+                    let publish_fault = inject_publish_fault();
+                    let publish_result = if publish_fault {
+                        Err(hipfire_runtime::prefix_index::InsertError::MisalignedHandle)
+                    } else {
+                        idx.publish_sealed_pages(domain, &tokens, &handles, checkpoint, pp)
+                    };
+                    if let Err(e) = publish_result {
                         eprintln!("[prefix-cache] publish_sealed_pages failed: {e:?}");
+                        // The cache refs taken above are now orphaned: no
+                        // index entry will ever release them. Roll them back
+                        // so the pages stay reclaimable (spec §4.4).
+                        if let Some(pp) = rig.pool.page_pool_mut() {
+                            for p in n_old_pages..n_new_pages {
+                                let _ = pp.release_cache_ref(page_indices[p]);
+                            }
+                        }
                     } else {
                         if let Some(f) = slots[s].as_mut() {
                             f.last_published_boundary = new_boundary;
@@ -3314,8 +3411,14 @@ fn run_loop(
             for s in 0..n {
                 let Some(f) = slots[s].as_ref() else { continue };
                 let Some(constraint) = f.grammar.as_ref() else { continue };
-                // Greedy only (spec §7.3: "not sampled (greedy only)").
-                if rig.sample_params[s].temperature > 1e-6 {
+                // Greedy only (spec §7.3: "not sampled (greedy only)"). The
+                // gate must match the sampler's own argmax path exactly
+                // (`temperature == 0.0` in sampling.rs): a tiny nonzero
+                // temperature takes the RNG-consuming sample path, whose
+                // discarded draw still advances the seed and would make
+                // later sampled output diverge from the scalar reference
+                // (spec §7.3 G3.4: RNG draw accounting).
+                if rig.sample_params[s].temperature != 0.0 {
                     continue;
                 }
                 // Only for decoding slots: remaining_prompt empty means
@@ -3648,7 +3751,7 @@ fn run_loop(
                 }
                 // Publish generated-prefix pages at client commit (spec §4.6 C6).
                 if !matches!(reason, DoneReason::ClientGone) && rig.prefix_cache {
-                    publish_generated_prefix(&mut rig, &mut slots, s);
+                    publish_generated_prefix(&mut rig, &mut slots, s, work[s].next_pos);
                 }
                 slots[s] = None;
                 let _ = rig.fair_queue.remove(session.0);
@@ -3774,9 +3877,25 @@ fn handle_command(
                     .close(&mut rig.pool, &mut rig.adm, SessionId(id));
             }
             // Drop prefix cache state so subsequent lookups miss (spec §4.6).
+            // The radix index owns cache leases taken at publication: it
+            // MUST release them into the pool before being replaced, or
+            // every published page strands CacheOnly and the pool drains to
+            // zero free pages within a few reset cycles (A20 leak).
             if rig.prefix_cache {
-                // Replace the radix index with a fresh empty one.
-                rig.prefix_index = Some(hipfire_runtime::prefix_index::PrefixIndex::new(1 << 16));
+                if let Some(pp) = rig.pool.page_pool_mut() {
+                    if let Some(idx) = rig.prefix_index.as_mut() {
+                        let released_pages = idx.release_all(pp);
+                        pp.drain_completed();
+                        if rig.gpu.slot_trace() {
+                            eprintln!(
+                                "[slot-trace] reset released {released_pages} cached pages"
+                            );
+                        }
+                    }
+                    // Fresh empty index: every subsequent lookup misses.
+                    rig.prefix_index =
+                        Some(hipfire_runtime::prefix_index::PrefixIndex::new(1 << 16));
+                }
                 // Drain and free GPU blobs from the checkpoint pool.
                 if let Some(pool) = rig.checkpoint_pool.as_mut() {
                     for blob in pool.drain_blobs() {
@@ -4065,6 +4184,38 @@ fn admit(
                     let _ = send_event(&req.reply, Event::Rejected { reason });
                     return;
                 }
+                // Compile the JSON Schema BEFORE any session mutation (spec
+                // §7 G1/G2; P4 exit "strict requests never silently
+                // unconstrained"). A compile failure rejects the request and
+                // leaves the matched session untouched — the daemon
+                // pre-validates, so this only fires on drift between that
+                // gate and the engine's compiler.
+                let grammar_constraint = match req.json_schema.as_ref() {
+                    Some(schema) => {
+                        match grammar::json_schema::CompiledSchema::compile(schema) {
+                            Ok(compiled) => Some(GrammarConstraint {
+                                matcher:
+                                    grammar::json_schema::SchemaMatcher::from_compiled(
+                                        &compiled,
+                                    ),
+                                mask_buf: Vec::new(),
+                            }),
+                            Err(e) => {
+                                let _ = send_event(
+                                    &req.reply,
+                                    Event::Rejected {
+                                        reason: format!(
+                                            "json_schema compile failed on admit: {e}"
+                                        ),
+                                    },
+                                );
+                                stats.lock().expect("stats").note_rejected();
+                                return;
+                            }
+                        }
+                    }
+                    None => None,
+                };
                 if let Ok(plan) = rig.sessions.begin_turn(&mut rig.pool, existing, &extended) {
                     if let Some(sess) = rig.sessions.get_mut(existing) {
                         sess.tokens = extended.clone();
@@ -4124,20 +4275,6 @@ fn admit(
                         }
                     }
                     install_sample_params(rig, slot, &req);
-                    // Compile the JSON Schema for the continuation path too
-                    // (spec §7 G1/G2). Same recompile-as-cursor pattern as
-                    // the cold admit path.
-                    let grammar_constraint = req.json_schema.as_ref().and_then(|schema| {
-                        grammar::json_schema::CompiledSchema::compile(schema)
-                            .ok()
-                            .map(|compiled| GrammarConstraint {
-                                matcher:
-                                    grammar::json_schema::SchemaMatcher::from_compiled(
-                                        &compiled,
-                                    ),
-                                mask_buf: Vec::new(),
-                            })
-                    });
                     slots[slot.0] = Some(InFlight {
                         session: existing,
                         reply: req.reply,
@@ -4337,12 +4474,28 @@ fn admit(
         };
         if let PrefixLookupResult::Hit(lookup) = &lookup_result {
             let ckpt_pool = rig.checkpoint_pool.as_ref().unwrap();
+            // Truthful drafter decision (spec §4.5, made before execution):
+            // there is no drafter checkpoint in the pool, so a resumed
+            // request that will run MTP brings the head up via the existing
+            // reseed path (head KV refills during the suffix prefill);
+            // everything else takes AR.
+            let mtp_will_be_active = rig.mtp_head.is_some()
+                && rig.mtp_k > 0
+                && req.visual_data.is_none()
+                && !request_penalized(&req)
+                && !request_sampled(&req)
+                && req.json_schema.is_none();
+            let drafter = if mtp_will_be_active {
+                DrafterDecision::Reseed
+            } else {
+                DrafterDecision::Ar
+            };
             match plan_resume(
                 ckpt_pool,
                 domain,
                 req.prompt_tokens.len() as u64,
                 lookup,
-                DrafterDecision::Ar,
+                drafter,
             ) {
                 Ok(plan) => {
                     let boundary = plan.boundary as usize;
@@ -4354,18 +4507,28 @@ fn admit(
                             .map(|h| h.handle.phys)
                             .collect();
                         if n_pages > 0 && phys_pages.len() == n_pages {
-                            if rig.pool.share_published_pages(slot, &phys_pages).is_ok() {
-                                // Restore DN state from the checkpoint pool
-                                // (peek + restore_to: one D2D copy from the
-                                // pool's immutable snapshot into the live
-                                // slot state).
-                                let ckpt_pool = rig.checkpoint_pool.as_ref().unwrap();
-                                if let Some(snapshot) =
-                                    ckpt_pool.peek(domain, boundary as u64)
-                                {
-                                    let _ = snapshot
-                                        .restore_to(&mut rig.dn_states[slot.0], &mut rig.gpu);
-                                }
+                            // Restore the recurrent state FIRST and
+                            // fail-closed (spec §5.4 S4): the slot's
+                            // DeltaNetState was just reset, so a failed
+                            // restore must not leave shared KV paired with
+                            // zeroed recurrent state — that silently
+                            // corrupts the suffix. On failure we fall back
+                            // to the cold path below (begin_turn resets the
+                            // table; the DN state is still the reset one).
+                            let restore_ok = ckpt_pool
+                                .peek(domain, boundary as u64)
+                                .map(|snapshot| {
+                                    snapshot
+                                        .restore_to(
+                                            &mut rig.dn_states[slot.0],
+                                            &mut rig.gpu,
+                                        )
+                                        .is_ok()
+                                })
+                                .unwrap_or(false);
+                            if restore_ok
+                                && rig.pool.share_published_pages(slot, &phys_pages).is_ok()
+                            {
                                 prefix_reused = boundary;
                                 prefix_hit = true;
                                 if rig.gpu.slot_trace() {
@@ -4376,6 +4539,11 @@ fn admit(
                                         req.prompt_tokens.len()
                                     );
                                 }
+                            } else if !restore_ok {
+                                eprintln!(
+                                    "[prefix-cache] checkpoint restore failed at \
+                                     boundary {boundary} — falling back to cold prefill"
+                                );
                             }
                         }
                     }
@@ -4390,6 +4558,43 @@ fn admit(
                 (rig.prefix_index.as_mut(), rig.cache_domain.as_ref())
             {
                 idx.unpin(domain);
+            }
+        }
+    }
+
+    // ── Cache reclaim under page pressure (spec §4.4 C4) ────────────────
+    // Running work has priority over cache-only residency: before this
+    // request's prefill starts allocating, make sure the pool can back the
+    // suffix plus the generation budget. If free pages are short, evict
+    // oldest unpinned radix leaves (their cache-only pages return to the
+    // free list) rather than letting a mid-prefill provision fail.
+    if rig.prefix_cache {
+        let suffix_tokens = req.prompt_tokens.len().saturating_sub(prefix_reused);
+        let needed_pages = suffix_tokens
+            .saturating_add(req.max_tokens.max(1))
+            .div_ceil(PAGE_TOKENS)
+            .saturating_add(1);
+        let page_bytes = rig
+            .pool
+            .page_pool()
+            .map(|pp| pp.k_page_bytes() + pp.v_page_bytes())
+            .unwrap_or(0);
+        let free = rig.pool.page_pool().map(|pp| pp.free_pages()).unwrap_or(0);
+        if page_bytes > 0 && free < needed_pages {
+            let evict_bytes = needed_pages.saturating_sub(free) * page_bytes;
+            let evicted = if let (Some(idx), Some(_domain)) =
+                (rig.prefix_index.as_mut(), rig.cache_domain.as_ref())
+            {
+                let pp = rig.pool.page_pool_mut().expect("paged pool");
+                idx.evict_unpinned_leaves(pp, evict_bytes)
+            } else {
+                Vec::new()
+            };
+            if !evicted.is_empty() && rig.gpu.slot_trace() {
+                eprintln!(
+                    "[slot-trace] reclaimed {} cache-only pages under admission pressure",
+                    evicted.len()
+                );
             }
         }
     }

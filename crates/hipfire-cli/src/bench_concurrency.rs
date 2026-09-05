@@ -290,6 +290,12 @@ struct StreamOutcome {
 /// done payload; `cached_tokens > 0` is the closest wire signal. If the
 /// daemon adds `prefix_hits` to the payload later, this check should prefer
 /// it.
+/// Whole-drain deadline for one concurrency arm (spec A14: finite
+/// resources). Generous enough for the slowest legitimate arm; a daemon
+/// that never terminates a stream fails the arm as rejected instead of
+/// hanging the benchmark.
+const DRAIN_DEADLINE: Duration = Duration::from_secs(300);
+
 fn drain_streams(
     engine: &hipfire_client::Engine,
     streams: &[(String, u64, mpsc::Receiver<Value>)],
@@ -304,8 +310,23 @@ fn drain_streams(
         })
         .collect();
     let mut active: Vec<usize> = (0..k).collect();
+    // Whole-drain deadline (spec A14: finite resources — a daemon that never
+    // terminates a stream must fail the bench, not hang it).
+    let deadline = Instant::now() + DRAIN_DEADLINE;
 
     while !active.is_empty() {
+        if Instant::now() >= deadline {
+            // Deadline exceeded: every still-active stream counts as
+            // rejected, its pending attempt entry is released so later
+            // repetitions of this arm are not poisoned by a "duplicate
+            // live generate" rejection.
+            for &idx in &active {
+                let (id, attempt_id, _) = &streams[idx];
+                outcomes[idx].rejected = true;
+                engine.release_attempt(id, *attempt_id);
+            }
+            break;
+        }
         let mut still_active = Vec::with_capacity(active.len());
         for &idx in &active {
             let (id, attempt_id, rx) = &streams[idx];
@@ -329,10 +350,18 @@ fn drain_streams(
                                     outcomes[idx].prefix_hits += 1;
                                 }
                             }
-                            engine
-                                .commit_attempt(id, *attempt_id)
-                                .map_err(|e| anyhow::anyhow!("commit: {e}"))?;
-                            still_active.push(idx);
+                            // A commit failure must not bail the whole
+                            // drain: bailing leaked every other stream's
+                            // pending entry and permanently poisoned later
+                            // repetitions of this arm. Mark this stream
+                            // rejected, release, continue.
+                            if let Err(e) = engine.commit_attempt(id, *attempt_id) {
+                                outcomes[idx].rejected = true;
+                                engine.release_attempt(id, *attempt_id);
+                                let _ = e;
+                            } else {
+                                still_active.push(idx);
+                            }
                         }
                         Some("done") => {
                             engine.release_attempt(id, *attempt_id);
@@ -420,7 +449,7 @@ impl ConcurrencyBackend for SlotDriver {
         // ── Turn 1 ───────────────────────────────────────────────────────
         let mut streams: Vec<(String, u64, mpsc::Receiver<Value>)> = Vec::with_capacity(k);
         for i in 0..k {
-            let id = format!("bench-slot-{i}");
+            let id = format!("bench-slot-{run}-{i}");
             let prompt = stream_prompt(run, i);
             let req = slot_request(&prompt, max_tokens, &id, 1);
             match self.engine.submit_streaming(&req) {
@@ -449,7 +478,7 @@ impl ConcurrencyBackend for SlotDriver {
             let mut streams2: Vec<(String, u64, mpsc::Receiver<Value>)> =
                 Vec::with_capacity(k);
             for i in 0..k {
-                let id = format!("bench-slot-{i}");
+                let id = format!("bench-slot-{run}-{i}");
                 let first_prompt = stream_prompt(run, i);
                 let messages = serde_json::json!([
                     {"role": "user", "content": first_prompt},
