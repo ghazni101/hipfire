@@ -295,6 +295,15 @@ impl<B: CheckpointBlob> QwenCheckpointPool<B> {
             .unwrap_or(false)
     }
 
+    /// Drain and return all stored blobs, clearing the pool. Used by the
+    /// serve engine's `free_gpu` to explicitly free each `DeltaNetSnapshot`'s
+    /// device buffers on shutdown (the pool itself has no `Drop` impl that
+    /// touches the GPU).
+    pub fn drain_blobs(&mut self) -> Vec<B> {
+        self.total_bytes = 0;
+        self.entries.drain().map(|(_, e)| e.blob).collect()
+    }
+
     /// Check whether a checkpoint at any page-aligned boundary `≤ max_p`
     /// for `domain` was previously evicted (for [`MissReason::Evicted`]
     /// reporting).
