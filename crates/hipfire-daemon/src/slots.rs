@@ -75,6 +75,20 @@ struct EngineSpawnParams {
     /// Minimum prefill quantum (spec §5.2 S2 / §5.3 S3). Read from
     /// `serve.prefill_min_tokens`; default 1.
     prefill_min_tokens: usize,
+    /// Bounded waiting room: max queued request count (spec §5.3 S3). Read
+    /// from `serve.max_queue`; must be non-zero.
+    wait_max_count: usize,
+    /// Bounded waiting room: max total queued bytes (spec §5.3 S3). Read
+    /// from `serve.max_queue_bytes`; must be non-zero.
+    wait_max_bytes: u64,
+    /// Bounded waiting room: per-waiter timeout in scheduler ticks (spec
+    /// §5.3 S3). Derived from `serve.queue_timeout_ms` — the engine ticks
+    /// once per serve iteration, so the millisecond value is used directly
+    /// as the tick count.
+    wait_timeout_ticks: u64,
+    /// Structured-output jump-forward (spec §7.3 G3). Read from
+    /// `serve.structured_jump_forward`; default false.
+    structured_jump_forward: bool,
 }
 
 /// The per-arch multi-slot engine behind the four-method surface
@@ -126,6 +140,17 @@ impl AnySlotEngine {
                         // defaults).
                         max_batch_tokens: p.max_batch_tokens,
                         prefill_min_tokens: p.prefill_min_tokens,
+                        // Bounded waiting room (spec §5.3 S3). Read from
+                        // serve.max_queue / serve.max_queue_bytes /
+                        // serve.queue_timeout_ms config keys.
+                        wait_max_count: p.wait_max_count,
+                        wait_max_bytes: p.wait_max_bytes,
+                        wait_timeout_ticks: p.wait_timeout_ticks,
+                        // Structured-output jump-forward (spec §7.3 G3).
+                        // Read from serve.structured_jump_forward; default
+                        // false — no behavior change on the constrained-
+                        // decode path.
+                        structured_jump_forward: p.structured_jump_forward,
                     },
                 )
                 .map_err(|e| format!("SlotEngine spawn: {e}"))?,
@@ -227,6 +252,38 @@ impl SlotBackend {
             .get("serve.prefill_min_tokens")
             .and_then(|v| if let hipfire_config::ConfigValue::Integer(i) = v { Some(*i as usize) } else { None })
             .unwrap_or(1);
+        // Read the bounded waiting room config (spec §5.3 S3). Keys are
+        // registered in hipfire-config as serve.max_queue /
+        // serve.max_queue_bytes / serve.queue_timeout_ms with env
+        // HIPFIRE_SERVE_MAX_QUEUE / HIPFIRE_SERVE_MAX_QUEUE_BYTES /
+        // HIPFIRE_SERVE_QUEUE_TIMEOUT_MS. Defaults 64 / 256 MiB / 30000 ms
+        // (the registered config defaults). The CLI startup guard rejects
+        // serve.max_queue=0 for multi-slot; Rig::build also refuses
+        // WaitQueue::new(0, _) as a backstop.
+        let wait_max_count = hipfire_config::active_or_local_process_config()
+            .values
+            .get("serve.max_queue")
+            .and_then(|v| if let hipfire_config::ConfigValue::Integer(i) = v { Some(*i as usize) } else { None })
+            .unwrap_or(64);
+        let wait_max_bytes = hipfire_config::active_or_local_process_config()
+            .values
+            .get("serve.max_queue_bytes")
+            .and_then(|v| if let hipfire_config::ConfigValue::Integer(i) = v { Some(*i as u64) } else { None })
+            .unwrap_or(268435456);
+        let wait_timeout_ticks = hipfire_config::active_or_local_process_config()
+            .values
+            .get("serve.queue_timeout_ms")
+            .and_then(|v| if let hipfire_config::ConfigValue::Integer(i) = v { Some(*i as u64) } else { None })
+            .unwrap_or(30000);
+        // Read the structured-output jump-forward flag (spec §7.3 G3).
+        // Key registered as serve.structured_jump_forward with env
+        // HIPFIRE_SERVE_STRUCTURED_JUMP_FORWARD. Default false — no
+        // behavior change on the constrained-decode path.
+        let structured_jump_forward = hipfire_config::active_or_local_process_config()
+            .values
+            .get("serve.structured_jump_forward")
+            .and_then(|v| if let hipfire_config::ConfigValue::Bool(b) = v { Some(*b) } else { None })
+            .unwrap_or(false);
 
         let vl_path = preflight.vl_path;
 
@@ -251,6 +308,10 @@ impl SlotBackend {
                 prefix_cache_max_bytes,
                 max_batch_tokens,
                 prefill_min_tokens,
+                wait_max_count,
+                wait_max_bytes,
+                wait_timeout_ticks,
+                structured_jump_forward,
             },
         )?;
 

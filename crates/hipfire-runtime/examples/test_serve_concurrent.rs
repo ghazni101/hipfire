@@ -71,10 +71,15 @@ fn main() {
         is_vl: false,
         vl_path: None,
         mtp_k: 0,
+        kv_mode_raw: String::new(),
         prefix_cache: false,
         prefix_cache_max_bytes: 0,
         max_batch_tokens: 4096,
         prefill_min_tokens: 1,
+        wait_max_count: 64,
+        wait_max_bytes: 256 * 1024 * 1024,
+        wait_timeout_ticks: 30_000,
+        structured_jump_forward: false,
     })
     .expect("SlotEngine::spawn");
     println!("engine up: {N_SLOTS} slots, {n_clients} clients, {MAX_TOKENS} tokens each");

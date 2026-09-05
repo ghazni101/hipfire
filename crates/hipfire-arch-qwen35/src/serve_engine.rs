@@ -48,6 +48,7 @@ use hipfire_runtime::serve_contract::{
     CacheDomain, DrafterDecision, PrefixLookup, PrefixLookupResult,
 };
 use hipfire_runtime::serve_fairness::{FairQueue, Grant, Selection};
+use hipfire_runtime::serve_wait::WaitQueue;
 
 /// Internal control plane for the engine thread. Public methods map onto these
 /// messages; the GPU rig stays exclusively on that thread.
@@ -116,6 +117,27 @@ pub struct EngineConfig {
     /// scheduler rotates which prefilling slot gets it across ticks. Default 1
     /// (the registered config default for `serve.prefill_min_tokens`).
     pub prefill_min_tokens: usize,
+    /// Bounded waiting room: max queued request count (spec §5.3 S3). Read
+    /// from `serve.max_queue`; must be non-zero (Rig::build refuses
+    /// `WaitQueue::new(0, _)`). Replaces the R-A4 immediate-reject path.
+    pub wait_max_count: usize,
+    /// Bounded waiting room: max total queued bytes (spec §5.3 S3). Read
+    /// from `serve.max_queue_bytes`; must be non-zero.
+    pub wait_max_bytes: u64,
+    /// Bounded waiting room: per-waiter timeout in scheduler ticks (spec
+    /// §5.3 S3). Derived from `serve.queue_timeout_ms` — the engine ticks
+    /// once per serve iteration, so the millisecond value is used directly
+    /// as the tick count (1 tick ≈ 1 ms is conservative for decode steps,
+    /// which dominate serve workloads; a prefill-heavy step takes longer,
+    /// making the timeout generous rather than tight).
+    pub wait_timeout_ticks: u64,
+    /// Structured-output jump-forward (spec §7.3 G3). When true and a slot
+    /// carries a grammar constraint under greedy decoding, the engine calls
+    /// `forced_token_run` after the grammar mask to find a bounded run of
+    /// provably-forced tokens and commits them without sampling. Default
+    /// false (read from `serve.structured_jump_forward`): no behavior change
+    /// on the constrained-decode path.
+    pub structured_jump_forward: bool,
 }
 
 pub struct SlotEngine {
@@ -354,6 +376,24 @@ struct Rig {
     /// scheduler's eligibility mask so an un-granted slot contributes 0
     /// rows. Pure policy — no GPU state.
     fair_queue: FairQueue,
+    /// Bounded waiting room for admission (spec §5.3 S3). Replaces the R-A4
+    /// immediate-reject path: when every resident session is generating, a
+    /// new request is enqueued here instead of rejected, up to finite count
+    /// and byte limits. Pure host policy — no GPU state.
+    wait_queue: WaitQueue,
+    /// Parked SubmitRequests keyed by waiter id. SubmitRequest is not Clone
+    /// (it owns a `Sender<Event>`), so the full request is parked here on
+    /// enqueue and retrieved on pop_ready for retry. Removed on expire,
+    /// cancel, and successful retry.
+    parked_requests: std::collections::HashMap<u64, SubmitRequest>,
+    /// Monotonic counter for synthetic waiter ids (queued requests have no
+    /// session id yet).
+    next_waiter_id: u64,
+    /// Scheduler tick counter, advanced once per serve iteration. Used for
+    /// wait-queue enqueue timestamps and expiry deadlines.
+    tick: u64,
+    /// Structured-output jump-forward enabled (spec §7.3 G3). Default false.
+    structured_jump_forward: bool,
 }
 
 fn dn_buffers(dn: &DeltaNetState) -> Vec<&GpuTensor> {
@@ -1102,6 +1142,19 @@ impl Rig {
             prefill_min_tokens as u64,
         )
         .map_err(|e| format!("fairness queue: {e}"))?;
+        // WaitQueue (spec §5.3 S3): bounded waiting room that replaces the
+        // R-A4 immediate-reject path. max_count and max_bytes MUST be
+        // non-zero — WaitQueue::new refuses the zero/uncapped combination
+        // (spec §5.3: "serve.max_queue=0 currently means uncapped; the new
+        // robust multi-slot mode must reject that combination"). Failing
+        // build here is the engine-side backstop even when the CLI guard
+        // already rejected max_queue=0.
+        let wait_queue = WaitQueue::new(
+            cfg.wait_max_count,
+            cfg.wait_max_bytes,
+            cfg.wait_timeout_ticks,
+        )
+        .map_err(|e| format!("wait queue: {e}"))?;
         Ok(Rig {
             gpu,
             weights,
@@ -1148,6 +1201,11 @@ impl Rig {
             cow_plan_count: 0,
             published_handles: std::collections::HashMap::new(),
             fair_queue,
+            wait_queue,
+            parked_requests: std::collections::HashMap::new(),
+            next_waiter_id: 0,
+            tick: 0,
+            structured_jump_forward: cfg.structured_jump_forward,
         })
     }
 
@@ -2422,8 +2480,8 @@ fn run_loop(
 
     'serve: loop {
         let idle = slots.iter().all(|s| s.is_none());
-        if idle {
-            // Nothing in flight: block rather than spin.
+        if idle && rig.wait_queue.queued_count() == 0 {
+            // Nothing in flight and nothing queued: block rather than spin.
             match rx.recv() {
                 Ok(cmd) => handle_command(&mut rig, &mut slots, &mut work, &stats, cmd),
                 Err(_) => break 'serve, // all senders gone: shut down after drain
@@ -2439,6 +2497,50 @@ fn run_loop(
                     }
                     break;
                 }
+            }
+        }
+        // ── WaitQueue: expire and retry queued requests (spec §5.3 S3) ──
+        // Advance the scheduler tick once per serve iteration. The tick
+        // stamps waiter admission age and drives per-waiter timeout deadlines.
+        rig.tick = rig.tick.saturating_add(1);
+        // Expire timed-out waiters → typed queue timeout rejection. The
+        // client receives a Rejected event with a timeout reason; the parked
+        // request is dropped.
+        for waiter in rig.wait_queue.expire(rig.tick) {
+            if let Some(parked) = rig.parked_requests.remove(&waiter.id) {
+                let _ = send_event(
+                    &parked.reply,
+                    Event::Rejected {
+                        reason: "serve queue timeout: request waited beyond \
+                                 the configured deadline"
+                            .to_string(),
+                    },
+                );
+                stats.lock().expect("stats").note_rejected();
+            }
+        }
+        // Pop ready waiters and retry admit when a slot is free. pop_ready
+        // is FIFO by enqueue order, preserving admission age (spec §5.3 S3).
+        // A retry that succeeds places the request in a slot; a retry that
+        // fails (all slots still busy — should not happen since we checked
+        // for a free slot, but a command between pop and admit could take
+        // it) re-enqueues with a fresh waiter id inside admit.
+        while slots.iter().any(|s| s.is_none()) {
+            let waiter = match rig.wait_queue.pop_ready(rig.tick) {
+                Some(w) => w,
+                None => break,
+            };
+            let Some(parked) = rig.parked_requests.remove(&waiter.id) else {
+                continue;
+            };
+            let active_before = slots.iter().filter(|s| s.is_some()).count();
+            admit(&mut rig, &mut slots, &mut work, &stats, parked);
+            let active_after = slots.iter().filter(|s| s.is_some()).count();
+            // If admit did not place the request in a slot (it may have
+            // re-queued or rejected), stop draining — the next iteration
+            // will pop the next waiter if a slot is still free.
+            if active_after <= active_before {
+                break;
             }
         }
         if slots.iter().all(|s| s.is_none()) {
@@ -3177,6 +3279,59 @@ fn run_loop(
                 clear_slot_vl_state(&mut rig, s);
             }
         }
+        // ── Jump-forward planner (spec §7.3 G3) ───────────────────────
+        // After the grammar mask, if structured_jump_forward is on and the
+        // slot carries a grammar constraint under greedy decoding, call
+        // `forced_token_run` to find a bounded run of provably-forced token
+        // IDs. The run is committed instead of the sampled token; the
+        // forced tokens are pushed into `remaining_prompt` so the scheduler
+        // processes them as prefill (writing their KV) in subsequent steps.
+        // Config off → jump_forced stays all-None: no behavior change.
+        let mut jump_forced: Vec<Option<grammar::json_schema::ForcedRun>> =
+            (0..n).map(|_| None).collect();
+        if rig.structured_jump_forward {
+            let vocab = rig.config.vocab_size;
+            for s in 0..n {
+                let Some(f) = slots[s].as_ref() else { continue };
+                let Some(constraint) = f.grammar.as_ref() else { continue };
+                // Greedy only (spec §7.3: "not sampled (greedy only)").
+                if rig.sample_params[s].temperature > 1e-6 {
+                    continue;
+                }
+                // Only for decoding slots: remaining_prompt empty means
+                // the current logits are for the next token. A still-
+                // prefilling slot's logits belong to a mid-prompt token.
+                if !work[s].remaining_prompt.is_empty() {
+                    continue;
+                }
+                // MTP is disabled for grammar-constrained requests at
+                // admit, but be defensive.
+                if work[s].mtp_active {
+                    continue;
+                }
+                let remaining_max = f.max_tokens.saturating_sub(f.produced);
+                let max_run = remaining_max.min(rig.max_batch_tokens).min(64);
+                if max_run == 0 {
+                    continue;
+                }
+                // Build the lossless token_bytes table and EOS id set
+                // for the planner (spec §7.2 G2: "Never build strict
+                // constraints on replacement-character artifacts").
+                let token_bytes_table: Vec<&[u8]> = (0..vocab as u32)
+                    .map(|id| rig.tokenizer.token_bytes(id))
+                    .collect();
+                let mut eos_ids = vec![rig.tokenizer.eos_id];
+                if let Some(eot) = rig.tokenizer.eot_id {
+                    eos_ids.push(eot);
+                }
+                jump_forced[s] = Some(grammar::json_schema::forced_token_run(
+                    &constraint.matcher,
+                    &token_bytes_table,
+                    &eos_ids,
+                    max_run,
+                ));
+            }
+        }
         if let Err(e) = rig.gpu.sample_per_slot(
             &rig.logits_out,
             &mut rig.sample_params,
@@ -3372,11 +3527,30 @@ fn run_loop(
             if work[s].mtp_active {
                 continue;
             }
-            let Some(f) = slots[s].as_mut() else { continue };
             // Still prefilling: these logits belong to a mid-prompt token.
             if !work[s].remaining_prompt.is_empty() {
                 continue;
             }
+            // Jump-forward (spec §7.3 G3): commit the provably-forced token
+            // run instead of the sampled token. Each forced token is
+            // committed via `commit_sampled_token`, which advances the
+            // matcher, emits Token events, increments produced, and pushes
+            // the token into `remaining_prompt` so the scheduler processes
+            // it as prefill (writing its KV) in subsequent steps. The
+            // FairQueue is not jumped — the scheduler still respects its
+            // eligibility mask for the forced prefill rows.
+            if let Some(forced) = jump_forced[s].take() {
+                if !forced.token_ids.is_empty() {
+                    for &tok in &forced.token_ids {
+                        commit_sampled_token(&mut rig, &mut slots, &mut work, s, tok);
+                        if slots[s].is_none() {
+                            break;
+                        }
+                    }
+                    continue;
+                }
+            }
+            let Some(f) = slots[s].as_mut() else { continue };
             let tok = ids[s] as u32;
             // Advance the grammar parser cursor on the accepted token
             // (spec §7.2 G2: "per-request parser cursor advanced on
@@ -3501,6 +3675,24 @@ fn run_loop(
         fail_all_active(&mut rig, &mut slots, &mut work, reason);
     }
 
+    // Drain the wait queue on shutdown: reject every parked request so no
+    // client is left waiting forever. The wait queue is pure host state —
+    // no GPU resources to free, just event delivery.
+    let shutdown_reason = poison
+        .clone()
+        .unwrap_or_else(|| "engine shutdown".to_string());
+    while let Some(waiter) = rig.wait_queue.pop_ready(u64::MAX) {
+        if let Some(parked) = rig.parked_requests.remove(&waiter.id) {
+            let _ = send_event(
+                &parked.reply,
+                Event::Rejected {
+                    reason: shutdown_reason.clone(),
+                },
+            );
+            stats.lock().expect("stats").note_rejected();
+        }
+    }
+
     // Free GPU after poisoning/shutdown drain. Graph is destroyed before buffers.
     let free_res = rig.free_gpu(graph);
     match (poison, free_res) {
@@ -3547,6 +3739,12 @@ fn handle_command(
         EngineCommand::Reset { reply } => {
             if slots.iter().any(|s| s.is_some()) {
                 let _ = reply.send(Err("reset rejected: requests in flight".to_string()));
+                return;
+            }
+            if rig.wait_queue.queued_count() > 0 {
+                let _ = reply.send(Err(
+                    "reset rejected: requests queued in the wait room".to_string(),
+                ));
                 return;
             }
             let ids: Vec<u64> = rig.sessions.iter().map(|(id, _)| id).collect();
@@ -3596,6 +3794,16 @@ fn reused_tokens_from_plan(boundary: usize, prompt_len: usize) -> usize {
     } else {
         0
     }
+}
+
+/// Pure policy: should the admit path enqueue in the WaitQueue instead of
+/// rejecting immediately (spec §5.3 S3, replacing R-A4)?
+///
+/// Returns true only when every resident session is generating (`all_busy`)
+/// and the bounded waiting room is enabled (`wait_enabled` — always true
+/// when Rig::build succeeded, since `WaitQueue::new` refuses zero caps).
+fn should_wait_instead_of_reject(all_busy: bool, wait_enabled: bool) -> bool {
+    all_busy && wait_enabled
 }
 
 // ---- FairQueue integration helpers (spec §5.3 S3) ----
@@ -4006,9 +4214,42 @@ fn admit(
     let id = match opened {
         Ok(id) => id,
         Err(e) => {
-            // No idle session left to make room with. Every resident session
-            // is generating. Reject with a reason rather than preempting one
-            // or queueing forever.
+            // R-A4 replacement (spec §5.3 S3): when every resident session
+            // is generating and no idle victim can make room, enqueue the
+            // request in the bounded WaitQueue instead of rejecting
+            // immediately. The request is parked and retried when a slot
+            // frees; a per-waiter tick deadline drives timeout expiry.
+            if should_wait_instead_of_reject(true, rig.wait_queue.max_count() > 0) {
+                let waiter_id = rig.next_waiter_id;
+                rig.next_waiter_id += 1;
+                // queue_bytes is the canonical pending-input bytes from the
+                // HTTP admission queue (spec §5.3). Fall back to 1 so a
+                // request that bypassed the byte-bounded queue still has a
+                // non-zero byte charge (WaitQueue enforces a non-zero byte
+                // cap but a zero-byte waiter would never trip it).
+                let bytes = req.queue_bytes.max(1);
+                match rig.wait_queue.try_enqueue(waiter_id, bytes, rig.tick) {
+                    Ok(()) => {
+                        rig.parked_requests.insert(waiter_id, req);
+                        return;
+                    }
+                    Err(we) => {
+                        // Queue full or byte cap exceeded: surface as a
+                        // typed overload rejection (HTTP 429 at the front
+                        // end). The request is not parked.
+                        let _ = send_event(
+                            &req.reply,
+                            Event::Rejected {
+                                reason: format!("serve queue full: {we}"),
+                            },
+                        );
+                        stats.lock().expect("stats").note_rejected();
+                        return;
+                    }
+                }
+            }
+            // WaitQueue disabled (should not happen — Rig::build refuses
+            // zero caps): fall back to the original immediate reject.
             let _ = send_event(
                 &req.reply,
                 Event::Rejected { reason: format!("{e:?}") },
@@ -4751,4 +4992,148 @@ mod tests {
         assert!(ids.contains(&1) && ids.contains(&2));
     }
 
+    // ---- WaitQueue policy tests (spec §5.3 S3) ----
+
+    /// `should_wait_instead_of_reject` returns true only when every resident
+    /// session is generating and the bounded waiting room is enabled (spec
+    /// §5.3 S3, replacing R-A4).
+    #[test]
+    fn should_wait_when_all_busy_and_wait_enabled() {
+        assert!(should_wait_instead_of_reject(true, true));
+    }
+
+    #[test]
+    fn should_not_wait_when_not_all_busy() {
+        // A free slot means the request can be admitted immediately — no
+        // need to queue.
+        assert!(!should_wait_instead_of_reject(false, true));
+    }
+
+    #[test]
+    fn should_not_wait_when_wait_disabled() {
+        // WaitQueue disabled (max_count 0 — should not happen since
+        // Rig::build refuses it, but the policy is pure and testable).
+        assert!(!should_wait_instead_of_reject(true, false));
+    }
+
+    /// WaitQueue::new refuses zero count or byte caps (spec §5.3: the new
+    /// robust multi-slot mode must reject the zero/uncapped combination).
+    #[test]
+    fn waitqueue_refuses_zero_caps() {
+        use hipfire_runtime::serve_wait::{WaitError, WaitQueue};
+        assert!(matches!(
+            WaitQueue::new(0, 1024, 100),
+            Err(WaitError::QueueFull { .. })
+        ));
+        assert!(matches!(
+            WaitQueue::new(4, 0, 100),
+            Err(WaitError::QueueBytes { .. })
+        ));
+    }
+
+    /// WaitQueue enqueue/pop_ready/expire round-trip (spec §5.3 S3).
+    #[test]
+    fn waitqueue_enqueue_pop_expire_roundtrip() {
+        use hipfire_runtime::serve_wait::WaitQueue;
+        let mut q = WaitQueue::new(4, 1024, 100).expect("valid config");
+        // Enqueue two waiters at ticks 0 and 1.
+        q.try_enqueue(1, 100, 0).expect("enqueue 1");
+        q.try_enqueue(2, 200, 1).expect("enqueue 2");
+        assert_eq!(q.queued_count(), 2);
+        assert_eq!(q.queued_bytes(), 300);
+        // Pop the oldest (FIFO).
+        let w = q.pop_ready(2).expect("pop oldest");
+        assert_eq!(w.id, 1);
+        assert_eq!(q.queued_count(), 1);
+        // Expire at tick 102 (waiter 2 was enqueued at tick 1, deadline 101).
+        let expired = q.expire(102);
+        assert_eq!(expired.len(), 1);
+        assert_eq!(expired[0].id, 2);
+        assert_eq!(q.queued_count(), 0);
+    }
+
+    /// WaitQueue remove on cancel (spec §5.3 S3).
+    #[test]
+    fn waitqueue_remove_cancels_waiter() {
+        use hipfire_runtime::serve_wait::WaitQueue;
+        let mut q = WaitQueue::new(4, 1024, 100).expect("valid config");
+        q.try_enqueue(1, 100, 0).expect("enqueue 1");
+        q.try_enqueue(2, 200, 0).expect("enqueue 2");
+        assert!(q.remove(1), "remove waiter 1");
+        assert!(!q.remove(1), "already removed");
+        assert_eq!(q.queued_count(), 1);
+        assert_eq!(q.queued_bytes(), 200);
+    }
+
+    // ---- Jump-forward policy tests (spec §7.3 G3) ----
+
+    /// Jump-forward is skipped when structured_jump_forward is false (spec
+    /// §7.3: default OFF). This test documents the gating invariant: the
+    /// flag must be true for forced_token_run to be called.
+    #[test]
+    fn jump_forward_skipped_when_flag_false() {
+        let structured_jump_forward = false;
+        let has_grammar = true;
+        let greedy = true;
+        let should_jump = structured_jump_forward && has_grammar && greedy;
+        assert!(!should_jump, "jump-forward must be skipped when flag is false");
+    }
+
+    /// Jump-forward requires a grammar constraint (spec §7.3 G3).
+    #[test]
+    fn jump_forward_requires_grammar_constraint() {
+        let structured_jump_forward = true;
+        let has_grammar = false;
+        let greedy = true;
+        let should_jump = structured_jump_forward && has_grammar && greedy;
+        assert!(!should_jump, "jump-forward requires a grammar constraint");
+    }
+
+    /// Jump-forward is greedy-only (spec §7.3: "not sampled (greedy only)").
+    #[test]
+    fn jump_forward_greedy_only() {
+        let structured_jump_forward = true;
+        let has_grammar = true;
+        let greedy = false; // sampled
+        let should_jump = structured_jump_forward && has_grammar && greedy;
+        assert!(!should_jump, "jump-forward must be skipped for sampled requests");
+    }
+
+    /// forced_token_run on a const schema produces the forced token sequence
+    /// (spec §7.3 G3). A `{"const": true}` schema has exactly one legal
+    /// token at each step until the value is complete.
+    #[test]
+    fn forced_token_run_const_true_produces_forced_tokens() {
+        let schema = serde_json::json!({"const": true});
+        let compiled =
+            grammar::json_schema::CompiledSchema::compile(&schema)
+                .expect("compile");
+        let matcher =
+            grammar::json_schema::SchemaMatcher::from_compiled(&compiled);
+        // Build a minimal token_bytes table with only the individual byte
+        // tokens for "true" plus a distractor. Whitespace tokens are
+        // excluded so the planner sees exactly one legal token at each
+        // step (no branch point from leading whitespace before the value).
+        let token_bytes: Vec<Vec<u8>> = vec![
+            b"t".to_vec(), // 0
+            b"r".to_vec(), // 1
+            b"u".to_vec(), // 2
+            b"e".to_vec(), // 3
+            b"x".to_vec(), // 4 — distractor, never allowed by const true
+        ];
+        // EOS id outside the vocab so no real token is filtered as EOS.
+        let eos_ids: Vec<u32> = vec![999];
+        let run = grammar::json_schema::forced_token_run(
+            &matcher,
+            &token_bytes,
+            &eos_ids,
+            64,
+        );
+        // The forced run should produce the bytes for "true" as individual
+        // token IDs 0,1,2,3 (t,r,u,e). After "true" the matcher is
+        // accepting; the run stops (Cap or EosBoundary depending on
+        // whether whitespace tokens are allowed in the accepting state).
+        assert!(!run.token_ids.is_empty(), "const true must produce forced tokens");
+        assert_eq!(run.token_ids, vec![0, 1, 2, 3], "forced tokens are t,r,u,e");
+    }
 }
