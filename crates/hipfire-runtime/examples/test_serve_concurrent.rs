@@ -73,6 +73,8 @@ fn main() {
         mtp_k: 0,
         prefix_cache: false,
         prefix_cache_max_bytes: 0,
+        max_batch_tokens: 4096,
+        prefill_min_tokens: 1,
     })
     .expect("SlotEngine::spawn");
     println!("engine up: {N_SLOTS} slots, {n_clients} clients, {MAX_TOKENS} tokens each");

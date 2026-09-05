@@ -24,6 +24,12 @@ pub struct Scheduler {
     /// the batched path is the default (and the only one compatible with a
     /// paged pool).
     pub vl_sequential: bool,
+    /// Rotation cursor for the prefill quantum (spec §5.2 S2). Each step the
+    /// first prefilling slot in rotation order gets the minimum prefill
+    /// quantum before extra budget is distributed round-robin; advancing this
+    /// cursor across ticks hands the quantum to a different prefilling slot
+    /// so two long prefills interleave instead of one blocking the other.
+    pub prefill_cursor: usize,
 }
 
 /// One slot's outstanding work as seen by the scheduler.
@@ -112,11 +118,29 @@ impl VlPrefill {
 }
 
 impl Scheduler {
-    /// Build the next step's `SlotBatch`, taking `min(chunk_size,
-    /// remaining_prompt.len())` tokens from each prefilling slot and one
-    /// token from each decoding slot, in slot order. Advances `next_pos`
-    /// (and drains `remaining_prompt`) for whatever it takes.
-    pub fn next_batch(&mut self, work: &mut [PendingWork]) -> SlotBatch {
+    /// Build the next step's `SlotBatch` under a global trunk-row budget
+    /// (spec §5.2 S2). `remaining_rows` is the row budget for this step's
+    /// prefill+decode work — the caller subtracts MTP verify rows (injected
+    /// later) from `max_batch_tokens` and passes the rest here, so the
+    /// returned batch's `prefill_rows + decode_rows` never exceeds it and the
+    /// full step (prefill + decode + verify) never exceeds `max_batch_tokens`.
+    ///
+    /// Allocation order (spec §5.2 S2): every runnable decode slot gets 1 row
+    /// first; if that would exceed the budget, fewer decode lanes are admitted.
+    /// Then, if any prefill is runnable and space remains, at least
+    /// `prefill_min_tokens` rows go to one prefilling slot — the slot chosen
+    /// by the persistent `prefill_cursor` so the quantum rotates across ticks.
+    /// Unused budget adds extra prefill rows by rotation, still capping each
+    /// slot at `chunk_size` (a per-request MAXIMUM, not the total budget).
+    /// Advances `next_pos` (and drains `remaining_prompt`) for whatever it
+    /// takes.
+    pub fn next_batch(
+        &mut self,
+        work: &mut [PendingWork],
+        remaining_rows: usize,
+        prefill_min_tokens: usize,
+    ) -> SlotBatch {
+        let n = work.len();
         // A step carrying VL rows runs the batched M-RoPE kernel for EVERY
         // row (text rows take [p, p, p], bit-identical to 1D RoPE), so the
         // per-row pos3/ext side arrays exist whenever some slot is VL — or
@@ -126,39 +150,97 @@ impl Scheduler {
             (w.vl_prefill.is_some() && !self.vl_sequential) || w.pos3_delta != 0
         });
         let mut b = SlotBatch::default();
-        for w in work.iter_mut() {
-            // Sequential-mode VL slots are owned by the per-token M-RoPE
-            // path. MTP slots prefill through this batched path like any
-            // other slot (their head-KV fill runs post-forward from x_batch);
-            // once decoding, the MTP verify rows are injected by the caller
-            // instead, so skip them here.
-            if (w.vl_prefill.is_some() && self.vl_sequential)
-                || (w.mtp_active && w.decoding)
-            {
-                b.m_per_slot.push(0);
+        b.m_per_slot = vec![0; n];
+
+        // ---- Phase 1: decode (1 row per runnable decode slot, slot order) ----
+        // Admit decode lanes in slot order until the budget is exhausted; a
+        // step that cannot afford every decode lane serves a prefix of them
+        // rather than overflowing (spec §5.2 S2).
+        let mut alloc = vec![0usize; n];
+        let mut used = 0usize;
+        for i in 0..n {
+            if !is_runnable_decode(&work[i], self.vl_sequential) {
                 continue;
             }
-            // Batched-mode VL slots wait until the engine has run
-            // vision_forward and uploaded their embedding matrix — building
-            // rows before that would embed garbage for the image pads.
-            let vl_waiting = w
-                .vl_prefill
-                .as_ref()
-                .is_some_and(|vl| vl.embeddings.is_empty() && vl.n_visual_tokens > 0);
-            if vl_waiting {
-                b.m_per_slot.push(0);
+            if used + 1 > remaining_rows {
+                break;
+            }
+            alloc[i] = 1;
+            used += 1;
+        }
+
+        // ---- Phase 2: prefill (round-robin from the rotation cursor) ----
+        // The first prefilling slot in rotation order receives at least
+        // `prefill_min_tokens` rows (when its prompt and the remaining budget
+        // allow); leftover budget is distributed by rotation, capping each
+        // slot at `chunk_size`. The cursor advances each tick so a different
+        // prefilling slot gets the quantum next step.
+        let mut avail = remaining_rows.saturating_sub(used);
+        if avail > 0 {
+            let prefill_slots: Vec<usize> = (0..n)
+                .filter(|&i| is_runnable_prefill(&work[i], self.vl_sequential))
+                .collect();
+            if !prefill_slots.is_empty() {
+                let n_pr = prefill_slots.len();
+                let start = self.prefill_cursor % n_pr;
+                // Guarantee the minimum prefill quantum to the rotated slot
+                // before distributing extra budget: reserve `prefill_min_tokens`
+                // for it (clamped to what its prompt and the budget allow) so a
+                // later round-robin pass cannot starve the quantum.
+                let head = prefill_slots[start];
+                let head_remaining = work[head].remaining_prompt.len();
+                let head_take = self
+                    .chunk_size
+                    .min(head_remaining)
+                    .min(avail)
+                    .max(prefill_min_tokens.min(head_remaining).min(avail));
+                if head_take > 0 && head_remaining > 0 {
+                    alloc[head] += head_take;
+                    avail -= head_take;
+                    used += head_take;
+                }
+                // Distribute any leftover budget by rotation, capping each
+                // slot at `chunk_size` total.
+                let mut keep_going = true;
+                while avail > 0 && keep_going {
+                    keep_going = false;
+                    for k in 0..n_pr {
+                        if avail == 0 {
+                            break;
+                        }
+                        let i = prefill_slots[(start + k) % n_pr];
+                        let already = alloc[i];
+                        let prompt_left = work[i].remaining_prompt.len().saturating_sub(already);
+                        let cap = self.chunk_size.saturating_sub(already);
+                        let take = cap.min(prompt_left).min(avail);
+                        if take == 0 {
+                            continue;
+                        }
+                        alloc[i] += take;
+                        avail -= take;
+                        used += take;
+                        keep_going = true;
+                    }
+                }
+                self.prefill_cursor = (self.prefill_cursor + 1) % n_pr;
+            }
+        }
+
+        // ---- Build the batch in slot order from the allocation ----
+        // Flat arrays are packed in slot order (the forward reads them via
+        // `m_per_slot` offsets), so the row-building pass runs in slot order
+        // even though the allocation was phased decode-then-prefill.
+        for i in 0..n {
+            let take = alloc[i];
+            if take == 0 {
                 continue;
             }
-            let take = if w.decoding {
-                w.remaining_prompt.len().min(1)
-            } else {
-                w.remaining_prompt.len().min(self.chunk_size)
-            };
+            let w = &mut work[i];
             let toks: Vec<u32> = w.remaining_prompt.drain(..take).collect();
             let start_pos = w.next_pos;
-            b.m_per_slot.push(toks.len());
-            for (i, t) in toks.iter().enumerate() {
-                let pos = start_pos + i;
+            b.m_per_slot[i] = toks.len();
+            for (j, t) in toks.iter().enumerate() {
+                let pos = start_pos + j;
                 b.tokens.push(*t);
                 b.positions.push(pos as i32);
                 b.row_slot.push(w.slot.0 as i32);
@@ -192,6 +274,42 @@ impl Scheduler {
     }
 }
 
+// ---- Runnable predicates (spec §5.2 S2) ----
+// A slot is skipped entirely when a sequential VL path owns it or it is a
+// decoding MTP slot whose verify rows the caller injects separately. A
+// batched VL slot still waiting on its vision-tower embeddings contributes no
+// rows (image pads would embed as the raw pad token). Decode slots carry one
+// seed token in `remaining_prompt`; prefill slots carry the un-prefilled
+// prompt suffix.
+
+/// Sequential VL or decoding MTP: owned elsewhere, never batched here.
+fn skip_entirely(w: &PendingWork, vl_sequential: bool) -> bool {
+    (w.vl_prefill.is_some() && vl_sequential) || (w.mtp_active && w.decoding)
+}
+
+/// Batched VL slot whose vision-tower embeddings have not landed yet.
+fn vl_waiting(w: &PendingWork) -> bool {
+    w.vl_prefill
+        .as_ref()
+        .is_some_and(|vl| vl.embeddings.is_empty() && vl.n_visual_tokens > 0)
+}
+
+/// A decoding slot that contributes one ordinary decode row this step.
+fn is_runnable_decode(w: &PendingWork, vl_sequential: bool) -> bool {
+    if skip_entirely(w, vl_sequential) || vl_waiting(w) {
+        return false;
+    }
+    w.decoding && !w.remaining_prompt.is_empty()
+}
+
+/// A prefilling slot with prompt tokens left to feed.
+fn is_runnable_prefill(w: &PendingWork, vl_sequential: bool) -> bool {
+    if skip_entirely(w, vl_sequential) || vl_waiting(w) {
+        return false;
+    }
+    !w.decoding && !w.remaining_prompt.is_empty()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -203,7 +321,7 @@ mod tests {
 
     #[test]
     fn a_long_prompt_is_chunked_not_run_whole() {
-        let mut s = Scheduler { chunk_size: 256, vl_sequential: false };
+        let mut s = Scheduler { chunk_size: 256, vl_sequential: false, prefill_cursor: 0 };
         let mut work = vec![PendingWork {
             slot: SlotId(0),
             remaining_prompt: prompt(1000),
@@ -211,7 +329,7 @@ mod tests {
             decoding: false,
             vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0, pos3_delta: 0,
         }];
-        let b = s.next_batch(&mut work);
+        let b = s.next_batch(&mut work, 4096, 1);
         assert_eq!(
             b.total_rows(),
             256,
@@ -223,7 +341,7 @@ mod tests {
 
     #[test]
     fn prefill_and_decode_mix_in_one_batch() {
-        let mut s = Scheduler { chunk_size: 256, vl_sequential: false };
+        let mut s = Scheduler { chunk_size: 256, vl_sequential: false, prefill_cursor: 0 };
         let mut work = vec![
             PendingWork {
                 slot: SlotId(0),
@@ -240,7 +358,7 @@ mod tests {
                 vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0, pos3_delta: 0,
             },
         ];
-        let b = s.next_batch(&mut work);
+        let b = s.next_batch(&mut work, 4096, 1);
         assert_eq!(
             b.m_per_slot,
             vec![256, 1],
@@ -250,7 +368,7 @@ mod tests {
 
     #[test]
     fn a_prompt_shorter_than_a_chunk_completes_in_one_batch() {
-        let mut s = Scheduler { chunk_size: 256, vl_sequential: false };
+        let mut s = Scheduler { chunk_size: 256, vl_sequential: false, prefill_cursor: 0 };
         let mut work = vec![PendingWork {
             slot: SlotId(0),
             remaining_prompt: prompt(10),
@@ -258,14 +376,14 @@ mod tests {
             decoding: false,
             vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0, pos3_delta: 0,
         }];
-        let b = s.next_batch(&mut work);
+        let b = s.next_batch(&mut work, 4096, 1);
         assert_eq!(b.total_rows(), 10);
         assert!(work[0].remaining_prompt.is_empty());
     }
 
     #[test]
     fn an_idle_slot_contributes_nothing() {
-        let mut s = Scheduler { chunk_size: 256, vl_sequential: false };
+        let mut s = Scheduler { chunk_size: 256, vl_sequential: false, prefill_cursor: 0 };
         let mut work = vec![PendingWork {
             slot: SlotId(0),
             remaining_prompt: vec![],
@@ -273,7 +391,7 @@ mod tests {
             decoding: false,
             vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0, pos3_delta: 0,
         }];
-        let b = s.next_batch(&mut work);
+        let b = s.next_batch(&mut work, 4096, 1);
         assert!(b.is_empty());
     }
 
@@ -309,7 +427,7 @@ mod tests {
         // Embeddings not yet produced: the slot must not enter the batch
         // (image pads would embed garbage), but the decoding slot next to it
         // is unaffected.
-        let mut s = Scheduler { chunk_size: 256, vl_sequential: false };
+        let mut s = Scheduler { chunk_size: 256, vl_sequential: false, prefill_cursor: 0 };
         let mut work = vec![
             PendingWork {
                 slot: SlotId(0),
@@ -330,7 +448,7 @@ mod tests {
                 vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0, pos3_delta: 0,
             },
         ];
-        let b = s.next_batch(&mut work);
+        let b = s.next_batch(&mut work, 4096, 1);
         assert_eq!(b.m_per_slot, vec![0, 1], "unprepared VL slots must wait");
         assert_eq!(work[0].remaining_prompt.len(), 10);
         assert_eq!(work[0].next_pos, 0);
@@ -339,7 +457,7 @@ mod tests {
 
     #[test]
     fn batched_vl_rows_carry_mrope_phases() {
-        let mut s = Scheduler { chunk_size: 256, vl_sequential: false };
+        let mut s = Scheduler { chunk_size: 256, vl_sequential: false, prefill_cursor: 0 };
         // Prompt where position 4 is an image pad.
         let mut toks = prompt(10);
         toks[4] = 42;
@@ -351,7 +469,7 @@ mod tests {
             vl_prefill: Some(vl_state(1, 10)),
             mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0, pos3_delta: 0,
         }];
-        let b = s.next_batch(&mut work);
+        let b = s.next_batch(&mut work, 4096, 1);
         assert_eq!(b.total_rows(), 10);
         assert_eq!(b.pos3.len(), 10, "one phase triplet per row");
         assert_eq!(b.pos3[4], [4, 9, 9], "the image row reads the table");
@@ -362,7 +480,7 @@ mod tests {
 
     #[test]
     fn vl_decode_rows_use_pos_plus_rope_delta() {
-        let mut s = Scheduler { chunk_size: 4, vl_sequential: false };
+        let mut s = Scheduler { chunk_size: 4, vl_sequential: false, prefill_cursor: 0 };
         let mut work = vec![PendingWork {
             slot: SlotId(0),
             remaining_prompt: vec![9],
@@ -371,7 +489,7 @@ mod tests {
             vl_prefill: Some(vl_state(2, 4)),
             mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0, pos3_delta: 0,
         }];
-        let b = s.next_batch(&mut work);
+        let b = s.next_batch(&mut work, 4096, 1);
         assert_eq!(b.total_rows(), 1);
         // Position 12 is past the 4-row table: [p + rope_delta; 3].
         assert_eq!(b.pos3[0], [12 + 7, 12 + 7, 12 + 7]);
@@ -380,7 +498,7 @@ mod tests {
 
     #[test]
     fn sequential_vl_slots_still_bypass_the_batch() {
-        let mut s = Scheduler { chunk_size: 256, vl_sequential: true };
+        let mut s = Scheduler { chunk_size: 256, vl_sequential: true, prefill_cursor: 0 };
         let mut work = vec![PendingWork {
             slot: SlotId(0),
             remaining_prompt: prompt(10),
@@ -389,14 +507,14 @@ mod tests {
             vl_prefill: Some(vl_state(1, 10)),
             mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0, pos3_delta: 0,
         }];
-        let b = s.next_batch(&mut work);
+        let b = s.next_batch(&mut work, 4096, 1);
         assert!(b.is_empty(), "sequential mode owns the slot");
         assert!(b.pos3.is_empty(), "no VL rows implies no side arrays");
         assert_eq!(work[0].remaining_prompt.len(), 10);
     }
 
     #[test]
-    fn mtp_prefill_slots_batch_but_decoding_mtp_slots_are_skipped() {        let mut s = Scheduler { chunk_size: 256, vl_sequential: false };
+    fn mtp_prefill_slots_batch_but_decoding_mtp_slots_are_skipped() {        let mut s = Scheduler { chunk_size: 256, vl_sequential: false, prefill_cursor: 0 };
         let mut work = vec![
             PendingWork {
                 // MTP slot still prefilling: its prompt chunk flows through
@@ -425,7 +543,7 @@ mod tests {
                 mtp_retire_fails: 0, pos3_delta: 0,
             },
         ];
-        let b = s.next_batch(&mut work);
+        let b = s.next_batch(&mut work, 4096, 1);
         assert_eq!(
             b.m_per_slot,
             vec![10, 0],
@@ -443,7 +561,7 @@ mod tests {
         // rope delta must phase-shift every row while ext_emb stays -1 (no
         // vision matrix exists any more). A pure-text neighbour keeps
         // [p, p, p].
-        let mut s = Scheduler { chunk_size: 256, vl_sequential: false };
+        let mut s = Scheduler { chunk_size: 256, vl_sequential: false, prefill_cursor: 0 };
         let mut work = vec![
             PendingWork {
                 slot: SlotId(0),
@@ -470,7 +588,7 @@ mod tests {
                 pos3_delta: 0,
             },
         ];
-        let b = s.next_batch(&mut work);
+        let b = s.next_batch(&mut work, 4096, 1);
         assert_eq!(b.m_per_slot, vec![3, 1]);
         assert_eq!(b.pos3.len(), 4, "delta rows put the step on M-RoPE too");
         assert_eq!(b.pos3[0], [300 - 240; 3], "phase = pos + session delta");
@@ -481,7 +599,7 @@ mod tests {
 
     #[test]
     fn plain_text_step_still_skips_the_pos3_arrays() {
-        let mut s = Scheduler { chunk_size: 256, vl_sequential: false };
+        let mut s = Scheduler { chunk_size: 256, vl_sequential: false, prefill_cursor: 0 };
         let mut work = vec![PendingWork {
             slot: SlotId(0),
             remaining_prompt: prompt(4),
@@ -494,9 +612,156 @@ mod tests {
             mtp_retire_fails: 0,
             pos3_delta: 0,
         }];
-        let b = s.next_batch(&mut work);
+        let b = s.next_batch(&mut work, 4096, 1);
         assert_eq!(b.total_rows(), 4);
         assert!(b.pos3.is_empty(), "no VL rows implies no side arrays");
         assert!(b.ext_emb.is_empty());
+    }
+
+    fn work_prefill(slot: usize, prompt_len: usize, next_pos: usize) -> PendingWork {
+        PendingWork {
+            slot: SlotId(slot),
+            remaining_prompt: prompt(prompt_len),
+            next_pos,
+            decoding: false,
+            vl_prefill: None,
+            mtp_active: false,
+            mtp_cycles: 0,
+            mtp_committed: 0,
+            mtp_retire_fails: 0,
+            pos3_delta: 0,
+        }
+    }
+
+    fn work_decode(slot: usize, seed: u32, next_pos: usize) -> PendingWork {
+        PendingWork {
+            slot: SlotId(slot),
+            remaining_prompt: vec![seed],
+            next_pos,
+            decoding: true,
+            vl_prefill: None,
+            mtp_active: false,
+            mtp_cycles: 0,
+            mtp_committed: 0,
+            mtp_retire_fails: 0,
+            pos3_delta: 0,
+        }
+    }
+
+    #[test]
+    fn mixed_decode_and_prefill_never_exceeds_max_batch_tokens() {
+        // 4 decode slots + 1 prefill slot (300 tokens, chunk 256). Budget 6.
+        // Decode gets 4 rows (one each), prefill gets 2 (remaining budget).
+        let mut s = Scheduler { chunk_size: 256, vl_sequential: false, prefill_cursor: 0 };
+        let mut work = vec![
+            work_decode(0, 1, 10),
+            work_decode(1, 2, 20),
+            work_decode(2, 3, 30),
+            work_decode(3, 4, 40),
+            work_prefill(4, 300, 0),
+        ];
+        let b = s.next_batch(&mut work, 6, 1);
+        assert!(
+            b.total_rows() <= 6,
+            "batch must not exceed budget: got {}",
+            b.total_rows()
+        );
+        assert_eq!(b.m_per_slot[0..4], vec![1, 1, 1, 1], "all 4 decode slots served");
+        assert_eq!(b.m_per_slot[4], 2, "prefill gets the remaining 2 rows");
+        assert_eq!(work[4].remaining_prompt.len(), 298);
+        assert_eq!(work[4].next_pos, 2);
+    }
+
+    #[test]
+    fn one_huge_prefill_chunk_is_truncated_to_remaining_budget() {
+        // A single prefill slot with a huge prompt. Budget 10, chunk 256.
+        // The slot gets only 10 rows (the budget), not the whole chunk.
+        let mut s = Scheduler { chunk_size: 256, vl_sequential: false, prefill_cursor: 0 };
+        let mut work = vec![work_prefill(0, 1000, 0)];
+        let b = s.next_batch(&mut work, 10, 1);
+        assert_eq!(b.total_rows(), 10, "prefill truncated to remaining budget");
+        assert_eq!(work[0].remaining_prompt.len(), 990);
+        assert_eq!(work[0].next_pos, 10);
+    }
+
+    #[test]
+    fn rotation_serves_two_prefills_across_ticks() {
+        // Two prefill slots, budget 4, chunk 256, prefill_min 1.
+        // Tick 1: cursor 0 → slot 0 gets the quantum (at least 1 row), then
+        // leftover budget (3) is distributed round-robin: slot 0 gets more
+        // up to chunk, then slot 1. With chunk=256 and budget=4, slot 0
+        // gets 4 rows total (quantum 1 + 3 extra), slot 1 gets 0.
+        // Tick 2: cursor advances to 1 → slot 1 gets the quantum first.
+        let mut s = Scheduler { chunk_size: 256, vl_sequential: false, prefill_cursor: 0 };
+        let mut work = vec![
+            work_prefill(0, 100, 0),
+            work_prefill(1, 100, 0),
+        ];
+        // Tick 1: cursor=0, slot 0 is the head.
+        let b1 = s.next_batch(&mut work, 4, 1);
+        assert_eq!(b1.total_rows(), 4);
+        assert!(b1.m_per_slot[0] > 0, "slot 0 gets rows on tick 1");
+        // Tick 2: cursor=1, slot 1 is the head.
+        let b2 = s.next_batch(&mut work, 4, 1);
+        assert_eq!(b2.total_rows(), 4);
+        assert!(
+            b2.m_per_slot[1] > 0,
+            "slot 1 gets rows on tick 2 (rotation): {:?}",
+            b2.m_per_slot
+        );
+        // Both slots made progress across the two ticks.
+        assert!(work[0].next_pos > 0 && work[1].next_pos > 0);
+    }
+
+    #[test]
+    fn zero_remaining_budget_returns_empty_batch() {
+        // Budget 0: no rows can be allocated, even with runnable work.
+        let mut s = Scheduler { chunk_size: 256, vl_sequential: false, prefill_cursor: 0 };
+        let mut work = vec![
+            work_decode(0, 1, 10),
+            work_prefill(1, 300, 0),
+        ];
+        let b = s.next_batch(&mut work, 0, 1);
+        assert!(b.is_empty(), "zero budget → empty batch");
+        assert_eq!(work[0].remaining_prompt, vec![1], "decode seed untouched");
+        assert_eq!(work[1].remaining_prompt.len(), 300, "prefill prompt untouched");
+    }
+
+    #[test]
+    fn decode_lanes_admitted_only_up_to_budget() {
+        // 5 decode slots, budget 3: only 3 decode lanes get a row.
+        let mut s = Scheduler { chunk_size: 256, vl_sequential: false, prefill_cursor: 0 };
+        let mut work = vec![
+            work_decode(0, 1, 10),
+            work_decode(1, 2, 20),
+            work_decode(2, 3, 30),
+            work_decode(3, 4, 40),
+            work_decode(4, 5, 50),
+        ];
+        let b = s.next_batch(&mut work, 3, 1);
+        assert_eq!(b.total_rows(), 3);
+        assert_eq!(b.m_per_slot, vec![1, 1, 1, 0, 0]);
+        // The unserved decode slots keep their seed.
+        assert_eq!(work[3].remaining_prompt, vec![4]);
+        assert_eq!(work[4].remaining_prompt, vec![5]);
+    }
+
+    #[test]
+    fn prefill_min_tokens_guaranteed_when_space_remains() {
+        // 1 decode (1 row) + 1 prefill (100 tokens). Budget 5, prefill_min 3.
+        // Decode gets 1, prefill gets at least 3 (the min quantum).
+        let mut s = Scheduler { chunk_size: 256, vl_sequential: false, prefill_cursor: 0 };
+        let mut work = vec![
+            work_decode(0, 1, 10),
+            work_prefill(1, 100, 0),
+        ];
+        let b = s.next_batch(&mut work, 5, 3);
+        assert_eq!(b.m_per_slot[0], 1, "decode gets 1 row");
+        assert!(
+            b.m_per_slot[1] >= 3,
+            "prefill gets at least prefill_min_tokens: got {}",
+            b.m_per_slot[1]
+        );
+        assert!(b.total_rows() <= 5);
     }
 }
