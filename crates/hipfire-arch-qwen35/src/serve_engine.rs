@@ -632,8 +632,7 @@ impl Rig {
                     head_opt = Some(h);
                 }
                 Ok(None) => {
-                    let sidecar = trunk_path.with_extension("mtp");
-                    if sidecar.exists() {
+                    if let Some(sidecar) = crate::mtp_head::find_mtp_sidecar(trunk_path) {
                         match crate::mtp_head::load_mtp_head(
                             &sidecar,
                             &mut gpu,
@@ -659,8 +658,7 @@ impl Rig {
                 }
                 Err(e) => {
                     eprintln!("  MTP bundled trailer load failed: {e}");
-                    let sidecar = trunk_path.with_extension("mtp");
-                    if sidecar.exists() {
+                    if let Some(sidecar) = crate::mtp_head::find_mtp_sidecar(trunk_path) {
                         match crate::mtp_head::load_mtp_head(
                             &sidecar,
                             &mut gpu,
@@ -689,15 +687,19 @@ impl Rig {
             None
         };
         if mtp_k > 0 && mtp_head.is_none() {
-            // The sidecar probe replaces the trunk's final extension
-            // (foo.mq4v2.hfq → foo.mq4v2.mtp). A sidecar named after a
-            // different trunk spelling — or any miss — must not silently
-            // degrade to AR: that is the "draft pulled but DFlash off" trap.
+            // Probe last-extension replacement *and* the stem sidecar
+            // (foo.mq4v2.hfq → foo.mq4v2.mtp and foo.mtp). A miss must
+            // not silently degrade to AR: that is the "draft pulled but
+            // DFlash off" trap.
+            let probed: Vec<String> = crate::mtp_head::mtp_sidecar_candidates(&cfg.model_path)
+                .into_iter()
+                .map(|p| p.display().to_string())
+                .collect();
             eprintln!(
                 "  [hipfire] MTP requested (mtp_k={mtp_k}) but no head was found: \
                  no bundled .mq4-mtp trailer and no sidecar at {} — \
                  serving without MTP",
-                cfg.model_path.with_extension("mtp").display()
+                probed.join(" or ")
             );
         }
 
@@ -1079,8 +1081,7 @@ impl Rig {
             ]);
             let mut sidecar_digests = Vec::new();
             if mtp_head.is_some() {
-                let sidecar = cfg.model_path.with_extension("mtp");
-                if sidecar.exists() {
+                if let Some(sidecar) = crate::mtp_head::find_mtp_sidecar(&cfg.model_path) {
                     match HfqFile::open(&sidecar) {
                         Ok(mtp_hfq) => sidecar_digests.push(mtp_hfq.content_digest()),
                         Err(_) => {
