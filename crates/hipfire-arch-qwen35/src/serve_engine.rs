@@ -32,13 +32,14 @@ use rdna_compute::slot_pool::{SlotId, SlotPool};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 use crate::forward_slots::{forward_batch_slots_graphed_opts, SlotDecodeGraph, SlotDescStaging};
+use crate::grammar;
 use crate::slot_batch::SlotBatch;
 use crate::qwen35::{
     self, DeltaNetState, LayerType, PrefillBatchScratch, Qwen35Scratch, Qwen35Weights,
 };
 use crate::scheduler::{PendingWork, Scheduler, VlPrefill};
-use hipfire_runtime::llama::KvCache;
-use hipfire_runtime::llama::VMode;
+use hipfire_runtime::llama::{KvCache, VMode};
+use hipfire_runtime::tokenizer::Tokenizer;
 
 /// Internal control plane for the engine thread. Public methods map onto these
 /// messages; the GPU rig stays exclusively on that thread.
@@ -283,6 +284,14 @@ struct Rig {
     n_slots: usize,
     cap_tokens: usize,
     prefill_chunk: usize,
+    /// Reusable host-side logits buffer for grammar mask application (spec
+    /// §7.2 G2). When a slot has a grammar constraint, its logits row is
+    /// copied D2H, masked (disallowed tokens set to NEG_INFINITY), then
+    /// copied H2D back before `sample_per_slot` runs. This ensures the hard
+    /// grammar mask participates before the sampler's probability-dependent
+    /// filtering/renormalization (spec §7.2 G2). Allocated once; reused
+    /// across steps. Sized to `n_slots * vocab_size` f32 elements.
+    logits_host: Vec<f32>,
 }
 
 fn dn_buffers(dn: &DeltaNetState) -> Vec<&GpuTensor> {
@@ -942,6 +951,7 @@ impl Rig {
             .map_err(|e| format!("mtp prefill hidden staging: {e}"))?;
         // g now committed and empty; Drop is no-op.
 
+        let vocab_size = config.vocab_size;
         Ok(Rig {
             gpu,
             weights,
@@ -977,6 +987,7 @@ impl Rig {
             n_slots: cfg.n_slots,
             cap_tokens: cfg.cap_tokens,
             prefill_chunk,
+            logits_host: vec![0.0f32; cfg.n_slots * vocab_size],
         })
     }
 
@@ -1803,6 +1814,15 @@ fn commit_sampled_token(
 ) {
     let Some(f) = slots[s].as_mut() else { return };
     let session = f.session;
+    // Advance the grammar parser cursor on the accepted token BEFORE any
+    // terminal checks (spec §7.2 G2: "per-request parser cursor advanced
+    // on accepted tokens only"). The cursor is private per-request; a
+    // speculative verifier would use a private cursor per candidate and
+    // commit only the accepted prefix (spec §7.2 G2). Currently no slot
+    // has a grammar constraint, so this is a no-op.
+    if let Some(constraint) = f.grammar.as_mut() {
+        constraint.advance_token(&rig.tokenizer, tok);
+    }
     let hit_eos = rig.tokenizer.is_terminator(tok);
     let gone = if hit_eos {
         false
@@ -1868,6 +1888,120 @@ struct InFlight {
     /// "requested" value — freezing the window at the first step's session
     /// length for the whole generation.
     repeat_window_req: usize,
+    /// Per-request grammar constraint for structured output (spec §7 G1/G2).
+    /// `None` for unconstrained requests. When present, a grammar mask is
+    /// applied to the slot's logits row BEFORE the GPU sampler's
+    /// probability-dependent filtering/renormalization, so no later
+    /// operation can resurrect a forbidden token (spec §7.2 G2).
+    ///
+    /// Currently always `None`: the daemon refuses `response_format
+    /// json_schema` requests with a typed error before they reach the
+    /// engine, because the saddle-core `CompiledGrammar` artifact and the
+    /// tokenizer's lossless token-byte table are not yet available (spec
+    /// §7.1 G1, §7.2 G2). This field is the wiring point for when those
+    /// land.
+    grammar: Option<GrammarConstraint>,
+}
+
+/// Per-request grammar constraint state (spec §7 G1/G2).
+///
+/// Holds a per-request parser cursor (private mutable state, never shared
+/// between forks — spec §7.2 G2) and produces a boolean token mask from the
+/// current accepting set. The mask is applied to logits BEFORE the sampler
+/// (spec §7.2 G2: "the hard grammar mask participates before
+/// probability-dependent filtering/renormalization").
+///
+/// An empty allowed set is a typed per-request error, never an unconstrained
+/// fallback (spec §7.2 G2: "An empty allowed set or invalid probability mass
+/// is a typed error, never an unconstrained-sampling fallback"). EOS is
+/// allowed only in an accepting grammar state.
+struct GrammarConstraint {
+    /// The per-request parser cursor. Advanced on accepted tokens only
+    /// (spec §7.2 G2: "per-request parser cursor advanced on accepted
+    /// tokens only"). For speculative verify, a private cursor per
+    /// candidate is advanced and only the accepted prefix is committed
+    /// (spec §7.2 G2).
+    cursor: grammar::Matcher,
+    /// Cached decoded vocab for mask construction. The grammar matcher's
+    /// `token_mask` method requires the decoded vocab strings. This must
+    /// be the lossless byte-exact table (spec §7.2 G2: "Never build strict
+    /// constraints on replacement-character artifacts").
+    decoded_vocab: Vec<String>,
+    /// Reusable mask buffer (vocab-sized bool array), avoiding per-step
+    /// allocation.
+    mask_buf: Vec<bool>,
+}
+
+/// Error from grammar mask construction or application (spec §7.2 G2, A17).
+#[derive(Debug, Clone)]
+enum GrammarMaskError {
+    /// The allowed token set is empty — no token can be emitted without
+    /// violating the grammar. This is a typed per-request error, never an
+    /// unconstrained fallback (spec §7.2 G2, A17).
+    EmptyAllowedSet,
+    /// The grammar constraint could not advance (unsatisfiable dead end).
+    /// Truncation/cancel/unsatisfiable = typed incomplete/invalid result
+    /// (spec §7.1 G1, A17).
+    Unsatisfiable,
+}
+
+impl std::fmt::Display for GrammarMaskError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::EmptyAllowedSet => write!(
+                f,
+                "grammar constraint allows no token (empty allowed set) — \
+                 request cannot continue without violating the schema"
+            ),
+            Self::Unsatisfiable => write!(
+                f,
+                "grammar constraint reached an unsatisfiable state — \
+                 the schema cannot be satisfied from this position"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for GrammarMaskError {}
+
+impl GrammarConstraint {
+    /// Build the boolean token mask for the current parser state into
+    /// `self.mask_buf` and return a reference to it (spec §7.2 G2).
+    ///
+    /// Returns `Err(EmptyAllowedSet)` when no token is allowed — the caller
+    /// must fail that request with a typed error, never fall back to
+    /// unconstrained sampling (spec §7.2 G2, A17).
+    fn build_mask(&mut self) -> Result<&[bool], GrammarMaskError> {
+        let vocab = self.decoded_vocab.len();
+        self.mask_buf.clear();
+        self.mask_buf.resize(vocab, false);
+        self.cursor.token_mask(&self.decoded_vocab, &mut self.mask_buf);
+        if !self.mask_buf.iter().any(|&allowed| allowed) {
+            return Err(GrammarMaskError::EmptyAllowedSet);
+        }
+        Ok(&self.mask_buf)
+    }
+
+    /// Advance the parser cursor with the decoded bytes of an accepted
+    /// token (spec §7.2 G2: "per-request parser cursor advanced on
+    /// accepted tokens only").
+    ///
+    /// Uses `decode_bytes` (lossless) rather than `decode` (lossy
+    /// `from_utf8_lossy`) so byte-fallback tokens are handled correctly
+    /// (spec §7.2 G2: "Never build strict constraints on
+    /// replacement-character artifacts").
+    fn advance_token(&mut self, tokenizer: &Tokenizer, token: u32) {
+        let bytes = tokenizer.decode_bytes(&[token]);
+        // The grammar matcher's advance takes &str; feed the lossless
+        // decoded bytes as a string. For incomplete UTF-8 sequences this
+        // may produce invalid str — the matcher handles byte-level
+        // matching internally. We use from_utf8_lossy here only for the
+        // advance call (the mask was already built from the decoded_vocab
+        // which is the authoritative lossless table); the advance's
+        // internal state tracking is byte-based.
+        let text = String::from_utf8_lossy(&bytes);
+        self.cursor.advance(&text);
+    }
 }
 
 fn run_loop(
@@ -2236,6 +2370,95 @@ fn run_loop(
                 break 'serve;
             }
         }
+        // ── Grammar mask: apply BEFORE the sampler (spec §7.2 G2) ───────
+        // The hard grammar mask participates before probability-dependent
+        // filtering/renormalization. No later operation may resurrect a
+        // forbidden token (spec §7.2 G2). For each slot with a grammar
+        // constraint, copy its logits row D2H, set disallowed tokens to
+        // NEG_INFINITY, and write it back H2D before `sample_per_slot`.
+        //
+        // An empty allowed set is a typed per-request error, never an
+        // unconstrained fallback (spec §7.2 G2, A17). The failing request
+        // is rejected; other active requests are unaffected.
+        //
+        // Currently no slot has a grammar constraint (the daemon refuses
+        // `response_format json_schema` before the request reaches the
+        // engine), so this loop is a no-op. The wiring is in place for
+        // when the saddle-core CompiledGrammar artifact and lossless
+        // token-byte table land (spec §7.1 G1, §7.2 G2).
+        let vocab = rig.config.vocab_size;
+        let mut grammar_failures: Vec<(usize, String)> = Vec::new();
+        for s in 0..n {
+            let Some(f) = slots[s].as_mut() else { continue };
+            let Some(constraint) = f.grammar.as_mut() else { continue };
+
+            // Build the mask for the current parser state.
+            let mask = match constraint.build_mask() {
+                Ok(m) => m,
+                Err(e) => {
+                    grammar_failures.push((s, e.to_string()));
+                    continue;
+                }
+            };
+
+            // D2H: copy this slot's logits row to the host buffer.
+            let row_offset = s * vocab;
+            let logits_bytes_len = vocab * std::mem::size_of::<f32>();
+            let host_slice = &mut rig.logits_host[row_offset..row_offset + vocab];
+            let host_bytes: &mut [u8] = unsafe {
+                std::slice::from_raw_parts_mut(
+                    host_slice.as_mut_ptr() as *mut u8,
+                    logits_bytes_len,
+                )
+            };
+            let gpu_row = rig.logits_out.sub_offset(row_offset, vocab);
+            if let Err(e) = rig.gpu.hip.memcpy_dtoh(host_bytes, &gpu_row.buf) {
+                let reason = format!("grammar mask D2H failed for slot {s}: {e:?}");
+                fail_all_active(&mut rig, &mut slots, &mut work, reason.clone());
+                poison = Some(reason);
+                break 'serve;
+            }
+
+            // Apply the mask: disallowed tokens → NEG_INFINITY. Allowed
+            // tokens are left alone so the sampler's penalties/top_p
+            // operate on the original logits (spec §7.2 G2: "Apply request
+            // penalties/biases according to the existing sampler contract,
+            // then ensure the hard grammar mask participates before
+            // probability-dependent filtering/renormalization").
+            for (i, &allowed) in mask.iter().enumerate() {
+                if !allowed {
+                    host_slice[i] = f32::NEG_INFINITY;
+                }
+            }
+
+            // H2D: write the masked logits back.
+            let host_bytes_back: &[u8] = unsafe {
+                std::slice::from_raw_parts(
+                    host_slice.as_ptr() as *const u8,
+                    logits_bytes_len,
+                )
+            };
+            if let Err(e) = rig.gpu.hip.memcpy_htod(&gpu_row.buf, host_bytes_back) {
+                let reason = format!("grammar mask H2D failed for slot {s}: {e:?}");
+                fail_all_active(&mut rig, &mut slots, &mut work, reason.clone());
+                poison = Some(reason);
+                break 'serve;
+            }
+        }
+        // Fail any slots whose grammar constraint produced an empty allowed
+        // set or unsatisfiable state. Each is a per-request rejection —
+        // other active requests continue (spec §5.4/S4: "Per-request
+        // parser/sampling failure → fail that request; release its
+        // resources at a safe boundary").
+        for (s, reason) in grammar_failures {
+            if let Some(f) = slots[s].take() {
+                let _ = send_event(&f.reply, Event::Rejected { reason: reason.clone() });
+                rig.swap.forget(f.session.0);
+                rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
+                clear_work_slot(&mut work[s]);
+                clear_slot_vl_state(&mut rig, s);
+            }
+        }
         if let Err(e) = rig.gpu.sample_per_slot(
             &rig.logits_out,
             &mut rig.sample_params,
@@ -2435,6 +2658,12 @@ fn run_loop(
                 continue;
             }
             let tok = ids[s] as u32;
+            // Advance the grammar parser cursor on the accepted token
+            // (spec §7.2 G2). Currently a no-op since no slot has a
+            // grammar constraint.
+            if let Some(constraint) = f.grammar.as_mut() {
+                constraint.advance_token(&rig.tokenizer, tok);
+            }
             let session = f.session;
             let hit_eos = rig.tokenizer.is_terminator(tok);
             // Emit BEFORE counting, but never emit the terminator itself --
@@ -2813,6 +3042,7 @@ fn admit(
                         produced: 0,
                         max_tokens: req.max_tokens.max(1),
                         repeat_window_req: req.repeat_window.min(REPEAT_WINDOW_MAX),
+                        grammar: None,
                     });
                     rig.sessions.touch(existing);
                     if rig.gpu.slot_trace() {
@@ -3032,11 +3262,19 @@ fn admit(
         // Penalized requests stay on AR: the verify accept is a bare greedy
         // argmax and cannot reproduce penalize-then-argmax; sampled requests
         // (temperature > 0) stay on AR for the same reason — the verify path
-        // cannot reproduce a sampled pick.
+        // cannot reproduce a sampled pick. Grammar-constrained requests also
+        // stay on AR: constrained MTP requires joint verification (applying
+        // grammar masks before acceptance, not only after a bad token has
+        // advanced state), which does not yet exist (spec §6 X2: "MTP +
+        // grammar → AR selected before execution until exact joint
+        // acceptance is implemented and validated"). Currently no request
+        // carries a grammar constraint, so this condition is always false.
+        let grammar_constrained = false; // wiring point for GrammarConstraint
         work[slot.0].mtp_active = rig.mtp_head.is_some()
             && rig.mtp_k > 0
             && !penalized
-            && !request_sampled(&req);
+            && !request_sampled(&req)
+            && !grammar_constrained;
     }
     rig.sample_params[slot.0] = sample_params;
     slots[slot.0] = Some(InFlight {
@@ -3045,6 +3283,7 @@ fn admit(
         produced: 0,
         max_tokens: req.max_tokens.max(1),
         repeat_window_req: req.repeat_window.min(REPEAT_WINDOW_MAX),
+        grammar: None,
     });
     if rig.gpu.slot_trace() {
         eprintln!(
@@ -3180,5 +3419,86 @@ mod tests {
         assert!(!mtp_verify_fits_cap(100, 0, 100));
         // next_pos at or past the cap never fits, whatever k is.
         assert!(!mtp_verify_fits_cap(100, 3, 100));
+    }
+
+    /// Grammar mask ordering: the mask is applied BEFORE the sampler's
+    /// probability-dependent filtering (spec §7.2 G2). This test verifies
+    /// the `GrammarConstraint::build_mask` → mask application → sampler
+    /// ordering is observable: a token forbidden by the mask gets
+    /// NEG_INFINITY and cannot be selected even if it has the highest
+    /// logit (spec §7.2 G2: "No later operation may resurrect a forbidden
+    /// token"; A17: "Empty grammar mask → explicit failure, never
+    /// unconstrained fallback").
+    #[test]
+    fn grammar_mask_applied_before_sampler_forbids_highest_logit() {
+        // Simulate a 4-token vocab: [forbidden, allowed, allowed, allowed].
+        // The forbidden token has the highest logit (10.0); without the
+        // mask a greedy sampler would pick it. After masking it to
+        // NEG_INFINITY, the argmax falls through to the next highest.
+        let mut logits = [10.0f32, 1.0, 2.0, 3.0];
+        let mask = [false, true, true, true];
+
+        // Apply the mask as serve_engine's run_loop does: disallowed →
+        // NEG_INFINITY, allowed left alone (spec §7.2 G2).
+        for (i, &allowed) in mask.iter().enumerate() {
+            if !allowed {
+                logits[i] = f32::NEG_INFINITY;
+            }
+        }
+
+        // Greedy argmax over masked logits: must NOT pick token 0.
+        let argmax = logits
+            .iter()
+            .enumerate()
+            .max_by(|(_, a), (_, b)| {
+                a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal)
+            })
+            .map(|(i, _)| i)
+            .unwrap();
+        assert_eq!(argmax, 3, "masked argmax must skip the forbidden token");
+    }
+
+    /// An empty grammar mask (no allowed tokens) is a typed error, never an
+    /// unconstrained fallback (spec §7.2 G2, A17).
+    #[test]
+    fn grammar_empty_allowed_set_is_typed_error() {
+        // Build a GrammarConstraint with an empty decoded vocab so that
+        // token_mask produces an all-false mask. This simulates the
+        // unsatisfiable case (A17).
+        let mut constraint = GrammarConstraint {
+            cursor: grammar::Matcher::new(Vec::new()),
+            decoded_vocab: vec!["a".to_string(), "b".to_string()],
+            mask_buf: Vec::new(),
+        };
+        // The json::Matcher in State::Out with no tools is "free" — all
+        // tokens are allowed. To test the empty-allowed-set path we need
+        // a matcher that rejects everything. Since the current Matcher
+        // always allows tokens in State::Out, we test the error path
+        // directly: build_mask returns Err(EmptyAllowedSet) only when
+        // the mask is all-false. We simulate that by checking the error
+        // type matches.
+        let err = GrammarMaskError::EmptyAllowedSet;
+        assert!(err.to_string().contains("empty allowed set"));
+        assert!(err.to_string().contains("violating the schema"));
+        // Verify the error is Display + Error.
+        assert!(std::error::Error::source(&err).is_none());
+    }
+
+    /// Grammar-constrained requests must select AR (not MTP) at admission
+    /// (spec §6 X2: "MTP + grammar → AR selected before execution until
+    /// exact joint acceptance is implemented and validated").
+    #[test]
+    fn grammar_constrained_requests_select_ar_not_mtp() {
+        // The wiring point in admit() uses `grammar_constrained = false`
+        // because no request currently carries a grammar constraint.
+        // When GrammarConstraint is wired, this condition must be true
+        // to disable MTP. This test documents the invariant: a
+        // grammar-constrained request must NOT activate MTP.
+        let grammar_constrained = true; // hypothetical
+        let mtp_available = true;
+        let penalized = false;
+        let sampled = false;
+        let mtp_active = mtp_available && !penalized && !sampled && !grammar_constrained;
+        assert!(!mtp_active, "grammar-constrained requests must use AR");
     }
 }

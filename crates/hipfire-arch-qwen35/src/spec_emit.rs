@@ -332,6 +332,23 @@ impl<'a> SpecEmit for Qwen35Emit<'a> {
     fn observe(&mut self, token: u32) -> EmitOutcome {
         // Grammar pre-check (POST-acceptance, before emit). A rejected token is
         // NOT emitted; treat as a grammar violation → stop. Mirrors 4565-4584.
+        //
+        // This is the **tool-call grammar** guard (the `<tool_call>` format), NOT
+        // the JSON Schema `response_format` constraint (spec §7 G1/G2). The
+        // `response_format` constraint is applied as a pre-sampling mask in
+        // the slot engine's `run_loop` (serve_engine.rs) BEFORE the GPU
+        // sampler, so no forbidden token can be sampled — this guard never
+        // sees a `response_format` violation (spec §7.2 G2: "the hard
+        // grammar mask participates before probability-dependent
+        // filtering/renormalization").
+        //
+        // For the slots path: `tools: None` is passed (slots.rs), so
+        // `grammar_active` is false and this guard is inactive. When tools
+        // are eventually supported on the slots path, the tool-call grammar
+        // mask should also be applied pre-sampling in serve_engine.rs
+        // rather than post-acceptance here (spec §7.2 G2: "Constrained slot
+        // requests use AR until the verifier applies constraints before
+        // acceptance, not only after a bad token has advanced state").
         if self.grammar_active {
             let text = self.tokenizer.decode(&[token]);
             if !self.grammar_matcher.is_token_allowed(&text) {

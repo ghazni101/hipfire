@@ -1529,6 +1529,28 @@ pub(crate) struct RequestContract {
     pub messages: serde_json::Value,
     pub tool_choice_policy: ToolChoicePolicy,
     pub forwarded_tools: Option<serde_json::Value>,
+    /// Validated `response_format` (spec §7 G1). `None` when the request
+    /// carries no `response_format` or it is `json_object` (which the
+    /// non-slot path already handles via tool-call grammar). A `json_schema`
+    /// value is parsed, validated against the supported subset, and forwarded
+    /// to the daemon so the slot engine can apply pre-sampling grammar masks.
+    pub response_format: Option<ResponseFormat>,
+}
+
+/// Validated OpenAI `response_format` for structured output (spec §7 G1).
+///
+/// Only `json_schema` is supported. The `schema` field carries the JSON
+/// Schema object validated against the strict subset (primitive types,
+/// objects, arrays, enum/const). Unsupported assertion keywords are rejected
+/// here so no intermediate wire adapter drops the constraint silently.
+#[derive(Debug, Clone)]
+pub(crate) struct ResponseFormat {
+    /// The raw JSON Schema object (validated subset).
+    pub schema: serde_json::Value,
+    /// Optional name from `json_schema.name` (OpenAI field, not a JSON
+    /// Schema keyword). Forwarded for diagnostics; not semantically
+    /// significant for mask construction.
+    pub name: Option<String>,
 }
 
 /// Architectures that surface reasoning content in multi-turn message history
@@ -1568,12 +1590,232 @@ pub(crate) fn project_request_contract(
     inject_default_system_message(&mut messages, default_system.as_deref());
     let (tool_choice_policy, forwarded_tools) =
         project_tool_choice(body.get("tool_choice"), body.get("tools"), &mut messages)?;
+    let response_format = validate_response_format(body.get("response_format"))?;
     Ok(RequestContract {
         max_tokens,
         messages,
         tool_choice_policy,
         forwarded_tools,
+        response_format,
     })
+}
+
+/// Validate OpenAI `response_format` for structured output (spec §7 G1).
+///
+/// Accepts:
+/// - `None` / null / absent → no constraint.
+/// - `{"type": "json_object"}` → no schema-level constraint (the model is
+///   asked to emit valid JSON; the existing tool-call grammar handles this
+///   on the non-slot path). Returns `None` so the slot path does not treat
+///   it as a strict schema.
+/// - `{"type": "json_schema", "json_schema": {"schema": {...}, ...}}` →
+///   validates the schema against the supported strict subset and returns
+///   a [`ResponseFormat``.
+///
+/// Rejects (HTTP 400 via `bail!`):
+/// - Unknown `type` values.
+/// - Missing/malformed `json_schema` wrapper or `schema` object.
+/// - Unsupported JSON Schema keywords (external refs, regex, recursion,
+///   combinators, unsupported assertions).
+/// - Contradictory/unsatisfiable schemas.
+pub(crate) fn validate_response_format(
+    value: Option<&serde_json::Value>,
+) -> Result<Option<ResponseFormat>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let ty = value
+        .get("type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("response_format.type is required"))?;
+    match ty {
+        "json_object" => {
+            // json_object is a weak constraint (valid JSON, no schema). The
+            // existing tool-call / DSML grammar handles this on the non-slot
+            // path; no strict schema to forward.
+            Ok(None)
+        }
+        "json_schema" => {
+            let js = value
+                .get("json_schema")
+                .ok_or_else(|| anyhow!("response_format.json_schema is required"))?;
+            if !js.is_object() {
+                bail!("response_format.json_schema must be an object");
+            }
+            let schema = js
+                .get("schema")
+                .ok_or_else(|| anyhow!("response_format.json_schema.schema is required"))?;
+            if !schema.is_object() {
+                bail!("response_format.json_schema.schema must be an object");
+            }
+            // Validate the schema against the supported strict subset (spec
+            // §7.1 G1). Reject unsupported keywords before generation so no
+            // intermediate wire adapter drops the constraint silently.
+            validate_json_schema_subset(schema, "$")?;
+            let name = js
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_owned());
+            Ok(Some(ResponseFormat {
+                schema: schema.clone(),
+                name,
+            }))
+        }
+        other => {
+            bail!("response_format.type '{other}' is not supported");
+        }
+    }
+}
+
+/// Supported JSON Schema keywords (spec §7.1 G1 strict subset).
+const SUPPORTED_TYPE_VALUES: &[&str] = &[
+    "string", "number", "integer", "boolean", "null", "object", "array",
+];
+
+/// Assertion keywords that are NOT supported in the strict subset (spec
+/// §7.1 G1: reject unsupported assertion keywords, external references,
+/// regex assertions, recursion and combinators before generation).
+const REJECTED_ASSERTION_KEYWORDS: &[&str] = &[
+    "$ref",
+    "$id",
+    "$schema",
+    "pattern",
+    "allOf",
+    "anyOf",
+    "oneOf",
+    "not",
+    "if",
+    "then",
+    "else",
+    "dependentSchemas",
+    "prefixItems",
+    "contains",
+    "maxContains",
+    "minContains",
+    "patternProperties",
+    "propertyNames",
+    "uniqueItems",
+    "multipleOf",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "contentEncoding",
+    "contentMediaType",
+    "format",
+];
+
+/// Recursively validate a JSON Schema object against the strict subset
+/// (spec §7.1 G1).
+///
+/// Supported:
+/// - `type`: string, number, integer, boolean, null, object, array
+/// - `properties`, `required`, `additionalProperties` (object)
+/// - `items`, `minItems`, `maxItems` (array)
+/// - `enum`, `const`
+/// - `minimum`, `maximum` (numeric bounds)
+/// - `minLength`, `maxLength` (string bounds)
+/// - `description` (annotation, ignored)
+///
+/// Rejected: external references (`$ref`), regex (`pattern`), recursion,
+/// combinators (`allOf`/`anyOf`/`oneOf`/`not`), and other unsupported
+/// assertion keywords.
+fn validate_json_schema_subset(schema: &serde_json::Value, path: &str) -> Result<()> {
+    if !schema.is_object() {
+        bail!("schema at {path} must be an object");
+    }
+    let obj = schema.as_object().unwrap();
+
+    // Check for rejected keywords first.
+    for &kw in REJECTED_ASSERTION_KEYWORDS {
+        if obj.contains_key(kw) {
+            bail!(
+                "unsupported JSON Schema keyword '{kw}' at {path} \
+                 (strict subset does not allow this assertion)"
+            );
+        }
+    }
+
+    // Validate `type` if present.
+    let ty = obj.get("type").and_then(|v| v.as_str());
+    if let Some(ty) = ty {
+        if !SUPPORTED_TYPE_VALUES.contains(&ty) {
+            bail!(
+                "unsupported JSON Schema type '{ty}' at {path} \
+                 (supported: {SUPPORTED_TYPE_VALUES:?})"
+            );
+        }
+    }
+
+    // `enum` and `const` are terminal — no nested schema to recurse into.
+    // `enum` must be a non-empty array; `const` can be any value.
+    if let Some(arr) = obj.get("enum").and_then(|v| v.as_array()) {
+        if arr.is_empty() {
+            bail!("enum at {path} must be a non-empty array");
+        }
+    }
+
+    // Object type: validate `properties` and `additionalProperties`.
+    if let Some(props) = obj.get("properties").and_then(|v| v.as_object()) {
+        for (key, sub) in props {
+            validate_json_schema_subset(sub, &format!("{path}.properties.{key}"))?;
+        }
+    }
+    if let Some(ap) = obj.get("additionalProperties") {
+        // `additionalProperties: false` is supported (no extra keys).
+        // `additionalProperties: true` is supported (extra keys allowed).
+        // `additionalProperties: <schema>` is supported (extra keys must
+        // match the schema).
+        if ap.is_object() {
+            validate_json_schema_subset(ap, &format!("{path}.additionalProperties"))?;
+        } else if !ap.is_boolean() {
+            bail!("additionalProperties at {path} must be a boolean or schema object");
+        }
+    }
+    if let Some(req) = obj.get("required").and_then(|v| v.as_array()) {
+        for item in req {
+            if !item.is_string() {
+                bail!("required at {path} must be an array of strings");
+            }
+        }
+    }
+
+    // Array type: validate `items`.
+    if let Some(items) = obj.get("items") {
+        if items.is_object() {
+            validate_json_schema_subset(items, &format!("{path}.items"))?;
+        } else if !items.is_boolean() {
+            bail!("items at {path} must be a boolean or schema object");
+        }
+    }
+    if let Some(n) = obj.get("minItems").and_then(|v| v.as_u64()) {
+        if let Some(max) = obj.get("maxItems").and_then(|v| v.as_u64()) {
+            if n > max {
+                bail!("minItems ({n}) > maxItems ({max}) at {path}: contradictory schema");
+            }
+        }
+    }
+
+    // Numeric bounds: check minimum <= maximum.
+    if let Some(min) = obj.get("minimum").and_then(|v| v.as_f64()) {
+        if let Some(max) = obj.get("maximum").and_then(|v| v.as_f64()) {
+            if min > max {
+                bail!("minimum ({min}) > maximum ({max}) at {path}: contradictory schema");
+            }
+        }
+    }
+
+    // String bounds: check minLength <= maxLength.
+    if let Some(min) = obj.get("minLength").and_then(|v| v.as_u64()) {
+        if let Some(max) = obj.get("maxLength").and_then(|v| v.as_u64()) {
+            if min > max {
+                bail!("minLength ({min}) > maxLength ({max}) at {path}: contradictory schema");
+            }
+        }
+    }
+
+    Ok(())
 }
 
 /// One correlated generation attempt under the shared serve runtime lock.
@@ -1678,6 +1920,7 @@ pub(crate) fn complete_request_attempt(
         let normalized_messages = contract.messages;
         let tool_choice_policy = contract.tool_choice_policy;
         let forwarded_tools = contract.forwarded_tools;
+        let response_format = contract.response_format;
         let mut generate = serde_json::json!({
             "type": "generate",
             "id": request_id(),
@@ -1708,6 +1951,23 @@ pub(crate) fn complete_request_attempt(
         // ignores it). none drops tools so the template/parser stay inactive.
         if let Some(tools) = forwarded_tools {
             generate["tools"] = tools;
+        }
+        // Forward validated response_format so the daemon/slot engine can
+        // apply pre-sampling grammar masks (spec §7 G1/G2). The schema was
+        // already validated against the strict subset in
+        // [`validate_response_format`]; the daemon re-checks capability
+        // before attempting mask construction.
+        if let Some(rf) = response_format {
+            let mut js = serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "schema": rf.schema,
+                }
+            });
+            if let Some(name) = rf.name {
+                js["json_schema"]["name"] = serde_json::Value::String(name);
+            }
+            generate["response_format"] = js;
         }
         for name in [
             "frequency_penalty",
@@ -2118,10 +2378,13 @@ pub(crate) fn complete_request_attempt(
 /// slot engine honours them via its penalize-then-argmax prepass (penalized
 /// requests decode AR; MTP stays off). Images are supported when the loaded
 /// model has a vision encoder (the daemon slot backend gates on is_vl).
-/// Rejects tools, non-null stop, logprobs, reasoning caps >= 2, and named
-/// thinking budgets other than `"off"`. Callers with `serve.multi_slot`
-/// enabled must surface the error — there is no ordinary-model fallback in
-/// that mode.
+/// `response_format` (json_schema) is forwarded — the daemon slot backend
+/// validates grammar-compiler availability and refuses with a typed error
+/// when the compiled artifact or lossless token-byte table is unavailable
+/// (spec §7 G1/G2). Rejects tools, non-null stop, logprobs, reasoning caps
+/// >= 2, and named thinking budgets other than `"off"`. Callers with
+/// `serve.multi_slot` enabled must surface the error — there is no
+/// ordinary-model fallback in that mode.
 pub(crate) fn multi_slot_request_supported(body: &serde_json::Value) -> Result<(), String> {
     if body
         .get("tools")
@@ -6733,5 +6996,162 @@ mod tests {
             "reasoning cap",
         );
         err_contains(serde_json::json!({ "thinking_budget": "high" }), "budget");
+    }
+
+    /// `response_format` validation: accepts valid json_schema, rejects
+    /// malformed/unsupported types and unsupported JSON Schema keywords
+    /// (spec §7.1 G1, A15).
+    #[test]
+    fn response_format_validation_accepts_and_rejects() {
+        // Absent / null → None (no constraint).
+        assert!(validate_response_format(None).unwrap().is_none());
+        assert!(
+            validate_response_format(Some(&serde_json::Value::Null))
+                .unwrap()
+                .is_none()
+        );
+
+        // json_object → None (weak constraint, no strict schema).
+        assert!(
+            validate_response_format(Some(&serde_json::json!({"type": "json_object"})))
+                .unwrap()
+                .is_none()
+        );
+
+        // Valid json_schema with a simple object schema.
+        let rf = validate_response_format(Some(&serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "test",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "age": {"type": "integer", "minimum": 0}
+                    },
+                    "required": ["name"],
+                    "additionalProperties": false
+                }
+            }
+        })))
+        .unwrap()
+        .expect("valid json_schema should produce ResponseFormat");
+        assert_eq!(rf.name.as_deref(), Some("test"));
+        assert_eq!(
+            rf.schema.get("type").and_then(|v| v.as_str()),
+            Some("object")
+        );
+
+        // Valid array schema with enum.
+        let rf = validate_response_format(Some(&serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "schema": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["a", "b", "c"]},
+                    "minItems": 1,
+                    "maxItems": 10
+                }
+            }
+        })))
+        .unwrap()
+        .expect("valid array schema");
+        assert!(rf.name.is_none());
+
+        // Rejected: unknown type.
+        let err = validate_response_format(Some(&serde_json::json!({
+            "type": "text"
+        })))
+        .unwrap_err();
+        assert!(err.to_string().contains("not supported"));
+
+        // Rejected: missing json_schema wrapper.
+        let err = validate_response_format(Some(&serde_json::json!({
+            "type": "json_schema"
+        })))
+        .unwrap_err();
+        assert!(err.to_string().contains("json_schema is required"));
+
+        // Rejected: missing schema object.
+        let err = validate_response_format(Some(&serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {}
+        })))
+        .unwrap_err();
+        assert!(err.to_string().contains("schema is required"));
+
+        // Rejected: $ref (external reference).
+        let err = validate_response_format(Some(&serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "schema": {"$ref": "#/definitions/foo"}
+            }
+        })))
+        .unwrap_err();
+        assert!(err.to_string().contains("$ref"));
+
+        // Rejected: pattern (regex assertion).
+        let err = validate_response_format(Some(&serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "schema": {"type": "string", "pattern": "^[a-z]+$"}
+            }
+        })))
+        .unwrap_err();
+        assert!(err.to_string().contains("pattern"));
+
+        // Rejected: allOf combinator.
+        let err = validate_response_format(Some(&serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "schema": {"allOf": [{"type": "string"}]}
+            }
+        })))
+        .unwrap_err();
+        assert!(err.to_string().contains("allOf"));
+
+        // Rejected: contradictory minItems > maxItems.
+        let err = validate_response_format(Some(&serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "schema": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 5,
+                    "maxItems": 3
+                }
+            }
+        })))
+        .unwrap_err();
+        assert!(err.to_string().contains("contradictory"));
+
+        // Rejected: unsupported type value.
+        let err = validate_response_format(Some(&serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "schema": {"type": "custom"}
+            }
+        })))
+        .unwrap_err();
+        assert!(err.to_string().contains("custom"));
+    }
+
+    /// `response_format` is forwarded into the generate payload and passes
+    /// the multi-slot gate (the daemon handles typed refusal).
+    #[test]
+    fn response_format_passes_multi_slot_gate() {
+        // A generate payload with response_format should pass
+        // multi_slot_request_supported — the daemon handles the typed
+        // refusal when the grammar compiler is unavailable.
+        let body = serde_json::json!({
+            "max_tokens": 16,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "schema": {"type": "object", "properties": {"x": {"type": "string"}}}
+                }
+            }
+        });
+        assert!(multi_slot_request_supported(&body).is_ok());
     }
 }

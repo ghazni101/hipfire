@@ -831,6 +831,7 @@ impl SlotBackend {
             frequency_penalty,
             min_p,
             visual_data,
+            queue_bytes: 0,
             reply: tx,
         };
         if let Err(e) = self.engine.submit(req) {
@@ -1428,6 +1429,26 @@ pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
     {
         return Some("logprobs not supported in experimental multi-slot".to_string());
     }
+    // response_format (json_schema) is forwarded by the CLI but the slot
+    // engine cannot yet apply pre-sampling grammar masks: the saddle-core
+    // CompiledGrammar artifact (spec §7.1 G1) and the tokenizer's lossless
+    // token-byte table (spec §7.2 G2) are not yet available. Refuse with a
+    // typed error rather than silently dropping the constraint or building
+    // masks on lossy decode (spec §7.2: "Never build strict constraints on
+    // replacement-character artifacts").
+    if msg
+        .get("response_format")
+        .and_then(|v| v.get("type"))
+        .and_then(|v| v.as_str())
+        == Some("json_schema")
+    {
+        return Some(
+            "structured output (response_format json_schema) is not yet supported \
+             on the multi-slot path: grammar compiler artifact and lossless \
+             token-byte table are unavailable (spec §7 G1/G2)"
+                .to_string(),
+        );
+    }
     // Token penalties and min_p are implemented by the slot sampler (in-kernel
     // repeat/presence/frequency over a per-slot recent-token window; min_p in
     // the top-p tail), so non-neutral values are honored, not refused. Only
@@ -1998,6 +2019,26 @@ mod tests {
         assert!(validate_generate_caps(&m4).is_some());
         let m5 = json!({"max_think_tokens": 1, "experimental_multi_slot": true});
         assert!(validate_generate_caps(&m5).is_none());
+    }
+
+    #[test]
+    fn generate_caps_rejects_response_format_json_schema() {
+        // json_schema response_format is refused on the multi-slot path
+        // because the saddle-core CompiledGrammar artifact and lossless
+        // token-byte table are not yet available (spec §7 G1/G2).
+        let m = json!({
+            "response_format": {"type": "json_schema", "json_schema": {"name": "test", "schema": {"type": "object"}}},
+            "experimental_multi_slot": true
+        });
+        let reason = validate_generate_caps(&m);
+        assert!(reason.is_some(), "json_schema response_format must be rejected");
+        assert!(reason.unwrap().contains("response_format json_schema"));
+        // Non-json_schema response_format (text) is not rejected by this guard.
+        let m2 = json!({
+            "response_format": {"type": "text"},
+            "experimental_multi_slot": true
+        });
+        assert!(validate_generate_caps(&m2).is_none(), "text response_format should not be rejected here");
     }
 
     #[test]
