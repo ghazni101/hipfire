@@ -107,7 +107,14 @@ fn wt_from_raw(
         18 => DType::MQ2G256,
         19 => DType::MQ2G256Lloyd,
         20 => DType::MQ3G256Lloyd,
-        30 => DType::MQ4G256Lloyd,
+        37 => DType::MFP2G32E8,
+        41 => DType::BQ1G128,
+        44 => DType::MQ4G256V2,
+        45 => DType::MQ4CG256,
+        47 => DType::MQ6G256V2,
+        48 => DType::MQ5G256V2,
+        49 => DType::MQ3G256V2,
+        50 => DType::MQ2G256V2,
         other => return Err(format!("unsupported quant_type {other}")),
     };
     let buf = gpu
