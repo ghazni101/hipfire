@@ -181,6 +181,10 @@ pub struct EngineStats {
     /// `restores` (swap-in): these are tokens skipped because a prior
     /// session published the same prefix to the radix index.
     pub reused_tokens: usize,
+    /// Free physical KV pages at the last completed step (A20 soak
+    /// telemetry). A monotonic decline across identical request cycles is
+    /// the page-level leak signature the oracle asserts against.
+    pub pool_free_pages: usize,
 }
 
 impl EngineStats {
@@ -202,6 +206,9 @@ impl EngineStats {
     }
     pub fn note_prefix_hit(&mut self) {
         self.prefix_hits += 1;
+    }
+    pub fn note_pool_free_pages(&mut self, n: usize) {
+        self.pool_free_pages = n;
     }
 }
 

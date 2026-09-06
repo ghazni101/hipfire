@@ -2583,6 +2583,15 @@ fn run_loop(
         // Advance the scheduler tick once per serve iteration. The tick
         // stamps waiter admission age and drives per-waiter timeout deadlines.
         rig.tick = rig.tick.saturating_add(1);
+        // A20 soak telemetry: sample free physical pages once per step so a
+        // monotonic decline across identical request cycles (the page-level
+        // leak signature) is observable from `EngineStats` (spec §9.2).
+        if let Some(pp) = rig.pool.page_pool() {
+            stats
+                .lock()
+                .expect("stats")
+                .note_pool_free_pages(pp.free_pages());
+        }
         // Expire timed-out waiters → typed queue timeout rejection. The
         // client receives a Rejected event with a timeout reason; the parked
         // request is dropped.
@@ -3765,6 +3774,13 @@ fn run_loop(
                         idx.unpin(domain);
                     }
                 }
+                // Hand the slot back — the session stays resident for
+                // continuation, but slot occupancy must end at terminal
+                // (matching commit_sampled_token). Wave 8's unpin edit
+                // accidentally deleted this clear and every batched-path
+                // termination wedged its slot (reset then always saw
+                // "requests in flight").
+                slots[s] = None;
                 let _ = rig.fair_queue.remove(session.0);
                 clear_work_slot(&mut work[s]);
                 clear_slot_vl_state(&mut rig, s);

@@ -2057,7 +2057,19 @@ pub fn mtp_batched_verify_accept_from_batch(
             argmax_per_pos
         );
     }
-    let accepted = greedy_trunk_spine_accept(&draft.candidates, &argmax_per_pos, eos_token_id);
+    // A19/A10 fault seam (oracle only): HIPFIRE_FAULT_MTP_FULL_REJECT=1
+    // forces every candidate to reject, so each cycle advances exactly one
+    // trunk token — the τ=1 full-reject path. The committed token is the
+    // trunk's own argmax, so greedy output must equal the accepting MTP /
+    // AR sequence; the cell proves rejected draft rows never become
+    // cache-visible (spec §4.6.2) and the repair path handles a zero-length
+    // accepted prefix.
+    let fault_full_reject = std::env::var("HIPFIRE_FAULT_MTP_FULL_REJECT").as_deref() == Ok("1");
+    let accepted = if fault_full_reject {
+        greedy_trunk_spine_accept(&[], &argmax_per_pos[..1], eos_token_id)
+    } else {
+        greedy_trunk_spine_accept(&draft.candidates, &argmax_per_pos, eos_token_id)
+    };
 
     let mut committed = accepted.committed;
     let mut hit_eos = accepted.hit_eos;
