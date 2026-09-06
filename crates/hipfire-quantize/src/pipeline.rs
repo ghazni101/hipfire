@@ -1062,13 +1062,19 @@ pub(crate) fn run() {
     // the hipfire loader looks them up.
     let is_minimax = arch_id == 10;
     let is_gemma4 = arch_id == 13;
+    // K2-Horizon (arch_id=15): MoVA attention (64 value experts + softplus
+    // gate) + sigmoid-routed MoE FFN (100 experts + 1 shared). Ships experts
+    // as separate 2D tensors (like DeepSeek V4 / MiniMax), not stacked 3D.
+    // The MoVA v_experts are MoE-style weights → MQ4, not Q8 attention.
+    let is_k2_horizon = arch_id == 15;
     // Covers both the dense arch-13 (12B/26B unified) and the EAGLE drafter
     // (arch-22). Both have the same AWQ-unsuitability: √d_model embedding scale
     // (not RMSNorm-anchored) corrupts AWQ saliency for FFN; embed/lm_head are
     // tied + scaled by √3840 making AWQ scale saliency meaningless there.
     let is_gemma4_family = arch_id == 13 || arch_id == 22;
     let is_moe_like =
-        is_moe || is_deepseek4 || is_lfm2moe || is_minimax || is_cohere2moe || is_gemma4;
+        is_moe || is_deepseek4 || is_lfm2moe || is_minimax || is_cohere2moe || is_gemma4
+        || is_k2_horizon;
     if (use_mq6g256v2 || use_mq5g256v2 || use_mq3g256v2 || use_mq2g256v2) && is_moe_like {
         eprintln!(
             "error: --format mq{{2,3,5,6}}v2 is dense-only (gfx1201 Qwen3.8); MoE model (arch_id={arch_id}) is not supported with this format. Use legacy mq{{2,3,5,6}} or mq4/mq4v2/mq4c for MoE, or run on a dense checkpoint."
@@ -1165,6 +1171,11 @@ pub(crate) fn run() {
     if is_cohere2moe {
         eprintln!(
             "  Cohere2-MoE detected — experts → --format ({{f16|q8|mq6|mq4}}); attn/dense → Q8 (F16 in oracle); router/embed → Q8; norms → F16."
+        );
+    }
+    if is_k2_horizon {
+        eprintln!(
+            "  K2-Horizon detected — MoVA attention (v_experts → MQ4, v_router/gate → Q8) + sigmoid MoE FFN (per-expert 2D → MQ4, router → Q8)."
         );
     }
 

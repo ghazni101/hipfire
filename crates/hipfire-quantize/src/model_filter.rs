@@ -202,11 +202,21 @@ pub(crate) fn q8_class_of(name: &str) -> Option<&'static str> {
         Some("embed")
     } else if name.ends_with("mlp.gate.weight")
         || name.ends_with("mlp.shared_expert_gate.weight")
+        || name.ends_with("mlp.router.weight")
         || name.ends_with("router.proj.weight")
+        // K2-Horizon MoVA value-expert router — precision-sensitive routing.
+        || name.ends_with("self_attn.v_router.weight")
     {
         Some("router")
     } else if name.contains("linear_attn.out_proj") || name.contains("ssm_out") {
         Some("ssm_out")
+    } else if
+        // K2-Horizon MoVA value experts are MoE-style weights (64 experts,
+        // top-4 per token) → quantize to MQ4, NOT Q8 attention. Exclude
+        // them from the "attn" class by checking before the broad bucket.
+        name.contains("v_experts")
+    {
+        None
     } else if name.contains("self_attn")
         || name.contains("attn_q")
         || name.contains("attn_k")
