@@ -7478,10 +7478,13 @@ pub fn generate_k2_horizon(
                 template,
                 system: system_prompt,
                 user: prompt,
-                enable_thinking: false,
+                // K2-Horizon's template opens `<ifm|think>\n` when
+                // reasoning_effort is set (default 'high'). The model
+                // starts generating inside the think block.
+                enable_thinking: true,
                 bos_token: None,
                 reasoning_strength: None,
-                reasoning_effort: None,
+                reasoning_effort: Some("high"),
             };
             match frame.render() {
                 Ok(rendered) => tokenizer.encode(&rendered),
@@ -7509,7 +7512,21 @@ pub fn generate_k2_horizon(
     }
 
     let eos_tok = m.k2_horizon().map(|b| b.eos_tok).unwrap_or(1);
+    // K2-Horizon uses two EOS tokens: <|ifm|endoftext|> (id 1) and
+    // <|ifm|im_end|> (id 250019). The model ends assistant turns with
+    // <|ifm|im_end|>; without checking it, generation continues past
+    // the turn boundary.
+    let im_end_tok: u32 = 250019;
 
+    // Think-block token IDs. K2-Horizon uses <ifm|think> / </ifm|think>
+    // (NOT the Qwenimd/d convention). The prompt's generation prompt
+    // opens <ifm|think>, so generation starts in think mode.
+    const THINK_OPEN: u32 = 250029;
+    const THINK_CLOSE: u32 = 250030;
+    const THINK_FAST_OPEN: u32 = 250050;
+    const THINK_FAST_CLOSE: u32 = 250051;
+    const THINK_FASTER_OPEN: u32 = 250052;
+    const THINK_FASTER_CLOSE: u32 = 250053;
     // ── Prefill (sequential decode_step) ──
     let prefill_t0 = Instant::now();
     {
@@ -7551,6 +7568,12 @@ pub fn generate_k2_horizon(
     let mut generated_count = 0usize;
     let mut rng = deepseek4::sampling::Xorshift::new(0xDEAD_BEEF);
     let mut emitted_visible = false;
+    // The Jinja template opens <ifm|think> in the generation prompt, so
+    // the model starts generating inside a think block. Track state at
+    // the token level: think-marker tokens are single-token added tokens
+    // that decode as complete strings, so no byte-level streaming router
+    // is needed.
+    let mut in_think = true;
 
     loop {
         if generated_count >= max_tokens {
@@ -7560,8 +7583,73 @@ pub fn generate_k2_horizon(
         // Sample next token from last logits.
         let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
 
-        if next_tok == eos_tok {
+        // Check both EOS tokens: <|ifm|endoftext|> (1) and <|ifm|im_end|> (250019).
+        if next_tok == eos_tok || next_tok == im_end_tok {
             break;
+        }
+
+        // Handle think-block marker tokens — toggle state, don't emit.
+        match next_tok {
+            THINK_OPEN | THINK_FAST_OPEN | THINK_FASTER_OPEN => {
+                in_think = true;
+                generated_count += 1;
+                // Still advance the model state.
+                let step = {
+                    let b = m.k2_horizon_mut().unwrap();
+                    let position = b.state.n_tokens as u32;
+                    k2_horizon::forward::decode_step(
+                        &b.config,
+                        &b.weights,
+                        &mut b.state,
+                        gpu,
+                        next_tok,
+                        position,
+                    )
+                };
+                match step {
+                    Ok(logits) => {
+                        last_logits = logits;
+                        let b = m.k2_horizon_mut().unwrap();
+                        b.state.n_tokens += 1;
+                    }
+                    Err(e) => {
+                        emit_error_with_id(stdout, id, format!("k2_horizon decode failed: {e:?}"));
+                        let _ = stdout.flush();
+                        return;
+                    }
+                }
+                continue;
+            }
+            THINK_CLOSE | THINK_FAST_CLOSE | THINK_FASTER_CLOSE => {
+                in_think = false;
+                generated_count += 1;
+                let step = {
+                    let b = m.k2_horizon_mut().unwrap();
+                    let position = b.state.n_tokens as u32;
+                    k2_horizon::forward::decode_step(
+                        &b.config,
+                        &b.weights,
+                        &mut b.state,
+                        gpu,
+                        next_tok,
+                        position,
+                    )
+                };
+                match step {
+                    Ok(logits) => {
+                        last_logits = logits;
+                        let b = m.k2_horizon_mut().unwrap();
+                        b.state.n_tokens += 1;
+                    }
+                    Err(e) => {
+                        emit_error_with_id(stdout, id, format!("k2_horizon decode failed: {e:?}"));
+                        let _ = stdout.flush();
+                        return;
+                    }
+                }
+                continue;
+            }
+            _ => {}
         }
 
         // Decode token → text and stream.
@@ -7569,13 +7657,23 @@ pub fn generate_k2_horizon(
             let tokenizer = m.tokenizer.as_ref().unwrap();
             tokenizer.decode(&[next_tok])
         };
-        let _ = writeln!(
-            stdout,
-            "{}",
-            serde_json::json!({"type": "token", "id": id, "text": frag, "attempt_id": active_attempt_id()})
-        );
+
+        if in_think {
+            // Reasoning channel — the CLI surfaces this as reasoning_content.
+            let _ = writeln!(
+                stdout,
+                "{}",
+                serde_json::json!({"type": "reasoning", "id": id, "text": frag, "attempt_id": active_attempt_id()})
+            );
+        } else {
+            let _ = writeln!(
+                stdout,
+                "{}",
+                serde_json::json!({"type": "token", "id": id, "text": frag, "attempt_id": active_attempt_id()})
+            );
+            emitted_visible = true;
+        }
         let _ = stdout.flush();
-        emitted_visible = true;
         generated_count += 1;
 
         // Advance one step.
