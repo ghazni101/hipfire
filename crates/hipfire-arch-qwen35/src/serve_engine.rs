@@ -2088,7 +2088,7 @@ fn request_penalized(req: &SubmitRequest) -> bool {
 /// a greedy/spec hybrid instead of the requested distribution. The daemon
 /// defaults temperature to 0.0 (greedy), so MTP stays on for default requests.
 fn request_sampled(req: &SubmitRequest) -> bool {
-    req.temperature > 1e-6
+    req.temperature > 0.0
 }
 
 /// Install a request's sampling parameters (including token penalties and
@@ -2182,7 +2182,7 @@ fn publish_generated_prefix(
         .map(|(i, &phys)| Handle {
             handle: rdna_compute::page_pool::PageHandle {
                 phys,
-                epoch: 0,
+                epoch: rig.pool.page_pool().map(|p| p.epoch()).unwrap_or(0),
                 generation: rig.pool.page_pool().map(|p| p.page_generation(phys)).unwrap_or(0),
             },
             token_offset: (i * PAGE_TOKENS) as u64,
@@ -3155,7 +3155,7 @@ fn run_loop(
                     .map(|(i, &phys)| Handle {
                         handle: rdna_compute::page_pool::PageHandle {
                             phys,
-                            epoch: 0,
+                            epoch: rig.pool.page_pool().map(|p| p.epoch()).unwrap_or(0),
                             generation: rig.pool.page_pool().map(|p| p.page_generation(phys)).unwrap_or(0),
                         },
                         token_offset: (i * PAGE_TOKENS) as u64,
@@ -3753,7 +3753,18 @@ fn run_loop(
                 if !matches!(reason, DoneReason::ClientGone) && rig.prefix_cache {
                     publish_generated_prefix(&mut rig, &mut slots, s, work[s].next_pos);
                 }
-                slots[s] = None;
+                // Release the prefix-cache lookup pins (spec §4.4 C4).
+                // lookup_with_pages pins the radix path so eviction cannot
+                // drop it mid-request; on normal completion the pins must be
+                // released or every successful prefix-cache request leaks a
+                // pin and the pinned path can never be evicted. The session's
+                // table refs (from share_published_pages) still protect the
+                // shared pages from being freed while the session is idle.
+                if rig.prefix_cache {
+                    if let (Some(idx), Some(domain)) = (rig.prefix_index.as_mut(), rig.cache_domain.as_ref()) {
+                        idx.unpin(domain);
+                    }
+                }
                 let _ = rig.fair_queue.remove(session.0);
                 clear_work_slot(&mut work[s]);
                 clear_slot_vl_state(&mut rig, s);
@@ -4281,7 +4292,7 @@ fn admit(
                         produced: 0,
                         max_tokens: req.max_tokens.max(1),
                         repeat_window_req: req.repeat_window.min(REPEAT_WINDOW_MAX),
-                        reused_tokens: 0,
+                        reused_tokens: plan.reused,
                         last_published_boundary: 0,
                         grammar: grammar_constraint,
                     });

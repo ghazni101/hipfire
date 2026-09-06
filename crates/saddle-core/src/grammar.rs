@@ -3222,26 +3222,24 @@ pub mod json_schema {
         depth: usize,
         path: &mut Vec<String>,
     ) -> Result<SchemaNode, SchemaError> {
-        let properties = match obj.get("properties").and_then(|v| v.as_object()) {
-            Some(p) => p,
-            None => {
-                return Err(SchemaError::InvalidSchema {
-                    reason: "object schema missing properties".to_string(),
-                })
-            }
-        };
+        let properties = obj.get("properties").and_then(|v| v.as_object());
 
-        let mut compiled_props = Vec::with_capacity(properties.len());
-        for (key, sub_schema) in properties {
-            // Recursion requires `$ref`, which the keyword gate above already
-            // rejects — a repeated property NAME at different nesting depths
-            // is ordinary finite JSON Schema ({"meta":{"meta":{"type":
-            // "string"}}}) and must compile. No path-name heuristic here.
-            path.push(key.clone());
-            let node = compile_node(sub_schema, depth + 1, path)?;
-            path.pop();
-            compiled_props.push((key.clone(), node));
+        let mut compiled_props = Vec::new();
+        if let Some(properties) = properties {
+            compiled_props.reserve(properties.len());
+            for (key, sub_schema) in properties {
+                // Recursion requires `$ref`, which the keyword gate above
+                // already rejects — a repeated property NAME at different
+                // nesting depths is ordinary finite JSON Schema
+                // ({"meta":{"meta":{"type":"string"}}}) and must compile.
+                // No path-name heuristic here.
+                path.push(key.clone());
+                let node = compile_node(sub_schema, depth + 1, path)?;
+                path.pop();
+                compiled_props.push((key.clone(), node));
+            }
         }
+
 
         let required: Vec<String> = obj
             .get("required")
@@ -3671,6 +3669,74 @@ pub mod json_schema {
         e.classify() == serde_json::error::Category::Eof
     }
 
+    /// Count the number of items started in the outermost JSON array (spec
+    /// §7.1: enforce `maxItems` incrementally). Returns `None` when the
+    /// buffer does not begin with `[`. The count includes incomplete items:
+    /// `[1,2` → 2, `[1,` → 1 (the comma starts a new item but no content
+    /// follows yet), `[1` → 1. `[]` → 0.
+    ///
+    /// Tracks string/escape state and nesting depth so commas inside nested
+    /// structures or strings are not counted.
+    fn count_root_array_items(bytes: &[u8]) -> Option<usize> {
+        let mut i = 0;
+        while i < bytes.len() && matches!(bytes[i], b' ' | b'\n' | b'\t' | b'\r') {
+            i += 1;
+        }
+        if i >= bytes.len() || bytes[i] != b'[' {
+            return None;
+        }
+        i += 1; // consume `[`
+
+        let mut depth: i32 = 1;
+        let mut in_string = false;
+        let mut escape = false;
+        let mut commas: usize = 0;
+        let mut has_content = false;
+
+        while i < bytes.len() {
+            let b = bytes[i];
+            if in_string {
+                if escape {
+                    escape = false;
+                } else if b == b'\\' {
+                    escape = true;
+                } else if b == b'"' {
+                    in_string = false;
+                }
+            } else {
+                match b {
+                    b'"' => {
+                        in_string = true;
+                        if depth == 1 { has_content = true; }
+                    }
+                    b'[' | b'{' => {
+                        if depth == 1 { has_content = true; }
+                        depth += 1;
+                    }
+                    b']' | b'}' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            return Some(commas + if has_content { 1 } else { 0 });
+                        }
+                    }
+                    b',' => {
+                        if depth == 1 {
+                            commas += 1;
+                            has_content = false;
+                        }
+                    }
+                    b' ' | b'\n' | b'\t' | b'\r' => {}
+                    _ => {
+                        if depth == 1 { has_content = true; }
+                    }
+                }
+            }
+            i += 1;
+        }
+        // Incomplete (no closing `]`): count started items.
+        Some(commas + if has_content { 1 } else { 0 })
+    }
+
     /// Check whether a growing number value could eventually match
     /// the schema. `raw` is the raw byte buffer (including any
     /// leading whitespace) that was parsed to produce `value`.
@@ -3957,8 +4023,26 @@ pub mod json_schema {
                     // Check if it's an EOF error (incomplete input).
                     if !is_eof_error(&e) {
                         self.errored = true;
+                    } else {
+                        // EOF: incomplete, keep buffering — but enforce
+                        // maxItems incrementally on the root array (spec
+                        // §7.1: "Enforce the supplied keywords"). Without
+                        // this the model can start emitting items beyond
+                        // maxItems and only discover the violation at array
+                        // close, creating a dead end (spec §7.1: "runtime
+                        // dead ends remain typed constraint errors" —
+                        // preventing them is better). Nested-array maxItems
+                        // is caught by validate on the complete value; the
+                        // root-level check covers the common structured-
+                        // output case (`{"type":"array","maxItems":N}`).
+                        if let SchemaNode::Array { max_items: Some(max), .. } = &self.root {
+                            if let Some(count) = count_root_array_items(rest) {
+                                if count > *max {
+                                    self.errored = true;
+                                }
+                            }
+                        }
                     }
-                    // EOF: incomplete, keep buffering.
                 }
             }
         }
@@ -5259,9 +5343,85 @@ pub mod json_schema {
             // Empty bytes are always allowed (vacuous) → true.
             assert!(mask[3]);
         }
+
+        // ── Regression: bare {"type":"object"} without properties ──────
+        #[test]
+        fn bare_object_type_without_properties_compiles() {
+            let schema = json!({"type": "object"});
+            let compiled = CompiledSchema::compile(&schema).expect("bare object must compile");
+            let m = compiled.matcher();
+            // Any object should be allowed.
+            assert!(m.is_token_allowed(b"{\"key\": 1}"));
+            assert!(m.is_token_allowed(b"{}"));
+        }
+
+        #[test]
+        fn bare_object_type_with_required_only_compiles() {
+            let schema = json!({"type": "object", "required": ["name"]});
+            let compiled = CompiledSchema::compile(&schema)
+                .expect("object with required but no properties must compile");
+            let m = compiled.matcher();
+            // `{"name": "x"}` satisfies the required field.
+            assert!(m.is_token_allowed(b"{\"name\": \"x\"}"));
+        }
+
+        // ── Regression: maxItems enforced incrementally ────────────────
+        #[test]
+        fn max_items_blocks_extra_item_incrementally() {
+            let schema = json!({"type": "array", "items": {"type": "integer"}, "maxItems": 2});
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let mut m = compiled.matcher();
+            m.advance(b"[1, 2");
+            assert!(!m.is_errored(), "two items is within maxItems");
+            // A third item must be refused incrementally.
+            m.advance(b", 3");
+            assert!(m.is_errored(), "third item exceeds maxItems");
+        }
+        #[test]
+        fn max_items_allows_up_to_limit() {
+            let schema = json!({"type": "array", "items": {"type": "integer"}, "maxItems": 3});
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let mut m = compiled.matcher();
+            m.advance(b"[1");
+            assert!(!m.is_errored());
+            m.advance(b", 2");
+            assert!(!m.is_errored());
+            m.advance(b", 3");
+            assert!(!m.is_errored());
+            // A 4th item must be refused.
+            m.advance(b", 4");
+            assert!(m.is_errored());
+        }
+
+        #[test]
+        fn max_items_empty_array_ok() {
+            let schema = json!({"type": "array", "items": {"type": "integer"}, "maxItems": 0});
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let mut m = compiled.matcher();
+            m.advance(b"[]");
+            assert!(m.is_accepting(), "empty array with maxItems:0 is valid");
+            let mut m2 = compiled.matcher();
+            m2.advance(b"[1");
+            assert!(m2.is_errored(), "any item exceeds maxItems:0");
+        }
+
+        #[test]
+        fn count_root_array_items_helper() {
+            assert_eq!(count_root_array_items(b"[]"), Some(0));
+            assert_eq!(count_root_array_items(b"[1"), Some(1));
+            assert_eq!(count_root_array_items(b"[1,"), Some(1));
+            assert_eq!(count_root_array_items(b"[1,2"), Some(2));
+            assert_eq!(count_root_array_items(b"[1,2,"), Some(2));
+            assert_eq!(count_root_array_items(b"[1,2,3]"), Some(3));
+            assert_eq!(count_root_array_items(b"[1,[2,3],4"), Some(3));
+            assert_eq!(count_root_array_items(b"[\"a\",\"b\""), Some(2));
+            assert_eq!(count_root_array_items(b"{"), None);
+            assert_eq!(count_root_array_items(b"  [1,2"), Some(2));
+            // String with comma inside should not count.
+            assert_eq!(count_root_array_items(b"[\"a,b\""), Some(1));
+        }
     }
 }
-
 } // mod json
 
 /// DSML grammar — state machine for `<｜DSML｜tool_calls>` XML-style tool calls.
