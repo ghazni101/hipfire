@@ -15,7 +15,37 @@
 // slots) for its whole duration. See `prefill_and_decode_mix_in_one_batch`.
 
 use crate::slot_batch::SlotBatch;
+use rdna_compute::page_pool::PAGE_TOKENS;
 use rdna_compute::slot_pool::SlotId;
+
+/// Trim a prompt-completing prefill round to end at the last page boundary
+/// (spec §4.5): a resumable recurrent-state checkpoint can only be captured
+/// when the round ends exactly at a published page boundary, so a round that
+/// would finish a prompt mid-page is trimmed to the boundary and the sub-page
+/// tail runs as its own final round. Every prompt longer than one page then
+/// produces a resumable checkpoint at `floor(len / PAGE_TOKENS) * PAGE_TOKENS`.
+///
+/// No effect on page-aligned prompts, sub-page prompts, or non-completing
+/// takes; an operator quantum above one page (`prefill_min_tokens`) wins —
+/// no trim — because alignment must not silently undercut the configured
+/// service floor.
+fn page_align_take(
+    take: usize,
+    take_start_pos: usize,
+    remaining_incl_take: usize,
+    prefill_min: usize,
+) -> usize {
+    if take >= remaining_incl_take && remaining_incl_take > 0 && prefill_min <= PAGE_TOKENS {
+        let end = take_start_pos + remaining_incl_take;
+        if end % PAGE_TOKENS != 0 && end > PAGE_TOKENS {
+            let boundary = (end / PAGE_TOKENS) * PAGE_TOKENS;
+            if boundary > take_start_pos {
+                return boundary - take_start_pos;
+            }
+        }
+    }
+    take
+}
 
 pub struct Scheduler {
     pub chunk_size: usize,
@@ -205,17 +235,27 @@ impl Scheduler {
             if !prefill_slots.is_empty() {
                 let n_pr = prefill_slots.len();
                 let start = self.prefill_cursor % n_pr;
-                // Guarantee the minimum prefill quantum to the rotated slot
-                // before distributing extra budget: reserve `prefill_min_tokens`
-                // for it (clamped to what its prompt and the budget allow) so a
-                // later round-robin pass cannot starve the quantum.
+                // Per-slot round quota: chunk_size capped to the prompt,
+                // quantum-floored, then page-aligned when the take would
+                // complete a mid-page prompt (spec §4.5, see
+                // `page_align_take`). Both the rotated head allocation and
+                // the leftover distribution draw from this quota, so a
+                // trimmed head is not refilled within the same round.
+                let quota_of = |w: &PendingWork| -> usize {
+                    let left = w.remaining_prompt.len();
+                    if left == 0 {
+                        return 0;
+                    }
+                    page_align_take(
+                        self.chunk_size.min(left).max(prefill_min_tokens.min(left)),
+                        w.next_pos,
+                        left,
+                        prefill_min_tokens,
+                    )
+                };
                 let head = prefill_slots[start];
                 let head_remaining = work[head].remaining_prompt.len();
-                let head_take = self
-                    .chunk_size
-                    .min(head_remaining)
-                    .min(avail)
-                    .max(prefill_min_tokens.min(head_remaining).min(avail));
+                let head_take = quota_of(&work[head]).min(avail);
                 if head_take > 0 && head_remaining > 0 {
                     alloc[head] += head_take;
                     avail -= head_take;
@@ -233,7 +273,7 @@ impl Scheduler {
                         let i = prefill_slots[(start + k) % n_pr];
                         let already = alloc[i];
                         let prompt_left = work[i].remaining_prompt.len().saturating_sub(already);
-                        let cap = self.chunk_size.saturating_sub(already);
+                        let cap = quota_of(&work[i]).saturating_sub(already);
                         let take = cap.min(prompt_left).min(avail);
                         if take == 0 {
                             continue;
@@ -415,6 +455,64 @@ mod tests {
         }];
         let b = s.next_batch(&mut work, 4096, 1);
         assert!(b.is_empty());
+    }
+
+    #[test]
+    fn a_mid_page_prompt_splits_at_the_last_page_boundary() {
+        // Spec §4.5: a checkpoint is only capturable when a prefill round
+        // ends exactly at a page boundary. A single-chunk 283-token prompt
+        // (chunk_size above the prompt length, the serve default) must be
+        // trimmed to 256 rows so the round ends at the boundary; the 27-row
+        // tail completes in the next round.
+        let mut s = Scheduler { chunk_size: 1024, vl_sequential: false, prefill_cursor: 0 };
+        let mut work = vec![PendingWork {
+            slot: SlotId(0),
+            remaining_prompt: prompt(283),
+            next_pos: 0,
+            decoding: false,
+            vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0, pos3_delta: 0,
+        }];
+        let b = s.next_batch(&mut work, 4096, 1);
+        assert_eq!(b.total_rows(), 256, "completing round must end at the page boundary");
+        assert_eq!(work[0].next_pos, 256);
+        let b2 = s.next_batch(&mut work, 4096, 1);
+        assert_eq!(b2.total_rows(), 27, "the sub-page tail completes prefill");
+        assert!(work[0].remaining_prompt.is_empty());
+        assert_eq!(work[0].next_pos, 283);
+    }
+
+    #[test]
+    fn a_page_aligned_prompt_prefills_in_one_round() {
+        // 256 is exactly one page multiple: no trim, no extra round.
+        let mut s = Scheduler { chunk_size: 1024, vl_sequential: false, prefill_cursor: 0 };
+        let mut work = vec![PendingWork {
+            slot: SlotId(0),
+            remaining_prompt: prompt(256),
+            next_pos: 0,
+            decoding: false,
+            vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0, pos3_delta: 0,
+        }];
+        let b = s.next_batch(&mut work, 4096, 1);
+        assert_eq!(b.total_rows(), 256);
+        assert!(work[0].remaining_prompt.is_empty());
+    }
+
+    #[test]
+    fn quantum_above_a_page_wins_over_alignment() {
+        // An operator prefill_min_tokens above one page opts out of the
+        // alignment trim — the configured service floor must not be silently
+        // undercut.
+        let mut s = Scheduler { chunk_size: 1024, vl_sequential: false, prefill_cursor: 0 };
+        let mut work = vec![PendingWork {
+            slot: SlotId(0),
+            remaining_prompt: prompt(283),
+            next_pos: 0,
+            decoding: false,
+            vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0, pos3_delta: 0,
+        }];
+        let b = s.next_batch(&mut work, 4096, 200);
+        assert_eq!(b.total_rows(), 283, "quantum above a page: no alignment trim");
+        assert!(work[0].remaining_prompt.is_empty());
     }
 
     fn vl_state(n_visual: usize, n_prompt: usize) -> VlPrefill {
