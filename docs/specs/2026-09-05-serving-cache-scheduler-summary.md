@@ -4,7 +4,7 @@
 
 - **Date:** 2026-09-05 (review pass appended same day)
 - **Branch:** `feat/serving-cache-scheduler` (pushed to `origin` at `ghazni101/hipfire`)
-- **Tip:** `2390e4e0f` `fix(slots): wave-8 residual audit — pin leak, greedy gates, bare objects, maxItems`
+- **Tip:** `a2e013b6e` `fix(slots): restore batched-path slot release; add wave-9 verification cells`
 - **Spec:** [2026-09-05-serving-cache-scheduler-spec.md](2026-09-05-serving-cache-scheduler-spec.md)
 - **Plan:** [2026-09-05-serving-cache-scheduler-plan.md](2026-09-05-serving-cache-scheduler-plan.md)
 - **GPU:** gfx1101 (AMD Radeon RX 7700 XT), HIP 7.15, ROCm 10 container (`local/rocm-base:10.0.0`)
@@ -217,6 +217,7 @@ The subsequent generate fails with an open-think-span validator (too few tokens 
 ## Commit history (this branch, newest first)
 
 ```
+a2e013b6e fix(slots): restore batched-path slot release; add wave-9 verification cells
 2390e4e0f fix(slots): wave-8 residual audit — pin leak, greedy gates, bare objects, maxItems
 890669a6d fix(scheduler): page-align prompt-completing prefill rounds so checkpoints are capturable
 4fbd66c3e docs: serving cache scheduler work summary and remaining gaps
@@ -287,3 +288,73 @@ Regression tests added (`saddle-core --lib`):
 | `count_root_array_items_helper` | Unit test for the byte-scanning helper (nesting, strings, commas) |
 
 Verification: `cargo test --workspace --lib` — all suites green (191 saddle-core, 261 hipfire-arch-qwen35, 0 failures across workspace).
+
+### Wave 9 — end-to-end verification pass (2026-09-06)
+
+Full verification campaign on gfx1101 / ROCm 10 container (GPU shared with a
+co-tenant workload holding ~7.75 GB; serve verified at 2 slots × 2048 ctx —
+the default 4×8192 shape does not fit alongside the co-tenant and was not a
+gate). Host: `cargo test --workspace --lib` green under `HIPFIRE_OOM_GUARD=1`
+(the `oversized_pool` case passes with the guard; the 7 bin-level
+`update_*` self-installer failures are documented environmental).
+
+#### Found and fixed
+
+| # | Area | Bug | Fix |
+|---|---|---|---|
+| 31 | `serve_engine.rs` | Wave-8 fix 25's edit **deleted** `slots[s] = None` at the run_loop batched-completion path instead of inserting beside it — every MTP-path termination wedged its slot, and `reset` always rejected "requests in flight" (caught by the A20 reset oracle cell) | Restored the clear beside the unpin; `commit_sampled_token` (sequential path) had kept its own |
+
+#### New verification cells (all GPU-PASS)
+
+| Cell | Mechanism | Evidence |
+|---|---|---|
+| A10 forced full-reject | `HIPFIRE_FAULT_MTP_FULL_REJECT=1` seam in `mtp_batched_verify_accept_from_batch` forces τ=1 every cycle | Generated sequence equals accepting-MTP greedy; warm replay identical — rejected candidate rows provably never cache-visible |
+| A13 concurrent | 4 simultaneous requests (3 warm + 1 cold) against 2 slots | WaitQueue losers complete with byte-exact outputs (1.2–4.4 s) |
+| A20 plateau | `EngineStats.pool_free_pages` sampled per step | Soak free pages flat (10,10,10,10); reset returns to 26 — no leak across the lifecycle |
+| A19 fault-hip | `HIPFIRE_FAULT_HIP=upload\|launch\|sync[:N]` injects the first bridge-call failure after arming (arm-after-load semantics) | launch/upload → typed rejection + same-engine exact recovery; sync (device_synchronize) → engine poison + fresh-engine recovery; all byte-identical (spec §5.4 S4) |
+
+Oracle pool note: the compose oracle moved to `cap_tokens: 2048` (32 pages).
+At 16 pages, wave-8's pin-release fix made cached paths evictable again and
+the A13 publications legitimately evicted the Italy prefix — correct §4.4
+behavior that the soak's `reused>=PAGE` assumption collided with. The suite
+now tests steady-state boundedness, not incidental eviction.
+
+#### Harness + product-route evidence
+
+- `serve_harness.py --mode chain` (multi-slot + prefix-cache serve, HTTP):
+  `cached_tokens 0→89→192→265→346` reproduced on the final binary — these
+  are single-chunk prompts, the case `890669a6d` (page-aligned prefill
+  rounds) revived.
+- `battery` complete (5 distinct prompts, cached=0 correct); `session`
+  complete (8 turns to ctx 1012, `cached_tokens=977` on the final turn; the
+  retrieval gate needs `--max-tokens ≥ 512` for visible answers).
+- Typed-refusal probes over HTTP: unsupported schema keyword, `json_object`,
+  `tools`, `stop`, `logprobs` → all typed rejections, per contract.
+- `hipfire bench --concurrency 2 --backend both`: **slots arm runs** on the
+  daemon protocol (2 slots, 0 rejected; 33.2 agg tok/s vs noslots 37.3 at
+  k=2 — P0 exit criterion met; not a perf claim).
+
+#### New gaps (this pass made them precise)
+
+- **Strict `json_schema` over ChatML fails closed** (NEW): a *valid*
+  supported-subset schema via `/v1/chat/completions` is typed-rejected with
+  "grammar constraint allows no token" — the reasoning (think) framing
+  requires tokens the schema forbids before JSON can start. The engine-level
+  raw-prompt schema path (oracle grammar cell) works. Follow-up: §7.2's
+  framing-aware grammar cursor (schema masks apply to the post-think answer
+  span). Never falsely succeeds — fail-closed.
+- **Admission vs forward page-accounting mismatch under pressure**: with a
+  resident session + published cache near pool capacity, admission granted a
+  request the forward could not back ("PagePool: need 8 more pages but only
+  0 free") → forward-level typed rejection instead of admit-level
+  wait/reclaim/reduce (spec §5.4 S4 row 3). Fail-closed; small requests
+  unaffected. Follow-up: wire admit-time eviction to the forward's actual
+  page demand or park on shortfall.
+- **Legacy batch (beta) arm**: 2/2 requests rejected at k=2;
+  `kv_cache_write_q8_0_independent` fails JIT compile on gfx1101
+  (sequential/batch prefill kernel variant — the slots path uses the paged
+  kernels and is unaffected). Pre-existing dispatch-fallback class; needs
+  triage but is outside this spec's X2 matrix.
+- A failed multi-page allocation in the daemon's slot route may briefly hold
+  freed pages in reclaim-pending (free count drifts 0→2→5 between retries)
+  before `drain_completed` retires them; all counts recovered.
