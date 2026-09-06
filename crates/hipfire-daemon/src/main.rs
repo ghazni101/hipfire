@@ -1711,6 +1711,7 @@ fn main() {
                             12 => "north_mini_code",
                             13 => "gemma4",
                             14 => "muse_glimmer",
+                            15 => "k2_horizon",
                             _ => "qwen3",
                         };
                         let drafter = m.speculator.as_ref().map(|speculator| speculator.name());
