@@ -168,7 +168,13 @@ impl Architecture for K2Horizon {
             cfg.mlp_only_layers.iter().copied().collect();
 
         // Globals.
-        let token_embd = load_f32(hfq, gpu, "model.embed_tokens.weight", &[cfg.vocab_size, hidden])?;
+        // Upload embedding as raw Q8_0 bytes (681 MB) instead of dequantizing
+        // to F32 (2.57 GB). embedding_lookup_q8 dequantizes one row on-GPU
+        // at lookup time. Matches minimax/deepseek4/cohere2moe pattern.
+        let (_qt, embed_bytes) = read_tensor(hfq, "model.embed_tokens.weight")?;
+        let token_embd = gpu
+            .upload_raw(&embed_bytes, &[embed_bytes.len()])
+            .map_err(|e| format!("k2_horizon: upload embed: {e:?}"))?;
         let final_norm = load_f32(hfq, gpu, "model.norm.weight", &[hidden])?;
         let lm_head = if cfg.tie_word_embeddings {
             None

@@ -231,7 +231,7 @@ pub fn decode_step(
         .map_err(|e| format!("k2_horizon: stage pos: {e:?}"))?;
 
     // Embedding lookup → state.h.
-    gpu.embedding_lookup(&weights.token_embd, &state.h, token_id, cfg.dim)
+    gpu.embedding_lookup_q8(&weights.token_embd, &state.h, token_id, cfg.dim)
         .map_err(|e| format!("k2_horizon: embed lookup: {e:?}"))?;
 
     let dense_layers = &weights.dense_layers;
