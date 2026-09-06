@@ -594,7 +594,6 @@ impl Gpu {
     pub fn silu_f32(&mut self, x: &GpuTensor, out: &GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("silu", kernels::SILU_SRC, "silu_f32")?;
-        let func = &self.functions["silu_f32"];
 
         let n = x.numel() as i32;
         let mut x_ptr = x.buf.as_ptr();
@@ -609,10 +608,26 @@ impl Gpu {
 
         let block = 256u32;
         let grid = ((n as u32) + block - 1) / block;
-        unsafe {
-            self.hip
-                .launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, None, &mut params)
+        let bytes = crate::profile::elementwise_bytes(n as usize);
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", "silu_f32", bytes);
+        let result = self.launch_maybe_blob(
+            "silu_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(x_ptr);
+                b.push_ptr(out_ptr);
+                b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
         }
+        result
     }
 
     /// out = silu(gate) * up — fused to avoid intermediate buffer
@@ -2176,7 +2191,6 @@ impl Gpu {
     pub fn softplus_f32(&mut self, x: &GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("softplus", kernels::SOFTPLUS_SRC, "softplus_f32")?;
-        let func = &self.functions["softplus_f32"];
         let mut xp = x.buf.as_ptr();
         let mut n = x.numel() as i32;
         let mut params: Vec<*mut c_void> = vec![
@@ -2185,16 +2199,25 @@ impl Gpu {
         ];
         let block = 256u32;
         let grid = ((n as u32) + block - 1) / block;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [grid, 1, 1],
-                [block, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
+        let bytes = crate::profile::elementwise1_bytes(n as usize);
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", "softplus_f32", bytes);
+        let result = self.launch_maybe_blob(
+            "softplus_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_i32(n);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
         }
+        result
     }
 
     /// L2 normalization per head, in-place. One warp per head.
@@ -3978,7 +4001,6 @@ impl Gpu {
     pub fn scale_f32(&mut self, x: &GpuTensor, scale: f32) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("scale_f32", kernels::SCALE_F32_SRC, "scale_f32")?;
-        let func = &self.functions["scale_f32"];
         let n = x.numel();
         let mut xp = x.buf.as_ptr();
         let mut nv = n as i32;
@@ -3992,16 +4014,20 @@ impl Gpu {
         let grid = ((n as u32) + block - 1) / block;
         let bytes = crate::profile::elementwise1_bytes(n);
         let timer = crate::profile::begin_timer(&self.hip, "elementwise", "scale_f32", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [grid, 1, 1],
-                [block, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = self.launch_maybe_blob(
+            "scale_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_i32(nv);
+                b.push_f32(sv);
+                b
+            },
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }

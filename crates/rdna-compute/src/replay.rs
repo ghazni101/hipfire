@@ -905,6 +905,15 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             Some(vec![read(0), write(8), read(16)])
         }
         "zero_f32" => Some(vec![write(0)]),
+        // K2-Horizon elementwise kernels (in-place or out-of-place f32)
+        "sigmoid_f32" => Some(vec![write(0)]),
+        "silu_f32" => Some(vec![read(0), write(8)]),
+        "scale_f32" => Some(vec![write(0)]),
+        "softplus_f32" => Some(vec![write(0)]),
+        "silu_mul_f32" => Some(vec![read(0), read(8), write(16)]),
+        "mul_f32" => Some(vec![read(0), read(8), write(16)]),
+        "grouped_rmsnorm_f32" => Some(vec![read(0), read(8), write(16)]),
+        "rope_f32" => Some(vec![write(0), write(8), read(16)]),
         "rotate_with_rms_gfx1100" => Some(vec![
             read(0),
             read(8),
@@ -1094,6 +1103,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
     if matches!(
         kernel,
         "hc_pre_post_sigmoid_scale_f32" | "hc_sinkhorn_4x4" | "sqrt_softplus_f32" | "zero_f32"
+        | "sigmoid_f32" | "scale_f32" | "softplus_f32"
     ) {
         return Some(16);
     }
@@ -1109,8 +1119,8 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "hc_apply_alpha"
             | "rmsnorm_f32_at_slot_buf"
             | "state_overlap_shift_f32_buf"
-            | "state_ring_write_f32_buf"
             | "add_inplace_f32"
+            | "silu_f32" | "silu_mul_f32" | "mul_f32"
     ) {
         return Some(32);
     }
@@ -1132,8 +1142,8 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "indexer_relu_score_f32_buf"
             | "indexer_top_k_buf"
             | "indexer_top_k_buf_parallel"
-            | "rope_tail_interleaved_f32"
             | "swa_ring_write_f32_buf"
+            | "grouped_rmsnorm_f32" | "rope_f32"
     ) {
         return Some(48);
     }
@@ -5325,7 +5335,14 @@ mod tests {
         "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151",
         "sigmoid_mul_f32",
         "gemv_hfq4g256_multirow_r2",
-        "gemv_hfq4g256_multirow_r4",
+        "sigmoid_f32",
+        "silu_f32",
+        "scale_f32",
+        "softplus_f32",
+        "silu_mul_f32",
+        "mul_f32",
+        "grouped_rmsnorm_f32",
+        "rope_f32",
         "gemv_hfq4g256_multirow_r8",
     ];
 
