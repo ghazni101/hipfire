@@ -23,10 +23,11 @@
 
 pub mod arch;
 pub mod config;
+pub mod forward;
+pub mod load;
 pub mod weights;
 
 pub use arch::K2Horizon;
-pub mod forward;
-
-pub use forward::K2HorizonState;
 pub use config::K2HorizonConfig;
+pub use forward::K2HorizonState;
+pub use load::K2HorizonBundle;

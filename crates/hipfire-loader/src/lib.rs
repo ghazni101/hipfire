@@ -1096,6 +1096,18 @@ impl LoadedModel {
             .and_then(|s| (s as &mut dyn Any).downcast_mut::<Cohere2MoeBundle>())
     }
 
+    pub fn k2_horizon(&self) -> Option<&hipfire_arch_k2_horizon::K2HorizonBundle> {
+        self.state
+            .as_deref()
+            .and_then(|s| (s as &dyn Any).downcast_ref::<hipfire_arch_k2_horizon::K2HorizonBundle>())
+    }
+
+    pub fn k2_horizon_mut(&mut self) -> Option<&mut hipfire_arch_k2_horizon::K2HorizonBundle> {
+        self.state.as_deref_mut().and_then(|s| {
+            (s as &mut dyn Any).downcast_mut::<hipfire_arch_k2_horizon::K2HorizonBundle>()
+        })
+    }
+
     /// DeepSeek V4 bundle if this model is a single-GPU arch_id=9, else None.
     /// (EP/pp ds4 keeps its state in `ep` (EpArch::Ds4), so this is None there.)
     pub fn deepseek4(&self) -> Option<&hipfire_arch_deepseek4::Deepseek4Bundle> {

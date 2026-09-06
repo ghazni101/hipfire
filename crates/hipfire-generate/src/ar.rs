@@ -742,6 +742,7 @@ pub enum GenerationRoute {
     LlamaSpec,
     GlimmerAr,
     GlimmerSpec,
+    K2HorizonAr,
     PipelineParallel,
     DotsOcr,
     Unknown,
@@ -771,6 +772,7 @@ impl GenerationRoute {
         Self::GlimmerSpec,
         Self::PipelineParallel,
         Self::DotsOcr,
+        Self::K2HorizonAr,
         Self::Unknown,
     ];
 
@@ -809,6 +811,7 @@ impl GenerationRoute {
             Self::LlamaSpec => "llama_spec",
             Self::GlimmerAr => "glimmer_ar",
             Self::GlimmerSpec => "glimmer_spec",
+            Self::K2HorizonAr => "k2_horizon_ar",
             Self::PipelineParallel => "pipeline_parallel",
             Self::DotsOcr => "dots_ocr",
             Self::Unknown => "unknown",
@@ -909,6 +912,7 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
             };
         }
         8 => return GenerationRoute::DotsOcr,
+        15 => return GenerationRoute::K2HorizonAr,
         _ => {}
     }
 
@@ -1545,6 +1549,32 @@ pub fn generate(
             );
             let _ = (repeat_penalty, repeat_window);
             crate::dense::generate_cohere2moe(
+                m,
+                gpu,
+                stdout,
+                id,
+                prompt,
+                system_prompt,
+                temp,
+                top_p,
+                max_tokens,
+                max_think_tokens,
+                tools,
+                messages_history,
+            );
+            return;
+        }
+        GenerationRoute::K2HorizonAr => {
+            let _ = (
+                budget_alert_at_tok,
+                budget_alert_text,
+                assistant_prefix,
+                pflash_state,
+                pflash_cfg,
+                think_mode,
+            );
+            let _ = (repeat_penalty, repeat_window);
+            crate::dense::generate_k2_horizon(
                 m,
                 gpu,
                 stdout,
@@ -4456,6 +4486,7 @@ pub fn reset_core_arch_key(arch_id: u32) -> &'static str {
         12 => "cohere2moe",
         13 => "gemma4",
         14 => "muse_glimmer",
+        15 => "k2_horizon",
         _ => "unknown",
     }
 }

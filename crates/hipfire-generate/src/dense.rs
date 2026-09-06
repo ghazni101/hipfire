@@ -12,6 +12,7 @@ use hipfire_arch_gemma4 as gemma4;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
 use hipfire_arch_muse_glimmer as glimmer;
+use hipfire_arch_k2_horizon as k2_horizon;
 use hipfire_arch_qwen2::qwen2;
 use std::any::Any;
 use std::path::PathBuf;
@@ -7413,6 +7414,222 @@ pub fn generate_qwen2(
         "tok_s": (tok_s * 100.0).round() / 100.0,
         "prefill_ms": prefill_ms,
         "total_ms": total_ms,
+        "attempt_id": active_attempt_id(),
+    });
+    match await_client_terminal_commit(stdout, id, &pending_done) {
+        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+        ClientTerminalDecision::Abort => {}
+    }
+}
+
+// ─── K2-Horizon (arch_id=15) generate path ─────────────────────────────
+//
+// Minimal bring-up: Jinja prompt render → sequential prefill → greedy/temp
+// decode loop → JSONL token stream → done event. No LCP, no batched prefill,
+// no spec decode, no agentic markers. Correctness-first; performance
+// refinements (batched prefill, indexed-MoE GEMV, GPU-side topk) come later.
+
+/// K2-Horizon generate path (arch_id=15). Sequential decode, CPU-side
+/// sampling. Follows the cohere2moe pattern but stripped to essentials.
+#[allow(clippy::too_many_arguments)]
+pub fn generate_k2_horizon(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    id: &str,
+    prompt: &str,
+    system_prompt: Option<&str>,
+    temp: f32,
+    top_p: f32,
+    max_tokens: usize,
+    _max_think_tokens: usize,
+    _tools: Option<&[serde_json::Value]>,
+    _messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+) {
+    if m.tokenizer.is_none() {
+        emit_error_with_id(stdout, id, "tokenizer not loaded");
+        let _ = stdout.flush();
+        return;
+    }
+    if m.k2_horizon().is_none() {
+        emit_error_with_id(
+            stdout,
+            id,
+            "k2_horizon bundle missing on arch_id=15 generate",
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
+    let t0 = Instant::now();
+
+    // ── Prompt build ──
+    let prompt_ids: Vec<u32> = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+        let try_jinja = jinja_enabled && m.chat_template.is_some();
+        if try_jinja {
+            let template = m.chat_template.as_ref().unwrap();
+            let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+                tokenizer,
+                template,
+                system: system_prompt,
+                user: prompt,
+                enable_thinking: false,
+                bos_token: None,
+                reasoning_strength: None,
+                reasoning_effort: None,
+            };
+            match frame.render() {
+                Ok(rendered) => tokenizer.encode(&rendered),
+                Err(e) => {
+                    emit_error_with_id(stdout, id, format!("k2_horizon jinja render failed: {e}"));
+                    let _ = stdout.flush();
+                    return;
+                }
+            }
+        } else {
+            // Fallback: BOS-prepended raw encode.
+            let mut ids = tokenizer.encode(prompt);
+            if let Some(sys) = system_prompt {
+                let sys_ids = tokenizer.encode(sys);
+                ids = sys_ids.into_iter().chain(ids).collect();
+            }
+            ids
+        }
+    };
+
+    if prompt_ids.is_empty() {
+        emit_error_with_id(stdout, id, "empty prompt after tokenize");
+        let _ = stdout.flush();
+        return;
+    }
+
+    let eos_tok = m.k2_horizon().map(|b| b.eos_tok).unwrap_or(1);
+
+    // ── Prefill (sequential decode_step) ──
+    let prefill_t0 = Instant::now();
+    {
+        let b = m.k2_horizon_mut().unwrap();
+        let _ = b.state.reset(gpu);
+    }
+
+    let mut last_logits: Vec<f32> = Vec::new();
+    for (i, &tok) in prompt_ids.iter().enumerate() {
+        let step = {
+            let b = m.k2_horizon_mut().unwrap();
+            let position = b.state.n_tokens as u32;
+            k2_horizon::forward::decode_step(
+                &b.config,
+                &b.weights,
+                &mut b.state,
+                gpu,
+                tok,
+                position,
+            )
+        };
+        match step {
+            Ok(logits) => {
+                last_logits = logits;
+                let b = m.k2_horizon_mut().unwrap();
+                b.state.n_tokens += 1;
+            }
+            Err(e) => {
+                emit_error_with_id(stdout, id, format!("k2_horizon prefill failed: {e:?}"));
+                let _ = stdout.flush();
+                return;
+            }
+        }
+    }
+    let prefill_ms = prefill_t0.elapsed().as_millis();
+
+    // ── Decode loop ──
+    let decode_t0 = Instant::now();
+    let mut generated_count = 0usize;
+    let mut rng = deepseek4::sampling::Xorshift::new(0xDEAD_BEEF);
+    let mut emitted_visible = false;
+
+    loop {
+        if generated_count >= max_tokens {
+            break;
+        }
+
+        // Sample next token from last logits.
+        let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
+
+        if next_tok == eos_tok {
+            break;
+        }
+
+        // Decode token → text and stream.
+        let frag = {
+            let tokenizer = m.tokenizer.as_ref().unwrap();
+            tokenizer.decode(&[next_tok])
+        };
+        let _ = writeln!(
+            stdout,
+            "{}",
+            serde_json::json!({"type": "token", "id": id, "text": frag, "attempt_id": active_attempt_id()})
+        );
+        let _ = stdout.flush();
+        emitted_visible = true;
+        generated_count += 1;
+
+        // Advance one step.
+        let step = {
+            let b = m.k2_horizon_mut().unwrap();
+            let position = b.state.n_tokens as u32;
+            k2_horizon::forward::decode_step(
+                &b.config,
+                &b.weights,
+                &mut b.state,
+                gpu,
+                next_tok,
+                position,
+            )
+        };
+        match step {
+            Ok(logits) => {
+                last_logits = logits;
+                let b = m.k2_horizon_mut().unwrap();
+                b.state.n_tokens += 1;
+            }
+            Err(e) => {
+                emit_error_with_id(stdout, id, format!("k2_horizon decode failed: {e:?}"));
+                let _ = stdout.flush();
+                return;
+            }
+        }
+    }
+
+    m.seq_pos = m.k2_horizon().map(|b| b.state.n_tokens).unwrap_or(0);
+
+    let decode_ms = decode_t0.elapsed().as_millis().max(1);
+    let total_ms = t0.elapsed().as_millis().max(1);
+    let tok_s = if generated_count > 0 {
+        (generated_count as f64 * 1000.0) / decode_ms as f64
+    } else {
+        0.0
+    };
+    let prefill_tokens = prompt_ids.len();
+    let prefill_tok_s = if prefill_ms > 0 {
+        (prefill_tokens as f64 * 1000.0) / prefill_ms as f64
+    } else {
+        0.0
+    };
+
+    let pending_done = serde_json::json!({
+        "type": "done",
+        "id": id,
+        "tokens": generated_count,
+        "tok_s": (tok_s * 100.0).round() / 100.0,
+        "prefill_tokens": prefill_tokens,
+        "prefill_ms": prefill_ms,
+        "prefill_tok_s": (prefill_tok_s * 10.0).round() / 10.0,
+        "decode_tok_s": (tok_s * 100.0).round() / 100.0,
+        "ttft_ms": prefill_ms,
+        "total_ms": total_ms,
+        "finish_reason": "stop",
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {

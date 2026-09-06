@@ -202,19 +202,24 @@ impl K2HorizonState {
 
 /// Single-token decode step.
 ///
-/// Reads `state.h` (residual stream, seeded by embedding lookup) and
-/// `position`. Writes logits to `state.logits`.
+/// Looks up the embedding for `token_id`, runs all 48 layers, and returns
+/// the full logits vector `[vocab_size]`.
 pub fn decode_step(
     cfg: &K2HorizonConfig,
     weights: &K2HorizonWeights,
     state: &mut K2HorizonState,
     gpu: &mut Gpu,
+    token_id: u32,
     position: u32,
-) -> Result<(), String> {
+) -> Result<Vec<f32>, String> {
     // Stage position on device.
     gpu.hip
         .memcpy_htod(&state.pos_buf, &position.to_ne_bytes())
         .map_err(|e| format!("k2_horizon: stage pos: {e:?}"))?;
+
+    // Embedding lookup → state.h.
+    gpu.embedding_lookup(&weights.token_embd, &state.h, token_id, cfg.dim)
+        .map_err(|e| format!("k2_horizon: embed lookup: {e:?}"))?;
 
     let dense_layers = &weights.dense_layers;
     let moe_layers = &weights.moe_layers;
@@ -248,7 +253,9 @@ pub fn decode_step(
         return Err("k2_horizon: tied embeddings not yet supported".into());
     }
 
-    Ok(())
+    // Download logits for CPU-side sampling.
+    gpu.download_f32(&state.logits)
+        .map_err(|e| format!("k2_horizon: download logits: {e:?}"))
 }
 
 // ─── KV write + attention helper ────────────────────────────────────────

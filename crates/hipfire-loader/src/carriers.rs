@@ -2291,10 +2291,33 @@ impl Carrier for K2HorizonCarrier {
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
         saddle_core::sampling::SamplingDefaults::new(1.0, 0.95, 1.0)
     }
-    fn load(&self, _src: ModelSource, _ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
-        Err(
-            "k2_horizon: load not yet implemented — see docs/plans/k2-horizon-arch-spec.md Phase 6".into(),
-        )
+    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+        if ctx.pp > 1 {
+            return Err("k2_horizon: pp>1 unsupported".into());
+        }
+        dir_diag(&src);
+        let meta = resolve_source_meta(&src, ctx.path)?;
+        let bundle = hipfire_arch_k2_horizon::load::load_k2_horizon_bundle(src, ctx)?;
+        let speculator = crate::spec_build::build_speculator(
+            meta.arch_id,
+            None,
+            None,
+            true,
+            ctx.max_seq,
+            ctx.spec,
+        );
+        Ok(LoadedModel {
+            state: Some(Box::new(bundle)),
+            speculator,
+            ..LoadedModel::skeleton(
+                meta.arch_id,
+                meta.tokenizer,
+                ctx.max_seq,
+                ctx.max_seq,
+                ctx.path.to_string(),
+                meta.chat_template,
+            )
+        })
     }
 }
 
