@@ -10,6 +10,7 @@ use crate::{DeviceBuffer, MemcpyKind};
 use libloading::{Library, Symbol};
 use std::ffi::{c_char, c_int, c_uint, c_void, CString};
 use std::ptr;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 /// Per-thread accumulators for time spent inside HIP FFI calls. Used by
 /// Phase 3a host-vs-GPU diagnostics to attribute the forward pass wall
@@ -111,6 +112,67 @@ type HipEvent = *mut c_void;
 type HipGraph = *mut c_void;
 type HipGraphExec = *mut c_void;
 pub type HipMemGenericAllocationHandle = *mut c_void;
+
+// ── A19 HIP fault injection (oracle only) ──────────────────────────────
+// HIPFIRE_FAULT_HIP=<class>[:<count>][,...] makes the FIRST `count` calls
+// of the chosen class (`upload` = H2D memcpy, `launch` = kernel launch,
+// `sync` = stream synchronize) fail with an injected error. This exercises
+// the engine's fail-closed path for device faults — typed rejection,
+// poisoned resources not reused, no same-forward fallback execution
+// (spec §5.4 S4, oracle cell A19). Inert unless the variable is set by the
+// time the first fault-class call occurs; the steady-state cost is one
+// atomic load per API call.
+const HIP_FAULT_UNSET: usize = usize::MAX;
+static HIP_FAULT_UPLOAD: AtomicUsize = AtomicUsize::new(HIP_FAULT_UNSET);
+static HIP_FAULT_LAUNCH: AtomicUsize = AtomicUsize::new(HIP_FAULT_UNSET);
+static HIP_FAULT_SYNC: AtomicUsize = AtomicUsize::new(HIP_FAULT_UNSET);
+
+fn hip_fault_consume(class_idx: usize, class: &'static str) -> bool {
+    let cells = [&HIP_FAULT_UPLOAD, &HIP_FAULT_LAUNCH, &HIP_FAULT_SYNC];
+    let cell = cells[class_idx];
+    let mut cur = cell.load(Ordering::Acquire);
+    if cur == HIP_FAULT_UNSET {
+        // Arm-after-load semantics: model load issues hundreds of fault-
+        // class calls before the oracle can arm, so an ABSENT variable must
+        // not latch the class inert — stay unset and re-read. Once the
+        // variable is present, the class count latches (0 = inert forever).
+        let Ok(spec) = std::env::var("HIPFIRE_FAULT_HIP") else {
+            return false;
+        };
+        let n = spec
+            .split(',')
+            .find_map(|part| {
+                let mut it = part.splitn(2, ':');
+                let name = it.next()?.trim();
+                if name != class {
+                    return None;
+                }
+                Some(it.next().and_then(|v| v.parse().ok()).unwrap_or(1))
+            })
+            .unwrap_or(0);
+        cell.store(n, Ordering::Release);
+        cur = n;
+    }
+    while cur != 0 {
+        match cell.compare_exchange(cur, cur - 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => {
+                eprintln!("[hip-bridge] A19: injected {class} fault (HIPFIRE_FAULT_HIP)");
+                return true;
+            }
+            Err(actual) => cur = actual,
+        }
+    }
+    false
+}
+
+const HIP_FAULT_UNKNOWN: u32 = 999; // hipErrorUnknown
+
+fn hip_fault_err(class: &'static str) -> HipError {
+    HipError::new(
+        HIP_FAULT_UNKNOWN,
+        &format!("HIPFIRE_FAULT_HIP: injected {class} failure (A19)"),
+    )
+}
 
 const HIP_SUCCESS: u32 = 0;
 
@@ -1115,6 +1177,9 @@ impl HipRuntime {
     }
 
     pub fn memcpy_htod(&self, dst: &DeviceBuffer, src: &[u8]) -> HipResult<()> {
+        if hip_fault_consume(0, "upload") {
+            return Err(hip_fault_err("upload"));
+        }
         assert!(
             src.len() <= dst.size,
             "source ({}) exceeds device buffer ({})",
@@ -1313,6 +1378,9 @@ impl HipRuntime {
     }
 
     pub fn stream_synchronize(&self, stream: &Stream) -> HipResult<()> {
+        if hip_fault_consume(2, "sync") {
+            return Err(hip_fault_err("sync"));
+        }
         let t = std::time::Instant::now();
         let code = unsafe { (self.fn_stream_synchronize)(stream.0) };
         crate::ffi::launch_counters::stream_sync::record(t.elapsed().as_nanos() as u64);
@@ -1365,6 +1433,9 @@ impl HipRuntime {
         stream: Option<&Stream>,
         params: &mut [*mut c_void],
     ) -> HipResult<()> {
+        if hip_fault_consume(1, "launch") {
+            return Err(hip_fault_err("launch"));
+        }
         let stream_raw = stream.map_or(ptr::null_mut(), |s| s.0);
         let t = std::time::Instant::now();
         let code = (self.fn_module_launch_kernel)(
@@ -1417,6 +1488,9 @@ impl HipRuntime {
         stream: Option<&Stream>,
         kernarg_blob: &mut [u8],
     ) -> HipResult<()> {
+        if hip_fault_consume(1, "launch") {
+            return Err(hip_fault_err("launch"));
+        }
         // HIP `extra` mode sentinel constants (from hip_runtime.h):
         //   HIP_LAUNCH_PARAM_BUFFER_POINTER = 0x01
         //   HIP_LAUNCH_PARAM_BUFFER_SIZE    = 0x02
@@ -1533,6 +1607,9 @@ impl HipRuntime {
         src: &[u8],
         stream: &Stream,
     ) -> HipResult<()> {
+        if hip_fault_consume(0, "upload") {
+            return Err(hip_fault_err("upload"));
+        }
         assert!(src.len() <= dst.size);
         let code = unsafe {
             (self.fn_memcpy_async)(
@@ -1704,6 +1781,9 @@ impl HipRuntime {
     }
 
     pub fn device_synchronize(&self) -> HipResult<()> {
+        if hip_fault_consume(2, "sync") {
+            return Err(hip_fault_err("sync"));
+        }
         let t = std::time::Instant::now();
         let code = unsafe { (self.fn_device_synchronize)() };
         crate::ffi::launch_counters::device_sync::record(t.elapsed().as_nanos() as u64);

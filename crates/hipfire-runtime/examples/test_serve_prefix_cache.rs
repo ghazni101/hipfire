@@ -11,10 +11,14 @@
 //!   * grammar AR: JSON Schema mask + prefix reuse; output parses as JSON
 //!   * A10 MTP cache visibility: long generation crossing page boundaries
 //!     under MTP still replays identically from cache (candidate rows never
-//!     become cache-visible, spec §4.6.2)
+//!     become cache-visible, spec §4.6.2), plus a forced full-reject cell
+//!     (HIPFIRE_FAULT_MTP_FULL_REJECT=1) proving the τ=1 repair path is
+//!     exact and rejected rows stay invisible
 //!   * A13 mixed load: a long cold prefill and short warm requests all make
-//!     progress (spec §5.3 S3)
-//!   * A20 lifecycle: repeated warm hits, reset → cold, re-warm after reset
+//!     progress (spec §5.3 S3), plus a concurrent phase (4 requests, 2
+//!     slots) proving WaitQueue losers complete with exact outputs
+//!   * A20 lifecycle: repeated warm hits, reset → cold, re-warm after reset,
+//!     with free-page plateau + post-reset leak assertions (spec §9.2)
 //!   * A19 (--fault-publish): HIPFIRE_FAULT_PREFIX_PUBLISH=1 makes the first
 //!     publication fail → honest miss, unchanged output (fail-closed)
 //!
@@ -46,6 +50,7 @@ fn main() {
 
     let mut model_path = None;
     let mut mtp_k_arg: Option<usize> = None;
+    let mut fault_hip_class: Option<String> = None;
     let mut args = std::env::args().skip(1);
     while let Some(a) = args.next() {
         if a == "--mtp-k" {
@@ -55,6 +60,10 @@ fn main() {
                     .parse()
                     .expect("mtp_k"),
             );
+        } else if a == "--fault-hip" {
+            fault_hip_class = Some("launch".to_string());
+        } else if let Some(v) = a.strip_prefix("--fault-hip=") {
+            fault_hip_class = Some(v.to_string());
         } else if !a.starts_with('-') {
             model_path = Some(a);
         }
@@ -111,7 +120,13 @@ fn main() {
     let engine = SlotEngine::spawn(EngineConfig {
         model_path: PathBuf::from(&model_path),
         n_slots: 2,
-        cap_tokens: 1024,
+        // Pool sizing is slots x cap over 128-token pages. 2048 keeps every
+        // published path (italy + germany + generated + atlantis) resident
+        // alongside two active slots, so the A20 soak measures steady-state
+        // boundedness instead of colliding with legitimate §4.4 eviction —
+        // the pinned-path release fix (wave 8) made cached paths evictable
+        // again, which a 16-page pool turned into a soak miss.
+        cap_tokens: 2048,
         prefill_chunk: 256,
         host_budget_bytes: 4 * 1024 * 1024 * 1024,
         swap_dir: std::env::temp_dir().join("hipfire-prefix-cache-swap"),
@@ -217,6 +232,116 @@ fn main() {
             "fail-closed publish must not change generation"
         );
         println!("PASS (A19)");
+        return;
+    }
+
+    // ── A19 fault-hip mode: device-fault injection below the engine ────
+    // HIPFIRE_FAULT_HIP=<class> makes the FIRST bridge call of that class
+    // fail. Required observables (spec §5.4 S4): the affected request is
+    // REJECTED with the fault reason (never a fake Done or garbage
+    // tokens), the engine quarantines the failed step's state, and the
+    // next identical request — fault disarmed — completes with output
+    // byte-identical to the pre-fault reference (no poisoned-resource
+    // reuse, no same-forward fallback execution).
+    if let Some(class) = fault_hip_class {
+        println!("--- A19 fault-hip mode (class={class}) ---");
+        // Reference BEFORE arming, so the fault lands mid-request.
+        let (reused_ref, toks_ref) = run(&engine, italy.clone(), &greedy);
+        println!(
+            "  reference: reused={reused_ref} generated={}",
+            toks_ref.len()
+        );
+        assert!(!toks_ref.is_empty());
+        std::env::set_var("HIPFIRE_FAULT_HIP", &class);
+        let (tx, rx) = channel::<Event>();
+        engine
+            .submit(SubmitRequest {
+                prompt_tokens: italy.clone(),
+                convo: Vec::new(),
+                continuation: Continuation::Cold,
+                max_tokens: 8,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: 0,
+                seed: 0,
+                repeat_window: 0,
+                repeat_penalty: 1.0,
+                presence_penalty: 0.0,
+                frequency_penalty: 0.0,
+                min_p: 0.0,
+                visual_data: None,
+                json_schema: None,
+                queue_bytes: 0,
+                reply: tx,
+            })
+            .expect("faulted submit");
+        let mut saw_rejection = false;
+        let mut saw_done = false;
+        let mut emitted = 0usize;
+        while let Ok(ev) = rx.recv() {
+            match ev {
+                Event::Rejected { reason } => {
+                    println!("  faulted request rejected: {reason}");
+                    saw_rejection = true;
+                }
+                Event::Token { .. } => emitted += 1,
+                Event::Done { .. } => saw_done = true,
+                Event::Accepted { .. } => {}
+            }
+        }
+        std::env::remove_var("HIPFIRE_FAULT_HIP");
+        assert!(saw_rejection, "the faulted request must be typed-rejected");
+        assert!(
+            !saw_done,
+            "a device-faulted request must never surface as a successful Done"
+        );
+        assert!(
+            emitted == 0,
+            "a device-faulted request must not emit sampled tokens as if real"
+        );
+        // Recovery: the same request without the fault must replay the
+        // reference exactly. launch/upload faults fail inside the step
+        // forward, whose handler closes state and keeps the engine alive —
+        // recovery runs on the same engine. A sync fault hits the
+        // device_synchronize guard, which POISONS the engine (spec §5.4 S4:
+        // quarantine what cannot be proven valid) — recovery needs a fresh
+        // engine, and must still match byte-for-byte.
+        let (reused_rec, toks_rec) = match engine.reset() {
+            Ok(()) => run(&engine, italy.clone(), &greedy),
+            Err(_) => {
+                println!("  engine poisoned by sync fault — recreating for recovery");
+                let fresh = SlotEngine::spawn(EngineConfig {
+                    model_path: PathBuf::from(&model_path),
+                    n_slots: 2,
+                    cap_tokens: 2048,
+                    prefill_chunk: 256,
+                    host_budget_bytes: 4 * 1024 * 1024 * 1024,
+                    swap_dir: std::env::temp_dir().join("hipfire-prefix-cache-swap"),
+                    is_vl: false,
+                    vl_path: None,
+                    mtp_k,
+                    kv_mode_raw: String::new(),
+                    prefix_cache: true,
+                    prefix_cache_max_bytes: 256 * 1024 * 1024,
+                    max_batch_tokens: 4096,
+                    prefill_min_tokens: 1,
+                    wait_max_count: 64,
+                    wait_max_bytes: 256 * 1024 * 1024,
+                    wait_timeout_ticks: 30_000,
+                    structured_jump_forward: false,
+                })
+                .expect("fresh engine after poison");
+                let out = run(&fresh, italy.clone(), &greedy);
+                drop(fresh);
+                out
+            }
+        };
+        println!("  recovery: reused={reused_rec} generated={}", toks_rec.len());
+        assert_eq!(
+            toks_rec, toks_ref,
+            "post-fault recovery must match the reference exactly"
+        );
+        println!("PASS (A19 fault-hip {class})");
         return;
     }
 
@@ -337,6 +462,36 @@ fn main() {
         "warm long generation must match cold exactly — no candidate row may be cache-visible"
     );
 
+    // ── A10 forced full-reject (τ=1 repair + cache visibility) ──────────
+    // HIPFIRE_FAULT_MTP_FULL_REJECT=1 makes every verify cycle reject all
+    // candidates, so the generation advances one trunk-argmax token per
+    // cycle — the same greedy sequence the accepting path produces, just
+    // slower. Asserting equality against toks_l1 proves the full-reject
+    // repair path (zero-length accepted prefix, DN rollback + replay) is
+    // exact; the warm replay equality proves rejected candidate rows never
+    // became cache-visible (spec §4.6.2, A10 "full reject").
+    std::env::set_var("HIPFIRE_FAULT_MTP_FULL_REJECT", "1");
+    let (reused_fr, toks_fr) = run(&engine, italy.clone(), &long_greedy);
+    std::env::remove_var("HIPFIRE_FAULT_MTP_FULL_REJECT");
+    println!(
+        "  A10 full-reject cold: reused={reused_fr} generated={}",
+        toks_fr.len()
+    );
+    assert_eq!(
+        toks_fr, toks_l1,
+        "forced full-reject MTP must produce the accepting-MTP greedy sequence"
+    );
+    let (reused_fw, toks_fw) = run(&engine, italy.clone(), &long_greedy);
+    println!("  A10 full-reject warm: reused={reused_fw}");
+    assert!(
+        reused_fw >= PAGE,
+        "warm replay after full-reject cycles must reuse the published prefix"
+    );
+    assert_eq!(
+        toks_fw, toks_fr,
+        "warm replay must match the full-reject generation — rejected candidates are not cache-visible"
+    );
+
     // ── A13: mixed load progress bound (spec §5.3 S3) ──────────────────
     // A long COLD prefill (distinct prefix) submitted concurrently with
     // short warm requests: all must complete — the long prefill may not
@@ -408,13 +563,115 @@ fn main() {
         "the distinct long prefix must be a cold miss"
     );
 
+    // ── A13 concurrent adversarial phase ────────────────────────────────
+    // Warm hits, a warm miss-then-hit branch, and one small fresh cold
+    // request all submitted back-to-back against two slots: losers must
+    // park in the WaitQueue and still complete (bounded waiting, spec
+    // §5.3 S3), with per-request outputs exact — reorder must not
+    // cross-contaminate greedy generations.
+    let small_cold: Vec<u32> = {
+        let mut v = tokenizer.encode("Tiny fresh cold prompt for the concurrency cell. ");
+        v.extend(tokenizer.encode("It only needs a page or two of KV."));
+        v
+    };
+    let specs: Vec<(Vec<u32>, Option<Vec<u32>>)> = vec![
+        (italy.clone(), Some(toks_italy_1.clone())),
+        (italy.clone(), Some(toks_italy_1.clone())),
+        (atl_short.clone(), Some(toks_short.clone())),
+        (small_cold, None),
+    ];
+    let t0 = std::time::Instant::now();
+    let rxs: Vec<std::sync::mpsc::Receiver<Event>> = specs
+        .iter()
+        .map(|(prompt, _)| {
+            let (tx, rx) = channel::<Event>();
+            engine
+                .submit(SubmitRequest {
+                    prompt_tokens: prompt.clone(),
+                    convo: Vec::new(),
+                    continuation: Continuation::Cold,
+                    max_tokens: 8,
+                    temperature: 0.0,
+                    top_p: 1.0,
+                    top_k: 0,
+                    seed: 0,
+                    repeat_window: 0,
+                    repeat_penalty: 1.0,
+                    presence_penalty: 0.0,
+                    frequency_penalty: 0.0,
+                    min_p: 0.0,
+                    visual_data: None,
+                    json_schema: None,
+                    queue_bytes: 0,
+                    reply: tx,
+                })
+                .expect("concurrent submit");
+            rx
+        })
+        .collect();
+    let handles: Vec<_> = rxs
+        .into_iter()
+        .zip(specs)
+        .map(|(rx, (_, expect))| {
+            std::thread::spawn(move || {
+                let mut reused = 0usize;
+                let mut tokens = Vec::new();
+                while let Ok(ev) = rx.recv() {
+                    match ev {
+                        Event::Accepted { reused: r, .. } => reused = r,
+                        Event::Token { id } => tokens.push(id),
+                        Event::Rejected { reason } => {
+                            panic!("concurrent request rejected: {reason}")
+                        }
+                        Event::Done { .. } => break,
+                    }
+                }
+                (reused, tokens, expect)
+            })
+        })
+        .collect();
+    for h in handles {
+        let (reused, tokens, expect) = h.join().expect("concurrent thread");
+        assert!(!tokens.is_empty(), "concurrent request produced no tokens");
+        if let Some(expect) = expect {
+            assert_eq!(
+                tokens, expect,
+                "concurrent warm request must replay the exact reference tokens"
+            );
+        }
+        let _ = reused;
+    }
+    println!(
+        "  A13 concurrent: 4 requests (3 warm + 1 cold) all exact in {:?}",
+        t0.elapsed()
+    );
+    assert!(
+        t0.elapsed() < std::time::Duration::from_secs(120),
+        "concurrent phase must complete within the wait bound"
+    );
+
     // A20: repeated warm hits stay bounded, then reset forces a cold miss.
+    // Pool telemetry (spec §9.2 / A20): identical request cycles at steady
+    // state must not walk free pages downward — the page-level leak
+    // signature.
+    let mut soak_free: Vec<usize> = Vec::new();
     for i in 0..4 {
         let (r, toks) = run(&engine, italy.clone(), &greedy);
-        println!("  soak[{i}]: reused={r} generated={}", toks.len());
+        soak_free.push(engine.stats().pool_free_pages);
+        println!(
+            "  soak[{i}]: reused={r} generated={} free_pages={}",
+            toks.len(),
+            soak_free[i]
+        );
         assert!(r >= PAGE, "soak request {i} lost prefix reuse ({r})");
         assert_eq!(toks, toks_italy_1, "soak request {i} drifted from greedy");
     }
+    assert!(
+        soak_free[3] + 1 >= soak_free[0],
+        "free pages declined across identical soak cycles: {:?} (leak)",
+        soak_free
+    );
+    let pre_reset_free = soak_free[3];
     engine.reset().expect("reset after idle");
     let (reused_after_reset, toks_after_reset) = run(&engine, italy.clone(), &greedy);
     println!("  after reset: reused={reused_after_reset}");
@@ -425,6 +682,14 @@ fn main() {
     assert_eq!(
         toks_after_reset, toks_italy_1,
         "post-reset cold generation must still match the original greedy run"
+    );
+    // Post-reset the pool must be back at-or-above the steady-state level:
+    // the radix cache leases were released (fix 11) and sessions closed.
+    let post_reset_free = engine.stats().pool_free_pages;
+    println!("  post-reset free_pages={post_reset_free} (pre-reset {pre_reset_free})");
+    assert!(
+        post_reset_free >= pre_reset_free,
+        "reset leaked pages: post-reset free {post_reset_free} < pre-reset {pre_reset_free}"
     );
 
     // A20 re-warm: publications resume after reset — the fresh cold run
