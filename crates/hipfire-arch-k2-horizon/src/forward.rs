@@ -29,8 +29,11 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 
 // ─── State ──────────────────────────────────────────────────────────────
 
-const DEFAULT_MAX_SEQ: usize = 32_768;
+const DEFAULT_MAX_SEQ: usize = 2048;
 const SOFTPLUS_BETA: f32 = std::f32::consts::LN_2;
+/// Flash prefill sub-batch size. Smaller = less VRAM. K2-Horizon has 32 heads
+/// × 128 head_dim; at max_seq=2048 this is 32×17×130×16 = ~1.1 MB.
+const FLASH_PREFILL_SUBBATCH: usize = 16;
 
 /// Per-decode GPU scratch + KV cache for K2-Horizon.
 pub struct K2HorizonState {
@@ -73,6 +76,7 @@ pub struct K2HorizonState {
     // head
     pub final_norm_buf: GpuTensor, // [hidden]
     pub logits: GpuTensor,         // [vocab]
+    pub flash_partials: GpuTensor, // flash attention scratch (pre-allocated)
 }
 
 impl K2HorizonState {
@@ -105,6 +109,7 @@ impl K2HorizonState {
             shared_down,
             final_norm_buf,
             logits,
+            flash_partials,
         } = self;
         let _ = kv.free_gpu(gpu);
         let _ = gpu.hip.free(pos_buf);
@@ -114,7 +119,7 @@ impl K2HorizonState {
             dense_gate, dense_up, dense_act,
             moe_router_logits, moe_expert_gate, moe_expert_up, moe_expert_act,
             moe_expert_down, shared_gate, shared_up, shared_act, shared_down,
-            final_norm_buf, logits,
+            final_norm_buf, logits, flash_partials,
         ] {
             let _ = gpu.free_tensor(t);
         }
@@ -186,6 +191,14 @@ impl K2HorizonState {
             shared_down: alloc(gpu, hidden, "shared_down")?,
             final_norm_buf: alloc(gpu, hidden, "final_norm_buf")?,
             logits: alloc(gpu, cfg.vocab_size, "logits")?,
+            flash_partials: alloc(
+                gpu,
+                cfg.n_heads
+                    * ((max_seq + 127) / 128)
+                    * (2 + cfg.head_dim)
+                    * FLASH_PREFILL_SUBBATCH,
+                "flash_partials",
+            )?,
         })
     }
 
@@ -295,7 +308,7 @@ fn attend(
         physical_cap: state.kv.physical_cap,
         batch_size: 1,
         max_ctx_len: 0,
-        flash_partials: None,
+        flash_partials: Some(&state.flash_partials),
         givens_cos: None,
         givens_sin: None,
         tree_bias: None,
