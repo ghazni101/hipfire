@@ -9,11 +9,13 @@
 //! - **MoE layers (3–47)**: MoVA attention (q/k + v_experts routing +
 //!   softplus post-attn gate) + sigmoid-routed MoE FFN.
 //!
-//! Both MoVA value-expert routing and MoE FFN routing use GPU-side
-//! `deepseek4_moe_topk_bias_aware_f32` for bias-aware top-K (no D2H),
-//! followed by GPU-indexed MoE GEMV kernels
-//! (`gemv_hfq4g256_moe_*_k8_indexed_batched`). The forward body is
-//! PM4-capturable — no CPU sync points inside the layer loop.
+//! MoVA value-expert routing uses GPU-side `deepseek4_moe_topk_bias_aware_f32`
+//! for bias-aware top-K, then downloads 4 expert indices (16 bytes) for
+//! per-expert `weight_gemv`. MoE FFN routing uses the same GPU top-K, then
+//! GPU-indexed MoE GEMV kernels (`gemv_hfq4g256_moe_*_k8_indexed_batched`).
+//! GPU-side sampling (`argmax_f32` / `sample_top_p`) eliminates the ~1 MB
+//! logits download per token. PM4 retained-replay is not yet enabled — the
+//! MoVA D2H index download breaks capture.
 //! KV write + attention uses the dispatch layer (`KvTierPlan` + `AttnParams`),
 //! matching the cohere2moe pattern.
 
@@ -24,12 +26,10 @@ use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::attention::AttnParams;
 use hipfire_dispatch::families::kv_tier::{KvTierInputs, KvTierPlan};
 use hipfire_runtime::llama::{
-    fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_for, weight_gemv,
-    weight_gemv_residual, KvCache, KvCacheExt,
+    rotate_x_mq_for, weight_gemv, weight_gemv_residual, KvCache, KvCacheExt,
 };
 use hipfire_dispatch::pipeline::{execute_steps, Step};
 use rdna_compute::{DType, Gpu, GpuTensor};
-
 // ─── State ──────────────────────────────────────────────────────────────
 
 const DEFAULT_MAX_SEQ: usize = 2048;
@@ -60,12 +60,10 @@ pub struct K2HorizonState {
     pub fa_v: GpuTensor,        // [n_kv_heads * head_dim] = [1024] (dense) or [kv_dim] (MoVA)
     pub fa_attn_out: GpuTensor, // [n_heads * head_dim] = [4096]
 
-    // MoVA routing scratch (GPU indexed GEMV)
+    // MoVA routing scratch
     pub v_router_logits: GpuTensor, // [mova_num_experts] = [64]
     pub v_topk_indices: GpuTensor,  // [mova_k_top] = [4] i32-in-F32
     pub v_topk_weights: GpuTensor,  // [mova_k_top] = [4]
-    pub v_x_rot: GpuTensor,         // [hidden] — FWHT(normed) for MoVA GEMV
-    pub v_expanded: GpuTensor,      // [mova_k_top * kv_dim] = [4 * 1024]
     pub attn_gate_out: GpuTensor,   // [n_heads * head_dim] = [4096] — gate_proj output
 
     // dense FFN scratch
@@ -114,8 +112,6 @@ impl K2HorizonState {
             v_router_logits,
             v_topk_indices,
             v_topk_weights,
-            v_x_rot,
-            v_expanded,
             attn_gate_out,
             dense_gate,
             dense_up,
@@ -141,10 +137,8 @@ impl K2HorizonState {
         let _ = gpu.hip.free(pos_buf);
         for t in [
             h, normed, fa_q, fa_k, fa_v, fa_attn_out,
-            v_router_logits, v_topk_indices, v_topk_weights, v_x_rot, v_expanded,
+            v_router_logits, v_topk_indices, v_topk_weights,
             attn_gate_out,
-            dense_gate, dense_up, dense_act,
-            shared_gate, shared_up, shared_act, shared_down,
             scratch_act, scratch_down, scratch_v,
             ffn_x_rot, gate_batch, up_batch, rot_batch, down_expanded,
             final_norm_buf, logits, flash_partials,
@@ -208,8 +202,6 @@ impl K2HorizonState {
             v_router_logits: alloc(gpu, mova_n_exp, "v_router_logits")?,
             v_topk_indices: alloc(gpu, mova_k, "v_topk_indices")?,
             v_topk_weights: alloc(gpu, mova_k, "v_topk_weights")?,
-            v_x_rot: alloc(gpu, hidden, "v_x_rot")?,
-            v_expanded: alloc(gpu, mova_k * kv_dim, "v_expanded")?,
             attn_gate_out: alloc(gpu, q_dim, "attn_gate_out")?,
             dense_gate: alloc(gpu, dense_inter, "dense_gate")?,
             dense_up: alloc(gpu, dense_inter, "dense_up")?,
@@ -255,9 +247,18 @@ impl K2HorizonState {
 
 // ─── Forward ────────────────────────────────────────────────────────────
 
-/// Stage per-token inputs: position + embedding lookup.
-/// Runs outside PM4 capture/replay — these are the per-token variable inputs.
-fn prepare_decode_inputs(
+/// Single-token decode step.
+/// Run the full forward (embedding → 48 layers → final norm → lm_head).
+/// Logits land in `state.logits` on GPU. No download.
+///
+/// PM4 retained-replay is not yet enabled for K2-Horizon: the MoVA
+/// per-expert GEMV path downloads 4 expert indices (16 bytes) per layer
+/// to select weight tensors on the host, which breaks PM4 capture. The
+/// GPU routing (deepseek4_moe_topk_bias_aware_f32) and GPU sampling
+/// (argmax_f32 / sample_top_p) are active — eliminating the CPU sort
+/// and 1MB logits download. PM4 can be enabled once a broadcast-capable
+/// indexed v_expert kernel eliminates the MoVA D2H sync.
+fn forward_only(
     cfg: &K2HorizonConfig,
     weights: &K2HorizonWeights,
     state: &mut K2HorizonState,
@@ -265,34 +266,28 @@ fn prepare_decode_inputs(
     token_id: u32,
     position: u32,
 ) -> Result<(), String> {
+    // Stage position on device.
     gpu.hip
         .memcpy_htod(&state.pos_buf, &position.to_ne_bytes())
         .map_err(|e| format!("k2_horizon: stage pos: {e:?}"))?;
+
+    // Embedding lookup → state.h.
     gpu.embedding_lookup_q8(&weights.token_embd, &state.h, token_id, cfg.dim)
         .map_err(|e| format!("k2_horizon: embed lookup: {e:?}"))?;
-    Ok(())
-}
 
-/// Run the decode body: 48 layers + final norm + lm_head.
-/// This is the PM4-capturable sequence — pure GPU kernel launches, no syncs.
-fn run_decode_body(
-    cfg: &K2HorizonConfig,
-    weights: &K2HorizonWeights,
-    state: &mut K2HorizonState,
-    gpu: &mut Gpu,
-) -> Result<(), String> {
     let dense_layers = &weights.dense_layers;
     let moe_layers = &weights.moe_layers;
 
     for (l, layer) in dense_layers.iter().enumerate() {
-        forward_dense_layer(cfg, layer, state, gpu, l, 0)?;
+        forward_dense_layer(cfg, layer, state, gpu, l, position)?;
     }
 
     for (l, layer) in moe_layers.iter().enumerate() {
         let global_layer = dense_layers.len() + l;
-        forward_moe_layer(cfg, layer, state, gpu, global_layer, 0)?;
+        forward_moe_layer(cfg, layer, state, gpu, global_layer, position)?;
     }
 
+    // Final norm + lm_head.
     gpu.grouped_rmsnorm_f32(
         &state.h,
         &weights.final_norm,
@@ -312,56 +307,6 @@ fn run_decode_body(
     }
     Ok(())
 }
-
-/// Single-token decode step with PM4 retained-replay support.
-/// Runs the full forward (embedding → 48 layers → final norm → lm_head).
-/// Logits land in `state.logits` on GPU. No download.
-fn forward_only(
-    cfg: &K2HorizonConfig,
-    weights: &K2HorizonWeights,
-    state: &mut K2HorizonState,
-    gpu: &mut Gpu,
-    token_id: u32,
-    position: u32,
-) -> Result<(), String> {
-    // PM4 lifecycle: if armed, begin capture; if ready, replay.
-    gpu.replay.set_forward_eligible(true);
-    gpu.replay
-        .begin_auto_capture_if_armed()
-        .map_err(|e| format!("k2_horizon: begin capture: {e}"))?;
-
-    // If PM4 is ready, replay the captured body (just pos upload + replay).
-    if gpu.replay.should_route_pm4() {
-        prepare_decode_inputs(cfg, weights, state, gpu, token_id, position)?;
-        let replay = unsafe { gpu.replay.replay_pm4(position as usize) };
-        return match replay {
-            Ok(_) => Ok(()),
-            Err(reason) => Err(format!("k2_horizon: pm4 replay: {reason}")),
-        };
-    }
-
-    // Not ready — run forward body (gets recorded if in RecordingWarmup).
-    prepare_decode_inputs(cfg, weights, state, gpu, token_id, position)?;
-    run_decode_body(cfg, weights, state, gpu)?;
-
-    // If we just finished recording, finalize the capture and prepare PM4.
-    if gpu.replay.should_auto_finalize_capture() {
-        gpu.hip
-            .device_synchronize()
-            .map_err(|e| format!("k2_horizon: sync for capture: {e:?}"))?;
-        gpu.replay
-            .finish_capture()
-            .map_err(|e| format!("k2_horizon: finish capture: {e}"))?;
-        let launches = gpu.replay.recorded_launches().len();
-        gpu.replay
-            .prepare_pm4_prefix(gpu.device_id as usize, launches)
-            .map(|_| ())
-            .map_err(|e| format!("k2_horizon: prepare pm4 prefix: {e}"))?;
-    }
-    Ok(())
-}
-
-/// Full decode step: forward + download logits for CPU-side sampling.
 /// Use [`decode_step_sampled`] instead when the caller can sample on GPU
 /// (avoids the ~1 MB logits download per token).
 pub fn decode_step(
@@ -434,8 +379,8 @@ fn attend(
         pos: seq_len - 1,
         q8_windowed: true,
         window: 0,
-        flash_mode: 2, // always flash — PM4-capturable (attention_flash_q8_0_reduce)
-        capture_mode: gpu.graphs.capture_mode,
+        flash_mode: 0, // let KvTierPlan decide (non-flash for short ctx, flash for long)
+        capture_mode: false,
         ..state.kv.tier_inputs()
     })
     .map_err(|e| format!("k2_horizon L{l}: kv tier: {e}"))?;
@@ -656,20 +601,19 @@ fn forward_moe_layer(
     Ok(())
 }
 
-// ─── MoVA value-expert routing (GPU indexed GEMV) ───────────────────────
+// ─── MoVA value-expert routing (GPU topk + per-expert GEMV) ────────────
 
-/// MoVA attention value routing using GPU-indexed MoE GEMV kernels:
-/// 1. router_logits = v_router(normed)  [mova_num_experts]
-/// 2. sigmoid(router_logits)
-/// 3. CPU top-k (download 64 floats, add bias for selection, topk, normalize, scale)
-/// MoVA value routing using per-expert weight_gemv:
-/// 1. router_logits = v_router(normed)  [mova_num_experts]
-/// 2. sigmoid(router_logits)
-/// 3. CPU top-k (download 64 floats, add bias for selection, topk, normalize, scale)
-/// 4. For each selected expert e:
-///    a. weight_gemv(v_experts[e], normed) → scratch_v [kv_dim]
-///    b. silu_f32(scratch_v) in-place
-///    c. fa_v += routing_weight[e] * scratch_v
+/// MoVA attention value routing:
+/// 1. router GEMV → v_router_logits [64]
+/// 2. sigmoid(router_logits) in-place
+/// 3. deepseek4_moe_topk_bias_aware_f32 → v_topk_indices + v_topk_weights (GPU)
+/// 4. Download 4 indices (16 bytes) to select experts on host
+/// 5. Per-expert: weight_gemv + silu_f32 + scale_f32 + add_inplace_f32
+///
+/// The per-expert loop (4 experts) uses weight_gemv which handles FWHT
+/// rotation internally. The 16-byte index download is the only D2H sync
+/// in this path — much cheaper than the previous 2× 256-byte downloads +
+/// CPU sort.
 fn forward_mova_value_routing(
     cfg: &K2HorizonConfig,
     attn: &crate::weights::MovaAttnWeights,
@@ -690,8 +634,8 @@ fn forward_mova_value_routing(
     gpu.sigmoid_f32(&state.v_router_logits)
         .map_err(|e| format!("k2_horizon L{l}: v_router sigmoid: {e:?}"))?;
 
-    // 3. GPU top-K with bias-aware semantics (selection = sigmoid+bias,
-    //    weights = sigmoid[selected] / sum * scaling). Single kernel launch.
+    // 3. GPU top-K with bias-aware semantics. Single kernel launch, no D2H
+    //    for the routing decision itself.
     let bias = attn
         .v_router_bias
         .as_ref()
@@ -707,47 +651,39 @@ fn forward_mova_value_routing(
     )
     .map_err(|e| format!("k2_horizon L{l}: v_router topk: {e:?}"))?;
 
-    // 4. FWHT-rotate normed for the indexed GEMV kernel.
-    rotate_x_mq_for(gpu, &attn.v_experts[0], &state.normed, &state.v_x_rot, hidden)
-        .map_err(|e| format!("k2_horizon L{l}: v rotate: {e:?}"))?;
+    // 4. Download the 4 selected expert indices (16 bytes) to select the
+    //    correct weight tensors on the host. This is the only D2H sync.
+    let idx_floats = gpu
+        .download_f32(&state.v_topk_indices)
+        .map_err(|e| format!("k2_horizon L{l}: download v_topk_indices: {e:?}"))?;
+    let expert_indices: Vec<usize> = idx_floats
+        .iter()
+        .map(|f| {
+            let bits = f.to_bits() as i32;
+            bits as usize
+        })
+        .collect();
 
-    // 5. Indexed MoE GEMV: all mova_top_k v_experts in one kernel launch.
-    //    Writes [mova_top_k × kv_dim] to v_expanded.
-    gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
-        &attn.v_expert_ptrs,
-        &state.v_topk_indices,
-        &state.v_x_rot,
-        &state.v_expanded,
-        kv_dim,
-        hidden,
-        mova_top_k,
-        1,
-    )
-    .map_err(|e| format!("k2_horizon L{l}: v_expert indexed gemv: {e:?}"))?;
+    // 5. Download the routing weights (16 bytes) for the per-expert scale.
+    let routing_weights = gpu
+        .download_f32(&state.v_topk_weights)
+        .map_err(|e| format!("k2_horizon L{l}: download v_topk_weights: {e:?}"))?;
 
-    // 6. SiLU activation on all expert outputs (in-place on v_expanded).
-    //    MoVA applies silu(v_expert(normed)) per expert.
-    let v_expanded_total = mova_top_k * kv_dim;
-    let v_expanded_view = GpuTensor {
-        buf: unsafe { state.v_expanded.buf.alias() },
-        shape: vec![v_expanded_total],
-        dtype: DType::F32,
-    };
-    gpu.silu_f32(&v_expanded_view, &v_expanded_view)
-        .map_err(|e| format!("k2_horizon L{l}: v_expert silu: {e:?}"))?;
-
-    // 7. Zero fa_v, then accumulate weighted expert outputs.
+    // 6. Zero fa_v, then per-expert GEMV + silu + scale + accumulate.
     gpu.zero_f32(&state.fa_v)
         .map_err(|e| format!("k2_horizon L{l}: zero fa_v: {e:?}"))?;
-    gpu.moe_down_combine_k8_batched(
-        &state.v_expanded,
-        &state.v_topk_weights,
-        &state.fa_v,
-        kv_dim,
-        mova_top_k,
-        1,
-    )
-    .map_err(|e| format!("k2_horizon L{l}: v_expert combine: {e:?}"))?;
+
+    for (k, &expert_idx) in expert_indices.iter().enumerate() {
+        let v_expert = &attn.v_experts[expert_idx];
+        weight_gemv(gpu, v_expert, &state.normed, &state.scratch_v)
+            .map_err(|e| format!("k2_horizon L{l}: v_expert[{k}]: {e}"))?;
+        gpu.silu_f32(&state.scratch_v, &state.scratch_v)
+            .map_err(|e| format!("k2_horizon L{l}: v_expert[{k}] silu: {e:?}"))?;
+        gpu.scale_f32(&state.scratch_v, routing_weights[k])
+            .map_err(|e| format!("k2_horizon L{l}: v_expert[{k}] scale: {e:?}"))?;
+        gpu.add_inplace_f32(&state.fa_v, &state.scratch_v)
+            .map_err(|e| format!("k2_horizon L{l}: v_expert[{k}] add: {e:?}"))?;
+    }
 
     Ok(())
 }
