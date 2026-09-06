@@ -257,6 +257,7 @@ pub fn decode_step(
     token_id: u32,
     position: u32,
 ) -> Result<Vec<f32>, String> {
+
     // Stage position on device.
     gpu.hip
         .memcpy_htod(&state.pos_buf, &position.to_ne_bytes())
@@ -278,6 +279,7 @@ pub fn decode_step(
         forward_moe_layer(cfg, layer, state, gpu, global_layer, position)?;
     }
 
+
     // Final norm + lm_head.
     gpu.grouped_rmsnorm_f32(
         &state.h,
@@ -289,6 +291,7 @@ pub fn decode_step(
         cfg.norm_eps,
     )
     .map_err(|e| format!("k2_horizon: final norm: {e:?}"))?;
+
 
     if let Some(lm_head) = &weights.lm_head {
         weight_gemv(gpu, lm_head, &state.final_norm_buf, &state.logits)
@@ -352,7 +355,6 @@ fn attend(
 
     execute_steps(gpu, &ctx, &[Step::Attend { plan, io }])
         .map_err(|e| format!("k2_horizon L{l}: attend: {e:?}"))?;
-
     Ok(())
 }
 
@@ -552,10 +554,8 @@ fn forward_mova_value_routing(
     let kv_dim = cfg.n_kv_heads * cfg.head_dim;
     let hidden = cfg.dim;
 
-    // router_logits = v_router(normed)
     weight_gemv(gpu, &attn.v_router, &state.normed, &state.v_router_logits)
         .map_err(|e| format!("k2_horizon L{l}: v_router: {e}"))?;
-
     // sigmoid(router_logits) — in-place
     gpu.sigmoid_f32(&state.v_router_logits)
         .map_err(|e| format!("k2_horizon L{l}: v_router sigmoid: {e:?}"))?;
@@ -635,9 +635,6 @@ fn forward_mova_value_routing(
         .map_err(|e| format!("k2_horizon L{l}: v_x_rot replicate: {e:?}"))?;
     }
 
-    // Indexed MoE GEMV: v_experts are single linear [kv_dim, hidden].
-    // Use the "down" indexed kernel (m=kv_dim, k=hidden, k_top=mova_top_k).
-    // This writes [mova_top_k * kv_dim] f32 into v_expanded.
     gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
         &attn.v_expert_ptrs,
         &state.v_topk_indices,
@@ -758,7 +755,6 @@ fn forward_sigmoid_moe_ffn(
         .memcpy_htod(&state.moe_topk_weights.buf, &w_bytes)
         .map_err(|e| format!("k2_horizon L{l}: upload moe_topk_weights: {e:?}"))?;
 
-    // FWHT-rotate normed for MQ4G256 prerotated GEMV.
     rotate_x_mq_for(gpu, &ffn.experts[0].gate_up, &state.normed, &state.ffn_x_rot, hidden)
         .map_err(|e| format!("k2_horizon L{l}: ffn rotate: {e:?}"))?;
 
@@ -802,7 +798,6 @@ fn forward_sigmoid_moe_ffn(
         1,
     )
     .map_err(|e| format!("k2_horizon L{l}: down indexed gemv: {e:?}"))?;
-
     // Combine: h += Σ w_k * down_k (in-place on residual).
     gpu.moe_down_combine_k8_batched(
         &state.down_expanded,
@@ -813,7 +808,6 @@ fn forward_sigmoid_moe_ffn(
         1,
     )
     .map_err(|e| format!("k2_horizon L{l}: moe combine: {e:?}"))?;
-
     // Shared expert (always-on SwiGLU).
     weight_gemv(gpu, &ffn.shared.gate, &state.normed, &state.shared_gate)
         .map_err(|e| format!("k2_horizon L{l}: shared gate: {e}"))?;

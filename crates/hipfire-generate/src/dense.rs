@@ -7461,6 +7461,9 @@ pub fn generate_k2_horizon(
         return;
     }
 
+    let gen_contract = crate::common::gen_start_contract_version_for_arch(m.arch_id);
+    emit_gen_start(stdout, id, false, gen_contract);
+
     let t0 = Instant::now();
 
     // ── Prompt build ──

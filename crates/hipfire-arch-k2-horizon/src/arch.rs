@@ -295,7 +295,7 @@ impl Architecture for K2Horizon {
                     hfq,
                     gpu,
                     &format!("{p}.self_attn.gate_proj.weight"),
-                    hidden,
+                    q_dim,   // [num_attention_heads * head_dim, dim] = [4096, 2560]
                     hidden,
                 )?;
 
