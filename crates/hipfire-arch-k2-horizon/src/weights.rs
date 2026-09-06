@@ -56,15 +56,18 @@ pub struct DenseLayerWeights {
 /// - `model.layers.{L}.self_attn.gate_proj.weight` → `attn_gate`
 ///
 /// `v_router` is [mova_num_experts, dim] = [64, 2560].
-/// Each `v_experts[E]` is [head_dim * n_heads, dim] = [4096, 2560] —
-/// same shape as a standard `v_proj` but per-expert.
+/// `v_router_bias` is [64] — added to sigmoid scores for selection only.
+/// Each `v_experts[E]` is [kv_dim, dim] = [1024, 2560] — produces the
+/// per-expert value projection (kv_dim = n_kv_heads * head_dim).
 /// `attn_gate` is [dim, dim] = [2560, 2560] — produces the softplus-gated
 /// post-attention scalar.
 pub struct MovaAttnWeights {
     pub wq: WeightTensor,          // [4096, 2560]
     pub wk: WeightTensor,          // [1024, 2560]
     pub v_router: WeightTensor,    // [64, 2560] — routes to value experts
-    pub v_experts: Vec<WeightTensor>, // 64 × [4096, 2560]
+    pub v_router_bias: Option<GpuTensor>, // [64] — present when moe_gate_bias=true
+    pub v_experts: Vec<WeightTensor>, // 64 × [1024, 2560] (kv_dim, not q_dim)
+    pub v_expert_ptrs: GpuTensor,  // [2*64] F32 = 64 u64 device ptrs
     pub wo: WeightTensor,          // [2560, 4096]
     pub attn_gate: WeightTensor,   // [2560, 2560] — softplus post-attn gate
 }
@@ -73,17 +76,17 @@ pub struct MovaAttnWeights {
 
 /// Per-expert FFN weights for the sigmoid-routed MoE.
 ///
-/// Tensor names (safetensors):
-/// - `model.layers.{L}.mlp.experts.{E}.gate_proj.weight` → `gate`
-/// - `model.layers.{L}.mlp.experts.{E}.down_proj.weight` → `down`
-/// - `model.layers.{L}.mlp.experts.{E}.up_proj.weight` → `up`
+/// The loader byte-fuses `gate_proj‖up_proj` into a single `gate_up` blob
+/// (matching cohere2moe/qwen35), which the indexed MoE GEMV kernels expect.
 ///
-/// Each expert: gate/up = [moe_intermediate_size, dim] = [768, 2560],
-/// down = [dim, moe_intermediate_size] = [2560, 768].
+/// Tensor names (safetensors):
+/// - `model.layers.{L}.mlp.experts.{E}.gate_proj.weight` → fused into `gate_up`
+/// - `model.layers.{L}.mlp.experts.{E}.up_proj.weight`   → fused into `gate_up`
+/// - `model.layers.{L}.mlp.experts.{E}.down_proj.weight` → `down`
+///
 pub struct MoeExpertWeights {
-    pub gate: WeightTensor, // [768, 2560]
-    pub up: WeightTensor,   // [768, 2560]
-    pub down: WeightTensor, // [2560, 768]
+    pub gate_up: WeightTensor, // [2*moe_intermediate_size, dim] = [1536, 2560] — fused gate‖up
+    pub down: WeightTensor,    // [dim, moe_intermediate_size] = [2560, 768]
 }
 
 /// Shared expert (always-on, 1 per MoE layer).
@@ -108,7 +111,9 @@ pub struct SharedExpertWeights {
 pub struct MoeFfnWeights {
     pub router: WeightTensor,      // [100, 2560]
     pub router_bias: Option<GpuTensor>, // [100] — present when moe_gate_bias=true
-    pub experts: Vec<MoeExpertWeights>, // 100 experts
+    pub experts: Vec<MoeExpertWeights>, // 100 experts (fused gate_up + down)
+    pub expert_gate_up_ptrs: GpuTensor, // [2*100] F32 = 100 u64 device ptrs
+    pub expert_down_ptrs: GpuTensor,    // [2*100] F32 = 100 u64 device ptrs
     pub shared: SharedExpertWeights,    // 1 shared expert
 }
 

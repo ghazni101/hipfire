@@ -248,7 +248,8 @@ impl Architecture for K2Horizon {
                 let wk = load_wt(hfq, gpu, &format!("{p}.self_attn.k_proj.weight"), kv_dim, hidden)?;
                 let wo = load_wt(hfq, gpu, &format!("{p}.self_attn.o_proj.weight"), hidden, q_dim)?;
 
-                // MoVA: v_router [64, 2560], v_experts[64] [4096, 2560], attn_gate [2560, 2560]
+                // MoVA: v_router [64, 2560] + v_router.bias [64],
+                // v_experts[64] [kv_dim=1024, 2560], attn_gate [2560, 2560].
                 let v_router = load_wt(
                     hfq,
                     gpu,
@@ -256,26 +257,50 @@ impl Architecture for K2Horizon {
                     mova_n_exp,
                     hidden,
                 )?;
+                let v_router_bias = if cfg.moe_gate_bias {
+                    Some(load_f32(
+                        hfq,
+                        gpu,
+                        &format!("{p}.self_attn.v_router.bias"),
+                        &[mova_n_exp],
+                    )?)
+                } else {
+                    None
+                };
                 let mut v_experts = Vec::with_capacity(mova_n_exp);
                 for e in 0..mova_n_exp {
                     let expert = load_wt(
                         hfq,
                         gpu,
                         &format!("{p}.self_attn.v_experts.{e}.weight"),
-                        q_dim, // [n_heads * head_dim, dim] = [4096, 2560]
+                        kv_dim, // [n_kv_heads * head_dim, dim] = [1024, 2560]
                         hidden,
                     )?;
                     v_experts.push(expert);
                 }
+                // Device pointer table for indexed MoE GEMV: mova_n_exp u64
+                // device addresses stored as [2*mova_n_exp] F32 (8 B/ptr).
+                let ve_ptrs: Vec<u8> = v_experts
+                    .iter()
+                    .flat_map(|e| (e.buf.buf.as_ptr() as u64).to_ne_bytes())
+                    .collect();
+                let v_expert_ptrs = gpu
+                    .alloc_tensor(&[2 * mova_n_exp], DType::F32)
+                    .map_err(|e| format!("k2_horizon: alloc v_expert_ptrs: {e:?}"))?;
+                gpu.hip
+                    .memcpy_htod(&v_expert_ptrs.buf, &ve_ptrs)
+                    .map_err(|e| format!("k2_horizon: htod v_expert_ptrs: {e:?}"))?;
+
                 let attn_gate = load_wt(
                     hfq,
                     gpu,
                     &format!("{p}.self_attn.gate_proj.weight"),
-                    hidden, // [dim, dim] = [2560, 2560]
+                    hidden,
                     hidden,
                 )?;
 
-                // MoE FFN: router [100, 2560], router_bias [100], experts[100], shared
+                // MoE FFN: router [100, 2560], router_bias [100],
+                // experts[100] (fused gate_up + down), shared expert.
                 let router = load_wt(
                     hfq,
                     gpu,
@@ -294,23 +319,22 @@ impl Architecture for K2Horizon {
                     None
                 };
 
+                // Byte-fuse gate_proj‖up_proj → gate_up [2*moe_inter, hidden]
+                // per expert (matching cohere2moe/qwen35 pattern).
                 let mut experts = Vec::with_capacity(n_exp);
                 for e in 0..n_exp {
                     let ep = format!("{p}.mlp.experts.{e}");
-                    let gate = load_wt(
-                        hfq,
-                        gpu,
-                        &format!("{ep}.gate_proj.weight"),
-                        moe_inter,
-                        hidden,
-                    )?;
-                    let up = load_wt(
-                        hfq,
-                        gpu,
-                        &format!("{ep}.up_proj.weight"),
-                        moe_inter,
-                        hidden,
-                    )?;
+                    let (qt_g, g) = read_tensor(hfq, &format!("{ep}.gate_proj.weight"))?;
+                    let (qt_u, u) = read_tensor(hfq, &format!("{ep}.up_proj.weight"))?;
+                    if qt_g != qt_u {
+                        return Err(format!(
+                            "k2_horizon L{l}E{e}: gate/up dtype mismatch ({qt_g:?} vs {qt_u:?}) — cannot byte-fuse gate_up"
+                        ));
+                    }
+                    let mut gate_up_bytes = g;
+                    gate_up_bytes.extend_from_slice(&u);
+                    let gate_up = wt_from_raw(gpu, qt_g, &gate_up_bytes, 2 * moe_inter, hidden)
+                        .map_err(|e2| format!("k2_horizon: fuse gate_up L{l}E{e}: {e2}"))?;
                     let down = load_wt(
                         hfq,
                         gpu,
@@ -318,8 +342,30 @@ impl Architecture for K2Horizon {
                         hidden,
                         moe_inter,
                     )?;
-                    experts.push(MoeExpertWeights { gate, up, down });
+                    experts.push(MoeExpertWeights { gate_up, down });
                 }
+
+                // Device pointer tables for indexed MoE GEMV kernels.
+                let gu_ptrs: Vec<u8> = experts
+                    .iter()
+                    .flat_map(|e| (e.gate_up.buf.buf.as_ptr() as u64).to_ne_bytes())
+                    .collect();
+                let dn_ptrs: Vec<u8> = experts
+                    .iter()
+                    .flat_map(|e| (e.down.buf.buf.as_ptr() as u64).to_ne_bytes())
+                    .collect();
+                let expert_gate_up_ptrs = gpu
+                    .alloc_tensor(&[2 * n_exp], DType::F32)
+                    .map_err(|e| format!("k2_horizon: alloc gu_ptrs: {e:?}"))?;
+                let expert_down_ptrs = gpu
+                    .alloc_tensor(&[2 * n_exp], DType::F32)
+                    .map_err(|e| format!("k2_horizon: alloc dn_ptrs: {e:?}"))?;
+                gpu.hip
+                    .memcpy_htod(&expert_gate_up_ptrs.buf, &gu_ptrs)
+                    .map_err(|e| format!("k2_horizon: htod gu_ptrs: {e:?}"))?;
+                gpu.hip
+                    .memcpy_htod(&expert_down_ptrs.buf, &dn_ptrs)
+                    .map_err(|e| format!("k2_horizon: htod dn_ptrs: {e:?}"))?;
 
                 // Shared expert (always-on).
                 let shared = SharedExpertWeights {
@@ -352,7 +398,9 @@ impl Architecture for K2Horizon {
                         wq,
                         wk,
                         v_router,
+                        v_router_bias,
                         v_experts,
+                        v_expert_ptrs,
                         wo,
                         attn_gate,
                     },
@@ -361,6 +409,8 @@ impl Architecture for K2Horizon {
                         router,
                         router_bias,
                         experts,
+                        expert_gate_up_ptrs,
+                        expert_down_ptrs,
                         shared,
                     },
                 });
