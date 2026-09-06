@@ -192,11 +192,15 @@ pub fn config_from_json(config_json: &str) -> Result<K2HorizonConfig, String> {
     config_from_value(&value)
 }
 
-/// Parse from a pre-parsed JSON value (the `config` object).
+/// Parse from a pre-parsed JSON value (the `config` object, or a raw config.json).
 fn config_from_value(config: &serde_json::Value) -> Result<K2HorizonConfig, String> {
     let raw: RawK2HorizonConfig = serde_json::from_value(config.clone())
         .map_err(|e| format!("k2_horizon: parsing config fields: {e}"))?;
+    config_from_raw(raw)
+}
 
+/// Build a `K2HorizonConfig` from the parsed raw serde struct.
+fn config_from_raw(raw: RawK2HorizonConfig) -> Result<K2HorizonConfig, String> {
     let dim = raw.hidden_size;
     let n_heads = raw.num_attention_heads;
     let n_kv_heads = raw.num_key_value_heads.unwrap_or(n_heads);
@@ -257,8 +261,16 @@ fn config_from_value(config: &serde_json::Value) -> Result<K2HorizonConfig, Stri
 }
 
 /// Parse a `K2HorizonConfig` from an HFQ file's metadata JSON.
+/// The HFQ metadata wraps the source `config.json` under the `config` key.
 pub fn config_from_hfq(hfq: &hipfire_runtime::hfq::HfqFile) -> Result<K2HorizonConfig, String> {
-    config_from_json(&hfq.metadata_json)
+    let wrapper: serde_json::Value = serde_json::from_str(&hfq.metadata_json)
+        .map_err(|e| format!("k2_horizon: metadata_json not valid JSON: {e}"))?;
+    let inner = wrapper
+        .get("config")
+        .ok_or_else(|| "k2_horizon: metadata_json missing `config` wrapper".to_string())?;
+    let raw: RawK2HorizonConfig = serde_json::from_value(inner.clone())
+        .map_err(|e| format!("k2_horizon: parsing config fields: {e}"))?;
+    config_from_raw(raw)
 }
 
 /// Parse a `K2HorizonConfig` from a safetensors directory's config.json.
@@ -405,5 +417,19 @@ mod tests {
         assert_eq!(cfg.layer_kinds[0], LayerKind::Moe);
         assert!((cfg.norm_eps - 1e-6).abs() < 1e-10);
         assert!((cfg.rope_theta - 10_000_000.0).abs() < 1.0);
+    }
+
+    #[test]
+    fn hfq_wrapper_config_key_extracted() {
+        // HFQ metadata wraps the source config.json under a `config` key.
+        // A bare config (no wrapper) should still parse via config_from_json,
+        // but config_from_hfq requires the wrapper.
+        let wrapped = format!(r#"{{"config":{REAL_CONFIG}}}"#);
+        let value: serde_json::Value = serde_json::from_str(&wrapped).unwrap();
+        let inner = value.get("config").unwrap();
+        let raw: RawK2HorizonConfig = serde_json::from_value(inner.clone()).unwrap();
+        let cfg = config_from_raw(raw).expect("parse wrapped config");
+        assert_eq!(cfg.dim, 2560);
+        assert_eq!(cfg.n_layers, 48);
     }
 }
