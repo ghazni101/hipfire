@@ -4,7 +4,7 @@
 
 - **Date:** 2026-09-05 (review pass appended same day)
 - **Branch:** `feat/serving-cache-scheduler` (pushed to `origin` at `ghazni101/hipfire`)
-- **Tip:** `aeeda2259` `fix(loader): probe stem .mtp sidecars like the slot engine`
+- **Tip:** `2390e4e0f` `fix(slots): wave-8 residual audit — pin leak, greedy gates, bare objects, maxItems`
 - **Spec:** [2026-09-05-serving-cache-scheduler-spec.md](2026-09-05-serving-cache-scheduler-spec.md)
 - **Plan:** [2026-09-05-serving-cache-scheduler-plan.md](2026-09-05-serving-cache-scheduler-plan.md)
 - **GPU:** gfx1101 (AMD Radeon RX 7700 XT), HIP 7.15, ROCm 10 container (`local/rocm-base:10.0.0`)
@@ -217,6 +217,10 @@ The subsequent generate fails with an open-think-span validator (too few tokens 
 ## Commit history (this branch, newest first)
 
 ```
+2390e4e0f fix(slots): wave-8 residual audit — pin leak, greedy gates, bare objects, maxItems
+890669a6d fix(scheduler): page-align prompt-completing prefill rounds so checkpoints are capturable
+4fbd66c3e docs: serving cache scheduler work summary and remaining gaps
+c88347efe fix(slots): review pass — ownership, fairness, grammar, and backpressure hardening
 aeeda2259 fix(loader): probe stem .mtp sidecars like the slot engine
 3803a0573 feat(slots): probe stem .mtp sidecars and compose prefix reuse
 fd3364798 feat(slots): C1 content digests and GPU-verified prefix reuse
@@ -257,3 +261,29 @@ b6b4a6a30 feat(pages): generations, sealing, COW, leases, deferred reclaim in Pa
 | `docs/CONFIG.md` | 7 new `serve.*` keys |
 | `docs/SERVE.md` | Experimental prefix-cache section |
 | `docs/specs/2026-09-05-serving-cache-scheduler-plan.md` | §0 progress table with wave 5 evidence |
+
+### Wave 8 — residual fixes (2026-09-06)
+
+Six residual bugs found by a follow-up audit and fixed:
+
+| # | Area | Bug | Fix |
+|---|---|---|---|
+| 25 | `serve_engine.rs` | Pin leak on normal completion — `lookup_with_pages` pins the radix path; `unpin` was only called on miss and `ClientGone`. Every successful prefix-cache request leaked a pin, preventing eviction of the matched path. | `idx.unpin(domain)` added to the normal completion path (Eos/MaxTokens) after `publish_generated_prefix` |
+| 26 | `serve_engine.rs` | `request_sampled` gate (`temperature > 1e-6`) disagreed with the sampler's greedy gate (`temperature == 0.0`). Temperatures in `(0.0, 1e-6]` were sampled but classified as greedy by `request_sampled`, enabling MTP with a greedy verify that can't reproduce the sampled pick. | Gate aligned to `temperature > 0.0` (matches sampler's `== 0.0` exactly) |
+| 27 | `grammar.rs` | `compile_object` rejected valid `{"type": "object"}` (no `properties`) as "object schema missing properties". A bare object type is valid JSON Schema meaning "any object". | Absent `properties` treated as empty vec; `additionalProperties` and `required` handling already work with empty properties |
+| 28 | `serve_engine.rs` | Both publish sites constructed `PageHandle` with `epoch: 0` instead of the pool's actual epoch. | `epoch: rig.pool.page_pool().map(|p| p.epoch()).unwrap_or(0)` at both sites |
+| 29 | `serve_engine.rs` | `InFlight.reused_tokens` set to `0` for continuation admits, but continuation hits do reuse tokens (`plan.reused`). Stats undercounted. | `reused_tokens: plan.reused` |
+| 30 | `grammar.rs` | `maxItems` not enforced incrementally — the matcher allowed emitting item starts beyond `maxItems`, creating dead ends that only surfaced at terminal validation. The `Frame::Array.count` field existed but was dormant. | `count_root_array_items` helper scans the raw buffer in the EOF branch of `parse()`; when the root schema is `Array { max_items: Some(N) }` and the item count exceeds N, the matcher errors immediately |
+
+Regression tests added (`saddle-core --lib`):
+
+| Test | What it guards |
+|---|---|
+| `bare_object_type_without_properties_compiles` | `{"type":"object"}` compiles and accepts any object |
+| `bare_object_type_with_required_only_compiles` | `{"type":"object","required":["name"]}` compiles and accepts `{"name":"x"}` |
+| `max_items_blocks_extra_item_incrementally` | 3rd item after `maxItems:2` errors before array close |
+| `max_items_allows_up_to_limit` | Items up to `maxItems:3` accepted; 4th errors |
+| `max_items_empty_array_ok` | `maxItems:0` accepts `[]`, rejects `[1` |
+| `count_root_array_items_helper` | Unit test for the byte-scanning helper (nesting, strings, commas) |
+
+Verification: `cargo test --workspace --lib` — all suites green (191 saddle-core, 261 hipfire-arch-qwen35, 0 failures across workspace).
