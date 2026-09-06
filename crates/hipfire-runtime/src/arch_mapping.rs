@@ -67,6 +67,8 @@ pub const MODEL_TYPE_TO_ARCH_ID: &[(&str, u32)] = &[
     // arch 14 — muse_glimmer dense (52-layer + ViT)
     ("muse_glimmer", 14),
     ("muse_glimmer_text", 14),
+    // arch 15 — k2_horizon (MoVA attention + sigmoid-routed MoE FFN)
+    ("k2_horizon", 15),
     // arch 22 — gemma4 EAGLE drafter (single-block spec-decode head for arch 13)
     ("gemma4_unified_assistant", 22),
     // arch 23 — muse_glimmer DFlash drafter

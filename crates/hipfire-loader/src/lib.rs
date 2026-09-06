@@ -305,6 +305,7 @@ const REGISTRY: &[&dyn Carrier] = &[
     &Cohere2MoeCarrier,
     &Gemma4Carrier,
     &MuseGlimmerCarrier,
+    &K2HorizonCarrier,
 ];
 
 // ─── Constants ────────────────────────────────────────────────────────
@@ -3337,6 +3338,7 @@ mod registry_tests {
             (10, false, "minimax"),
             (11, false, "lfm2moe"),
             (12, false, "cohere2moe"),
+            (15, false, "k2_horizon"),
         ];
         for &(id, is_dir, want) in cases {
             let got: Vec<&str> = REGISTRY

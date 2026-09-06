@@ -2248,6 +2248,56 @@ impl Carrier for MuseGlimmerCarrier {
     }
 }
 
+// ─── K2HorizonCarrier ──────────────────────────────────────────────────
+//
+// Stub carrier for K2-Horizon (MoVA-36B-A4B, arch_id=15). Claims the arch_id
+// so the loader fails with a clean "not yet implemented" error instead of
+// "no carrier". The full load path (config parse, weight upload, forward)
+// lands in Phase 6 of the k2-horizon-arch-spec.
+
+pub struct K2HorizonCarrier;
+impl Carrier for K2HorizonCarrier {
+    fn name(&self) -> &'static str {
+        "k2_horizon"
+    }
+    fn spec_target_guard<'m>(
+        &self,
+        _state: &'m mut Option<Box<dyn hipfire_runtime::arch_model::ArchModel>>,
+        _model_path: &str,
+    ) -> Result<Box<dyn SpecTargetGuard + 'm>, String> {
+        Err("k2_horizon: spec decode not yet wired (AR-only)".into())
+    }
+    fn make_spec_emitter<'a>(
+        &self,
+        _ctx: SpecEmitCtx<'a>,
+    ) -> Result<Box<dyn SpecEmit + 'a>, String> {
+        Err("k2_horizon: spec emitter not yet wired".into())
+    }
+    fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
+        arch_id == 15
+    }
+    fn caps(&self) -> saddle_core::caps::ArchCaps {
+        saddle_core::caps::ArchCaps {
+            supports_continuous_batch: false,
+            supports_ep_batch: false,
+            dflash: None,
+            supports_mtp: false,
+            spec_excludes_adaptive: false,
+            semantic_contract_version: None,
+            has_deltanet: false,
+            supports_images: false,
+        }
+    }
+    fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
+        saddle_core::sampling::SamplingDefaults::new(1.0, 0.95, 1.0)
+    }
+    fn load(&self, _src: ModelSource, _ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+        Err(
+            "k2_horizon: load not yet implemented — see docs/plans/k2-horizon-arch-spec.md Phase 6".into(),
+        )
+    }
+}
+
 #[cfg(test)]
 mod gemma4_route_tests {
     use super::{gemma4_use_lowered, gemma4_validate_drafter_route};

@@ -198,9 +198,23 @@ pub fn retry_candidate_reset_inventory() -> &'static [ResetCoreCoverage] {
             reason: "muse_glimmer not a serve-hardening retry candidate yet",
         },
     };
+    const K2_HORIZON: ResetCoreCoverage = ResetCoreCoverage {
+        arch: "k2_horizon",
+        recurrent_or_conv: true,
+        s_ef_residual: true,
+        kv_or_aux_caches: true,
+        graphs: false,
+        drafter: true,
+        adaptive: false,
+        host_position_and_conversation: true,
+        eligibility: RetryResetEligibility::Ineligible {
+            reason: "k2_horizon not a serve-hardening retry candidate yet",
+        },
+    };
     &[
         QWEN35, DEEPSEEK4, LLAMA, QWEN2, COHERE2MOE, DOTS_OCR, MINIMAX, LFM2MOE, GEMMA4,
         MUSE_GLIMMER,
+        K2_HORIZON,
     ]
 }
 
@@ -404,6 +418,7 @@ mod tests {
                 12 => Some("cohere2moe"),
                 13 => Some("gemma4"),
                 14 => Some("muse_glimmer"),
+                15 => Some("k2_horizon"),
                 // Drafter sidecars (22, 23) are intentionally not retry
                 // candidates and have no inventory row.
                 22 | 23 => None,
