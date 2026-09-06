@@ -36,6 +36,7 @@ pub struct DenseLayerWeights {
     pub wk: WeightTensor,     // [n_kv_heads * head_dim, dim] = [1024, 2560]
     pub wv: WeightTensor,     // [n_kv_heads * head_dim, dim] = [1024, 2560]
     pub wo: WeightTensor,     // [dim, n_heads * head_dim] = [2560, 4096]
+    pub attn_gate: WeightTensor, // [n_heads * head_dim, dim] = [4096, 2560]
     pub ffn_norm: GpuTensor,  // [dim]
     pub w_gate: WeightTensor, // [intermediate_size, dim] = [6144, 2560]
     pub w_up: WeightTensor,   // [intermediate_size, dim] = [6144, 2560]

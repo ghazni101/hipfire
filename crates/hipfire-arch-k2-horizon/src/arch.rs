@@ -209,6 +209,13 @@ impl Architecture for K2Horizon {
                 let wk = load_wt(hfq, gpu, &format!("{p}.self_attn.k_proj.weight"), kv_dim, hidden)?;
                 let wv = load_wt(hfq, gpu, &format!("{p}.self_attn.v_proj.weight"), kv_dim, hidden)?;
                 let wo = load_wt(hfq, gpu, &format!("{p}.self_attn.o_proj.weight"), hidden, q_dim)?;
+                let attn_gate = load_wt(
+                    hfq,
+                    gpu,
+                    &format!("{p}.self_attn.gate_proj.weight"),
+                    q_dim,   // [num_attention_heads * head_dim, dim] = [4096, 2560]
+                    hidden,
+                )?;
                 let w_gate = load_wt(
                     hfq,
                     gpu,
@@ -230,13 +237,13 @@ impl Architecture for K2Horizon {
                     hidden,
                     dense_inter,
                 )?;
-
                 dense_layers.push(DenseLayerWeights {
                     attn_norm,
                     wq,
                     wk,
                     wv,
                     wo,
+                    attn_gate,
                     ffn_norm,
                     w_gate,
                     w_up,

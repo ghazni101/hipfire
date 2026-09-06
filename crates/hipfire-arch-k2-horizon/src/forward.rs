@@ -415,6 +415,20 @@ fn forward_dense_layer(
     let seq_len = position as usize + 1;
     attend(cfg, state, gpu, l, seq_len)?;
 
+    // softplus post-attention gate: attn_out *= softplus(gate_proj(normed))
+    //   F.softplus(x, beta=ln(2)) = log(1 + exp(ln2 * x)) / ln2
+    //   GPU softplus_f32 computes log(1 + exp(x)) — pre-scale by ln2, post-divide by ln2.
+    weight_gemv(gpu, &layer.attn_gate, &state.normed, &state.attn_gate_out)
+        .map_err(|e| format!("k2_horizon L{l}: attn gate: {e}"))?;
+    gpu.scale_f32(&state.attn_gate_out, SOFTPLUS_BETA)
+        .map_err(|e| format!("k2_horizon L{l}: gate pre-scale: {e:?}"))?;
+    gpu.softplus_f32(&state.attn_gate_out)
+        .map_err(|e| format!("k2_horizon L{l}: softplus gate: {e:?}"))?;
+    gpu.scale_f32(&state.attn_gate_out, 1.0 / SOFTPLUS_BETA)
+        .map_err(|e| format!("k2_horizon L{l}: gate post-scale: {e:?}"))?;
+    gpu.mul_f32(&state.fa_attn_out, &state.attn_gate_out, &state.fa_attn_out)
+        .map_err(|e| format!("k2_horizon L{l}: gate mul: {e:?}"))?;
+
     // h += o_proj(attn_out)
     weight_gemv_residual(gpu, &layer.wo, &state.fa_attn_out, &state.h)
         .map_err(|e| format!("k2_horizon L{l}: o_proj: {e}"))?;
@@ -498,17 +512,17 @@ fn forward_moe_layer(
     // KV write + attention.
     let seq_len = position as usize + 1;
     attend(cfg, state, gpu, l, seq_len)?;
-
     // softplus post-attention gate: attn_out *= softplus(gate_proj(normed))
-    //   K2-Horizon uses softplus(x, beta=ln(2)) = log(1 + 2^x).
-    //   The GPU softplus_f32 kernel computes log(1 + exp(x)) with no beta.
-    //   Pre-scale x by ln(2) so softplus(ln2 * x) = log(1 + exp(ln2 * x)) = log(1 + 2^x).
+    //   F.softplus(x, beta=ln(2)) = log(1 + exp(ln2 * x)) / ln2
+    //   GPU softplus_f32 computes log(1 + exp(x)) — pre-scale by ln2, post-divide by ln2.
     weight_gemv(gpu, &attn.attn_gate, &state.normed, &state.attn_gate_out)
         .map_err(|e| format!("k2_horizon L{l}: attn gate: {e}"))?;
     gpu.scale_f32(&state.attn_gate_out, SOFTPLUS_BETA)
         .map_err(|e| format!("k2_horizon L{l}: gate pre-scale: {e:?}"))?;
     gpu.softplus_f32(&state.attn_gate_out)
         .map_err(|e| format!("k2_horizon L{l}: softplus gate: {e:?}"))?;
+    gpu.scale_f32(&state.attn_gate_out, 1.0 / SOFTPLUS_BETA)
+        .map_err(|e| format!("k2_horizon L{l}: gate post-scale: {e:?}"))?;
     gpu.mul_f32(&state.fa_attn_out, &state.attn_gate_out, &state.fa_attn_out)
         .map_err(|e| format!("k2_horizon L{l}: gate mul: {e:?}"))?;
 
