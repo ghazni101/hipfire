@@ -2389,7 +2389,12 @@ pub(crate) fn load_params(
     kv_backend_override: Option<&str>,
 ) -> Result<serde_json::Value> {
     let configured_max_seq = config_u64(resolved, "memory.max_seq")?;
-    let max_seq = configured_max_seq.max(max_tokens.saturating_add(1024));
+    // Cap at configured max_seq: the user-set value is a VRAM budget ceiling,
+    // not just a floor.  Without this cap, a request with max_tokens=50000
+    // bumps max_seq to 51024 and OOMs the GPU on reload.
+    let max_seq = configured_max_seq
+        .max(max_tokens.saturating_add(1024))
+        .min(configured_max_seq);
     let configured_kv = config_string(resolved, "memory.kv_cache")?;
     let kv_mode = kv_override
         .map(str::to_owned)

@@ -971,6 +971,12 @@ impl ServeRuntime {
         }
         let path = path.ok_or_else(|| anyhow!("model not found locally: {model}"))?;
         let resolved = resolved_for_model(&self.paths, model, tag.as_deref(), entry)?;
+        // Cap the requested max_seq at the configured ceiling.  When the user
+        // explicitly sets memory.max_seq below the default (32768) they are
+        // declaring a VRAM budget; a request with a large max_tokens must not
+        // trigger a reload that exceeds that budget and OOMs the GPU.
+        let configured_max_seq = config_u64(&resolved, "memory.max_seq")?;
+        let minimum_max_seq = minimum_max_seq.map(|m| m.min(configured_max_seq));
         let must_reload = self.current_path.as_ref() != Some(&path)
             || minimum_max_seq.is_some_and(|minimum| self.current_max_seq < minimum);
         if must_reload {
