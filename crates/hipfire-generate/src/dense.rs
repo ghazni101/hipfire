@@ -7575,13 +7575,16 @@ pub fn generate_k2_horizon(
     // is needed.
     let mut in_think = true;
 
+    // Sample the first token from the prefill's last logits on CPU (one-time).
+    // All subsequent tokens are sampled on GPU via decode_step_sampled,
+    // avoiding the ~1 MB logits download per token.
+    let mut next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
+    let mut rng_state: u32 = 0xDEAD_BEEF;
+
     loop {
         if generated_count >= max_tokens {
             break;
         }
-
-        // Sample next token from last logits.
-        let next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
 
         // Check both EOS tokens: <|ifm|endoftext|> (1) and <|ifm|im_end|> (250019).
         if next_tok == eos_tok || next_tok == im_end_tok {
@@ -7593,22 +7596,26 @@ pub fn generate_k2_horizon(
             THINK_OPEN | THINK_FAST_OPEN | THINK_FASTER_OPEN => {
                 in_think = true;
                 generated_count += 1;
-                // Still advance the model state.
+                // Advance state + sample next token on GPU.
                 let step = {
                     let b = m.k2_horizon_mut().unwrap();
                     let position = b.state.n_tokens as u32;
-                    k2_horizon::forward::decode_step(
+                    k2_horizon::forward::decode_step_sampled(
                         &b.config,
                         &b.weights,
                         &mut b.state,
                         gpu,
                         next_tok,
                         position,
+                        temp,
+                        top_p,
+                        rng_state,
                     )
                 };
                 match step {
-                    Ok(logits) => {
-                        last_logits = logits;
+                    Ok((tok, new_rng)) => {
+                        next_tok = tok;
+                        rng_state = new_rng;
                         let b = m.k2_horizon_mut().unwrap();
                         b.state.n_tokens += 1;
                     }
@@ -7626,18 +7633,22 @@ pub fn generate_k2_horizon(
                 let step = {
                     let b = m.k2_horizon_mut().unwrap();
                     let position = b.state.n_tokens as u32;
-                    k2_horizon::forward::decode_step(
+                    k2_horizon::forward::decode_step_sampled(
                         &b.config,
                         &b.weights,
                         &mut b.state,
                         gpu,
                         next_tok,
                         position,
+                        temp,
+                        top_p,
+                        rng_state,
                     )
                 };
                 match step {
-                    Ok(logits) => {
-                        last_logits = logits;
+                    Ok((tok, new_rng)) => {
+                        next_tok = tok;
+                        rng_state = new_rng;
                         let b = m.k2_horizon_mut().unwrap();
                         b.state.n_tokens += 1;
                     }
@@ -7676,22 +7687,26 @@ pub fn generate_k2_horizon(
         let _ = stdout.flush();
         generated_count += 1;
 
-        // Advance one step.
+        // Advance state + sample next token on GPU (no logits download).
         let step = {
             let b = m.k2_horizon_mut().unwrap();
             let position = b.state.n_tokens as u32;
-            k2_horizon::forward::decode_step(
+            k2_horizon::forward::decode_step_sampled(
                 &b.config,
                 &b.weights,
                 &mut b.state,
                 gpu,
                 next_tok,
                 position,
+                temp,
+                top_p,
+                rng_state,
             )
         };
         match step {
-            Ok(logits) => {
-                last_logits = logits;
+            Ok((tok, new_rng)) => {
+                next_tok = tok;
+                rng_state = new_rng;
                 let b = m.k2_horizon_mut().unwrap();
                 b.state.n_tokens += 1;
             }

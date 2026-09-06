@@ -96,6 +96,8 @@ pub struct K2HorizonState {
     pub final_norm_buf: GpuTensor, // [hidden]
     pub logits: GpuTensor,         // [vocab]
     pub flash_partials: GpuTensor, // flash attention scratch (pre-allocated)
+    pub sample_buf: GpuTensor,   // [2] F32 — (token_id, rng_state) from GPU sampler
+    pub repeat_buf: GpuTensor,   // [64] F32 — repeat penalty window (unused, required by kernel)
 }
 
 impl K2HorizonState {
@@ -133,8 +135,8 @@ impl K2HorizonState {
             shared_act,
             shared_down,
             scratch_act, scratch_down, scratch_v,
-            final_norm_buf,
-            logits,
+            final_norm_buf, logits,
+            sample_buf, repeat_buf,
             flash_partials,
         } = self;
         let _ = kv.free_gpu(gpu);
@@ -148,6 +150,7 @@ impl K2HorizonState {
             scratch_act, scratch_down, scratch_v,
             ffn_x_rot, gate_batch, up_batch, rot_batch, down_expanded,
             final_norm_buf, logits, flash_partials,
+            sample_buf, repeat_buf,
         ] {
             let _ = gpu.free_tensor(t);
         }
@@ -230,6 +233,8 @@ impl K2HorizonState {
             shared_down: alloc(gpu, hidden, "shared_down")?,
             final_norm_buf: alloc(gpu, hidden, "final_norm_buf")?,
             logits: alloc(gpu, cfg.vocab_size, "logits")?,
+            sample_buf: alloc(gpu, 2, "sample_buf")?,
+            repeat_buf: alloc(gpu, 64, "repeat_buf")?,
             flash_partials: alloc(
                 gpu,
                 cfg.n_heads
@@ -253,18 +258,16 @@ impl K2HorizonState {
 // ─── Forward ────────────────────────────────────────────────────────────
 
 /// Single-token decode step.
-///
-/// Looks up the embedding for `token_id`, runs all 48 layers, and returns
-/// the full logits vector `[vocab_size]`.
-pub fn decode_step(
+/// Run the full forward (embedding → 48 layers → final norm → lm_head).
+/// Logits land in `state.logits` on GPU. No download.
+fn forward_only(
     cfg: &K2HorizonConfig,
     weights: &K2HorizonWeights,
     state: &mut K2HorizonState,
     gpu: &mut Gpu,
     token_id: u32,
     position: u32,
-) -> Result<Vec<f32>, String> {
-
+) -> Result<(), String> {
     // Stage position on device.
     gpu.hip
         .memcpy_htod(&state.pos_buf, &position.to_ne_bytes())
@@ -286,7 +289,6 @@ pub fn decode_step(
         forward_moe_layer(cfg, layer, state, gpu, global_layer, position)?;
     }
 
-
     // Final norm + lm_head.
     gpu.grouped_rmsnorm_f32(
         &state.h,
@@ -299,18 +301,70 @@ pub fn decode_step(
     )
     .map_err(|e| format!("k2_horizon: final norm: {e:?}"))?;
 
-
     if let Some(lm_head) = &weights.lm_head {
         weight_gemv(gpu, lm_head, &state.final_norm_buf, &state.logits)
             .map_err(|e| format!("k2_horizon: lm_head: {e}"))?;
     } else {
-        // Tied embeddings — would need embed tensor as WeightTensor.
         return Err("k2_horizon: tied embeddings not yet supported".into());
     }
+    Ok(())
+}
 
-    // Download logits for CPU-side sampling.
+/// Full decode step: forward + download logits for CPU-side sampling.
+/// Use [`decode_step_sampled`] instead when the caller can sample on GPU
+/// (avoids the ~1 MB logits download per token).
+pub fn decode_step(
+    cfg: &K2HorizonConfig,
+    weights: &K2HorizonWeights,
+    state: &mut K2HorizonState,
+    gpu: &mut Gpu,
+    token_id: u32,
+    position: u32,
+) -> Result<Vec<f32>, String> {
+    forward_only(cfg, weights, state, gpu, token_id, position)?;
     gpu.download_f32(&state.logits)
         .map_err(|e| format!("k2_horizon: download logits: {e:?}"))
+}
+
+/// Decode step with GPU-side sampling. Runs the forward, then samples
+/// directly from the on-GPU logits — no ~1 MB D2H download. Returns
+/// `(token_id, new_rng_state)`.
+///
+/// `temp <= 1e-6` → greedy argmax (4-byte D2H). `temp > 0` → top-p
+/// nucleus sampling (8-byte D2H: token + new RNG).
+pub fn decode_step_sampled(
+    cfg: &K2HorizonConfig,
+    weights: &K2HorizonWeights,
+    state: &mut K2HorizonState,
+    gpu: &mut Gpu,
+    token_id: u32,
+    position: u32,
+    temp: f32,
+    top_p: f32,
+    rng_state: u32,
+) -> Result<(u32, u32), String> {
+    forward_only(cfg, weights, state, gpu, token_id, position)?;
+    if temp <= 1e-6 {
+        let tok = gpu
+            .argmax_f32(&state.logits, cfg.vocab_size)
+            .map_err(|e| format!("k2_horizon: argmax: {e:?}"))?;
+        Ok((tok, rng_state))
+    } else {
+        let (tok, new_rng) = gpu
+            .sample_top_p(
+                &state.logits,
+                &state.sample_buf,
+                &state.repeat_buf,
+                cfg.vocab_size,
+                temp,
+                top_p,
+                rng_state,
+                0,
+                0.0,
+            )
+            .map_err(|e| format!("k2_horizon: sample_top_p: {e:?}"))?;
+        Ok((tok, new_rng))
+    }
 }
 
 // ─── KV write + attention helper ────────────────────────────────────────

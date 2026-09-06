@@ -29,5 +29,5 @@ pub mod weights;
 
 pub use arch::K2Horizon;
 pub use config::K2HorizonConfig;
-pub use forward::K2HorizonState;
+pub use forward::{decode_step, decode_step_sampled, K2HorizonState};
 pub use load::K2HorizonBundle;
