@@ -1141,6 +1141,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-k2-horizon"
+version = "0.3.0"
+dependencies = [
+ "hip-bridge",
+ "hipfire-config",
+ "hipfire-dispatch",
+ "hipfire-runtime",
+ "rdna-compute",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-arch-lfm2moe"
 version = "0.1.0"
 dependencies = [
