@@ -203,7 +203,7 @@ impl K2HorizonState {
             v_router_logits: alloc(gpu, mova_n_exp, "v_router_logits")?,
             v_topk_indices: alloc(gpu, mova_k, "v_topk_indices")?,
             v_topk_weights: alloc(gpu, mova_k, "v_topk_weights")?,
-            v_x_rot: alloc(gpu, hidden, "v_x_rot")?,
+            v_x_rot: alloc(gpu, mova_k * hidden, "v_x_rot")?,
             v_expanded: alloc(gpu, mova_k * kv_dim, "v_expanded")?,
             attn_gate_out: alloc(gpu, q_dim, "attn_gate_out")?,
             dense_gate: alloc(gpu, dense_inter, "dense_gate")?,
@@ -618,8 +618,22 @@ fn forward_mova_value_routing(
         .map_err(|e| format!("k2_horizon L{l}: upload v_topk_weights: {e:?}"))?;
 
     // FWHT-rotate normed for MQ4G256 prerotated GEMV.
+    // The down indexed kernel expects rot_batch as [k_top × K], but all
+    // v_experts share the same input — rotate once into the first slice,
+    // then replicate to the remaining k_top-1 slices via dtod copies.
     rotate_x_mq_for(gpu, &attn.v_experts[0], &state.normed, &state.v_x_rot, hidden)
         .map_err(|e| format!("k2_horizon L{l}: v rotate: {e:?}"))?;
+    let hidden_bytes = hidden * 4;
+    for k in 1..mova_top_k {
+        gpu.memcpy_dtod_at_auto(
+            &state.v_x_rot.buf,
+            k * hidden_bytes,
+            &state.v_x_rot.buf,
+            0,
+            hidden_bytes,
+        )
+        .map_err(|e| format!("k2_horizon L{l}: v_x_rot replicate: {e:?}"))?;
+    }
 
     // Indexed MoE GEMV: v_experts are single linear [kv_dim, hidden].
     // Use the "down" indexed kernel (m=kv_dim, k=hidden, k_top=mova_top_k).
