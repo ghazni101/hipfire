@@ -88,6 +88,9 @@ pub struct K2HorizonState {
     pub shared_up: GpuTensor,         // [moe_intermediate_size] = [768]
     pub shared_act: GpuTensor,        // [moe_intermediate_size] = [768]
     pub shared_down: GpuTensor,       // [hidden] = [2560]
+    pub scratch_act: GpuTensor,    // [moe_inter] — silu_mul output for per-expert down
+    pub scratch_down: GpuTensor,   // [hidden] — per-expert down GEMV output
+    pub scratch_v: GpuTensor,      // [kv_dim] — per-expert MoVA v_expert output
 
     // head
     pub final_norm_buf: GpuTensor, // [hidden]
@@ -129,6 +132,7 @@ impl K2HorizonState {
             shared_up,
             shared_act,
             shared_down,
+            scratch_act, scratch_down, scratch_v,
             final_norm_buf,
             logits,
             flash_partials,
@@ -140,9 +144,9 @@ impl K2HorizonState {
             v_router_logits, v_topk_indices, v_topk_weights, v_x_rot, v_expanded,
             attn_gate_out,
             dense_gate, dense_up, dense_act,
-            moe_router_logits, moe_topk_indices, moe_topk_weights,
-            ffn_x_rot, gate_batch, up_batch, rot_batch, down_expanded,
             shared_gate, shared_up, shared_act, shared_down,
+            scratch_act, scratch_down, scratch_v,
+            ffn_x_rot, gate_batch, up_batch, rot_batch, down_expanded,
             final_norm_buf, logits, flash_partials,
         ] {
             let _ = gpu.free_tensor(t);
@@ -220,6 +224,9 @@ impl K2HorizonState {
             shared_gate: alloc(gpu, moe_inter, "shared_gate")?,
             shared_up: alloc(gpu, moe_inter, "shared_up")?,
             shared_act: alloc(gpu, moe_inter, "shared_act")?,
+            scratch_act: alloc(gpu, moe_inter, "scratch_act")?,
+            scratch_down: alloc(gpu, hidden, "scratch_down")?,
+            scratch_v: alloc(gpu, kv_dim, "scratch_v")?,
             shared_down: alloc(gpu, hidden, "shared_down")?,
             final_norm_buf: alloc(gpu, hidden, "final_norm_buf")?,
             logits: alloc(gpu, cfg.vocab_size, "logits")?,
@@ -534,12 +541,14 @@ fn forward_moe_layer(
 /// 1. router_logits = v_router(normed)  [mova_num_experts]
 /// 2. sigmoid(router_logits)
 /// 3. CPU top-k (download 64 floats, add bias for selection, topk, normalize, scale)
-/// 4. Upload topk_indices + topk_weights
-/// 5. rotate_x_mq_for(normed) → v_x_rot
-/// 6. gemv_hfq4g256_moe_down_k8_indexed_batched_expanded (v_experts are single
-///    linear [kv_dim, hidden], so this is a "down" GEMV with m=kv_dim, k=hidden)
-/// 7. silu_f32 on expanded output
-/// 8. zero fa_v, then moe_down_combine_k8_batched (weighted sum into fa_v)
+/// MoVA value routing using per-expert weight_gemv:
+/// 1. router_logits = v_router(normed)  [mova_num_experts]
+/// 2. sigmoid(router_logits)
+/// 3. CPU top-k (download 64 floats, add bias for selection, topk, normalize, scale)
+/// 4. For each selected expert e:
+///    a. weight_gemv(v_experts[e], normed) → scratch_v [kv_dim]
+///    b. silu_f32(scratch_v) in-place
+///    c. fa_v += routing_weight[e] * scratch_v
 ///
 /// Output lands in `state.fa_v` ([kv_dim]).
 fn forward_mova_value_routing(
@@ -551,8 +560,7 @@ fn forward_mova_value_routing(
 ) -> Result<(), String> {
     let mova_top_k = cfg.mova_num_experts_per_tok;
     let scaling = cfg.router_scaling_factor;
-    let kv_dim = cfg.n_kv_heads * cfg.head_dim;
-    let hidden = cfg.dim;
+    let _kv_dim = cfg.n_kv_heads * cfg.head_dim;
 
     weight_gemv(gpu, &attn.v_router, &state.normed, &state.v_router_logits)
         .map_err(|e| format!("k2_horizon L{l}: v_router: {e}"))?;
@@ -561,8 +569,6 @@ fn forward_mova_value_routing(
         .map_err(|e| format!("k2_horizon L{l}: v_router sigmoid: {e:?}"))?;
 
     // Download sigmoid scores (tiny: 64 floats = 256 bytes) for CPU top-k.
-    // The GPU moe_topk_renorm_k8 kernel cannot handle bias-for-selection-only,
-    // so we do topk+normalize+scale on CPU and upload indices+weights.
     let scores = gpu
         .download_f32(&state.v_router_logits)
         .map_err(|e| format!("k2_horizon L{l}: download v_router scores: {e:?}"))?;
@@ -601,85 +607,45 @@ fn forward_mova_value_routing(
         }
     };
 
-    // Upload topk indices (as i32) and weights to GPU.
-    let idx_bytes: Vec<u8> = topk
-        .iter()
-        .flat_map(|(idx, _)| (*idx as i32).to_ne_bytes())
-        .collect();
-    let w_bytes: Vec<u8> = routing_weights
-        .iter()
-        .flat_map(|w| w.to_ne_bytes())
-        .collect();
-    gpu.hip
-        .memcpy_htod(&state.v_topk_indices.buf, &idx_bytes)
-        .map_err(|e| format!("k2_horizon L{l}: upload v_topk_indices: {e:?}"))?;
-    gpu.hip
-        .memcpy_htod(&state.v_topk_weights.buf, &w_bytes)
-        .map_err(|e| format!("k2_horizon L{l}: upload v_topk_weights: {e:?}"))?;
-
-    // FWHT-rotate normed for MQ4G256 prerotated GEMV.
-    // The down indexed kernel expects rot_batch as [k_top × K], but all
-    // v_experts share the same input — rotate once into the first slice,
-    // then replicate to the remaining k_top-1 slices via dtod copies.
-    rotate_x_mq_for(gpu, &attn.v_experts[0], &state.normed, &state.v_x_rot, hidden)
-        .map_err(|e| format!("k2_horizon L{l}: v rotate: {e:?}"))?;
-    let hidden_bytes = hidden * 4;
-    for k in 1..mova_top_k {
-        gpu.memcpy_dtod_at_auto(
-            &state.v_x_rot.buf,
-            k * hidden_bytes,
-            &state.v_x_rot.buf,
-            0,
-            hidden_bytes,
-        )
-        .map_err(|e| format!("k2_horizon L{l}: v_x_rot replicate: {e:?}"))?;
-    }
-
-    gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
-        &attn.v_expert_ptrs,
-        &state.v_topk_indices,
-        &state.v_x_rot,
-        &state.v_expanded,
-        kv_dim,
-        hidden,
-        mova_top_k,
-        1,
-    )
-    .map_err(|e| format!("k2_horizon L{l}: v_expert indexed gemv: {e:?}"))?;
-
-    // silu on expanded output (v = Σ w_e * silu(v_experts[e](normed)))
-    gpu.silu_f32(&state.v_expanded, &state.v_expanded)
-        .map_err(|e| format!("k2_horizon L{l}: v_expert silu: {e:?}"))?;
-
-    // Zero fa_v, then combine: fa_v += Σ w_k * v_expanded[k]
+    // Zero fa_v before accumulating expert outputs.
     gpu.zero_f32(&state.fa_v)
         .map_err(|e| format!("k2_horizon L{l}: zero fa_v: {e:?}"))?;
-    gpu.moe_down_combine_k8_batched(
-        &state.v_expanded,
-        &state.v_topk_weights,
-        &state.fa_v,
-        kv_dim,
-        mova_top_k,
-        1,
-    )
-    .map_err(|e| format!("k2_horizon L{l}: v_combine: {e:?}"))?;
+
+    // Per-expert GEMV: the indexed down kernel is hardcoded for K=512, but
+    // v_experts have K=hidden=2560. Use weight_gemv (handles arbitrary K)
+    // for each selected expert, then scale+accumulate into fa_v.
+    for (k, (expert_idx, _)) in topk.iter().enumerate() {
+        let v_expert = &attn.v_experts[*expert_idx];
+        weight_gemv(gpu, v_expert, &state.normed, &state.scratch_v)
+            .map_err(|e| format!("k2_horizon L{l}: v_expert[{k}]: {e}"))?;
+        // silu(v_expert(normed)) — in-place
+        gpu.silu_f32(&state.scratch_v, &state.scratch_v)
+            .map_err(|e| format!("k2_horizon L{l}: v_expert[{k}] silu: {e:?}"))?;
+        // fa_v += routing_weight[k] * scratch_v
+        gpu.scale_f32(&state.scratch_v, routing_weights[k])
+            .map_err(|e| format!("k2_horizon L{l}: v_expert[{k}] scale: {e:?}"))?;
+        gpu.add_inplace_f32(&state.fa_v, &state.scratch_v)
+            .map_err(|e| format!("k2_horizon L{l}: v_expert[{k}] add: {e:?}"))?;
+    }
 
     Ok(())
 }
 
-// ─── Sigmoid-routed MoE FFN (GPU indexed GEMV) ──────────────────────────
+// ─── Sigmoid-routed MoE FFN ─────────────────────────────────────────────
 
-/// Sigmoid-routed MoE FFN using GPU-indexed MoE GEMV kernels:
+/// Sigmoid-routed MoE FFN:
 /// 1. router_logits = router(normed)  [num_experts]
 /// 2. sigmoid(router_logits)
 /// 3. CPU top-k (download 100 floats, add bias for selection, topk, normalize, scale)
 /// 4. Upload topk_indices + topk_weights
 /// 5. rotate_x_mq_for(normed) → ffn_x_rot
 /// 6. gemv_hfq4g256_moe_gate_up_k8_indexed_batched → gate_batch + up_batch
-/// 7. fused_silu_mul_rotate_mq_batched_for → rot_batch
-/// 8. gemv_hfq4g256_moe_down_k8_indexed_batched_expanded → down_expanded
-/// 9. moe_down_combine_k8_batched → h += Σ w_k * down_k (in-place residual)
-/// 10. shared expert (SwiGLU GEMV) → add to h
+///    (gate_up indexed kernel loops over groups — handles arbitrary K)
+/// 7. Per-expert down: for each selected expert e:
+///    a. silu_mul_f32(gate_batch[e], up_batch[e]) → scratch_act
+///    b. weight_gemv(down[e], scratch_act) → scratch_down  (handles arbitrary K)
+///    c. h += routing_weight[e] * scratch_down
+/// 8. shared expert (SwiGLU GEMV) → add to h
 fn forward_sigmoid_moe_ffn(
     cfg: &K2HorizonConfig,
     ffn: &crate::weights::MoeFfnWeights,
@@ -739,7 +705,7 @@ fn forward_sigmoid_moe_ffn(
         }
     };
 
-    // Upload topk indices (as i32) and weights to GPU.
+    // Upload topk indices (as i32) and weights to GPU for the indexed gate_up kernel.
     let idx_bytes: Vec<u8> = topk
         .iter()
         .flat_map(|(idx, _)| (*idx as i32).to_ne_bytes())
@@ -759,6 +725,7 @@ fn forward_sigmoid_moe_ffn(
         .map_err(|e| format!("k2_horizon L{l}: ffn rotate: {e:?}"))?;
 
     // Indexed MoE gate_up GEMV: all top_k experts in one kernel launch.
+    // The gate_up indexed kernel loops over groups — handles arbitrary K.
     // gate_batch and up_batch are [top_k * moe_inter] each.
     gpu.gemv_hfq4g256_moe_gate_up_k8_indexed_batched(
         &ffn.expert_gate_up_ptrs,
@@ -773,41 +740,28 @@ fn forward_sigmoid_moe_ffn(
     )
     .map_err(|e| format!("k2_horizon L{l}: gate_up indexed gemv: {e:?}"))?;
 
-    // Fused silu_mul + FWHT rotation: rot_batch = silu(gate) * up, then rotate.
-    fused_silu_mul_rotate_mq_batched_for(
-        gpu,
-        &ffn.experts[0].down,
-        &state.gate_batch,
-        &state.up_batch,
-        &state.rot_batch,
-        moe_inter,
-        top_k,
-    )
-    .map_err(|e| format!("k2_horizon L{l}: silu_mul_rotate: {e:?}"))?;
+    // Per-expert down GEMV: the indexed down kernel is hardcoded for K=512,
+    // but moe_inter=768 (3 groups). Use weight_gemv (handles arbitrary K)
+    // for each selected expert's down projection.
+    for (k, (expert_idx, _)) in topk.iter().enumerate() {
+        // silu_mul: scratch_act = silu(gate_batch[k]) * up_batch[k]
+        let gate_k = state.gate_batch.sub_offset(k * moe_inter, moe_inter);
+        let up_k = state.up_batch.sub_offset(k * moe_inter, moe_inter);
+        gpu.silu_mul_f32(&gate_k, &up_k, &state.scratch_act)
+            .map_err(|e| format!("k2_horizon L{l}: expert[{k}] silu_mul: {e:?}"))?;
 
-    // Indexed MoE down GEMV: all top_k experts in one kernel launch.
-    // down_expanded is [top_k * hidden] f32.
-    gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
-        &ffn.expert_down_ptrs,
-        &state.moe_topk_indices,
-        &state.rot_batch,
-        &state.down_expanded,
-        hidden,
-        moe_inter,
-        top_k,
-        1,
-    )
-    .map_err(|e| format!("k2_horizon L{l}: down indexed gemv: {e:?}"))?;
-    // Combine: h += Σ w_k * down_k (in-place on residual).
-    gpu.moe_down_combine_k8_batched(
-        &state.down_expanded,
-        &state.moe_topk_weights,
-        &state.h,
-        hidden,
-        top_k,
-        1,
-    )
-    .map_err(|e| format!("k2_horizon L{l}: moe combine: {e:?}"))?;
+        // down GEMV: scratch_down = down[expert] * scratch_act
+        let expert = &ffn.experts[*expert_idx];
+        weight_gemv(gpu, &expert.down, &state.scratch_act, &state.scratch_down)
+            .map_err(|e| format!("k2_horizon L{l}: expert[{k}] down: {e}"))?;
+
+        // h += routing_weight[k] * scratch_down
+        gpu.scale_f32(&state.scratch_down, routing_weights[k])
+            .map_err(|e| format!("k2_horizon L{l}: expert[{k}] scale: {e:?}"))?;
+        gpu.add_inplace_f32(&state.h, &state.scratch_down)
+            .map_err(|e| format!("k2_horizon L{l}: expert[{k}] add: {e:?}"))?;
+    }
+
     // Shared expert (always-on SwiGLU).
     weight_gemv(gpu, &ffn.shared.gate, &state.normed, &state.shared_gate)
         .map_err(|e| format!("k2_horizon L{l}: shared gate: {e}"))?;
