@@ -204,6 +204,76 @@ impl Gpu {
         result
     }
 
+    /// Grouped RMSNorm: variance computed per `n / n_groups` contiguous chunk,
+    /// not over the full vector. Used by K2-Horizon (`layernorm_num_groups=2`).
+    ///
+    /// `weight` is `[n]` (full vector length, indexed by global position).
+    /// `x` and `out` are `[batch, n]` (or `[n]` when `batch == 1`).
+    /// Launches `batch * n_groups` blocks, each handling one chunk.
+    pub fn grouped_rmsnorm_f32(
+        &mut self,
+        x: &GpuTensor,
+        weight: &GpuTensor,
+        out: &GpuTensor,
+        batch: usize,
+        n: usize,
+        n_groups: usize,
+        eps: f32,
+    ) -> HipResult<()> {
+        assert!(
+            n % n_groups == 0,
+            "grouped_rmsnorm: n ({n}) must be divisible by n_groups ({n_groups})"
+        );
+        self.bind_thread()?;
+        self.ensure_kernel("grouped_rmsnorm_f32", kernels::RMSNORM_SRC, "grouped_rmsnorm_f32")?;
+
+        let x_ptr = x.buf.as_ptr();
+        let w_ptr = weight.buf.as_ptr();
+        let out_ptr = out.buf.as_ptr();
+        let n_val = n as i32;
+        let n_groups_val = n_groups as i32;
+        let eps_val = eps;
+
+        let chunk_len = n / n_groups;
+        let block_size = 256u32.min(chunk_len as u32);
+        let shared_mem = block_size * 4;
+        let grid = (batch * n_groups) as u32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &x_ptr as *const _ as *mut c_void,
+            &w_ptr as *const _ as *mut c_void,
+            &out_ptr as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+            &n_groups_val as *const _ as *mut c_void,
+            &eps_val as *const _ as *mut c_void,
+        ];
+
+        let bytes = crate::profile::rmsnorm_bytes(batch * n);
+        let timer =
+            crate::profile::begin_timer(&self.hip, "rmsnorm", "grouped_rmsnorm_f32", bytes);
+        let result = self.launch_maybe_blob(
+            "grouped_rmsnorm_f32",
+            [grid, 1, 1],
+            [block_size, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(x_ptr);
+                b.push_ptr(w_ptr);
+                b.push_ptr(out_ptr);
+                b.push_i32(n_val);
+                b.push_i32(n_groups_val);
+                b.push_f32(eps_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Fused sandwich post-norm + residual-add (gemma4 L4):
     ///   out[r,i] = residual[r,i] + rmsnorm(x[r,i], weight[i])
     /// Collapses the (rmsnorm_f32 -> memcpy(out<-residual) -> add_inplace_f32)
