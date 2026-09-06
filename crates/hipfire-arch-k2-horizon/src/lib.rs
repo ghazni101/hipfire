@@ -26,4 +26,7 @@ pub mod config;
 pub mod weights;
 
 pub use arch::K2Horizon;
+pub mod forward;
+
+pub use forward::K2HorizonState;
 pub use config::K2HorizonConfig;

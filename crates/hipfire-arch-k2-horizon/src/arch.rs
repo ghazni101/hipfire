@@ -9,10 +9,11 @@
 //! the trait — the daemon calls arch-specific forward functions directly,
 //! matching the qwen35 pattern (see `hipfire-arch-qwen35/src/arch.rs`).
 //!
-//! Phase 1 implements config parsing only. `load_weights` and `new_state`
-//! return "not yet implemented" errors until Phase 6.
+//! `load_weights` returns "not yet implemented" until Phase 6 (loader).
+//! `new_state` is implemented via `K2HorizonState::new`.
 
 use crate::config::{config_from_hfq, K2HorizonConfig};
+use crate::forward::K2HorizonState;
 use crate::weights::K2HorizonWeights;
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::hfq::HfqFile;
@@ -21,11 +22,6 @@ use rdna_compute::Gpu;
 /// Type marker for the K2-Horizon architecture (MoVA attention +
 /// sigmoid-routed MoE FFN). arch_id = 15.
 pub struct K2Horizon;
-
-/// Placeholder state — the real KV cache + MoVA routing scratch lands in
-/// Phase 2/3. This is a zero-sized type so the trait compiles without
-/// allocating GPU resources.
-pub struct K2HorizonState;
 
 impl Architecture for K2Horizon {
     type Weights = K2HorizonWeights;
@@ -52,7 +48,7 @@ impl Architecture for K2Horizon {
         Err("k2_horizon: load_weights not yet implemented — Phase 6".into())
     }
 
-    fn new_state(_gpu: &mut Gpu, _cfg: &Self::Config) -> Result<Self::State, String> {
-        Err("k2_horizon: new_state not yet implemented — Phase 2/3".into())
+    fn new_state(gpu: &mut Gpu, cfg: &Self::Config) -> Result<Self::State, String> {
+        K2HorizonState::new(gpu, cfg)
     }
 }
