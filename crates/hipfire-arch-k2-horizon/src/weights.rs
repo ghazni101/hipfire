@@ -31,16 +31,16 @@ use rdna_compute::GpuTensor;
 /// - `model.layers.{L}.mlp.up_proj.weight` → `w_up`
 /// - `model.layers.{L}.mlp.down_proj.weight` → `w_down`
 pub struct DenseLayerWeights {
-    pub attn_norm: GpuTensor, // [dim] — RMSNorm weight
-    pub wq: WeightTensor,     // [n_heads * head_dim, dim] = [4096, 2560]
-    pub wk: WeightTensor,     // [n_kv_heads * head_dim, dim] = [1024, 2560]
-    pub wv: WeightTensor,     // [n_kv_heads * head_dim, dim] = [1024, 2560]
-    pub wo: WeightTensor,     // [dim, n_heads * head_dim] = [2560, 4096]
+    pub attn_norm: GpuTensor,    // [dim] — RMSNorm weight
+    pub wq: WeightTensor,        // [n_heads * head_dim, dim] = [4096, 2560]
+    pub wk: WeightTensor,        // [n_kv_heads * head_dim, dim] = [1024, 2560]
+    pub wv: WeightTensor,        // [n_kv_heads * head_dim, dim] = [1024, 2560]
+    pub wo: WeightTensor,        // [dim, n_heads * head_dim] = [2560, 4096]
     pub attn_gate: WeightTensor, // [n_heads * head_dim, dim] = [4096, 2560]
-    pub ffn_norm: GpuTensor,  // [dim]
-    pub w_gate: WeightTensor, // [intermediate_size, dim] = [6144, 2560]
-    pub w_up: WeightTensor,   // [intermediate_size, dim] = [6144, 2560]
-    pub w_down: WeightTensor, // [dim, intermediate_size] = [2560, 6144]
+    pub ffn_norm: GpuTensor,     // [dim]
+    pub w_gate: WeightTensor,    // [intermediate_size, dim] = [6144, 2560]
+    pub w_up: WeightTensor,      // [intermediate_size, dim] = [6144, 2560]
+    pub w_down: WeightTensor,    // [dim, intermediate_size] = [2560, 6144]
 }
 
 // ─── MoVA attention (layers 3–47) ───────────────────────────────────────
@@ -60,17 +60,21 @@ pub struct DenseLayerWeights {
 /// `v_router_bias` is [64] — added to sigmoid scores for selection only.
 /// Each `v_experts[E]` is [kv_dim, dim] = [1024, 2560] — produces the
 /// per-expert value projection (kv_dim = n_kv_heads * head_dim).
-/// `attn_gate` is [dim, dim] = [2560, 2560] — produces the softplus-gated
-/// post-attention scalar.
+/// `attn_gate` is [n_heads * head_dim, dim] = [4096, 2560] — produces the
+/// per-element softplus gate applied to the attention output.
 pub struct MovaAttnWeights {
-    pub wq: WeightTensor,          // [4096, 2560]
-    pub wk: WeightTensor,          // [1024, 2560]
-    pub v_router: WeightTensor,    // [64, 2560] — routes to value experts
+    pub wq: WeightTensor,                 // [4096, 2560]
+    pub wk: WeightTensor,                 // [1024, 2560]
+    pub v_router: WeightTensor,           // [64, 2560] — routes to value experts
     pub v_router_bias: Option<GpuTensor>, // [64] — present when moe_gate_bias=true
-    pub v_experts: Vec<WeightTensor>, // 64 × [1024, 2560] (kv_dim, not q_dim)
-    pub v_expert_ptrs: GpuTensor,  // [2*64] F32 = 64 u64 device ptrs
-    pub wo: WeightTensor,          // [2560, 4096]
-    pub attn_gate: WeightTensor,   // [2560, 2560] — softplus post-attn gate
+    pub v_experts: Vec<WeightTensor>,     // 64 × [1024, 2560] (kv_dim, not q_dim)
+    /// Owning blob when v_experts were packed into one allocation. The
+    /// `v_experts` WeightTensors are non-owning views into it — keep this
+    /// alive for the model's lifetime and free it (not the views) on unload.
+    pub v_experts_owner: Option<GpuTensor>,
+    pub v_expert_ptrs: GpuTensor, // [2*64] F32 = 64 u64 device ptrs
+    pub wo: WeightTensor,         // [2560, 4096]
+    pub attn_gate: WeightTensor,  // [4096, 2560] — softplus post-attn gate
 }
 
 // ─── Sigmoid-routed MoE FFN (layers 3–47) ───────────────────────────────
@@ -110,9 +114,14 @@ pub struct SharedExpertWeights {
 /// - `model.layers.{L}.mlp.experts.{E}.*` → `experts[E]`
 /// - `model.layers.{L}.mlp.shared_experts.*` → `shared`
 pub struct MoeFfnWeights {
-    pub router: WeightTensor,      // [100, 2560]
+    pub router: WeightTensor,           // [100, 2560]
     pub router_bias: Option<GpuTensor>, // [100] — present when moe_gate_bias=true
     pub experts: Vec<MoeExpertWeights>, // 100 experts (fused gate_up + down)
+    /// Owning blobs when experts were packed (gate_up blob + down blob).
+    /// The per-expert WeightTensors are non-owning views — keep alive for
+    /// the model's lifetime; free the owners (not the views) on unload.
+    pub experts_gate_up_owner: Option<GpuTensor>,
+    pub experts_down_owner: Option<GpuTensor>,
     pub expert_gate_up_ptrs: GpuTensor, // [2*100] F32 = 100 u64 device ptrs
     pub expert_down_ptrs: GpuTensor,    // [2*100] F32 = 100 u64 device ptrs
     pub shared: SharedExpertWeights,    // 1 shared expert
@@ -146,4 +155,86 @@ pub struct K2HorizonWeights {
     /// Output/lm_head [vocab_size, dim] = [250624, 2560]
     /// (present when tie_word_embeddings=false)
     pub lm_head: Option<WeightTensor>,
+}
+
+// ─── Freeing ────────────────────────────────────────────────────────────
+
+impl K2HorizonWeights {
+    /// Free every GPU allocation owned by this weight set.
+    ///
+    /// Packed-expert WeightTensors are non-owning views (`DeviceBuffer`
+    /// `Borrowed`) into the `*_owner` blobs — `free_all` on them would be
+    /// refused by `Gpu::free_tensor` anyway, so we free the owners once and
+    /// drop the views. Non-packed experts own their buffers and are freed
+    /// per-expert via `free_all`.
+    pub fn free_gpu(self, gpu: &mut rdna_compute::Gpu) {
+        let _ = gpu.free_tensor(self.token_embd);
+        let _ = gpu.free_tensor(self.final_norm);
+        if let Some(lm) = self.lm_head {
+            lm.free_all(gpu);
+        }
+
+        for layer in self.dense_layers {
+            let _ = gpu.free_tensor(layer.attn_norm);
+            let _ = gpu.free_tensor(layer.ffn_norm);
+            layer.wq.free_all(gpu);
+            layer.wk.free_all(gpu);
+            layer.wv.free_all(gpu);
+            layer.wo.free_all(gpu);
+            layer.attn_gate.free_all(gpu);
+            layer.w_gate.free_all(gpu);
+            layer.w_up.free_all(gpu);
+            layer.w_down.free_all(gpu);
+        }
+
+        for layer in self.moe_layers {
+            let _ = gpu.free_tensor(layer.attn_norm);
+            let _ = gpu.free_tensor(layer.ffn_norm);
+
+            let attn = layer.attn;
+            attn.wq.free_all(gpu);
+            attn.wk.free_all(gpu);
+            attn.wo.free_all(gpu);
+            attn.attn_gate.free_all(gpu);
+            attn.v_router.free_all(gpu);
+            if let Some(b) = attn.v_router_bias {
+                let _ = gpu.free_tensor(b);
+            }
+            let _ = gpu.free_tensor(attn.v_expert_ptrs);
+            if let Some(owner) = attn.v_experts_owner {
+                // Views into the owner — drop them, free the blob once.
+                drop(attn.v_experts);
+                let _ = gpu.free_tensor(owner);
+            } else {
+                for e in attn.v_experts {
+                    e.free_all(gpu);
+                }
+            }
+
+            let ffn = layer.ffn;
+            ffn.router.free_all(gpu);
+            if let Some(b) = ffn.router_bias {
+                let _ = gpu.free_tensor(b);
+            }
+            let _ = gpu.free_tensor(ffn.expert_gate_up_ptrs);
+            let _ = gpu.free_tensor(ffn.expert_down_ptrs);
+            if ffn.experts_gate_up_owner.is_some() || ffn.experts_down_owner.is_some() {
+                drop(ffn.experts);
+                if let Some(o) = ffn.experts_gate_up_owner {
+                    let _ = gpu.free_tensor(o);
+                }
+                if let Some(o) = ffn.experts_down_owner {
+                    let _ = gpu.free_tensor(o);
+                }
+            } else {
+                for e in ffn.experts {
+                    e.gate_up.free_all(gpu);
+                    e.down.free_all(gpu);
+                }
+            }
+            ffn.shared.gate.free_all(gpu);
+            ffn.shared.up.free_all(gpu);
+            ffn.shared.down.free_all(gpu);
+        }
+    }
 }

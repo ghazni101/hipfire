@@ -1,6 +1,9 @@
 # K2-Horizon (MoVA-36B-A4B) — Architecture Support Spec
 
-**Status:** Draft. Branch `feat/k2-horizon-arch-spec`.
+**Status:** In progress on `feat/k2-horizon-arch-spec`. Phases 0–6 are
+implemented (arch crate, grouped RMSNorm, MoVA + sigmoid-MoE decode
+forward, quantizer arm, carrier, AR generate path, GPU sampling, PM4
+retained-replay). Remaining gaps are tracked in §9.
 
 ## Goal
 
@@ -56,7 +59,10 @@ All dimensions from `config.json` and `modeling_k2_horizon.py` in
 
 ```
 Layer 0–2:  K2HorizonDecoderLayer (dense)
-  ├── K2HorizonAttention      (standard MHA: q_proj, k_proj, v_proj, o_proj)
+  ├── K2HorizonAttention      (MHA: q/k/v/o + gate_proj — the softplus
+  │                            post-attention gate applies to DENSE layers
+  │                            too; gate_func is set for both attention
+  │                            classes in modeling_k2_horizon.py)
   └── K2HorizonMLP            (SwiGLU: gate_proj, up_proj, down_proj)
 
 Layer 3–47: K2HorizonDecoderLayer (sparse)
@@ -195,13 +201,14 @@ model.layers.{N}.post_attention_layernorm.weight
 model.layers.{N}.self_attn.q_proj.weight
 model.layers.{N}.self_attn.k_proj.weight
 model.layers.{N}.self_attn.o_proj.weight
+# Dense layers (0–2) only — standard MHA v_proj + the same softplus gate:
+model.layers.{N}.self_attn.v_proj.weight
+model.layers.{N}.self_attn.gate_proj.weight
 # MoVA layers (3–47) only:
 model.layers.{N}.self_attn.v_router.weight
 model.layers.{N}.self_attn.v_router.bias
 model.layers.{N}.self_attn.v_experts.{E}.weight       # E = 0..63
 model.layers.{N}.self_attn.gate_proj.weight
-# Dense layers (0–2) only:
-model.layers.{N}.self_attn.v_proj.weight
 # Dense FFN (layers 0–2):
 model.layers.{N}.mlp.gate_proj.weight
 model.layers.{N}.mlp.up_proj.weight
@@ -412,8 +419,10 @@ test with `n_groups=2`, `hidden_size=2560` (the real shape).
    attention dispatch infrastructure.
 
 5. **Dense attention (layers 0–2)** — standard q/k/v/o projections, no
-   MoVA, no gate. Closest to qwen35's `FullAttnLayerWeights` minus
-   q_norm/k_norm.
+   MoVA, but **with** the same softplus post-attention gate
+   (`self_attn.gate_proj` exists on dense layers — verified in
+   `modeling_k2_horizon.py:227` and the safetensors layout). Closest to
+   qwen35's `FullAttnLayerWeights` minus q_norm/k_norm, plus the gate.
 
 **Acceptance:** Per-layer activation cosine vs HF reference > 0.999 at
 F32 (using the bf16-oracle lesson from dots-ocr: compare against numpy
@@ -609,30 +618,38 @@ interleaving. Reuse the existing `apply_rotary_pos_emb` kernel path.
 ## 7. File map
 
 ```
-crates/hipfire-arch-k2-horizon/           NEW crate
+crates/hipfire-arch-k2-horizon/           NEW crate (as built)
   Cargo.toml
   src/
     lib.rs
-    arch.rs                               Architecture trait impl
+    arch.rs                               Architecture trait impl + packed-expert loader
     config.rs                             K2HorizonConfig parser
-    weights.rs                            weight structs
-    load.rs                               weight loader (HFQ + safetensors)
-    forward.rs                            decode forward (MoVA + MoE + dense)
-    prefill.rs                            prefill forward
-    state.rs                              KV cache state
-    kernels/                              arch-specific HIP kernels
-      grouped_rmsnorm.hip                 grouped RMSNorm
-      mova_value_route.hip               v_expert routing + GEMV
-      softplus_gate.hip                   post-attention softplus gate
-      sigmoid_router.hip                  sigmoid MoE router
+    weights.rs                            weight structs + free_gpu
+    load.rs                               K2HorizonBundle (ArchModel)
+    forward.rs                            decode forward (MoVA + MoE + dense) + PM4 replay
+    lowered.rs                            LayerProgram/SuperOp dispatch (HIPFIRE_FORWARD_LOWERED, opt-in)
+    prefill.rs                            batched prefill (currently unused — see gaps)
+  tests/
+    grouped_rmsnorm.rs                    GPU smoke test (--ignored)
+
+kernels/src/                              shared kernel tree (no per-arch dir)
+  rmsnorm.hip                             grouped_rmsnorm_f32 (appended)
+  softplus_gate.hip                       fused softplus post-attn gate
+  replicate_batched.hip                   [N×K] → [N×K_TOP×K] replicate
+  gemv_mq4g256v2_moe_gate_up_k8_indexed_batched.hip
+  gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded.hip
 
 crates/hipfire-runtime/src/arch_mapping.rs    add ("k2_horizon", 15)
 crates/hipfire-loader/src/carriers.rs         add K2HorizonCarrier
 crates/hipfire-quantize/src/pipeline.rs       add is_k2_horizon to is_moe_like
 crates/hipfire-quantize/src/model_filter.rs   tensor name matching for K2-Horizon
 crates/hipfire-runtime/src/reset_core.rs      arch_key + inventory for id 15
+crates/hipfire-generate/src/dense.rs          generate_k2_horizon (AR path)
+Containerfile.k2-horizon                      serving container
 docs/plans/k2-horizon-arch-spec.md            this file
+docs/plans/k2-horizon-pm4-spec.md             PM4/redline spec
 ```
+
 
 ## 8. MQ4R quant command (target)
 
@@ -659,3 +676,111 @@ Serve registration via `models.toml` inside the serve container:
 [models.k2-horizon-36b-a4b-mq4r]
 path = "/home/ghazni/models/hipfire/IFM/K2-Horizon-MoVA-36B-A4B-MQ4R/k2-horizon-36b-a4b.mq4r"
 ```
+
+## 9. Remaining gaps (as of 2026-09-11 second review)
+
+Ordered by impact. Items marked [FIXED] were closed during the
+2026-09-11 review passes on this branch.
+
+### Correctness (second pass, 2026-09-11)
+
+0a. **[FIXED] `in_think` misrouted reasoning when thinking "off"** — the
+    K2-Horizon Jinja template ignores `enable_thinking`; `reasoning_effort
+    | default('high')` always opens a think block. `in_think =
+    max_think_tokens != 1` therefore published reasoning as visible content
+    for `max_think_tokens=1`. Fixed: `in_think` always starts true,
+    `reasoning_effort` is derived from `max_think_tokens` (1→low,
+    ≤512→low, ≤2048→medium, else high), and the cap force-closes the think
+    block by feeding the matching close tag through the marker arm.
+
+0b. **[FIXED] Missing gfx12 packing guard** — the
+    `fix/pack-mq4g256v2-experts` port packed experts unconditionally; the
+    upstream fix gates on `is_rdna3()` because gfx1201 tg128 fell 171→77
+    tok/s under packed views. Added `packed_experts_supported(gpu)` to both
+    the v_experts and MoE expert paths.
+
+0c. **[FIXED] Non-V2 expert dtypes silently misdecoded** — the indexed
+    GEMV kernels (`gemv_mq4g256v2_moe_*_k8_indexed_batched*`) hardcode
+    fp16 per-128 headers; `packable_mq4_dtype` also accepts qt=13/45 whose
+    headers differ. Added `require_v2_expert_dtype` fail-fast checks on
+    both v_experts and MoE experts (packed and fallback paths).
+
+0d. **[FIXED] Double host read in `load_packed_experts`** — the packability
+    probe read every expert tensor, then the concat loop read them again.
+    Single-pass now.
+
+### Correctness (first pass)
+
+1. **[FIXED] `state.n_tokens` not advanced after sequential prefill** —
+   `generate_k2_horizon` ran `decode_step` per prompt token but never set
+   `n_tokens`, so decode restarted at position 0 and overwrote the KV
+   cache. Fixed in `dense.rs`.
+
+2. **[FIXED] Partial-warp hazard in `deepseek4_moe_topk_bias_aware{,_batched}`**
+   — launched with `blockDim = n_exp`; for `n_exp=100` (K2-Horizon MoE
+   router) the last warp has 28 inactive lanes and `__shfl_down` reads
+   undefined values, which can poison the argmax with a garbage expert
+   index → OOB `expert_ptrs` read → wild pointer in the indexed GEMV.
+   This is the likely root cause of the "batched prefill IMA (hipMemcpy
+   D2H code 700)" noted in `dense.rs`. Fixed by launching
+   `round_up(n_exp, 32)` threads + defensive `n_exp`/`k_top` guards and
+   padded-lane index clamps in both kernels.
+
+3. **[FIXED] PM4 capture hole in MoVA decode** — `forward_mova_value_routing`
+   used `memcpy_dtod_at_auto` to replicate `v_x_rot` into `v_rot_batch`;
+   D2D memcpys are not recorded by Redline capture, so PM4 replay would
+   have used stale rotated inputs. Replaced with `replicate_batched_f32`
+   (a recorded kernel launch).
+
+4. **[FIXED] VRAM leak on unload** — `K2HorizonBundle::free_gpu` dropped
+   weights without freeing (`DeviceBuffer` has no `Drop`), and the packed
+   expert owner tensors were dropped at load scope, making ~20 GB
+   unfreeable. Added `v_experts_owner` / `experts_{gate_up,down}_owner`
+   fields + `K2HorizonWeights::free_gpu`.
+
+### Still open
+
+5. **[FIXED] Batched prefill re-enabled** — `forward_prefill_batch` is now
+   the default in `generate_k2_horizon` (`HIPFIRE_K2_PREFILL_SEQ=1` opts
+   back to sequential). Verified in-container: 400 tok/s prefill on the
+   24-token smoke prompt vs ~242 tok/s sequential.
+
+6. **[PARTIAL] End-to-end smoke validated in container** — `docker run
+   k2-horizon-serve` loads the .mq4r (24.35 GB VRAM of 25.75 GB), greedy
+   chat completions return correct coherent output (17×23=391, sliding-
+   window code answer), think-block parsing works (reasoning_content
+   separated), think-cap force-close verified. Still owed:
+   `serve_harness.py battery` + `chain` for multi-prompt coverage.
+
+7. **[FIXED] PM4 retained-replay now captures and replays** — the
+   `gemv_mq4g256v2_residual` scratch-memory rejection was fixed by
+   swapping the shared-expert down projection to plain `weight_gemv` +
+   `add_inplace_f32` (one extra launch, PM4-safe). Verified in-container:
+   `retained route ready: capture=2064 launches, packet_count=1`, decode
+   83→92.4 tok/s on the smoke prompt. Still owed:
+   `redline_daemon_harness.py` for the formal replay-parity report before
+   any perf claim.
+
+8. **KLD eval not run** — Phase 7 acceptance (KLD < 0.25 vs F32 oracle)
+   is unmeasured. `hipfire eval kld` against the bf16 source.
+
+9. **Lowered path unvalidated** — `lowered.rs` is opt-in
+   (`HIPFIRE_FORWARD_LOWERED=1`) and has never produced output. Needs an
+   A/B against the hand path before it can default on.
+
+10. **Spec-decode / MTP** — carrier returns "not yet wired" for spec
+    decode; K2-Horizon has no MTP head in the released checkpoint
+    (non-goal per §5).
+
+11. **Multi-turn / session state** — `generate_k2_horizon` is
+    single-turn AR only; no `serve_harness.py chain` coverage, no
+    prefix-cache interaction tested.
+
+12. **`flash_partials` over-allocation** — sized with a
+    `FLASH_PREFILL_SUBBATCH` multiplier that decode never needs; ~85 MB
+    of scratch at max_seq=65536 that could be tightened.
+
+13. **[VERIFIED] VRAM budget at max_seq** — `ctx.max_seq` reaches
+    `new_with_max_seq` via `load_k2_horizon_bundle`; the Containerfile's
+    `max_seq=32768` config is honored. Measured 24.35 GB used of 25.75 GB
+    at 32k ctx — tight but stable.

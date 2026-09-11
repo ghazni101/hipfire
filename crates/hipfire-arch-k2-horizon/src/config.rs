@@ -34,37 +34,37 @@ pub enum LayerKind {
 #[derive(Debug, Clone)]
 pub struct K2HorizonConfig {
     // ── Core dimensions ──
-    pub dim: usize,              // hidden_size = 2560
-    pub n_layers: usize,         // num_hidden_layers = 48
-    pub vocab_size: usize,       // 250624
-    pub norm_eps: f32,           // rms_norm_eps = 1e-6
-    pub eos_token: u32,          // first eos_token_id (1)
+    pub dim: usize,        // hidden_size = 2560
+    pub n_layers: usize,   // num_hidden_layers = 48
+    pub vocab_size: usize, // 250624
+    pub norm_eps: f32,     // rms_norm_eps = 1e-6
+    pub eos_token: u32,    // first eos_token_id (1)
 
     // ── Attention ──
-    pub n_heads: usize,          // num_attention_heads = 32
-    pub n_kv_heads: usize,       // num_key_value_heads = 8
-    pub head_dim: usize,         // 128
-    pub rope_theta: f32,         // 10_000_000
-    pub rope_head_dim: usize,    // 128 (== head_dim → full rotary)
-    pub attention_bias: bool,    // false
+    pub n_heads: usize,       // num_attention_heads = 32
+    pub n_kv_heads: usize,    // num_key_value_heads = 8
+    pub head_dim: usize,      // 128
+    pub rope_theta: f32,      // 10_000_000
+    pub rope_head_dim: usize, // 128 (== head_dim → full rotary)
+    pub attention_bias: bool, // false
 
     // ── Grouped RMSNorm ──
     pub layernorm_num_groups: usize, // 2
 
     // ── Dense FFN (layers 0–2) ──
-    pub intermediate_size: usize,    // 6144
+    pub intermediate_size: usize, // 6144
 
     // ── MoE FFN (layers 3–47) ──
-    pub num_experts: usize,              // 100
-    pub num_experts_per_tok: usize,      // 8
-    pub moe_intermediate_size: usize,    // 768
-    pub num_shared_experts: usize,       // 1
-    pub norm_topk_prob: bool,            // true
+    pub num_experts: usize,           // 100
+    pub num_experts_per_tok: usize,   // 8
+    pub moe_intermediate_size: usize, // 768
+    pub num_shared_experts: usize,    // 1
+    pub norm_topk_prob: bool,         // true
 
     // ── MoE router ──
-    pub router_score_func: String,       // "sigmoid"
-    pub router_scaling_factor: f32,      // 2.5
-    pub moe_gate_bias: bool,             // true
+    pub router_score_func: String,  // "sigmoid"
+    pub router_scaling_factor: f32, // 2.5
+    pub moe_gate_bias: bool,        // true
 
     // ── MoVA attention ──
     pub mova_num_experts: usize,         // 64
@@ -72,12 +72,12 @@ pub struct K2HorizonConfig {
     pub attention_gate_func: String,     // "softplus"
 
     // ── Layer topology ──
-    pub mlp_only_layers: Vec<usize>,     // [0, 1, 2]
-    pub layer_kinds: Vec<LayerKind>,     // derived from mlp_only_layers
+    pub mlp_only_layers: Vec<usize>, // [0, 1, 2]
+    pub layer_kinds: Vec<LayerKind>, // derived from mlp_only_layers
 
     // ── Misc ──
-    pub max_position_embeddings: usize,  // 524288
-    pub tie_word_embeddings: bool,       // false
+    pub max_position_embeddings: usize, // 524288
+    pub tie_word_embeddings: bool,      // false
 }
 
 // ─── Raw serde struct (mirrors config.json) ─────────────────────────────
@@ -170,9 +170,7 @@ fn default_max_pos() -> usize {
 /// → default.
 fn first_token_or(v: Option<&serde_json::Value>, default: u32) -> u32 {
     match v {
-        Some(serde_json::Value::Number(n)) => {
-            n.as_u64().map(|x| x as u32).unwrap_or(default)
-        }
+        Some(serde_json::Value::Number(n)) => n.as_u64().map(|x| x as u32).unwrap_or(default),
         Some(serde_json::Value::Array(a)) => a
             .first()
             .and_then(|e| e.as_u64())
@@ -187,8 +185,8 @@ fn first_token_or(v: Option<&serde_json::Value>, default: u32) -> u32 {
 /// Parse a `K2HorizonConfig` from the outer `config` JSON node (the inner
 /// blob under the metadata_json `config` key, or a raw `config.json`).
 pub fn config_from_json(config_json: &str) -> Result<K2HorizonConfig, String> {
-    let value: serde_json::Value =
-        serde_json::from_str(config_json).map_err(|e| format!("k2_horizon: parsing config JSON: {e}"))?;
+    let value: serde_json::Value = serde_json::from_str(config_json)
+        .map_err(|e| format!("k2_horizon: parsing config JSON: {e}"))?;
     config_from_value(&value)
 }
 
@@ -274,9 +272,7 @@ pub fn config_from_hfq(hfq: &hipfire_runtime::hfq::HfqFile) -> Result<K2HorizonC
 }
 
 /// Parse a `K2HorizonConfig` from a safetensors directory's config.json.
-pub fn config_from_safetensors_dir(
-    config_json: &str,
-) -> Result<K2HorizonConfig, String> {
+pub fn config_from_safetensors_dir(config_json: &str) -> Result<K2HorizonConfig, String> {
     config_from_json(config_json)
 }
 

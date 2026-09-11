@@ -47,9 +47,9 @@ use tiny_http::{Header, Method, Request, Response, Server, StatusCode};
 mod bench_concurrency;
 mod serve;
 mod setup;
-use crate::serve::{ServePidRecord, parse_pid_record, detach_serve, parse_host_port};
-use crate::serve::http::request_id;
 use crate::serve::complete::next_attempt_id;
+use crate::serve::http::request_id;
+use crate::serve::{detach_serve, parse_host_port, parse_pid_record, ServePidRecord};
 use setup::setup_command;
 
 pub(crate) const MODEL_SUFFIXES: &[&str] = &[
@@ -654,10 +654,12 @@ fn run() -> Result<()> {
         Some(Commands::Stop(args)) => crate::serve::stop_command(&paths, args),
         Some(Commands::Restart(args)) => {
             let port = args.positionals.iter().find_map(|value| {
-                value
-                    .parse::<u16>()
-                    .ok()
-                    .or_else(|| crate::serve::parse_host_port(value).ok().flatten().map(|(_, port)| port))
+                value.parse::<u16>().ok().or_else(|| {
+                    crate::serve::parse_host_port(value)
+                        .ok()
+                        .flatten()
+                        .map(|(_, port)| port)
+                })
             });
             let _ = crate::serve::stop_command(
                 &paths,
@@ -1929,9 +1931,7 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     }
 
     let daemon = find_daemon(paths).ok_or_else(|| {
-        anyhow!(
-            "daemon binary not found; build `cargo build --release -p hipfire-daemon`"
-        )
+        anyhow!("daemon binary not found; build `cargo build --release -p hipfire-daemon`")
     })?;
     let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
     let mut engine = Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config)?;
@@ -2274,7 +2274,6 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
     Ok(())
 }
 
-
 pub(crate) fn resolved_for_model(
     paths: &Paths,
     model_name: &str,
@@ -2326,7 +2325,11 @@ pub(crate) fn resolved_for_model(
     Ok(resolve(layers)?)
 }
 
-pub(crate) fn find_model_path(paths: &Paths, registry: &RegistryV1, model: &str) -> Option<PathBuf> {
+pub(crate) fn find_model_path(
+    paths: &Paths,
+    registry: &RegistryV1,
+    model: &str,
+) -> Option<PathBuf> {
     let direct = PathBuf::from(model);
     if direct.is_file() {
         return fs::canonicalize(direct).ok();
@@ -2706,7 +2709,10 @@ pub(crate) fn config_value<'a>(
         .ok_or_else(|| anyhow!("missing resolved configuration key {key}"))
 }
 
-pub(crate) fn config_string(resolved: &hipfire_config::ResolvedConfig, key: &str) -> Result<String> {
+pub(crate) fn config_string(
+    resolved: &hipfire_config::ResolvedConfig,
+    key: &str,
+) -> Result<String> {
     match config_value(resolved, key)? {
         hipfire_config::ConfigValue::String(value) => Ok(value.clone()),
         value => bail!("{key} resolved as {}, expected string", value.kind()),
@@ -5377,16 +5383,15 @@ fn registry_source(source: RegistrySource) -> &'static str {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::serve::complete::{
-        Completion, ThinkFragment, forward_think_fragments, inject_default_system_message,
-        normalize_openai_messages,
+        forward_think_fragments, inject_default_system_message, normalize_openai_messages,
+        Completion, ThinkFragment,
     };
     use crate::serve::http::handle_http;
-    use crate::serve::{Admission, ServeMeta, ServeRuntime, ServeShared, serve_instance_token};
+    use crate::serve::{serve_instance_token, Admission, ServeMeta, ServeRuntime, ServeShared};
     use hipfire_config::CONFIG_PROFILE_NAMES;
     fn test_paths(label: &str) -> Paths {
         let nonce = std::time::SystemTime::now()
@@ -5421,8 +5426,6 @@ mod tests {
             last_activity: Instant::now() - Duration::from_secs(600),
         }
     }
-
-
 
     #[test]
     fn model_suffix_filter_covers_current_formats() {
@@ -5606,7 +5609,12 @@ mod tests {
         let registry = RegistryV1::parse(raw, "test").unwrap();
 
         // Exact Qwen families get VMM + 262144 + 81920
-        for tag in ["qwen3.5:4b", "qwen3.6:35b-a3b", "qwen3.8:27b", "qwen3.8:27b-fast"] {
+        for tag in [
+            "qwen3.5:4b",
+            "qwen3.6:35b-a3b",
+            "qwen3.8:27b",
+            "qwen3.8:27b-fast",
+        ] {
             let (_, entry) = registry.model(tag).unwrap();
             let resolved = resolved_for_model(&paths, tag, Some(tag), Some(entry)).unwrap();
             assert_eq!(
@@ -6088,9 +6096,6 @@ mod tests {
             "final off must drop projected developer.dflash_draft"
         );
     }
-
-
-
 
     #[test]
     pub(crate) fn artifact_urls_honor_endpoint_precedence() {
@@ -6930,7 +6935,6 @@ mod tests {
         fs::remove_dir_all(root).unwrap();
     }
 
-
     #[test]
     fn run_options_after_prompt_and_tui_passthrough_parse() {
         let cli =
@@ -6948,9 +6952,6 @@ mod tests {
         };
         assert_eq!(args.arguments, ["--check"]);
     }
-
-
-
 
     #[test]
     fn registry_system_prompt_is_injected_only_when_client_omits_one() {
@@ -6976,7 +6977,6 @@ mod tests {
         assert_eq!(messages[0]["role"], "system");
         assert_eq!(messages[0]["content"], "client policy");
     }
-
 
     #[test]
     fn normalize_reasoning_sources_with_flag_on_and_off() {
@@ -7108,11 +7108,6 @@ mod tests {
         );
     }
 
-
-
-
-
-
     #[test]
     fn positional_model_config_scope_parses_without_stealing_global_actions() {
         let global = Cli::try_parse_from(["hipfire", "config", "list", "--json"]).unwrap();
@@ -7237,18 +7232,6 @@ mod tests {
         assert_eq!(config_rule_json(variant_field.rule)["maximum"], 5);
     }
 
-
-
-
-
-
-
-
-
-
-
-
-
     fn sample_completion(
         content: &str,
         tool_calls: Vec<ToolCall>,
@@ -7282,15 +7265,6 @@ mod tests {
         }
     }
 
-
-
-
-
-
-
-
-
-
     /// Build a Completion whose done envelope has a non-string/missing finish_reason.
     fn sample_completion_with_done(
         content: &str,
@@ -7310,27 +7284,12 @@ mod tests {
         }
     }
 
-
-
-
     fn sample_tool_call(name: &str) -> serde_json::Value {
         serde_json::json!({
             "name": name,
             "arguments": { "path": "README.md" }
         })
     }
-
-
-
-
-
-
-
-
-
-
-
-
 
     fn task15_daemon_err(class: &str, retryable: bool, attempt_id: u64) -> anyhow::Error {
         anyhow::Error::new(hipfire_client::ClientError::Daemon(
@@ -7345,7 +7304,6 @@ mod tests {
         ))
     }
 
-
     #[test]
     fn task15_serve_retry_config_defaults_off() {
         let resolved = resolve(Vec::<NamedLayer>::new()).expect("resolve empty layers");
@@ -7357,28 +7315,7 @@ mod tests {
 
     // --- StreamContractGate / complete_request framing (fix round 2) ---
 
-
-
-
-
     // ── Task 6: canonical OpenAI tool-call adapter + endpoint registry ──
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 
     #[test]
     fn forward_think_fragments_preserves_cancelled_callback_error() {
@@ -7395,8 +7332,6 @@ mod tests {
         // Fragment still applied before callback failure (accumulation is local).
         assert_eq!(content, "x");
     }
-
-
 
     // =========================================================================
     // Task 11 — no-GPU fake-daemon HTTP acceptance through real serve lowering
@@ -7855,27 +7790,16 @@ mod tests {
 
     /// Capability denial: daemon typed error on tools request → no completion/tool payload.
     #[cfg(unix)]
-
     // --- Task 15: server-owned one-retry (disabled-by-default) ---
-
     #[cfg(unix)]
-
     #[cfg(unix)]
-
     #[cfg(unix)]
-
     #[cfg(unix)]
-
     #[cfg(unix)]
-
     #[cfg(unix)]
-
     #[cfg(unix)]
-
     #[cfg(unix)]
-
     #[cfg(unix)]
-
     #[test]
     fn bench_generate_request_includes_numeric_first_attempt() {
         let req = bench_generate_request("bench prompt", 37);
@@ -7930,5 +7854,4 @@ mod tests {
         // Still an ordinary benchmark generate otherwise.
         assert_eq!(req.get("max_tokens").and_then(|v| v.as_u64()), Some(128));
     }
-
 }

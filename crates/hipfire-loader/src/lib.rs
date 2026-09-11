@@ -1097,9 +1097,9 @@ impl LoadedModel {
     }
 
     pub fn k2_horizon(&self) -> Option<&hipfire_arch_k2_horizon::K2HorizonBundle> {
-        self.state
-            .as_deref()
-            .and_then(|s| (s as &dyn Any).downcast_ref::<hipfire_arch_k2_horizon::K2HorizonBundle>())
+        self.state.as_deref().and_then(|s| {
+            (s as &dyn Any).downcast_ref::<hipfire_arch_k2_horizon::K2HorizonBundle>()
+        })
     }
 
     pub fn k2_horizon_mut(&mut self) -> Option<&mut hipfire_arch_k2_horizon::K2HorizonBundle> {
@@ -1714,7 +1714,11 @@ fn finish_qwen35_load(
         let trunk_path = Path::new(ctx.path);
         let mut head_opt: Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead> = None;
         let mut load_err: Option<String> = None;
-        match hipfire_arch_qwen35::mtp_head::load_mtp_head_bundled(trunk_path, ctx.gpu, physical_cap) {
+        match hipfire_arch_qwen35::mtp_head::load_mtp_head_bundled(
+            trunk_path,
+            ctx.gpu,
+            physical_cap,
+        ) {
             Ok(Some(h)) => {
                 eprintln!(
                     "  MTP head loaded (bundled .mq4-mtp): n_embd={} vocab={}",
@@ -1725,7 +1729,11 @@ fn finish_qwen35_load(
             Ok(None) => {
                 let sidecar = trunk_path.with_extension("mtp");
                 if sidecar.exists() {
-                    match hipfire_arch_qwen35::mtp_head::load_mtp_head(&sidecar, ctx.gpu, physical_cap) {
+                    match hipfire_arch_qwen35::mtp_head::load_mtp_head(
+                        &sidecar,
+                        ctx.gpu,
+                        physical_cap,
+                    ) {
                         Ok(h) => {
                             eprintln!(
                                 "  MTP head loaded (sidecar {}): n_embd={} vocab={}",
@@ -1736,7 +1744,8 @@ fn finish_qwen35_load(
                             head_opt = Some(h);
                         }
                         Err(e) => {
-                            load_err = Some(format!("sidecar {} load failed: {e}", sidecar.display()));
+                            load_err =
+                                Some(format!("sidecar {} load failed: {e}", sidecar.display()));
                         }
                     }
                 }
@@ -1745,7 +1754,11 @@ fn finish_qwen35_load(
                 load_err = Some(format!("bundled trailer load failed: {e}"));
                 let sidecar = trunk_path.with_extension("mtp");
                 if sidecar.exists() {
-                    match hipfire_arch_qwen35::mtp_head::load_mtp_head(&sidecar, ctx.gpu, physical_cap) {
+                    match hipfire_arch_qwen35::mtp_head::load_mtp_head(
+                        &sidecar,
+                        ctx.gpu,
+                        physical_cap,
+                    ) {
                         Ok(h) => {
                             eprintln!(
                                 "  MTP head loaded (sidecar {} after bundled error): n_embd={} vocab={}",
@@ -1757,7 +1770,8 @@ fn finish_qwen35_load(
                             load_err = None;
                         }
                         Err(e2) => {
-                            load_err = Some(format!("bundled: {e}; sidecar {}: {e2}", sidecar.display()));
+                            load_err =
+                                Some(format!("bundled: {e}; sidecar {}: {e2}", sidecar.display()));
                         }
                     }
                 }
@@ -1768,7 +1782,9 @@ fn finish_qwen35_load(
                 return Err(rollback_unfinished_qwen35(
                     format!(
                         "MTP head required (mtp=on) but not found: {}",
-                        load_err.unwrap_or_else(|| "no bundled trailer or .mtp sidecar found".to_string())
+                        load_err.unwrap_or_else(
+                            || "no bundled trailer or .mtp sidecar found".to_string()
+                        )
                     ),
                     bundle,
                     vision_weights,
@@ -1827,7 +1843,6 @@ fn finish_qwen35_load(
     };
     model.mtp_weights_present = mtp_present;
     Ok(model)
-
 }
 
 // ─── Main public API ──────────────────────────────────────────────────

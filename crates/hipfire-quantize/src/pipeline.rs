@@ -1072,8 +1072,12 @@ pub(crate) fn run() {
     // (not RMSNorm-anchored) corrupts AWQ saliency for FFN; embed/lm_head are
     // tied + scaled by √3840 making AWQ scale saliency meaningless there.
     let is_gemma4_family = arch_id == 13 || arch_id == 22;
-    let is_moe_like =
-        is_moe || is_deepseek4 || is_lfm2moe || is_minimax || is_cohere2moe || is_gemma4
+    let is_moe_like = is_moe
+        || is_deepseek4
+        || is_lfm2moe
+        || is_minimax
+        || is_cohere2moe
+        || is_gemma4
         || is_k2_horizon;
     if (use_mq6g256v2 || use_mq5g256v2 || use_mq3g256v2 || use_mq2g256v2) && is_moe_like {
         eprintln!(

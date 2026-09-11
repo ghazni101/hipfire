@@ -125,6 +125,11 @@ pub enum EscapeKind {
     Deepseek4SwaTopK,
     /// Gemma final logit softcap (output stage).
     GemmaLogitSoftcap,
+    /// K2-Horizon MoVA attention block: norm + Q/K proj + MoVA value-expert
+    /// routing + RoPE + flash attention + softplus gate + o_proj. Too
+    /// irregular for Proj/Attend (MoVA router + 64 value experts + sigmoid
+    /// top-K + V2 indexed GEMV + softplus gate = bespoke kernel sequence).
+    K2HorizonMovaAttn,
 }
 
 /// One coarse super-op. For `Proj`/`ResidualGemv`/`Moe` the `key` is the

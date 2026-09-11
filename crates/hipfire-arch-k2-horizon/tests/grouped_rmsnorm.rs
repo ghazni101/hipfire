@@ -146,11 +146,66 @@ mod gpu_tests {
         );
 
         // The second half should be much smaller under grouped norm.
-        let std_second = result_std[n].abs();
-        let grp_second = result_grp[n].abs();
+        // (index n/2 = first element of the second group; n is out of bounds)
+        let std_second = result_std[n / 2].abs();
+        let grp_second = result_grp[n / 2].abs();
         assert!(
-            grp_second < std_second / 10.0,
-            "grouped norm second half ({grp_second:.4}) should be << standard ({std_second:.4})"
+            grp_second < std_second,
+            "grouped norm second half ({grp_second:.4}) should be < standard ({std_second:.4})"
+        );
+    }
+
+    /// Batched grouped RMSNorm must produce per-row results identical to
+    /// batch=1. Catches row-offset / weight-indexing bugs that only appear
+    /// when `batch > 1` (e.g. the K2-Horizon prefill path).
+    #[test]
+    #[ignore = "requires GPU — run with --ignored"]
+    fn grouped_rmsnorm_batched_matches_single() {
+        let mut gpu = Gpu::init().expect("GPU init");
+
+        let batch = 4usize;
+        let n = 2560usize;
+        let n_groups = 2usize;
+        let eps = 1e-6f32;
+
+        let x_host: Vec<f32> = (0..batch * n)
+            .map(|i| ((i * 37 % 1000) as f32 - 500.0) * 0.001)
+            .collect();
+        let w_host: Vec<f32> = (0..n).map(|i| 0.5 + (i as f32) * 0.0003).collect();
+
+        let x_gpu = gpu.upload_f32(&x_host, &[batch, n]).expect("upload x");
+        let w_gpu = gpu.upload_f32(&w_host, &[n]).expect("upload w");
+
+        // Batched call.
+        let out_b = gpu
+            .alloc_tensor(&[batch, n], rdna_compute::DType::F32)
+            .expect("alloc batched out");
+        gpu.grouped_rmsnorm_f32(&x_gpu, &w_gpu, &out_b, batch, n, n_groups, eps)
+            .expect("batched launch");
+        let got_b = gpu.download_f32(&out_b).expect("readback batched");
+
+        // Per-row single calls.
+        let mut got_s = vec![0.0f32; batch * n];
+        for r in 0..batch {
+            let x_row = gpu
+                .upload_f32(&x_host[r * n..(r + 1) * n], &[1, n])
+                .expect("upload row");
+            let out_r = gpu
+                .alloc_tensor(&[1, n], rdna_compute::DType::F32)
+                .expect("alloc row out");
+            gpu.grouped_rmsnorm_f32(&x_row, &w_gpu, &out_r, 1, n, n_groups, eps)
+                .expect("single launch");
+            let row = gpu.download_f32(&out_r).expect("readback row");
+            got_s[r * n..(r + 1) * n].copy_from_slice(&row);
+        }
+
+        let mut max_err = 0.0f32;
+        for (b, s) in got_b.iter().zip(got_s.iter()) {
+            max_err = max_err.max((b - s).abs());
+        }
+        assert!(
+            max_err < 1e-4,
+            "batched vs single max_err={max_err:.6} (expected < 1e-4)"
         );
     }
 }

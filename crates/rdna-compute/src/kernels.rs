@@ -2302,6 +2302,18 @@ pub const GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str = concat!
     include_str!("../../../kernels/src/gemv_hfq4g256_moe_down_k8_indexed_batched_expanded.hip")
 );
 
+/// V2 (MQ4G256V2, qt=44) batched indexed MoE gate_up GEMV. Same structure as
+/// `GEMV_HFQ4G256_MOE_GATE_UP_INDEXED_BATCHED_SRC` but decodes fp16 per-128
+/// headers instead of f32 per-256 headers.
+pub const GEMV_MQ4G256V2_MOE_GATE_UP_INDEXED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq4g256v2_moe_gate_up_k8_indexed_batched.hip");
+
+/// V2 (MQ4G256V2, qt=44) atomic-free batched indexed MoE down GEMV. Same
+/// structure as `GEMV_HFQ4G256_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC` but
+/// decodes fp16 per-128 headers instead of f32 per-256 headers.
+pub const GEMV_MQ4G256V2_MOE_DOWN_K8_INDEXED_BATCHED_EXPANDED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded.hip");
+
 /// Nine-path fused MoE gate_up (routed k=8, decode T=1): one CTA stages the
 /// activation into LDS once and all 8 routed-expert warps share it, replacing
 /// the per-(row,krank) x restaging of `gemv_hfq4g256_moe_gate_up_k8_indexed`.
@@ -5314,6 +5326,11 @@ pub const SIGMOID_SRC: &str = include_str!("../../../kernels/src/sigmoid.hip");
 #[cfg(feature = "deltanet")]
 pub const SOFTPLUS_SRC: &str = include_str!("../../../kernels/src/softplus.hip");
 
+/// Fused softplus post-attention gate: out[i] *= softplus_beta(gate[i]).
+/// Replaces scale→softplus→scale→mul (4 launches) with 1 launch.
+#[cfg(feature = "deltanet")]
+pub const SOFTPLUS_GATE_SRC: &str = include_str!("../../../kernels/src/softplus_gate.hip");
+
 /// L2 normalization per head: out[i] = x[i] / sqrt(sum(x²) + eps).
 /// Grid: [n_heads]. Block: [32]. Each warp normalizes one head of head_dim elements.
 #[cfg(feature = "deltanet")]
@@ -7062,6 +7079,10 @@ mod gfx1201_e8_decode_identity {
         }
     }
 }
+
+/// Replicate [N × K] → [N × K_TOP × K] for batched MoVA value routing.
+pub const REPLICATE_BATCHED_F32_SRC: &str =
+    include_str!("../../../kernels/src/replicate_batched.hip");
 
 #[cfg(test)]
 mod dispatch_tests {

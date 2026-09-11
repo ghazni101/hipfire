@@ -25,6 +25,8 @@ pub mod arch;
 pub mod config;
 pub mod forward;
 pub mod load;
+pub mod lowered;
+pub mod prefill;
 pub mod weights;
 
 pub use arch::K2Horizon;

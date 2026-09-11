@@ -1,0 +1,65 @@
+# K2-Horizon serving container — pre-built binaries on ROCm base.
+#
+# 100k Q8 KV context does NOT fit: 19 GB model + 10.44 GB KV = 29.44 GB
+# vs 24.5 GB usable on gfx1100. Max feasible ≈ 48k tokens (5 GB KV).
+# DEFAULT_MAX_SEQ raised to 65536 in forward.rs; config sets 32768
+# (safe margin for state buffers + JIT kernel cache).
+#
+# Build:
+#   docker build -f Containerfile.k2-horizon -t k2-horizon-serve .
+#
+# Run:
+#   docker run --rm -d \
+#     --device /dev/kfd --device /dev/dri \
+#     --security-opt seccomp=unconfined \
+#     -v /home/ghazni/models:/models:ro \
+#     -v k2-horizon-kcache:/var/cache/hipfire \
+#     -p 9001:9001 \
+#     k2-horizon-serve
+
+FROM docker.io/rocm/dev-ubuntu-24.04:7.2.4
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV HIP_PATH=/opt/rocm \
+    HIPFIRE_KERNEL_CACHE=/var/cache/hipfire \
+    HIPFIRE_DAEMON_BIN=/opt/hipfire/bin/daemon \
+    HIPFIRE_DIR=/root/.hipfire
+RUN mkdir -p /var/cache/hipfire /root/.hipfire && chmod 1777 /var/cache/hipfire
+
+# Pre-built binaries from the host (dlopen'd ROCm, no hard link).
+COPY .docker-bin/daemon /opt/hipfire/bin/daemon
+COPY .docker-bin/hipfire /usr/local/bin/hipfire
+
+# Config: Q8 KV, 32k context (VRAM-safe for 24.5 GB), port 9001.
+RUN mkdir -p /root/.hipfire
+COPY <<'EOF' /root/.hipfire/config.toml
+schema_version = 1
+
+[reasoning]
+mode = "on"
+
+[serve]
+multi_slot = false
+
+[speculation]
+mtp = "on"
+
+[memory]
+kv_cache = "q8"
+max_seq = 32768
+EOF
+
+# Symlink model into the models directory so /v1/models lists it.
+RUN mkdir -p /root/.hipfire/models && \
+    ln -sf /models/RAW/IFM/K2-Horizon-MoVA-36B-A4B/K2-Horizon-MoVA-36B-A4B.mq4r \
+           /root/.hipfire/models/K2-Horizon-MoVA-36B-A4B.mq4r
+
+VOLUME ["/var/cache/hipfire"]
+EXPOSE 9001
+
+ENTRYPOINT ["hipfire"]
+CMD ["serve", "K2-Horizon-MoVA-36B-A4B.mq4r", "0.0.0.0:9001", "--kv-mode", "q8"]

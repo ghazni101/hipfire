@@ -211,11 +211,10 @@ pub(crate) fn q8_class_of(name: &str) -> Option<&'static str> {
     } else if name.contains("linear_attn.out_proj") || name.contains("ssm_out") {
         Some("ssm_out")
     } else if
-        // K2-Horizon MoVA value experts are MoE-style weights (64 experts,
-        // top-4 per token) → quantize to MQ4, NOT Q8 attention. Exclude
-        // them from the "attn" class by checking before the broad bucket.
-        name.contains("v_experts")
-    {
+    // K2-Horizon MoVA value experts are MoE-style weights (64 experts,
+    // top-4 per token) → quantize to MQ4, NOT Q8 attention. Exclude
+    // them from the "attn" class by checking before the broad bucket.
+    name.contains("v_experts") {
         None
     } else if name.contains("self_attn")
         || name.contains("attn_q")

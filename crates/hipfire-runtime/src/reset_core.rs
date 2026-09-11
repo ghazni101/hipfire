@@ -212,7 +212,15 @@ pub fn retry_candidate_reset_inventory() -> &'static [ResetCoreCoverage] {
         },
     };
     &[
-        QWEN35, DEEPSEEK4, LLAMA, QWEN2, COHERE2MOE, DOTS_OCR, MINIMAX, LFM2MOE, GEMMA4,
+        QWEN35,
+        DEEPSEEK4,
+        LLAMA,
+        QWEN2,
+        COHERE2MOE,
+        DOTS_OCR,
+        MINIMAX,
+        LFM2MOE,
+        GEMMA4,
         MUSE_GLIMMER,
         K2_HORIZON,
     ]
@@ -349,7 +357,12 @@ mod tests {
 
     #[test]
     fn unknown_architectures_remain_ineligible() {
-        for arch in ["unknown-arch", "toy", "gemma4_unified_assistant", "muse_glimmer_assistant"] {
+        for arch in [
+            "unknown-arch",
+            "toy",
+            "gemma4_unified_assistant",
+            "muse_glimmer_assistant",
+        ] {
             assert!(
                 reset_coverage_for(arch).is_none(),
                 "{arch} must have no inventory row"

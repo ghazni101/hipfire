@@ -13,7 +13,6 @@ use crate::forward::K2HorizonState;
 use crate::weights::K2HorizonWeights;
 use hipfire_runtime::arch::Architecture;
 use hipfire_runtime::arch_model::ArchModel;
-use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::KvCache;
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
 use rdna_compute::Gpu;
@@ -55,12 +54,12 @@ impl ArchModel for K2HorizonBundle {
     }
 
     fn free_gpu(self: Box<Self>, gpu: &mut Gpu) {
-        // Drop weights (frees WeightTensor GPU buffers) then state (frees
-        // scratch + KV cache). Order doesn't matter — both are GPU-owned.
+        // Free state scratch + KV cache, then all weight allocations.
+        // DeviceBuffer has no Drop — without this, every unload leaks the
+        // full model VRAM (~20 GB at MQ4R).
         let bundle = *self;
         bundle.state.free_gpu(gpu);
-        // Weights' WeightTensor drop handles GPU free internally.
-        drop(bundle.weights);
+        bundle.weights.free_gpu(gpu);
     }
 }
 
@@ -75,8 +74,7 @@ pub fn load_k2_horizon_bundle(
     match src {
         ModelSource::Hfq(mut hfq) => {
             let config = <K2Horizon as Architecture>::config_from_hfq(&hfq)?;
-            let weights =
-                <K2Horizon as Architecture>::load_weights(&mut hfq, &config, ctx.gpu)?;
+            let weights = <K2Horizon as Architecture>::load_weights(&mut hfq, &config, ctx.gpu)?;
             let state = K2HorizonState::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
                 .map_err(|e| format!("k2_horizon: new_with_max_seq failed: {e}"))?;
 
@@ -91,8 +89,9 @@ pub fn load_k2_horizon_bundle(
                 eos_tok,
             })
         }
-        ModelSource::Dir(_) => {
-            Err("k2_horizon: safetensors-dir source not supported — quantize first, then serve the HFQ".into())
-        }
+        ModelSource::Dir(_) => Err(
+            "k2_horizon: safetensors-dir source not supported — quantize first, then serve the HFQ"
+                .into(),
+        ),
     }
 }

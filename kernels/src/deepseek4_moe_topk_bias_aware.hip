@@ -25,8 +25,10 @@
 //   indices:      [k_top]      i32 (written as i32 little-endian raw)
 //   weights:      [k_top]      fp32
 //
-// Launch: grid = [1, 1, 1], block = [256, 1, 1]. n_exp must equal blockDim.x.
-// k_top ≤ 32 (DeepSeek V4: k_top=6).
+// Launch: grid = [1, 1, 1], block = [round_up(n_exp, 32), 1, 1]. n_exp ≤ 1024
+// (s_score/s_biased capacity). k_top ≤ 32 (DeepSeek V4: k_top=6).
+// blockDim MUST be warp-aligned: per-warp __shfl_down reads undefined values
+// from inactive lanes when n_exp % 32 != 0 (K2-Horizon n_exp=100).
 
 #include <hip/hip_runtime.h>
 #include <math.h>
@@ -43,6 +45,8 @@ extern "C" __global__ void deepseek4_moe_topk_bias_aware_f32(
     int   k_top,
     float route_scale
 ) {
+    if (n_exp > 1024 || k_top > MAX_K_TOP || k_top <= 0) return;
+
     const int tid = threadIdx.x;
 
     __shared__ float s_score[1024];        // scores[i] (raw, used for weights)
@@ -71,7 +75,9 @@ extern "C" __global__ void deepseek4_moe_topk_bias_aware_f32(
     for (int k = 0; k < k_top; ++k) {
         // Each thread loads its slot's biased value (or -inf if out of range).
         float v   = (tid < n_exp) ? s_biased[tid] : -1e30f;
-        int   ix  = tid;
+        // Clamp padded-lane index so a degenerate all-(-inf) argmax can never
+        // produce an out-of-range expert index.
+        int   ix  = (tid < n_exp) ? tid : 0;
 
         // Warp reduce.
         const int warp_id = tid >> 5;

@@ -13,7 +13,9 @@
 //   weights[b, k_top]
 //
 // Grid:  [batch_size, 1, 1]
-// Block: [256, 1, 1]  — n_exp must be ≤ 256 (DeepSeek V4: n_exp=256 exactly)
+// Block: [round_up(n_exp, 32), 1, 1] — n_exp ≤ 1024 (s_score/s_biased
+// capacity). blockDim MUST be warp-aligned: per-warp __shfl_down reads
+// undefined values from inactive lanes when n_exp % 32 != 0.
 //
 // Byte-identical to deepseek4_moe_topk_bias_aware_f32 at batch_size == 1.
 
@@ -35,7 +37,7 @@ extern "C" __global__ void deepseek4_moe_topk_bias_aware_batched_f32(
 ) {
     const int b   = blockIdx.x;
     const int tid = threadIdx.x;
-    if (b >= batch_size) return;
+    if (n_exp > 1024 || k_top > MAX_K_TOP || k_top <= 0) return;
 
     __shared__ float s_score[1024];
     __shared__ float s_biased[1024];
@@ -57,7 +59,9 @@ extern "C" __global__ void deepseek4_moe_topk_bias_aware_batched_f32(
 
     for (int k = 0; k < k_top; ++k) {
         float v  = (tid < n_exp) ? s_biased[tid] : -1e30f;
-        int   ix = tid;
+        // Clamp padded-lane index so a degenerate all-(-inf) argmax can never
+        // produce an out-of-range expert index.
+        int   ix = (tid < n_exp) ? tid : 0;
 
         const int warp_id = tid >> 5;
         const int lane_id = tid & 31;

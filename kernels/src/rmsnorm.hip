@@ -116,6 +116,9 @@ extern "C" __global__ void grouped_rmsnorm_f32(
     float rms = rsqrtf(sdata[0] / (float)chunk_len + eps);
     for (int i = threadIdx.x; i < chunk_len; i += blockDim.x) {
         int idx = offset + i;
-        out[idx] = x[idx] * weight[idx] * rms;
+        // weight is [n] shared across batch rows — index it with the
+        // within-row position, not the global flat index (which overruns
+        // the buffer for row > 0 → IMA at batch > 1).
+        out[idx] = x[idx] * weight[group * chunk_len + i] * rms;
     }
 }

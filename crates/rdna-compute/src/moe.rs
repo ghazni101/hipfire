@@ -843,10 +843,16 @@ impl Gpu {
             &mut rs as *mut _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
         ];
+        // blockDim must be a multiple of 32: the kernel's per-warp
+        // __shfl_down reduction reads undefined values from inactive lanes
+        // when n_exp % 32 != 0 (e.g. K2-Horizon n_exp=100 → warp 3 has 28
+        // inactive lanes), which can poison the argmax with a garbage
+        // expert index → OOB expert_ptrs read downstream.
+        let block = ((n_exp as u32) + 31) & !31;
         self.launch_maybe_blob(
             "deepseek4_moe_topk_bias_aware_batched_f32",
             [batch_size as u32, 1, 1],
-            [n_exp as u32, 1, 1],
+            [block, 1, 1],
             0,
             &mut params,
             || {
@@ -895,10 +901,12 @@ impl Gpu {
             &mut kt as *mut _ as *mut c_void,
             &mut rs as *mut _ as *mut c_void,
         ];
+        // blockDim must be a multiple of 32 — see the batched variant above.
+        let block = ((n_exp as u32) + 31) & !31;
         self.launch_maybe_blob(
             "deepseek4_moe_topk_bias_aware_f32",
             [1, 1, 1],
-            [n_exp as u32, 1, 1],
+            [block, 1, 1],
             0,
             &mut params,
             || {
@@ -1522,11 +1530,7 @@ impl Gpu {
         assert!(self.arch_caps.supports_ds4_f16_compressor_cache());
         assert_eq!(cache.dtype, DType::F16);
         let symbol = "deepseek4_topk_kv_gather_f16_buf";
-        self.ensure_kernel(
-            symbol,
-            kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC,
-            symbol,
-        )?;
+        self.ensure_kernel(symbol, kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC, symbol)?;
         let cp = cache.buf.as_ptr();
         let ip = topk_idx.buf.as_ptr();
         let op = out.buf.as_ptr();
@@ -1582,11 +1586,7 @@ impl Gpu {
         assert!(self.arch_caps.supports_ds4_f16_compressor_cache());
         assert_eq!(cache.dtype, DType::F16);
         let symbol = "deepseek4_topk_kv_gather_identity_f16_buf";
-        self.ensure_kernel(
-            symbol,
-            kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC,
-            symbol,
-        )?;
+        self.ensure_kernel(symbol, kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC, symbol)?;
         let cp = cache.buf.as_ptr();
         let op = out.buf.as_ptr();
         let kbp = k_buf.buf.as_ptr();
@@ -1635,11 +1635,7 @@ impl Gpu {
         assert!(self.arch_caps.supports_ds4_f16_compressor_cache());
         assert_eq!(cache.dtype, DType::F16);
         let symbol = "deepseek4_topk_kv_gather_batched_tiled_f16";
-        self.ensure_kernel(
-            symbol,
-            kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC,
-            symbol,
-        )?;
+        self.ensure_kernel(symbol, kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC, symbol)?;
         let cp = cache.buf.as_ptr();
         let ip = topk_idx.buf.as_ptr();
         let op = out.buf.as_ptr();
@@ -1702,11 +1698,7 @@ impl Gpu {
         assert!(self.arch_caps.supports_ds4_f16_compressor_cache());
         assert_eq!(cache.dtype, DType::F16);
         let symbol = "deepseek4_topk_kv_gather_identity_batched_f16";
-        self.ensure_kernel(
-            symbol,
-            kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC,
-            symbol,
-        )?;
+        self.ensure_kernel(symbol, kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC, symbol)?;
         let cp = cache.buf.as_ptr();
         let op = out.buf.as_ptr();
         let mut k = k_active;

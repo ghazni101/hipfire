@@ -9,10 +9,10 @@
 use hipfire_arch_cohere2moe as cohere2moe;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_gemma4 as gemma4;
+use hipfire_arch_k2_horizon as k2_horizon;
 use hipfire_arch_lfm2moe as lfm2moe;
 use hipfire_arch_minimax as minimax;
 use hipfire_arch_muse_glimmer as glimmer;
-use hipfire_arch_k2_horizon as k2_horizon;
 use hipfire_arch_qwen2::qwen2;
 use std::any::Any;
 use std::path::PathBuf;
@@ -7442,7 +7442,7 @@ pub fn generate_k2_horizon(
     temp: f32,
     top_p: f32,
     max_tokens: usize,
-    _max_think_tokens: usize,
+    max_think_tokens: usize,
     _tools: Option<&[serde_json::Value]>,
     _messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
 ) {
@@ -7478,13 +7478,23 @@ pub fn generate_k2_horizon(
                 template,
                 system: system_prompt,
                 user: prompt,
-                // K2-Horizon's template opens `<ifm|think>\n` when
-                // reasoning_effort is set (default 'high'). The model
-                // starts generating inside the think block.
-                enable_thinking: true,
+                // K2-Horizon's template opens a think block whenever
+                // `add_generation_prompt` is set — `enable_thinking` is not
+                // consulted; `reasoning_effort | default('high')` picks the
+                // tag (high→<ifm|think>, medium→<ifm|think_fast>,
+                // low→<ifm|think_faster>). Map the caller's think budget onto
+                // the effort ladder (mirrors glimmer_reasoning_strength):
+                // 1 = no-think → lowest effort, 0 = uncapped → high.
+                enable_thinking: max_think_tokens != 1,
                 bos_token: None,
                 reasoning_strength: None,
-                reasoning_effort: Some("high"),
+                reasoning_effort: Some(match max_think_tokens {
+                    1 => "low",
+                    0 => "high",
+                    n if n <= 512 => "low",
+                    n if n <= 2048 => "medium",
+                    _ => "high",
+                }),
             };
             match frame.render() {
                 Ok(rendered) => tokenizer.encode(&rendered),
@@ -7535,29 +7545,67 @@ pub fn generate_k2_horizon(
     }
 
     let mut last_logits: Vec<f32> = Vec::new();
-    for (i, &tok) in prompt_ids.iter().enumerate() {
-        let step = {
-            let b = m.k2_horizon_mut().unwrap();
-            let position = b.state.n_tokens as u32;
-            k2_horizon::forward::decode_step(
-                &b.config,
-                &b.weights,
-                &mut b.state,
-                gpu,
-                tok,
-                position,
-            )
-        };
-        match step {
-            Ok(logits) => {
-                last_logits = logits;
-                let b = m.k2_horizon_mut().unwrap();
-                b.state.n_tokens += 1;
+    {
+        let b = m.k2_horizon_mut().unwrap();
+        // Batched prefill (PREFILL_MAX_BATCH=256 tokens/chunk). The prior
+        // IMA (hipMemcpy D2H 700) traced to the partial-warp topk hazard,
+        // fixed in deepseek4_moe_topk_bias_aware{,_batched}. Sequential
+        // decode_step prefill remains the fallback on error.
+        let use_batched = hipfire_config::developer_var("HIPFIRE_K2_PREFILL_SEQ")
+            .map(|v| v != "1")
+            .unwrap_or(true);
+        let batched = if use_batched {
+            match k2_horizon::prefill::PrefillScratch::new(gpu, &b.config) {
+                Ok(ps) => {
+                    let r = k2_horizon::prefill::forward_prefill_batch(
+                        &b.config,
+                        &b.weights,
+                        &ps,
+                        &mut b.state,
+                        gpu,
+                        &prompt_ids,
+                    );
+                    ps.free_gpu(gpu);
+                    Some(r)
+                }
+                Err(e) => Some(Err(e)),
             }
-            Err(e) => {
-                emit_error_with_id(stdout, id, format!("k2_horizon prefill failed: {e:?}"));
+        } else {
+            None
+        };
+        match batched {
+            Some(Ok(logits)) => last_logits = logits,
+            Some(Err(e)) => {
+                emit_error_with_id(stdout, id, format!("k2_horizon prefill failed: {e}"));
                 let _ = stdout.flush();
                 return;
+            }
+            None => {
+                for (i, &tok) in prompt_ids.iter().enumerate() {
+                    match k2_horizon::decode_step(
+                        &b.config,
+                        &b.weights,
+                        &mut b.state,
+                        gpu,
+                        tok,
+                        i as u32,
+                    ) {
+                        Ok(logits) => last_logits = logits,
+                        Err(e) => {
+                            emit_error_with_id(
+                                stdout,
+                                id,
+                                format!("k2_horizon prefill failed: {e}"),
+                            );
+                            let _ = stdout.flush();
+                            return;
+                        }
+                    }
+                }
+                // Sequential decode_step does not advance n_tokens (unlike
+                // the batched driver, which sets it per chunk). Without this,
+                // decode restarts at position 0 and overwrites the KV cache.
+                b.state.n_tokens = prompt_ids.len();
             }
         }
     }
@@ -7568,22 +7616,41 @@ pub fn generate_k2_horizon(
     let mut generated_count = 0usize;
     let mut rng = deepseek4::sampling::Xorshift::new(0xDEAD_BEEF);
     let mut emitted_visible = false;
-    // The Jinja template opens <ifm|think> in the generation prompt, so
-    // the model starts generating inside a think block. Track state at
-    // the token level: think-marker tokens are single-token added tokens
-    // that decode as complete strings, so no byte-level streaming router
-    // is needed.
+    // The Jinja template ALWAYS opens a think block in the generation
+    // prompt (`reasoning_effort | default('high')` — enable_thinking is not
+    // consulted), so generation always starts inside a think block
+    // regardless of the caller's think budget. `max_think_tokens` is a CAP:
+    // 1 = minimum effort (think_faster), N = force-close after N reasoning
+    // tokens, 0 = uncapped. Track state at the token level: think-marker
+    // tokens are single-token added tokens that decode as complete strings,
+    // so no byte-level streaming router is needed.
     let mut in_think = true;
+    let mut reasoning_tokens = 0usize;
+    // Close tag matching the block the template opened (effort → tag).
+    let think_close_tok: u32 = match max_think_tokens {
+        1 => THINK_FASTER_CLOSE,
+        0 => THINK_CLOSE,
+        n if n <= 512 => THINK_FASTER_CLOSE,
+        n if n <= 2048 => THINK_FAST_CLOSE,
+        _ => THINK_CLOSE,
+    };
 
     // Sample the first token from the prefill's last logits on CPU (one-time).
     // All subsequent tokens are sampled on GPU via decode_step_sampled,
     // avoiding the ~1 MB logits download per token.
     let mut next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
-    let mut rng_state: u32 = 0xDEAD_BEEF;
 
+    let mut rng_state: u32 = 0xDEAD_BEEF;
     loop {
         if generated_count >= max_tokens {
             break;
+        }
+
+        // Force-close the think block once the reasoning budget is spent.
+        // The close tag is fed through the normal marker arm below, so it
+        // reaches the model's KV cache and flips in_think off.
+        if in_think && max_think_tokens > 1 && reasoning_tokens >= max_think_tokens {
+            next_tok = think_close_tok;
         }
 
         // Check both EOS tokens: <|ifm|endoftext|> (1) and <|ifm|im_end|> (250019).
@@ -7671,6 +7738,7 @@ pub fn generate_k2_horizon(
 
         if in_think {
             // Reasoning channel — the CLI surfaces this as reasoning_content.
+            reasoning_tokens += 1;
             let _ = writeln!(
                 stdout,
                 "{}",

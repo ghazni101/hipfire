@@ -225,7 +225,11 @@ impl Gpu {
             "grouped_rmsnorm: n ({n}) must be divisible by n_groups ({n_groups})"
         );
         self.bind_thread()?;
-        self.ensure_kernel("grouped_rmsnorm_f32", kernels::RMSNORM_SRC, "grouped_rmsnorm_f32")?;
+        self.ensure_kernel(
+            "grouped_rmsnorm_f32",
+            kernels::RMSNORM_SRC,
+            "grouped_rmsnorm_f32",
+        )?;
 
         let x_ptr = x.buf.as_ptr();
         let w_ptr = weight.buf.as_ptr();
@@ -249,8 +253,7 @@ impl Gpu {
         ];
 
         let bytes = crate::profile::rmsnorm_bytes(batch * n);
-        let timer =
-            crate::profile::begin_timer(&self.hip, "rmsnorm", "grouped_rmsnorm_f32", bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "rmsnorm", "grouped_rmsnorm_f32", bytes);
         let result = self.launch_maybe_blob(
             "grouped_rmsnorm_f32",
             [grid, 1, 1],
@@ -479,6 +482,55 @@ impl Gpu {
                 b
             },
         )
+    }
+
+    /// Replicate [N × K] → [N × K_TOP × K] for batched MoVA value routing.
+    pub fn replicate_batched_f32(
+        &mut self,
+        input: &GpuTensor,
+        output: &GpuTensor,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "replicate_batched",
+            kernels::REPLICATE_BATCHED_F32_SRC,
+            "replicate_batched_f32",
+        )?;
+        let ip = input.buf.as_ptr();
+        let op = output.buf.as_ptr();
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let n_val = batch_size as i32;
+        let total = (batch_size * k_top * k) as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ip as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = (total as u32).div_ceil(block);
+        let result = self.launch_maybe_blob(
+            "replicate_batched_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ip);
+                b.push_ptr(op);
+                b.push_i32(k_val);
+                b.push_i32(kt_val);
+                b.push_i32(n_val);
+                b
+            },
+        );
+        result
     }
     /// Zero inactive rows of a 2D F32 tensor [rows, cols] row-major.
     /// `active_mask` lane bit i selects row i as active. Only inactive rows
@@ -2210,6 +2262,49 @@ impl Gpu {
             || {
                 let mut b = hip_bridge::KernargBlob::new();
                 b.push_ptr(xp);
+                b.push_i32(n);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Fused softplus post-attention gate: out[i] *= softplus_beta(gate[i]).
+    /// Replaces scale→softplus→scale→mul (4 launches) with 1 launch.
+    #[cfg(feature = "deltanet")]
+    pub fn softplus_gate_f32(&mut self, gate: &GpuTensor, out: &GpuTensor) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "softplus_gate",
+            kernels::SOFTPLUS_GATE_SRC,
+            "softplus_gate_f32",
+        )?;
+        let gp = gate.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let n = gate.numel() as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &gp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &n as *const _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = ((n as u32) + block - 1) / block;
+        let bytes = crate::profile::elementwise_bytes(n as usize);
+        let timer =
+            crate::profile::begin_timer(&self.hip, "elementwise", "softplus_gate_f32", bytes);
+        let result = self.launch_maybe_blob(
+            "softplus_gate_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(gp);
+                b.push_ptr(op);
                 b.push_i32(n);
                 b
             },
@@ -5840,16 +5935,28 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         if rows == 0 {
-            return Err(hip_bridge::HipError::new(0, "dynamic_causal_conv_f32: rows must be > 0"));
+            return Err(hip_bridge::HipError::new(
+                0,
+                "dynamic_causal_conv_f32: rows must be > 0",
+            ));
         }
         if hidden == 0 {
-            return Err(hip_bridge::HipError::new(0, "dynamic_causal_conv_f32: hidden must be > 0"));
+            return Err(hip_bridge::HipError::new(
+                0,
+                "dynamic_causal_conv_f32: hidden must be > 0",
+            ));
         }
         if kernel_size == 0 {
-            return Err(hip_bridge::HipError::new(0, "dynamic_causal_conv_f32: kernel_size must be > 0"));
+            return Err(hip_bridge::HipError::new(
+                0,
+                "dynamic_causal_conv_f32: kernel_size must be > 0",
+            ));
         }
         if group_size == 0 {
-            return Err(hip_bridge::HipError::new(0, "dynamic_causal_conv_f32: group_size must be > 0"));
+            return Err(hip_bridge::HipError::new(
+                0,
+                "dynamic_causal_conv_f32: group_size must be > 0",
+            ));
         }
         if hidden % group_size != 0 {
             return Err(hip_bridge::HipError::new(
@@ -5869,7 +5976,10 @@ impl Gpu {
         let window = kernel_size.checked_mul(groups).ok_or_else(|| {
             hip_bridge::HipError::new(0, "dynamic_causal_conv_f32: kernel_size*groups overflow")
         })?;
-        if dynamic_offset.checked_add(window).is_none_or(|e| e > dynamic_row_stride) {
+        if dynamic_offset
+            .checked_add(window)
+            .is_none_or(|e| e > dynamic_row_stride)
+        {
             return Err(hip_bridge::HipError::new(
                 0,
                 &format!(
@@ -5892,25 +6002,45 @@ impl Gpu {
             ));
         }
         // dtype checks: F32 only (caller's contract).
-        for (name, t) in [("input", input), ("base", base), ("dynamic", dynamic), ("output", output)] {
+        for (name, t) in [
+            ("input", input),
+            ("base", base),
+            ("dynamic", dynamic),
+            ("output", output),
+        ] {
             if t.dtype != DType::F32 {
                 return Err(hip_bridge::HipError::new(
                     0,
-                    &format!("dynamic_causal_conv_f32: {name} dtype must be F32 (got {:?})", t.dtype),
+                    &format!(
+                        "dynamic_causal_conv_f32: {name} dtype must be F32 (got {:?})",
+                        t.dtype
+                    ),
                 ));
             }
         }
         // Buffer size checks (bytes).
         let f32 = DType::F32.size();
-        let input_need = rows.checked_mul(hidden).and_then(|n| n.checked_mul(f32)).ok_or_else(|| {
-            hip_bridge::HipError::new(0, "dynamic_causal_conv_f32: rows*hidden overflow")
-        })?;
-        let base_need = kernel_size.checked_mul(hidden).and_then(|n| n.checked_mul(f32)).ok_or_else(|| {
-            hip_bridge::HipError::new(0, "dynamic_causal_conv_f32: kernel_size*hidden overflow")
-        })?;
-        let dynamic_need = rows.checked_mul(dynamic_row_stride).and_then(|n| n.checked_mul(f32)).ok_or_else(|| {
-            hip_bridge::HipError::new(0, "dynamic_causal_conv_f32: rows*dynamic_row_stride overflow")
-        })?;
+        let input_need = rows
+            .checked_mul(hidden)
+            .and_then(|n| n.checked_mul(f32))
+            .ok_or_else(|| {
+                hip_bridge::HipError::new(0, "dynamic_causal_conv_f32: rows*hidden overflow")
+            })?;
+        let base_need = kernel_size
+            .checked_mul(hidden)
+            .and_then(|n| n.checked_mul(f32))
+            .ok_or_else(|| {
+                hip_bridge::HipError::new(0, "dynamic_causal_conv_f32: kernel_size*hidden overflow")
+            })?;
+        let dynamic_need = rows
+            .checked_mul(dynamic_row_stride)
+            .and_then(|n| n.checked_mul(f32))
+            .ok_or_else(|| {
+                hip_bridge::HipError::new(
+                    0,
+                    "dynamic_causal_conv_f32: rows*dynamic_row_stride overflow",
+                )
+            })?;
         let output_need = input_need;
         if input.buf.size() < input_need {
             return Err(hip_bridge::HipError::new(
@@ -5988,7 +6118,11 @@ impl Gpu {
             }
         }
         const KERNEL: &str = "dynamic_causal_conv_f32";
-        self.ensure_kernel("dynamic_conv_f32", crate::kernels::DYNAMIC_CONV_F32_SRC, KERNEL)?;
+        self.ensure_kernel(
+            "dynamic_conv_f32",
+            crate::kernels::DYNAMIC_CONV_F32_SRC,
+            KERNEL,
+        )?;
         let input_ptr = input.buf.as_ptr();
         let base_ptr = base.buf.as_ptr();
         let dynamic_ptr = dynamic.buf.as_ptr();
@@ -6018,13 +6152,8 @@ impl Gpu {
         ];
         let bytes = input_need + base_need + dynamic_need + output_need;
         let timer = crate::profile::begin_timer(&self.hip, "dynamic_conv", KERNEL, bytes);
-        let result = self.launch_maybe_blob(
-            KERNEL,
-            [grid, 1, 1],
-            [block, 1, 1],
-            0,
-            &mut params,
-            || {
+        let result =
+            self.launch_maybe_blob(KERNEL, [grid, 1, 1], [block, 1, 1], 0, &mut params, || {
                 let mut blob = hip_bridge::KernargBlob::new();
                 blob.push_ptr(input_ptr);
                 blob.push_ptr(base_ptr);
@@ -6038,8 +6167,7 @@ impl Gpu {
                 blob.push_i32(stride_i32);
                 blob.push_i32(offset_i32);
                 blob
-            },
-        );
+            });
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -6064,16 +6192,28 @@ impl Gpu {
     ) -> HipResult<()> {
         self.bind_thread()?;
         if rows == 0 {
-            return Err(hip_bridge::HipError::new(0, "dynamic_conv_f32: rows must be > 0"));
+            return Err(hip_bridge::HipError::new(
+                0,
+                "dynamic_conv_f32: rows must be > 0",
+            ));
         }
         if hidden == 0 {
-            return Err(hip_bridge::HipError::new(0, "dynamic_conv_f32: hidden must be > 0"));
+            return Err(hip_bridge::HipError::new(
+                0,
+                "dynamic_conv_f32: hidden must be > 0",
+            ));
         }
         if kernel_size == 0 {
-            return Err(hip_bridge::HipError::new(0, "dynamic_conv_f32: kernel_size must be > 0"));
+            return Err(hip_bridge::HipError::new(
+                0,
+                "dynamic_conv_f32: kernel_size must be > 0",
+            ));
         }
         if group_size == 0 {
-            return Err(hip_bridge::HipError::new(0, "dynamic_conv_f32: group_size must be > 0"));
+            return Err(hip_bridge::HipError::new(
+                0,
+                "dynamic_conv_f32: group_size must be > 0",
+            ));
         }
         if hidden % group_size != 0 {
             return Err(hip_bridge::HipError::new(
@@ -6095,19 +6235,36 @@ impl Gpu {
                 "dynamic_conv_f32: rows/hidden/kernel_size/groups/group_size exceed i32::MAX",
             ));
         }
-        for (name, t) in [("input", input), ("base", base), ("dynamic", dynamic), ("output", output)] {
+        for (name, t) in [
+            ("input", input),
+            ("base", base),
+            ("dynamic", dynamic),
+            ("output", output),
+        ] {
             if t.dtype != DType::F32 {
                 return Err(hip_bridge::HipError::new(
                     0,
-                    &format!("dynamic_conv_f32: {name} dtype must be F32 (got {:?})", t.dtype),
+                    &format!(
+                        "dynamic_conv_f32: {name} dtype must be F32 (got {:?})",
+                        t.dtype
+                    ),
                 ));
             }
         }
         let f32 = DType::F32.size();
-        let input_need = rows.checked_mul(hidden).and_then(|n| n.checked_mul(f32)).unwrap();
-        let base_need = kernel_size.checked_mul(hidden).and_then(|n| n.checked_mul(f32)).unwrap();
+        let input_need = rows
+            .checked_mul(hidden)
+            .and_then(|n| n.checked_mul(f32))
+            .unwrap();
+        let base_need = kernel_size
+            .checked_mul(hidden)
+            .and_then(|n| n.checked_mul(f32))
+            .unwrap();
         let groups_stride = kernel_size.checked_mul(groups).unwrap();
-        let dynamic_need = rows.checked_mul(groups_stride).and_then(|n| n.checked_mul(f32)).unwrap();
+        let dynamic_need = rows
+            .checked_mul(groups_stride)
+            .and_then(|n| n.checked_mul(f32))
+            .unwrap();
         let output_need = input_need;
         if input.buf.size() < input_need {
             return Err(hip_bridge::HipError::new(
@@ -6146,7 +6303,11 @@ impl Gpu {
             ));
         }
         const KERNEL: &str = "dynamic_conv_f32";
-        self.ensure_kernel("dynamic_conv_f32", crate::kernels::DYNAMIC_CONV_F32_SRC, KERNEL)?;
+        self.ensure_kernel(
+            "dynamic_conv_f32",
+            crate::kernels::DYNAMIC_CONV_F32_SRC,
+            KERNEL,
+        )?;
         let input_ptr = input.buf.as_ptr();
         let base_ptr = base.buf.as_ptr();
         let dynamic_ptr = dynamic.buf.as_ptr();
@@ -6172,13 +6333,8 @@ impl Gpu {
         ];
         let bytes = input_need + base_need + dynamic_need + output_need;
         let timer = crate::profile::begin_timer(&self.hip, "dynamic_conv", KERNEL, bytes);
-        let result = self.launch_maybe_blob(
-            KERNEL,
-            [grid, 1, 1],
-            [block, 1, 1],
-            0,
-            &mut params,
-            || {
+        let result =
+            self.launch_maybe_blob(KERNEL, [grid, 1, 1], [block, 1, 1], 0, &mut params, || {
                 let mut blob = hip_bridge::KernargBlob::new();
                 blob.push_ptr(input_ptr);
                 blob.push_ptr(base_ptr);
@@ -6190,13 +6346,10 @@ impl Gpu {
                 blob.push_i32(groups_i32);
                 blob.push_i32(group_size_i32);
                 blob
-            },
-        );
+            });
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
         result
     }
-
-
 }
