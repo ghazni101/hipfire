@@ -18,14 +18,17 @@
 //! `forward.rs` remains the live path; this is oracle-validated before flip.
 
 use crate::config::K2HorizonConfig;
-use crate::forward::{attend, forward_mova_value_routing, forward_sigmoid_moe_ffn, K2HorizonState};
+use crate::forward::{
+    attend, forward_mova_value_routing, forward_sigmoid_moe_ffn, gemv_normed, norm_and_rotate,
+    K2HorizonState,
+};
 use crate::weights::{DenseLayerWeights, K2HorizonWeights, MovaLayerWeights};
 use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::pipeline::superop::{
     self, ForwardBindings, OpBinding, OpFlavor, SuperOp, SuperOpKind, WeightSlot,
 };
 use hipfire_dispatch::types::DispatchError;
-use hipfire_runtime::llama::weight_gemv;
+use hipfire_runtime::llama::{weight_gemv, weight_gemv_prerotated};
 use rdna_compute::Gpu;
 
 // ── Opcodes (encoded in OpBinding.weights[0]) ───────────────────────────
@@ -79,6 +82,9 @@ fn k2_lower_variant(v: K2Variant) -> superop::LayerProgram {
 // ── Block functions (split from forward.rs for lowered dispatch) ────────
 
 /// Dense attention block: norm + QKV + RoPE + attend + softplus_gate + o_proj.
+/// Mirrors `forward_dense_layer`'s attention half — uses the shared
+/// `normed_rot` (norm_and_rotate) and `proj_rot` (o_proj) buffers so the
+/// lowered path is numerically identical to the hand path.
 fn dense_attention_block(
     cfg: &K2HorizonConfig,
     layer: &DenseLayerWeights,
@@ -87,26 +93,14 @@ fn dense_attention_block(
     l: usize,
     position: u32,
 ) -> Result<(), String> {
-    let hidden = cfg.dim;
-    let eps = cfg.norm_eps;
-    let n_groups = cfg.layernorm_num_groups;
+    // normed = grouped_rmsnorm(h, attn_norm); normed_rot = FWHT(normed) once.
+    norm_and_rotate(cfg, &layer.attn_norm, state, gpu, l)?;
 
-    gpu.grouped_rmsnorm_f32(
-        &state.h,
-        &layer.attn_norm,
-        &state.normed,
-        1,
-        hidden,
-        n_groups,
-        eps,
-    )
-    .map_err(|e| format!("k2_horizon L{l}: input norm: {e:?}"))?;
-
-    weight_gemv(gpu, &layer.wq, &state.normed, &state.fa_q)
+    gemv_normed(gpu, &layer.wq, state, &state.fa_q)
         .map_err(|e| format!("k2_horizon L{l}: q_proj: {e}"))?;
-    weight_gemv(gpu, &layer.wk, &state.normed, &state.fa_k)
+    gemv_normed(gpu, &layer.wk, state, &state.fa_k)
         .map_err(|e| format!("k2_horizon L{l}: k_proj: {e}"))?;
-    weight_gemv(gpu, &layer.wv, &state.normed, &state.fa_v)
+    gemv_normed(gpu, &layer.wv, state, &state.fa_v)
         .map_err(|e| format!("k2_horizon L{l}: v_proj: {e}"))?;
 
     gpu.rope_f32(
@@ -123,20 +117,30 @@ fn dense_attention_block(
     let seq_len = position as usize + 1;
     attend(cfg, state, gpu, l, seq_len)?;
 
-    weight_gemv(gpu, &layer.attn_gate, &state.normed, &state.attn_gate_out)
+    gemv_normed(gpu, &layer.attn_gate, state, &state.attn_gate_out)
         .map_err(|e| format!("k2_horizon L{l}: attn gate: {e}"))?;
     gpu.softplus_gate_f32(&state.attn_gate_out, &state.fa_attn_out)
         .map_err(|e| format!("k2_horizon L{l}: softplus gate: {e:?}"))?;
 
-    weight_gemv(gpu, &layer.wo, &state.fa_attn_out, &state.scratch_h)
-        .map_err(|e| format!("k2_horizon L{l}: o_proj: {e}"))?;
+    // o_proj reads fa_attn_out (q_dim), rotated into proj_rot.
+    gpu.rotate_x_mq(&state.fa_attn_out, &state.proj_rot, layer.wo.k)
+        .map_err(|e| format!("k2_horizon L{l}: o rotate: {e:?}"))?;
+    weight_gemv_prerotated(
+        gpu,
+        &layer.wo,
+        &state.fa_attn_out,
+        Some(&state.proj_rot),
+        &state.scratch_h,
+    )
+    .map_err(|e| format!("k2_horizon L{l}: o_proj: {e}"))?;
     gpu.add_inplace_f32(&state.h, &state.scratch_h)
         .map_err(|e| format!("k2_horizon L{l}: o_proj add: {e:?}"))?;
 
     Ok(())
 }
 
-/// Dense FFN gate+up block: norm + gate_proj + up_proj.
+/// Dense FFN gate+up block: norm + gate_proj + up_proj. Mirrors the FFN half
+/// of `forward_dense_layer` — shared `normed_rot` via norm_and_rotate.
 fn dense_gate_up_block(
     cfg: &K2HorizonConfig,
     layer: &DenseLayerWeights,
@@ -144,30 +148,18 @@ fn dense_gate_up_block(
     gpu: &mut Gpu,
     l: usize,
 ) -> Result<(), String> {
-    let hidden = cfg.dim;
-    let eps = cfg.norm_eps;
-    let n_groups = cfg.layernorm_num_groups;
+    norm_and_rotate(cfg, &layer.ffn_norm, state, gpu, l)?;
 
-    gpu.grouped_rmsnorm_f32(
-        &state.h,
-        &layer.ffn_norm,
-        &state.normed,
-        1,
-        hidden,
-        n_groups,
-        eps,
-    )
-    .map_err(|e| format!("k2_horizon L{l}: ffn norm: {e:?}"))?;
-
-    weight_gemv(gpu, &layer.w_gate, &state.normed, &state.dense_gate)
+    gemv_normed(gpu, &layer.w_gate, state, &state.dense_gate)
         .map_err(|e| format!("k2_horizon L{l}: dense gate: {e}"))?;
-    weight_gemv(gpu, &layer.w_up, &state.normed, &state.dense_up)
+    gemv_normed(gpu, &layer.w_up, state, &state.dense_up)
         .map_err(|e| format!("k2_horizon L{l}: dense up: {e}"))?;
 
     Ok(())
 }
 
-/// Dense FFN down block: silu_mul + down_proj + residual add.
+/// Dense FFN down block: silu_mul + down_proj + residual add. w_down reads
+/// dense_act (not normed) — rotated into proj_rot, matching the hand path.
 fn dense_down_block(
     cfg: &K2HorizonConfig,
     layer: &DenseLayerWeights,
@@ -175,18 +167,27 @@ fn dense_down_block(
     gpu: &mut Gpu,
     l: usize,
 ) -> Result<(), String> {
-    let _ = cfg;
     gpu.silu_mul_f32(&state.dense_gate, &state.dense_up, &state.dense_act)
         .map_err(|e| format!("k2_horizon L{l}: dense silu_mul: {e:?}"))?;
-    weight_gemv(gpu, &layer.w_down, &state.dense_act, &state.scratch_h)
-        .map_err(|e| format!("k2_horizon L{l}: dense down: {e}"))?;
+    gpu.rotate_x_mq(&state.dense_act, &state.proj_rot, cfg.intermediate_size)
+        .map_err(|e| format!("k2_horizon L{l}: down rotate: {e:?}"))?;
+    weight_gemv_prerotated(
+        gpu,
+        &layer.w_down,
+        &state.dense_act,
+        Some(&state.proj_rot),
+        &state.scratch_h,
+    )
+    .map_err(|e| format!("k2_horizon L{l}: dense down: {e}"))?;
     gpu.add_inplace_f32(&state.h, &state.scratch_h)
         .map_err(|e| format!("k2_horizon L{l}: dense down add: {e:?}"))?;
     Ok(())
 }
 
 /// MoE attention block: norm + Q/K + MoVA routing + RoPE + attend +
-/// softplus_gate + o_proj. (The irregular Escape op.)
+/// softplus_gate + o_proj. (The irregular Escape op.) Mirrors
+/// `forward_moe_layer`'s attention half — populates `normed_rot` via
+/// norm_and_rotate so forward_mova_value_routing reads a fresh rotation.
 fn moe_attention_block(
     cfg: &K2HorizonConfig,
     layer: &MovaLayerWeights,
@@ -195,25 +196,14 @@ fn moe_attention_block(
     l: usize,
     position: u32,
 ) -> Result<(), String> {
-    let hidden = cfg.dim;
-    let eps = cfg.norm_eps;
-    let n_groups = cfg.layernorm_num_groups;
     let attn = &layer.attn;
 
-    gpu.grouped_rmsnorm_f32(
-        &state.h,
-        &layer.attn_norm,
-        &state.normed,
-        1,
-        hidden,
-        n_groups,
-        eps,
-    )
-    .map_err(|e| format!("k2_horizon L{l}: input norm: {e:?}"))?;
+    // normed = grouped_rmsnorm(h, attn_norm); normed_rot = FWHT(normed) once.
+    norm_and_rotate(cfg, &layer.attn_norm, state, gpu, l)?;
 
-    weight_gemv(gpu, &attn.wq, &state.normed, &state.fa_q)
+    gemv_normed(gpu, &attn.wq, state, &state.fa_q)
         .map_err(|e| format!("k2_horizon L{l}: q_proj: {e}"))?;
-    weight_gemv(gpu, &attn.wk, &state.normed, &state.fa_k)
+    gemv_normed(gpu, &attn.wk, state, &state.fa_k)
         .map_err(|e| format!("k2_horizon L{l}: k_proj: {e}"))?;
 
     forward_mova_value_routing(cfg, attn, state, gpu, l)?;
@@ -232,20 +222,31 @@ fn moe_attention_block(
     let seq_len = position as usize + 1;
     attend(cfg, state, gpu, l, seq_len)?;
 
-    weight_gemv(gpu, &attn.attn_gate, &state.normed, &state.attn_gate_out)
+    gemv_normed(gpu, &attn.attn_gate, state, &state.attn_gate_out)
         .map_err(|e| format!("k2_horizon L{l}: attn gate: {e}"))?;
     gpu.softplus_gate_f32(&state.attn_gate_out, &state.fa_attn_out)
         .map_err(|e| format!("k2_horizon L{l}: softplus gate: {e:?}"))?;
 
-    weight_gemv(gpu, &attn.wo, &state.fa_attn_out, &state.scratch_h)
-        .map_err(|e| format!("k2_horizon L{l}: o_proj: {e}"))?;
+    // o_proj reads fa_attn_out (q_dim), rotated into proj_rot.
+    gpu.rotate_x_mq(&state.fa_attn_out, &state.proj_rot, attn.wo.k)
+        .map_err(|e| format!("k2_horizon L{l}: o rotate: {e:?}"))?;
+    weight_gemv_prerotated(
+        gpu,
+        &attn.wo,
+        &state.fa_attn_out,
+        Some(&state.proj_rot),
+        &state.scratch_h,
+    )
+    .map_err(|e| format!("k2_horizon L{l}: o_proj: {e}"))?;
     gpu.add_inplace_f32(&state.h, &state.scratch_h)
         .map_err(|e| format!("k2_horizon L{l}: o_proj add: {e:?}"))?;
 
     Ok(())
 }
 
-/// MoE FFN block: norm + sigmoid-routed MoE FFN + shared expert.
+/// MoE FFN block: norm + sigmoid-routed MoE FFN + shared expert. Populates
+/// `normed_rot` via norm_and_rotate so forward_sigmoid_moe_ffn's router and
+/// expert GEMVs read a fresh rotation (not a stale buffer).
 fn moe_ffn_block(
     cfg: &K2HorizonConfig,
     layer: &MovaLayerWeights,
@@ -253,20 +254,7 @@ fn moe_ffn_block(
     gpu: &mut Gpu,
     l: usize,
 ) -> Result<(), String> {
-    let hidden = cfg.dim;
-    let eps = cfg.norm_eps;
-    let n_groups = cfg.layernorm_num_groups;
-
-    gpu.grouped_rmsnorm_f32(
-        &state.h,
-        &layer.ffn_norm,
-        &state.normed,
-        1,
-        hidden,
-        n_groups,
-        eps,
-    )
-    .map_err(|e| format!("k2_horizon L{l}: ffn norm: {e:?}"))?;
+    norm_and_rotate(cfg, &layer.ffn_norm, state, gpu, l)?;
 
     forward_sigmoid_moe_ffn(cfg, &layer.ffn, state, gpu, l)?;
 

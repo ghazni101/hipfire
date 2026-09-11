@@ -382,7 +382,7 @@ pub fn run_decode_body(
 /// branch is the only weight-dependent variant), so rotating once and
 /// reusing the buffer across wq/wk/v_router/attn_gate/router/gate/up
 /// eliminates ~8 redundant `mq_rotate_x` launches per layer.
-fn norm_and_rotate(
+pub(crate) fn norm_and_rotate(
     cfg: &K2HorizonConfig,
     norm_w: &GpuTensor,
     state: &mut K2HorizonState,
@@ -408,7 +408,7 @@ fn norm_and_rotate(
 /// uses the fixed FWHT rotation (non-AWQ). Falls back to plain
 /// `weight_gemv` for AWQ-scaled or non-rotating dtypes so the shared buffer
 /// is never fed a rotation it wasn't built for.
-fn gemv_normed(
+pub(crate) fn gemv_normed(
     gpu: &mut Gpu,
     w: &hipfire_runtime::llama::WeightTensor,
     state: &K2HorizonState,

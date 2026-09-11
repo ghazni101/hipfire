@@ -112,8 +112,10 @@ fn main() {
         }
     }
 
-    // Timed decode.
+    // Timed decode. Collect token ids so the sequence can be diffed across
+    // forward paths (hand vs HIPFIRE_FORWARD_LOWERED) for a correctness A/B.
     let mut per_token_ms = Vec::with_capacity(gen_len);
+    let mut gen_tokens = Vec::with_capacity(gen_len);
     let t_gen = Instant::now();
     for _ in 0..gen_len {
         let pos = state.n_tokens as u32;
@@ -123,6 +125,7 @@ fn main() {
         )
         .expect("gen decode");
         per_token_ms.push(t.elapsed().as_secs_f64() * 1000.0);
+        gen_tokens.push(tok);
         next_tok = tok;
         state.n_tokens += 1;
     }
@@ -142,6 +145,9 @@ fn main() {
         max,
         1000.0 / avg
     );
+    // Token sequence on stdout so two runs can be diffed for a correctness
+    // A/B (hand vs HIPFIRE_FORWARD_LOWERED). Greedy argmax → deterministic.
+    println!("TOKENS {:?}", gen_tokens);
     println!(
         "SUMMARY gen_tok_s={:.1} avg_ms={:.2} p50_ms={:.2}",
         1000.0 / avg,
