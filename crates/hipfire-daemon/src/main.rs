@@ -3330,13 +3330,13 @@ fn main() {
                     }
                     _ => {}
                 }
-                // arch 5/6 = Qwen3.5, arch 14 = Muse Glimmer. Both prime with a
-                // batched prefill and then step tokens one at a time, so the
-                // same bench shape applies; the two branches below differ only
-                // in which forward they call.
+                // arch 5/6 = Qwen3.5, arch 14 = Muse Glimmer, arch 15 =
+                // K2-Horizon. All prime with a batched prefill and then step
+                // tokens one at a time, so the same bench shape applies; the
+                // carrier's bench_decode_prime/run picks the right forward.
                 if m.pp > 1
                     || m.ep.is_some()
-                    || (m.arch_id != 5 && m.arch_id != 6 && m.arch_id != 14)
+                    || (m.arch_id != 5 && m.arch_id != 6 && m.arch_id != 14 && m.arch_id != 15)
                 {
                     emit_uncorrelated_error(
                         &mut stdout,
@@ -3414,7 +3414,8 @@ fn main() {
                 let prime_error: Option<String> =
                     match hipfire_loader::bench_decode_route(m.arch_id) {
                         hipfire_loader::BenchDecodeRoute::Qwen35
-                        | hipfire_loader::BenchDecodeRoute::MuseGlimmer => {
+                        | hipfire_loader::BenchDecodeRoute::MuseGlimmer
+                        | hipfire_loader::BenchDecodeRoute::K2Horizon => {
                             hipfire_loader::carrier_for(m.arch_id)
                                 .and_then(|c| c.bench_decode_prime(m, &mut gpu, &synthetic))
                                 .unwrap_or_else(|| {
@@ -3472,7 +3473,8 @@ fn main() {
                 let mut decode_err: Option<String> = None;
                 let run_ok = match hipfire_loader::bench_decode_route(m.arch_id) {
                     hipfire_loader::BenchDecodeRoute::Qwen35
-                    | hipfire_loader::BenchDecodeRoute::MuseGlimmer => {
+                    | hipfire_loader::BenchDecodeRoute::MuseGlimmer
+                    | hipfire_loader::BenchDecodeRoute::K2Horizon => {
                         hipfire_loader::carrier_for(m.arch_id)
                             .and_then(|c| {
                                 c.bench_decode_run(

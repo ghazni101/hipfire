@@ -2332,6 +2332,60 @@ impl Carrier for K2HorizonCarrier {
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
         arch_id == 15
     }
+    fn bench_decode_prime(
+        &self,
+        m: &mut LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        synthetic: &[u32],
+    ) -> Option<Option<String>> {
+        let b = m.k2_horizon_mut()?;
+        let ps = match hipfire_arch_k2_horizon::prefill::PrefillScratch::new(gpu, &b.config) {
+            Ok(ps) => ps,
+            Err(e) => return Some(Some(format!("prefill scratch: {e}"))),
+        };
+        Some(
+            hipfire_arch_k2_horizon::prefill::forward_prefill_batch(
+                &b.config,
+                &b.weights,
+                &ps,
+                &mut b.state,
+                gpu,
+                synthetic,
+            )
+            .err(),
+        )
+    }
+    fn bench_decode_run(
+        &self,
+        m: &mut LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        context: usize,
+        iterations: usize,
+        decode_err: &mut Option<String>,
+    ) -> Option<bool> {
+        let b = m.k2_horizon_mut()?;
+        let mut ok = true;
+        for i in 0..iterations {
+            let token = 101 + (i as u32 % 1000);
+            let position = (context + i) as u32;
+            match hipfire_arch_k2_horizon::forward::decode_step(
+                &b.config,
+                &b.weights,
+                &mut b.state,
+                gpu,
+                token,
+                position,
+            ) {
+                Ok(_) => b.state.n_tokens = (context + i + 1),
+                Err(e) => {
+                    *decode_err = Some(format!("iter {i} pos {}: {e}", context + i));
+                    ok = false;
+                    break;
+                }
+            }
+        }
+        Some(ok)
+    }
     fn caps(&self) -> saddle_core::caps::ArchCaps {
         saddle_core::caps::ArchCaps {
             supports_continuous_batch: false,

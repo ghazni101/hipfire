@@ -293,7 +293,7 @@ impl K2HorizonState {
 /// Stage per-token inputs that must run OUTSIDE PM4 capture:
 /// position H2D + embedding lookup. The token_id is a host arg to the
 /// embedding kernel (not a device buffer), so it cannot be captured.
-fn prepare_decode_inputs(
+pub fn prepare_decode_inputs(
     cfg: &K2HorizonConfig,
     weights: &K2HorizonWeights,
     state: &mut K2HorizonState,
@@ -320,7 +320,7 @@ fn prepare_decode_inputs(
 /// device-pointer kernarg blobs. The position is read from `pos_buf`
 /// (staged by `prepare_decode_inputs`), so it remains dynamic across
 /// PM4 replays.
-pub(crate) fn run_decode_body(
+pub fn run_decode_body(
     cfg: &K2HorizonConfig,
     weights: &K2HorizonWeights,
     state: &mut K2HorizonState,
