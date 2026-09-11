@@ -738,6 +738,27 @@ Ordered by impact. Items marked [FIXED] were closed during the
    unfreeable. Added `v_experts_owner` / `experts_{gate_up,down}_owner`
    fields + `K2HorizonWeights::free_gpu`.
 
+### Perf (third pass, 2026-09-11)
+
+0e. **[FIXED] Rotate-once FWHT — shared `normed_rot` across all
+    normed-reading GEMVs** — every MQ4G256V2 projection that reads
+    `normed` in a layer applies the same weight-independent FWHT
+    rotation, but the prior code rotated `normed` inside each
+    `weight_gemv` call (~8 redundant `mq_rotate_x` launches per layer:
+    wq, wk, wv, attn_gate, v_router, moe_router, gate, up, plus the
+    MoVA/MoE expert-input rotates). Added `state.normed_rot`
+    (FWHT(normed), once per norm via `norm_and_rotate`) and
+    `state.proj_rot` (rotate scratch for the non-normed GEMV inputs:
+    o_proj, w_down, shared down). `gemv_normed` consumes the shared
+    buffer via `weight_gemv_prerotated` when the weight uses the fixed
+    rotation, falling back to plain `weight_gemv` for AWQ-scaled or
+    non-rotating dtypes. The MoVA `v_rot_batch` and MoE `gate_up`
+    indexed GEMVs reuse `normed_rot` under the same AWQ guard.
+    Verified in-container (gfx1100, K2-Horizon-MoVA-36B-A4B.mq4r):
+    HIP decode 83 → 91.6 tok/s, PM4 retained replay 122 tok/s
+    in-process / 121 tok/s daemon steady-state, correct output
+    (17×23=391, Paris), PM4 tape 1737 launches replays clean.
+
 ### Still open
 
 5. **[FIXED] Batched prefill re-enabled** — `forward_prefill_batch` is now
