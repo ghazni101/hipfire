@@ -797,9 +797,15 @@ Ordered by impact. Items marked [FIXED] were closed during the
     single-turn AR only; no `serve_harness.py chain` coverage, no
     prefix-cache interaction tested.
 
-12. **`flash_partials` over-allocation** — sized with a
-    `FLASH_PREFILL_SUBBATCH` multiplier that decode never needs; ~85 MB
-    of scratch at max_seq=65536 that could be tightened.
+12. **[FIXED] `flash_partials` over-allocation** — was sized with a
+    `FLASH_PREFILL_SUBBATCH` (16) multiplier decode never needs. Split:
+    decode `state.flash_partials` is now a single query row sized against
+    `q8_flash_tile_size` (32 on gfx1100 → `n_heads*1024*(2+head_dim)` at
+    max_seq=32768 ≈ 17 MB); the ×SUBBATCH buffer moved to `PrefillScratch`
+    and is freed after prefill. **Trap found:** sizing decode with /128
+    (attn_tile_size) under-allocates 4× vs the q8 kernel's tile=32 → OOB
+    partials write → GPU page fault. The old ×16 multiplier had been
+    accidentally masking it. Verified in-container: 93.8 tok/s, no fault.
 
 13. **[VERIFIED] VRAM budget at max_seq** — `ctx.max_seq` reaches
     `new_with_max_seq` via `load_k2_horizon_bundle`; the Containerfile's
