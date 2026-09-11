@@ -785,9 +785,15 @@ Ordered by impact. Items marked [FIXED] were closed during the
 8. **KLD eval not run** — Phase 7 acceptance (KLD < 0.25 vs F32 oracle)
    is unmeasured. `hipfire eval kld` against the bf16 source.
 
-9. **Lowered path unvalidated** — `lowered.rs` is opt-in
-   (`HIPFIRE_FORWARD_LOWERED=1`) and has never produced output. Needs an
-   A/B against the hand path before it can default on.
+9. **[FIXED] Lowered path oracle-validated** — `lowered.rs` was written
+   before the rotate-once FWHT optimization (0e) and called bare
+   `grouped_rmsnorm_f32` + `weight_gemv`, never populating `normed_rot`.
+   `forward_mova_value_routing` / `forward_sigmoid_moe_ffn` read
+   `normed_rot` for every routed projection → stale buffer → divergent
+   tokens. Fixed: lowered blocks now use `norm_and_rotate` + `gemv_normed`
+   / `weight_gemv_prerotated`, matching the hand path. A/B in-container:
+   identical greedy token sequence, 90.9 vs 91.5 tok/s. Still opt-in
+   (`HIPFIRE_FORWARD_LOWERED=1`) — no perf win, default stays off.
 
 10. **Spec-decode / MTP** — carrier returns "not yet wired" for spec
     decode; K2-Horizon has no MTP head in the released checkpoint
