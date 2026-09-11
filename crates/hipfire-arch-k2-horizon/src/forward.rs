@@ -469,6 +469,7 @@ pub fn decode_step_sampled(
     temp: f32,
     top_p: f32,
     rng_state: u32,
+    blocked: &[u32],
 ) -> Result<(u32, u32), String> {
     if state.retained_state_poisoned {
         return Err("k2_horizon: retained state poisoned until reset".to_string());
@@ -476,14 +477,17 @@ pub fn decode_step_sampled(
     if gpu.replay.is_enabled() {
         gpu.replay.set_forward_eligible(true);
         return decode_step_sampled_with_retained_replay(
-            cfg, weights, state, gpu, token_id, position, temp, top_p, rng_state,
+            cfg, weights, state, gpu, token_id, position, temp, top_p, rng_state, blocked,
         );
     }
     forward_only(cfg, weights, state, gpu, token_id, position)?;
-    sample_from_logits(cfg, state, gpu, temp, top_p, rng_state)
+    sample_from_logits(cfg, state, gpu, temp, top_p, rng_state, blocked)
 }
 
 /// Sample from on-GPU logits. `temp <= 1e-6` → argmax, else top-p.
+/// `blocked` token ids are forced to -INF before sampling (the
+/// `sampler::sample` `blocked_tokens` mechanism) so the model cannot
+/// re-open a think block once the think cap has latched.
 fn sample_from_logits(
     cfg: &K2HorizonConfig,
     state: &mut K2HorizonState,
@@ -491,7 +495,22 @@ fn sample_from_logits(
     temp: f32,
     top_p: f32,
     rng_state: u32,
+    blocked: &[u32],
 ) -> Result<(u32, u32), String> {
+    // Unconditional -INF writes for blocked tokens (one 4-byte H2D each),
+    // matching hipfire_runtime::sampler::sample. Runs outside the retained
+    // capture window (sample_from_logits is called post-replay/post-capture),
+    // so it never invalidates a captured PM4 packet.
+    if !blocked.is_empty() {
+        let neg_inf: [u8; 4] = f32::NEG_INFINITY.to_ne_bytes();
+        for &tok in blocked {
+            if (tok as usize) < cfg.vocab_size {
+                let _ = gpu
+                    .hip
+                    .memcpy_htod_offset(&state.logits.buf, (tok as usize) * 4, &neg_inf);
+            }
+        }
+    }
     if temp <= 1e-6 {
         let tok = gpu
             .argmax_f32(&state.logits, cfg.vocab_size)
@@ -515,6 +534,8 @@ fn sample_from_logits(
     }
 }
 
+
+
 /// PM4 retained-replay lifecycle for GPU-sampled decode. Follows the
 /// lfm2moe pattern: warmup → capture → replay.
 ///
@@ -528,7 +549,6 @@ fn sample_from_logits(
 /// 3. **Replay** (subsequent decode steps): stage inputs, then
 ///    `replay_pm4` / `replay_linear_aql` replays the captured packet.
 ///    The position is dynamic via `pos_buf`; all device pointers are
-///    baked into the packet.
 fn decode_step_sampled_with_retained_replay(
     cfg: &K2HorizonConfig,
     weights: &K2HorizonWeights,
@@ -539,6 +559,7 @@ fn decode_step_sampled_with_retained_replay(
     temp: f32,
     top_p: f32,
     rng_state: u32,
+    blocked: &[u32],
 ) -> Result<(u32, u32), String> {
     if state.retained_state_poisoned {
         return Err("k2_horizon: retained state poisoned until reset".to_string());
@@ -549,7 +570,7 @@ fn decode_step_sampled_with_retained_replay(
     if !state.retained_warmed_up {
         forward_only(cfg, weights, state, gpu, token_id, position)?;
         state.retained_warmed_up = true;
-        return sample_from_logits(cfg, state, gpu, temp, top_p, rng_state);
+        return sample_from_logits(cfg, state, gpu, temp, top_p, rng_state, blocked);
     }
 
     // 2. Stage per-token inputs outside the capture window.
@@ -574,7 +595,7 @@ fn decode_step_sampled_with_retained_replay(
         };
         match replay_result {
             Ok(()) => {
-                return sample_from_logits(cfg, state, gpu, temp, top_p, rng_state);
+                return sample_from_logits(cfg, state, gpu, temp, top_p, rng_state, blocked);
             }
             Err(reason) => {
                 let msg = format!("K2-Horizon retained replay failed: {reason}");
@@ -655,7 +676,7 @@ fn decode_step_sampled_with_retained_replay(
     }
 
     // 6. Sample from the on-GPU logits.
-    sample_from_logits(cfg, state, gpu, temp, top_p, rng_state)
+    sample_from_logits(cfg, state, gpu, temp, top_p, rng_state, blocked)
 }
 
 // ─── KV write + attention helper ────────────────────────────────────────

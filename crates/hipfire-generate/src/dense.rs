@@ -7630,6 +7630,9 @@ pub fn generate_k2_horizon(
     let mut reasoning_tokens = 0usize;
     // Latched once the think cap fires — see the force-close arm in the loop.
     let mut think_capped = false;
+    // Open-think tokens blocked at the sampler once the cap latches (the
+    // `blocked_tokens` mechanism from hipfire_runtime::sampler::sample).
+    const THINK_OPEN_TOKENS: [u32; 3] = [THINK_OPEN, THINK_FAST_OPEN, THINK_FASTER_OPEN];
     let think_close_tok: u32 = match max_think_tokens {
         1 => THINK_FASTER_CLOSE,
         0 => THINK_CLOSE,
@@ -7664,17 +7667,10 @@ pub fn generate_k2_horizon(
             next_tok = think_close_tok;
             // Latch: K2-Horizon re-opens a think block after a forced close
             // and would otherwise ping-pong open/close for the rest of the
-            // turn. Once the cap fires, keep enforcing it for the remainder
-            // of the turn — a re-opened think-open is substituted with the
-            // close token below so the model commits to its answer.
+            // turn. Once the cap fires, keep enforcing it — the open-think
+            // tokens are blocked at the sampler (below) so the model commits
+            // to its answer instead of looping back into thinking.
             think_capped = true;
-        }
-        // Once capped, substitute a re-opened think-open with the close tag
-        // so the model stays out of think mode and produces the answer.
-        if think_capped
-            && matches!(next_tok, THINK_OPEN | THINK_FAST_OPEN | THINK_FASTER_OPEN)
-        {
-            next_tok = think_close_tok;
         }
         // Hard bound: if the model still hasn't produced a visible answer a
         // margin past the cap (persistent re-open loop), force EOS so the
@@ -7708,6 +7704,7 @@ pub fn generate_k2_horizon(
                         temp,
                         top_p,
                         rng_state,
+                        if think_capped { &THINK_OPEN_TOKENS[..] } else { &[] },
                     )
                 };
                 match step {
@@ -7741,6 +7738,7 @@ pub fn generate_k2_horizon(
                         temp,
                         top_p,
                         rng_state,
+                        if think_capped { &THINK_OPEN_TOKENS[..] } else { &[] },
                     )
                 };
                 match step {
@@ -7800,6 +7798,7 @@ pub fn generate_k2_horizon(
                 temp,
                 top_p,
                 rng_state,
+                if think_capped { &THINK_OPEN_TOKENS[..] } else { &[] },
             )
         };
         match step {
