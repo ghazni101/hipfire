@@ -2557,11 +2557,19 @@ pub(crate) fn apply_reasoning_request(
         request["assistant_prefix"] = serde_json::json!("closed_think");
         return Ok(());
     }
+    // An explicit per-request `max_think_tokens` in the HTTP body wins over
+    // config. Without this, a caller that sends `max_think_tokens` without
+    // `reasoning_effort` silently gets the config budget instead of their cap.
+    let body_cap = request
+        .get("max_think_tokens")
+        .and_then(serde_json::Value::as_u64);
     let explicit = resolved
         .get("reasoning.max_tokens")
         .map(|value| &value.value)
         .filter(|value| !matches!(value, hipfire_config::ConfigValue::Null));
-    let max_think = if let Some(value) = explicit {
+    let max_think = if let Some(cap) = body_cap {
+        cap
+    } else if let Some(value) = explicit {
         match value {
             hipfire_config::ConfigValue::Integer(value) => *value as u64,
             _ => bail!("reasoning.max_tokens resolved to a non-integer"),
@@ -2678,6 +2686,14 @@ pub(crate) fn apply_http_reasoning_request(
         request["max_think_tokens"] = serde_json::json!(explicit_cap);
         request["reasoning_effort"] = serde_json::json!(normalized);
         return Ok(());
+    }
+    // Copy an explicit per-request `max_think_tokens` into the generate
+    // message before the config-driven reasoning resolver runs — the resolver
+    // reads it back as the cap (body wins over config). Without this, a caller
+    // that sends `max_think_tokens` without `reasoning_effort` silently gets
+    // the config budget instead of their cap.
+    if let Some(cap) = body.get("max_think_tokens").and_then(|v| v.as_u64()) {
+        request["max_think_tokens"] = serde_json::json!(cap);
     }
     apply_reasoning_request(resolved, request)?;
     if deepseek4_effort_contract

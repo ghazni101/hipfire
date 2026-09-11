@@ -7617,7 +7617,6 @@ pub fn generate_k2_horizon(
     let mut rng = deepseek4::sampling::Xorshift::new(request_seed as u64);
     let decode_t0 = Instant::now();
     let mut generated_count = 0usize;
-    let mut rng = deepseek4::sampling::Xorshift::new(0xDEAD_BEEF);
     let mut emitted_visible = false;
     // The Jinja template ALWAYS opens a think block in the generation
     // prompt (`reasoning_effort | default('high')` — enable_thinking is not
@@ -7629,7 +7628,8 @@ pub fn generate_k2_horizon(
     // so no byte-level streaming router is needed.
     let mut in_think = true;
     let mut reasoning_tokens = 0usize;
-    // Close tag matching the block the template opened (effort → tag).
+    // Latched once the think cap fires — see the force-close arm in the loop.
+    let mut think_capped = false;
     let think_close_tok: u32 = match max_think_tokens {
         1 => THINK_FASTER_CLOSE,
         0 => THINK_CLOSE,
@@ -7657,12 +7657,31 @@ pub fn generate_k2_horizon(
         if generated_count >= max_tokens {
             break;
         }
-
         // Force-close the think block once the reasoning budget is spent.
         // The close tag is fed through the normal marker arm below, so it
         // reaches the model's KV cache and flips in_think off.
         if in_think && max_think_tokens > 1 && reasoning_tokens >= max_think_tokens {
             next_tok = think_close_tok;
+            // Latch: K2-Horizon re-opens a think block after a forced close
+            // and would otherwise ping-pong open/close for the rest of the
+            // turn. Once the cap fires, keep enforcing it for the remainder
+            // of the turn — a re-opened think-open is substituted with the
+            // close token below so the model commits to its answer.
+            think_capped = true;
+        }
+        // Once capped, substitute a re-opened think-open with the close tag
+        // so the model stays out of think mode and produces the answer.
+        if think_capped
+            && matches!(next_tok, THINK_OPEN | THINK_FAST_OPEN | THINK_FASTER_OPEN)
+        {
+            next_tok = think_close_tok;
+        }
+        // Hard bound: if the model still hasn't produced a visible answer a
+        // margin past the cap (persistent re-open loop), force EOS so the
+        // turn can't run out to max_tokens on pure think churn.
+        if think_capped && !emitted_visible && generated_count >= max_think_tokens + 64 {
+            eprintln!("[k2-think-cap] id={} — no answer {} tokens past think cap {}; forcing EOS", id, generated_count, max_think_tokens);
+            break;
         }
 
         // Check both EOS tokens: <|ifm|endoftext|> (1) and <|ifm|im_end|> (250019).
