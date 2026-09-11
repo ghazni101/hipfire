@@ -109,6 +109,7 @@ hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4" }
 hipfire-arch-dots-ocr = { path = "../hipfire-arch-dots-ocr" }
 hipfire-arch-gemma4 = { path = "../hipfire-arch-gemma4" }
 hipfire-arch-muse-glimmer = { path = "../hipfire-arch-muse-glimmer" }
+hipfire-arch-k2-horizon = { path = "../hipfire-arch-k2-horizon" }
 hipfire-pflash = { path = "../hipfire-pflash" }
 hipfire-engine = { path = "../hipfire-engine" }
 hipfire-loader = { path = "../hipfire-loader" }
@@ -130,6 +131,10 @@ required-features = []
 
 [[example]]
 name = "bench_qwen35_mq4"
+required-features = []
+
+[[example]]
+name = "bench_k2_horizon"
 required-features = []
 
 [[example]]

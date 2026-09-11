@@ -28,7 +28,8 @@ use hipfire_dispatch::families::attention::AttnParams;
 use hipfire_dispatch::families::kv_tier::{KvTierInputs, KvTierPlan};
 use hipfire_dispatch::pipeline::{execute_steps, Step};
 use hipfire_runtime::llama::{
-    fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_for, weight_gemv, KvCache, KvCacheExt,
+    fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_for, weight_gemv, weight_gemv_prerotated,
+    KvCache, KvCacheExt,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 // ─── State ──────────────────────────────────────────────────────────────
@@ -87,6 +88,8 @@ pub struct K2HorizonState {
     pub shared_up: GpuTensor,         // [moe_intermediate_size] = [768]
     pub shared_act: GpuTensor,        // [moe_intermediate_size] = [768]
     pub scratch_h: GpuTensor, // [hidden] — temp for weight_gemv + add_inplace (PM4-safe residual)
+    pub normed_rot: GpuTensor, // [hidden] — FWHT(normed), rotated once per layer, reused by all normed-reading projections
+    pub proj_rot: GpuTensor, // [max(q_dim, dense_inter, moe_inter)] — rotate scratch for non-normed GEMV inputs (o_proj, w_down, shared down)
 
     // head
     pub final_norm_buf: GpuTensor, // [hidden]
@@ -132,6 +135,8 @@ impl K2HorizonState {
             rot_batch,
             down_expanded,
             shared_gate,
+            normed_rot,
+            proj_rot,
             shared_up,
             shared_act,
             scratch_h,
@@ -171,6 +176,8 @@ impl K2HorizonState {
             rot_batch,
             down_expanded,
             shared_gate,
+            normed_rot,
+            proj_rot,
             shared_up,
             shared_act,
             scratch_h,
@@ -249,6 +256,8 @@ impl K2HorizonState {
             gate_batch: alloc(gpu, moe_k * moe_inter, "gate_batch")?,
             up_batch: alloc(gpu, moe_k * moe_inter, "up_batch")?,
             rot_batch: alloc(gpu, moe_k * moe_inter, "rot_batch")?,
+            normed_rot: alloc(gpu, hidden, "normed_rot")?,
+            proj_rot: alloc(gpu, q_dim.max(dense_inter).max(moe_inter), "proj_rot")?,
             down_expanded: alloc(gpu, moe_k * hidden, "down_expanded")?,
             shared_gate: alloc(gpu, moe_inter, "shared_gate")?,
             shared_up: alloc(gpu, moe_inter, "shared_up")?,
@@ -349,6 +358,53 @@ pub(crate) fn run_decode_body(
         return Err("k2_horizon: tied embeddings not yet supported".into());
     }
     Ok(())
+}
+
+/// Grouped RMSNorm + one shared FWHT rotation of `normed` into
+/// `state.normed_rot`. All MQ4G256V2 projections that read `normed` in a
+/// layer share the same fixed FWHT rotation (weight-independent — the AWQ
+/// branch is the only weight-dependent variant), so rotating once and
+/// reusing the buffer across wq/wk/v_router/attn_gate/router/gate/up
+/// eliminates ~8 redundant `mq_rotate_x` launches per layer.
+fn norm_and_rotate(
+    cfg: &K2HorizonConfig,
+    norm_w: &GpuTensor,
+    state: &mut K2HorizonState,
+    gpu: &mut Gpu,
+    l: usize,
+) -> Result<(), String> {
+    gpu.grouped_rmsnorm_f32(
+        &state.h,
+        norm_w,
+        &state.normed,
+        1,
+        cfg.dim,
+        cfg.layernorm_num_groups,
+        cfg.norm_eps,
+    )
+    .map_err(|e| format!("k2_horizon L{l}: norm: {e:?}"))?;
+    gpu.rotate_x_mq(&state.normed, &state.normed_rot, cfg.dim)
+        .map_err(|e| format!("k2_horizon L{l}: normed rotate: {e:?}"))?;
+    Ok(())
+}
+
+/// GEMV against `normed`, consuming the shared `normed_rot` when the weight
+/// uses the fixed FWHT rotation (non-AWQ). Falls back to plain
+/// `weight_gemv` for AWQ-scaled or non-rotating dtypes so the shared buffer
+/// is never fed a rotation it wasn't built for.
+fn gemv_normed(
+    gpu: &mut Gpu,
+    w: &hipfire_runtime::llama::WeightTensor,
+    state: &K2HorizonState,
+    y: &GpuTensor,
+) -> rdna_compute::HipResult<()> {
+    let use_shared =
+        w.awq_scale.is_none() && hipfire_dispatch::types::dtype_needs_rotation(w.gpu_dtype);
+    if use_shared {
+        weight_gemv_prerotated(gpu, w, &state.normed, Some(&state.normed_rot), y)
+    } else {
+        weight_gemv(gpu, w, &state.normed, y)
+    }
 }
 
 /// Full forward (prepare + body). Used by the non-PM4 path and during
@@ -654,24 +710,16 @@ fn forward_dense_layer(
     let eps = cfg.norm_eps;
     let n_groups = cfg.layernorm_num_groups;
 
-    // normed = grouped_rmsnorm(h, attn_norm)
-    gpu.grouped_rmsnorm_f32(
-        &state.h,
-        &layer.attn_norm,
-        &state.normed,
-        1,
-        hidden,
-        n_groups,
-        eps,
-    )
-    .map_err(|e| format!("k2_horizon L{l}: input norm: {e:?}"))?;
+    // normed = grouped_rmsnorm(h, attn_norm); normed_rot = FWHT(normed)
+    // rotated ONCE, reused by wq/wk/wv/attn_gate below.
+    norm_and_rotate(cfg, &layer.attn_norm, state, gpu, l)?;
 
     // q = q_proj(normed), k = k_proj(normed), v = v_proj(normed)
-    weight_gemv(gpu, &layer.wq, &state.normed, &state.fa_q)
+    gemv_normed(gpu, &layer.wq, state, &state.fa_q)
         .map_err(|e| format!("k2_horizon L{l}: q_proj: {e}"))?;
-    weight_gemv(gpu, &layer.wk, &state.normed, &state.fa_k)
+    gemv_normed(gpu, &layer.wk, state, &state.fa_k)
         .map_err(|e| format!("k2_horizon L{l}: k_proj: {e}"))?;
-    weight_gemv(gpu, &layer.wv, &state.normed, &state.fa_v)
+    gemv_normed(gpu, &layer.wv, state, &state.fa_v)
         .map_err(|e| format!("k2_horizon L{l}: v_proj: {e}"))?;
 
     // RoPE on Q and K (full rotary, rope_head_dim == head_dim)
@@ -692,38 +740,46 @@ fn forward_dense_layer(
 
     // softplus post-attention gate: attn_out *= softplus_beta(gate_proj(normed))
     //   Fused: replaces scale→softplus→scale→mul (4 launches) with 1 launch.
-    weight_gemv(gpu, &layer.attn_gate, &state.normed, &state.attn_gate_out)
+    gemv_normed(gpu, &layer.attn_gate, state, &state.attn_gate_out)
         .map_err(|e| format!("k2_horizon L{l}: attn gate: {e}"))?;
     gpu.softplus_gate_f32(&state.attn_gate_out, &state.fa_attn_out)
         .map_err(|e| format!("k2_horizon L{l}: softplus gate: {e:?}"))?;
 
-    // h += o_proj(attn_out)
-    weight_gemv(gpu, &layer.wo, &state.fa_attn_out, &state.scratch_h)
-        .map_err(|e| format!("k2_horizon L{l}: o_proj: {e}"))?;
+    // h += o_proj(attn_out) — o_proj reads fa_attn_out (q_dim), rotated into proj_rot.
+    gpu.rotate_x_mq(&state.fa_attn_out, &state.proj_rot, layer.wo.k)
+        .map_err(|e| format!("k2_horizon L{l}: o rotate: {e:?}"))?;
+    weight_gemv_prerotated(
+        gpu,
+        &layer.wo,
+        &state.fa_attn_out,
+        Some(&state.proj_rot),
+        &state.scratch_h,
+    )
+    .map_err(|e| format!("k2_horizon L{l}: o_proj: {e}"))?;
     gpu.add_inplace_f32(&state.h, &state.scratch_h)
         .map_err(|e| format!("k2_horizon L{l}: o_proj add: {e:?}"))?;
 
-    // FFN: normed = grouped_rmsnorm(h, ffn_norm)
-    gpu.grouped_rmsnorm_f32(
-        &state.h,
-        &layer.ffn_norm,
-        &state.normed,
-        1,
-        hidden,
-        n_groups,
-        eps,
-    )
-    .map_err(|e| format!("k2_horizon L{l}: ffn norm: {e:?}"))?;
+    // FFN: normed = grouped_rmsnorm(h, ffn_norm) + shared rotation.
+    norm_and_rotate(cfg, &layer.ffn_norm, state, gpu, l)?;
 
     // dense SwiGLU: down(silu(gate(normed)) * up(normed))
-    weight_gemv(gpu, &layer.w_gate, &state.normed, &state.dense_gate)
+    gemv_normed(gpu, &layer.w_gate, state, &state.dense_gate)
         .map_err(|e| format!("k2_horizon L{l}: dense gate: {e}"))?;
-    weight_gemv(gpu, &layer.w_up, &state.normed, &state.dense_up)
+    gemv_normed(gpu, &layer.w_up, state, &state.dense_up)
         .map_err(|e| format!("k2_horizon L{l}: dense up: {e}"))?;
     gpu.silu_mul_f32(&state.dense_gate, &state.dense_up, &state.dense_act)
         .map_err(|e| format!("k2_horizon L{l}: dense silu_mul: {e:?}"))?;
-    weight_gemv(gpu, &layer.w_down, &state.dense_act, &state.scratch_h)
-        .map_err(|e| format!("k2_horizon L{l}: dense down: {e}"))?;
+    // w_down reads dense_act (not normed) — rotate into proj_rot scratch.
+    gpu.rotate_x_mq(&state.dense_act, &state.proj_rot, cfg.intermediate_size)
+        .map_err(|e| format!("k2_horizon L{l}: down rotate: {e:?}"))?;
+    weight_gemv_prerotated(
+        gpu,
+        &layer.w_down,
+        &state.dense_act,
+        Some(&state.proj_rot),
+        &state.scratch_h,
+    )
+    .map_err(|e| format!("k2_horizon L{l}: dense down: {e}"))?;
     gpu.add_inplace_f32(&state.h, &state.scratch_h)
         .map_err(|e| format!("k2_horizon L{l}: dense down add: {e:?}"))?;
 
@@ -731,7 +787,6 @@ fn forward_dense_layer(
 }
 
 // ─── MoE layer (layers 3–47): MoVA attention + sigmoid MoE FFN ──────────
-
 fn forward_moe_layer(
     cfg: &K2HorizonConfig,
     layer: &MovaLayerWeights,
@@ -740,30 +795,19 @@ fn forward_moe_layer(
     l: usize,
     position: u32,
 ) -> Result<(), String> {
-    let hidden = cfg.dim;
-    let eps = cfg.norm_eps;
-    let n_groups = cfg.layernorm_num_groups;
     let attn = &layer.attn;
     let ffn = &layer.ffn;
 
     // ── Attention branch ──────────────────────────────────────────────
 
-    // normed = grouped_rmsnorm(h, attn_norm)
-    gpu.grouped_rmsnorm_f32(
-        &state.h,
-        &layer.attn_norm,
-        &state.normed,
-        1,
-        hidden,
-        n_groups,
-        eps,
-    )
-    .map_err(|e| format!("k2_horizon L{l}: input norm: {e:?}"))?;
+    // normed = grouped_rmsnorm(h, attn_norm); normed_rot = FWHT(normed)
+    // rotated ONCE, reused by wq/wk/v_router/attn_gate below.
+    norm_and_rotate(cfg, &layer.attn_norm, state, gpu, l)?;
 
     // q = q_proj(normed), k = k_proj(normed)
-    weight_gemv(gpu, &attn.wq, &state.normed, &state.fa_q)
+    gemv_normed(gpu, &attn.wq, state, &state.fa_q)
         .map_err(|e| format!("k2_horizon L{l}: q_proj: {e}"))?;
-    weight_gemv(gpu, &attn.wk, &state.normed, &state.fa_k)
+    gemv_normed(gpu, &attn.wk, state, &state.fa_k)
         .map_err(|e| format!("k2_horizon L{l}: k_proj: {e}"))?;
 
     // MoVA: v = combine_routed_experts(normed)
@@ -785,30 +829,29 @@ fn forward_moe_layer(
     let seq_len = position as usize + 1;
     attend(cfg, state, gpu, l, seq_len)?;
     //   Fused: replaces scale→softplus→scale→mul (4 launches) with 1 launch.
-    weight_gemv(gpu, &attn.attn_gate, &state.normed, &state.attn_gate_out)
+    gemv_normed(gpu, &attn.attn_gate, state, &state.attn_gate_out)
         .map_err(|e| format!("k2_horizon L{l}: attn gate: {e}"))?;
     gpu.softplus_gate_f32(&state.attn_gate_out, &state.fa_attn_out)
         .map_err(|e| format!("k2_horizon L{l}: softplus gate: {e:?}"))?;
 
-    // h += o_proj(attn_out)
-    weight_gemv(gpu, &attn.wo, &state.fa_attn_out, &state.scratch_h)
-        .map_err(|e| format!("k2_horizon L{l}: o_proj: {e}"))?;
+    // h += o_proj(attn_out) — o_proj reads fa_attn_out (q_dim), rotated into proj_rot.
+    gpu.rotate_x_mq(&state.fa_attn_out, &state.proj_rot, attn.wo.k)
+        .map_err(|e| format!("k2_horizon L{l}: o rotate: {e:?}"))?;
+    weight_gemv_prerotated(
+        gpu,
+        &attn.wo,
+        &state.fa_attn_out,
+        Some(&state.proj_rot),
+        &state.scratch_h,
+    )
+    .map_err(|e| format!("k2_horizon L{l}: o_proj: {e}"))?;
     gpu.add_inplace_f32(&state.h, &state.scratch_h)
         .map_err(|e| format!("k2_horizon L{l}: o_proj add: {e:?}"))?;
 
     // ── FFN branch: sigmoid-routed MoE ────────────────────────────────
 
-    // normed = grouped_rmsnorm(h, ffn_norm)
-    gpu.grouped_rmsnorm_f32(
-        &state.h,
-        &layer.ffn_norm,
-        &state.normed,
-        1,
-        hidden,
-        n_groups,
-        eps,
-    )
-    .map_err(|e| format!("k2_horizon L{l}: ffn norm: {e:?}"))?;
+    // normed = grouped_rmsnorm(h, ffn_norm) + shared rotation.
+    norm_and_rotate(cfg, &layer.ffn_norm, state, gpu, l)?;
 
     forward_sigmoid_moe_ffn(cfg, ffn, state, gpu, l)?;
 
@@ -841,8 +884,8 @@ pub(crate) fn forward_mova_value_routing(
     let kv_dim = cfg.n_kv_heads * cfg.head_dim;
     let hidden = cfg.dim;
 
-    // 1. router GEMV → v_router_logits [64]
-    weight_gemv(gpu, &attn.v_router, &state.normed, &state.v_router_logits)
+    // 1. router GEMV → v_router_logits [64] — reads normed via shared normed_rot.
+    gemv_normed(gpu, &attn.v_router, state, &state.v_router_logits)
         .map_err(|e| format!("k2_horizon L{l}: v_router: {e}"))?;
 
     // 2. sigmoid(router_logits) — in-place
@@ -867,19 +910,26 @@ pub(crate) fn forward_mova_value_routing(
     )
     .map_err(|e| format!("k2_horizon L{l}: v_router topk: {e:?}"))?;
 
-    // 4. FWHT-rotate normed into v_x_rot, then replicate across k_top slices
-    //    for the indexed kernel's [N × K_TOP × K] rot_batch layout.
+    // 4. Replicate the rotated normed input across k_top slices for the
+    //    indexed kernel's [N × K_TOP × K] rot_batch layout. Reuse the shared
+    //    normed_rot when the v_experts use the fixed FWHT rotation (non-AWQ);
+    //    AWQ-scaled experts need their own rotate into v_x_rot.
     //    replicate_batched_f32 (not memcpy_dtod_at_auto) so the copy is a
     //    recorded kernel launch — PM4-capturable.
-    rotate_x_mq_for(
-        gpu,
-        &attn.v_experts[0],
-        &state.normed,
-        &state.v_x_rot,
-        hidden,
-    )
-    .map_err(|e| format!("k2_horizon L{l}: v rotate: {e:?}"))?;
-    gpu.replicate_batched_f32(&state.v_x_rot, &state.v_rot_batch, hidden, mova_top_k, 1)
+    let v_rot_src = if attn.v_experts[0].awq_scale.is_none() {
+        &state.normed_rot
+    } else {
+        rotate_x_mq_for(
+            gpu,
+            &attn.v_experts[0],
+            &state.normed,
+            &state.v_x_rot,
+            hidden,
+        )
+        .map_err(|e| format!("k2_horizon L{l}: v rotate: {e:?}"))?;
+        &state.v_x_rot
+    };
+    gpu.replicate_batched_f32(v_rot_src, &state.v_rot_batch, hidden, mova_top_k, 1)
         .map_err(|e| format!("k2_horizon L{l}: v_rot_batch replicate: {e:?}"))?;
 
     // 5. V2 indexed MoE GEMV: all mova_top_k v_experts in one kernel launch.
@@ -946,8 +996,8 @@ pub(crate) fn forward_sigmoid_moe_ffn(
     let hidden = cfg.dim;
     let moe_inter = cfg.moe_intermediate_size;
 
-    // 1. router GEMV → moe_router_logits [100]
-    weight_gemv(gpu, &ffn.router, &state.normed, &state.moe_router_logits)
+    // 1. router GEMV → moe_router_logits [100] — reads normed via shared normed_rot.
+    gemv_normed(gpu, &ffn.router, state, &state.moe_router_logits)
         .map_err(|e| format!("k2_horizon L{l}: moe router: {e}"))?;
 
     // 2. sigmoid(router_logits) — in-place
@@ -970,21 +1020,28 @@ pub(crate) fn forward_sigmoid_moe_ffn(
     )
     .map_err(|e| format!("k2_horizon L{l}: moe topk: {e:?}"))?;
 
-    // 4. FWHT-rotate normed for the indexed gate_up GEMV.
-    rotate_x_mq_for(
-        gpu,
-        &ffn.experts[0].gate_up,
-        &state.normed,
-        &state.ffn_x_rot,
-        hidden,
-    )
-    .map_err(|e| format!("k2_horizon L{l}: ffn rotate: {e:?}"))?;
+    // 4. Reuse the shared normed_rot for the indexed gate_up GEMV when the
+    //    experts use the fixed FWHT rotation (non-AWQ); AWQ-scaled experts
+    //    need their own rotate into ffn_x_rot.
+    let ffn_rot = if ffn.experts[0].gate_up.awq_scale.is_none() {
+        &state.normed_rot
+    } else {
+        rotate_x_mq_for(
+            gpu,
+            &ffn.experts[0].gate_up,
+            &state.normed,
+            &state.ffn_x_rot,
+            hidden,
+        )
+        .map_err(|e| format!("k2_horizon L{l}: ffn rotate: {e:?}"))?;
+        &state.ffn_x_rot
+    };
 
     // 5. V2 indexed MoE gate_up GEMV: all top_k experts in one kernel launch.
     gpu.gemv_mq4g256v2_moe_gate_up_k8_indexed_batched(
         &ffn.expert_gate_up_ptrs,
         &state.moe_topk_indices,
-        &state.ffn_x_rot,
+        ffn_rot,
         &state.gate_batch,
         &state.up_batch,
         2 * moe_inter,
@@ -1032,10 +1089,11 @@ pub(crate) fn forward_sigmoid_moe_ffn(
     )
     .map_err(|e| format!("k2_horizon L{l}: moe combine: {e:?}"))?;
 
-    // 9. Shared expert (always-on SwiGLU).
-    weight_gemv(gpu, &ffn.shared.gate, &state.normed, &state.shared_gate)
+    // 9. Shared expert (always-on SwiGLU). gate/up read normed via shared
+    //    normed_rot; down reads shared_act, rotated into proj_rot.
+    gemv_normed(gpu, &ffn.shared.gate, state, &state.shared_gate)
         .map_err(|e| format!("k2_horizon L{l}: shared gate: {e}"))?;
-    weight_gemv(gpu, &ffn.shared.up, &state.normed, &state.shared_up)
+    gemv_normed(gpu, &ffn.shared.up, state, &state.shared_up)
         .map_err(|e| format!("k2_horizon L{l}: shared up: {e}"))?;
     gpu.silu_mul_f32(&state.shared_gate, &state.shared_up, &state.shared_act)
         .map_err(|e| format!("k2_horizon L{l}: shared silu_mul: {e:?}"))?;
@@ -1043,8 +1101,16 @@ pub(crate) fn forward_sigmoid_moe_ffn(
     // weight_gemv_residual — gemv_mq4g256v2_residual uses scratch memory
     // (private=32) that gfx10/11 PM4 dispatch rejects, which would poison
     // the whole retained-replay capture for one fused launch.
-    weight_gemv(gpu, &ffn.shared.down, &state.shared_act, &state.scratch_h)
-        .map_err(|e| format!("k2_horizon L{l}: shared down: {e}"))?;
+    gpu.rotate_x_mq(&state.shared_act, &state.proj_rot, ffn.shared.down.k)
+        .map_err(|e| format!("k2_horizon L{l}: shared down rotate: {e:?}"))?;
+    weight_gemv_prerotated(
+        gpu,
+        &ffn.shared.down,
+        &state.shared_act,
+        Some(&state.proj_rot),
+        &state.scratch_h,
+    )
+    .map_err(|e| format!("k2_horizon L{l}: shared down: {e}"))?;
     gpu.add_inplace_f32(&state.h, &state.scratch_h)
         .map_err(|e| format!("k2_horizon L{l}: shared down add: {e:?}"))?;
 
