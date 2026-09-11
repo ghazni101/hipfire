@@ -1596,6 +1596,7 @@ pub fn generate(
                 max_tokens,
                 max_think_tokens,
                 request_seed,
+                reasoning_effort,
                 tools,
                 messages_history,
             );

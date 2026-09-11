@@ -7446,6 +7446,10 @@ pub fn generate_k2_horizon(
     // Per-request sampler seed (hipfire-engine::request_seed_for). Replaces
     // the fixed 0xDEAD_BEEF that made same-prompt requests byte-identical.
     request_seed: u32,
+    // Jinja reasoning_effort — selects which think tag the generation prompt
+    // opened (high→<ifm|think>, medium→<ifm|think_fast>, low→<ifm|think_faster>)
+    // so the force-close feeds the MATCHING close tag, not a mismatched one.
+    reasoning_effort: Option<&str>,
     _tools: Option<&[serde_json::Value]>,
     _messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
 ) {
@@ -7633,11 +7637,15 @@ pub fn generate_k2_horizon(
     // Open-think tokens blocked at the sampler once the cap latches (the
     // `blocked_tokens` mechanism from hipfire_runtime::sampler::sample).
     const THINK_OPEN_TOKENS: [u32; 3] = [THINK_OPEN, THINK_FAST_OPEN, THINK_FASTER_OPEN];
-    let think_close_tok: u32 = match max_think_tokens {
-        1 => THINK_FASTER_CLOSE,
-        0 => THINK_CLOSE,
-        n if n <= 512 => THINK_FASTER_CLOSE,
-        n if n <= 2048 => THINK_FAST_CLOSE,
+    // Close tag must MATCH the open tag the generation prompt emitted, which
+    // is selected by reasoning_effort (high→<ifm|think>, medium→<ifm|think_fast>,
+    // low→<ifm|think_faster>) — NOT by the token budget. Feeding a mismatched
+    // close (e.g. </ifm|think_faster> into an <ifm|think> block) leaves the
+    // model's block unclosed, so it keeps reasoning into the content channel.
+    let think_close_tok: u32 = match reasoning_effort {
+        Some("low") => THINK_FASTER_CLOSE,
+        Some("medium") | Some("med") => THINK_FAST_CLOSE,
+        // high / uncapped / absent all open <ifm|think>.
         _ => THINK_CLOSE,
     };
 
