@@ -62,4 +62,6 @@ VOLUME ["/var/cache/hipfire"]
 EXPOSE 9001
 
 ENTRYPOINT ["hipfire"]
-CMD ["serve", "K2-Horizon-MoVA-36B-A4B.mq4r", "0.0.0.0:9001", "--kv-mode", "q8"]
+# --idle-timeout 300: unload the model after 5 min idle (frees ~24 GB VRAM).
+# Override at `docker run ... k2-horizon-serve serve <model> <addr> --idle-timeout N`.
+CMD ["serve", "K2-Horizon-MoVA-36B-A4B.mq4r", "0.0.0.0:9001", "--kv-mode", "q8", "--idle-timeout", "300"]

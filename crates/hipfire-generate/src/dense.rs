@@ -7645,6 +7645,15 @@ pub fn generate_k2_horizon(
 
     let mut rng_state: u32 = request_seed;
     loop {
+        // Abort check at the top of every iteration so a mid-decode client
+        // cancel stops the loop immediately and emits `aborted`+`done`.
+        // Without this the loop runs the full `max_tokens` of wasted work
+        // after the HTTP client has already timed out and sent `abort`.
+        if check_abort(id) {
+            let ep = production_fail_closed_rollback(m, gpu, None, None);
+            emit_spec_cancel_after_rollback(stdout, id, generated_count, &ep);
+            return;
+        }
         if generated_count >= max_tokens {
             break;
         }
