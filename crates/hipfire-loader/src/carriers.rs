@@ -2339,21 +2339,25 @@ impl Carrier for K2HorizonCarrier {
         synthetic: &[u32],
     ) -> Option<Option<String>> {
         let b = m.k2_horizon_mut()?;
-        let ps = match hipfire_arch_k2_horizon::prefill::PrefillScratch::new(gpu, &b.config) {
+        let ps = match hipfire_arch_k2_horizon::prefill::PrefillScratch::new(
+            gpu,
+            &b.config,
+            b.state.max_seq,
+        ) {
             Ok(ps) => ps,
             Err(e) => return Some(Some(format!("prefill scratch: {e}"))),
         };
-        Some(
-            hipfire_arch_k2_horizon::prefill::forward_prefill_batch(
-                &b.config,
-                &b.weights,
-                &ps,
-                &mut b.state,
-                gpu,
-                synthetic,
-            )
-            .err(),
+        let result = hipfire_arch_k2_horizon::prefill::forward_prefill_batch(
+            &b.config,
+            &b.weights,
+            &ps,
+            &mut b.state,
+            gpu,
+            synthetic,
         )
+        .err();
+        ps.free_gpu(gpu);
+        Some(result)
     }
     fn bench_decode_run(
         &self,

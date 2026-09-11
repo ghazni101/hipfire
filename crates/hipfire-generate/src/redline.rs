@@ -330,17 +330,19 @@ pub fn redline_prime_k2_horizon(
     bundle: &mut k2_horizon::K2HorizonBundle,
     context: usize,
 ) -> Result<(), String> {
-    let ps = k2_horizon::prefill::PrefillScratch::new(gpu, &bundle.config)
+    let ps = k2_horizon::prefill::PrefillScratch::new(gpu, &bundle.config, bundle.state.max_seq)
         .map_err(|e| format!("k2_horizon prime scratch: {e}"))?;
     let synthetic: Vec<u32> = (0..context as u32).map(|i| 10 + (i % 1000)).collect();
-    k2_horizon::prefill::forward_prefill_batch(
+    let result = k2_horizon::prefill::forward_prefill_batch(
         &bundle.config,
         &bundle.weights,
         &ps,
         &mut bundle.state,
         gpu,
         &synthetic,
-    )?;
+    );
+    ps.free_gpu(gpu);
+    result?;
     gpu.hip
         .device_synchronize()
         .map_err(|e| format!("k2_horizon prime sync: {e:?}"))?;

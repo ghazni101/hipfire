@@ -38,7 +38,7 @@ const DEFAULT_MAX_SEQ: usize = 65536;
 
 /// Flash prefill sub-batch size. Smaller = less VRAM. K2-Horizon has 32 heads
 /// × 128 head_dim; at max_seq=2048 this is 32×17×130×16 = ~1.1 MB.
-const FLASH_PREFILL_SUBBATCH: usize = 16;
+pub(crate) const FLASH_PREFILL_SUBBATCH: usize = 16;
 
 /// Per-decode GPU scratch + KV cache for K2-Horizon.
 ///
@@ -267,11 +267,27 @@ impl K2HorizonState {
             logits: alloc(gpu, cfg.vocab_size, "logits")?,
             sample_buf: alloc(gpu, 2, "sample_buf")?,
             repeat_buf: alloc(gpu, 64, "repeat_buf")?,
-            flash_partials: alloc(
-                gpu,
-                cfg.n_heads * ((max_seq + 127) / 128) * (2 + cfg.head_dim) * FLASH_PREFILL_SUBBATCH,
-                "flash_partials",
-            )?,
+            // Decode needs partials for a single query row; the ×SUBBATCH
+            // prefill-sized buffer lives in PrefillScratch (freed after
+            // prefill) so it isn't resident during decode. Size against the
+            // q8 decode kernel's tile (q8_flash_tile_size, 32 on gfx1100) —
+            // NOT attn_tile_size (128) — or the buffer is 4× undersized and
+            // the kernel writes OOB.
+            flash_partials: {
+                let tile = rdna_compute::attention::q8_flash_tile_size(
+                    &gpu.arch,
+                    cfg.n_heads,
+                    cfg.n_kv_heads,
+                    cfg.head_dim,
+                    max_seq,
+                );
+                let max_tiles = (max_seq + tile - 1) / tile;
+                alloc(
+                    gpu,
+                    cfg.n_heads * max_tiles * (2 + cfg.head_dim),
+                    "flash_partials",
+                )?
+            },
             retained_warmed_up: false,
             retained_state_poisoned: false,
         })

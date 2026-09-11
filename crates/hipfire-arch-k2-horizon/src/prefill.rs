@@ -71,10 +71,13 @@ pub struct PrefillScratch {
     // Final
     pub final_norm_buf: GpuTensor, // [MAX_BATCH × hidden]
     pub logits: GpuTensor,         // [vocab] — last token only
+    // Flash attention partials, sized for the prefill sub-batch (the decode
+    // state's flash_partials is single-row; prefill needs ×SUBBATCH).
+    pub flash_partials: GpuTensor,
 }
 
 impl PrefillScratch {
-    pub fn new(gpu: &mut Gpu, cfg: &K2HorizonConfig) -> Result<Self, String> {
+    pub fn new(gpu: &mut Gpu, cfg: &K2HorizonConfig, max_seq: usize) -> Result<Self, String> {
         let mb = PREFILL_MAX_BATCH;
         let hidden = cfg.dim;
         let q_dim = cfg.n_heads * cfg.head_dim;
@@ -129,6 +132,14 @@ impl PrefillScratch {
             shared_act: alloc(gpu, mb * moe_inter, "shared_act")?,
             final_norm_buf: alloc(gpu, mb * hidden, "final_norm_buf")?,
             logits: alloc(gpu, vocab, "logits")?,
+            flash_partials: alloc(
+                gpu,
+                cfg.n_heads
+                    * ((max_seq + 127) / 128)
+                    * (2 + cfg.head_dim)
+                    * crate::forward::FLASH_PREFILL_SUBBATCH,
+                "prefill_flash_partials",
+            )?,
         })
     }
 
@@ -166,6 +177,7 @@ impl PrefillScratch {
             shared_act,
             final_norm_buf,
             logits,
+            flash_partials,
         } = self;
         for t in [
             tokens,
@@ -200,6 +212,7 @@ impl PrefillScratch {
             shared_act,
             final_norm_buf,
             logits,
+            flash_partials,
         ] {
             let _ = gpu.free_tensor(t);
         }
@@ -264,7 +277,7 @@ fn attend_batch(
         physical_cap: kv.kv.physical_cap,
         batch_size: n,
         max_ctx_len: start_pos + n,
-        flash_partials: Some(&kv.flash_partials),
+        flash_partials: Some(&ps.flash_partials),
         givens_cos: None,
         givens_sin: None,
         tree_bias: None,

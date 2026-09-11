@@ -80,7 +80,7 @@ fn main() {
 
     // Prefill with a fixed token id (BOS-ish); content doesn't matter for perf.
     let prompt: Vec<u32> = vec![1u32; prefill_len];
-    let ps = k2::prefill::PrefillScratch::new(&mut gpu, &config).expect("prefill scratch");
+    let ps = k2::prefill::PrefillScratch::new(&mut gpu, &config, max_seq).expect("prefill scratch");
     let t_prefill = Instant::now();
     let logits =
         k2::prefill::forward_prefill_batch(&config, &weights, &ps, &mut state, &mut gpu, &prompt)

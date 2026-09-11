@@ -7555,7 +7555,7 @@ pub fn generate_k2_horizon(
             .map(|v| v != "1")
             .unwrap_or(true);
         let batched = if use_batched {
-            match k2_horizon::prefill::PrefillScratch::new(gpu, &b.config) {
+            match k2_horizon::prefill::PrefillScratch::new(gpu, &b.config, b.state.max_seq) {
                 Ok(ps) => {
                     let r = k2_horizon::prefill::forward_prefill_batch(
                         &b.config,
