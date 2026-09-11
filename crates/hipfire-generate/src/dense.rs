@@ -7443,6 +7443,9 @@ pub fn generate_k2_horizon(
     top_p: f32,
     max_tokens: usize,
     max_think_tokens: usize,
+    // Per-request sampler seed (hipfire-engine::request_seed_for). Replaces
+    // the fixed 0xDEAD_BEEF that made same-prompt requests byte-identical.
+    request_seed: u32,
     _tools: Option<&[serde_json::Value]>,
     _messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
 ) {
@@ -7611,7 +7614,7 @@ pub fn generate_k2_horizon(
     }
     let prefill_ms = prefill_t0.elapsed().as_millis();
 
-    // ── Decode loop ──
+    let mut rng = deepseek4::sampling::Xorshift::new(request_seed as u64);
     let decode_t0 = Instant::now();
     let mut generated_count = 0usize;
     let mut rng = deepseek4::sampling::Xorshift::new(0xDEAD_BEEF);
@@ -7640,7 +7643,7 @@ pub fn generate_k2_horizon(
     // avoiding the ~1 MB logits download per token.
     let mut next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
 
-    let mut rng_state: u32 = 0xDEAD_BEEF;
+    let mut rng_state: u32 = request_seed;
     loop {
         if generated_count >= max_tokens {
             break;

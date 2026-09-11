@@ -1249,6 +1249,7 @@ pub(crate) fn complete_request_attempt(
             "reasoning_effort",
             "logprobs",
             "top_logprobs",
+            "seed",
         ] {
             if let Some(value) = body.get(name) {
                 generate[name] = value.clone();

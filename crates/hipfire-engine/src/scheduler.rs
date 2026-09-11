@@ -984,3 +984,79 @@ pub fn block_attractor_unclosed_cpu(
         }
     }
 }
+
+// ── Per-request sampler seeding ─────────────────────────────────────────
+// Ported from master: replaces the historical fixed 0x13579BDF that made
+// same-prompt requests byte-identical at temp>0. `batch_rng_for_key` already
+// exists above (line ~493); these are the unseeded/seeded wrappers.
+
+
+/// Process-global monotonic request counter, mixed into every unseeded
+/// request's derived RNG so two requests that reuse the same wire key (clients
+/// that always send `id:"r1", attempt_id:1`) still get distinct sampler streams.
+static REQUEST_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Process-start nonce (nanos since UNIX_EPOCH). Mixed into the derived seed so
+/// raw daemon clients that reuse identical `(id, attempt_id)` keys across
+/// daemon restarts do not replay the same unseeded draw sequences; within a
+/// process the counter already guarantees distinctness.
+static BOOT_NONCE: std::sync::LazyLock<u64> = std::sync::LazyLock::new(|| {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0x9E3779B97F4A7C15)
+});
+
+/// Fresh unseeded per-request RNG state: [`batch_rng_for_key`] mixed with the
+/// process-global request counter and [`BOOT_NONCE`]. Every call draws new
+/// counter entropy regardless of client keying.
+pub fn fresh_request_rng(key: &AttemptKey) -> u64 {
+    batch_rng_for_key(key)
+        ^ *BOOT_NONCE
+        ^ REQUEST_COUNTER
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+            .wrapping_mul(0x9E3779B97F4A7C15)
+}
+
+/// Explicit-seed RNG state: splitmix over the wire seed ALONE (attempt
+/// identity deliberately excluded so an explicit seed reproduces its draw
+/// sequence for every request that carries it). `0` maps to the 0x13579BDF
+/// sentinel because xorshift state 0 is stuck.
+pub fn seeded_request_rng(client_seed: u64) -> u64 {
+    let mut z = client_seed.wrapping_add(0x13579BDF);
+    z ^= z >> 30;
+    z = z.wrapping_mul(0xBF58476D1CE4E5B9);
+    z ^= z >> 27;
+    z = z.wrapping_mul(0xFF51AFD7ED558CCD);
+    z ^= z >> 31;
+    let seed = z as u32;
+    if seed == 0 {
+        0x13579BDF as u64
+    } else {
+        seed as u64
+    }
+}
+
+/// Per-request sampler RNG across BOTH sampling routes: explicit wire `seed`
+/// wins via [`seeded_request_rng`], else fresh counter/nonce entropy via
+/// [`fresh_request_rng`]. Consumed as u32 by the sample kernels; returned
+/// widened so callers need no second cast.
+pub fn request_rng_u64(key: &AttemptKey, client_seed: Option<u64>) -> u64 {
+    match client_seed {
+        Some(s) => seeded_request_rng(s),
+        None => fresh_request_rng(key),
+    }
+}
+
+/// Per-request sampler seed (u32) for the sequential AR route, replacing the
+/// historical fixed 0x13579BDF that made same-prompt requests byte-identical
+/// at temp>0. The result is never 0: xorshift32 treats a 0 state as
+/// stuck/degenerate.
+pub fn request_seed_for(key: &AttemptKey, client_seed: Option<u64>) -> u32 {
+    let seed = request_rng_u64(key, client_seed) as u32;
+    if seed == 0 {
+        0x13579BDF
+    } else {
+        seed
+    }
+}

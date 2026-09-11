@@ -35,3 +35,4 @@ pub mod prompt;
 pub mod redline;
 pub mod scheduler;
 pub mod terminal;
+pub mod wire_seed;

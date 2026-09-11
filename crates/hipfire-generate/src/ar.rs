@@ -1049,6 +1049,12 @@ pub fn generate(
     // `Some(k)` emits OpenAI logprobs with k candidates per token. `None` is the
     // default and leaves every token envelope byte-identical to before.
     logprobs_top_k: Option<usize>,
+    // Per-request sampler seed for both the GPU xorshift stream and the
+    // process-global CPU fallback sampler. The caller derives it via
+    // hipfire-engine::request_seed_for (explicit wire `seed` wins, else
+    // attempt-key + counter entropy) so two requests with the same prompt
+    // no longer replay the identical draw sequence at temp>0.
+    request_seed: u32,
 ) {
     // ── Producer-route authority (Task 6) ──────────────────────────────
     // Resolve the selected generation route BEFORE sampler RNG reset and
@@ -1198,10 +1204,11 @@ pub fn generate(
     }
 
     // hunt3 M-E: seed the process-global CPU sampler RNG with this request's
-    // fixed seed so the grammar/CPU-fallback sample stream is deterministic per
-    // request and does not carry RNG state across requests. Matches the u32 the
-    // GPU sample path uses (0x13579BDF).
-    hipfire_runtime::llama::reset_cpu_sampler_rng(0x13579BDF);
+    // seed so the grammar/CPU-fallback sample stream is isolated per request
+    // and does not carry RNG state across requests. Matches the u32 the GPU
+    // sample path uses (request_seed, derived by hipfire-engine's
+    // request_seed_for from the wire `seed` field or the attempt key + counter).
+    hipfire_runtime::llama::reset_cpu_sampler_rng(request_seed);
     // Adaptive KV poison is sticky until unload/reload. Refuse generation so a
     // partial tier transition cannot continue writing into mixed-tier state.
     if let Some(ad) = m.kv_adaptive.as_ref() {
@@ -1588,6 +1595,7 @@ pub fn generate(
                 top_p,
                 max_tokens,
                 max_think_tokens,
+                request_seed,
                 tools,
                 messages_history,
             );
@@ -3223,7 +3231,7 @@ pub fn generate(
         // Generate. GPU-side sampling eliminates per-token logits download +
         // CPU softmax + CPU repeat penalty. Closes the 2× gap between raw
         // bench throughput and daemon throughput.
-        //
+        let mut rng_state: u32 = request_seed;
         // Kernel signature reads `repeat_tokens[0..repeat_window]`, so we
         // only need to upload the tokens that will actually be read — no
         // need to clear the buffer between calls. The upload is on the same
@@ -4248,7 +4256,7 @@ pub fn generate(
         let scratch = &b.scratch;
         let kv = &mut b.kv;
 
-        let mut rng_state = 42u32;
+        let mut rng_state = request_seed;
         let batched_prefill = llama_qwen3_batched_prefill_eligible(
             &gpu.arch,
             config.arch,
