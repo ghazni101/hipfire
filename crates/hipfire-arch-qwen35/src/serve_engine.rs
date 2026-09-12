@@ -43,7 +43,7 @@ use hipfire_runtime::llama::{KvCache, VMode};
 use hipfire_runtime::tokenizer::Tokenizer;
 use crate::speculative::DeltaNetSnapshot;
 use crate::checkpoint::{capture_checkpoint, plan_resume, CheckpointId, QwenCheckpointPool};
-use hipfire_runtime::prefix_index::{Handle, PrefixIndex};
+use hipfire_runtime::prefix_index::{Handle, PinTicket, PrefixIndex};
 use hipfire_runtime::serve_contract::{
     CacheDomain, DrafterDecision, PrefixLookup, PrefixLookupResult,
 };
@@ -66,6 +66,7 @@ enum EngineCommand {
     },
 }
 
+#[derive(Clone)]
 pub struct EngineConfig {
     pub model_path: PathBuf,
     pub n_slots: usize,
@@ -389,6 +390,44 @@ struct Rig {
     tick: u64,
     /// Structured-output jump-forward enabled (spec §7.3 G3). Default false.
     structured_jump_forward: bool,
+    /// Bounded cache of compiled JSON Schemas, keyed by canonical
+    /// serialization. `validate_generate_caps` compiles once at submit and
+    /// admit compiles again per request — for a repeated schema that is a
+    /// per-request DoS surface. 8 entries is enough for a serving mix;
+    /// eviction is FIFO over insertion order.
+    schema_cache: std::collections::HashMap<
+        Vec<u8>,
+        grammar::json_schema::CompiledSchema,
+    >,
+    /// Insertion order for `schema_cache` FIFO eviction.
+    schema_cache_order: std::collections::VecDeque<Vec<u8>>,
+}
+
+/// Compile a JSON Schema through the rig's bounded cache. The daemon's
+/// `validate_generate_caps` already compiled this schema once at submit;
+/// without a cache every admit pays a second full compile — a per-request
+/// DoS surface for a repeated schema. Keyed by canonical serialization;
+/// FIFO eviction at 8 entries.
+fn cached_compile_schema(
+    rig: &mut Rig,
+    schema: &serde_json::Value,
+) -> Result<grammar::json_schema::CompiledSchema, grammar::json_schema::SchemaError> {
+    let key = serde_json::to_vec(schema).unwrap_or_default();
+    if let Some(compiled) = rig.schema_cache.get(&key) {
+        return Ok(compiled.clone());
+    }
+    let compiled = grammar::json_schema::CompiledSchema::compile(schema)?;
+    const SCHEMA_CACHE_CAP: usize = 8;
+    while rig.schema_cache.len() >= SCHEMA_CACHE_CAP {
+        if let Some(evict) = rig.schema_cache_order.pop_front() {
+            rig.schema_cache.remove(&evict);
+        } else {
+            break;
+        }
+    }
+    rig.schema_cache_order.push_back(key.clone());
+    rig.schema_cache.insert(key, compiled.clone());
+    Ok(compiled)
 }
 
 fn dn_buffers(dn: &DeltaNetState) -> Vec<&GpuTensor> {
@@ -1243,6 +1282,8 @@ impl Rig {
             next_waiter_id: 0,
             tick: 0,
             structured_jump_forward: cfg.structured_jump_forward,
+            schema_cache: std::collections::HashMap::new(),
+            schema_cache_order: std::collections::VecDeque::new(),
         })
     }
 
@@ -2006,6 +2047,23 @@ fn clear_work_slot(work: &mut PendingWork) {
     work.mtp_retire_fails = 0;
 }
 
+/// Release a request's prefix-cache pin on every terminal path (spec §4.4
+/// C4). `lookup_with_pages` pins the matched radix path so eviction cannot
+/// drop it mid-request; the pin must be released exactly once, whether the
+/// request completed, was cancelled, or failed. The session's table refs
+/// (from `share_published_pages`) still protect shared pages while the
+/// session is idle — the pin only guards the in-flight window.
+fn release_pin_ticket(rig: &mut Rig, ticket: &mut PinTicket) {
+    if ticket.is_empty() {
+        return;
+    }
+    if let (Some(idx), Some(domain)) =
+        (rig.prefix_index.as_mut(), rig.cache_domain.as_ref())
+    {
+        idx.release_pin(domain, std::mem::take(ticket));
+    }
+}
+
 /// Rebuild a `SlotBatch`'s flat arrays to exclude rows belonging to failed
 /// slots (spec §5.4/S4: per-slot provision failure isolates the failing
 /// request). The flat arrays (tokens, positions, row_slot, pos3, ext_emb) are
@@ -2198,7 +2256,7 @@ fn publish_generated_prefix(
     }
     let domain = rig.cache_domain.as_ref().unwrap();
     let idx = rig.prefix_index.as_mut().unwrap();
-    let pp = rig.pool.page_pool().unwrap();
+    let pp = rig.pool.page_pool_mut().unwrap();
     // Capture a checkpoint only when the published boundary is exactly the
     // recurrent-state boundary (spec §4.5). A ceiling-refused capture
     // (CheckpointId::NONE) publishes pages without a checkpoint — the
@@ -2318,10 +2376,16 @@ fn commit_sampled_token(
             let _ = send_event(&f.reply, Event::Done { reason, generated });
         }
         // Publish generated-prefix pages at client commit (spec §4.6 C6).
-        // Only for non-cancellation completions; ClientGone unpins instead.
+        // Take the pin ticket out of `f` first: publish needs `slots`
+        // mutably, which `f` borrows.
+        let mut pin_ticket = std::mem::take(&mut f.pin_ticket);
         if !matches!(reason, DoneReason::ClientGone) && rig.prefix_cache {
             publish_generated_prefix(rig, slots, s, work[s].next_pos);
         }
+        // Release the prefix-cache lookup pin on EVERY terminal path —
+        // completion and cancellation alike (spec §4.4 C4). A pin left
+        // held keeps the matched radix path unevictable forever.
+        release_pin_ticket(rig, &mut pin_ticket);
         slots[s] = None;
         // FairQueue: the request is done — drop it so it stops consuming
         // the fairness budget (spec §5.3 S3). Idempotent (NotFound ignored).
@@ -2329,12 +2393,6 @@ fn commit_sampled_token(
         clear_work_slot(&mut work[s]);
         clear_slot_vl_state(rig, s);
         if matches!(reason, DoneReason::ClientGone) {
-            // Cancellation: unpin prefix cache domain pins (spec §4.4).
-            if rig.prefix_cache {
-                if let (Some(idx), Some(domain)) = (rig.prefix_index.as_mut(), rig.cache_domain.as_ref()) {
-                    idx.unpin(domain);
-                }
-            }
             rig.swap.forget(session.0);
             rig.sessions.close(&mut rig.pool, &mut rig.adm, session);
         } else {
@@ -2383,6 +2441,10 @@ struct InFlight {
     /// `SchemaMatcher` cursor (per-request mutable state) is installed
     /// (spec §7.2 G2).
     grammar: Option<GrammarConstraint>,
+    /// Pin on the radix path this request's prefix-cache lookup matched
+    /// (spec §4.4 C4). Empty when prefix_cache is off or the lookup missed.
+    /// Released by [`release_pin_ticket`] on every terminal path.
+    pin_ticket: PinTicket,
 }
 
 /// Per-request grammar constraint state (spec §7 G1/G2).
@@ -2406,6 +2468,15 @@ struct GrammarConstraint {
     /// Reusable mask buffer (vocab-sized bool array), avoiding per-step
     /// allocation.
     mask_buf: Vec<bool>,
+    /// Framing-aware cursor (spec §7.2): while the generation is inside a
+    /// `<think>` span the schema mask is deferred — think tokens are not
+    /// JSON and must not be masked. The matcher only sees tokens emitted
+    /// after `</think>`.
+    in_think: bool,
+    /// Special token ids for the think tags; `None` when the tokenizer has
+    /// no think vocabulary (mask applies from token 0).
+    think_open_id: Option<u32>,
+    think_close_id: Option<u32>,
 }
 
 /// Error from grammar mask construction or application (spec §7.2 G2, A17).
@@ -2459,6 +2530,16 @@ impl GrammarConstraint {
     ) -> Result<&[bool], GrammarMaskError> {
         self.mask_buf.clear();
         self.mask_buf.resize(vocab_size, false);
+        // Framing-aware cursor: inside a think span the schema does not
+        // apply — every non-terminator token is legal. EOS stays masked so
+        // the model cannot end the turn without closing the think span and
+        // producing the schema-conforming answer (spec §7.2).
+        if self.in_think {
+            for id in 0..vocab_size as u32 {
+                self.mask_buf[id as usize] = !tokenizer.is_terminator(id);
+            }
+            return Ok(&self.mask_buf);
+        }
         let accepting = self.matcher.is_accepting();
         for id in 0..vocab_size as u32 {
             // EOS/terminator tokens: allowed only in an accepting state
@@ -2491,6 +2572,26 @@ impl GrammarConstraint {
     /// (spec §7.2 G2: "Never build strict constraints on
     /// replacement-character artifacts").
     fn advance_token(&mut self, tokenizer: &Tokenizer, token: u32) {
+        // Think-span transitions are framing, not JSON content — the tags
+        // themselves never reach the matcher.
+        if Some(token) == self.think_open_id {
+            self.in_think = true;
+            return;
+        }
+        if Some(token) == self.think_close_id {
+            self.in_think = false;
+            return;
+        }
+        if self.in_think {
+            return; // think tokens are not schema content
+        }
+        // Terminators are control tokens, not JSON content — feeding
+        // `<|im_end|>` bytes into the matcher would error an accepted
+        // state (and, while `number_open`, corrupt a still-growable
+        // trailing number).
+        if tokenizer.is_terminator(token) {
+            return;
+        }
         let bytes = tokenizer.token_bytes(token);
         if !bytes.is_empty() {
             self.matcher.advance(bytes);
@@ -2541,13 +2642,14 @@ fn run_loop(
                            work: &mut [PendingWork],
                            reason: String| {
         for (s, f) in slots.iter_mut().enumerate() {
-            if let Some(f) = f.take() {
+            if let Some(mut f) = f.take() {
                 let _ = send_event(
                     &f.reply,
                     Event::Rejected {
                         reason: reason.clone(),
                     },
                 );
+                release_pin_ticket(rig, &mut f.pin_ticket);
                 rig.swap.forget(f.session.0);
                 let sid = f.session;
                 rig.sessions.close(&mut rig.pool, &mut rig.adm, sid);
@@ -2558,6 +2660,17 @@ fn run_loop(
         }
     };
 
+    // Panic containment: a panic inside the serve loop (a radix/pool
+    // internal `unwrap`, an index slip, a kernel-contract violation) must
+    // not kill the engine thread with in-flight requests still holding
+    // slots, pins and admission budget. Catch it, fail every active
+    // request with a typed rejection, and poison the engine so teardown
+    // reports the fault instead of silently wedging.
+    let serve_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+    // Debug-only per-step pool invariant check (spec §9.2): catches page
+    // accounting drift at the step it happens rather than at the next OOM.
+    let check_pool_invariants =
+        std::env::var("HIPFIRE_DEBUG_POOL_INVARIANTS").as_deref() == Ok("1");
     'serve: loop {
         let idle = slots.iter().all(|s| s.is_none());
         if idle && rig.wait_queue.queued_count() == 0 {
@@ -2653,13 +2766,14 @@ fn run_loop(
             match vl_forward_remaining(&mut rig, SlotId(s), &mut work[s], pad) {
                 Ok(tok) => commit_sampled_token(&mut rig, &mut slots, &mut work, s, tok),
                 Err(reason) => {
-                    if let Some(f) = slots[s].take() {
+                    if let Some(mut f) = slots[s].take() {
                         let _ = send_event(
                             &f.reply,
                             Event::Rejected {
                                 reason: reason.clone(),
                             },
                         );
+                        release_pin_ticket(&mut rig, &mut f.pin_ticket);
                         rig.swap.forget(f.session.0);
                         let _ = rig.fair_queue.remove(f.session.0);
                         rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
@@ -2706,13 +2820,14 @@ fn run_loop(
                             mtp_drafts[s] = Some(draft);
                         }
                         Err(reason) => {
-                            if let Some(f) = slots[s].take() {
+                            if let Some(mut f) = slots[s].take() {
                                 let _ = send_event(
                                     &f.reply,
                                     Event::Rejected {
                                         reason: reason.clone(),
                                     },
                                 );
+                                release_pin_ticket(&mut rig, &mut f.pin_ticket);
                                 rig.swap.forget(f.session.0);
                                 let _ = rig.fair_queue.remove(f.session.0);
                                 rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
@@ -2748,10 +2863,11 @@ fn run_loop(
                 let outcome = vision_tower_step(&mut rig, s, &mut job, vl);
                 rig.vl_tower_jobs[s] = job;
                 if let Err(reason) = outcome {
-                    if let Some(f) = slots[s].take() {
+                    if let Some(mut f) = slots[s].take() {
                         let _ = send_event(&f.reply, Event::Rejected {
                             reason: reason.clone(),
                         });
+                        release_pin_ticket(&mut rig, &mut f.pin_ticket);
                         rig.swap.forget(f.session.0);
                         let _ = rig.fair_queue.remove(f.session.0);
                         rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
@@ -2984,8 +3100,9 @@ fn run_loop(
         // Before KV write kernels: plan copy-on-write for each active slot's
         // block table over the write interval. Sealed/CacheOnly pages (shared
         // via prefix cache) are scheduled for copy to private pages; private
-        // pages are a no-op. Always-on — correct even when prefix_cache is
-        // off (no sealed pages exist, so plan_cow returns an empty plan).
+        // pages are a no-op. Paged mode only — in contiguous mode there are
+        // no shared pages to protect and plan_cow would fail closed on every
+        // request.
         let mut cow_plans: Vec<Option<(usize, rdna_compute::page_pool::CowPlan)>> = Vec::with_capacity(n);
         let mut row_offset = 0usize;
         // Per-slot COW provision (spec §5.4/S4): a plan_cow failure for one
@@ -2995,8 +3112,9 @@ fn run_loop(
         let mut failed_slots: Vec<usize> = Vec::new();
         for s in 0..n {
             let m = batch.m_per_slot[s];
-            if m == 0 {
+            if m == 0 || !rig.pool.is_paged() {
                 cow_plans.push(None);
+                row_offset += m;
                 continue;
             }
             let write_start = batch.positions[row_offset] as usize;
@@ -3025,18 +3143,18 @@ fn run_loop(
                 // Abort any COW plan that WAS created for this slot before
                 // the failure (shouldn't happen since plan_cow failed, but
                 // be safe).
-                if let Some((_, p)) = cow_plans.get(s).and_then(|o| o.as_ref()) {
+                if let Some((_, p)) = cow_plans.get_mut(s).and_then(|o| o.take()) {
                     rig.pool.abort_cow_for_slot(p);
                 }
-                cow_plans[s] = None;
                 // Zero the slot's batch rows so the forward does not write
                 // through a slot whose COW plan failed.
                 let m = batch.m_per_slot[s];
                 batch.m_per_slot[s] = 0;
                 let _ = m; // rows are dropped from the flat arrays below
-                if let Some(f) = slots[s].take() {
+                if let Some(mut f) = slots[s].take() {
                     let reason = "COW reservation failed for this slot".to_string();
                     let _ = send_event(&f.reply, Event::Rejected { reason });
+                    release_pin_ticket(&mut rig, &mut f.pin_ticket);
                     rig.swap.forget(f.session.0);
                     let _ = rig.fair_queue.remove(f.session.0);
                     rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
@@ -3102,15 +3220,19 @@ fn run_loop(
         // tables to private copy pages. On forward failure, abort instead.
         match &fwd {
             Ok(()) => {
-                for (s, plan) in cow_plans.iter().flatten() {
-                    if let Err(e) = rig.pool.commit_cow_for_slot(SlotId(*s), plan) {
-                        eprintln!("[cow] commit_cow failed for slot {s}: {e}");
+                for entry in cow_plans.iter_mut() {
+                    if let Some((s, p)) = entry.take() {
+                        if let Err(e) = rig.pool.commit_cow_for_slot(SlotId(s), p) {
+                            eprintln!("[cow] commit_cow failed for slot {s}: {e}");
+                        }
                     }
                 }
             }
             Err(_) => {
-                for (_, plan) in cow_plans.iter().flatten() {
-                    rig.pool.abort_cow_for_slot(plan);
+                for plan in cow_plans.iter_mut() {
+                    if let Some((_, p)) = plan.take() {
+                        rig.pool.abort_cow_for_slot(p);
+                    }
                 }
             }
         }
@@ -3183,7 +3305,7 @@ fn run_loop(
                 if tokens.len() == new_boundary {
                     let domain = rig.cache_domain.as_ref().unwrap();
                     let idx = rig.prefix_index.as_mut().unwrap();
-                    let pp = rig.pool.page_pool().unwrap();
+                    let pp = rig.pool.page_pool_mut().unwrap();
                     // Capture a checkpoint at the boundary — ONLY when the
                     // published boundary is exactly the recurrent-state
                     // boundary (`next_pos`). The live DeltaNetState sits at
@@ -3260,13 +3382,14 @@ fn run_loop(
             // If this invariant were broken, we would need to poison instead.
             let reason = e.to_string();
             for (s, f) in slots.iter_mut().enumerate() {
-                if let Some(f) = f.take() {
+                if let Some(mut f) = f.take() {
                     let _ = send_event(
                         &f.reply,
                         Event::Rejected {
                             reason: reason.clone(),
                         },
                     );
+                    release_pin_ticket(&mut rig, &mut f.pin_ticket);
                     rig.swap.forget(f.session.0);
                     let _ = rig.fair_queue.remove(f.session.0);
                     rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
@@ -3283,6 +3406,11 @@ fn run_loop(
             fail_all_active(&mut rig, &mut slots, &mut work, reason.clone());
             poison = Some(reason);
             break 'serve;
+        }
+        if check_pool_invariants {
+            if let Some(pp) = rig.pool.page_pool() {
+                pp.check_invariants();
+            }
         }
         // Penalty windows: for each slot whose request carries non-neutral
         // token penalties, clamp the requested window to what the session
@@ -3396,8 +3524,9 @@ fn run_loop(
         // parser/sampling failure → fail that request; release its
         // resources at a safe boundary").
         for (s, reason) in grammar_failures {
-            if let Some(f) = slots[s].take() {
+            if let Some(mut f) = slots[s].take() {
                 let _ = send_event(&f.reply, Event::Rejected { reason: reason.clone() });
+                release_pin_ticket(&mut rig, &mut f.pin_ticket);
                 rig.swap.forget(f.session.0);
                 let _ = rig.fair_queue.remove(f.session.0);
                 rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
@@ -3581,13 +3710,14 @@ fn run_loop(
                         }
                     }
                     Err(reason) => {
-                        if let Some(f) = slots[s].take() {
+                        if let Some(mut f) = slots[s].take() {
                             let _ = send_event(
                                 &f.reply,
                                 Event::Rejected {
                                     reason: reason.clone(),
                                 },
                             );
+                            release_pin_ticket(&mut rig, &mut f.pin_ticket);
                             rig.swap.forget(f.session.0);
                             let _ = rig.fair_queue.remove(f.session.0);
                             rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
@@ -3636,13 +3766,14 @@ fn run_loop(
                         }
                     }
                     Err(reason) => {
-                        if let Some(f) = slots[s].take() {
+                        if let Some(mut f) = slots[s].take() {
                             let _ = send_event(
                                 &f.reply,
                                 Event::Rejected {
                                     reason: reason.clone(),
                                 },
                             );
+                            release_pin_ticket(&mut rig, &mut f.pin_ticket);
                             rig.swap.forget(f.session.0);
                             let _ = rig.fair_queue.remove(f.session.0);
                             rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
@@ -3758,22 +3889,11 @@ fn run_loop(
                 } else {
                     let _ = send_event(&f.reply, Event::Done { reason, generated });
                 }
-                // Publish generated-prefix pages at client commit (spec §4.6 C6).
-                if !matches!(reason, DoneReason::ClientGone) && rig.prefix_cache {
-                    publish_generated_prefix(&mut rig, &mut slots, s, work[s].next_pos);
-                }
-                // Release the prefix-cache lookup pins (spec §4.4 C4).
-                // lookup_with_pages pins the radix path so eviction cannot
-                // drop it mid-request; on normal completion the pins must be
-                // released or every successful prefix-cache request leaks a
-                // pin and the pinned path can never be evicted. The session's
-                // table refs (from share_published_pages) still protect the
-                // shared pages from being freed while the session is idle.
-                if rig.prefix_cache {
-                    if let (Some(idx), Some(domain)) = (rig.prefix_index.as_mut(), rig.cache_domain.as_ref()) {
-                        idx.unpin(domain);
-                    }
-                }
+                // Release the prefix-cache lookup pin on EVERY terminal
+                // path — completion and cancellation alike (spec §4.4 C4).
+                // The session's table refs (from share_published_pages)
+                // still protect the shared pages while the session is idle.
+                release_pin_ticket(&mut rig, &mut f.pin_ticket);
                 // Hand the slot back — the session stays resident for
                 // continuation, but slot occupancy must end at terminal
                 // (matching commit_sampled_token). Wave 8's unpin edit
@@ -3785,18 +3905,11 @@ fn run_loop(
                 clear_work_slot(&mut work[s]);
                 clear_slot_vl_state(&mut rig, s);
                 if matches!(reason, DoneReason::ClientGone) {
-                    // Cancellation: unpin prefix cache domain pins (spec §4.4).
-                    if rig.prefix_cache {
-                        if let (Some(idx), Some(domain)) = (rig.prefix_index.as_mut(), rig.cache_domain.as_ref()) {
-                            idx.unpin(domain);
-                        }
-                    }
                     // Nobody will follow up on a vanished client, so hand the
                     // slot back at once.
                     rig.swap.forget(session.0);
                     rig.sessions.close(&mut rig.pool, &mut rig.adm, session);
                 } else {
-                    // Keep the session RESIDENT but idle. Its KV and recurrent
                     // state are exactly what a follow-up turn continuing this
                     // conversation needs; closing here is what made multi-turn
                     // reuse impossible. LRU eviction reclaims the slot when
@@ -3811,6 +3924,16 @@ fn run_loop(
                 rig.sessions.touch(session);
             }
         }
+    }
+    }));
+    if let Err(payload) = serve_result {
+        let msg = payload
+            .downcast_ref::<&str>()
+            .map(|s| s.to_string())
+            .or_else(|| payload.downcast_ref::<String>().cloned())
+            .unwrap_or_else(|| "unknown panic".to_string());
+        poison = Some(format!("engine panic: {msg}"));
+        eprintln!("[serve] panic in engine loop — failing all in-flight: {msg}");
     }
 
     // Shutdown/drain: if channel closed or poisoned while slots remain, fail them.
@@ -3875,7 +3998,8 @@ fn handle_command(
                 .iter()
                 .position(|s| s.as_ref().map(|f| f.session == sid).unwrap_or(false))
             {
-                if let Some(inflight) = slots[idx].take() {
+                if let Some(mut inflight) = slots[idx].take() {
+                    release_pin_ticket(rig, &mut inflight.pin_ticket);
                     drop(inflight.reply);
                 }
                 clear_work_slot(&mut work[idx]);
@@ -4211,6 +4335,87 @@ fn admit(
                     let _ = send_event(&req.reply, Event::Rejected { reason });
                     return;
                 }
+                // Page-demand reclaim (spec §5.4 S4 row 3), mirroring the
+                // cold-admit path: the suffix plus generation budget must be
+                // backable by the pool BEFORE begin_turn mutates the table —
+                // otherwise the forward dies mid-prefill on "need N more
+                // pages". Evict radix leaves first, then LRU idle sessions;
+                // the matched session itself is never a victim.
+                if rig.pool.is_paged() {
+                    let held = rig
+                        .sessions
+                        .get(existing)
+                        .map(|s| s.next_pos)
+                        .unwrap_or(0);
+                    let needed_pages = extended
+                        .len()
+                        .saturating_sub(held)
+                        .saturating_add(req.max_tokens.max(1))
+                        .div_ceil(PAGE_TOKENS)
+                        .saturating_add(1);
+                    if let (Some(idx), Some(domain)) =
+                        (rig.prefix_index.as_mut(), rig.cache_domain.as_ref())
+                    {
+                        let free = rig
+                            .pool
+                            .page_pool()
+                            .map(|pp| pp.free_pages())
+                            .unwrap_or(0);
+                        if free < needed_pages {
+                            let page_bytes = rig
+                                .pool
+                                .page_pool()
+                                .map(|pp| pp.k_page_bytes() + pp.v_page_bytes())
+                                .unwrap_or(0);
+                            let pp = rig.pool.page_pool_mut().expect("paged pool");
+                            idx.evict_unpinned_leaves(
+                                pp,
+                                needed_pages.saturating_sub(free) * page_bytes,
+                            );
+                        }
+                        let _ = domain;
+                    }
+                    let mut exclude: Vec<SessionId> = busy.clone();
+                    exclude.push(existing);
+                    loop {
+                        let free = rig
+                            .pool
+                            .page_pool()
+                            .map(|pp| pp.free_pages())
+                            .unwrap_or(0);
+                        if free >= needed_pages {
+                            break;
+                        }
+                        let Some(victim) = rig.sessions.lru_idle_victim(&exclude) else {
+                            break;
+                        };
+                        if !evict(rig, victim) {
+                            break;
+                        }
+                        stats.lock().expect("stats").note_eviction();
+                    }
+                    let free = rig
+                        .pool
+                        .page_pool()
+                        .map(|pp| pp.free_pages())
+                        .unwrap_or(0);
+                    if free < needed_pages {
+                        // Keep the session resident — a smaller retry can
+                        // still continue it; only this request is refused.
+                        let _ = send_event(
+                            &req.reply,
+                            Event::Rejected {
+                                reason: format!(
+                                    "page demand exceeds pool: need \
+                                     {needed_pages} pages, {free} free \
+                                     after reclaim"
+                                ),
+                            },
+                        );
+                        stats.lock().expect("stats").note_rejected();
+                        return;
+                    }
+                }
                 // Compile the JSON Schema BEFORE any session mutation (spec
                 // §7 G1/G2; P4 exit "strict requests never silently
                 // unconstrained"). A compile failure rejects the request and
@@ -4219,13 +4424,20 @@ fn admit(
                 // gate and the engine's compiler.
                 let grammar_constraint = match req.json_schema.as_ref() {
                     Some(schema) => {
-                        match grammar::json_schema::CompiledSchema::compile(schema) {
+                        match cached_compile_schema(rig, schema) {
                             Ok(compiled) => Some(GrammarConstraint {
                                 matcher:
                                     grammar::json_schema::SchemaMatcher::from_compiled(
                                         &compiled,
                                     ),
                                 mask_buf: Vec::new(),
+                                in_think: req.started_in_think,
+                                think_open_id: rig
+                                    .tokenizer
+                                    .special_token_id("<think>"),
+                                think_close_id: rig
+                                    .tokenizer
+                                    .special_token_id("</think>"),
                             }),
                             Err(e) => {
                                 let _ = send_event(
@@ -4243,7 +4455,8 @@ fn admit(
                     }
                     None => None,
                 };
-                if let Ok(plan) = rig.sessions.begin_turn(&mut rig.pool, existing, &extended) {
+                match rig.sessions.begin_turn(&mut rig.pool, existing, &extended) {
+                    Ok(plan) => {
                     if let Some(sess) = rig.sessions.get_mut(existing) {
                         sess.tokens = extended.clone();
                         sess.convo = req.convo.clone();
@@ -4311,6 +4524,9 @@ fn admit(
                         reused_tokens: plan.reused,
                         last_published_boundary: 0,
                         grammar: grammar_constraint,
+                        // Continuation reuse is session-local (convo hash),
+                        // not a radix lookup — no pin to hold.
+                        pin_ticket: PinTicket::none(),
                     });
                     rig.sessions.touch(existing);
                     if rig.gpu.slot_trace() {
@@ -4329,6 +4545,25 @@ fn admit(
                     st.note_admitted();
                     st.note_prefix_hit();
                     return;
+                    }
+                    Err(e) => {
+                        // The session was restored onto a slot (or was
+                        // already resident) but its turn cannot begin —
+                        // falling through to the cold-admit path would let
+                        // lru_idle_victim close the just-restored session
+                        // (it holds a slot but is not in `busy`) and
+                        // double-occupy the slot. Reject and close instead.
+                        let _ = send_event(
+                            &req.reply,
+                            Event::Rejected {
+                                reason: format!("continuation begin_turn failed: {e}"),
+                            },
+                        );
+                        rig.swap.forget(existing.0);
+                        rig.sessions.close(&mut rig.pool, &mut rig.adm, existing);
+                        stats.lock().expect("stats").note_rejected();
+                        return;
+                    }
                 }
             }
         }
@@ -4486,10 +4721,14 @@ fn admit(
     // requests skip the radix entirely (spec X2: Vision+prefix reuse OFF).
     let mut prefix_reused: usize = 0;
     let mut prefix_hit = false;
+    // The lookup's pin on the matched radix path. Held until the request
+    // terminates (released by release_pin_ticket on every exit path) or
+    // released immediately below when the hit does not convert.
+    let mut pin_ticket = PinTicket::none();
     if should_lookup_prefix(rig.prefix_cache, req.visual_data.is_some()) {
         rig.lookup_count += 1;
         let domain = rig.cache_domain.as_ref().unwrap();
-        let (lookup_result, hit_handles) = {
+        let (lookup_result, hit_handles, ticket) = {
             let pp = rig
                 .pool
                 .page_pool()
@@ -4499,8 +4738,9 @@ fn admit(
                 .unwrap()
                 .lookup_with_pages(domain, &req.prompt_tokens, pp, None)
         };
+        pin_ticket = ticket;
         if let PrefixLookupResult::Hit(lookup) = &lookup_result {
-            let ckpt_pool = rig.checkpoint_pool.as_ref().unwrap();
+            let ckpt_pool = rig.checkpoint_pool.as_mut().unwrap();
             // Truthful drafter decision (spec §4.5, made before execution):
             // there is no drafter checkpoint in the pool, so a resumed
             // request that will run MTP brings the head up via the existing
@@ -4574,18 +4814,20 @@ fn admit(
                             }
                         }
                     }
+                    // The plan pinned this boundary against eviction; the
+                    // restore attempt is over (or was skipped) either way,
+                    // so release it on every Ok(plan) exit path.
+                    if plan.boundary > 0 {
+                        ckpt_pool.unpin(domain, plan.boundary);
+                    }
                 }
                 Err(_) => {} // No checkpoint at any boundary: cold prefill
             }
         }
-        // Unpin on miss — lookup pins the radix path; a miss means we
-        // won't use those pages, so release the pins to allow eviction.
+        // Release the pin when the hit did not convert — a miss means we
+        // won't use those pages, so the path must be evictable again.
         if !prefix_hit {
-            if let (Some(idx), Some(domain)) =
-                (rig.prefix_index.as_mut(), rig.cache_domain.as_ref())
-            {
-                idx.unpin(domain);
-            }
+            release_pin_ticket(rig, &mut pin_ticket);
         }
     }
 
@@ -4623,6 +4865,60 @@ fn admit(
                     evicted.len()
                 );
             }
+        }
+    }
+
+    // ── Idle-session reclaim under page pressure (spec §5.4 S4 row 3) ──
+    // Radix-leaf eviction only frees cache-only pages. Pages held by idle
+    // resident sessions' table refs are neither free nor radix-evictable,
+    // so a shortfall here means the forward WILL fail mid-prefill with
+    // "need N more pages". Evict LRU idle sessions (snapshot to swap, or
+    // cold on snapshot failure) until the demand is backed; if no victim
+    // remains, reject at admit instead of letting the forward die.
+    if rig.pool.is_paged() {
+        let suffix_tokens = req.prompt_tokens.len().saturating_sub(prefix_reused);
+        let needed_pages = suffix_tokens
+            .saturating_add(req.max_tokens.max(1))
+            .div_ceil(PAGE_TOKENS)
+            .saturating_add(1);
+        // The just-opened session holds a slot but is not in `busy` —
+        // exclude it explicitly so it is never its own eviction victim.
+        let mut exclude: Vec<SessionId> = busy.clone();
+        exclude.push(id);
+        loop {
+            let free = rig.pool.page_pool().map(|pp| pp.free_pages()).unwrap_or(0);
+            if free >= needed_pages {
+                break;
+            }
+            let Some(victim) = rig.sessions.lru_idle_victim(&exclude) else {
+                break;
+            };
+            if !evict(rig, victim) {
+                break;
+            }
+            stats.lock().expect("stats").note_eviction();
+            if rig.gpu.slot_trace() {
+                eprintln!(
+                    "[slot-trace] evicted idle session {victim:?} for page demand \
+                     ({free} free < {needed_pages} needed)"
+                );
+            }
+        }
+        let free = rig.pool.page_pool().map(|pp| pp.free_pages()).unwrap_or(0);
+        if free < needed_pages {
+            let _ = send_event(
+                &req.reply,
+                Event::Rejected {
+                    reason: format!(
+                        "page demand exceeds pool: need {needed_pages} pages, \
+                         {free} free after reclaim"
+                    ),
+                },
+            );
+            release_pin_ticket(rig, &mut pin_ticket);
+            rig.sessions.close(&mut rig.pool, &mut rig.adm, id);
+            stats.lock().expect("stats").note_rejected();
+            return;
         }
     }
 
@@ -4672,6 +4968,9 @@ fn admit(
     )
     .is_err()
     {
+        // A prefix hit still holds its PinTicket — release it before
+        // closing so the path does not pin the radix forever.
+        release_pin_ticket(rig, &mut pin_ticket);
         rig.sessions.close(&mut rig.pool, &mut rig.adm, id);
         return;
     }
@@ -4697,10 +4996,13 @@ fn admit(
     // mutable cursor. CompiledSchema is immutable and Send+Sync; the
     // SchemaMatcher is request-local mutable state (spec §7.2 G2).
     let grammar_constraint = req.json_schema.as_ref().and_then(|schema| {
-        match grammar::json_schema::CompiledSchema::compile(schema) {
+        match cached_compile_schema(rig, schema) {
             Ok(compiled) => Some(GrammarConstraint {
                 matcher: grammar::json_schema::SchemaMatcher::from_compiled(&compiled),
                 mask_buf: Vec::new(),
+                in_think: req.started_in_think,
+                think_open_id: rig.tokenizer.special_token_id("<think>"),
+                think_close_id: rig.tokenizer.special_token_id("</think>"),
             }),
             Err(e) => {
                 // Should not happen (validated at submit), but fail closed.
@@ -4710,6 +5012,7 @@ fn admit(
                         reason: format!("json_schema compile failed on admit: {e}"),
                     },
                 );
+                release_pin_ticket(rig, &mut pin_ticket);
                 rig.sessions.close(&mut rig.pool, &mut rig.adm, id);
                 stats.lock().expect("stats").note_rejected();
                 return None;
@@ -4779,6 +5082,7 @@ fn admit(
         reused_tokens: if prefix_hit { prefix_reused } else { 0 },
         last_published_boundary: reused,
         grammar: grammar_constraint,
+        pin_ticket,
     });
     if rig.gpu.slot_trace() {
         eprintln!(

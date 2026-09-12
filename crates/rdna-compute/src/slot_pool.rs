@@ -557,7 +557,7 @@ impl SlotPool {
     pub fn commit_cow_for_slot(
         &mut self,
         slot: SlotId,
-        plan: &crate::page_pool::CowPlan,
+        plan: crate::page_pool::CowPlan,
     ) -> Result<(), String> {
         let pool = self
             .page_pool
@@ -576,7 +576,7 @@ impl SlotPool {
 
     /// Abort a COW plan: releases the reserved private pages without
     /// mutating the block table.
-    pub fn abort_cow_for_slot(&mut self, plan: &crate::page_pool::CowPlan) {
+    pub fn abort_cow_for_slot(&mut self, plan: crate::page_pool::CowPlan) {
         if let Some(pool) = self.page_pool.as_mut() {
             pool.abort_cow(plan);
         }

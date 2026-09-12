@@ -109,7 +109,8 @@ fn main() {
                 min_p: 0.0,
                 visual_data: None,
                 json_schema: None,
-                queue_bytes: 0,
+                started_in_think: false,
+        queue_bytes: 0,
                 reply: tx,
             })
             .expect("submit");
