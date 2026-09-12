@@ -81,7 +81,11 @@ pub struct SubmitRequest {
     /// compiled at `validate_generate_caps` before submit; the engine
     /// recompiles on admit to build the per-request cursor.
     pub json_schema: Option<serde_json::Value>,
-    /// Canonical pending-input bytes charged to the HTTP admission queue
+    /// Whether the assistant turn opened inside a `<think>` span (spec §7.2
+    /// framing-aware grammar cursor). When true and `json_schema` is set,
+    /// the grammar mask is deferred until `</think>` is emitted — the think
+    /// preamble is not JSON and must not be masked by the schema.
+    pub started_in_think: bool,
     /// (spec §5.3). The unified permit carries this from HTTP through daemon
     /// to slots so bytes are charged once and released exactly once. Zero
     /// when the request did not pass through the byte-bounded queue.

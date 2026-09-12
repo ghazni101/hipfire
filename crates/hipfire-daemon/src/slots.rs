@@ -1200,6 +1200,7 @@ impl SlotBackend {
             min_p,
             visual_data,
             json_schema,
+            started_in_think,
             // Canonical pending-input bytes (spec §5.3): the engine's wait
             // queue charges its byte cap against this, so daemon-side
             // waiters must carry the real prompt weight — a hardcoded 0
@@ -1940,30 +1941,39 @@ pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
                 .to_string(),
         );
     }
+    // Fields the wire accepts but the engine never reads must be refused,
+    // not silently dropped: `n: 2` returning one completion is a silent
+    // semantic downgrade (spec §7.1).
+    if msg.get("n").and_then(|v| v.as_u64()).is_some_and(|n| n != 1) {
+        return Some("n != 1 not supported in experimental multi-slot".to_string());
+    }
+    if msg.get("best_of").is_some_and(|v| !v.is_null()) {
+        return Some("best_of not supported in experimental multi-slot".to_string());
+    }
+    if msg.get("logit_bias").is_some_and(|v| !v.is_null()) {
+        return Some("logit_bias not supported in experimental multi-slot".to_string());
+    }
+    if msg.get("echo").and_then(|v| v.as_bool()) == Some(true) {
+        return Some("echo not supported in experimental multi-slot".to_string());
+    }
+    if msg.get("suffix").is_some_and(|v| !v.is_null()) {
+        return Some("suffix not supported in experimental multi-slot".to_string());
+    }
     None
 }
 
 // ── Message projection (pure) ────────────────────────────────────────────────
 
-/// Canonical pending-input byte weight for a generate request (spec §5.3):
-/// the sum of user-visible text the request carries — every message
-/// content plus a bare `prompt` fallback. This is the byte charge the
-/// engine's bounded wait queue sees; it is a floor, not an upper bound
-/// (template framing and image bytes are additive on the wire but a
-/// monotone prompt-derived charge is what the queue bound needs).
+/// Canonical pending-input bytes charged to the admission queue (spec §5.3).
+///
+/// Charges the FULL serialized request, not just the prompt text: a large
+/// `response_format.json_schema.schema`, `logit_bias` map, or `suffix`
+/// payload otherwise bypasses the waiting-room byte cap entirely while
+/// still occupying the same queue slot and memory.
 pub fn canonical_prompt_bytes(msg: &serde_json::Value) -> u64 {
-    let mut total: u64 = 0;
-    if let Some(arr) = msg.get("messages").and_then(|v| v.as_array()) {
-        for m in arr {
-            if let Some(text) = m.get("content").and_then(|v| v.as_str()) {
-                total = total.saturating_add(text.len() as u64);
-            }
-        }
-    }
-    if let Some(prompt) = msg.get("prompt").and_then(|v| v.as_str()) {
-        total = total.saturating_add(prompt.len() as u64);
-    }
-    total
+    serde_json::to_vec(msg)
+        .map(|v| v.len() as u64)
+        .unwrap_or(u64::MAX)
 }
 
 /// FNV-1a 64 hash of user turn text.

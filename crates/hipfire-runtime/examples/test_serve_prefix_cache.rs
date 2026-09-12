@@ -190,7 +190,8 @@ fn main() {
                 min_p: 0.0,
                 visual_data: None,
                 json_schema: spec.json_schema.clone(),
-                queue_bytes: 0,
+                started_in_think: false,
+        queue_bytes: 0,
                 reply: tx,
             })
             .expect("submit");
@@ -271,7 +272,8 @@ fn main() {
                 min_p: 0.0,
                 visual_data: None,
                 json_schema: None,
-                queue_bytes: 0,
+                started_in_think: false,
+        queue_bytes: 0,
                 reply: tx,
             })
             .expect("faulted submit");
@@ -342,6 +344,158 @@ fn main() {
             "post-fault recovery must match the reference exactly"
         );
         println!("PASS (A19 fault-hip {class})");
+        return;
+    }
+
+    // ── A20 swap/spill mode: model-swap respawn + idle spill/restore ────
+    // Spec §5.4 A20: "repeated model swap, cache on/off, idle
+    // spill/restore, repeated long soak — bounded plateau after warmup,
+    // correct reset, no monotonic resource leak or stale state". The soak
+    // and reset halves live in the default flow below; this mode covers
+    // the two missing pieces:
+    //   * MODEL SWAP: shutdown + respawn must rebuild a working engine
+    //     whose cache starts cold and re-warms correctly, repeatedly.
+    //   * IDLE SPILL/RESTORE: an idle session evicted under slot pressure
+    //     must come back through the swap-restore path with its stored
+    //     prefix intact (reused >= prompt), not silently re-prefill.
+    if std::env::args().any(|a| a == "--a20") {
+        println!("--- A20 swap/spill mode ---");
+
+        // Spill/restore on the live engine. Two slots: S and T fill them,
+        // a third cold request forces the LRU idle session (S) out to
+        // swap; a named reentry on S must restore it.
+        let submit_turn = |continuation: Continuation,
+                           convo: Vec<u64>|
+         -> (u64, usize, Vec<u32>) {
+            let (tx, rx) = channel::<Event>();
+            engine
+                .submit(SubmitRequest {
+                    prompt_tokens: italy.clone(),
+                    convo,
+                    continuation,
+                    max_tokens: 8,
+                    temperature: 0.0,
+                    top_p: 1.0,
+                    top_k: 0,
+                    seed: 0,
+                    repeat_window: 0,
+                    repeat_penalty: 1.0,
+                    presence_penalty: 0.0,
+                    frequency_penalty: 0.0,
+                    min_p: 0.0,
+                    visual_data: None,
+                    json_schema: None,
+                    started_in_think: false,
+                    queue_bytes: 0,
+                    reply: tx,
+                })
+                .expect("a20 submit");
+            let (mut session, mut reused) = (u64::MAX, 0usize);
+            let mut tokens = Vec::new();
+            while let Ok(ev) = rx.recv() {
+                match ev {
+                    Event::Accepted {
+                        session: s,
+                        reused: r,
+                        ..
+                    } => {
+                        session = s;
+                        reused = r;
+                    }
+                    Event::Token { id } => tokens.push(id),
+                    Event::Done { .. } => break,
+                    Event::Rejected { reason } => panic!("a20 rejected: {reason}"),
+                }
+            }
+            assert_ne!(session, u64::MAX, "engine never accepted");
+            (session, reused, tokens)
+        };
+
+        let convo_a = vec![0xA20u64];
+        let convo_b = vec![0xB20u64];
+        let convo_c = vec![0xC20u64];
+        let (sess_a, _, toks_a) = submit_turn(Continuation::Cold, convo_a.clone());
+        let (_sess_b, _, _) = submit_turn(Continuation::Cold, convo_b.clone());
+        // Third cold request: both slots busy-idle -> LRU victim (sess_a)
+        // spills to swap.
+        let (_sess_c, _, _) = submit_turn(Continuation::Cold, convo_c.clone());
+        let evictions = engine.stats().evictions;
+        assert!(evictions >= 1, "slot pressure must have spilled a session");
+        // Named reentry on the spilled session: restore path must bring it
+        // back with its stored prefix (reused >= prompt length).
+        let suffix = tokenizer.encode(" And the capital of Italy is");
+        let (restored, reused_r, toks_r) = submit_turn(
+            Continuation::ToolResults {
+                tokens: suffix,
+                session: sess_a,
+            },
+            convo_a.clone(),
+        );
+        let restores = engine.stats().restores;
+        assert_eq!(restored, sess_a, "reentry must land on session A");
+        assert!(
+            restores >= 1,
+            "the spilled session must have been restored, not re-prefilled"
+        );
+        assert!(
+            reused_r >= italy.len(),
+            "restored session must reuse its stored prefix ({reused_r} < {})",
+            italy.len()
+        );
+        assert_eq!(
+            toks_r.len(),
+            toks_a.len(),
+            "restored turn must generate the full budget"
+        );
+        println!(
+            "  spill/restore: evictions={evictions} restores={restores} \
+             reused={reused_r}/{}",
+            italy.len()
+        );
+
+        // Model swap: shutdown + respawn, twice. Each fresh engine must
+        // cold-start (reused=0) then re-warm (reused=256) — proving cache
+        // state does not leak across engine lifetimes and teardown frees
+        // the pool completely.
+        let cfg = EngineConfig {
+            model_path: PathBuf::from(&model_path),
+            n_slots: 2,
+            cap_tokens: 2048,
+            prefill_chunk: 256,
+            host_budget_bytes: 4 * 1024 * 1024 * 1024,
+            swap_dir: std::env::temp_dir().join("hipfire-prefix-cache-swap"),
+            is_vl: false,
+            vl_path: None,
+            mtp_k,
+            kv_mode_raw: String::new(),
+            prefix_cache: true,
+            prefix_cache_max_bytes: 256 * 1024 * 1024,
+            max_batch_tokens: 4096,
+            prefill_min_tokens: 1,
+            wait_max_count: 64,
+            wait_max_bytes: 256 * 1024 * 1024,
+            wait_timeout_ticks: 30_000,
+            structured_jump_forward: false,
+        };
+        engine.shutdown().expect("a20 shutdown");
+        for cycle in 0..2 {
+            let fresh = SlotEngine::spawn(cfg.clone()).expect("a20 respawn");
+            let (r_cold, t_cold) = run(&fresh, italy.clone(), &greedy);
+            assert_eq!(r_cold, 0, "swap cycle {cycle}: fresh engine must be cold");
+            let (r_warm, t_warm) = run(&fresh, italy.clone(), &greedy);
+            assert_eq!(
+                r_warm, 256,
+                "swap cycle {cycle}: re-warm must hit the full prefix"
+            );
+            assert_eq!(t_warm, t_cold, "swap cycle {cycle}: output drift");
+            println!(
+                "  swap cycle {cycle}: cold reused=0, warm reused={r_warm}, \
+                 free_pages={}",
+                fresh.stats().pool_free_pages
+            );
+            fresh.shutdown().expect("a20 cycle shutdown");
+        }
+        println!("PASS (A20 swap/spill)");
         return;
     }
 
@@ -535,7 +689,8 @@ fn main() {
             min_p: 0.0,
             visual_data: None,
             json_schema: None,
-            queue_bytes: 0,
+            started_in_think: false,
+        queue_bytes: 0,
             reply: tx_long,
         })
         .expect("submit long");
@@ -574,34 +729,78 @@ fn main() {
         v.extend(tokenizer.encode("It only needs a page or two of KV."));
         v
     };
-    let specs: Vec<(Vec<u32>, Option<Vec<u32>>)> = vec![
-        (italy.clone(), Some(toks_italy_1.clone())),
-        (italy.clone(), Some(toks_italy_1.clone())),
-        (atl_short.clone(), Some(toks_short.clone())),
-        (small_cold, None),
+    // Spec §5.4 A13 asks for *mixed samplers* and *per-request wait-bound*
+    // assertions on top of the exactness check: a sampled request and a
+    // penalized request join the two greedy warm hits, each on its own
+    // convo domain, and every request must individually complete inside
+    // the wait bound — a parked loser that never drains is a starvation
+    // bug the aggregate wall-clock would hide.
+    const WAIT_BOUND: std::time::Duration = std::time::Duration::from_secs(120);
+    struct Adversarial {
+        prompt: Vec<u32>,
+        convo: Vec<u64>,
+        temperature: f32,
+        seed: u32,
+        repeat_penalty: f32,
+        expect: Option<Vec<u32>>,
+    }
+    let specs: Vec<Adversarial> = vec![
+        Adversarial {
+            prompt: italy.clone(),
+            convo: vec![0xA13_1],
+            temperature: 0.0,
+            seed: 0,
+            repeat_penalty: 1.0,
+            expect: Some(toks_italy_1.clone()),
+        },
+        Adversarial {
+            prompt: italy.clone(),
+            convo: vec![0xA13_2],
+            temperature: 0.0,
+            seed: 0,
+            repeat_penalty: 1.0,
+            expect: Some(toks_italy_1.clone()),
+        },
+        Adversarial {
+            prompt: atl_short.clone(),
+            convo: vec![0xA13_3],
+            temperature: 0.8,
+            seed: 7,
+            repeat_penalty: 1.0,
+            expect: None,
+        },
+        Adversarial {
+            prompt: small_cold,
+            convo: vec![0xA13_4],
+            temperature: 0.0,
+            seed: 0,
+            repeat_penalty: 1.15,
+            expect: None,
+        },
     ];
     let t0 = std::time::Instant::now();
     let rxs: Vec<std::sync::mpsc::Receiver<Event>> = specs
         .iter()
-        .map(|(prompt, _)| {
+        .map(|s| {
             let (tx, rx) = channel::<Event>();
             engine
                 .submit(SubmitRequest {
-                    prompt_tokens: prompt.clone(),
-                    convo: Vec::new(),
+                    prompt_tokens: s.prompt.clone(),
+                    convo: s.convo.clone(),
                     continuation: Continuation::Cold,
                     max_tokens: 8,
-                    temperature: 0.0,
+                    temperature: s.temperature,
                     top_p: 1.0,
                     top_k: 0,
-                    seed: 0,
+                    seed: s.seed,
                     repeat_window: 0,
-                    repeat_penalty: 1.0,
+                    repeat_penalty: s.repeat_penalty,
                     presence_penalty: 0.0,
                     frequency_penalty: 0.0,
                     min_p: 0.0,
                     visual_data: None,
                     json_schema: None,
+                    started_in_think: false,
                     queue_bytes: 0,
                     reply: tx,
                 })
@@ -612,8 +811,9 @@ fn main() {
     let handles: Vec<_> = rxs
         .into_iter()
         .zip(specs)
-        .map(|(rx, (_, expect))| {
+        .map(|(rx, s)| {
             std::thread::spawn(move || {
+                let start = std::time::Instant::now();
                 let mut reused = 0usize;
                 let mut tokens = Vec::new();
                 while let Ok(ev) = rx.recv() {
@@ -626,28 +826,29 @@ fn main() {
                         Event::Done { .. } => break,
                     }
                 }
-                (reused, tokens, expect)
+                (reused, tokens, s.expect, start.elapsed())
             })
         })
         .collect();
-    for h in handles {
-        let (reused, tokens, expect) = h.join().expect("concurrent thread");
-        assert!(!tokens.is_empty(), "concurrent request produced no tokens");
+    for (i, h) in handles.into_iter().enumerate() {
+        let (reused, tokens, expect, elapsed) = h.join().expect("concurrent thread");
+        assert!(!tokens.is_empty(), "concurrent request {i} produced no tokens");
+        assert!(
+            elapsed < WAIT_BOUND,
+            "request {i} exceeded the per-request wait bound ({elapsed:?} >= {WAIT_BOUND:?})"
+        );
         if let Some(expect) = expect {
             assert_eq!(
                 tokens, expect,
-                "concurrent warm request must replay the exact reference tokens"
+                "concurrent warm request {i} must replay the exact reference tokens"
             );
         }
         let _ = reused;
     }
     println!(
-        "  A13 concurrent: 4 requests (3 warm + 1 cold) all exact in {:?}",
+        "  A13 concurrent: 4 requests (2 greedy + sampled + penalized, \
+         distinct convos) all exact in {:?}",
         t0.elapsed()
-    );
-    assert!(
-        t0.elapsed() < std::time::Duration::from_secs(120),
-        "concurrent phase must complete within the wait bound"
     );
 
     // A20: repeated warm hits stay bounded, then reset forces a cold miss.

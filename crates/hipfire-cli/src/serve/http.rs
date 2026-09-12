@@ -1177,6 +1177,9 @@ pub(crate) struct StreamBackpressure {
     stall_started: Option<Instant>,
     /// Whether the consumer is currently stalled (pending bytes ≥ buffer).
     stalled: bool,
+    /// Client-disconnect flag: a stalled send loop must wake on cancel,
+    /// not sleep to the deadline while the consumer is already gone.
+    cancelled: Option<Arc<AtomicBool>>,
 }
 
 /// How long a Full-channel retry sleeps before re-checking pending bytes.
@@ -1197,7 +1200,15 @@ impl StreamBackpressure {
             stall_timeout,
             stall_started: None,
             stalled: false,
+            cancelled: None,
         }
+    }
+
+    /// Attach the request's cancellation flag so a stalled send loop
+    /// wakes on client disconnect instead of sleeping to the deadline.
+    pub(crate) fn with_cancelled(mut self, cancelled: Arc<AtomicBool>) -> Self {
+        self.cancelled = Some(cancelled);
+        self
     }
 
     /// Whether the consumer is currently stalled (spec §5.4). The engine
@@ -1236,6 +1247,11 @@ impl StreamBackpressure {
                 if self.stall_started.is_none() {
                     self.stall_started = Some(Instant::now());
                 }
+                // A cancelled request's consumer is gone: abort now rather
+                // than sleeping to the deadline.
+                if self.cancelled.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) {
+                    return Err(StreamStallError);
+                }
                 if Instant::now() >= deadline {
                     return Err(StreamStallError);
                 }
@@ -1262,6 +1278,10 @@ impl StreamBackpressure {
                     self.stalled = true;
                     if self.stall_started.is_none() {
                         self.stall_started = Some(Instant::now());
+                    }
+                    if self.cancelled.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) {
+                        drop(returned);
+                        return Err(StreamStallError);
                     }
                     if Instant::now() >= deadline {
                         drop(returned);
@@ -1330,12 +1350,9 @@ async fn handle_streaming(
     // byte bound — real bytes, not an estimate). Created BEFORE the role
     // chunk so the pre-forwarder insertion is counted too — an uncounted
     // chunk would be subtracted on poll and wrap the counter, tripping the
-    // byte bound on every subsequent send.
+    // byte bound. `bp_pending` is created before the role chunk for the
+    // same reason.
     let pending_bytes = Arc::new(AtomicU64::new(0));
-    let first_chunk = ResponseChunk::plain(sse_data(&first));
-    pending_bytes.fetch_add(first_chunk.bytes.len() as u64, Ordering::Relaxed);
-    let _ = tx.try_send(first_chunk);
-
     let bp_pending = Arc::clone(&pending_bytes);
 
     let tx_clone = tx.clone();
@@ -1350,12 +1367,15 @@ async fn handle_streaming(
         // producing for a stalled consumer at the byte bound and aborts after
         // the timeout. Committed state is retained; the guard only pauses the
         // forwarder. The engine-side scheduling skip is wired in Wave 4.
-        let backpressure = std::cell::RefCell::new(StreamBackpressure::new(
-            tx_clone.clone(),
-            bp_pending,
-            stream_buffer_bytes,
-            stream_stall_timeout,
-        ));
+        let backpressure = std::cell::RefCell::new(
+            StreamBackpressure::new(
+                tx_clone.clone(),
+                bp_pending,
+                stream_buffer_bytes,
+                stream_stall_timeout,
+            )
+            .with_cancelled(Arc::clone(&cancelled)),
+        );
         let result = complete_request_cancellable(
             &shared_clone,
             &body,

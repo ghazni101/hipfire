@@ -45,8 +45,10 @@ impl std::fmt::Display for AdmitError {
 pub struct AdmissionController {
     footprint: ModelFootprint,
     budget_bytes: u64,
-    /// Granted context per admitted session, in tokens.
-    admitted: Vec<usize>,
+    /// Granted context per admitted session, keyed by session id so two
+    /// sessions with identical context sizes cannot release each other's
+    /// budget.
+    admitted: Vec<(u64, usize)>,
     /// Host-tier budget for swapped-out snapshots. Separate from the VRAM
     /// budget: admission is the production memory gate for BOTH, because the
     /// control group does not contain amdgpu GTT.
@@ -75,7 +77,7 @@ impl AdmissionController {
         let kv: u64 = self
             .admitted
             .iter()
-            .map(|&ctx| (ctx as u64).checked_mul(self.footprint.kv_bytes_per_token).unwrap_or(u64::MAX))
+            .map(|&(_, ctx)| (ctx as u64).checked_mul(self.footprint.kv_bytes_per_token).unwrap_or(u64::MAX))
             .fold(0u64, |a, b| a.saturating_add(b));
         self.footprint.weights_bytes.saturating_add(kv)
     }
@@ -84,7 +86,7 @@ impl AdmissionController {
     ///
     /// Rejects rather than silently capping: a caller that asked for 128K and
     /// silently got 8K would produce baffling truncation far from here.
-    pub fn admit(&mut self, requested_ctx: usize) -> Result<usize, AdmitError> {
+    pub fn admit(&mut self, session: u64, requested_ctx: usize) -> Result<usize, AdmitError> {
         let kv_need = (requested_ctx as u64)
             .checked_mul(self.footprint.kv_bytes_per_token)
             .ok_or(AdmitError::WouldExceedBudget {
@@ -110,7 +112,7 @@ impl AdmissionController {
         if need >= available {
             return Err(AdmitError::WouldExceedBudget { need, available });
         }
-        self.admitted.push(requested_ctx);
+        self.admitted.push((session, requested_ctx));
         Ok(requested_ctx)
     }
 
@@ -143,8 +145,12 @@ impl AdmissionController {
         self.host_budget = bytes;
     }
 
-    pub fn release(&mut self, granted_ctx: usize) {
-        if let Some(i) = self.admitted.iter().position(|&c| c == granted_ctx) {
+    /// Return a session's context allowance to the budget, keyed by the
+    /// session id handed to [`admit`](Self::admit). Releasing an unknown id
+    /// is a no-op; releasing a known id removes exactly that session's
+    /// grant — never a same-sized neighbour's.
+    pub fn release(&mut self, session: u64) {
+        if let Some(i) = self.admitted.iter().position(|(id, _)| *id == session) {
             self.admitted.remove(i);
         }
     }
@@ -395,9 +401,9 @@ mod tests {
     #[test]
     fn weights_are_charged_once_not_per_session() {
         let mut a = AdmissionController::new(f27b(), 32 * GIB);
-        a.admit(1024).unwrap();
+        a.admit(1, 1024).unwrap();
         let after_one = a.used_bytes();
-        a.admit(1024).unwrap();
+        a.admit(2, 1024).unwrap();
         let after_two = a.used_bytes();
         // The second session adds only its KV, never another copy of the weights.
         assert!(after_two - after_one < GIB, "weights charged twice");
@@ -408,10 +414,10 @@ mod tests {
     fn the_27b_cannot_take_four_agents_at_128k() {
         // 15 GB + 4 x 4.25 GB = 32.25 GB against a 32 GB card.
         let mut a = AdmissionController::new(f27b(), 32 * GIB);
-        for _ in 0..3 {
-            a.admit(128 * 1024).expect("first three must fit");
+        for i in 0..3u64 {
+            a.admit(i, 128 * 1024).expect("first three must fit");
         }
-        let e = a.admit(128 * 1024).unwrap_err();
+        let e = a.admit(4, 128 * 1024).unwrap_err();
         assert!(
             matches!(e, AdmitError::WouldExceedBudget { .. }),
             "got {e:?}"
@@ -421,8 +427,8 @@ mod tests {
     #[test]
     fn the_27b_does_take_four_agents_at_96k() {
         let mut a = AdmissionController::new(f27b(), 32 * GIB);
-        for i in 0..4 {
-            a.admit(96 * 1024)
+        for i in 0..4u64 {
+            a.admit(i, 96 * 1024)
                 .unwrap_or_else(|e| panic!("agent {i} rejected: {e:?}"));
         }
     }
@@ -430,8 +436,8 @@ mod tests {
     #[test]
     fn the_35b_does_take_four_agents_at_128k() {
         let mut a = AdmissionController::new(f35b(), 32 * GIB);
-        for i in 0..4 {
-            a.admit(128 * 1024)
+        for i in 0..4u64 {
+            a.admit(i, 128 * 1024)
                 .unwrap_or_else(|e| panic!("agent {i} rejected: {e:?}"));
         }
     }
@@ -439,22 +445,23 @@ mod tests {
     #[test]
     fn release_returns_budget_so_a_later_session_fits() {
         let mut a = AdmissionController::new(f27b(), 32 * GIB);
-        for _ in 0..3 {
-            a.admit(128 * 1024).unwrap();
+        for i in 0..3u64 {
+            a.admit(i, 128 * 1024).unwrap();
         }
-        assert!(a.admit(128 * 1024).is_err());
-        a.release(128 * 1024);
-        a.admit(128 * 1024)
+        assert!(a.admit(8, 128 * 1024).is_err());
+        // Release session 1's grant — not a same-sized neighbour's.
+        a.release(1);
+        a.admit(9, 128 * 1024)
             .expect("budget must be reusable after release");
     }
 
     #[test]
     fn rejection_reports_the_numbers_not_just_a_failure() {
         let mut a = AdmissionController::new(f27b(), 32 * GIB);
-        for _ in 0..3 {
-            a.admit(128 * 1024).unwrap();
+        for i in 0..3u64 {
+            a.admit(i, 128 * 1024).unwrap();
         }
-        match a.admit(128 * 1024).unwrap_err() {
+        match a.admit(11, 128 * 1024).unwrap_err() {
             AdmitError::WouldExceedBudget { need, available } => {
                 // `>=`, not `>`. Zero headroom is a rejection: 15 GiB of weights
                 // plus 4 x 4.25 GiB of KV is an EXACT tie with a 32 GiB budget,
@@ -477,7 +484,7 @@ mod tests {
         // One agent asking for more than the whole card can hold.
         let mut a = AdmissionController::new(f27b(), 32 * GIB);
         assert!(
-            a.admit(2 * 1024 * 1024).is_err(),
+            a.admit(12, 2 * 1024 * 1024).is_err(),
             "must reject, not silently truncate"
         );
     }

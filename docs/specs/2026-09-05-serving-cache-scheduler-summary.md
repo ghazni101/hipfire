@@ -55,11 +55,22 @@ Perf hardening: `is_token_allowed` gained bounded fast paths (structural first-b
 
 ### Remaining gaps (unchanged or newly precise)
 
-- **Early per-token schema pruning (new, precise):** the incremental matcher is syntax-conservative — a schema-invalid *value start* (e.g. `null` under a `"type":"string"` property) is only caught at terminal validation as a typed A17 failure, never a false success. Spec-conformant but late; schema-aware incremental matching (the dormant `Frame` machinery) is the follow-up.
 - **Vision + prefix reuse (X2/A18)** — still off; needs the pixel/embedding/position oracle.
 - **Slots tools / stop / logprobs** — refusals stay (spec: remove only with complete behavior).
 - **`admissions.yml` / ARCHITECTURE.md / default-on** — still gated on the full §12 evidence tuple.
-- **P6 overlap** — flag only, stays off.
+- **P6 overlap** — flag only, stays off until a measured host gap exceeds fixture noise.
+
+### Wave 10 — gap closure pass (2026-09-12)
+
+| # | Gap | Resolution |
+|---|---|---|
+| W10-1 | Forward page-accounting mismatch under pool pressure | Admit-time page demand now wired on BOTH admit paths: cold admit AND continuation admit estimate `ceil((uncached + max_tokens)/128)+1` pages, evict radix leaves then LRU idle sessions, and typed-reject (`page demand exceeds pool`) instead of dying mid-forward. Verified: 8-page pool rejects a 9-page demand at admit; small requests unaffected. |
+| W10-2 | Strict `json_schema` over ChatML rejected requests with thinking | Framing-aware grammar cursor: `SubmitRequest.started_in_think` + `GrammarConstraint.{in_think,think_open_id,think_close_id}` defer the schema mask until `</think>`; think-tag tokens never reach the matcher. Verified e2e: schema+thinking returns valid JSON in `content` with reasoning in `reasoning_content`. |
+| W10-3 | Early per-token schema pruning | `is_token_allowed` now refuses tokens whose first non-whitespace byte cannot begin a value conforming to the expected `SchemaNode` (schema-position stack on `scan_raw`/`RawScan`; `value_next` byte set). Also fixed two latent fast-path bugs: `:` refused after object keys, `]` refused at empty-array positions. 8 new tests; 201 saddle-core tests green. |
+| W10-4 | Mid-page radix divergence refused (`MidPageDivergence`) | Partial-page nodes: `Node.first_page_skip` lets an edge begin mid-page while its `PageHandle` still covers a full 128-token page; `split_edge` forks at any token via a zero-page marker; `walk` derives `Handle.token_offset` from `child_base - first_page_skip`. `MidPageDivergence` removed. GPU cell: zero publish refusals; A13 mixed `reused=512` (divergent tail cached). |
+| W10-5 | A19 fault injection below the HIP bridge | `HIPFIRE_FAULT_HIP=<upload|launch|sync>` seam in `hip-bridge` (arm-after-load, atomic countdown). `--fault-hip=<class>` cell: typed rejection, no fake Done, sync poison → fresh-engine recovery byte-identical. All 3 classes PASS. |
+| W10-6 | A20 model swap + idle spill/restore | `--a20` cell: slot pressure spills an idle session (evictions=1), named reentry restores it (restores=1, reused ≥ prompt); two shutdown+respawn cycles each cold→warm with stable `free_pages`. PASS. |
+| W10-7 | A13 adversarial multi-domain wait bounds | Concurrent phase now mixes samplers (2 greedy + sampled + penalized, distinct convos) with a per-request 120 s wait-bound assertion. PASS. |
 
 ---
 
@@ -186,13 +197,13 @@ The subsequent generate fails with an open-think-span validator (too few tokens 
 
 ### A19 — HIP fault injection / fail-closed reuse
 
-- Pool/engine-seam fault path landed: `HIPFIRE_FAULT_PREFIX_PUBLISH=1` fails the first publication; `test_serve_prefix_cache --fault-publish` proves honest miss + unchanged output + no cache-ref leak.
-- Still open: fault injection below the HIP bridge itself (upload/launch/sync failure injection).
+- **Closed (wave 10):** `HIPFIRE_FAULT_HIP=<upload|launch|sync>` injects below the HIP bridge; `--fault-hip=<class>` proves typed rejection, no fake Done, sync poison → fresh-engine byte-identical recovery. All 3 classes PASS on gfx1101.
+- Pool/engine-seam fault path landed earlier: `HIPFIRE_FAULT_PREFIX_PUBLISH=1` fails the first publication; `--fault-publish` proves honest miss + unchanged output + no cache-ref leak.
 
 ### A20 — Full lifecycle soak
 
 - Landed: 4-hit warm soak, reset → cold (reused=0), **re-warm after reset reuses again** (allocation epoch drop + cache-lease release), post-reset output matches the original greedy run.
-- Still open: repeated model *swap* with cache on/off (unload/reload path), idle spill/restore cycle on the slot engine, long soak with a page-level monotonic-leak counter.
+- **Closed (wave 10):** `--a20` cell covers idle spill/restore (evictions=1 → restores=1, reused ≥ prompt) and two shutdown+respawn model-swap cycles (cold→warm, stable `free_pages`). PASS on gfx1101.
 
 ### A10 — MTP page-crossing / partial-accept cache-visibility
 
@@ -202,7 +213,7 @@ The subsequent generate fails with an open-think-span validator (too few tokens 
 ### A13 — Mixed-load progress bound
 
 - Landed: long cold prefill submitted before a short warm request — both complete; cold miss stays a miss (no false reuse).
-- Still open: adversarial multi-domain mixed samplers run with per-request wait-bound assertions on GPU.
+- **Closed (wave 10):** adversarial phase now mixes samplers (2 greedy + sampled + penalized, distinct convos) with a per-request 120 s wait-bound assertion. PASS on gfx1101.
 
 ### P6 — Scheduler overlap
 

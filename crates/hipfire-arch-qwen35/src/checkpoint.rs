@@ -141,6 +141,26 @@ impl<B: CheckpointBlob> QwenCheckpointPool<B> {
         self.entries.is_empty()
     }
 
+    /// Whether a blob of `bytes` could be inserted without exceeding the
+    /// ceiling — accounting for the entry it would replace at `key` and for
+    /// evicting every unpinned entry. Lets `capture_checkpoint` refuse
+    /// BEFORE paying for the GPU allocation and device-to-device copy.
+    pub fn can_afford(&self, key: &CheckpointKey, bytes: u64) -> bool {
+        let replaced = self
+            .entries
+            .get(key)
+            .map(|e| e.blob.bytes_len())
+            .unwrap_or(0);
+        let unpinned_bytes: u64 = self
+            .entries
+            .iter()
+            .filter(|(k, e)| !e.pinned && **k != *key)
+            .map(|(_, e)| e.blob.bytes_len())
+            .sum();
+        let floor = self.total_bytes.saturating_sub(replaced + unpinned_bytes);
+        floor.saturating_add(bytes) <= self.max_bytes
+    }
+
     /// Verify `p` is a valid capture boundary: `p == 0` or `p` is a
     /// multiple of [`PAGE_TOKENS`].
     fn is_aligned(p: u64) -> bool {
@@ -172,10 +192,13 @@ impl<B: CheckpointBlob> QwenCheckpointPool<B> {
         let bytes = blob.bytes_len();
         let key = (domain, p);
 
-        // If an entry already exists at this key, replace it.
+        // If an entry already exists at this key, replace it and KEEP its
+        // id: radix nodes store the CheckpointId from the first capture, so
+        // minting a fresh id on re-capture would strand those references.
+        let mut reuse_id = None;
         if let Some(old) = self.entries.remove(&key) {
             self.total_bytes = self.total_bytes.saturating_sub(old.blob.bytes_len());
-            // Keep the same id for stability across re-capture.
+            reuse_id = Some(old.id);
         }
 
         // Clear any prior eviction record for this key.
@@ -196,8 +219,11 @@ impl<B: CheckpointBlob> QwenCheckpointPool<B> {
             }
         }
 
-        let id = CheckpointId(self.next_id);
-        self.next_id += 1;
+        let id = reuse_id.unwrap_or_else(|| {
+            let id = CheckpointId(self.next_id);
+            self.next_id += 1;
+            id
+        });
         self.lru_clock += 1;
         self.total_bytes += bytes;
         self.entries.insert(
@@ -423,6 +449,23 @@ fn find_largest_pool_checkpoint_below<B: CheckpointBlob>(
 /// `committed_tokens` and `materialized_rows` must reflect only this
 /// processed prefix, not the accepted token history.
 pub fn plan_resume<B: CheckpointBlob>(
+    pool: &mut QwenCheckpointPool<B>,
+    domain: &CacheDomain,
+    prompt_len: u64,
+    lookup: &PrefixLookup,
+    drafter: DrafterDecision,
+) -> Result<ResumePlan, MissReason> {
+    let plan = plan_resume_inner(pool, domain, prompt_len, lookup, drafter)?;
+    // Pin the chosen boundary so an unrelated capture cannot evict the
+    // checkpoint between this plan and the caller's restore. p == 0 is the
+    // initial state — no entry exists to pin.
+    if plan.boundary > 0 {
+        pool.pin(domain, plan.boundary);
+    }
+    Ok(plan)
+}
+
+fn plan_resume_inner<B: CheckpointBlob>(
     pool: &QwenCheckpointPool<B>,
     domain: &CacheDomain,
     prompt_len: u64,
@@ -495,8 +538,10 @@ use rdna_compute::Gpu;
 /// live state into it via [`DeltaNetSnapshot::save_from`], and inserts it
 /// into the pool. The pool evicts oldest unpinned entries as needed.
 ///
-/// Returns the minted [`CheckpointId`], or an error if snapshot allocation
-/// or the device-to-device copy fails.
+/// Returns the minted [`CheckpointId`], [`CheckpointId::NONE`] when the
+/// pool ceiling cannot cover the capture even after evicting every
+/// unpinned entry, or an error if snapshot allocation or the
+/// device-to-device copy fails.
 ///
 /// **P2-wire will call this** from the serve engine's commit/prefill
 /// path at page-aligned completed boundaries.
@@ -509,6 +554,15 @@ pub fn capture_checkpoint(
 ) -> HipResult<CheckpointId> {
     if !QwenCheckpointPool::<DeltaNetSnapshot>::is_aligned(p) {
         return Err(HipError::new(0, "capture_checkpoint: boundary not page-aligned"));
+    }
+
+    // Pre-check the pool ceiling BEFORE allocating the snapshot and paying
+    // for the device-to-device copy: a capture the pool cannot afford is a
+    // soft refusal, indistinguishable from a hard failure only after the
+    // work is already spent.
+    let bytes = DeltaNetSnapshot::bytes_for(state);
+    if !pool.can_afford(&(domain.clone(), p), bytes) {
+        return Ok(CheckpointId::NONE);
     }
 
     let mut snap = DeltaNetSnapshot::new_for(gpu, state)?;
@@ -624,7 +678,7 @@ mod tests {
 
         // Plan for a 200-token prompt: p=128 < 200 → SuffixRecompute.
         let plan = plan_resume(
-            &pool,
+            &mut pool,
             &dom,
             200,
             &lookup(128),
@@ -654,7 +708,7 @@ mod tests {
         // Prompt of exactly 128 tokens: must NOT resume at p=128.
         // Should select p=0 (initial state) with EarlierBoundary.
         let plan = plan_resume(
-            &pool,
+            &mut pool,
             &dom,
             128,
             &lookup(128),
@@ -683,7 +737,7 @@ mod tests {
 
         // Prompt of exactly 256 tokens: should select p=128, not p=256.
         let plan = plan_resume(
-            &pool,
+            &mut pool,
             &dom,
             256,
             &lookup(256),
@@ -699,12 +753,12 @@ mod tests {
 
     #[test]
     fn a7_empty_prompt_no_underflow() {
-        let pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
         let dom = test_domain("a7-empty");
 
         // No checkpoints, empty prompt, resumable=0.
         let plan = plan_resume(
-            &pool,
+            &mut pool,
             &dom,
             0,
             &lookup(0),
@@ -720,12 +774,12 @@ mod tests {
 
     #[test]
     fn a8_missing_checkpoint_is_no_checkpoint() {
-        let pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
         let dom = test_domain("a8-missing");
 
         // Lookup claims 128 resumable tokens, but no checkpoint in pool.
         let err = plan_resume(
-            &pool,
+            &mut pool,
             &dom,
             200,
             &lookup(128),
@@ -749,7 +803,7 @@ mod tests {
 
         // Lookup still claims 128 resumable, but checkpoint was evicted.
         let err = plan_resume(
-            &pool,
+            &mut pool,
             &dom,
             200,
             &lookup(128),
@@ -764,12 +818,12 @@ mod tests {
 
     #[test]
     fn a8_missing_is_not_silent_hit() {
-        let pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
         let dom = test_domain("a8-silent");
 
         // resumable > 0 but no checkpoint → must error, not return a plan.
         let result = plan_resume(
-            &pool,
+            &mut pool,
             &dom,
             200,
             &lookup(64),
@@ -791,7 +845,7 @@ mod tests {
 
         // Plan for 200-token prompt.
         let plan = plan_resume(
-            &pool,
+            &mut pool,
             &dom,
             200,
             &lookup(128),
@@ -821,7 +875,7 @@ mod tests {
         pool.insert(dom.clone(), 256, HostBlob { bytes: 4096 });
 
         let plan = plan_resume(
-            &pool,
+            &mut pool,
             &dom,
             256, // exact match
             &lookup(256),
@@ -919,7 +973,7 @@ mod tests {
 
         // Planning with dom_b should miss.
         let err = plan_resume(
-            &pool,
+            &mut pool,
             &dom_b,
             200,
             &lookup(128),
@@ -931,7 +985,7 @@ mod tests {
 
         // Planning with dom_a should succeed.
         let plan = plan_resume(
-            &pool,
+            &mut pool,
             &dom_a,
             200,
             &lookup(128),
@@ -1029,7 +1083,7 @@ mod tests {
 
         // Default Ar.
         let plan_ar = plan_resume(
-            &pool,
+            &mut pool,
             &dom,
             200,
             &lookup(128),
@@ -1040,7 +1094,7 @@ mod tests {
 
         // Admission can choose Checkpoint.
         let plan_ckpt = plan_resume(
-            &pool,
+            &mut pool,
             &dom,
             200,
             &lookup(128),
@@ -1051,7 +1105,7 @@ mod tests {
 
         // Or Reseed.
         let plan_reseed = plan_resume(
-            &pool,
+            &mut pool,
             &dom,
             200,
             &lookup(128),
@@ -1090,7 +1144,7 @@ mod tests {
         // But no checkpoint at 128 → NoCheckpoint (p=0 checkpoint doesn't
         // help for a 128-token prompt with resumable=128).
         let err = plan_resume(
-            &pool,
+            &mut pool,
             &dom,
             128,
             &lookup(128),
@@ -1113,7 +1167,7 @@ mod tests {
 
         // Lookup says 200 resumable (not page-aligned). Should find p=128.
         let plan = plan_resume(
-            &pool,
+            &mut pool,
             &dom,
             300,
             &lookup(200),
