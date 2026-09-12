@@ -62,7 +62,7 @@ fn main() {
         prefill_min_tokens: 1,
         wait_max_count: 64,
         wait_max_bytes: 256 * 1024 * 1024,
-        wait_timeout_ticks: 30_000,
+        queue_timeout_ms: 30_000,
         structured_jump_forward: false,
     })
     .expect("engine");

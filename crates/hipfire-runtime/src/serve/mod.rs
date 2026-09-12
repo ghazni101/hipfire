@@ -90,6 +90,11 @@ pub struct SubmitRequest {
     /// to slots so bytes are charged once and released exactly once. Zero
     /// when the request did not pass through the byte-bounded queue.
     pub queue_bytes: u64,
+    /// Submitter-chosen cancellation identity (spec §4.6 C6): a queued
+    /// request has no session id yet, so `EngineCommand::CancelWaiting`
+    /// matches parked work by this tag. Idempotent — an unmatched tag is a
+    /// no-op. 0 means "no cancellation identity".
+    pub request_tag: u64,
     pub reply: Sender<Event>,
 }
 

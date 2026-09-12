@@ -656,6 +656,10 @@ pub(crate) enum EndpointAdapterStatus {
 pub(crate) enum EndpointAdapterError {
     Unavailable { endpoint: &'static str },
     Lossy { endpoint: &'static str },
+    /// Tool list exceeds the grammar compiler's bounds — rejected before
+    /// admission so it is a typed 400, not a daemon-side panic.
+    TooManyTools { count: usize, max: usize },
+    ToolsTooLarge { bytes: usize, max: usize },
 }
 
 impl std::fmt::Display for EndpointAdapterError {
@@ -666,6 +670,12 @@ impl std::fmt::Display for EndpointAdapterError {
             }
             Self::Lossy { endpoint } => {
                 write!(f, "endpoint adapter lossy for tools on {endpoint}")
+            }
+            Self::TooManyTools { count, max } => {
+                write!(f, "too many tools: {count} exceeds the maximum of {max}")
+            }
+            Self::ToolsTooLarge { bytes, max } => {
+                write!(f, "tool definitions too large: {bytes} bytes exceeds the maximum of {max}")
             }
         }
     }
@@ -700,6 +710,28 @@ pub(crate) fn gate_chat_completions_tools(
         .is_some_and(|tools| !tools.is_empty());
     if !has_tools {
         return Ok(());
+    }
+    // Grammar-compiler bounds (saddle-core MAX_TOOL_SCHEMAS=256,
+    // MAX_SCHEMA_BYTES=64 KiB per schema): reject oversized tool lists
+    // BEFORE admission so they are typed 400s, not a daemon-side
+    // construction panic on the DFlash path.
+    if let Some(tools) = body.get("tools").and_then(serde_json::Value::as_array) {
+        if tools.len() > 256 {
+            return Err(EndpointAdapterError::TooManyTools {
+                count: tools.len(),
+                max: 256,
+            });
+        }
+        let total_bytes: usize = tools
+            .iter()
+            .map(|t| serde_json::to_string(t).map(|s| s.len()).unwrap_or(0))
+            .sum();
+        if total_bytes > 64 * 1024 * 4 {
+            return Err(EndpointAdapterError::ToolsTooLarge {
+                bytes: total_bytes,
+                max: 64 * 1024 * 4,
+            });
+        }
     }
     match endpoint_adapter_status(EndpointAdapterKind::OpenAiChatCompletions) {
         EndpointAdapterStatus::AvailableLossless => Ok(()),
@@ -1837,12 +1869,15 @@ fn validate_json_schema_subset(schema: &serde_json::Value, path: &str) -> Result
         }
     }
 
-    // Array type: validate `items`.
+    // Array type: validate `items`. The saddle-core compiler only accepts
+    // a schema OBJECT for `items` — the CLI validator must refuse exactly
+    // the same set (a boolean `items` accepted here would be rejected
+    // server-side, a 400 at the wrong layer; contract drift hides bugs).
     if let Some(items) = obj.get("items") {
         if items.is_object() {
             validate_json_schema_subset(items, &format!("{path}.items"))?;
-        } else if !items.is_boolean() {
-            bail!("items at {path} must be a boolean or schema object");
+        } else {
+            bail!("items at {path} must be a schema object (boolean form is outside the supported subset)");
         }
     }
     if let Some(n) = obj.get("minItems").and_then(|v| v.as_u64()) {

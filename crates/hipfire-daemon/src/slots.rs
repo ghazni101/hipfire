@@ -108,7 +108,7 @@ struct EngineSpawnParams {
     /// §5.3 S3). Derived from `serve.queue_timeout_ms` — the engine ticks
     /// once per serve iteration, so the millisecond value is used directly
     /// as the tick count.
-    wait_timeout_ticks: u64,
+    queue_timeout_ms: u64,
     /// Structured-output jump-forward (spec §7.3 G3). Read from
     /// `serve.structured_jump_forward`; default false.
     structured_jump_forward: bool,
@@ -168,7 +168,7 @@ impl AnySlotEngine {
                         // serve.queue_timeout_ms config keys.
                         wait_max_count: p.wait_max_count,
                         wait_max_bytes: p.wait_max_bytes,
-                        wait_timeout_ticks: p.wait_timeout_ticks,
+                        queue_timeout_ms: p.queue_timeout_ms,
                         // Structured-output jump-forward (spec §7.3 G3).
                         // Read from serve.structured_jump_forward; default
                         // false — no behavior change on the constrained-
@@ -188,6 +188,11 @@ impl AnySlotEngine {
     fn submit(&self, req: SubmitRequest) -> Result<(), String> {
         match self {
             Self::Qwen35(e) => e.submit(req),
+        }
+    }
+    fn cancel_waiting(&self, request_tag: u64) {
+        match self {
+            Self::Qwen35(e) => e.cancel_waiting(request_tag),
         }
     }
     fn close(&self, session: u64) -> Result<(), String> {
@@ -418,7 +423,7 @@ impl SlotBackend {
             .get("serve.max_queue_bytes")
             .and_then(|v| if let hipfire_config::ConfigValue::Integer(i) = v { Some(*i as u64) } else { None })
             .unwrap_or(268435456);
-        let wait_timeout_ticks = hipfire_config::active_or_local_process_config()
+        let queue_timeout_ms = hipfire_config::active_or_local_process_config()
             .values
             .get("serve.queue_timeout_ms")
             .and_then(|v| if let hipfire_config::ConfigValue::Integer(i) = v { Some(*i as u64) } else { None })
@@ -464,7 +469,7 @@ impl SlotBackend {
                 prefill_min_tokens,
                 wait_max_count,
                 wait_max_bytes,
-                wait_timeout_ticks,
+                queue_timeout_ms,
                 structured_jump_forward,
             },
         )?;
@@ -1184,6 +1189,16 @@ impl SlotBackend {
         // Transition queued (stdin reader announced). Bind will happen after Accepted.
         let _ = batch_transition_to_queued(id, attempt_id, admission);
         let (tx, rx) = mpsc::channel::<Event>();
+        // Cancellation identity (spec §4.6 C6): a request parked in the
+        // engine's waiting room has no session id yet, so the abort path
+        // cancels it by this tag. (id, attempt_id) is unique per attempt.
+        let request_tag = {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            id.hash(&mut h);
+            attempt_id.hash(&mut h);
+            h.finish()
+        };
         let req = SubmitRequest {
             prompt_tokens,
             convo: convo.clone(),
@@ -1206,6 +1221,7 @@ impl SlotBackend {
             // waiters must carry the real prompt weight — a hardcoded 0
             // (floored to 1 downstream) made the byte cap unbindable.
             queue_bytes: canonical_prompt_bytes(msg),
+            request_tag,
             reply: tx,
         };
         if let Err(e) = self.engine.submit(req) {
@@ -1297,6 +1313,11 @@ impl SlotBackend {
         loop {
             if batch_check_abort(id, attempt_id, admission) {
                 drop(rx);
+                // A request parked in the engine's waiting room has no
+                // session to close — cancel it by tag so it leaves the queue
+                // (and its queue-byte charge) immediately instead of being
+                // admitted against a dead receiver later (spec §4.6 C6/A11).
+                self.engine.cancel_waiting(request_tag);
                 if let Some(sess) = accepted_session.take() {
                     self.close_session(sess);
                 } else if let Some(session) = claimed_session {
@@ -1392,11 +1413,23 @@ impl SlotBackend {
             } else if let Some(session) = claimed_session {
                 self.close_session(session);
             }
-            emit_qwen_ar_slot_error(
+            // Overload rejections (bounded wait queue full / queue timeout)
+            // are CAPACITY signals, not engine faults — surface them with
+            // the overload kind so the front end maps them to 429 instead
+            // of 500 (spec §5.3 S3: "HTTP 429 for bounded queue rejection").
+            let kind = if reason.starts_with("serve queue full")
+                || reason.starts_with("serve queue timeout")
+                || reason.starts_with("cancelled while queued")
+            {
+                "overload"
+            } else {
+                "internal"
+            };
+            hipfire_engine::emit::emit_active_attempt_error(
                 stdout,
                 id,
                 &format!("multi_slot rejected: {reason}"),
-                "internal",
+                kind,
                 false,
                 false,
             );

@@ -534,6 +534,12 @@ async fn handle_request(
                 "pid": std::process::id(),
                 "token": meta.instance_token,
                 "native": true,
+                // Route capability advertisement (multi-slot, prefix cache,
+                // structured output, queue bounds): built once at startup
+                // from the same resolved config the daemon's slot engine
+                // reads. OpenAI-compatible clients ignore the extra field;
+                // hipfire clients discover the route with it.
+                "capabilities": shared.capabilities,
             });
             json_response(body, 200)
         }
@@ -547,6 +553,10 @@ async fn handle_request(
                 "retries_attempted": meta.retries_attempted,
                 "retries_succeeded": meta.retries_succeeded,
                 "recent_tok_s": meta.recent_tok_s,
+                "mode": shared.capabilities["mode"],
+                "multi_slot": shared.capabilities["multi_slot"],
+                "slots": shared.capabilities["multi_slot_slots"],
+                "prefix_cache": shared.capabilities["prefix_cache"],
             });
             json_response(body, 200)
         }
@@ -580,11 +590,23 @@ async fn handle_request(
             };
             let body = serde_json::json!({
                 "object": "list",
-                "data": local.into_iter().map(|model| serde_json::json!({
-                    "id": model.registry_tag.unwrap_or(model.name),
-                    "object": "model",
-                    "owned_by": "hipfire",
-                })).collect::<Vec<_>>()
+                "data": local.into_iter().map(|model| {
+                    // Per-model capability projection: the route-level
+                    // multi-slot/structured-output facts plus sidecar
+                    // probes on the model file (MTP draft, vision tower).
+                    // Extra fields are ignored by OpenAI-compatible
+                    // clients; hipfire clients use them for discovery.
+                    let caps = crate::serve::model_capabilities(
+                        &shared.capabilities,
+                        &model.path,
+                    );
+                    serde_json::json!({
+                        "id": model.registry_tag.unwrap_or(model.name),
+                        "object": "model",
+                        "owned_by": "hipfire",
+                        "capabilities": caps,
+                    })
+                }).collect::<Vec<_>>()
             });
             json_response(body, 200)
         }
@@ -1338,22 +1360,12 @@ async fn handle_streaming(
         .unwrap_or("unknown")
         .to_owned();
 
-    let first = serde_json::json!({
-        "id": id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
-        "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": null }],
-    });
     // Shared pending-byte counter: the forwarder adds each chunk's bytes,
     // the body's poll loop subtracts them as the consumer drains (spec §5.4
-    // byte bound — real bytes, not an estimate). Created BEFORE the role
-    // chunk so the pre-forwarder insertion is counted too — an uncounted
-    // chunk would be subtracted on poll and wrap the counter, tripping the
-    // byte bound. `bp_pending` is created before the role chunk for the
-    // same reason.
+    // byte bound — real bytes, not an estimate).
     let pending_bytes = Arc::new(AtomicU64::new(0));
     let bp_pending = Arc::clone(&pending_bytes);
+
 
     let tx_clone = tx.clone();
     let shared_clone = Arc::clone(&shared);
@@ -1376,6 +1388,22 @@ async fn handle_streaming(
             )
             .with_cancelled(Arc::clone(&cancelled)),
         );
+        // Leading role delta (OpenAI streaming shape). Sent through the same
+        // bounded backpressure path as every other chunk so its bytes are
+        // counted and a stalled consumer delays it too. (The chunk used to
+        // be constructed and dropped before the worker — a dead store; the
+        // role delta never reached clients.)
+        {
+            let first = serde_json::json!({
+                "id": id_clone,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_clone,
+                "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": null }],
+            });
+            let mut bp = backpressure.borrow_mut();
+            let _ = bp.send(ResponseChunk::plain(sse_data(&first)));
+        }
         let result = complete_request_cancellable(
             &shared_clone,
             &body,
@@ -1428,9 +1456,23 @@ async fn handle_streaming(
                     Err(_) => return Err(hipfire_client::ClientError::Cancelled),
                 }
                 drop(bp);
-                match ack_rx.recv() {
+                // The terminal chunk is delivered only when the CLIENT
+                // actually reads it (poll_flush acks). A zero-window or
+                // silent client used to pin this thread AND its admission
+                // permit forever — bound the wait by the stall deadline and
+                // fail with Cancelled, which releases both (spec §5.4/S4:
+                // "abort on configured deadline").
+                match ack_rx.recv_timeout(stream_stall_timeout) {
                     Ok(Ok(())) => Ok(()),
-                    Ok(Err(_)) | Err(_) => Err(hipfire_client::ClientError::Cancelled),
+                    Ok(Err(_)) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        Err(hipfire_client::ClientError::Cancelled)
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        eprintln!(
+                            "[serve] terminal ack deadline exceeded — releasing admission permit"
+                        );
+                        Err(hipfire_client::ClientError::Cancelled)
+                    }
                 }
             },
         );
@@ -1563,6 +1605,17 @@ pub(crate) fn request_error_status(message: &str) -> u16 {
     let lower = message.to_ascii_lowercase();
     if lower.contains("model not found") {
         404
+    } else if lower.contains("serve queue full")
+        || lower.contains("serve queue timeout")
+        || lower.contains("queue full:")
+        || lower.contains("queue timeout:")
+        || lower.contains("cancelled while queued")
+        || lower.contains("overload")
+    {
+        // Bounded-queue rejection / queue timeout / parked cancellation are
+        // capacity signals, not faults (spec §5.3 S3: 429 for bounded queue
+        // rejection; 503 stays reserved for a poisoned/unavailable backend).
+        429
     } else if lower.contains("kv budget")
         || lower.contains("max_tokens")
         || lower.contains("invalid")
@@ -1570,7 +1623,18 @@ pub(crate) fn request_error_status(message: &str) -> u16 {
         || lower.contains("endpoint adapter")
         || lower.contains("lossy")
         || lower.contains("malformed canonical tool call")
+        || lower.contains("must be a")
+        || lower.contains("must be an")
+        || lower.contains("outside the supported subset")
+        || lower.contains("unsatisfiable")
+        || lower.contains("exceeds the maximum")
+        || lower.contains("not supported on this serve route")
+        || lower.contains("outside the strict subset")
+        || lower.contains("does not allow this assertion")
+        || lower.contains("does not support this request")
     {
+        // Schema/refusal rejections are request errors: the client can fix
+        // them by changing the request (400), not server faults (500).
         400
     } else {
         500

@@ -323,6 +323,11 @@ fn drain_streams(
             for &idx in &active {
                 let (id, attempt_id, _) = &streams[idx];
                 outcomes[idx].rejected = true;
+                // Cancel daemon-side (not just client-side release):
+                // without an abort the daemon keeps generating into a
+                // dropped channel and that background load pollutes the
+                // NEXT sample's throughput.
+                let _ = engine.cancel_attempt(id, *attempt_id);
                 engine.release_attempt(id, *attempt_id);
             }
             break;
@@ -521,7 +526,7 @@ impl ConcurrencyBackend for SlotDriver {
 /// `drive_qwen_continuous_batch`; without it the request runs sequentially and
 /// the resulting numbers would describe a non-batched run. Answer-mode fields
 /// mirror `bench_generate_request` so both backends measure the same turn.
-pub fn batch_request(prompt: &str, max_tokens: u64, id: &str) -> serde_json::Value {
+pub fn batch_request(prompt: &str, max_tokens: u64, id: &str, attempt_id: u64) -> serde_json::Value {
     serde_json::json!({
         "type": "generate",
         "id": id,
@@ -530,7 +535,7 @@ pub fn batch_request(prompt: &str, max_tokens: u64, id: &str) -> serde_json::Val
         "top_p": 1.0,
         "repeat_penalty": 1.1,
         "max_tokens": max_tokens,
-        "attempt_id": 1,
+        "attempt_id": attempt_id,
         "serve_continuous_batch": true,
         "max_think_tokens": 1,
         "assistant_prefix": "closed_think",
@@ -601,7 +606,12 @@ impl ConcurrencyBackend for SequentialDriver {
                 } else {
                     format!("{base} {FOLLOWUP_PROMPT}")
                 };
-                let req = batch_request(&prompt, max_tokens, &format!("bench-seq-{i}-{turn}"));
+                let req = batch_request(
+                    &prompt,
+                    max_tokens,
+                    &format!("bench-seq-{i}-{turn}"),
+                    ((run as u64) << 32) | ((i as u64) << 16) | turn as u64,
+                );
                 // Drop the batch-route opt-in: this arm is deliberately the
                 // plain sequential path.
                 let mut req = req;
@@ -633,6 +643,10 @@ impl ConcurrencyBackend for SequentialDriver {
 pub struct DaemonDriver {
     engine: hipfire_client::Engine,
     max_concurrency: usize,
+    /// Monotonic attempt-id source so repetitions never reuse one (a fixed
+    /// id made the daemon's terminal registry drop later repetitions as
+    /// duplicate live generates after a deadline trip).
+    next_attempt: std::sync::atomic::AtomicU64,
 }
 
 impl DaemonDriver {
@@ -654,6 +668,7 @@ impl DaemonDriver {
         Ok(Self {
             engine,
             max_concurrency,
+            next_attempt: std::sync::atomic::AtomicU64::new(1),
         })
     }
 }
@@ -679,11 +694,21 @@ impl ConcurrencyBackend for DaemonDriver {
         // behaviour under test. `submit_streaming` registers each pending
         // channel with the reader thread so lifecycle frames are routed, not
         // dropped.
+        // Unique attempt ids PER REPETITION: a fixed attempt_id made the
+        // daemon's terminal registry drop a later repetition as a
+        // "duplicate live generate" after a deadline trip silently
+        // converted the whole arm into timeouts.
         let mut streams: Vec<(String, u64, mpsc::Receiver<Value>)> = Vec::with_capacity(k);
         for i in 0..k {
             let id = format!("bench-conc-{i}");
             let prompt = STREAM_PROMPTS[i % STREAM_PROMPTS.len()];
-            let req = batch_request(prompt, max_tokens, &id);
+            // Per-repetition attempt id: a fixed id made the daemon's
+            // terminal registry drop later repetitions as duplicate live
+            // generates after a deadline trip.
+            let attempt_id = self
+                .next_attempt
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let req = batch_request(prompt, max_tokens, &id, attempt_id);
             match self.engine.submit_streaming(&req) {
                 Ok(s) => streams.push(s),
                 Err(e) => {
@@ -899,7 +924,7 @@ mod tests {
     /// non-batched run.
     #[test]
     fn batch_request_opts_into_the_batch_route_and_answer_mode() {
-        let r = batch_request("hello", 64, "bench-c-1");
+        let r = batch_request("hello", 64, "bench-c-1", 1);
         assert_eq!(
             r.get("serve_continuous_batch").and_then(|v| v.as_bool()),
             Some(true)

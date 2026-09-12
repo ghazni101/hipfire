@@ -249,6 +249,14 @@ pub enum InsertError {
     /// A handle's token_offset is not page-aligned or handle count doesn't
     /// match the number of full pages.
     MisalignedHandle,
+    /// The retained-cache byte ceiling (`max_retained_bytes`) cannot hold
+    /// this publish even after evicting every unpinned leaf (spec §4.4).
+    CacheByteBoundExceeded {
+        /// Bytes currently retained by the tree.
+        retained: usize,
+        /// The configured ceiling.
+        max: usize,
+    },
 }
 
 impl std::fmt::Display for InsertError {
@@ -268,6 +276,11 @@ impl std::fmt::Display for InsertError {
             Self::MisalignedHandle => {
                 write!(f, "misaligned page handle (not page-aligned or count mismatch)")
             }
+            Self::CacheByteBoundExceeded { retained, max } => write!(
+                f,
+                "retained cache bytes {} exceed ceiling {} and eviction could not free enough",
+                retained, max
+            ),
         }
     }
 }
@@ -285,6 +298,19 @@ impl std::error::Error for InsertError {}
 /// for full 128-token pages only, plus optional [`CheckpointId`]s at resumable
 /// boundaries.
 ///
+/// # Cache-ref ownership
+///
+/// The INDEX owns one `PagePool` cache ref per node slot holding a handle:
+/// `create_chain` takes a ref for every page recorded in a newly created
+/// node (and releases them if the chain rolls back), and eviction /
+/// `release_all` release exactly the refs the index took. A physical page
+/// referenced by two nodes (a mid-page fork's straddling page) carries two
+/// refs — balanced by construction. Callers must `PagePool::seal` pages
+/// before publishing but must NOT take cache refs themselves: refs taken
+/// outside the index for pages the tree does not adopt (an already-present
+/// chain, a refused insert) would be owned by nobody and leak the page away
+/// from the free list forever.
+///
 /// Construct with [`PrefixIndex::new`] specifying `max_cpu_nodes` to bound
 /// CPU node/token metadata (spec §4.4: "Bound CPU node/token metadata as well
 /// as device bytes").
@@ -292,6 +318,14 @@ pub struct PrefixIndex {
     trees: HashMap<CacheDomain, DomainTree>,
     max_cpu_nodes: usize,
     total_nodes: usize,
+    /// Optional ceiling on total device bytes referenced by tree nodes
+    /// (spec §4.4: cache retention is a ceiling, never a permanently
+    /// reserved partition). Enforced at insert: the oldest unpinned leaves
+    /// are evicted first; an insert that still does not fit is refused.
+    max_retained_bytes: Option<usize>,
+    /// Running sum over all trees of `pages.len() × (k_page + v_page)`
+    /// bytes (the same arithmetic eviction credits).
+    retained_bytes: usize,
 }
 
 /// Internal result of walking the tree to find the longest token prefix.
@@ -319,7 +353,21 @@ impl PrefixIndex {
             trees: HashMap::new(),
             max_cpu_nodes,
             total_nodes: 0,
+            max_retained_bytes: None,
+            retained_bytes: 0,
         }
+    }
+
+    /// Set the retained-cache byte ceiling (spec §9.1
+    /// `serve.prefix_cache_max_bytes`). Zero disables retention entirely —
+    /// every publish is refused rather than reinterpreted as unlimited.
+    pub fn set_max_retained_bytes(&mut self, max_bytes: usize) {
+        self.max_retained_bytes = Some(max_bytes);
+    }
+
+    /// Total device bytes currently referenced by tree nodes.
+    pub fn retained_bytes(&self) -> usize {
+        self.retained_bytes
     }
 
     /// Current total node count across all domain trees.
@@ -607,9 +655,12 @@ impl PrefixIndex {
 
     /// Insert a completed prefix into the index (spec §4.2 C2).
     ///
-    /// The caller must have already sealed the pages and taken cache refs
-    /// via `PagePool::seal` + `PagePool::add_cache_ref` (spec §4.2: "insert
-    /// after caller has sealed pages and taken cache refs via PagePool").
+    /// The caller must have already sealed the pages via `PagePool::seal`.
+    /// The INDEX takes one cache ref per node slot holding a handle (and
+    /// releases it on rollback/eviction) — the caller must NOT take
+    /// publication refs itself: refs for pages the tree does not adopt
+    /// (an already-present chain, a refused insert) would be owned by
+    /// nobody and leak.
     ///
     /// `handles` is the ordered list of full-page handles with their logical
     /// token offsets. `checkpoint` is the optional checkpoint id at the final
@@ -649,6 +700,36 @@ impl PrefixIndex {
             self.trees.insert(domain.clone(), t);
         }
 
+        // Retained-bytes ceiling (spec §4.4: cache retention is a ceiling,
+        // and §9.1: zero means no retained cache). The insert needs at most
+        // `handles.len()` page slots; evict oldest unpinned leaves until the
+        // ceiling can hold the insert, refusing if eviction cannot progress.
+        if let Some(max_bytes) = self.max_retained_bytes {
+            let page_bytes = pool.k_page_bytes() + pool.v_page_bytes();
+            if max_bytes < page_bytes {
+                return Err(InsertError::CacheByteBoundExceeded {
+                    retained: self.retained_bytes,
+                    max: max_bytes,
+                });
+            }
+            loop {
+                let projected = self
+                    .retained_bytes
+                    .saturating_add(handles.len().saturating_mul(page_bytes));
+                if projected <= max_bytes {
+                    break;
+                }
+                let before = self.total_nodes;
+                self.evict_unpinned_leaves(pool, projected.saturating_sub(max_bytes));
+                if self.total_nodes == before {
+                    return Err(InsertError::CacheByteBoundExceeded {
+                        retained: self.retained_bytes,
+                        max: max_bytes,
+                    });
+                }
+            }
+        }
+
         // Insert, evicting oldest unpinned leaves to make room when the CPU
         // node bound binds (spec §4.4: reclaim cache-only pages before
         // rejecting work). An insert that adds zero nodes (exact re-publish
@@ -659,12 +740,21 @@ impl PrefixIndex {
                 tokens,
                 handles,
                 checkpoint,
+                pool,
                 self.max_cpu_nodes,
                 self.total_nodes,
             );
             match result {
                 Ok(delta) => {
                     self.total_nodes = (self.total_nodes as i32 + delta) as usize;
+                    // Each created node holds exactly one page handle, so
+                    // retained bytes track node creation; eviction and chain
+                    // rollback subtract the same arithmetic (see the
+                    // cache-ref ownership doc on the struct).
+                    self.retained_bytes = self.retained_bytes.saturating_add(
+                        delta.unsigned_abs() as usize
+                            * (pool.k_page_bytes() + pool.v_page_bytes()),
+                    );
                     return Ok(());
                 }
                 Err(InsertError::CpuNodeBoundExceeded { .. }) => {
@@ -696,6 +786,30 @@ impl PrefixIndex {
 
 
     // ── Pin / Unpin ───────────────────────────────────────────────────
+
+    /// Test-only: drop the index's cache ref on `phys` and remove the
+    /// handle from whichever node holds it — simulates losing one page
+    /// (a residency gap) without evicting the whole leaf.
+    #[cfg(test)]
+    pub(crate) fn test_drop_page_ref(
+        &mut self,
+        pool: &mut PagePool,
+        domain: &CacheDomain,
+        phys: u32,
+    ) {
+        if let Some(tree) = self.trees.get_mut(domain) {
+            for (_, node) in tree.nodes.iter_mut() {
+                if let Some(pos) = node.pages.iter().position(|p| p.phys == phys) {
+                    node.pages.remove(pos);
+                    let _ = pool.release_cache_ref(phys);
+                    self.retained_bytes = self
+                        .retained_bytes
+                        .saturating_sub(pool.k_page_bytes() + pool.v_page_bytes());
+                    return;
+                }
+            }
+        }
+    }
 
     /// Release one lookup's pin (spec §4.4 C4).
     ///
@@ -740,6 +854,7 @@ impl PrefixIndex {
             }
         }
         self.total_nodes = 0;
+        self.retained_bytes = 0;
         released
     }
 
@@ -812,11 +927,14 @@ impl PrefixIndex {
             tree.nodes.remove(&nid);
             self.total_nodes = self.total_nodes.saturating_sub(1);
 
-            // Release cache refs.
+            // Release cache refs (the index owns exactly one per node page
+            // slot — see the ownership doc on `PrefixIndex`).
             for ph in &pages {
-                bytes_freed += pool.k_page_bytes() + pool.v_page_bytes();
+                let page_bytes = pool.k_page_bytes() + pool.v_page_bytes();
+                bytes_freed += page_bytes;
                 let _ = pool.release_cache_ref(ph.phys);
                 evicted_phys.push(ph.phys);
+                self.retained_bytes = self.retained_bytes.saturating_sub(page_bytes);
             }
 
             // Removing this leaf may have turned its parent into a new
@@ -864,8 +982,8 @@ impl PrefixIndex {
     /// `checkpoint` is an opaque id minted by the caller (the Qwen adapter).
     /// `CheckpointId::NONE` means no checkpoint (spec §4.5).
     ///
-    /// The caller must have already sealed the pages and taken cache refs
-    /// via `PagePool::seal` + `PagePool::add_cache_ref`.
+    /// The caller must have sealed the pages (`PagePool::seal`); the index
+    /// takes the cache refs itself (see `insert`).
     pub fn publish_sealed_pages(
         &mut self,
         domain: &CacheDomain,
@@ -919,12 +1037,16 @@ impl PrefixIndex {
 // =========================================================================
 
 /// Insert tokens/handles into a domain tree, splitting edges as needed.
-/// Returns the net change in node count (positive = nodes added).
+/// Takes one `PagePool` cache ref for every page handle recorded in a newly
+/// created node (released again if the chain rolls back — see the
+/// cache-ref ownership doc on [`PrefixIndex`]). Returns the net change in
+/// node count (positive = nodes added).
 fn insert_into_tree(
     tree: &mut DomainTree,
     tokens: &[u32],
     handles: &[Handle],
     checkpoint: Option<CheckpointId>,
+    pool: &mut PagePool,
     max_cpu_nodes: usize,
     current_total: usize,
 ) -> Result<i32, InsertError> {
@@ -959,28 +1081,29 @@ fn insert_into_tree(
             None => return Ok(delta),
         };
 
-        let next_token = tokens[query_pos];
-        let child_id = match node.children.get(&next_token).copied() {
-            Some(id) => id,
-            None => {
-                let remaining_tokens = &tokens[query_pos..];
-                // query_pos may sit mid-page (a partial-node match leaves
-                // the cursor inside the new key's current page): the
-                // branch's first node claims only the tail of that page.
-                let remaining_handles = &handles[query_pos / PAGE_TOKENS..];
-                delta += create_chain(
-                    tree,
-                    current,
-                    remaining_tokens,
-                    remaining_handles,
-                    query_pos % PAGE_TOKENS,
-                    checkpoint,
-                    max_cpu_nodes,
-                    current_total + delta as usize,
-                )?;
-                return Ok(delta);
-            }
-        };
+            let next_token = tokens[query_pos];
+            let child_id = match node.children.get(&next_token).copied() {
+                Some(id) => id,
+                None => {
+                    let remaining_tokens = &tokens[query_pos..];
+                    // query_pos may sit mid-page (a partial-node match leaves
+                    // the cursor inside the new key's current page): the
+                    // branch's first node claims only the tail of that page.
+                    let remaining_handles = &handles[query_pos / PAGE_TOKENS..];
+                    delta += create_chain(
+                        tree,
+                        current,
+                        remaining_tokens,
+                        remaining_handles,
+                        query_pos % PAGE_TOKENS,
+                        checkpoint,
+                        pool,
+                        max_cpu_nodes,
+                        current_total + delta as usize,
+                    )?;
+                    return Ok(delta);
+                }
+            };
 
         let child = match tree.nodes.get(&child_id) {
             Some(c) => c,
@@ -1044,6 +1167,7 @@ fn insert_into_tree(
                     remaining_handles,
                     first_skip,
                     checkpoint,
+                    pool,
                     max_cpu_nodes,
                     current_total + delta as usize,
                 )?;
@@ -1058,8 +1182,9 @@ fn insert_into_tree(
 /// page. Returns the number of nodes added.
 ///
 /// Transactional (spec §4.3): if the CPU node bound is hit partway through,
-/// every node this call created is removed and unlinked again, so the tree
-/// and the caller's node-count accounting stay consistent — the insert is
+/// every node this call created is removed and unlinked again, and every
+/// cache ref this call took is released, so the tree, the node-count
+/// accounting AND the pool refcounts stay consistent — the insert is
 /// refused whole, not half-applied.
 fn create_chain(
     tree: &mut DomainTree,
@@ -1068,6 +1193,7 @@ fn create_chain(
     handles: &[Handle],
     first_skip: usize,
     checkpoint: Option<CheckpointId>,
+    pool: &mut PagePool,
     max_cpu_nodes: usize,
     current_total: usize,
 ) -> Result<i32, InsertError> {
@@ -1075,8 +1201,10 @@ fn create_chain(
     let mut token_pos = 0usize;
     let mut handle_idx = 0usize;
     let mut added: i32 = 0;
-    // (node_id, first_token) for every node created by this call, for rollback.
-    let mut created: Vec<(NodeId, u32)> = Vec::new();
+    // (node_id, first_token, page_handle) for every node created by this
+    // call — nodes for unlinking on rollback, handles for releasing the
+    // cache refs the index took for them.
+    let mut created: Vec<(NodeId, u32, PageHandle)> = Vec::new();
 
     while token_pos < tokens.len() {
         // The first node of a mid-page branch claims only the tail of its
@@ -1114,12 +1242,14 @@ fn create_chain(
             // linked into `parent` — later nodes hang off earlier created
             // nodes, which `tree.nodes.remove` makes unreachable. Unlinking
             // later nodes by first_token could otherwise remove an unrelated
-            // pre-existing sibling of `parent`.
-            if let Some((_, first_ft)) = created.first().copied() {
+            // pre-existing sibling of `parent`. Each created node held one
+            // cache ref: release them all so the pages stay reclaimable.
+            if let Some((_, first_ft, _)) = created.first().copied() {
                 tree.nodes.get_mut(&parent).unwrap().children.remove(&first_ft);
             }
-            for (id, _) in created.into_iter().rev() {
+            for (id, _, ph) in created.into_iter().rev() {
                 tree.nodes.remove(&id);
+                let _ = pool.release_cache_ref(ph.phys);
             }
             // The unused node id stays allocated (monotonic ids may have
             // gaps — harmless).
@@ -1129,8 +1259,27 @@ fn create_chain(
             });
         }
 
+        // The index owns one cache ref per node slot holding a handle (see
+        // the ownership doc on `PrefixIndex`). Refuse the whole insert if
+        // the pool refuses the ref (Free/ReclaimPending page): a node whose
+        // ref could not be taken would be released into underflow by
+        // eviction later.
+        if let Err(e) = pool.add_cache_ref(page_handle.phys) {
+            if let Some((_, first_ft, _)) = created.first().copied() {
+                tree.nodes.get_mut(&parent).unwrap().children.remove(&first_ft);
+            }
+            for (id, _, ph) in created.into_iter().rev() {
+                tree.nodes.remove(&id);
+                let _ = pool.release_cache_ref(ph.phys);
+            }
+            return Err(InsertError::InvalidHandle(format!(
+                "cache ref refused for phys {} (handle gen {}): {e}",
+                page_handle.phys, page_handle.generation
+            )));
+        }
+
         tree.nodes.insert(node_id, new_node);
-        created.push((node_id, first_token));
+        created.push((node_id, first_token, page_handle));
         added += 1;
 
         tree.nodes.get_mut(&current_parent).unwrap().children.insert(first_token, node_id);
@@ -1292,11 +1441,12 @@ mod tests {
         let allocated = pool.alloc_pages(&mut table, n_pages);
         assert_eq!(allocated, n_pages);
 
+        // Seal only: the index takes its own cache refs at publish time
+        // (cache-ref ownership moved inside `insert`).
         let mut handles = Vec::new();
         for lp in 0..n_pages {
             let phys = table.physical(lp).unwrap();
             pool.seal(phys).unwrap();
-            pool.add_cache_ref(phys).unwrap();
             let gen = pool.page_generation(phys);
             handles.push(Handle {
                 handle: PageHandle {
@@ -1310,7 +1460,8 @@ mod tests {
         (pool, handles)
     }
 
-    /// Create a single pool with `n_pages` pages, seal + cache-ref each.
+    /// Create a single pool with `n_pages` pages and seal each page (the
+    /// index takes the cache refs at publish time).
     fn setup_big_pool(n_pages: usize) -> (PagePool, Vec<Handle>) {
         let mut pool = PagePool::new_with_strides(64, 128, 128).unwrap();
         let mut table = BlockTable::new();
@@ -1319,7 +1470,6 @@ mod tests {
         for lp in 0..n_pages {
             let phys = table.physical(lp).unwrap();
             pool.seal(phys).unwrap();
-            pool.add_cache_ref(phys).unwrap();
             let gen = pool.page_generation(phys);
             handles.push(Handle {
                 handle: PageHandle { phys, epoch: pool.epoch(), generation: gen },
@@ -1414,7 +1564,6 @@ mod tests {
                     for lp in 0..need {
                         let phys = table.physical(lp).unwrap();
                         pool.seal(phys).unwrap();
-                        pool.add_cache_ref(phys).unwrap();
                         phys_list.push(phys);
                         handles.push(Handle {
                             handle: PageHandle {
@@ -1439,12 +1588,10 @@ mod tests {
                             keys.push(key);
                         }
                         Err(_) => {
-                            // Refused insert: the pages were never handed
-                            // to the index — release the test's cache refs
-                            // so they return to the pool.
-                            for &p in &phys_list {
-                                let _ = pool.release_cache_ref(p);
-                            }
+                            // Refused insert: release the TABLE refs so the
+                            // pages return to the pool (the index took no
+                            // cache refs — it refused whole).
+                            let _ = pool.release_table(&mut table);
                             pool.drain_completed();
                         }
                     }
@@ -2128,10 +2275,9 @@ mod tests {
         assert_eq!(allocated, 2);
         let phys0 = table.physical(0).unwrap();
         let phys1 = table.physical(1).unwrap();
+        // Seal only — the index takes its own cache refs at publish.
         pool.seal(phys0).unwrap();
-        pool.add_cache_ref(phys0).unwrap();
         pool.seal(phys1).unwrap();
-        pool.add_cache_ref(phys1).unwrap();
         let handles = vec![
             Handle {
                 handle: PageHandle { phys: phys0, epoch: 0, generation: pool.page_generation(phys0) },
@@ -2164,9 +2310,10 @@ mod tests {
         }
         index.release_pin(&domain, std::mem::take(&mut _ticket));
 
-        // Invalidate page 0: drop its cache ref, then drop the table ref —
-        // it frees (generation bumps) while page 1 stays cache-resident.
-        pool.release_cache_ref(phys0).unwrap();
+        // Invalidate page 0: drop the INDEX's cache ref on it (test seam),
+        // then drop the table ref — it frees (generation bumps) while page
+        // 1 stays cache-resident.
+        index.test_drop_page_ref(&mut pool, &domain, phys0);
         pool.release_table(&mut table).unwrap();
         assert_eq!(pool.page_state(phys0), rdna_compute::page_pool::PageState::Free);
         assert_eq!(pool.page_state(phys1), rdna_compute::page_pool::PageState::CacheOnly);
