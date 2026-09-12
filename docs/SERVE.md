@@ -351,6 +351,35 @@ Vision+prefix reuse stays off. Tools/stop/logprobs stay refused on slots.
 `serve.scheduler_overlap` stays off (no overlap implementation, no
 host-gap to measure). This is not a registry admission.
 
+### Capability advertisement
+
+`/health` carries a `capabilities` object built once at startup from the
+SAME resolved config the daemon's slot engine reads, so what is advertised
+is what the engine was built with. `/v1/models` entries carry a
+per-model `capabilities` projection (route facts plus `.mtp`/`.vl` sidecar
+probes on the model file), and `/stats` reports `mode`, `slots`, and
+`prefix_cache`. OpenAI-compatible clients ignore the extra fields;
+hipfire clients (and deployment tooling) use them for discovery:
+
+```json
+{
+  "status": "ok",
+  "capabilities": {
+    "openai_compatible": true,
+    "mode": "multi-slot",
+    "multi_slot": true,
+    "multi_slot_slots": 2,
+    "prefix_cache": true,
+    "structured_output": true,
+    "structured_output_subset": "json-schema-strict-v1",
+    "refused_request_fields": ["tools", "stop", "logprobs", "response_format:json_object"]
+  }
+}
+```
+
+The standard route advertises the honest absence (`"multi_slot": false`,
+`"structured_output": false`) rather than aspirational capabilities.
+
 ```bash
 HIPFIRE_SERVE_MULTI_SLOT=true HIPFIRE_SERVE_PREFIX_CACHE=true \
   hipfire serve 127.0.0.1:11435 <model.hfq>

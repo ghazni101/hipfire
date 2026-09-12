@@ -384,6 +384,7 @@ fn main() {
     let mut scheduler = Scheduler {
         chunk_size,
         vl_sequential: false,
+        prefill_cursor: 0,
     };
     let mut n_generated = vec![0usize; pool_capacity];
     // Every slot holding an admitted session starts NOT finished; the
@@ -393,7 +394,7 @@ fn main() {
 
     println!("\n--- generating (each line: one step, one token per still-active session) ---");
     for step in 0..n_steps {
-        let batch = scheduler.next_batch(&mut work);
+        let batch = scheduler.next_batch(&mut work, chunk_size.max(1), 1);
         if batch.is_empty() {
             break;
         }

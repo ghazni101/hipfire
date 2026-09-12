@@ -67,6 +67,16 @@ pub struct Session {
     /// symptom). Lives on the session, not the slot: it must survive
     /// eviction/restore and apply wherever the session is resumed.
     pub rope_delta: i32,
+    /// Highest page-aligned token boundary of this session's KV that has
+    /// been published to the cross-session prefix cache (spec §4.6 C6).
+    ///
+    /// Lives on the session, not the slot: a continuation turn must resume
+    /// publication from here, or it re-takes cache refs on pages the radix
+    /// already owns (each orphaned ref strands the page away from the free
+    /// list — a monotonic pool drain across turns). Reset to 0 whenever the
+    /// session's physical pages are lost (swap/cold), because the radix's
+    /// handles no longer describe the restored pages.
+    pub published_boundary: usize,
     /// Monotonic stamp for LRU. Bumped by `touch`.
     pub last_used: u64,
 }
@@ -117,6 +127,7 @@ impl SessionTable {
                 residency: Residency::Resident,
                 convo: Vec::new(),
                 rope_delta: 0,
+                published_boundary: 0,
                 last_used: {
                     self.clock += 1;
                     self.clock
@@ -270,6 +281,10 @@ impl SessionTable {
                 pool.release(slot);
             }
             s.residency = Residency::Swapped;
+            // The snapshot restore allocates FRESH pages; the radix's
+            // handles no longer describe this session's table, so the next
+            // published turn must start its publication accounting over.
+            s.published_boundary = 0;
         }
     }
 
@@ -282,6 +297,7 @@ impl SessionTable {
             }
             s.residency = Residency::Cold;
             s.next_pos = 0;
+            s.published_boundary = 0;
         }
     }
 

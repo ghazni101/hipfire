@@ -360,6 +360,7 @@ fn main() {
     let mut scheduler = Scheduler {
         chunk_size,
         vl_sequential: false,
+        prefill_cursor: 0,
     };
     let mut n_generated = vec![0usize; n_slots];
     let mut finished = vec![false; n_slots];
@@ -390,7 +391,7 @@ fn main() {
     // Safety net against an infinite loop from a logic error above; a
     // correct run always terminates within n_steps.
     for step in 0..n_steps {
-        let batch = scheduler.next_batch(&mut work);
+        let batch = scheduler.next_batch(&mut work, chunk_size.max(1), 1);
         if batch.is_empty() {
             break;
         }

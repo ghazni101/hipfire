@@ -126,6 +126,137 @@ pub(crate) struct ServeShared {
     /// `serve.stream_stall_timeout_ms`). The request is aborted after this
     /// deadline on the multi-slot route.
     pub(crate) stream_stall_timeout: Duration,
+    /// Route capability advertisement (spec §9.1 observability; OpenAI
+    /// discovery). Built ONCE at startup from the same resolved config the
+    /// daemon reads, so what `/health` advertises is what the slot engine
+    /// was built with — never a separate source of truth. Immutable:
+    /// route capabilities are configuration, not live state.
+    pub(crate) capabilities: serde_json::Value,
+}
+
+/// Mirror of the MTP sidecar probe in
+/// `hipfire_arch_qwen35::mtp_head::mtp_sidecar_candidates` (hipfire-cli
+/// does not depend on the arch crate — keep the two in sync). Candidates:
+/// `<name-with-last-ext-replaced>.mtp`, `<stem-without-.hfq-or-quant>.mtp`.
+pub(crate) fn mtp_sidecar_exists(trunk: &std::path::Path) -> bool {
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    let mut push = |p: std::path::PathBuf| {
+        if !candidates.iter().any(|e| e == &p) {
+            candidates.push(p);
+        }
+    };
+    push(trunk.with_extension("mtp"));
+    let name = trunk.file_name().and_then(|s| s.to_str()).unwrap_or("");
+    let parent = trunk.parent().unwrap_or_else(|| std::path::Path::new("."));
+    let stem = name.strip_suffix(".hfq").unwrap_or(name);
+    const QUANTS: &[&str] = &[
+        ".mq4v2", ".mq6v2", ".mq5v2", ".mq3v2", ".mq2v2", ".mq4cg256", ".mq4",
+        ".mq6", ".mq8", ".q8", ".q4", ".bf16",
+    ];
+    for q in QUANTS {
+        if let Some(base) = stem.strip_suffix(q) {
+            push(parent.join(format!("{base}.mtp")));
+        }
+    }
+    if let Some((base, rest)) = stem.rsplit_once('.') {
+        if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphanumeric()) {
+            push(parent.join(format!("{base}.mtp")));
+        }
+    }
+    candidates.into_iter().any(|p| p.exists())
+}
+
+/// Vision sidecar probe — mirrors the daemon's `discover_vl_sidecar`
+/// sibling convention (`<stem>.vl`; the HIPFIRE_VL_FILE override is
+/// daemon-env state the serve cannot see, so this probe is the sibling
+/// convention only).
+pub(crate) fn vision_sidecar_exists(trunk: &std::path::Path) -> bool {
+    match (trunk.parent(), trunk.file_stem()) {
+        (Some(parent), Some(stem)) => {
+            parent.join(format!("{}.vl", stem.to_string_lossy())).exists()
+        }
+        _ => false,
+    }
+}
+
+/// Build the route capability advertisement from the resolved serve
+/// configuration (spec §9.1). Pure so tests can pin the payload shape.
+/// Values come from the SAME config resolution the daemon's slot engine
+/// reads, so this never drifts from what the engine was built with.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn route_capabilities(
+    multi_slot: bool,
+    multi_slot_slots: u64,
+    multi_slot_ctx: u64,
+    multi_slot_prefill_chunk: u64,
+    prefix_cache: bool,
+    prefix_cache_max_bytes: u64,
+    structured_jump_forward: bool,
+    scheduler_overlap: bool,
+    max_batch_tokens: u64,
+    prefill_min_tokens: u64,
+    max_queue: u64,
+    max_queue_bytes: u64,
+    queue_timeout_ms: u64,
+    stream_buffer_bytes: u64,
+    stream_stall_timeout_ms: u64,
+    max_request_bytes: u64,
+) -> serde_json::Value {
+    // Structured output is a property of the multi-slot route (the strict
+    // json_schema subset + framing-aware cursor live in the slot engine);
+    // the standard route refuses response_format rather than enforcing it.
+    let structured_output = multi_slot;
+    serde_json::json!({
+        "openai_compatible": true,
+        "mode": if multi_slot { "multi-slot" } else { "standard" },
+        "streaming": true,
+        "multi_slot": multi_slot,
+        "multi_slot_slots": multi_slot_slots,
+        "multi_slot_ctx": multi_slot_ctx,
+        "multi_slot_prefill_chunk": multi_slot_prefill_chunk,
+        "prefix_cache": prefix_cache,
+        "prefix_cache_max_bytes": prefix_cache_max_bytes,
+        "structured_output": structured_output,
+        "structured_output_subset": if structured_output {
+            serde_json::json!("json-schema-strict-v1")
+        } else {
+            serde_json::Value::Null
+        },
+        "structured_jump_forward": structured_jump_forward,
+        "scheduler_overlap": scheduler_overlap,
+        "max_batch_tokens": max_batch_tokens,
+        "prefill_min_tokens": prefill_min_tokens,
+        "max_queue": max_queue,
+        "max_queue_bytes": max_queue_bytes,
+        "queue_timeout_ms": queue_timeout_ms,
+        "stream_buffer_bytes": stream_buffer_bytes,
+        "stream_stall_timeout_ms": stream_stall_timeout_ms,
+        "max_request_bytes": max_request_bytes,
+        // Honest refusal list: fields this route rejects BEFORE generation
+        // (typed 400s). Mirrors `multi_slot_request_supported` + the
+        // response_format gate.
+        "refused_request_fields": if multi_slot {
+            serde_json::json!(["tools", "stop", "logprobs", "response_format:json_object"])
+        } else {
+            serde_json::json!(["response_format"])
+        },
+    })
+}
+
+/// Per-model capability projection for `/v1/models`: the ROUTE-level
+/// multi-slot/structured-output facts plus model-file facts (sidecar
+/// presence) probed from the trunk path.
+pub(crate) fn model_capabilities(
+    route: &serde_json::Value,
+    trunk: &std::path::Path,
+) -> serde_json::Value {
+    serde_json::json!({
+        "multi_slot": route["multi_slot"],
+        "structured_output": route["structured_output"],
+        "prefix_cache": route["prefix_cache"],
+        "mtp_sidecar": mtp_sidecar_exists(trunk),
+        "vision_sidecar": vision_sidecar_exists(trunk),
+    })
 }
 
 #[derive(Debug, Default)]
@@ -223,9 +354,10 @@ pub(crate) struct AdmissionGuard {
     is_eligible: bool,
     model: Option<String>,
     /// Canonical pending-input bytes this request charged to the queue
-    /// (spec §5.3). Released exactly once on Drop so a queued request's
-    /// bytes are charged once and released once across cancel/timeout/normal
-    /// paths. Zero when the request was admitted immediately (never queued).
+    /// (spec §5.3). Released exactly once at ACQUIRE time (the queued
+    /// byte charge converts to the in-flight charge) across
+    /// cancel/timeout/normal paths. Zero when the request was admitted
+    /// immediately (never queued).
     queue_bytes: u64,
 }
 
@@ -1050,6 +1182,13 @@ pub(crate) fn serve_foreground(
     let stream_buffer_bytes = config_u64(&global, "serve.stream_buffer_bytes")?;
     let stream_stall_timeout =
         Duration::from_millis(config_u64(&global, "serve.stream_stall_timeout_ms")?);
+    // Cache/scheduler route flags (spec §9.1). Read with the SAME config
+    // resolution the daemon applies so /health advertises the engine's
+    // actual build options.
+    let prefix_cache = config_bool(&global, "serve.prefix_cache")?;
+    let prefix_cache_max_bytes = config_u64(&global, "serve.prefix_cache_max_bytes")?;
+    let structured_jump_forward = config_bool(&global, "serve.structured_jump_forward")?;
+    let scheduler_overlap = config_bool(&global, "serve.scheduler_overlap")?;
     // Multi-slot is an alternate daemon-owned Qwen35 mode, not continuous batching.
     // Combining them is rejected until a future integration lands. The robust
     // multi-slot mode also rejects an uncapped queue (serve.max_queue=0) rather
@@ -1089,7 +1228,28 @@ pub(crate) fn serve_foreground(
             multi_slot_slots, multi_slot_ctx
         );
     }
+    // Capability advertisement snapshot (see `route_capabilities`): built
+    // once here, after startup validation, from the resolved values below.
+    let capabilities = route_capabilities(
+        multi_slot_enabled,
+        multi_slot_slots,
+        multi_slot_ctx,
+        multi_slot_prefill_chunk,
+        prefix_cache,
+        prefix_cache_max_bytes,
+        structured_jump_forward,
+        scheduler_overlap,
+        max_batch_tokens,
+        prefill_min_tokens,
+        max_queue as u64,
+        max_queue_bytes,
+        queue_timeout.as_millis() as u64,
+        stream_buffer_bytes,
+        stream_stall_timeout.as_millis() as u64,
+        max_request_bytes,
+    );
     let shared = Arc::new(ServeShared {
+        capabilities,
         metrics: metrics::Metrics::default(),
         runtime: Mutex::new(ServeRuntime {
             engine,
@@ -1196,9 +1356,6 @@ pub(crate) fn serve_foreground(
         let shared = Arc::clone(&shared);
         thread::spawn(move || loop {
             thread::sleep(Duration::from_secs(1));
-            if shared.admission.inflight() != 0 {
-                continue;
-            }
             let expired = {
                 let meta = shared
                     .meta
@@ -1214,6 +1371,15 @@ pub(crate) fn serve_foreground(
                     .runtime
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
+                // Inflight check INSIDE the runtime lock (TOCTOU): the old
+                // check-then-lock window let a request acquire its permit
+                // between the check and the unload — unloading the model
+                // out from under a live request. Under the lock, a request
+                // either has its permit (inflight != 0 → skip) or has not
+                // started (unload precedes it).
+                if shared.admission.inflight() != 0 {
+                    continue;
+                }
                 if runtime.current_path.is_some() {
                     let result = runtime.engine.unload();
                     if result.is_ok() {
@@ -2609,5 +2775,100 @@ mod tests {
             assert_eq!(err.kind(), AdmissionErrorKind::Cancelled);
             assert!(err.is_cancelled());
         });
+    }
+}
+
+#[cfg(test)]
+mod capabilities_tests {
+    use super::*;
+
+    fn route() -> serde_json::Value {
+        route_capabilities(
+            /*multi_slot*/ true,
+            2,
+            50000,
+            1024,
+            /*prefix_cache*/ true,
+            536870912,
+            /*jump_forward*/ true,
+            /*overlap*/ false,
+            8192,
+            1,
+            64,
+            268435456,
+            30000,
+            4 << 20,
+            30_000,
+            64 << 20,
+        )
+    }
+
+    /// The multi-slot route advertises every capability a client needs to
+    /// discover before using it (spec §9.1): slots, cache, structured
+    /// output subset, queue bounds, and the honest refusal list.
+    #[test]
+    fn multi_slot_route_advertises_capabilities() {
+        let caps = route();
+        assert_eq!(caps["mode"], "multi-slot");
+        assert_eq!(caps["multi_slot"], true);
+        assert_eq!(caps["multi_slot_slots"], 2);
+        assert_eq!(caps["multi_slot_ctx"], 50000);
+        assert_eq!(caps["prefix_cache"], true);
+        assert_eq!(caps["prefix_cache_max_bytes"], 536870912);
+        assert_eq!(caps["structured_output"], true);
+        assert_eq!(caps["structured_output_subset"], "json-schema-strict-v1");
+        assert_eq!(caps["structured_jump_forward"], true);
+        assert_eq!(caps["scheduler_overlap"], false);
+        assert_eq!(caps["max_batch_tokens"], 8192);
+        assert_eq!(caps["max_queue"], 64);
+        assert_eq!(caps["queue_timeout_ms"], 30000);
+        assert_eq!(caps["openai_compatible"], true);
+        let refused = caps["refused_request_fields"].as_array().unwrap();
+        for field in ["tools", "stop", "logprobs", "response_format:json_object"] {
+            assert!(
+                refused.iter().any(|v| v == field),
+                "refusal list must contain {field}"
+            );
+        }
+    }
+
+    /// The standard route must NOT advertise multi-slot/structured-output
+    /// capabilities it does not have — advertisement is honest, not
+    /// aspirational (spec §6 X2: no silent capability inflation).
+    #[test]
+    fn standard_route_advertises_honest_absence() {
+        let caps = route_capabilities(
+            false, 4, 8192, 1024, false, 0, false, false, 4096, 1, 64,
+            268435456, 30000, 4 << 20, 30_000, 64 << 20,
+        );
+        assert_eq!(caps["mode"], "standard");
+        assert_eq!(caps["multi_slot"], false);
+        assert_eq!(caps["structured_output"], false);
+        assert!(caps["structured_output_subset"].is_null());
+        assert_eq!(caps["prefix_cache"], false);
+        let refused = caps["refused_request_fields"].as_array().unwrap();
+        assert!(refused.iter().any(|v| v == "response_format"));
+    }
+
+    /// Per-model projection: sidecar probes hit the filesystem, so use the
+    /// cargo manifest as a trunk that certainly has no sidecars.
+    #[test]
+    fn model_capabilities_probe_sidecars() {
+        let caps = model_capabilities(&route(), std::path::Path::new("Cargo.toml"));
+        assert_eq!(caps["multi_slot"], true);
+        assert_eq!(caps["structured_output"], true);
+        assert_eq!(caps["mtp_sidecar"], false);
+        assert_eq!(caps["vision_sidecar"], false);
+
+        // A trunk whose stripped-quant sibling exists: mirror of the
+        // qwen35 convention (`model.mq4v2.hfq` → `model.mtp`).
+        let dir = std::env::temp_dir().join(format!("hipfire-caps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let trunk = dir.join("model.mq4v2.hfq");
+        std::fs::write(&trunk, b"x").unwrap();
+        std::fs::write(dir.join("model.mtp"), b"x").unwrap();
+        let caps = model_capabilities(&route(), &trunk);
+        assert_eq!(caps["mtp_sidecar"], true, "quant-stripped .mtp sibling found");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

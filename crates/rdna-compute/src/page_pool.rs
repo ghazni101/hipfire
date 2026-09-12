@@ -911,7 +911,11 @@ impl PagePool {
     /// Mark a full page as [`PageState::Sealed`] (immutable).  Idempotent
     /// on already-Sealed pages.  Returns `Err` if the page is Free,
     /// CacheOnly, or ReclaimPending (spec §4.3).
+    ///
+    /// Bounds-checks `phys` first like every other public entry point — a
+    /// stale or fabricated index must produce `Err`, never a panic.
     pub fn seal(&mut self, phys: u32) -> Result<(), String> {
+        self.check_phys(phys)?;
         let meta = &mut self.page_meta[phys as usize];
         match meta.state {
             PageState::Private => {

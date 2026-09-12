@@ -72,6 +72,63 @@ Perf hardening: `is_token_allowed` gained bounded fast paths (structural first-b
 | W10-6 | A20 model swap + idle spill/restore | `--a20` cell: slot pressure spills an idle session (evictions=1), named reentry restores it (restores=1, reused ≥ prompt); two shutdown+respawn cycles each cold→warm with stable `free_pages`. PASS. |
 | W10-7 | A13 adversarial multi-domain wait bounds | Concurrent phase now mixes samplers (2 greedy + sampled + penalized, distinct convos) with a per-request 120 s wait-bound assertion. PASS. |
 
+
+### Wave 11 — deep-review fix campaign (2026-09-12)
+
+A full deep review (three parallel sweeps + first-party verification of the
+pool/index/fairness/checkpoint cores) found two P0s, four P1s, and a set of
+P2 design gaps. Every finding below was fixed and verified; all 39 workspace
+lib suites green (saddle-core 210, hipfire-runtime 698, hipfire-arch-qwen35
+261); GPU compose oracle + A19/A20 fault cells PASS; live serve regression
+matrix PASS.
+
+| # | Area | Bug | Fix |
+|---|---|---|---|
+| P0-1 | `serve_engine.rs` | Prefix-cache publication ran between the forward and its error check: a failed step sealed/published unwritten pages and captured a mid-layer DN checkpoint, permanently poisoning the radix | Publication (and checkpoint capture) gated on `fwd.is_ok()`; spec §4.6/§5.4 |
+| P0-2 | `grammar.rs` | Malformed keyword VALUES silently compiled to no constraint (`{"enum":"hello"}` → `Any`, `required` as string → empty, non-numeric `minItems` → 0): strict requests ran unconstrained and reported success | Every present-but-wrong-typed keyword value is a typed `InvalidSchema`; empty `enum` rejected as unsatisfiable (CLI validator aligned) |
+| P1-2 | `serve_engine.rs` | The COW write barrier never executed its copies: the forward wrote through the still-bound sealed mapping and `commit_cow` rebind to uninitialized destinations (reachable via edited-history continuations) | `execute_cow_copies` runs the per-layer K/V d2d copies at plan time; commit (rebind) moved BEFORE the forward; commit failure fails only that slot |
+| P1-3 | `serve_engine.rs` | Prefix-hit restore was fail-open on the share step: `share_published_pages` failure fell to cold prefill on top of an advanced DN state (silent corruption) | DN state reset on ANY non-converting exit of the hit path |
+| P1-4 | `serve_engine.rs` | Dropping an MTP draft in the reservation-shrink path wedged the slot forever (`remaining_prompt` was already taken; every readiness predicate false) | Draft seeds stashed per-slot; a dropped draft restores the seed and retires `mtp_active`. Pre-draft budget gate caps drafted slots at `max_batch_tokens/(k+1)` in FairQueue age order |
+| P1-5 | `serve_engine.rs` | Continuation admits reset `last_published_boundary` to 0: every turn re-took cache refs on already-published pages — orphaned refs stranded pages away from the free list (monotonic pool drain) | Published boundary persisted on the session (`Session::published_boundary`), seeded from reuse at admit, clamped at `begin_turn`, reset on swap/cold |
+| P1-6 | `serve_engine.rs` | Plain-AR slots never set `decoding`: decode rows were classified as prefill (FairQueue Phase-1 never applied) and generated pages published mid-flight (C6 violation) while the Done path never published | `decoding=true` set at the prefill→decode transition; Done-time `publish_generated_prefix` on the plain-decode terminal; mid-step loop skips decoding slots; vision-guard (`rope_delta != 0`) on all publication sites |
+| P1-7 | `grammar.rs` | Dead-end wedges: one-byte-deep pruning let doomed continuations commit (nested numeric enum divergence, nested fraction under `integer`, nested minItems/maxItems, `additionalProperties:false` unknown keys, duplicate keys) then refused completion forever — burn to max_tokens then reject | Scan-level flags (`unknown_key`, `required_missing_on_close`, `min_items_unmet_on_close`, `array_over_max`, `number_dead_end`) are typed errors at the token that proves the dead end; structural pruning refuses `,` after all keys of a closed object, refuses `}` under unmet `required`, forces items under `minItems`, forces close over `maxItems`; key-string filter prunes characters that diverge from unused known keys; nested numeric dead ends (fraction under `Integer`, impossible `Const`/`Enum` targets) classified BEFORE the phase flip |
+| P1-8 | `grammar.rs` | `is_token_allowed` at a number/literal tail was O(vocab × output_len): clone + full rescan + reparse per candidate (measured 135× slower than adjacent positions) | Number-tail fast path (pure continuation bytes at Any/Number/Integer positions — dot-free under `Integer`) plus an exact structural-byte refusal at literal tails; the O(n) simulation remains the authority for everything else |
+| P1-9 | `http.rs`/`slots.rs` | Terminal-ack wait had no deadline (a zero-window client pinned the admission permit forever); engine-originated queue rejections surfaced as 500, never the spec's 429 | Terminal ack bounded by `stream_stall_timeout`; queue-full/timeout/cancelled rejections classified `overload` daemon-side and mapped to 429; refusal messages mapped to 400 |
+| P2-1 | `serve_engine.rs`/`serve_wait.rs` | Waiter deadlines denominated in ticks (1 tick ≈ 1 ms assumption false in both directions); new Submits admitted ahead of queued waiters; re-enqueue after a failed retry slid the deadline forever; no cancellation for queued work | Wall-clock `Instant` deadlines (`queue_timeout_ms`); newcomer parks when the room is non-empty; original admission age preserved across retries (`pending_repark_age` handoff); `EngineCommand::CancelWaiting` + `SubmitRequest::request_tag` wired from the daemon abort path |
+| P2-2 | `serve_engine.rs` | Dead pub-ref scheme: refs taken by the caller before insert were orphaned whenever the index declined to adopt pages | Cache-ref ownership moved INSIDE the index (one ref per node slot, released on rollback/eviction/release_all); callers only `seal`; orphaned-ref class eliminated structurally |
+| P2-3 | `prefix_index.rs` | No ceiling on retained KV page bytes (only checkpoints were bounded) | `PrefixIndex::max_retained_bytes` enforced at insert with leaf eviction; `retained_bytes()` observable; wired to `serve.prefix_cache_max_bytes` |
+| P2-4 | misc | `seal()` missing `check_phys`; schema-cache key `unwrap_or_default()` collision; 24 stats `expect`s poisoning callers' threads; sequential-VL silently dropping penalties/min_p; mid-string `<think>` un-masking; jump-forward planning during think; dead role chunk (compiler-verified); idle-eviction TOCTOU; stale demo examples; bench attempt-id reuse across repetitions; `AdmissionGuard` doc drift; CLI/compiler `items`-bool drift; huge-int const f64 confusion | All fixed (small, each with tests where host-testable) |
+
+New regression tests: 9 saddle-core tests (nested max/minItems pruning, AP:false
+key pruning + close forcing, duplicate-key pruning, malformed keyword values,
+huge-int const, number-tail soundness). Verification:
+
+- `cargo test --workspace --lib`: 39 suites green.
+- GPU compose oracle (gfx1101 container): greedy cold/warm/branch 0→256→256,
+  sampled deterministic, grammar JSON, A10 (long-generate + forced
+  full-reject), A13 (mixed + concurrent samplers), A20 soak free_pages flat
+  (20,20,20,20) — the continuation-leak fix's direct evidence — reset →
+  cold → re-warm 256.
+- A19 fault cells: publish-fault honest miss; HIP upload/launch/sync typed
+  rejection + same-engine exact recovery.
+- Live `hipfire-serve` (Ornith-1.5-9B MQ4, multi-slot 2, prefix cache on,
+  q8): chain cached_tokens 0→40→83→126 (restarted engine: 0→89→192→265→346
+  canonical), radix cold 0/warm 256/branch 256, strict json_schema returns
+  schema-valid JSON with `finish=stop` under the framing-aware cursor
+  (text-based `</think>` detection added: a tokenizer without the special
+  close id no longer defers the mask forever), typed refusals 400, 6-vs-2
+  concurrent all-complete.
+- hipfire binary md5 `dd8e629baa6da05fc7bed9de92141d30`; daemon md5
+  `dac823c79ed4354aa1a26a60f3910685`.
+
+Residual (documented, out of scope): FairQueue remains an eligibility mask
+rather than the allocation authority (verify rows pre-subtracted; forced rows
+ride prefill); `ServeCapacityAccount` stays an unwired (correct, tested)
+primitive; key-filter pruning covers AP:false objects only (duplicate unknown
+keys under open objects still fail at completion); engine-side stall skip on
+a bounded event channel remains open (CLI-side byte bound + deadline are
+enforced).
+
 ---
 
 ## What was done
