@@ -1,9 +1,8 @@
 # K2-Horizon serving container — pre-built binaries on ROCm base.
 #
-# 100k Q8 KV context does NOT fit: 19 GB model + 10.44 GB KV = 29.44 GB
-# vs 24.5 GB usable on gfx1100. Max feasible ≈ 48k tokens (5 GB KV).
-# DEFAULT_MAX_SEQ raised to 65536 in forward.rs; config sets 32768
-# (safe margin for state buffers + JIT kernel cache).
+# 50k Q8 KV context: 19 GB model + ~5 GB KV ≈ 24 GB on 24.5 GB usable
+# gfx1100. 64k OOM'd (hipMalloc out of memory, 26 MB free at KV alloc).
+# Reasoning is uncapped (budget="uncapped") — no think-token cap.
 #
 # Build:
 #   docker build -f Containerfile.k2-horizon -t k2-horizon-serve .
@@ -40,7 +39,8 @@ COPY <<'EOF' /root/.hipfire/config.toml
 schema_version = 1
 
 [reasoning]
-mode = "on"
+# uncapped — no think-token cap; the model reasons until it closes the block.
+budget = "uncapped"
 
 [serve]
 multi_slot = false
@@ -50,7 +50,7 @@ mtp = "on"
 
 [memory]
 kv_cache = "q8"
-max_seq = 32768
+max_seq = 40960
 EOF
 
 # Symlink model into the models directory so /v1/models lists it.
