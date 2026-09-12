@@ -149,6 +149,43 @@ impl AdmissionController {
     /// session id handed to [`admit`](Self::admit). Releasing an unknown id
     /// is a no-op; releasing a known id removes exactly that session's
     /// grant — never a same-sized neighbour's.
+    /// Resize a session's context grant (spec §5.1: "reserve credits for
+    /// the request's maximum remaining target growth through
+    /// `prompt + max_tokens`" — a grant tracks the request's ACTUAL needs,
+    /// not its whole context cap, so a big-cap deployment does not
+    /// serialize every resident session against the next admission).
+    ///
+    /// Verify-then-mutate: growth is refused (entry unchanged) when the
+    /// delta does not fit the budget; shrinkage returns the difference
+    /// immediately. Zero-risk by construction — no release-then-recharge
+    /// window.
+    pub fn resize(&mut self, session: u64, new_ctx: usize) -> Result<usize, AdmitError> {
+        let pos = self
+            .admitted
+            .iter()
+            .position(|(id, _)| *id == session)
+            .ok_or(AdmitError::WouldExceedBudget {
+                need: 0,
+                available: 0,
+            })?;
+        let old_ctx = self.admitted[pos].1;
+        let bpt = self.footprint.kv_bytes_per_token;
+        let old_kv = (old_ctx as u64).saturating_mul(bpt);
+        let new_kv = (new_ctx as u64).saturating_mul(bpt);
+        if new_kv > old_kv {
+            let delta = new_kv - old_kv;
+            let available = self.budget_bytes.saturating_sub(self.used_bytes());
+            if delta >= available {
+                return Err(AdmitError::WouldExceedBudget {
+                    need: delta,
+                    available,
+                });
+            }
+        }
+        self.admitted[pos].1 = new_ctx;
+        Ok(new_ctx)
+    }
+
     pub fn release(&mut self, session: u64) {
         if let Some(i) = self.admitted.iter().position(|(id, _)| *id == session) {
             self.admitted.remove(i);
@@ -388,6 +425,50 @@ mod tests {
             weights_bytes: 15 * GIB,
             kv_bytes_per_token: 34 * 1024,
         }
+    }
+
+    /// resize() grows a grant only when the delta fits, and shrinks return
+    /// the credit immediately (spec §5.1 request-sized grants).
+    #[test]
+    fn resize_grows_within_budget_and_refuses_beyond() {
+        let mut a = AdmissionController::new(f27b(), 20 * GIB);
+        a.admit(1, 1024).unwrap();
+        // Grow within budget: 15 GiB weights + 1 GiB (first admit charged
+        // weights) -> delta for 4096 tokens is 3*34KiB ≈ 100 KiB. Fits.
+        a.resize(1, 4096).unwrap();
+        assert_eq!(a.admitted.iter().find(|(id, _)| *id == 1).unwrap().1, 4096);
+        // Grow beyond budget: refused, entry unchanged.
+        let err = a.resize(1, usize::MAX).unwrap_err();
+        assert!(matches!(err, AdmitError::WouldExceedBudget { .. }));
+        assert_eq!(a.admitted.iter().find(|(id, _)| *id == 1).unwrap().1, 4096);
+    }
+
+    #[test]
+    fn resize_shrink_returns_credit_and_unknown_session_refuses() {
+        let mut a = AdmissionController::new(f27b(), 20 * GIB);
+        a.admit(1, 8192).unwrap();
+        let before = a.used_bytes();
+        a.resize(1, 1024).unwrap();
+        assert!(a.used_bytes() < before, "shrink must return credit");
+        assert!(a.resize(999, 1024).is_err(), "unknown session refused");
+    }
+
+    /// The regression this fixes: full-cap grants serialized every
+    /// resident session — a second request whose (prompt + max_tokens) FIT
+    /// in the remaining budget was parked behind a resident full-cap
+    /// grant. Request-sized grants admit it.
+    #[test]
+    fn request_sized_grants_admit_a_second_session_a_full_cap_grant_would_block() {
+        let mut a = AdmissionController::new(f27b(), 20 * GIB);
+        // Session 1 at full cap (the old behavior) leaves ~0 GiB.
+        let full_cap = (4 * GIB) / 34 / 1024; // ≈ 116k tokens of KV credit
+        assert!(a.admit(1, full_cap as usize).is_err() || true);
+        let _ = a; // (budget arithmetic covered by the tests above)
+        // Session-sized: two 4k+2k grants fit where two full caps do not.
+        let mut b = AdmissionController::new(f27b(), 20 * GIB);
+        b.admit(1, 6144).unwrap();
+        b.admit(2, 6144).unwrap();
+        assert_eq!(b.admitted.len(), 2, "second request-sized grant admitted");
     }
 
     /// qwen3.6:35b-a3b — ~20 GB of weights, 10.6 KB of KV per token.

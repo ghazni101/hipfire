@@ -616,10 +616,21 @@ impl FairQueue {
         // --- Bounded backfill: starved_oldest (spec §5.3 S3.4) ---
         // Find the oldest request (by fairness order) that has unserved needs
         // and is individually feasible (needed_rows <= max_batch_tokens).
+        //
+        // "Unserved" means got NOTHING this step. A request that received a
+        // grant is being PROGRESSIVELY served — a multi-tick prefill always
+        // has remaining tokens after any finite grant, so counting remaining
+        // tokens alone as unserviced latches starved_oldest for the whole
+        // prefill and (via the engine's backfill mask) starves every other
+        // slot to zero rows until the prefill completes — the exact
+        // serialization this policy was meant to prevent.
         let mut starved_oldest = false;
         let mut best_starved: Option<usize> = None;
         for (i, r) in self.requests.iter().enumerate() {
             let prefill_remaining = r.uncached_prefill_tokens;
+            let got_prefill = grants.iter().any(|g| {
+                matches!(g, Grant::Prefill { id, .. } if *id == r.id)
+            });
             let got_decode = grants.iter().any(|g| {
                 matches!(g, Grant::Decode { id } if *id == r.id)
             });
@@ -629,7 +640,7 @@ impl FairQueue {
             let got_forced = grants.iter().any(|g| {
                 matches!(g, Grant::Forced { id, .. } if *id == r.id)
             });
-            let unserved = prefill_remaining > 0
+            let unserved = (prefill_remaining > 0 && !got_prefill)
                 || (r.wants_decode && r.verify_rows == 0 && !got_decode)
                 || (r.verify_rows > 0 && !got_verify)
                 || (r.forced_rows > 0 && !got_forced);
@@ -669,6 +680,46 @@ mod tests {
 
     fn queue(max_batch_tokens: u64, decode_lanes: u64, prefill_min: u64) -> FairQueue {
         FairQueue::new(max_batch_tokens, decode_lanes, prefill_min).expect("valid config")
+    }
+
+    /// Regression: a decode lane and a multi-tick prefill running together
+    /// must NOT latch starved_oldest (the prefill received a grant and is
+    /// being progressively served). The old "remaining tokens > 0 = unserved"
+    /// test latched starvation for the whole prefill and the engine's
+    /// backfill mask starved the prefilling slot to zero rows until the
+    /// decode finished — serializing two concurrent requests.
+    #[test]
+    fn partial_prefill_grant_does_not_latch_starved_oldest() {
+        let mut q = queue(8192, 2, 1);
+        // A: decoding (wants one decode row), admitted first.
+        q.admit(0, "default", 0).unwrap();
+        q.set_needs(0, true, 0, 0).unwrap();
+        // B: 4320-token prefill, admitted one tick later.
+        q.admit(1, "default", 4320).unwrap();
+        q.set_needs(1, false, 0, 0).unwrap();
+
+        let sel = q.select(2, 1, 8188);
+        assert!(sel.grants.iter().any(|g| matches!(g, Grant::Decode { id: 0 })));
+        assert!(sel.grants.iter().any(|g| matches!(g, Grant::Prefill { id: 1, .. })));
+        assert!(
+            !sel.starved_oldest,
+            "both requests received service — starvation must not latch"
+        );
+
+        // The legitimate case still fires: the oldest request got NOTHING
+        // this step while a younger one was served.
+        let mut q2 = queue(8192, 2, 1);
+        q2.admit(0, "default", 4320).unwrap(); // oldest: prefill
+        q2.set_needs(0, false, 0, 0).unwrap();
+        q2.admit(1, "default", 0).unwrap(); // younger: decode
+        q2.set_needs(1, true, 0, 0).unwrap();
+        // Exhaust the budget with the younger decode lanes so the oldest
+        // prefill cannot receive even its minimum quantum.
+        let sel2 = q2.select(2, 1, 1);
+        assert!(
+            sel2.starved_oldest,
+            "oldest feasible request with zero service must set starved_oldest"
+        );
     }
 
     /// Test 1: aged request beats younger cache hit.

@@ -4856,6 +4856,28 @@ fn admit(
                     }
                     None => None,
                 };
+                // Resize the session's admission grant to the new turn's
+                // actual need BEFORE any mutation (spec §5.1 + §5.4 row 1:
+                // a failed grant is a pre-execution rejection, not a
+                // mid-turn shortfall). The old full-cap grant is shrunk or
+                // grown here; a growth that does not fit the budget fails
+                // this request cleanly and leaves the session untouched.
+                let turn_grant = extended
+                    .len()
+                    .saturating_add(req.max_tokens.max(1))
+                    .min(rig.cap_tokens);
+                if let Err(e) = rig.adm.resize(existing.0, turn_grant) {
+                    let _ = send_event(
+                        &req.reply,
+                        Event::Rejected {
+                            reason: format!(
+                                "admission grant for the extended turn does not fit: {e}"
+                            ),
+                        },
+                    );
+                    lock_stats(stats).note_rejected();
+                    return;
+                }
                 match rig.sessions.begin_turn(&mut rig.pool, existing, &extended) {
                     Ok(plan) => {
                     if let Some(sess) = rig.sessions.get_mut(existing) {
@@ -5017,7 +5039,20 @@ fn admit(
     //   the victim instead: its grant returns to the budget and a future
     //   turn on that conversation simply cold-prefills.
     // In both cases only IDLE sessions are touched — never an active one.
-    let mut opened = rig.sessions.open(&mut rig.pool, &mut rig.adm, rig.cap_tokens);
+    //
+    // The grant is the REQUEST's maximum remaining growth (prompt +
+    // max_tokens, clamped to the context cap), not the whole cap (spec
+    // §5.1). A full-cap grant charged ~1.7 GiB of KV credit per session on
+    // a big-cap deployment: after trunk weights, the SECOND concurrent
+    // request's grant did not fit and it parked behind the first until its
+    // session closed — slots serialized for long generations even though
+    // both had free pages and free rows.
+    let grant_tokens = req
+        .prompt_tokens
+        .len()
+        .saturating_add(req.max_tokens.max(1))
+        .min(rig.cap_tokens);
+    let mut opened = rig.sessions.open(&mut rig.pool, &mut rig.adm, grant_tokens);
     while opened.is_err() && rig.sessions.lru_idle_victim(&busy).is_some() {
         let budget_shaped = matches!(
             opened,
@@ -5045,7 +5080,7 @@ fn admit(
             }
             lock_stats(stats).note_eviction();
         }
-        opened = rig.sessions.open(&mut rig.pool, &mut rig.adm, rig.cap_tokens);
+        opened = rig.sessions.open(&mut rig.pool, &mut rig.adm, grant_tokens);
     }
     let id = match opened {
         Ok(id) => id,

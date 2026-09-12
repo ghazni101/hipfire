@@ -129,6 +129,44 @@ keys under open objects still fail at completion); engine-side stall skip on
 a bounded event channel remains open (CLI-side byte bound + deadline are
 enforced).
 
+### Wave 12 — parallel-generation verification campaign (2026-09-12)
+
+A proper two-slot parallel load verification (two concurrent ~4k-token-prompt
++ 1600-token-generation requests, ~200 of 782 KV pages under load, live
+Ornith serve) exposed TWO real concurrency bugs that every prior test missed
+— the earlier "concurrency" cells used trivial generations that completed
+inside a single scheduling regime:
+
+| # | Layer | Bug | Fix |
+|---|---|---|---|
+| 1 | `admission.rs` | Sessions were granted their FULL context cap (`cap_tokens` = 50k tokens ≈ 1.7 GiB of KV credit). After trunk weights, the second concurrent session's grant did not fit the budget, so every request parked behind the resident one until its session CLOSED — the two slots were effectively serialized for long generations despite free pages and free rows on both slots. | Request-sized grants (spec §5.1: "reserve credits for the request's maximum remaining target growth through `prompt + max_tokens`"): the engine grants `prompt + max_tokens` clamped to the cap; new `AdmissionController::resize` (verify-then-mutate) grows/shrinks the grant per continuation turn BEFORE any mutation, fail-closed on budget refusal. |
+| 2 | `serve_fairness.rs` | `starved_oldest` counted any request with `uncached_prefill_tokens > 0` as "unserved" — a multi-tick prefill is permanently "unserved" by that test, so starvation latched for the WHOLE prefill and the engine's bounded-backfill mask restricted eligibility to only the oldest request. A decoding slot + a prefilling slot serialized at the scheduler even after fix 1 (trace: the prefilling session contributed zero rows for 43 s, then ran full chunks the instant the decoder finished). | "Unserved" now means received NOTHING this step; a request with a grant this step is being progressively served. The legitimate bounded-backfill case (oldest feasible request with zero service) still fires (regression-tested both ways). |
+
+Also: the container's default 30 s wall-clock queue timeout (wave 11 made it
+honest) surfaced as a 429 for a request queued behind a 75 s generation —
+deployment knob, not a bug; raise `HIPFIRE_SERVE_QUEUE_TIMEOUT_MS` when
+long queue waits are expected.
+
+Verification (live `ornith-1.5-9b-mq4-multislot-hipfire`, 2 slots, prefix
+cache on, both fixes in):
+
+- Slot trace: both sessions ADMIT 0.2–0.6 s apart; prefill publications
+  INTERLEAVED across slots within the same scheduler step
+  (`2048` on slot 0 and `1024` on slot 1 at the same timestamp); both
+  slots decode with MTP and retire adaptively independently.
+- Parallel pair (12.5k KV tokens each): 62.2 s vs 88.7 s sequential
+  (1.43×); aggregate decode throughput 51.6 tok/s vs ~37 solo
+  (bandwidth-bound batching).
+- Coherence/isolation: both parallel outputs are coherent on-topic essays
+  with zero cross-slot topic bleed.
+- Soak: 3 fresh cold parallel rounds, drift 7.8%, no 429s, retries=0,
+  queue drains to 0 — no slot wedge or page-leak signature.
+- `cargo test --workspace --lib`: 39 suites green (incl. new
+  `resize_grows_within_budget_and_refuses_beyond`,
+  `resize_shrink_returns_credit_and_unknown_session_refuses`,
+  `request_sized_grants_admit_a_second_session_a_full_cap_grant_would_block`,
+  `partial_prefill_grant_does_not_latch_starved_oldest`).
+
 ---
 
 ## What was done
