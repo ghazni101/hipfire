@@ -28,9 +28,10 @@ use hipfire_dispatch::pipeline::superop::{
     self, ForwardBindings, OpBinding, OpFlavor, SuperOp, SuperOpKind, WeightSlot,
 };
 use hipfire_dispatch::types::DispatchError;
-use hipfire_runtime::llama::{
-    fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_for, weight_gemv, weight_gemv_residual};
 use hipfire_runtime::llama::KvCacheExt;
+use hipfire_runtime::llama::{
+    fused_silu_mul_rotate_mq_batched_for, rotate_x_mq_for, weight_gemv, weight_gemv_residual,
+};
 use rdna_compute::{DType, Gpu};
 
 /// Decode one token; returns the full logits vector.
@@ -258,6 +259,51 @@ pub fn prepare_retained_decode_inputs(
     )
     .map_err(|e| format!("lfm2moe: embed lookup: {e:?}"))?;
     Ok(())
+}
+
+/// Prefill one position from a raw embedding row instead of a token id —
+/// the VL seam: projected visual features take the `<image>` placeholder
+/// positions (see `hipfire-generate::vision::generate_lfm2_vl`). Same
+/// staging contract as `prepare_retained_decode_inputs` + the ordinary
+/// decode body; returns logits like `decode_step`.
+///
+/// Note the streaming invariant: unlike retained-decode staging, this runs
+/// OUTSIDE any captured graph region (a fresh h-memcpy per call), which is
+/// fine — VL prefill is eager by construction.
+pub fn prefill_embed_step(
+    cfg: &Lfm2MoeConfig,
+    weights: &Lfm2MoeWeights,
+    state: &mut Lfm2MoeState,
+    gpu: &mut Gpu,
+    embedding: &[f32],
+    position: u32,
+) -> Result<Vec<f32>, String> {
+    if state.retained_state_poisoned {
+        return Err("lfm2moe: retained state poisoned until reset".to_string());
+    }
+    if (position as usize) >= state.max_seq {
+        return Err(format!(
+            "lfm2moe: position {} >= max_seq {}",
+            position, state.max_seq
+        ));
+    }
+    if embedding.len() != cfg.hidden_size {
+        return Err(format!(
+            "lfm2moe: prefill_embed_step expects {} floats, got {}",
+            cfg.hidden_size,
+            embedding.len()
+        ));
+    }
+    gpu.hip
+        .memcpy_htod(&state.pos_buf, &(position as i32).to_ne_bytes())
+        .map_err(|e| format!("lfm2moe: htod pos: {e:?}"))?;
+    let bytes: Vec<u8> = embedding.iter().flat_map(|v| v.to_le_bytes()).collect();
+    gpu.hip
+        .memcpy_htod(&state.h.buf, &bytes)
+        .map_err(|e| format!("lfm2moe: htod visual embedding: {e:?}"))?;
+    decode_step_layers_and_head(cfg, weights, state, gpu, position, None)?;
+    gpu.download_f32(&state.logits)
+        .map_err(|e| format!("lfm2moe: download logits (embed prefill): {e:?}"))
 }
 
 #[doc(hidden)]

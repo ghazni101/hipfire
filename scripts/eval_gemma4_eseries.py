@@ -160,6 +160,10 @@ class Daemon:
         ple_batched_prefill: bool | None,
         ple_branch_batched_prefill: bool | None,
         ple_activation_fused_prefill: bool | None,
+        kv_mode: str,
+        flash_attn_ck_lib: Path | None,
+        flash_attn_ck_workspace_bytes: int,
+        force_native_prefill: bool,
         runtime_home: Path | None,
     ):
         env = os.environ.copy()
@@ -175,6 +179,18 @@ class Daemon:
         env["HIPFIRE_GEMMA4_EAGLE"] = "0"
         env["HIPFIRE_Q8_BATCHED_LEGACY"] = "0"
         env["HIPFIRE_GEMMA4_PREFILL_BATCH"] = str(prefill_batch)
+        env["HIPFIRE_KV_MODE"] = kv_mode
+        if flash_attn_ck_lib is None:
+            env.pop("HIPFIRE_FLASH_ATTN_CK_LIB", None)
+            env.pop("HIPFIRE_FLASH_ATTN_CK_WORKSPACE_BYTES", None)
+        else:
+            env["HIPFIRE_FLASH_ATTN_CK_LIB"] = str(flash_attn_ck_lib.resolve())
+            env["HIPFIRE_FLASH_ATTN_CK_WORKSPACE_BYTES"] = str(
+                flash_attn_ck_workspace_bytes
+            )
+            env.pop("HIPFIRE_FLASH_PREFILL", None)
+        if force_native_prefill:
+            env["HIPFIRE_FLASH_PREFILL"] = "0"
         for name, enabled in (
             ("HIPFIRE_GEMMA4_Q8_FUSED_PREFILL", q8_fused_prefill),
             ("HIPFIRE_GEMMA4_BATCHED_EMBEDDING_PREFILL", batched_embedding_prefill),
@@ -380,6 +396,12 @@ def main() -> int:
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--prefill-batch", type=int, default=8)
     parser.add_argument(
+        "--kv-mode", choices=("q8", "asym4", "asym3", "asym2"), default="q8"
+    )
+    parser.add_argument("--flash-attn-ck-lib", type=Path)
+    parser.add_argument("--flash-attn-ck-workspace-bytes", type=int, default=536870912)
+    parser.add_argument("--force-native-prefill", action="store_true")
+    parser.add_argument(
         "--q8-fused-prefill", action=argparse.BooleanOptionalAction, default=None
     )
     parser.add_argument(
@@ -454,7 +476,12 @@ def main() -> int:
         "max_seq": args.max_seq,
         "default_max_tokens": args.max_tokens,
         "temperature": 0.0,
-        "kv_mode": "q8",
+        "kv_mode": args.kv_mode,
+        "flash_attn_ck_lib": (
+            str(args.flash_attn_ck_lib.resolve()) if args.flash_attn_ck_lib else None
+        ),
+        "flash_attn_ck_workspace_bytes": args.flash_attn_ck_workspace_bytes,
+        "force_native_prefill": args.force_native_prefill,
         "q8_batched_legacy": False,
         "prefill_batch": args.prefill_batch,
         "closed_think": args.closed_think,
@@ -476,6 +503,10 @@ def main() -> int:
         args.ple_batched_prefill,
         args.ple_branch_batched_prefill,
         args.ple_activation_fused_prefill,
+        args.kv_mode,
+        args.flash_attn_ck_lib,
+        args.flash_attn_ck_workspace_bytes,
+        args.force_native_prefill,
         args.runtime_home,
     )
     rows = list(existing)
@@ -499,9 +530,12 @@ def main() -> int:
                 "model": str(args.model.resolve()),
                 "params": {
                     "max_seq": args.max_seq,
-                    "kv_mode": "q8",
+                    "kv_mode": args.kv_mode,
+                    "speculation": "off",
                     "dflash_mode": "off",
+                    "dspark_mode": "off",
                     "mtp_mode": "off",
+                    "ngram_draft": False,
                     "tp": 1,
                     "pp": 1,
                 },

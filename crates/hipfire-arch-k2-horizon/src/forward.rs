@@ -534,8 +534,6 @@ fn sample_from_logits(
     }
 }
 
-
-
 /// PM4 retained-replay lifecycle for GPU-sampled decode. Follows the
 /// lfm2moe pattern: warmup → capture → replay.
 ///

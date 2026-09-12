@@ -48,6 +48,9 @@ pub(crate) fn should_quantize(name: &str) -> bool {
         || name.starts_with("model.vision_tower.")
         || name.starts_with("model.vision_adapter.")
         || name.starts_with("model.vision_projection.")
+        // LFM2/Idefics-style multimodal projector rides the vision group
+        // (VL artifact contract) — F16 under --include-vision, skipped without.
+        || name.starts_with("model.multi_modal_projector.")
     {
         return false;
     }

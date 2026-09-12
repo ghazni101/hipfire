@@ -65,12 +65,13 @@ pub fn load_lfm2moe_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Lfm2Mo
                 state,
                 eos_tok,
                 lfm2_decode_batch: None,
+                vision_config: None,
+                vision_weights: None,
             })
         }
         ModelSource::Dir(source) => {
-            let config = crate::config::config_from_source(&source).ok_or_else(|| {
-                "lfm2moe: failed to parse config from safetensors".to_string()
-            })?;
+            let config = crate::config::config_from_source(&source)
+                .ok_or_else(|| "lfm2moe: failed to parse config from safetensors".to_string())?;
             let weights = crate::lfm2moe::load_weights_from_source(&source, &config, ctx.gpu)?;
             hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
             let state = Lfm2MoeState::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
@@ -83,8 +84,11 @@ pub fn load_lfm2moe_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Lfm2Mo
                 state,
                 eos_tok,
                 lfm2_decode_batch: None,
+                // Safetensors Dir loads stay text-only — the qwen35 carrier
+                // makes the same choice; VL artifacts are HFQ-only here.
+                vision_config: None,
+                vision_weights: None,
             })
         }
     }
 }
-

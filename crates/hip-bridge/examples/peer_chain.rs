@@ -731,6 +731,7 @@ fn check_rocr_completion(signal: &CompletionSignal) -> HipResult<()> {
         Err(HipError {
             code: 1,
             message: format!("ROCr async-copy completion signal ended at {value}, expected 0"),
+            context: None,
         })
     }
 }
@@ -739,6 +740,7 @@ fn rocr_as_hip(error: redline_rocr::RuntimeError) -> HipError {
     HipError {
         code: 1,
         message: error.to_string(),
+        context: None,
     }
 }
 
@@ -927,6 +929,7 @@ fn rccl_as_hip(error: hip_bridge::RcclError) -> HipError {
     HipError {
         code: error.status,
         message: error.to_string(),
+        context: None,
     }
 }
 

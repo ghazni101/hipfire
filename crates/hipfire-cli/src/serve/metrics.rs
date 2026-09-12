@@ -119,7 +119,10 @@ impl Metrics {
         {
             self.decode_tok_s.observe(v);
         }
-        if let Some(v) = done.get("prefill_tok_s").and_then(serde_json::Value::as_f64) {
+        if let Some(v) = done
+            .get("prefill_tok_s")
+            .and_then(serde_json::Value::as_f64)
+        {
             self.prefill_tok_s.observe(v);
         }
     }
@@ -269,7 +272,11 @@ mod tests {
         let m = Metrics::default();
         m.observe_done(&done(&[("prefill_tok_s", 400.0)]));
         assert_eq!(m.prefill_tok_s.count(), 1);
-        assert_eq!(m.decode_tok_s.count(), 0, "absent decode must not be recorded");
+        assert_eq!(
+            m.decode_tok_s.count(),
+            0,
+            "absent decode must not be recorded"
+        );
         assert_eq!(m.requests_total.load(Ordering::Relaxed), 1);
         // ttft/latency come from observe_timing, never from the done payload.
         m.observe_timing(None, 120.0);
@@ -306,8 +313,14 @@ mod tests {
             "hipfire_ttft_milliseconds",
             "hipfire_decode_tokens_per_second",
         ] {
-            assert!(out.contains(&format!("# HELP {name} ")), "missing HELP {name}");
-            assert!(out.contains(&format!("# TYPE {name} ")), "missing TYPE {name}");
+            assert!(
+                out.contains(&format!("# HELP {name} ")),
+                "missing HELP {name}"
+            );
+            assert!(
+                out.contains(&format!("# TYPE {name} ")),
+                "missing TYPE {name}"
+            );
         }
         assert!(out.contains("hipfire_queue_depth 3"));
         assert!(out.contains("hipfire_model_loaded 1"));

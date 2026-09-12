@@ -186,8 +186,7 @@ pub fn hc_split_sinkhorn_ref(
         for j in 0..hc_mult {
             for k in 0..hc_mult {
                 let idx = j * hc_mult + k + hc_mult * 2;
-                comb_f[j * hc_mult + k] =
-                    mixes[mbase + idx] as f64 * s2 + hc_base[idx] as f64;
+                comb_f[j * hc_mult + k] = mixes[mbase + idx] as f64 * s2 + hc_base[idx] as f64;
             }
         }
 
@@ -333,8 +332,15 @@ pub fn hc_pre_ref(
         }
     }
 
-    let (pre, post, comb) =
-        hc_split_sinkhorn_ref(&mixes, hc_scale, hc_base, rows, hc_mult, sinkhorn_iters, hc_eps)?;
+    let (pre, post, comb) = hc_split_sinkhorn_ref(
+        &mixes,
+        hc_scale,
+        hc_base,
+        rows,
+        hc_mult,
+        sinkhorn_iters,
+        hc_eps,
+    )?;
 
     // y = sum_h pre[h] * x[h, :]
     let mut y = vec![0.0f32; rows * dim];
@@ -572,7 +578,6 @@ pub fn gate_ref(
             original[e] = softplus_f64(s).sqrt();
         }
 
-
         // Bias shifts selection only.
         let mut select = original.clone();
         if let Some(b) = bias {
@@ -717,7 +722,6 @@ pub fn expert_swiglu_ref(
     out
 }
 
-
 // ═══════════════════════════════════════════════════════════════════════════
 // Attention SWA + compressed f64 oracle (main path; compress_ratio 0 / 4 / 128)
 // ═══════════════════════════════════════════════════════════════════════════
@@ -751,13 +755,13 @@ pub fn expert_swiglu_ref(
 
 use crate::attention::{
     apply_rope_interleaved_inplace, get_compress_topk_idxs, get_window_topk_idxs,
-    precompute_rope_freqs, swa_n_valid, PARENT_ATTN_INDEX_TOPK, PARENT_DIM, PARENT_HEAD_DIM,
-    PARENT_HEADS_PER_GROUP, PARENT_KV_ACT_QUANT_BLOCK, PARENT_NOPE_DIM, PARENT_N_HEADS,
-    PARENT_N_KV_HEADS, PARENT_O_GROUPS, PARENT_O_LORA, PARENT_PER_GROUP_IN, PARENT_Q_LORA,
-    PARENT_Q_WIDTH, PARENT_RMS_EPS, PARENT_ROPE_DIM, PARENT_ROPE_THETA, PARENT_SWA_WINDOW,
-    PARENT_WO_A_OUT,
+    precompute_rope_freqs, swa_n_valid, PARENT_ATTN_INDEX_TOPK, PARENT_DIM, PARENT_HEADS_PER_GROUP,
+    PARENT_HEAD_DIM, PARENT_KV_ACT_QUANT_BLOCK, PARENT_NOPE_DIM, PARENT_N_HEADS, PARENT_N_KV_HEADS,
+    PARENT_O_GROUPS, PARENT_O_LORA, PARENT_PER_GROUP_IN, PARENT_Q_LORA, PARENT_Q_WIDTH,
+    PARENT_RMS_EPS, PARENT_ROPE_DIM, PARENT_ROPE_THETA, PARENT_SWA_WINDOW, PARENT_WO_A_OUT,
 };
 use crate::codec::act_quant_fp8_inplace_ref;
+use crate::codec::{act_quant_fp4_inplace_ref, hadamard_rotate_ref, round_to_bf16};
 use crate::compressor::{
     compressor_prefill_ref, PARENT_COMPRESS_ROPE_THETA, PARENT_YARN_BETA_FAST,
     PARENT_YARN_BETA_SLOW, PARENT_YARN_FACTOR, PARENT_YARN_ORIG_SEQ,
@@ -766,9 +770,6 @@ use crate::indexer::{
     indexer_apply_offset_and_causal_mask, indexer_n_compressed, indexer_n_visible,
     indexer_oracle_f64, indexer_weights_scale, PARENT_INDEX_HEAD_DIM, PARENT_INDEX_N_HEADS,
     PARENT_INDEX_TOPK,
-};
-use crate::codec::{
-    act_quant_fp4_inplace_ref, hadamard_rotate_ref, round_to_bf16,
 };
 
 /// RoPE table policy for the main q/kv/o path (`model.py:481-488`).
@@ -1263,8 +1264,8 @@ pub fn attention_swa_ref_cfg(
     //   topk_idxs = cat([window_idxs, compress_topk_idxs], -1)
     //   kv = cat([kv, kv_compress], dim=1)   # prefill only
     //   o = sparse_attn(q, kv, sink, topk_idxs, scale)
-    let window_idxs =
-        get_window_topk_idxs(window, rows, start_pos).map_err(|e| err_msg(&format!("window: {e}")))?;
+    let window_idxs = get_window_topk_idxs(window, rows, start_pos)
+        .map_err(|e| err_msg(&format!("window: {e}")))?;
     let k_win = rows.min(window);
     if window_idxs.len() != rows * k_win {
         return Err(err_msg(&format!(
@@ -1318,8 +1319,7 @@ pub fn attention_swa_ref_cfg(
     if k_attn > 0 {
         for r in 0..rows {
             let dst = r * k_attn;
-            joint_idxs[dst..dst + k_win]
-                .copy_from_slice(&window_idxs[r * k_win..(r + 1) * k_win]);
+            joint_idxs[dst..dst + k_win].copy_from_slice(&window_idxs[r * k_win..(r + 1) * k_win]);
             if k_comp > 0 {
                 joint_idxs[dst + k_win..dst + k_attn]
                     .copy_from_slice(&compress_idxs[r * k_comp..(r + 1) * k_comp]);
@@ -1366,8 +1366,7 @@ pub fn attention_swa_ref_cfg(
         for r in 0..rows {
             let src = (r * n_heads + g * heads_per_group) * head_dim;
             let dst = r * per_group_in;
-            xg[dst..dst + per_group_in]
-                .copy_from_slice(&attn_inv_rope[src..src + per_group_in]);
+            xg[dst..dst + per_group_in].copy_from_slice(&attn_inv_rope[src..src + per_group_in]);
         }
         let w_off = g * o_lora * per_group_in;
         let w_g = &w.wo_a[w_off..w_off + o_lora * per_group_in];
@@ -1615,17 +1614,7 @@ fn indexer_select_ref(
     let w_f64: Vec<f64> = weights.iter().map(|&v| v as f64).collect();
     let k_out = PARENT_INDEX_TOPK.min(n_slots.max(1));
     let (_scores, topk) = indexer_oracle_f64(
-        &q_f64,
-        &kv_f64,
-        &w_f64,
-        rows,
-        n_heads,
-        head_dim,
-        n_slots,
-        start_pos,
-        ratio,
-        k_out,
-        offset,
+        &q_f64, &kv_f64, &w_f64, rows, n_heads, head_dim, n_slots, start_pos, ratio, k_out, offset,
     )
     .map_err(|e| err_msg(&format!("indexer oracle: {e}")))?;
 
@@ -1669,12 +1658,13 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::erasing_op)] // row 0 of the mix matrix is written via 0 * r + c
     fn hc_split_sinkhorn_doubly_stochastic_and_iters_matter() {
         let hc = 4usize;
         let rows = 1usize;
         let mix_hc = (2 + hc) * hc; // 24
-        // Strongly asymmetric comb logits so Sinkhorn has real work to do.
-        // Layout: mixes[0..hc]=pre, [hc..2hc]=post, [2hc..]=comb row-major.
+                                    // Strongly asymmetric comb logits so Sinkhorn has real work to do.
+                                    // Layout: mixes[0..hc]=pre, [hc..2hc]=post, [2hc..]=comb row-major.
         let mut mixes = vec![0.0f32; rows * mix_hc];
         for j in 0..hc {
             mixes[j] = 0.0; // pre logits
@@ -1877,7 +1867,7 @@ mod tests {
         let x = [1.0f32];
         let logits = [0.0f32, 1.0, 2.0, -1.0];
         let weight = logits; // [n_experts, 1]
-        // Bias that flips ranking: boost expert 3, suppress expert 2.
+                             // Bias that flips ranking: boost expert 3, suppress expert 2.
         let bias = [-10.0f32, -10.0, -10.0, 10.0];
         // Uncorrected sqrtsoftplus scores:
         let mut orig = [0.0f64; 4];
@@ -1888,18 +1878,7 @@ mod tests {
         // expert 2 has highest orig but bias is equal -10 so ranking among 0..2
         // follows orig: 2 > 1 > 0. With bias on 3 = +10, select order: 3, then 2.
         let route_scale = 1.5f64;
-        let r = gate_ref(
-            &x,
-            &weight,
-            Some(&bias),
-            1,
-            1,
-            4,
-            2,
-            route_scale,
-            true,
-        )
-        .unwrap();
+        let r = gate_ref(&x, &weight, Some(&bias), 1, 1, 4, 2, route_scale, true).unwrap();
         assert_eq!(r.indices, vec![3, 2]);
 
         // Weights are UNCORRECTED orig, L1-normalized, then * route_scale.
@@ -2034,7 +2013,6 @@ mod tests {
             assert!((*w - 0.5).abs() < 1e-6);
         }
     }
-
 
     // ── Attention SWA oracle tests ──────────────────────────────────────
 
@@ -2211,8 +2189,8 @@ mod tests {
             indexer: None,
         };
         let out = attention_swa_ref_cfg(
-            &x, &w, rows, 0, dim, n_heads, head_dim, rope_dim, q_lora, o_lora, o_groups,
-            window, 1e-6, /*rope_original_seq_len=*/ 0, 10_000.0, /*compress_ratio=*/ 0,
+            &x, &w, rows, 0, dim, n_heads, head_dim, rope_dim, q_lora, o_lora, o_groups, window,
+            1e-6, /*rope_original_seq_len=*/ 0, 10_000.0, /*compress_ratio=*/ 0,
         )
         .unwrap();
 
@@ -2332,8 +2310,24 @@ mod tests {
         assert!(err.contains("unsupported compress_ratio=7"), "{err}");
 
         // Tables must differ enough that a swap is measurable at pos>0.
-        let plain = precompute_rope_freqs(PARENT_ROPE_DIM, o0, t0, PARENT_YARN_FACTOR, PARENT_YARN_BETA_FAST, PARENT_YARN_BETA_SLOW).unwrap();
-        let yarn = precompute_rope_freqs(PARENT_ROPE_DIM, o4, t4, PARENT_YARN_FACTOR, PARENT_YARN_BETA_FAST, PARENT_YARN_BETA_SLOW).unwrap();
+        let plain = precompute_rope_freqs(
+            PARENT_ROPE_DIM,
+            o0,
+            t0,
+            PARENT_YARN_FACTOR,
+            PARENT_YARN_BETA_FAST,
+            PARENT_YARN_BETA_SLOW,
+        )
+        .unwrap();
+        let yarn = precompute_rope_freqs(
+            PARENT_ROPE_DIM,
+            o4,
+            t4,
+            PARENT_YARN_FACTOR,
+            PARENT_YARN_BETA_FAST,
+            PARENT_YARN_BETA_SLOW,
+        )
+        .unwrap();
         assert_eq!(plain.len(), yarn.len());
         let mut max_rel = 0.0f64;
         for (a, b) in plain.iter().zip(yarn.iter()) {
@@ -2403,14 +2397,14 @@ mod tests {
         };
 
         let r0 = attention_swa_ref_cfg(
-            &x, &w, rows, 0, dim, n_heads, head_dim, rope_dim, q_lora, o_lora, o_groups,
-            window, 1e-6, 0, 10_000.0, /*compress_ratio=*/ 0,
+            &x, &w, rows, 0, dim, n_heads, head_dim, rope_dim, q_lora, o_lora, o_groups, window,
+            1e-6, 0, 10_000.0, /*compress_ratio=*/ 0,
         )
         .unwrap();
         let (orig, theta) = attention_main_rope_policy(4).unwrap();
         let r4 = attention_swa_ref_cfg(
-            &x, &w, rows, 0, dim, n_heads, head_dim, rope_dim, q_lora, o_lora, o_groups,
-            window, 1e-6, orig, theta, /*compress_ratio=*/ 0,
+            &x, &w, rows, 0, dim, n_heads, head_dim, rope_dim, q_lora, o_lora, o_groups, window,
+            1e-6, orig, theta, /*compress_ratio=*/ 0,
         )
         .unwrap();
         // Production wrapper routes ratio through attention_main_rope_policy;
@@ -2427,7 +2421,10 @@ mod tests {
         for i in 0..q_width {
             row0_q = row0_q.max((r0.q_post_rope[i] - r4.q_post_rope[i]).abs());
         }
-        assert!(row0_q < 1e-6, "row0 q_post_rope must match across tables; d={row0_q}");
+        assert!(
+            row0_q < 1e-6,
+            "row0 q_post_rope must match across tables; d={row0_q}"
+        );
 
         // Row 1: tables disagree → post-RoPE q/kv must move.
         let mut row1_q = 0.0f32;

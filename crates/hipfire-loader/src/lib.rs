@@ -28,8 +28,9 @@ use hipfire_runtime::arch_model::ArchModel;
 use hipfire_runtime::cask::CaskCtx;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv_backend::KvBackend;
+use hipfire_runtime::kv_mode;
 use hipfire_runtime::llama;
-use hipfire_runtime::llama::KvCacheExt;
+use hipfire_runtime::llama::{KvCacheExt, KvDims, KvLayers, KvTarget};
 use hipfire_runtime::loader_api::{CaskConfig, LoadCtx, ModelSource, SpecLoadCfg};
 use hipfire_runtime::multi_gpu::Gpus;
 use hipfire_runtime::spec::{SpecEmit, SpecEmitCtx, SpecTargetGuard, Speculator};
@@ -215,7 +216,7 @@ pub fn bench_decode_route(arch_id: u32) -> BenchDecodeRoute {
         11 => BenchDecodeRoute::Lfm2Moe,
         5 | 6 => BenchDecodeRoute::Qwen35,
         14 => BenchDecodeRoute::MuseGlimmer,
-        15 => BenchDecodeRoute::K2Horizon,
+        16 => BenchDecodeRoute::K2Horizon,
         _ => BenchDecodeRoute::Unsupported,
     }
 }
@@ -227,16 +228,16 @@ pub fn bench_decode_route(arch_id: u32) -> BenchDecodeRoute {
 pub enum VisionRoute {
     DotsOcr,
     QwenVl,
+    Lfm2Vl,
     None,
 }
 pub fn vision_route(arch_id: u32) -> VisionRoute {
     // Declared-capability gate: text-only arches declare `supports_images == false`
     // and must return `None` even if the arch_id table would say otherwise.
     // The table itself cannot be removed: it discriminates *which* vision
-    // implementation to run (QwenVl vs DotsOcr have distinct generate bodies in
-    // `hipfire_generate::vision::{generate_vl, generate_vl_dots_ocr}`), not just
-    // whether vision is present. Consulting caps here makes the gate declarative
-    // without changing behaviour.
+    // implementation to run (QwenVl vs DotsOcr vs Lfm2Vl have distinct generate
+    // bodies in `hipfire_generate::vision`), not just whether vision is present.
+    // Consulting caps here makes the gate declarative without changing behaviour.
     let caps = carrier_for(arch_id).map(|c| c.caps()).unwrap_or_default();
     if !caps.supports_images {
         return VisionRoute::None;
@@ -244,6 +245,7 @@ pub fn vision_route(arch_id: u32) -> VisionRoute {
     match arch_id {
         8 => VisionRoute::DotsOcr,
         5 | 6 => VisionRoute::QwenVl,
+        11 => VisionRoute::Lfm2Vl,
         _ => VisionRoute::None,
     }
 }
@@ -268,10 +270,12 @@ pub fn ep_prompt_route(arch_id: u32) -> EpPromptRoute {
 pub enum EpEosRoute {
     Deepseek4,
     Minimax,
+    Qwen35,
 }
 pub fn ep_eos_route(arch_id: u32) -> EpEosRoute {
     match arch_id {
         10 => EpEosRoute::Minimax,
+        5 | 6 => EpEosRoute::Qwen35,
         _ => EpEosRoute::Deepseek4,
     }
 }
@@ -305,6 +309,7 @@ const REGISTRY: &[&dyn Carrier] = &[
     &MinimaxCarrier,
     &Lfm2MoeCarrier,
     &Cohere2MoeCarrier,
+    &MapleCarrier,
     &Gemma4Carrier,
     &MuseGlimmerCarrier,
     &K2HorizonCarrier,
@@ -313,7 +318,9 @@ const REGISTRY: &[&dyn Carrier] = &[
 // ─── Constants ────────────────────────────────────────────────────────
 
 /// Built-in Qwen3.5/3.6 chat template (froggeric/Qwen at HF).
-/// Used when no per-model or env-override template is available.
+/// Fallback when arch 5/6 has no configured/per-model override and the HFQ
+/// lacks an embedded `tokenizer_config.chat_template` (older Qwen3.5/3.6 files).
+/// Qwen3.8 ships an official template with `reasoning_effort` and uses that.
 const FROGGERIC_QWEN35_TEMPLATE: &str =
     include_str!("../../hipfire-runtime/templates/eval/qwen35-froggeric-v20.jinja");
 
@@ -1098,6 +1105,20 @@ impl LoadedModel {
             .and_then(|s| (s as &mut dyn Any).downcast_mut::<Cohere2MoeBundle>())
     }
 
+    /// Maple-Preview bundle if this model is arch_id=15, else None.
+    pub fn maple(&self) -> Option<&hipfire_arch_maple::MapleBundle> {
+        self.state
+            .as_deref()
+            .and_then(|s| (s as &dyn Any).downcast_ref::<hipfire_arch_maple::MapleBundle>())
+    }
+
+    pub fn maple_mut(&mut self) -> Option<&mut hipfire_arch_maple::MapleBundle> {
+        self.state
+            .as_deref_mut()
+            .and_then(|s| (s as &mut dyn Any).downcast_mut::<hipfire_arch_maple::MapleBundle>())
+    }
+
+    /// K2-Horizon bundle if this model is arch_id=16, else None.
     pub fn k2_horizon(&self) -> Option<&hipfire_arch_k2_horizon::K2HorizonBundle> {
         self.state.as_deref().and_then(|s| {
             (s as &dyn Any).downcast_ref::<hipfire_arch_k2_horizon::K2HorizonBundle>()
@@ -1131,6 +1152,18 @@ impl LoadedModel {
         self.qwen35().and_then(|b| b.vision_config.as_ref())
     }
 
+    pub fn ack_dims(&self) -> (usize, usize, usize) {
+        if let Some(st) = self.state.as_ref() {
+            let arch = st.as_ref() as &dyn hipfire_runtime::arch_model::ArchModel;
+            return (arch.dim(), arch.n_layers(), arch.vocab_size());
+        }
+        // EP and dense-TP loads keep the model in `ep`, leaving `state` empty.
+        self.ep
+            .as_ref()
+            .map(|ep| ep.inner.model_dims())
+            .unwrap_or((0, 0, 0))
+    }
+
     pub fn vision_weights(&self) -> Option<&qwen35_vl::VisionWeights> {
         self.qwen35().and_then(|b| b.vision_weights.as_ref())
     }
@@ -1141,6 +1174,34 @@ impl LoadedModel {
 
     pub fn vision_weights_mut(&mut self) -> Option<&mut qwen35_vl::VisionWeights> {
         self.qwen35_mut().and_then(|b| b.vision_weights.as_mut())
+    }
+
+    /// Declared vision capability across ALL carriers that can carry a
+    /// tower: qwen35-vl (arch 5/6 bundle field), dots-ocr (arch 8), and
+    /// lfm2-vl (arch-11 bundle field). The daemon's image gate consults
+    /// this instead of the qwen-typed accessors above.
+    pub fn has_vision_encoder(&self) -> bool {
+        if self.dots_ocr().is_some() {
+            return true;
+        }
+        if let Some(b) = self.lfm2moe() {
+            if b.vision_config.is_some() {
+                return true;
+            }
+        }
+        self.qwen35().is_some_and(|b| b.vision_config.is_some())
+    }
+
+    /// LFM2-VL (arch 11) projected-vision config + weights, when loaded
+    /// from an artifact quantized with `--include-vision`.
+    pub fn lfm2_vision(
+        &self,
+    ) -> Option<(
+        &hipfire_arch_lfm2_vl::VisionConfig,
+        &hipfire_arch_lfm2_vl::VisionWeights,
+    )> {
+        let b = self.lfm2moe()?;
+        Some((b.vision_config.as_ref()?, b.vision_weights.as_ref()?))
     }
 
     /// DotsOcr bundle if this model is arch_id=8, else None.
@@ -1229,6 +1290,39 @@ pub enum EpArch {
         weights: Vec<hipfire_arch_qwen35::qwen35::Qwen35Weights>,
         batch: Option<hipfire_arch_qwen35::qwen35::Qwen35DecodeBatchEpState>,
     },
+    /// Dense Qwen tensor parallelism. Kept separate from `Qwen35`, whose
+    /// ownership and scheduling contract is four-rank routed-expert EP.
+    Qwen35DenseTp {
+        shard: hipfire_runtime::tp_shard::ShardConfig,
+        configs: Vec<hipfire_arch_qwen35::qwen35::Qwen35Config>,
+        weights: Vec<hipfire_arch_qwen35::qwen35::Qwen35Weights>,
+        kv_caches: Vec<llama::KvCache>,
+        dn_states: Vec<hipfire_arch_qwen35::qwen35::DeltaNetState>,
+        scratches: Vec<hipfire_arch_qwen35::qwen35::Qwen35Scratch>,
+    },
+}
+
+impl EpArch {
+    // A dense-TP rank config keeps global dim/n_layers/vocab: `local_dense_tp_config` narrows only head counts and `hidden_dim`.
+    pub fn model_dims(&self) -> (usize, usize, usize) {
+        match self {
+            EpArch::Ds4 { config, .. } => (
+                config.hidden_size,
+                config.num_hidden_layers,
+                config.vocab_size,
+            ),
+            EpArch::Minimax { config, .. } => (
+                config.hidden_size,
+                config.num_hidden_layers,
+                config.vocab_size,
+            ),
+            EpArch::Qwen35 { config, .. } => (config.dim, config.n_layers, config.vocab_size),
+            EpArch::Qwen35DenseTp { configs, .. } => configs
+                .first()
+                .map(|c| (c.dim, c.n_layers, c.vocab_size))
+                .unwrap_or((0, 0, 0)),
+        }
+    }
 }
 
 // ─── Helper functions ─────────────────────────────────────────────────
@@ -1283,7 +1377,15 @@ fn resolve_chat_template(hfq: &HfqFile, model_path: &str) -> Option<String> {
         return Some(s);
     }
     match hfq.arch_id {
-        5 | 6 => return Some(FROGGERIC_QWEN35_TEMPLATE.to_string()),
+        // Prefer HFQ-embedded tokenizer_config.chat_template (Qwen3.8 official
+        // low/medium/xhigh reasoning_effort). Fall back to froggeric for older
+        // Qwen3.5/3.6 files that lack one.
+        5 | 6 => {
+            return Some(qwen35_template_from_embedded(
+                hfq.chat_template(),
+                model_path,
+            ))
+        }
         11 => {
             if let Some(t) = hfq.chat_template() {
                 return Some(t);
@@ -1307,6 +1409,195 @@ fn resolve_chat_template(hfq: &HfqFile, model_path: &str) -> Option<String> {
         _ => {}
     }
     hfq.chat_template()
+}
+
+/// Arch 5/6 template after configured/per-model overrides: embedded HFQ
+/// `tokenizer_config.chat_template` when present, else froggeric fallback.
+/// Ornith 1.5 basenames get a load-time Qwen3.8-shaped `reasoning_effort`
+/// adaptation of the embedded (non-native) parent template; other models and
+/// the froggeric missing-template path are left alone.
+fn qwen35_template_from_embedded(embedded: Option<String>, model_path: &str) -> String {
+    match embedded {
+        Some(t) if is_ornith15_artifact(model_path) => adapt_ornith15_embedded_chat_template(t),
+        Some(t) => t,
+        None => FROGGERIC_QWEN35_TEMPLATE.to_string(),
+    }
+}
+
+/// Case-insensitive basename match for Ornith 1.5 MQ4/MQ4R artifacts.
+/// Scope is exact: filename prefix `ornith-1.5-` or legacy `ornith1.5-`,
+/// AND final extension case-insensitively exactly `.mq4` or `.mq4r`.
+/// Other extensions (`.mq6`, `.hfq`, `.json`, sidecars) and bare names
+/// are out of scope even when the Ornith 1.5 prefix matches.
+fn is_ornith15_artifact(model_path: &str) -> bool {
+    let basename = std::path::Path::new(model_path)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    let lower = basename.to_ascii_lowercase();
+    let prefix_ok = lower.starts_with("ornith-1.5-") || lower.starts_with("ornith1.5-");
+    if !prefix_ok {
+        return false;
+    }
+    // Path::extension is the final suffix after the last `.`.
+    let ext = std::path::Path::new(basename)
+        .extension()
+        .and_then(|s| s.to_str())
+        .map(|e| e.to_ascii_lowercase())
+        .unwrap_or_default();
+    ext == "mq4" || ext == "mq4r"
+}
+
+/// Qwen3.8 reasoning_effort system-prompt block (official chat_template.jinja).
+const QWEN38_REASONING_BLOCK: &str = "\
+{%- set reasoning_instructions = '' %}\n\
+{%- if enable_thinking is undefined or enable_thinking is true %}\n\
+    {%- set resolved_reasoning_effort = reasoning_effort|default('xhigh') %}\n\
+    {%- if resolved_reasoning_effort not in ('xhigh', 'medium', 'low') %}\n\
+        {{- raise_exception('Unexpected reasoning effort ' ~ reasoning_effort ~ '. Supported types are xhigh (default), medium, and low.') }}\n\
+    {%- endif %}\n\
+    {%- if resolved_reasoning_effort == 'xhigh' %}\n\
+        {%- set reasoning_instructions = 'Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.' %}\n\
+    {%- elif resolved_reasoning_effort == 'low' %}\n\
+        {%- set reasoning_instructions = 'Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.' %}\n\
+    {%- endif %}\n\
+{%- endif %}\n";
+
+/// Unique marker: tools gate opening the system tools block.
+const ORNITH_TOOLS_GATE: &str = "{%- if tools and tools is iterable and tools is not mapping %}";
+
+/// Unique compound marker: tools system open immediately followed by the
+/// `# Tools` header (no reasoning_instructions yet).
+const ORNITH_TOOLS_SYSTEM_OPEN: &str = concat!(
+    "{%- if tools and tools is iterable and tools is not mapping %}\n",
+    "    {{- '<|im_start|>system\\n' }}\n",
+    "    {{- \"# Tools\\n\\nYou have access to the following functions:\\n\\n<tools>\" }}"
+);
+
+/// Replacement: same tools open, with non-empty reasoning_instructions
+/// prepended into the system turn (Qwen3.8 structure).
+const ORNITH_TOOLS_SYSTEM_OPEN_ADAPTED: &str = concat!(
+    "{%- if tools and tools is iterable and tools is not mapping %}\n",
+    "    {{- '<|im_start|>system\\n' }}\n",
+    "    {%- if reasoning_instructions %}\n",
+    "        {{- reasoning_instructions + '\\n\\n' }}\n",
+    "    {%- endif %}\n",
+    "    {{- \"# Tools\\n\\nYou have access to the following functions:\\n\\n<tools>\" }}"
+);
+
+/// Unique marker: no-tools branch that only emits a system turn when a
+/// system message exists (no effort injection, no no-system path).
+const ORNITH_NO_TOOLS_SYSTEM_BRANCH: &str = concat!(
+    "{%- else %}\n",
+    "    {%- if messages[0].role == 'system' %}\n",
+    "        {%- set content = render_content(messages[0].content, false, true)|trim %}\n",
+    "        {{- '<|im_start|>system\\n' + content + '<|im_end|>\\n' }}\n",
+    "    {%- endif %}\n",
+    "{%- endif %}"
+);
+
+/// Replacement: Qwen3.8 system/no-system logic with reasoning_instructions.
+/// Double space before `+ content` matches the official Qwen3.8 template.
+const ORNITH_NO_TOOLS_SYSTEM_BRANCH_ADAPTED: &str = concat!(
+    "{%- else %}\n",
+    "    {%- if messages[0].role == 'system' %}\n",
+    "        {%- set content = render_content(messages[0].content, false, true)|trim %}\n",
+    "        {%- if content %}\n",
+    "            {{- '<|im_start|>system\\n' + (reasoning_instructions + '\\n\\n' if reasoning_instructions else '')  + content + '<|im_end|>\\n' }}\n",
+    "        {%- elif reasoning_instructions %}\n",
+    "            {{- '<|im_start|>system\\n' + reasoning_instructions + '<|im_end|>\\n' }}\n",
+    "        {%- endif %}\n",
+    "    {%- elif reasoning_instructions %}\n",
+    "        {{- '<|im_start|>system\\n' + reasoning_instructions + '<|im_end|>\\n' }}\n",
+    "    {%- endif %}\n",
+    "{%- endif %}"
+);
+
+/// Load-time adapter for Ornith 1.5 embedded Qwen3.5/3.6 templates: inject the
+/// official Qwen3.8 `reasoning_effort` low/medium/xhigh system-prompt contract
+/// via exact-marker rewrite. Already-native templates and marker drift are
+/// returned unchanged so `probe_effort_capability` stays honest.
+fn adapt_ornith15_embedded_chat_template(template: String) -> String {
+    if template.contains("reasoning_effort") {
+        return template;
+    }
+    match try_adapt_ornith15_qwen35_to_effort_native(&template) {
+        Ok(adapted) => adapted,
+        Err(reason) => {
+            eprintln!(
+                "[chat_template] ornith-1.5 reasoning_effort adapter skipped ({reason}); keeping embedded template"
+            );
+            template
+        }
+    }
+}
+
+/// Atomic exact-marker rewrite. Preflights every required unique marker, then
+/// applies all three substitutions. Any missing/duplicate marker → Err so the
+/// caller returns the original string.
+fn try_adapt_ornith15_qwen35_to_effort_native(template: &str) -> Result<String, String> {
+    let gate_n = template.matches(ORNITH_TOOLS_GATE).count();
+    if gate_n != 1 {
+        return Err(format!("expected 1 tools gate marker, found {gate_n}"));
+    }
+    let tools_open_n = template.matches(ORNITH_TOOLS_SYSTEM_OPEN).count();
+    if tools_open_n != 1 {
+        return Err(format!(
+            "expected 1 tools system-open marker, found {tools_open_n}"
+        ));
+    }
+    let no_tools_n = template.matches(ORNITH_NO_TOOLS_SYSTEM_BRANCH).count();
+    if no_tools_n != 1 {
+        return Err(format!(
+            "expected 1 no-tools system branch marker, found {no_tools_n}"
+        ));
+    }
+
+    // Insert the reasoning block immediately before the tools gate.
+    let mut out = template.replacen(
+        ORNITH_TOOLS_GATE,
+        &(QWEN38_REASONING_BLOCK.to_string() + ORNITH_TOOLS_GATE),
+        1,
+    );
+    // Prepend non-empty instruction into the tools system turn.
+    out = out.replacen(
+        ORNITH_TOOLS_SYSTEM_OPEN,
+        ORNITH_TOOLS_SYSTEM_OPEN_ADAPTED,
+        1,
+    );
+    // Replace the no-tools system/no-system branch.
+    out = out.replacen(
+        ORNITH_NO_TOOLS_SYSTEM_BRANCH,
+        ORNITH_NO_TOOLS_SYSTEM_BRANCH_ADAPTED,
+        1,
+    );
+
+    // Honesty post-conditions: effort vocabulary + both instruction literals +
+    // tools/system/no-system insertion branches present; original no-tools
+    // emission gone.
+    let has_effort_default = out.contains("reasoning_effort|default('xhigh')");
+    let has_rungs = out.contains("('xhigh', 'medium', 'low')");
+    let has_low = out.contains(
+        "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.",
+    );
+    let has_xhigh = out.contains(
+        "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.",
+    );
+    // Jinja source stores `\n` as backslash+n inside quotes.
+    let has_tools_prepend = out.contains("reasoning_instructions + '\\n\\n'");
+    let has_no_system = out.contains("{%- elif reasoning_instructions %}");
+    let original_no_tools_gone = !out.contains(ORNITH_NO_TOOLS_SYSTEM_BRANCH);
+    if !(has_effort_default
+        && has_rungs
+        && has_low
+        && has_xhigh
+        && has_tools_prepend
+        && has_no_system
+        && original_no_tools_gone)
+    {
+        return Err("post-condition failed after marker rewrite".into());
+    }
+    Ok(out)
 }
 
 /// Rewrite the Onyx/Harmony chat template for Muse Glimmer (arch 14) so
@@ -2478,6 +2769,94 @@ impl Drop for Qwen35EpStaging {
     }
 }
 
+/// Transactional owner for dense Qwen TP construction. Every vector is kept
+/// rank-aligned; an early return frees only the objects that were published
+/// into the guard, on their owning device.
+struct Qwen35DenseTpStaging {
+    gpus: Option<Gpus>,
+    weights: Vec<qwen35::Qwen35Weights>,
+    kv_caches: Vec<llama::KvCache>,
+    dn_states: Vec<qwen35::DeltaNetState>,
+    scratches: Vec<qwen35::Qwen35Scratch>,
+}
+
+impl Qwen35DenseTpStaging {
+    fn new(gpus: Gpus) -> Self {
+        Self {
+            gpus: Some(gpus),
+            weights: Vec::new(),
+            kv_caches: Vec::new(),
+            dn_states: Vec::new(),
+            scratches: Vec::new(),
+        }
+    }
+
+    fn gpus_mut(&mut self) -> &mut Gpus {
+        self.gpus.as_mut().expect("dense TP staging gpus taken")
+    }
+
+    #[allow(clippy::type_complexity)]
+    fn into_parts(
+        mut self,
+    ) -> (
+        Gpus,
+        Vec<qwen35::Qwen35Weights>,
+        Vec<llama::KvCache>,
+        Vec<qwen35::DeltaNetState>,
+        Vec<qwen35::Qwen35Scratch>,
+    ) {
+        (
+            self.gpus.take().expect("dense TP into_parts called twice"),
+            std::mem::take(&mut self.weights),
+            std::mem::take(&mut self.kv_caches),
+            std::mem::take(&mut self.dn_states),
+            std::mem::take(&mut self.scratches),
+        )
+    }
+}
+
+impl Drop for Qwen35DenseTpStaging {
+    fn drop(&mut self) {
+        let Some(mut gpus) = self.gpus.take() else {
+            return;
+        };
+        for (rank, scratch) in self.scratches.drain(..).enumerate() {
+            if let Some(gpu) = gpus.devices.get_mut(rank) {
+                let _ = gpu.bind_thread();
+                let _ = scratch.free_gpu(gpu);
+            }
+        }
+        for (rank, state) in self.dn_states.drain(..).enumerate() {
+            if let Some(gpu) = gpus.devices.get_mut(rank) {
+                let _ = gpu.bind_thread();
+                state.free_gpu(gpu);
+            }
+        }
+        for (rank, kv) in self.kv_caches.drain(..).enumerate() {
+            if let Some(gpu) = gpus.devices.get_mut(rank) {
+                let _ = gpu.bind_thread();
+                let _ = kv.free_gpu(gpu);
+            }
+        }
+        for (rank, weights) in self.weights.drain(..).enumerate() {
+            if let Some(gpu) = gpus.devices.get_mut(rank) {
+                let _ = gpu.bind_thread();
+                weights.free_gpu(gpu);
+            }
+        }
+        // Best-effort: reclaim peer-rooted reduce scratch reserved pre-enable_peer_all
+        // so a failed dense-TP load cannot strand VRAM after peer mapping.
+        let _ = gpus.free_peer_reduce_scratch();
+        for gpu in &mut gpus.devices {
+            let _ = gpu.bind_thread();
+            gpu.invalidate_weight_caches();
+            gpu.invalidate_graph_state();
+            gpu.drain_pool();
+        }
+        let _ = gpus.free_tp_graph_signals();
+    }
+}
+
 /// Expert-parallel (EP) model load — shards the routed experts across `tp` ranks
 /// (`Gpus::init_tp` + per-arch sharded weight load), wrapped in a staging guard so
 /// a mid-load failure frees every already-loaded rank's VRAM (no leak, prior model
@@ -2543,10 +2922,11 @@ pub fn load_model_ep_with_kv_mode(
     tp: usize,
     kv_mode: Option<&str>,
     kv_backend: Option<&str>,
+    state_quant: Option<&str>,
 ) -> Result<LoadedModel, String> {
     let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     let kv_backend_raw = kv_backend.unwrap_or("contiguous");
-    let kv_backend: KvBackend = kv_backend_raw.parse().map_err(|err| format!("{err}"))?;
+    let kv_backend_kind: KvBackend = kv_backend_raw.parse().map_err(|err| format!("{err}"))?;
     match hfq.arch_id {
         9 => load_model_ep_ds4(
             path,
@@ -2554,14 +2934,14 @@ pub fn load_model_ep_with_kv_mode(
             tp,
             resolve_deepseek4_compressor_cache_kv_mode(kv_mode)?,
         ),
-        10 if kv_backend == KvBackend::Vmm => {
+        10 if kv_backend_kind == KvBackend::Vmm => {
             Err(format!("KV backend '{kv_backend_raw}' requires tp=1"))
         }
         10 => load_model_ep_minimax(path, max_seq, tp),
-        5 | 6 if kv_backend == KvBackend::Vmm => {
+        5 | 6 if kv_backend_kind == KvBackend::Vmm => {
             Err(format!("KV backend '{kv_backend_raw}' requires tp=1"))
         }
-        5 | 6 => load_model_ep_qwen35(path, max_seq, tp),
+        5 | 6 => load_model_ep_qwen35(path, max_seq, tp, kv_mode, kv_backend, state_quant),
         id => Err(format!(
             "EP not supported for arch_id={id} (expected 5|6 for Qwen3.5, 9 for DeepSeek V4 or 10 for MiniMax)"
         )),
@@ -2585,7 +2965,7 @@ pub fn load_model_ep_with_compressor_cache(
         }
         10 => Err("DeepSeek V4 compressor-cache storage cannot be applied to MiniMax".to_string()),
         5 | 6 if compressor_cache == hipfire_config::Deepseek4CompressorCache::F32 => {
-            load_model_ep_qwen35(path, max_seq, tp)
+            load_model_ep_qwen35(path, max_seq, tp, None, None, None)
         }
         5 | 6 => Err("DeepSeek V4 compressor-cache storage cannot be applied to Qwen3.5".to_string()),
         id => Err(format!(
@@ -2952,14 +3332,16 @@ fn load_model_ep_minimax(path: &str, max_seq: usize, tp: usize) -> Result<Loaded
         )
     })
 }
-fn load_model_ep_qwen35(path: &str, max_seq: usize, tp: usize) -> Result<LoadedModel, String> {
+fn load_model_ep_qwen35(
+    path: &str,
+    max_seq: usize,
+    tp: usize,
+    kv_mode: Option<&str>,
+    kv_backend: Option<&str>,
+    state_quant: Option<&str>,
+) -> Result<LoadedModel, String> {
     use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
 
-    if tp != 4 {
-        return Err(format!(
-            "EP qwen35 requires tp=4, got tp={tp} (only 4×gfx1201 expert-parallel is supported)"
-        ));
-    }
     let hfq_probe = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
     if hfq_probe.arch_id != 5 && hfq_probe.arch_id != 6 {
         return Err(format!(
@@ -2971,14 +3353,22 @@ fn load_model_ep_qwen35(path: &str, max_seq: usize, tp: usize) -> Result<LoadedM
         hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq_probe.metadata_json)
             .map_err(|e| format!("tokenizer not found: {e}"))?;
     let config = qwen35::config_from_hfq(&hfq_probe).map_err(|e| format!("qwen35 config: {e}"))?;
+    if config.num_experts == 0 {
+        drop(hfq_probe);
+        return load_model_tp_qwen35_dense(path, max_seq, tp, kv_mode, state_quant);
+    }
+    // MoE EP: keep existing behavior; dense-only selectors are handled above. Silence unused.
+    let _ = (kv_mode, kv_backend, state_quant);
+    if tp != 4 {
+        return Err(format!(
+            "EP qwen35 MoE requires tp=4, got tp={tp} (only 4×gfx1201 expert-parallel is supported)"
+        ));
+    }
     if config.paged_experts {
         return Err("EP qwen35: paged_experts must be false".to_string());
     }
     if config.reap_keep.is_some() {
         return Err("EP qwen35: REAP keep-map incompatible with EP".to_string());
-    }
-    if config.num_experts == 0 {
-        return Err("EP qwen35: config has no routed experts".to_string());
     }
     let arch_id = hfq_probe.arch_id;
     let n_exp = config.num_experts;
@@ -3043,6 +3433,176 @@ fn load_model_ep_qwen35(path: &str, max_seq: usize, tp: usize) -> Result<LoadedM
                 config,
                 weights,
                 batch: None,
+            },
+        }),
+        qwen35_eos_tok: eos_tok,
+        rec_temperature: rec.and_then(|r| r.temperature),
+        rec_top_p: rec.and_then(|r| r.top_p),
+        rec_top_k: rec.and_then(|r| r.top_k.map(|k| k as f32)),
+        ..LoadedModel::skeleton(
+            arch_id,
+            tokenizer,
+            max_seq,
+            max_seq,
+            path.to_string(),
+            chat_template,
+        )
+    })
+}
+
+fn load_model_tp_qwen35_dense(
+    path: &str,
+    max_seq: usize,
+    tp: usize,
+    kv_mode: Option<&str>,
+    state_quant: Option<&str>,
+) -> Result<LoadedModel, String> {
+    use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
+
+    let hfq = HfqFile::open(Path::new(path)).map_err(|e| format!("{e}"))?;
+    let tokenizer = hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(&hfq.metadata_json)
+        .map_err(|e| format!("tokenizer not found: {e}"))?;
+    let config = qwen35::config_from_hfq(&hfq).map_err(|e| format!("qwen35 config: {e}"))?;
+    let shard = ShardConfig::new(tp, false, 0, ExpertAssign::Stride)
+        .map_err(|e| format!("dense TP ShardConfig: {e}"))?;
+    // Compute static per-rank whole-unit layouts CPU-only before any GPU allocation.
+    // Validates GQA/G256 geometry, TP range 2..5, and global coverage contiguously.
+    let layouts = qwen35::dense_tp_rank_layouts(&config, &shard)
+        .map_err(|e| format!("dense TP layout: {e}"))?;
+    // Resolve state quant via canonical parser; dense TP honors Q8/default, FP32, Q4.
+    let state_quant_resolved = parse_state_quant(state_quant)?;
+    // Resolve KV mode via Qwen policy (contiguous only). Explicit unsupported => fail before GPU init.
+    let kv_raw = kv_mode.unwrap_or("");
+    let kv_trim = kv_raw.trim();
+    let kv_lower = kv_trim.to_ascii_lowercase();
+    let kv_mode_resolved = if kv_lower.is_empty() {
+        kv_mode::resolve("", &kv_mode::QWEN35_HFQ_POLICY, config.head_dim).mode
+    } else {
+        let rr = kv_mode::resolve(&kv_lower, &kv_mode::QWEN35_HFQ_POLICY, config.head_dim);
+        if rr.warning.is_some() {
+            return Err(format!(
+                "unsupported kv_mode '{kv_trim}' (expected q8|asym2|asym3|asym4|fwht2|fwht3|fwht4)"
+            ));
+        }
+        rr.mode
+    };
+    // Preflight weights before GPU allocation (validates qt geometry/blob/sidecar).
+    qwen35::preflight_weights_dense_tp(&hfq, &config, &shard)?;
+    let configs = layouts
+        .iter()
+        .map(|layout| qwen35::local_dense_tp_config(&config, layout))
+        .collect::<Vec<_>>();
+    let arch_id = hfq.arch_id;
+    let chat_template = resolve_chat_template(&hfq, path);
+    let rec = hfq.recommended_sampling();
+    let eos_tok = {
+        let ids = tokenizer.encode("<|im_end|>");
+        if ids.len() == 1 {
+            ids[0]
+        } else {
+            config.eos_token
+        }
+    };
+    drop(hfq);
+
+    let gpus = Gpus::init_tp(tp, config.n_layers).map_err(|e| format!("init_tp: {e:?}"))?;
+    if gpus.devices.len() != tp {
+        return Err(format!(
+            "init_tp gave {} devices, expected tp={tp}",
+            gpus.devices.len()
+        ));
+    }
+    let mut staging = Qwen35DenseTpStaging::new(gpus);
+    for rank in 0..tp {
+        staging.gpus_mut().devices[rank]
+            .bind_thread()
+            .map_err(|e| format!("dense TP bind rank {rank}: {e:?}"))?;
+        let mut rank_hfq = HfqFile::open(Path::new(path))
+            .map_err(|e| format!("dense TP reopen rank {rank}: {e}"))?;
+        let weights = qwen35::load_weights_dense_tp_rank(
+            &mut rank_hfq,
+            &config,
+            &mut staging.gpus_mut().devices[rank],
+            &layouts[rank],
+        )
+        .map_err(|e| format!("dense TP weight load rank {rank}: {e:?}"))?;
+        staging.weights.push(weights);
+
+        let local = &configs[rank];
+        let is_kv_layer: Vec<bool> = config
+            .layer_types
+            .iter()
+            .map(|t| *t == qwen35::LayerType::FullAttention)
+            .collect();
+        let dims = KvDims {
+            layers: KvLayers::Mask(is_kv_layer),
+            n_kv_heads: local.n_kv_heads,
+            head_dim: local.head_dim,
+            max_seq,
+            physical_cap: Some(max_seq),
+        };
+        let kv = <llama::KvCache as KvCacheExt>::from_mode_with_backend(
+            kv_mode_resolved,
+            KvBackend::Contiguous,
+            KvTarget::Single(&mut staging.gpus_mut().devices[rank]),
+            &dims,
+        )
+        .map_err(|e| format!("dense TP KV rank {rank}: {e:?}"))?;
+        staging.kv_caches.push(kv);
+        let dn = qwen35::DeltaNetState::new_with_quant(
+            &mut staging.gpus_mut().devices[rank],
+            local,
+            state_quant_resolved,
+        )
+        .map_err(|e| format!("dense TP DeltaNet rank {rank}: {e:?}"))?;
+        staging.dn_states.push(dn);
+        let scratch = qwen35::Qwen35Scratch::new_with_kv_max(
+            &mut staging.gpus_mut().devices[rank],
+            local,
+            128,
+            max_seq,
+        )
+        .map_err(|e| format!("dense TP scratch rank {rank}: {e:?}"))?;
+        staging.scratches.push(scratch);
+    }
+    // Probe complete peer topology without mutation. Complete → enable + RCCL;
+    // mixed → host-staged allreduce (no peer enable, no device reduce scratch).
+    let peer = staging
+        .gpus_mut()
+        .can_access_peer_all()
+        .map_err(|e| format!("dense TP can_access_peer_all: {e:?}"))?;
+    if peer {
+        let enabled = staging
+            .gpus_mut()
+            .enable_peer_all()
+            .map_err(|e| format!("dense TP enable_peer_all: {e:?}"))?;
+        if !enabled {
+            return Err(
+                "dense TP enable_peer_all returned false after can_access_peer_all".to_string(),
+            );
+        }
+    } else {
+        // Mixed P2P topology: select host-staged allreduce; do not enable peers
+        // or reserve device reduction scratch.
+        eprintln!(
+            "[loader] dense qwen TP mixed topology: host-staged allreduce (no peer enable/scratch)"
+        );
+    }
+    hipfire_runtime::ep::ensure_rank_streams(staging.gpus_mut())
+        .map_err(|e| format!("dense TP ensure_rank_streams: {e:?}"))?;
+    let (gpus, weights, kv_caches, dn_states, scratches) = staging.into_parts();
+    eprintln!("[loader] dense qwen TP load complete: {tp} ranks, peer_access={peer}");
+
+    Ok(LoadedModel {
+        ep: Some(EpState {
+            gpus,
+            inner: EpArch::Qwen35DenseTp {
+                shard,
+                configs,
+                weights,
+                kv_caches,
+                dn_states,
+                scratches,
             },
         }),
         qwen35_eos_tok: eos_tok,
@@ -3157,7 +3717,54 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
                     }
                 }
             }
+            EpArch::Qwen35DenseTp {
+                weights,
+                kv_caches,
+                dn_states,
+                scratches,
+                ..
+            } => {
+                for (rank, scratch) in scratches.into_iter().enumerate() {
+                    if let Some(dev) = gpus.devices.get_mut(rank) {
+                        let _ = dev.bind_thread();
+                        if let Err(e) = scratch.free_gpu(dev) {
+                            if ep_first_err.is_none() {
+                                ep_first_err = Some(format!(
+                                    "unload dense qwen TP scratch rank {rank}: {e:?}"
+                                ));
+                            }
+                        }
+                    }
+                }
+                for (rank, state) in dn_states.into_iter().enumerate() {
+                    if let Some(dev) = gpus.devices.get_mut(rank) {
+                        let _ = dev.bind_thread();
+                        state.free_gpu(dev);
+                    }
+                }
+                for (rank, kv) in kv_caches.into_iter().enumerate() {
+                    if let Some(dev) = gpus.devices.get_mut(rank) {
+                        let _ = dev.bind_thread();
+                        let _ = kv.free_gpu(dev);
+                    }
+                }
+                for (rank, weights) in weights.into_iter().enumerate() {
+                    if let Some(dev) = gpus.devices.get_mut(rank) {
+                        let _ = dev.bind_thread();
+                        weights.free_gpu(dev);
+                    }
+                }
+            }
         }
+        // Reclaim unleased peer-rooted collective scratch before device pool
+        // teardown. Idempotent across EP variants; fold first error into
+        // ep_first_err so unload reports cleanup failure.
+        if let Err(e) = gpus.free_peer_reduce_scratch() {
+            if ep_first_err.is_none() {
+                ep_first_err = Some(format!("unload dense TP peer reduce scratch: {e:?}"));
+            }
+        }
+
         for dev in gpus.devices.iter_mut() {
             let _ = dev.bind_thread();
             dev.invalidate_weight_caches();
@@ -3367,7 +3974,8 @@ mod registry_tests {
             (10, false, "minimax"),
             (11, false, "lfm2moe"),
             (12, false, "cohere2moe"),
-            (15, false, "k2_horizon"),
+            (15, false, "maple"),
+            (16, false, "k2_horizon"),
         ];
         for &(id, is_dir, want) in cases {
             let got: Vec<&str> = REGISTRY
@@ -3485,16 +4093,20 @@ mod registry_tests {
         assert_eq!(super::vision_route(5), super::VisionRoute::QwenVl);
         assert_eq!(super::vision_route(6), super::VisionRoute::QwenVl);
         assert_eq!(super::vision_route(8), super::VisionRoute::DotsOcr);
+        assert_eq!(super::vision_route(11), super::VisionRoute::Lfm2Vl);
         assert_eq!(super::vision_route(0), super::VisionRoute::None);
         assert_eq!(super::vision_route(7), super::VisionRoute::None);
         assert_eq!(super::vision_route(9), super::VisionRoute::None);
         // Text-only carriers must stay false.
+        assert!(
+            REGISTRY.iter().find(|c| c.name() == "lfm2moe").unwrap().caps().supports_images,
+            "lfm2moe (arch 11, lfm2_vl artifacts) must declare supports_images —              tower-less checkpoints still refuse images via has_vision_encoder()"
+        );
         for name in [
             "qwen2",
             "llama",
             "deepseek4",
             "minimax",
-            "lfm2moe",
             "cohere2moe",
             "gemma4",
             "muse_glimmer",
@@ -3521,7 +4133,7 @@ mod registry_tests {
             generation_early_route, vision_route, BenchDecodeRoute, ContinuousBatchRoute,
             EpEosRoute, EpPromptRoute, GenerationEarlyRoute, VisionRoute,
         };
-        use saddle_core::caps::{ArchCaps, DflashKind};
+        use saddle_core::caps::{ArchCaps, DflashKind, ReasoningContract};
 
         let caps_of = |name: &str| -> ArchCaps {
             REGISTRY
@@ -3537,6 +4149,7 @@ mod registry_tests {
         assert_eq!(
             caps_of("qwen35"),
             ArchCaps {
+                reasoning_contract: ReasoningContract::QwenJinja,
                 supports_continuous_batch: true,
                 supports_ep_batch: true,
                 dflash: Some(DflashKind::Qwen),
@@ -3561,20 +4174,34 @@ mod registry_tests {
                 ..text_only
             }
         );
-        assert_eq!(caps_of("deepseek4"), text_only);
+        assert_eq!(
+            caps_of("deepseek4"),
+            ArchCaps {
+                reasoning_contract: ReasoningContract::DeepSeek4,
+                ..text_only
+            }
+        );
         assert_eq!(caps_of("minimax"), text_only);
         assert_eq!(
             caps_of("lfm2moe"),
             ArchCaps {
                 supports_continuous_batch: true,
+                supports_images: true,
                 ..text_only
             }
         );
         assert_eq!(caps_of("cohere2moe"), text_only);
-        assert_eq!(caps_of("gemma4"), text_only);
+        assert_eq!(
+            caps_of("gemma4"),
+            ArchCaps {
+                reasoning_contract: ReasoningContract::GemmaBoolean,
+                ..text_only
+            }
+        );
         assert_eq!(
             caps_of("muse_glimmer"),
             ArchCaps {
+                reasoning_contract: ReasoningContract::MuseGlimmer,
                 semantic_contract_version: Some(2),
                 ..text_only
             }
@@ -3604,25 +4231,25 @@ mod registry_tests {
                 "continuous_batch_route({id}).is_some() disagrees with carrier caps"
             );
         }
-
-        // ── bench_decode_route: 9, 11, 5|6, 14, 15; everything else Unsupported ──
-        for id in 0u32..=15 {
+        // ── bench_decode_route: 9, 11, 5|6, 14, 16; everything else Unsupported ──
+        for id in 0u32..=16 {
             let want = match id {
                 9 => BenchDecodeRoute::Deepseek4,
                 11 => BenchDecodeRoute::Lfm2Moe,
                 5 | 6 => BenchDecodeRoute::Qwen35,
                 14 => BenchDecodeRoute::MuseGlimmer,
-                15 => BenchDecodeRoute::K2Horizon,
+                16 => BenchDecodeRoute::K2Horizon,
                 _ => BenchDecodeRoute::Unsupported,
             };
             assert_eq!(bench_decode_route(id), want, "bench_decode_route({id})");
         }
 
-        // ── vision_route: 8 -> DotsOcr, 5|6 -> QwenVl, gated by supports_images ──
+        // ── vision_route: 8 -> DotsOcr, 5|6 -> QwenVl, 11 -> Lfm2Vl; gated by supports_images ──
         for id in 0u32..=14 {
             let want = match id {
                 8 => VisionRoute::DotsOcr,
                 5 | 6 => VisionRoute::QwenVl,
+                11 => VisionRoute::Lfm2Vl,
                 _ => VisionRoute::None,
             };
             assert_eq!(vision_route(id), want, "vision_route({id})");
@@ -3638,12 +4265,12 @@ mod registry_tests {
             assert_eq!(ep_prompt_route(id), want, "ep_prompt_route({id})");
         }
 
-        // ── ep_eos_route: 10 -> Minimax, everything else Deepseek4 ──
+        // ── ep_eos_route: Qwen, MiniMax and DeepSeek carry distinct EOS ──
         for id in 0u32..=14 {
-            let want = if id == 10 {
-                EpEosRoute::Minimax
-            } else {
-                EpEosRoute::Deepseek4
+            let want = match id {
+                5 | 6 => EpEosRoute::Qwen35,
+                10 => EpEosRoute::Minimax,
+                _ => EpEosRoute::Deepseek4,
             };
             assert_eq!(ep_eos_route(id), want, "ep_eos_route({id})");
         }
@@ -3760,5 +4387,470 @@ mod registry_tests {
         for arch in ["gfx1030", "gfx942", "gfx1010", "gfx908"] {
             assert!(!is_dflash_lm_head_wmma_arch(arch), "{arch}");
         }
+    }
+
+    #[test]
+    fn qwen_embedded_template_wins_over_froggeric() {
+        // Qwen3.8-style embedded template carries official reasoning_effort.
+        let embedded = "{% if reasoning_effort %}{{ reasoning_effort }}{% endif %}".to_string();
+        let got = super::qwen35_template_from_embedded(Some(embedded.clone()), "qwen3.8-27b.mq4");
+        assert_eq!(got, embedded);
+        assert!(got.contains("reasoning_effort"));
+        assert_ne!(got.as_str(), super::FROGGERIC_QWEN35_TEMPLATE);
+    }
+
+    #[test]
+    fn qwen_missing_template_uses_froggeric_fallback() {
+        // Legacy Qwen3.5/3.6 HFQs without tokenizer_config.chat_template.
+        // Ornith path without embedded also keeps plain froggeric (no adapt).
+        let got = super::qwen35_template_from_embedded(None, "ornith-1.5-35b-a3b.mq4");
+        assert_eq!(got.as_str(), super::FROGGERIC_QWEN35_TEMPLATE);
+        let got2 = super::qwen35_template_from_embedded(None, "qwen3.6-35b.mq4");
+        assert_eq!(got2.as_str(), super::FROGGERIC_QWEN35_TEMPLATE);
+    }
+
+    /// Official Qwen3.8 low / xhigh instruction literals (exact contract).
+    const ORNITH_LOW_INSTR: &str = "Reasoning effort is set to low. Keep your thinking brief and focused, moving directly to the conclusion without unnecessary elaboration.";
+    const ORNITH_XHIGH_INSTR: &str = "Reasoning effort is set to xhigh. Please think carefully through the task, validate key assumptions, consider plausible alternatives, and prioritize correctness, consistency, and clarity in the final answer.";
+
+    /// Minimal Qwen3.5/3.6-shaped skeleton with the exact Ornith/official
+    /// tools + no-tools system markers the load-time adapter rewrites, plus
+    /// enough surrounding Jinja to actually render tools / system / user-only
+    /// branches through `JinjaChatFrame::render_messages`.
+    fn ornith_parent_template_skeleton() -> String {
+        // This is an independent fixture copied from the embedded Ornith parent
+        // template shape. Do not construct it from the production marker
+        // constants: the fixture must catch whitespace drift in those markers.
+        concat!(
+            "{%- macro render_content(content, do_vision_count, is_system_content=false) %}{{- content }}{%- endmacro %}\n",
+            "{%- if tools and tools is iterable and tools is not mapping %}\n",
+            "    {{- '<|im_start|>system\\n' }}\n",
+            "    {{- \"# Tools\\n\\nYou have access to the following functions:\\n\\n<tools>\" }}\n",
+            "    {%- for tool in tools %}\n",
+            "        {{- \"\\n\" }}\n",
+            "        {{- tool | tojson }}\n",
+            "    {%- endfor %}\n",
+            "    {{- \"\\n</tools>\" }}\n",
+            "    {%- if messages[0].role == 'system' %}\n",
+            "        {%- set content = render_content(messages[0].content, false, true)|trim %}\n",
+            "        {%- if content %}\n",
+            "            {{- '\\n\\n' + content }}\n",
+            "        {%- endif %}\n",
+            "    {%- endif %}\n",
+            "    {{- '<|im_end|>\\n' }}\n",
+            "{%- else %}\n",
+            "    {%- if messages[0].role == 'system' %}\n",
+            "        {%- set content = render_content(messages[0].content, false, true)|trim %}\n",
+            "        {{- '<|im_start|>system\\n' + content + '<|im_end|>\\n' }}\n",
+            "    {%- endif %}\n",
+            "{%- endif %}\n",
+            "{%- for message in messages %}\n",
+            "    {%- if message.role != 'system' %}\n",
+            "        {%- set content = render_content(message.content, false)|trim %}\n",
+            "        {{- '<|im_start|>' + message.role + '\\n' + content + '<|im_end|>\\n' }}\n",
+            "    {%- endif %}\n",
+            "{%- endfor %}",
+        )
+        .to_string()
+    }
+
+    /// Hermetic GPT-2-BPE tokenizer sufficient for Jinja string rendering
+    /// (bos override is empty; encode path is unused by these tests).
+    fn test_tokenizer() -> hipfire_runtime::tokenizer::Tokenizer {
+        // GPT-2 mode trigger (`Ġ`) + full byte fallback so any short
+        // ASCII content round-trips if a future test encodes.
+        let mut entries: Vec<String> = Vec::new();
+        entries.push(r#""<|im_start|>": 0"#.to_string());
+        entries.push(r#""<|im_end|>": 1"#.to_string());
+        entries.push(r#""system": 2"#.to_string());
+        entries.push(r#""user": 3"#.to_string());
+        entries.push(r#""assistant": 4"#.to_string());
+        entries.push(r#""\n": 5"#.to_string());
+        entries.push(r#""Ġ": 6"#.to_string());
+        for b in 0u32..=255u32 {
+            let ch = byte_to_gpt2_char_test(b as u8);
+            let escaped = json_escape(&ch.to_string());
+            entries.push(format!(r#""{escaped}": {}"#, 100 + b));
+        }
+        let vocab = entries.join(", ");
+        let json = format!(
+            r#"{{
+                "model": {{"type": "BPE", "vocab": {{ {vocab} }}, "merges": []}},
+                "added_tokens": [
+                    {{"id": 0, "content": "<|im_start|>", "special": true}},
+                    {{"id": 1, "content": "<|im_end|>", "special": true}}
+                ]
+            }}"#
+        );
+        hipfire_runtime::tokenizer::Tokenizer::from_hf_json(&json).expect("test tokenizer")
+    }
+
+    fn byte_to_gpt2_char_test(b: u8) -> char {
+        let mut bs: Vec<u32> = Vec::new();
+        bs.extend((b'!' as u32)..=(b'~' as u32));
+        bs.extend((0xA1u32)..=(0xACu32));
+        bs.extend((0xAEu32)..=(0xFFu32));
+        let mut cs: Vec<u32> = bs.clone();
+        let mut n = 0u32;
+        for b2 in 0u32..=255u32 {
+            if !bs.contains(&b2) {
+                bs.push(b2);
+                cs.push(256 + n);
+                n += 1;
+            }
+        }
+        for (i, &bv) in bs.iter().enumerate() {
+            if bv == b as u32 {
+                return char::from_u32(cs[i]).unwrap();
+            }
+        }
+        char::from_u32(b as u32).unwrap()
+    }
+
+    fn json_escape(s: &str) -> String {
+        let mut out = String::new();
+        for c in s.chars() {
+            match c {
+                '\\' => out.push_str("\\\\"),
+                '"' => out.push_str("\\\""),
+                '\n' => out.push_str("\\n"),
+                '\r' => out.push_str("\\r"),
+                '\t' => out.push_str("\\t"),
+                c if (c as u32) < 0x20 => out.push_str(&format!("\\u{:04x}", c as u32)),
+                c => out.push(c),
+            }
+        }
+        out
+    }
+
+    fn test_msg(
+        role: hipfire_runtime::prompt_frame::Role,
+        content: &str,
+    ) -> hipfire_runtime::prompt_frame::Message {
+        hipfire_runtime::prompt_frame::Message {
+            role,
+            content: content.to_string(),
+            reasoning_content: None,
+            name: None,
+            rendered_name: None,
+            tool_calls: Vec::new(),
+            tool_call_id: None,
+            tool_plan: String::new(),
+        }
+    }
+
+    fn adapted_ornith_template() -> String {
+        super::qwen35_template_from_embedded(
+            Some(ornith_parent_template_skeleton()),
+            "ornith-1.5-35b-a3b.mq4",
+        )
+    }
+
+    fn render_ornith(
+        template: &str,
+        messages: &[hipfire_runtime::prompt_frame::Message],
+        tools: Option<&[serde_json::Value]>,
+        enable_thinking: bool,
+        reasoning_effort: Option<&str>,
+    ) -> String {
+        let tok = test_tokenizer();
+        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+            tokenizer: &tok,
+            template,
+            system: None,
+            user: "",
+            enable_thinking,
+            bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort,
+        };
+        frame
+            .render_messages(messages, tools, None)
+            .unwrap_or_else(|e| panic!("render failed (effort={reasoning_effort:?}): {e}"))
+    }
+
+    /// Extract the first `<|im_start|>system ... <|im_end|>` body (no markers).
+    fn first_system_body(rendered: &str) -> Option<&str> {
+        const START: &str = "<|im_start|>system\n";
+        const END: &str = "<|im_end|>";
+        let i = rendered.find(START)?;
+        let rest = &rendered[i + START.len()..];
+        let j = rest.find(END)?;
+        Some(&rest[..j])
+    }
+
+    #[test]
+    fn ornith15_canonical_and_legacy_basenames_adapt() {
+        let skeleton = ornith_parent_template_skeleton();
+        for path in [
+            "/models/ornith-1.5-35b-a3b.mq4",
+            "/models/ornith-1.5-35b-a3b.mq4r",
+            "/models/ORNITH-1.5-35B-A3B.MQ4",
+            "/models/ORNITH-1.5-35B-A3B.MQ4R",
+            "/models/ornith1.5-35b-a3b.mq4",
+            "ornith1.5-35b-a3b.mq4r",
+        ] {
+            let got = super::qwen35_template_from_embedded(Some(skeleton.clone()), path);
+            assert!(
+                got.contains("reasoning_effort|default('xhigh')"),
+                "path {path} must adapt: missing default"
+            );
+            assert!(
+                got.contains("('xhigh', 'medium', 'low')"),
+                "path {path} must accept exact rungs"
+            );
+            assert!(
+                got.contains(ORNITH_LOW_INSTR),
+                "path {path} missing low instruction"
+            );
+            assert!(
+                got.contains(ORNITH_XHIGH_INSTR),
+                "path {path} missing xhigh instruction"
+            );
+            // medium injects nothing: no medium instruction string.
+            assert!(
+                !got.contains("Reasoning effort is set to medium"),
+                "path {path} must not steer medium"
+            );
+            // tools prepend + system/no-system branches.
+            assert!(
+                got.contains("reasoning_instructions + '\\n\\n'"),
+                "path {path} missing tools/system prepend"
+            );
+            assert!(
+                got.contains("{%- elif reasoning_instructions %}"),
+                "path {path} missing no-system branch"
+            );
+            assert_ne!(got, skeleton, "path {path} must change the template");
+        }
+    }
+
+    #[test]
+    fn unrelated_qwen_basename_is_untouched() {
+        let skeleton = ornith_parent_template_skeleton();
+        for path in [
+            "qwen3.6-35b-a3b.mq4",
+            "qwen3.5-397b.mq4",
+            "ornith-1.0-35b.mq4",
+            "ornith-2.0-35b-a3b.mq4",
+            "not-ornith-1.5-35b.mq4",
+        ] {
+            let got = super::qwen35_template_from_embedded(Some(skeleton.clone()), path);
+            assert_eq!(got, skeleton, "path {path} must not adapt");
+            assert!(!got.contains("reasoning_effort"), "path {path}");
+        }
+    }
+
+    #[test]
+    fn ornith15_wrong_extension_is_untouched() {
+        let skeleton = ornith_parent_template_skeleton();
+        for path in [
+            "ornith-1.5-35b-a3b.mq6",
+            "ornith-1.5-35b-a3b.hfq",
+            "ornith-1.5-35b-a3b",
+            "ornith-1.5-35b-a3b.json",
+            "ornith-1.5-35b-a3b.mq4.sidecar",
+            "ornith1.5-35b-a3b.MQ6",
+            "/models/ORNITH-1.5-35B-A3B.hfq",
+            "ornith-1.5-35b-a3b.mq4r.bak",
+        ] {
+            let got = super::qwen35_template_from_embedded(Some(skeleton.clone()), path);
+            assert_eq!(got, skeleton, "path {path} must not adapt (extension gate)");
+            assert!(
+                !got.contains("reasoning_effort"),
+                "path {path} must not gain effort"
+            );
+        }
+    }
+
+    #[test]
+    fn already_native_ornith_template_stays_unchanged() {
+        let native = format!(
+            "{}{}",
+            super::QWEN38_REASONING_BLOCK,
+            ornith_parent_template_skeleton()
+        );
+        assert!(native.contains("reasoning_effort"));
+        let got =
+            super::qwen35_template_from_embedded(Some(native.clone()), "ornith-1.5-35b-a3b.mq4");
+        assert_eq!(got, native, "already-native must not be rewritten");
+    }
+
+    #[test]
+    fn marker_drift_returns_original_unadapted() {
+        // Missing the no-tools branch marker → adapter must no-op.
+        let drifted = format!(
+            "{}\n{{%- set ns = namespace(x=1) %}}",
+            super::ORNITH_TOOLS_SYSTEM_OPEN
+        );
+        let got =
+            super::qwen35_template_from_embedded(Some(drifted.clone()), "ornith-1.5-35b-a3b.mq4");
+        assert_eq!(
+            got, drifted,
+            "drift must keep original so probe stays honest"
+        );
+        assert!(!got.contains("reasoning_effort|default('xhigh')"));
+
+        // Duplicate tools gate without the compound tools-open → no-op.
+        let dup = format!(
+            "{gate}\n{gate}\n{no_tools}",
+            gate = super::ORNITH_TOOLS_GATE,
+            no_tools = super::ORNITH_NO_TOOLS_SYSTEM_BRANCH
+        );
+        let got2 =
+            super::qwen35_template_from_embedded(Some(dup.clone()), "ornith1.5-35b-a3b.mq4r");
+        assert_eq!(got2, dup);
+    }
+
+    #[test]
+    fn ornith15_adapted_jinja_renders_effort_contract() {
+        use hipfire_runtime::prompt_frame::Role;
+
+        let template = adapted_ornith_template();
+        assert!(
+            template.contains("reasoning_effort|default('xhigh')"),
+            "adapter must inject effort block"
+        );
+
+        let tool = serde_json::json!({
+            "type": "function",
+            "function": {
+                "name": "echo",
+                "description": "echo",
+                "parameters": {"type": "object", "properties": {}}
+            }
+        });
+        let tools = [tool];
+
+        let user_only = [test_msg(Role::User, "hi")];
+        let with_system = [test_msg(Role::System, "SYS"), test_msg(Role::User, "hi")];
+
+        // Four effort states × three structural branches.
+        let efforts: [(Option<&str>, Option<&str>); 4] = [
+            (None, Some(ORNITH_XHIGH_INSTR)),          // undefined → xhigh
+            (Some("low"), Some(ORNITH_LOW_INSTR)),     // explicit low
+            (Some("medium"), None),                    // medium: no instruction
+            (Some("xhigh"), Some(ORNITH_XHIGH_INSTR)), // explicit xhigh
+        ];
+
+        for (effort, want_instr) in efforts {
+            // 1) tools present
+            let r = render_ornith(&template, &with_system, Some(&tools), true, effort);
+            let sys = first_system_body(&r).expect("tools path emits system");
+            assert!(
+                sys.contains("# Tools"),
+                "tools branch missing header (effort={effort:?}): {sys:?}"
+            );
+            match want_instr {
+                Some(instr) => {
+                    assert!(
+                        sys.starts_with(instr),
+                        "tools: instruction must lead system turn (effort={effort:?}): {sys:?}"
+                    );
+                    assert!(
+                        sys.contains(&format!("{instr}\n\n# Tools")),
+                        "tools: instruction must sit before # Tools (effort={effort:?})"
+                    );
+                    // system content still appended after tools block
+                    assert!(sys.contains("SYS"), "tools: system content lost");
+                }
+                None => {
+                    assert!(
+                        !sys.contains("Reasoning effort is set to"),
+                        "medium must not inject instruction (tools): {sys:?}"
+                    );
+                    assert!(
+                        sys.starts_with("# Tools"),
+                        "medium tools system starts at # Tools: {sys:?}"
+                    );
+                }
+            }
+
+            // 2) no tools + existing system message
+            let r = render_ornith(&template, &with_system, None, true, effort);
+            let sys = first_system_body(&r).expect("system path emits system");
+            match want_instr {
+                Some(instr) => {
+                    assert_eq!(
+                        sys,
+                        format!("{instr}\n\nSYS"),
+                        "no-tools+system placement (effort={effort:?})"
+                    );
+                }
+                None => {
+                    assert_eq!(sys, "SYS", "medium no-tools+system is bare content");
+                }
+            }
+            assert!(
+                r.contains("<|im_start|>user\nhi<|im_end|>"),
+                "user turn must remain (effort={effort:?})"
+            );
+
+            // 3) no tools + user-only (no system message)
+            let r = render_ornith(&template, &user_only, None, true, effort);
+            match want_instr {
+                Some(instr) => {
+                    let sys = first_system_body(&r).expect("user-only effort injects system");
+                    assert_eq!(
+                        sys, instr,
+                        "no-tools user-only system body (effort={effort:?})"
+                    );
+                }
+                None => {
+                    assert!(
+                        first_system_body(&r).is_none(),
+                        "medium user-only must not invent a system turn: {r:?}"
+                    );
+                }
+            }
+            assert!(
+                r.contains("<|im_start|>user\nhi<|im_end|>"),
+                "user turn must remain user-only (effort={effort:?})"
+            );
+        }
+
+        // Undefined effort matches explicit xhigh on every branch.
+        for tools_arg in [Some(tools.as_slice()), None] {
+            for msgs in [with_system.as_slice(), user_only.as_slice()] {
+                // Skip tools+user_only if tools need messages[0] system check —
+                // still valid: tools path tolerates non-system first message.
+                let undef = render_ornith(&template, msgs, tools_arg, true, None);
+                let xhigh = render_ornith(&template, msgs, tools_arg, true, Some("xhigh"));
+                assert_eq!(
+                    undef,
+                    xhigh,
+                    "undefined must match xhigh (tools={})",
+                    tools_arg.is_some()
+                );
+            }
+        }
+
+        // Thinking disabled: effort instructions absent on every branch.
+        for effort in [None, Some("low"), Some("medium"), Some("xhigh")] {
+            for (msgs, tools_arg) in [
+                (with_system.as_slice(), Some(tools.as_slice())),
+                (with_system.as_slice(), None),
+                (user_only.as_slice(), None),
+            ] {
+                let r = render_ornith(&template, msgs, tools_arg, false, effort);
+                assert!(
+                    !r.contains("Reasoning effort is set to"),
+                    "thinking-off must drop effort instr (effort={effort:?}): {r:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn ornith15_adapted_template_probe_effort_capability() {
+        let template = adapted_ornith_template();
+        let tok = test_tokenizer();
+        let cap = hipfire_runtime::prompt_frame::probe_effort_capability(&tok, &template);
+        assert!(cap.native, "adapted Ornith template must be effort-native");
+        assert_eq!(
+            cap.supported,
+            vec!["low", "medium", "xhigh"],
+            "supported rungs must be exactly the Qwen3.8 contract"
+        );
     }
 }

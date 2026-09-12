@@ -8,8 +8,8 @@ use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::kv_adaptive::{KvAdaptive, Preset};
 use hipfire_runtime::kv_backend::KvBackend;
 use hipfire_runtime::kv_mode::{self, ResolveResult};
-use hipfire_runtime::llama::{self, KvCache, KvDims, KvLayers, KvTarget};
 use hipfire_runtime::llama::KvCacheExt;
+use hipfire_runtime::llama::{self, KvCache, KvDims, KvLayers, KvTarget};
 use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
 
 pub struct Qwen35Bundle {
@@ -82,7 +82,10 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
     };
 
     // ── Scratch (free dn + kv + weights on fail) ─────────────────────
-    let scratch = match Qwen35Scratch::new_with_kv_max(ctx.gpu, &config, 2048, ctx.max_seq) {
+    // Flash-attention partials address physical KV slots, not the logical
+    // context range.  An eviction-bounded cache can make this cap much smaller
+    // than max_seq, so sizing from max_seq retains memory for unreachable tiles.
+    let scratch = match Qwen35Scratch::new_with_kv_max(ctx.gpu, &config, 2048, kv.physical_cap) {
         Ok(v) => v,
         Err(e) => {
             let cleanup = free_dn_kv_and_weights(dn, kv, weights, ctx.gpu);
@@ -419,13 +422,15 @@ fn construct_kv_cache(
                 )
                 .map_err(|e| format!("{e}"))?
             }
-            (KvBackend::Contiguous, llama::VMode::Q8) => <KvCache as KvCacheExt>::from_mode_with_backend(
-                mode,
-                KvBackend::Contiguous,
-                KvTarget::Single(ctx.gpu),
-                &plan.dims,
-            )
-            .map_err(|e| format!("{e}"))?,
+            (KvBackend::Contiguous, llama::VMode::Q8) => {
+                <KvCache as KvCacheExt>::from_mode_with_backend(
+                    mode,
+                    KvBackend::Contiguous,
+                    KvTarget::Single(ctx.gpu),
+                    &plan.dims,
+                )
+                .map_err(|e| format!("{e}"))?
+            }
             (KvBackend::Contiguous, vm) => {
                 let mut kv = <KvCache as KvCacheExt>::from_mode_with_backend(
                     mode,

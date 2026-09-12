@@ -924,6 +924,19 @@ impl Default for SpecRequestConfig {
     }
 }
 
+/// Map a request's wire seed onto the speculator RNG state. `0` maps to the
+/// historical `0x13579BDF` sentinel because xorshift state 0 is stuck; every
+/// other seed passes through verbatim so an explicit seed reproduces its draw
+/// sequence exactly. Shared by every `Speculator::configure_request` impl that
+/// owns an xorshift stream (generic DFlash, DSpark, n-gram).
+pub fn request_rng_state(rng_seed: u64) -> u64 {
+    if rng_seed == 0 {
+        0x1357_9BDF
+    } else {
+        rng_seed
+    }
+}
+
 /// Typed MTP+ngram-mod counters surfaced on the wire done event.
 ///
 /// Populated by the Qwen MTP drafter when `HIPFIRE_MTP_NGRAM` composition is
@@ -948,7 +961,6 @@ pub struct MtpRequestStats {
     /// Latched after the first positive n-gram acceptance this request.
     pub mtp_retired: bool,
 }
-
 
 /// One acceptance window's committed tokens: the accepted draft prefix plus the
 /// verifier's bonus, EXCLUDING the seed. Identical in meaning to qwen35's
@@ -1082,7 +1094,6 @@ pub trait MtpDrafter {
     fn request_stats(&self) -> MtpRequestStats {
         MtpRequestStats::default()
     }
-
 }
 
 /// Generic adapter driving any [`MtpDrafter`] through the [`Speculator`]
@@ -1680,6 +1691,51 @@ mod tests {
         };
         assert_eq!(step.emit.len(), step.accepted + 1);
         assert_eq!(*step.emit.last().unwrap(), step.next_seed);
+    }
+    // ── request_rng_state ─────────────────────────────────────────────────
+
+    #[test]
+    fn request_rng_state_zero_maps_to_sentinel_otherwise_passthrough() {
+        assert_eq!(request_rng_state(0), 0x1357_9BDF);
+        // The sentinel itself is idempotent (explicit seed == sentinel works).
+        assert_eq!(request_rng_state(0x1357_9BDF), 0x1357_9BDF);
+        // Explicit seeds reproduce verbatim — this is what makes HTTP
+        // seed=N byte-reproducible through the sampled spec routes.
+        assert_eq!(request_rng_state(42), 42);
+        assert_eq!(request_rng_state(u64::MAX), u64::MAX);
+    }
+
+    #[test]
+    fn request_rng_state_distinct_seeds_distinct_states() {
+        let states: std::collections::HashSet<u64> = (1u64..=64).map(request_rng_state).collect();
+        assert_eq!(
+            states.len(),
+            64,
+            "mapping must be injective on the nonzero domain"
+        );
+    }
+
+    #[test]
+    fn request_rng_state_seeded_stream_advances_and_replays() {
+        // Route-level RNG-advance contract: a speculator configured with an
+        // explicit seed draws from that exact state and advances it every
+        // draw; the same seed replays the same sequence (xorshift32).
+        let mut rng_a = request_rng_state(1234) as u32;
+        let mut rng_b = request_rng_state(1234) as u32;
+        let mut rng_c = request_rng_state(1235) as u32;
+        let xs = |s: &mut u32| {
+            let mut x = *s;
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            *s = x;
+            x
+        };
+        let seq_a: Vec<u32> = (0..16).map(|_| xs(&mut rng_a)).collect();
+        let seq_b: Vec<u32> = (0..16).map(|_| xs(&mut rng_b)).collect();
+        let seq_c: Vec<u32> = (0..16).map(|_| xs(&mut rng_c)).collect();
+        assert_eq!(seq_a, seq_b, "same seed ⇒ same draw sequence");
+        assert_ne!(seq_a, seq_c, "different seed ⇒ different stream");
     }
 
     // ── accept_greedy_prefix ────────────────────────────────────────────────

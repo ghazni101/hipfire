@@ -40,7 +40,14 @@ impl ArchModel for Lfm2MoeBundle {
             state,
             eos_tok: _,
             lfm2_decode_batch,
+            vision_config: _,
+            vision_weights,
         } = *self;
+        // Vision FIRST so its buffers are returned before the big text-tower
+        // pool drain reuses VRAM (pointer-keyed leak class; see AGENTS.md).
+        if let Some(vw) = vision_weights {
+            vw.free_gpu(gpu);
+        }
         if let Some(batch) = lfm2_decode_batch {
             batch.free_gpu(gpu);
         }

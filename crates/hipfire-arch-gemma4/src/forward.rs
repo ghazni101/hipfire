@@ -68,7 +68,10 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 /// must therefore use the same arithmetic family as eager decode rather than
 /// numerically-close fused/WMMA variants whose small drift accumulates in KV.
 fn eagle_strict_enabled() -> bool {
-    std::env::var("HIPFIRE_GEMMA4_EAGLE").ok().as_deref() == Some("1")
+    hipfire_config::developer_var("HIPFIRE_GEMMA4_EAGLE")
+        .ok()
+        .as_deref()
+        == Some("1")
 }
 
 /// Master switch for the qwen35-mirror fused-projection FFN path
@@ -78,7 +81,9 @@ fn eagle_strict_enabled() -> bool {
 /// pre-FWHT-rotated input).
 fn fused_ffn_enabled() -> bool {
     !matches!(
-        std::env::var("HIPFIRE_GEMMA4_FUSED_FFN").ok().as_deref(),
+        hipfire_config::developer_var("HIPFIRE_GEMMA4_FUSED_FFN")
+            .ok()
+            .as_deref(),
         Some("0") | Some("off") | Some("false")
     )
 }
@@ -91,7 +96,9 @@ fn fused_ffn_enabled() -> bool {
 /// fused kernel is byte-equivalent to two separate Q8 GEMVs).
 fn fused_qk_enabled() -> bool {
     !matches!(
-        std::env::var("HIPFIRE_GEMMA4_FUSED_QK").ok().as_deref(),
+        hipfire_config::developer_var("HIPFIRE_GEMMA4_FUSED_QK")
+            .ok()
+            .as_deref(),
         Some("0") | Some("off") | Some("false")
     )
 }
@@ -105,7 +112,7 @@ fn fused_qk_enabled() -> bool {
 fn fused_postnorm_enabled() -> bool {
     !eagle_strict_enabled()
         && !matches!(
-            std::env::var("HIPFIRE_GEMMA4_FUSED_POSTNORM")
+            hipfire_config::developer_var("HIPFIRE_GEMMA4_FUSED_POSTNORM")
                 .ok()
                 .as_deref(),
             Some("0") | Some("off") | Some("false")
@@ -121,7 +128,7 @@ fn fused_postnorm_enabled() -> bool {
 fn fused_qk_rope_enabled() -> bool {
     !eagle_strict_enabled()
         && !matches!(
-            std::env::var("HIPFIRE_GEMMA4_FUSED_QK_ROPE")
+            hipfire_config::developer_var("HIPFIRE_GEMMA4_FUSED_QK_ROPE")
                 .ok()
                 .as_deref(),
             Some("0") | Some("off") | Some("false")
@@ -169,7 +176,7 @@ fn qk_proj(
 /// the exact same math as `rmsnorm_f32` + rotation-doing `weight_gemv`, fused.
 fn fused_attn_norm_enabled() -> bool {
     !matches!(
-        std::env::var("HIPFIRE_GEMMA4_FUSED_ATTN_NORM")
+        hipfire_config::developer_var("HIPFIRE_GEMMA4_FUSED_ATTN_NORM")
             .ok()
             .as_deref(),
         Some("0") | Some("off") | Some("false")
@@ -309,14 +316,16 @@ pub fn decode_step_with_graph(
 ) -> Result<Vec<f32>, String> {
     use std::sync::OnceLock;
     static GRAPH_ENV: OnceLock<Option<bool>> = OnceLock::new();
-    let env_override =
-        *GRAPH_ENV.get_or_init(
-            || match std::env::var("HIPFIRE_GEMMA4_GRAPH").ok().as_deref() {
-                Some("1") => Some(true),
-                Some("0") => Some(false),
-                _ => None,
-            },
-        );
+    let env_override = *GRAPH_ENV.get_or_init(|| {
+        match hipfire_config::developer_var("HIPFIRE_GEMMA4_GRAPH")
+            .ok()
+            .as_deref()
+        {
+            Some("1") => Some(true),
+            Some("0") => Some(false),
+            _ => None,
+        }
+    });
     // The captured path is the default. Set HIPFIRE_GEMMA4_GRAPH=0 to retain
     // the eager fallback for diagnostics.
     let graph_on = env_override.unwrap_or(true);
@@ -1069,7 +1078,7 @@ fn attn_q8_swa(
     }
     // DIAG: HIPFIRE_GEMMA4_BASELINE_ATTN routes through the proven baseline
     // attention_q8_0_kv (no window) to isolate the new _swa kernel.
-    if std::env::var_os("HIPFIRE_GEMMA4_BASELINE_ATTN").is_some() {
+    if hipfire_config::developer_var_os("HIPFIRE_GEMMA4_BASELINE_ATTN").is_some() {
         return gpu
             .attention_q8_0_kv(
                 q,

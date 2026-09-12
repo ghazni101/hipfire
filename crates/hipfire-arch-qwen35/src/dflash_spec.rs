@@ -22,7 +22,8 @@ use crate::speculative::{
 use hipfire_runtime::dflash::{DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::spec::{
-    EvictRetain, PrefillOutcome, SpecGrammar, SpecRequestConfig, SpecStep, SpecTarget, Speculator,
+    request_rng_state, EvictRetain, PrefillOutcome, SpecGrammar, SpecRequestConfig, SpecStep,
+    SpecTarget, Speculator,
 };
 use rdna_compute::Gpu;
 use std::path::Path;
@@ -82,9 +83,7 @@ impl DflashState {
         // freed. Unknown quiescence → intentional leak; daemon restart is the
         // containment path.
         if let Err(reason) = verify_pm4.shutdown() {
-            eprintln!(
-                "dflash verify PM4: refusing free after unknown quiescence: {reason}"
-            );
+            eprintln!("dflash verify PM4: refusing free after unknown quiescence: {reason}");
             std::mem::forget((
                 verify_pm4,
                 draft_weights,
@@ -1020,18 +1019,15 @@ impl Speculator for DflashSpeculator {
 
     fn configure_request(&mut self, cfg: SpecRequestConfig) {
         // Store the request's sampling config for the chain-mode branch of
-        // `step`. Re-seed the RNG to the same fixed value spec-graph used per
-        // `generate_dflash` call (a fresh `let mut rng_state = 0x13579BDF`), so a
-        // sampled request is deterministic given its seed and two identical
-        // requests in one session produce identical output — preserving
-        // spec-graph's behavior rather than letting the seed drift across turns.
-        // New SpecRequestConfig fields (min_p / rng_seed / ngram) are ignored —
-        // this path never supported them.
+        // `step`, and re-seed the sampled-draw RNG from the request seed via
+        // the shared helper (0 maps to the 0x13579BDF sentinel; every other
+        // seed passes through verbatim so an explicit wire `seed` reproduces
+        // its draw sequence exactly).
         self.sample_temp = cfg.temp;
         self.sample_top_p = cfg.top_p;
         self.sample_top_k = cfg.top_k;
         self.sample_cactus = cfg.cactus_delta;
-        self.rng_state = 0x13579BDF;
+        self.rng_state = request_rng_state(cfg.rng_seed);
     }
 
     fn requires_greedy(&self) -> bool {
@@ -1229,7 +1225,7 @@ mod admit_dflash_verify_pm4_tests {
                 kv_is_q8: true,
                 dn_state_is_q8: true,
                 adaptive_kv_absent: true,
-        runtime_extract_layers: &DFLASH_VERIFY_PM4_EXTRACT_LAYERS,
+                runtime_extract_layers: &DFLASH_VERIFY_PM4_EXTRACT_LAYERS,
                 runtime_block_size: DFLASH_VERIFY_PM4_BLOCK,
                 target_layer_ids: &DFLASH_VERIFY_PM4_EXTRACT_LAYERS,
                 ddtree_present: false,

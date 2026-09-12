@@ -465,7 +465,6 @@ pub fn act_quant_fp8_inplace_ref(
     Ok(())
 }
 
-
 /// `fp4_act_quant(..., inplace=True)` reference (`kernel.py:163-171`).
 ///
 /// Groups of 32 along the last dim. Fused quantize+dequantize with BF16 write-back.
@@ -645,11 +644,7 @@ mod tests {
             let v = e2m1_to_f32(code);
             let expect = E2M1_LUT[code as usize];
             // Byte-identical for every slot, including distinct ±0.
-            assert_eq!(
-                v.to_bits(),
-                expect.to_bits(),
-                "LUT mismatch at code {code}"
-            );
+            assert_eq!(v.to_bits(), expect.to_bits(), "LUT mismatch at code {code}");
             let back = f32_to_e2m1(v);
             assert_eq!(back, code, "e2m1 round-trip failed for code {code}");
         }
@@ -735,6 +730,7 @@ mod tests {
     // ── block dequant ──────────────────────────────────────────────────
 
     #[test]
+    #[allow(clippy::erasing_op)] // deliberate "row 0" indexing: 0 * bk + col
     fn dequant_dense_fp8_ragged_260x300() {
         // 260×300 exercises ceil in both dims: scale grid = [3, 3] not [2, 2].
         let m = 260usize;
@@ -751,7 +747,7 @@ mod tests {
         s[0 * bk + 2] = 126;
         s[2 * bk + 2] = 128;
         s[2 * bk + 0] = 129; // 4.0
-                              // Fill remaining scales with 127 so unset blocks are quiet.
+                             // Fill remaining scales with 127 so unset blocks are quiet.
         for b in s.iter_mut() {
             if *b == 0 {
                 *b = 127;
@@ -782,6 +778,7 @@ mod tests {
     }
 
     #[test]
+    #[allow(clippy::erasing_op)] // deliberate "row 0" indexing: 0 * k + col
     fn dequant_expert_fp4_nibble_order_and_scales() {
         // M=2, K=64 → stored [2, 32], scale [2, 2].
         let m = 2usize;
@@ -859,7 +856,10 @@ mod tests {
         let mut y = vec![0.0f32; 8];
         act_quant_fp8_inplace_ref(&mut y, 8, 8).unwrap();
         let s = fast_round_scale(1e-4, 1.0 / 448.0);
-        assert!(s > 0.0 && (s.to_bits() & 0x007f_ffff) == 0, "floor scale must be >0 pot2, got {s}");
+        assert!(
+            s > 0.0 && (s.to_bits() & 0x007f_ffff) == 0,
+            "floor scale must be >0 pot2, got {s}"
+        );
         for v in &y {
             assert_eq!(*v, 0.0);
         }
@@ -923,13 +923,13 @@ mod tests {
         // Boundaries of amax/448 at powers of two: 448*2^k for integer k.
         // Just-above values that BF16 rounds back onto the boundary.
         let near = [
-            224.4f32,  // → 224, s: 1.0 vs 0.5
-            112.3,     // → 112, s: 0.5 vs 0.25
-            56.2,      // → 56,  s: 0.25 vs 0.125
-            28.1,      // → 28,  s: 0.125 vs 0.0625
-            14.05,     // → 14
-            7.02,      // → 7
-            448.4,     // → 448, s: 2.0 vs 1.0
+            224.4f32, // → 224, s: 1.0 vs 0.5
+            112.3,    // → 112, s: 0.5 vs 0.25
+            56.2,     // → 56,  s: 0.25 vs 0.125
+            28.1,     // → 28,  s: 0.125 vs 0.0625
+            14.05,    // → 14
+            7.02,     // → 7
+            448.4,    // → 448, s: 2.0 vs 1.0
         ];
         for r in 0..n_rows {
             for g in 0..(last_dim / BLOCK) {
@@ -938,7 +938,8 @@ mod tests {
                     // Full-f32 mantissa junk (bottom 16 bits set) — like f64→f32
                     // cast from an f64-accum matmul, not a BF16 residual.
                     let bits = (0.37f32 * (i as f32 + 1.0)).to_bits() | 0x0000_a5a5;
-                    rope_like[base + i] = f32::from_bits(bits) * if i % 2 == 0 { 1.0 } else { -1.0 };
+                    rope_like[base + i] =
+                        f32::from_bits(bits) * if i % 2 == 0 { 1.0 } else { -1.0 };
                 }
                 // Plant a near-boundary amax in each group.
                 rope_like[base] = near[g % near.len()];
@@ -958,7 +959,6 @@ mod tests {
             );
         }
     }
-
 
     #[test]
     fn act_quant_fp4_inplace_floor_differs_from_fp8() {

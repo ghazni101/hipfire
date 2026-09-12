@@ -113,6 +113,11 @@ type HipGraphExec = *mut c_void;
 pub type HipMemGenericAllocationHandle = *mut c_void;
 
 const HIP_SUCCESS: u32 = 0;
+
+/// `hipEventQuery` return when previously-recorded work is still outstanding.
+/// Per `hip_runtime_api.h` (`hipErrorNotReady = 600`); a non-blocking poll
+/// treats exactly this code as "not yet", every other nonzero code as failure.
+pub const HIP_ERROR_NOT_READY: u32 = 600;
 pub const HIP_MEM_LOCATION_TYPE_DEVICE: u32 = 1;
 pub const HIP_MEM_ALLOCATION_TYPE_PINNED: u32 = 1;
 pub const HIP_MEM_ACCESS_FLAGS_PROT_READ_WRITE: u32 = 3;
@@ -297,6 +302,7 @@ pub struct HipRuntime {
     fn_event_create: unsafe extern "C" fn(*mut HipEvent) -> u32,
     fn_event_create_with_flags: unsafe extern "C" fn(*mut HipEvent, c_uint) -> u32,
     fn_event_record: unsafe extern "C" fn(HipEvent, HipStream) -> u32,
+    fn_event_query: unsafe extern "C" fn(HipEvent) -> u32,
     fn_event_synchronize: unsafe extern "C" fn(HipEvent) -> u32,
     fn_event_elapsed_time: unsafe extern "C" fn(*mut f32, HipEvent, HipEvent) -> u32,
     fn_event_destroy: unsafe extern "C" fn(HipEvent) -> u32,
@@ -605,6 +611,11 @@ impl HipRuntime {
                     lib,
                     "hipEventRecord",
                     unsafe extern "C" fn(HipEvent, HipStream) -> u32
+                ),
+                fn_event_query: load_fn!(
+                    lib,
+                    "hipEventQuery",
+                    unsafe extern "C" fn(HipEvent) -> u32
                 ),
                 fn_event_synchronize: load_fn!(
                     lib,
@@ -1473,6 +1484,22 @@ impl HipRuntime {
         let code = unsafe { (self.fn_event_synchronize)(event.0) };
         crate::ffi::launch_counters::event_sync::record(t.elapsed().as_nanos() as u64);
         self.check(code, "hipEventSynchronize")
+    }
+
+    pub fn event_query(&self, event: &Event) -> HipResult<bool> {
+        // Non-blocking by construction: hipSuccess = recorded and complete,
+        // hipErrorNotReady (600) = work still outstanding, anything else is
+        // a real failure (invalid handle, device lost) and propagates.
+        let code = unsafe { (self.fn_event_query)(event.0) };
+        if code == HIP_SUCCESS {
+            Ok(true)
+        } else if code == HIP_ERROR_NOT_READY {
+            Ok(false)
+        } else {
+            self.check(code, "hipEventQuery")?;
+            // Unreachable: check errs on every nonzero code.
+            Ok(false)
+        }
     }
 
     pub fn event_elapsed_ms(&self, start: &Event, stop: &Event) -> HipResult<f32> {

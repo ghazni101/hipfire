@@ -165,7 +165,7 @@ fn run_prefill_residual_muse_or_key(
 /// Default ON. Since the kernel is bit-identical to the shared one, this knob
 /// is a perf A/B switch, not a correctness escape hatch.
 fn muse_gemm_enabled() -> bool {
-    std::env::var("HIPFIRE_GLIMMER_MUSE_GEMM")
+    hipfire_config::developer_var("HIPFIRE_GLIMMER_MUSE_GEMM")
         .map(|v| v != "0" && !v.is_empty())
         .unwrap_or(true)
 }
@@ -173,7 +173,7 @@ fn muse_gemm_enabled() -> bool {
 // Opt-out for fusing the FFN activation and MagnumQuant G256 rotation.
 #[inline]
 fn fused_silu_rotate_supported(w: &WeightTensor) -> bool {
-    std::env::var("HIPFIRE_GLIMMER_FUSED_SILU_ROTATE").as_deref() != Ok("0")
+    hipfire_config::developer_var("HIPFIRE_GLIMMER_FUSED_SILU_ROTATE").as_deref() != Ok("0")
         && matches!(w.gpu_dtype, DType::MQ4G256 | DType::MQ6G256)
         && w.k % 256 == 0
 }
@@ -220,12 +220,12 @@ fn run_prefill_fused_qkvza_key(
 // HIPFIRE_GLIMMER_SHARED_ROT default ON (=1 or unset), =0 selects old path.
 // Mirrors Gemma4's attn_input_qkv and Qwen35's run_fa_layer_body precedent.
 fn shared_rot_enabled() -> bool {
-    std::env::var("HIPFIRE_GLIMMER_SHARED_ROT").as_deref() != Ok("0")
+    hipfire_config::developer_var("HIPFIRE_GLIMMER_SHARED_ROT").as_deref() != Ok("0")
 }
 
 fn batched_lm_head_enabled() -> bool {
     !matches!(
-        std::env::var("HIPFIRE_GLIMMER_BATCHED_LM_HEAD")
+        hipfire_config::developer_var("HIPFIRE_GLIMMER_BATCHED_LM_HEAD")
             .ok()
             .as_deref(),
         Some("0") | Some("off") | Some("false")
@@ -237,7 +237,7 @@ fn batched_lm_head_enabled() -> bool {
 /// `HIPFIRE_GLIMMER_FUSED_POSTNORM=0|off|false|no` (case-insensitive).
 /// Decode-only; not byte-identical (residual add rounds in-kernel).
 fn fused_postnorm_enabled() -> bool {
-    match std::env::var("HIPFIRE_GLIMMER_FUSED_POSTNORM") {
+    match hipfire_config::developer_var("HIPFIRE_GLIMMER_FUSED_POSTNORM") {
         Ok(v) => !matches!(
             v.trim().to_ascii_lowercase().as_str(),
             "0" | "off" | "false" | "no"
@@ -254,7 +254,7 @@ fn fused_postnorm_enabled() -> bool {
 /// layers pass `n_rot_pairs=0` (norm+scale, no RoPE). Not eligible when
 /// any of NO_QK_NORM / NO_QK_SCALE / ROPE_INTERLEAVED ablations are on.
 fn fused_qk_rope_enabled() -> bool {
-    match std::env::var("HIPFIRE_GLIMMER_FUSED_QK_ROPE") {
+    match hipfire_config::developer_var("HIPFIRE_GLIMMER_FUSED_QK_ROPE") {
         Ok(v) => !matches!(
             v.trim().to_ascii_lowercase().as_str(),
             "0" | "off" | "false"
@@ -279,7 +279,7 @@ fn fused_qk_rope_enabled() -> bool {
 ///   within budget but closer to limit; B=128 is more conservative.
 ///   Both defaults (192 and 256) sit well inside that headroom.
 pub fn glimmer_prefill_chunk_size(prompt_len: usize) -> usize {
-    if let Some(v) = std::env::var("HIPFIRE_GLIMMER_PREFILL_CHUNK")
+    if let Some(v) = hipfire_config::developer_var("HIPFIRE_GLIMMER_PREFILL_CHUNK")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
     {
@@ -757,7 +757,7 @@ fn glimmer_layer_decode(
     //
     // `HIPFIRE_GLIMMER_FLASH_DECODE` overrides the threshold in tokens; 0
     // disables flash decode entirely.
-    let flash_min = std::env::var("HIPFIRE_GLIMMER_FLASH_DECODE")
+    let flash_min = hipfire_config::developer_var("HIPFIRE_GLIMMER_FLASH_DECODE")
         .ok()
         .and_then(|v| v.trim().parse::<usize>().ok())
         .unwrap_or(1280);
@@ -2167,7 +2167,10 @@ fn verify_block_capture_impl(
     let restore_pos = position as usize;
     let device = matches!(&capture, CaptureBackend::Device);
     let t_verify_start = std::time::Instant::now();
-    let do_timing = std::env::var("HIPFIRE_GLIMMER_TIMING").ok().as_deref() == Some("1");
+    let do_timing = hipfire_config::developer_var("HIPFIRE_GLIMMER_TIMING")
+        .ok()
+        .as_deref()
+        == Some("1");
 
     // Host: sorted capture index + position-major buf. Device: validate cursor
     // and clone layer_to_slot; begin_verify runs after scratch alloc succeeds.
@@ -2494,7 +2497,7 @@ fn verify_block_capture_impl(
             // same query-tiled WMMA kernels prefill already uses (one WMMA B
             // fragment reused across 16 query rows: O(ctx)).
             let wmma_full = b > 1
-                && std::env::var("HIPFIRE_GLIMMER_WMMA_FULL")
+                && hipfire_config::developer_var("HIPFIRE_GLIMMER_WMMA_FULL")
                     .map(|v| v != "0" && !v.is_empty())
                     .unwrap_or(true);
             let mut wmma_done = false;
@@ -3349,10 +3352,11 @@ fn prefill_chunk_batched(
             // So it costs ~0.2% (inside noise) below the window and is the
             // difference between working and not above it. `=0` restores the
             // batched path and reintroduces the ceiling.
-            let flash_full = std::env::var("HIPFIRE_GLIMMER_FLASH_FULL")
+            let flash_full = hipfire_config::developer_var("HIPFIRE_GLIMMER_FLASH_FULL")
                 .map(|v| v != "0" && !v.is_empty())
                 .unwrap_or(true);
-            let use_flash = std::env::var("HIPFIRE_GLIMMER_NO_FLASH").as_deref() != Ok("1")
+            let use_flash = hipfire_config::developer_var("HIPFIRE_GLIMMER_NO_FLASH").as_deref()
+                != Ok("1")
                 && ((window != 0 && seq_len > window)
                     || (window == 0 && flash_full && seq_len > 2048));
             if use_flash {
@@ -3425,7 +3429,7 @@ fn prefill_chunk_batched(
                 // get the parent. Both are Q8 WMMA, so all 52 layers are now on
                 // matrix hardware instead of 13 of them.
                 let wmma_full = b > 1
-                    && std::env::var("HIPFIRE_GLIMMER_WMMA_FULL")
+                    && hipfire_config::developer_var("HIPFIRE_GLIMMER_WMMA_FULL")
                         .map(|v| v != "0" && !v.is_empty())
                         .unwrap_or(true);
                 let mut wmma_done = false;
@@ -3553,7 +3557,7 @@ fn prefill_chunk_batched(
             // processes per config: 1372 -> 1356 ms at 1080 (+1.2%) and 7366 ->
             // 7310 ms at 4241 (+0.8%), byte-identical both lengths. Env opt-out
             // HIPFIRE_GLIMMER_O_RESIDUAL=0 kept for A/B.
-            let o_use_residual = std::env::var("HIPFIRE_GLIMMER_O_RESIDUAL")
+            let o_use_residual = hipfire_config::developer_var("HIPFIRE_GLIMMER_O_RESIDUAL")
                 .map(|v| v != "0" && !v.is_empty())
                 .unwrap_or(true)
                 && b > 1

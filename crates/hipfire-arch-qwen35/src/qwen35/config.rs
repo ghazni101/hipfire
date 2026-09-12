@@ -9,8 +9,10 @@ use hip_bridge::HipError;
 use hip_bridge::HipResult;
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::model_source::ModelSource;
+use hipfire_runtime::tp_shard::ShardConfig;
 use rdna_compute::GpuTensor;
 use serde::Deserialize;
+use std::ops::Range;
 
 // ─── Config ─────────────────────────────────────────────────────────────
 
@@ -168,6 +170,333 @@ pub struct Qwen35Config {
     /// no pruning (today's behavior, byte-identical to baseline). Not
     /// (de)serialized — `Qwen35Config` does not derive serde.
     pub reap_keep: Option<std::sync::Arc<hipfire_reap::plan::ReapPlan>>,
+}
+
+/// Immutable per-rank layout for dense Qwen3.8 MQV2 tensor parallelism.
+///
+/// Each rank owns half-open global ranges for attention Q heads, attention KV
+/// heads, Delta key heads, Delta value heads, and FFN hidden columns. Q,
+/// Delta, and FFN ranges are model-lifetime static, balanced, and cover their
+/// global tensors exactly once. KV ranges also cover the tensor; when TP
+/// exceeds the global KV-head count, a GQA group is split between ranks and
+/// that group's KV head is deliberately replicated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DenseTpRankLayout {
+    pub rank: usize,
+    pub q_head_range: Range<usize>,
+    pub kv_head_range: Range<usize>,
+    pub delta_key_head_range: Range<usize>,
+    pub delta_value_head_range: Range<usize>,
+    pub ffn_hidden_range: Range<usize>,
+}
+
+/// Build static per-rank layouts for dense Qwen TP2..5.
+///
+/// Attention normally shards whole GQA units. If there are fewer KV heads
+/// than ranks, it instead partitions enough Q groups to give every rank work
+/// and replicates the corresponding KV head. Q heads are still exact-cover;
+/// replicated K/V projections and cache rows are identical inputs to the
+/// disjoint local Q heads and therefore do not duplicate output contributions.
+/// Delta uses the minimum whole GQA macro-unit whose value width is G256
+/// aligned. FFN uses whole G256 groups. Every local projection width remains
+/// G256-aligned and TP2..5 are admitted.
+pub fn dense_tp_rank_layouts(
+    config: &Qwen35Config,
+    shard: &ShardConfig,
+) -> Result<Vec<DenseTpRankLayout>, String> {
+    let tp = shard.tp_size;
+    if tp < 2 || tp > 5 {
+        return Err(format!("dense TP requires tp 2..=5, got {tp}"));
+    }
+    if tp == 0 {
+        return Err("dense TP tp_size must be non-zero".to_string());
+    }
+    if config.num_experts != 0 {
+        return Err("dense TP requires num_experts=0; use the MoE EP route".to_string());
+    }
+    if config.hidden_dim == 0 || config.hidden_dim % 256 != 0 {
+        return Err(format!(
+            "hidden_dim {} is not aligned to 256 (must be whole G256 groups)",
+            config.hidden_dim
+        ));
+    }
+    if config.n_kv_heads == 0 || config.n_heads == 0 || config.n_heads % config.n_kv_heads != 0 {
+        return Err(format!(
+            "GQA ratio not exact: n_heads {} not a multiple of n_kv_heads {}",
+            config.n_heads, config.n_kv_heads
+        ));
+    }
+    let q_per_kv = config.n_heads / config.n_kv_heads;
+    let total_attn_units = config.n_kv_heads;
+    if tp > config.n_heads {
+        return Err(format!(
+            "attention Q heads {} < tp {tp} (cannot cover all ranks)",
+            config.n_heads
+        ));
+    }
+    if config.linear_num_key_heads == 0
+        || config.linear_num_value_heads == 0
+        || config.linear_num_value_heads % config.linear_num_key_heads != 0
+    {
+        return Err(format!(
+            "Delta GQA ratio not exact: value heads {} not a multiple of key heads {}",
+            config.linear_num_value_heads, config.linear_num_key_heads
+        ));
+    }
+    let dn_ratio = config.linear_num_value_heads / config.linear_num_key_heads;
+    let key_heads = config.linear_num_key_heads;
+    let value_heads = config.linear_num_value_heads;
+    let value_dim = config.linear_value_head_dim;
+    // Find minimal macro-unit k where per-unit value width is G256 aligned and units tile exactly.
+    let mut k_unit: Option<usize> = None;
+    for k in 1..=key_heads {
+        if key_heads % k != 0 {
+            continue;
+        }
+        let v_unit = k * dn_ratio;
+        if value_heads % v_unit != 0 {
+            continue;
+        }
+        if (v_unit * value_dim) % 256 != 0 {
+            continue;
+        }
+        k_unit = Some(k);
+        break;
+    }
+    let k_unit = k_unit.ok_or_else(|| {
+        format!(
+            "cannot find G256-aligned GQA macro-unit for Delta (key_heads={key_heads} value_heads={value_heads} value_dim={value_dim})"
+        )
+    })?;
+    let v_unit = k_unit * dn_ratio;
+    let total_dn_units = key_heads / k_unit;
+    debug_assert_eq!(value_heads / v_unit, total_dn_units);
+    if total_dn_units < tp {
+        return Err(format!(
+            "Delta GQA macro-units {} < tp {tp}",
+            total_dn_units
+        ));
+    }
+    let ffn_groups = config.hidden_dim / 256;
+    if ffn_groups < tp {
+        return Err(format!("FFN G256 groups {} < tp {tp}", ffn_groups));
+    }
+    let mut attn_ranges = Vec::with_capacity(tp);
+    if total_attn_units >= tp {
+        for rank in 0..tp {
+            let units = ShardConfig::balanced_range(rank, tp, total_attn_units);
+            attn_ranges.push((
+                units.start * q_per_kv..units.end * q_per_kv,
+                units.start..units.end,
+            ));
+        }
+    } else {
+        // Start with one rank per KV head, then split Q groups until every
+        // rank has work. Extra ranks are assigned from the first group onward;
+        // this offsets the slightly larger leading FFN shards.
+        let mut partitions = vec![1usize; total_attn_units];
+        let mut extra = tp - total_attn_units;
+        let mut unit = 0usize;
+        while extra > 0 {
+            if partitions[unit] < q_per_kv {
+                partitions[unit] += 1;
+                extra -= 1;
+            }
+            unit = (unit + 1) % total_attn_units;
+        }
+        for (kv_head, &parts) in partitions.iter().enumerate() {
+            for part in 0..parts {
+                let local_q = ShardConfig::balanced_range(part, parts, q_per_kv);
+                let group_start = kv_head * q_per_kv;
+                attn_ranges.push((
+                    group_start + local_q.start..group_start + local_q.end,
+                    kv_head..kv_head + 1,
+                ));
+            }
+        }
+        debug_assert_eq!(attn_ranges.len(), tp);
+    }
+    let mut layouts = Vec::with_capacity(tp);
+    for rank in 0..tp {
+        let (q_range, kv_range) = attn_ranges[rank].clone();
+        let dn_units = ShardConfig::balanced_range(rank, tp, total_dn_units);
+        let dk_range = dn_units.start * k_unit..dn_units.end * k_unit;
+        let dv_range = dn_units.start * v_unit..dn_units.end * v_unit;
+        let ffn_units = ShardConfig::balanced_range(rank, tp, ffn_groups);
+        let ffn_range = ffn_units.start * 256..ffn_units.end * 256;
+        // Validate per-rank non-empty and G256 alignment of local widths.
+        if q_range.is_empty()
+            || kv_range.is_empty()
+            || dk_range.is_empty()
+            || dv_range.is_empty()
+            || ffn_range.is_empty()
+        {
+            return Err(format!(
+                "rank {rank} has empty range (tp={tp} units too small)"
+            ));
+        }
+        let local_attn_width = (q_range.end - q_range.start) * config.head_dim;
+        let local_dn_width = (dv_range.end - dv_range.start) * config.linear_value_head_dim;
+        let local_ffn_width = ffn_range.end - ffn_range.start;
+        if local_attn_width % 256 != 0 {
+            return Err(format!(
+                "rank {rank} attention local input width {local_attn_width} is not aligned to a 256-element quant group"
+            ));
+        }
+        if local_dn_width % 256 != 0 {
+            return Err(format!(
+                "rank {rank} DeltaNet output local width {local_dn_width} is not aligned to a 256-element quant group"
+            ));
+        }
+        if local_ffn_width % 256 != 0 {
+            return Err(format!(
+                "rank {rank} FFN down local input width {local_ffn_width} is not aligned to a 256-element quant group"
+            ));
+        }
+        layouts.push(DenseTpRankLayout {
+            rank,
+            q_head_range: q_range,
+            kv_head_range: kv_range,
+            delta_key_head_range: dk_range,
+            delta_value_head_range: dv_range,
+            ffn_hidden_range: ffn_range,
+        });
+    }
+    // Validate global coverage: contiguous, non-overlapping, exact cover.
+    let mut cur = 0usize;
+    for l in &layouts {
+        if l.q_head_range.start != cur {
+            return Err(format!(
+                "q_head ranges not contiguous at rank {}: expected start {cur}, got {}",
+                l.rank, l.q_head_range.start
+            ));
+        }
+        cur = l.q_head_range.end;
+    }
+    if cur != config.n_heads {
+        return Err(format!(
+            "q_head ranges do not cover global tensor: covered {cur}, expected {}",
+            config.n_heads
+        ));
+    }
+    // KV heads exact-cover when whole GQA units are sharded. A split GQA unit
+    // deliberately repeats the same range on adjacent ranks, so validate
+    // ordered union coverage with no gaps rather than forbidding overlap.
+    cur = 0;
+    for l in &layouts {
+        if l.kv_head_range.start > cur {
+            return Err(format!(
+                "kv_head ranges leave a gap at rank {}: covered through {cur}, next starts {}",
+                l.rank, l.kv_head_range.start
+            ));
+        }
+        cur = cur.max(l.kv_head_range.end);
+    }
+    if cur != config.n_kv_heads {
+        return Err(format!(
+            "kv_head ranges do not cover global tensor: covered {cur}, expected {}",
+            config.n_kv_heads
+        ));
+    }
+    cur = 0;
+    for l in &layouts {
+        if l.delta_key_head_range.start != cur {
+            return Err(format!(
+                "delta key ranges not contiguous at rank {}: expected start {cur}, got {}",
+                l.rank, l.delta_key_head_range.start
+            ));
+        }
+        cur = l.delta_key_head_range.end;
+    }
+    if cur != config.linear_num_key_heads {
+        return Err(format!(
+            "delta key ranges do not cover global tensor: covered {cur}, expected {}",
+            config.linear_num_key_heads
+        ));
+    }
+    cur = 0;
+    for l in &layouts {
+        if l.delta_value_head_range.start != cur {
+            return Err(format!(
+                "delta value ranges not contiguous at rank {}: expected start {cur}, got {}",
+                l.rank, l.delta_value_head_range.start
+            ));
+        }
+        cur = l.delta_value_head_range.end;
+    }
+    if cur != config.linear_num_value_heads {
+        return Err(format!(
+            "delta value ranges do not cover global tensor: covered {cur}, expected {}",
+            config.linear_num_value_heads
+        ));
+    }
+    cur = 0;
+    for l in &layouts {
+        if l.ffn_hidden_range.start != cur {
+            return Err(format!(
+                "ffn hidden ranges not contiguous at rank {}: expected start {cur}, got {}",
+                l.rank, l.ffn_hidden_range.start
+            ));
+        }
+        cur = l.ffn_hidden_range.end;
+    }
+    if cur != config.hidden_dim {
+        return Err(format!(
+            "ffn hidden ranges do not cover global tensor: covered {cur}, expected {}",
+            config.hidden_dim
+        ));
+    }
+    // Every local Q range must map exactly onto its local KV range. Whole GQA
+    // shards retain the global ratio; split groups use a smaller local ratio
+    // while sharing the same replicated KV head.
+    for l in &layouts {
+        let q_cnt = l.q_head_range.end - l.q_head_range.start;
+        let kv_cnt = l.kv_head_range.end - l.kv_head_range.start;
+        if kv_cnt == 0 || q_cnt % kv_cnt != 0 {
+            return Err(format!(
+                "rank {} Q/KV count mismatch: q {:?}, kv {:?}",
+                l.rank, l.q_head_range, l.kv_head_range
+            ));
+        }
+        let local_q_per_kv = q_cnt / kv_cnt;
+        let mapping_matches = (0..q_cnt).all(|local_q| {
+            let global_kv = (l.q_head_range.start + local_q) / q_per_kv;
+            let local_kv_as_global = l.kv_head_range.start + local_q / local_q_per_kv;
+            global_kv == local_kv_as_global
+        });
+        if !mapping_matches {
+            return Err(format!(
+                "rank {} Q/KV mapping mismatch: q {:?}, kv {:?}, global q_per_kv {q_per_kv}",
+                l.rank, l.q_head_range, l.kv_head_range
+            ));
+        }
+        let dk_cnt = l.delta_key_head_range.end - l.delta_key_head_range.start;
+        let dv_cnt = l.delta_value_head_range.end - l.delta_value_head_range.start;
+        if dk_cnt == 0 || dv_cnt % dk_cnt != 0 || dv_cnt / dk_cnt != dn_ratio {
+            return Err(format!(
+                "rank {} Delta GQA ratio mismatch: v {dv_cnt} / k {dk_cnt} != {dn_ratio}",
+                l.rank
+            ));
+        }
+    }
+    Ok(layouts)
+}
+
+/// Validate the shape contract for the dense Qwen hybrid TP path via layout construction.
+pub fn validate_dense_tp(config: &Qwen35Config, shard: &ShardConfig) -> Result<(), String> {
+    dense_tp_rank_layouts(config, shard).map(|_| ())
+}
+
+pub fn local_dense_tp_config(config: &Qwen35Config, layout: &DenseTpRankLayout) -> Qwen35Config {
+    let mut local = config.clone();
+    local.n_heads = layout.q_head_range.end - layout.q_head_range.start;
+    local.n_kv_heads = layout.kv_head_range.end - layout.kv_head_range.start;
+    local.linear_num_key_heads =
+        layout.delta_key_head_range.end - layout.delta_key_head_range.start;
+    local.linear_num_value_heads =
+        layout.delta_value_head_range.end - layout.delta_value_head_range.start;
+    local.hidden_dim = layout.ffn_hidden_range.end - layout.ffn_hidden_range.start;
+    local
 }
 /// Expert-parallel reduction mode. Only deterministic left-associated
 /// peer-rooted sum is admitted for the batched EP route.
@@ -989,5 +1318,313 @@ mod tests {
         cfg.num_experts = 0;
         cfg.dim = 2_048;
         assert!(!qwen36_27b_dense_shape(&cfg, 48));
+    }
+
+    #[test]
+    fn dense_tp_layouts_qwen38_tp2_exact() {
+        use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
+        let inner = serde_json::json!({
+            "hidden_size": 5120,
+            "intermediate_size": 17408,
+            "num_hidden_layers": 64,
+            "num_attention_heads": 48,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "vocab_size": 248320,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 48,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128
+        });
+        let cfg = from_config_value(&inner).expect("qwen3.8 dense shape");
+        let shard = ShardConfig::new(2, false, 0, ExpertAssign::Stride).unwrap();
+        let layouts = dense_tp_rank_layouts(&cfg, &shard).unwrap();
+        assert_eq!(layouts.len(), 2);
+        assert_eq!(layouts[0].q_head_range, 0..24);
+        assert_eq!(layouts[0].kv_head_range, 0..4);
+        assert_eq!(layouts[0].delta_key_head_range, 0..8);
+        assert_eq!(layouts[0].delta_value_head_range, 0..24);
+        assert_eq!(layouts[0].ffn_hidden_range, 0..8704);
+        assert_eq!(layouts[1].q_head_range, 24..48);
+        assert_eq!(layouts[1].kv_head_range, 4..8);
+        assert_eq!(layouts[1].delta_key_head_range, 8..16);
+        assert_eq!(layouts[1].delta_value_head_range, 24..48);
+        assert_eq!(layouts[1].ffn_hidden_range, 8704..17408);
+        // local configs via layout
+        let local0 = local_dense_tp_config(&cfg, &layouts[0]);
+        assert_eq!(local0.n_heads, 24);
+        assert_eq!(local0.n_kv_heads, 4);
+        assert_eq!(local0.linear_num_key_heads, 8);
+        assert_eq!(local0.linear_num_value_heads, 24);
+        assert_eq!(local0.hidden_dim, 8704);
+    }
+
+    #[test]
+    fn dense_tp_local_config_keeps_global_dim_layers_vocab() {
+        use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
+        let inner = serde_json::json!({
+            "hidden_size": 5120,
+            "intermediate_size": 17408,
+            "num_hidden_layers": 64,
+            "num_attention_heads": 48,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "vocab_size": 248320,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 48,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128
+        });
+        let cfg = from_config_value(&inner).expect("qwen3.8 dense shape");
+        for tp in 2..=5 {
+            let shard = ShardConfig::new(tp, false, 0, ExpertAssign::Stride).unwrap();
+            let layouts = dense_tp_rank_layouts(&cfg, &shard).unwrap();
+            for (rank, layout) in layouts.iter().enumerate() {
+                let local = local_dense_tp_config(&cfg, layout);
+                assert_eq!(local.dim, cfg.dim, "tp={tp} rank={rank}");
+                assert_eq!(local.n_layers, cfg.n_layers, "tp={tp} rank={rank}");
+                assert_eq!(local.vocab_size, cfg.vocab_size, "tp={tp} rank={rank}");
+            }
+        }
+    }
+
+    #[test]
+    fn dense_tp_layouts_qwen38_tp3_exact() {
+        use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
+        let inner = serde_json::json!({
+            "hidden_size": 5120,
+            "intermediate_size": 17408,
+            "num_hidden_layers": 64,
+            "num_attention_heads": 48,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "vocab_size": 248320,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 48,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128
+        });
+        let cfg = from_config_value(&inner).expect("qwen3.8 dense shape");
+        let shard = ShardConfig::new(3, false, 0, ExpertAssign::Stride).unwrap();
+        let layouts = dense_tp_rank_layouts(&cfg, &shard).unwrap();
+        assert_eq!(layouts.len(), 3);
+        // Attention 3/3/2 units => Q 18,18,12 ; KV 3,3,2
+        assert_eq!(layouts[0].q_head_range, 0..18);
+        assert_eq!(layouts[0].kv_head_range, 0..3);
+        assert_eq!(layouts[1].q_head_range, 18..36);
+        assert_eq!(layouts[1].kv_head_range, 3..6);
+        assert_eq!(layouts[2].q_head_range, 36..48);
+        assert_eq!(layouts[2].kv_head_range, 6..8);
+        // Delta 3/3/2 macro-units (2+6) => key 6,6,4 ; value 18,18,12
+        assert_eq!(layouts[0].delta_key_head_range, 0..6);
+        assert_eq!(layouts[0].delta_value_head_range, 0..18);
+        assert_eq!(layouts[1].delta_key_head_range, 6..12);
+        assert_eq!(layouts[1].delta_value_head_range, 18..36);
+        assert_eq!(layouts[2].delta_key_head_range, 12..16);
+        assert_eq!(layouts[2].delta_value_head_range, 36..48);
+        // FFN 68 groups 23/23/22 => 5888,5888,5632
+        assert_eq!(layouts[0].ffn_hidden_range, 0..5888);
+        assert_eq!(layouts[1].ffn_hidden_range, 5888..11776);
+        assert_eq!(layouts[2].ffn_hidden_range, 11776..17408);
+    }
+
+    #[test]
+    fn dense_tp_layouts_qwen38_tp4_exact() {
+        use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
+        let inner = serde_json::json!({
+            "hidden_size": 5120,
+            "intermediate_size": 17408,
+            "num_hidden_layers": 64,
+            "num_attention_heads": 48,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "vocab_size": 248320,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 48,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128
+        });
+        let cfg = from_config_value(&inner).expect("qwen3.8 dense shape");
+        let shard = ShardConfig::new(4, false, 0, ExpertAssign::Stride).unwrap();
+        let layouts = dense_tp_rank_layouts(&cfg, &shard).unwrap();
+        assert_eq!(layouts.len(), 4);
+        for (i, l) in layouts.iter().enumerate() {
+            assert_eq!(l.q_head_range, i * 12..(i + 1) * 12);
+            assert_eq!(l.kv_head_range, i * 2..(i + 1) * 2);
+            assert_eq!(l.delta_key_head_range, i * 4..(i + 1) * 4);
+            assert_eq!(l.delta_value_head_range, i * 12..(i + 1) * 12);
+            assert_eq!(l.ffn_hidden_range, i * 4352..(i + 1) * 4352);
+        }
+    }
+
+    #[test]
+    fn dense_tp_layouts_qwen38_tp5_exact() {
+        use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
+        let inner = serde_json::json!({
+            "hidden_size": 5120,
+            "intermediate_size": 17408,
+            "num_hidden_layers": 64,
+            "num_attention_heads": 48,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "vocab_size": 248320,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 48,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128
+        });
+        let cfg = from_config_value(&inner).expect("qwen3.8 dense shape");
+        let shard = ShardConfig::new(5, false, 0, ExpertAssign::Stride).unwrap();
+        let layouts = dense_tp_rank_layouts(&cfg, &shard).unwrap();
+        assert_eq!(layouts.len(), 5);
+        // Attention 2/2/2/1/1 units
+        assert_eq!(layouts[0].q_head_range, 0..12);
+        assert_eq!(layouts[0].kv_head_range, 0..2);
+        assert_eq!(layouts[1].q_head_range, 12..24);
+        assert_eq!(layouts[1].kv_head_range, 2..4);
+        assert_eq!(layouts[2].q_head_range, 24..36);
+        assert_eq!(layouts[2].kv_head_range, 4..6);
+        assert_eq!(layouts[3].q_head_range, 36..42);
+        assert_eq!(layouts[3].kv_head_range, 6..7);
+        assert_eq!(layouts[4].q_head_range, 42..48);
+        assert_eq!(layouts[4].kv_head_range, 7..8);
+        // Delta same pattern
+        assert_eq!(layouts[0].delta_key_head_range, 0..4);
+        assert_eq!(layouts[0].delta_value_head_range, 0..12);
+        assert_eq!(layouts[1].delta_key_head_range, 4..8);
+        assert_eq!(layouts[1].delta_value_head_range, 12..24);
+        assert_eq!(layouts[2].delta_key_head_range, 8..12);
+        assert_eq!(layouts[2].delta_value_head_range, 24..36);
+        assert_eq!(layouts[3].delta_key_head_range, 12..14);
+        assert_eq!(layouts[3].delta_value_head_range, 36..42);
+        assert_eq!(layouts[4].delta_key_head_range, 14..16);
+        assert_eq!(layouts[4].delta_value_head_range, 42..48);
+        // FFN 14/14/14/13/13 groups
+        assert_eq!(layouts[0].ffn_hidden_range, 0..3584);
+        assert_eq!(layouts[1].ffn_hidden_range, 3584..7168);
+        assert_eq!(layouts[2].ffn_hidden_range, 7168..10752);
+        assert_eq!(layouts[3].ffn_hidden_range, 10752..14080);
+        assert_eq!(layouts[4].ffn_hidden_range, 14080..17408);
+    }
+
+    #[test]
+    fn dense_tp_layouts_four_kv_heads_tp5_replicates_one_kv_head() {
+        use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
+        let inner = serde_json::json!({
+            "hidden_size": 4096,
+            "intermediate_size": 17408,
+            "num_hidden_layers": 64,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 4,
+            "head_dim": 256,
+            "vocab_size": 248320,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 48,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128
+        });
+        let cfg = from_config_value(&inner).expect("four-KV dense shape");
+        let shard = ShardConfig::new(5, false, 0, ExpertAssign::Stride).unwrap();
+        let layouts = dense_tp_rank_layouts(&cfg, &shard).unwrap();
+        assert_eq!(layouts.len(), 5);
+        assert_eq!(layouts[0].q_head_range, 0..2);
+        assert_eq!(layouts[0].kv_head_range, 0..1);
+        assert_eq!(layouts[1].q_head_range, 2..4);
+        assert_eq!(layouts[1].kv_head_range, 0..1);
+        assert_eq!(layouts[2].q_head_range, 4..8);
+        assert_eq!(layouts[2].kv_head_range, 1..2);
+        assert_eq!(layouts[3].q_head_range, 8..12);
+        assert_eq!(layouts[3].kv_head_range, 2..3);
+        assert_eq!(layouts[4].q_head_range, 12..16);
+        assert_eq!(layouts[4].kv_head_range, 3..4);
+        for layout in &layouts {
+            let local = local_dense_tp_config(&cfg, layout);
+            assert_eq!(local.n_heads % local.n_kv_heads, 0);
+            assert_eq!(local.n_heads * local.head_dim % 256, 0);
+        }
+    }
+
+    #[test]
+    fn dense_tp_refuses_invalid_tp_and_non_covering() {
+        use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
+        let inner = serde_json::json!({
+            "hidden_size": 5120,
+            "intermediate_size": 17408,
+            "num_hidden_layers": 64,
+            "num_attention_heads": 48,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "vocab_size": 248320,
+            "linear_num_key_heads": 16,
+            "linear_num_value_heads": 48,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128
+        });
+        let cfg = from_config_value(&inner).unwrap();
+        // tp out of range
+        let s1 = ShardConfig::new(1, false, 0, ExpertAssign::Stride).unwrap();
+        assert!(dense_tp_rank_layouts(&cfg, &s1).is_err());
+        let s6 = ShardConfig::new(6, false, 0, ExpertAssign::Stride).unwrap();
+        assert!(dense_tp_rank_layouts(&cfg, &s6).is_err());
+        // zero tp via direct build not allowed (ShardConfig::new(0) fails, so not tested here)
+    }
+
+    #[test]
+    fn dense_tp_refuses_geometries_cannot_preserve_gqa_g256() {
+        use hipfire_runtime::tp_shard::{ExpertAssign, ShardConfig};
+        // hidden_dim not G256 aligned
+        let inner = serde_json::json!({
+            "hidden_size": 1024,
+            "intermediate_size": 1000,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 2,
+            "head_dim": 128,
+            "vocab_size": 1000,
+            "linear_num_key_heads": 4,
+            "linear_num_value_heads": 8,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128
+        });
+        let cfg = from_config_value(&inner).unwrap();
+        let shard = ShardConfig::new(2, false, 0, ExpertAssign::Stride).unwrap();
+        assert!(dense_tp_rank_layouts(&cfg, &shard).is_err());
+        // GQA ratio not exact
+        let inner2 = serde_json::json!({
+            "hidden_size": 1024,
+            "intermediate_size": 1024,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 7,
+            "num_key_value_heads": 2,
+            "head_dim": 128,
+            "vocab_size": 1000,
+            "linear_num_key_heads": 4,
+            "linear_num_value_heads": 8,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128
+        });
+        let cfg2 = from_config_value(&inner2).unwrap();
+        assert!(dense_tp_rank_layouts(&cfg2, &shard).is_err());
+        // MoE not allowed
+        let mut cfg3 = cfg.clone();
+        cfg3.num_experts = 8;
+        cfg3.hidden_dim = 1024;
+        assert!(dense_tp_rank_layouts(&cfg3, &shard).is_err());
+        // Delta GQA ratio not exact
+        let inner4 = serde_json::json!({
+            "hidden_size": 1024,
+            "intermediate_size": 1024,
+            "num_hidden_layers": 2,
+            "num_attention_heads": 8,
+            "num_key_value_heads": 2,
+            "head_dim": 128,
+            "vocab_size": 1000,
+            "linear_num_key_heads": 3,
+            "linear_num_value_heads": 7,
+            "linear_key_head_dim": 128,
+            "linear_value_head_dim": 128
+        });
+        let cfg4 = from_config_value(&inner4).unwrap();
+        assert!(dense_tp_rank_layouts(&cfg4, &shard).is_err());
     }
 }

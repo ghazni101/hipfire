@@ -60,12 +60,14 @@
 //!   verify-loop equivalent for MTP would be Task 11.
 
 use crate::qwen35::Qwen35Weights;
-use hip_bridge::{DeviceBuffer, HipResult};
+use hip_bridge::{DeviceBuffer, HipError, HipResult};
+use hipfire_dispatch::pipeline::{run_uniform_moe_down_expanded, run_uniform_moe_gate_up};
 use hipfire_runtime::hfq::{HfqFile, HfqTensorInfo};
+use hipfire_runtime::llama::KvCacheExt;
 use hipfire_runtime::llama::{
     self, f16_to_f32, fused_silu_mul_rotate_mq_batched_for, fused_silu_mul_rotate_mq_for,
-    rotate_x_mq_for, weight_gemv, EmbeddingFormat, WeightTensor};
-use hipfire_runtime::llama::KvCacheExt;
+    rotate_x_mq_for, weight_gemv, EmbeddingFormat, WeightTensor,
+};
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::path::Path;
 
@@ -1113,9 +1115,19 @@ fn sanity_check_2d_shape(name: &str, info: &HfqTensorInfo, m: usize, k: usize) {
     );
 }
 
+fn mtp_packed_dtype(quant_type: u8) -> Option<DType> {
+    match quant_type {
+        13 => Some(DType::MQ4G256),
+        15 => Some(DType::MQ6G256),
+        44 => Some(DType::MQ4G256V2),
+        47 => Some(DType::MQ6G256V2),
+        _ => None,
+    }
+}
+
 /// Wrap raw quantized bytes into a [`WeightTensor`]. Local copy of the
 /// dispatch table from `qwen35::load_weight_tensor_raw`, restricted to the
-/// quant types `mtp_extract` actually emits (MQ4, Q8_F16=Q8_0, F16, F32).
+/// quant types emitted by the MTP extractors and published sidecars.
 fn weight_tensor_from_raw(
     gpu: &Gpu,
     quant_type: u8,
@@ -1125,16 +1137,16 @@ fn weight_tensor_from_raw(
     name: &str,
 ) -> HipResult<WeightTensor> {
     match quant_type {
-        13 => {
-            // MQ4G256 — must be K%256-aligned (kernel requirement).
+        qt @ (13 | 15 | 44 | 47) => {
+            let dtype = mtp_packed_dtype(qt).expect("packed quant arm must map");
             assert!(
                 k % 256 == 0,
-                ".mtp tensor '{name}' is MQ4G256 with K={k} not divisible by 256"
+                ".mtp tensor '{name}' is {dtype:?} with K={k} not divisible by 256"
             );
             let buf = gpu.upload_raw(data, &[data.len()])?;
             Ok(WeightTensor {
                 buf,
-                gpu_dtype: DType::MQ4G256,
+                gpu_dtype: dtype,
                 m,
                 k,
                 row_stride: 0,
@@ -1192,8 +1204,50 @@ fn weight_tensor_from_raw(
         }
         other => panic!(
             ".mtp tensor '{name}': unsupported quant_type={other} \
-             (mtp_extract emits MQ4G256=13, Q8_F16=3, F16=1, F32=2)"
+             (supported: MQ4/MQ6 G256 V1=13/15, V2=44/47, Q8_F16=3, F16=1, F32=2)"
         ),
+    }
+}
+
+#[cfg(test)]
+mod packed_dtype_tests {
+    use super::*;
+
+    #[test]
+    fn published_mtp_packed_formats_map_to_exact_runtime_dtypes() {
+        assert_eq!(mtp_packed_dtype(13), Some(DType::MQ4G256));
+        assert_eq!(mtp_packed_dtype(15), Some(DType::MQ6G256));
+        assert_eq!(mtp_packed_dtype(44), Some(DType::MQ4G256V2));
+        assert_eq!(mtp_packed_dtype(47), Some(DType::MQ6G256V2));
+        assert_eq!(mtp_packed_dtype(48), None);
+    }
+
+    #[test]
+    fn batched_prompt_fill_keeps_q8_mqv2_and_falls_back_elsewhere() {
+        assert!(weight_gemm_batched_supported(DType::MQ4G256V2));
+        assert!(weight_gemm_batched_supported(DType::MQ6G256V2));
+        assert!(weight_gemm_batched_supported(DType::MQ4G256));
+        assert!(weight_gemm_batched_supported(DType::Q8_0));
+        assert!(!weight_gemm_batched_supported(DType::MQ6G256));
+
+        let mqv2 = [
+            DType::MQ4G256V2,
+            DType::MQ4G256V2,
+            DType::MQ6G256V2,
+            DType::MQ6G256V2,
+        ];
+        assert!(mtp_prompt_fill_uses_batched(MtpKvMode::Q8, &mqv2));
+        assert!(!mtp_prompt_fill_uses_batched(MtpKvMode::Asym3, &mqv2));
+        assert!(!mtp_prompt_fill_uses_batched(MtpKvMode::Fwht4, &mqv2));
+        assert!(!mtp_prompt_fill_uses_batched(
+            MtpKvMode::Q8,
+            &[
+                DType::MQ6G256,
+                DType::MQ4G256V2,
+                DType::MQ4G256V2,
+                DType::MQ4G256V2
+            ]
+        ));
     }
 }
 
@@ -1741,18 +1795,22 @@ fn mtp_moe_ffn_decode(
     }
 
     let e0 = ffn.experts.first().expect("MoE MTP has no routed experts");
-    assert_eq!(
-        e0.gate_up.gpu_dtype,
-        DType::MQ4G256,
-        "MoE MTP routed gate_up currently requires MQ4G256"
+    let gate_dtype = e0.gate_up.gpu_dtype;
+    let down_dtype = e0.down.gpu_dtype;
+    assert!(
+        ffn.experts
+            .iter()
+            .all(|e| e.gate_up.gpu_dtype == gate_dtype),
+        "MoE MTP routed gate_up experts must have one uniform dtype"
     );
-    assert_eq!(
-        e0.down.gpu_dtype,
-        DType::MQ4G256,
-        "MoE MTP routed down currently requires MQ4G256"
+    assert!(
+        ffn.experts.iter().all(|e| e.down.gpu_dtype == down_dtype),
+        "MoE MTP routed down experts must have one uniform dtype"
     );
     rotate_x_mq_for(gpu, &e0.gate_up, x_norm, x_rot, dim)?;
-    gpu.gemv_hfq4g256_moe_gate_up_k8_indexed(
+    run_uniform_moe_gate_up(
+        gpu,
+        gate_dtype,
         &ffn.expert_gate_up_ptrs,
         topk_indices,
         x_rot,
@@ -1761,11 +1819,14 @@ fn mtp_moe_ffn_decode(
         2 * mi,
         e0.gate_up.k,
         k_top,
-    )?;
+    )
+    .map_err(|error| HipError::new(0, &error.to_string()))?;
     fused_silu_mul_rotate_mq_batched_for(
         gpu, &e0.down, gate_batch, up_batch, rot_batch, mi, k_top,
     )?;
-    gpu.gemv_hfq4g256_moe_down_k8_indexed_batched_expanded(
+    run_uniform_moe_down_expanded(
+        gpu,
+        down_dtype,
         &ffn.expert_down_ptrs,
         topk_indices,
         rot_batch,
@@ -1774,7 +1835,8 @@ fn mtp_moe_ffn_decode(
         e0.down.k,
         k_top,
         1,
-    )?;
+    )
+    .map_err(|error| HipError::new(0, &error.to_string()))?;
     gpu.moe_down_combine_k8_batched(down_expanded, topk_weights, x_residual, e0.down.m, k_top, 1)?;
 
     Ok(())
@@ -2127,6 +2189,36 @@ fn weight_gemm_batched(
             llama::rotate_x_mq_batched_for(gpu, w, x_batched, rot, w.k, n)?;
             gpu.gemm_hfq4g256(&w.buf, rot, y_batched, w.m, w.k, n)
         }
+        DType::MQ4G256V2 => {
+            let rot = rotated_x_scratch.expect("MQ4V2 batched gemm requires rotated_x_scratch");
+            llama::rotate_x_mq_batched_for(gpu, w, x_batched, rot, w.k, n)?;
+            crate::qwen35::prefill::run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmMq4G256V2,
+                &w.buf,
+                w.gpu_dtype,
+                rot,
+                y_batched,
+                w.m,
+                w.k,
+                n,
+            )
+        }
+        DType::MQ6G256V2 => {
+            let rot = rotated_x_scratch.expect("MQ6V2 batched gemm requires rotated_x_scratch");
+            llama::rotate_x_mq_batched_for(gpu, w, x_batched, rot, w.k, n)?;
+            crate::qwen35::prefill::run_plain_gemm_key(
+                gpu,
+                hipfire_dispatch::types::KernelKey::GemmMq6G256V2,
+                &w.buf,
+                w.gpu_dtype,
+                rot,
+                y_batched,
+                w.m,
+                w.k,
+                n,
+            )
+        }
         DType::F32 => {
             // Fallback: per-row gemv (slow but correct). MTP head loaded via
             // load_weight_raw can ship F32 for rare formats — keep functional.
@@ -2139,6 +2231,34 @@ fn weight_gemm_batched(
         }
         other => panic!("weight_gemm_batched: unsupported dtype {:?}", other),
     }
+}
+
+/// True when [`weight_gemm_batched`] has a non-panicking arm for `dtype`.
+/// Published MQ6G256-v1 sidecars have GEMV but no batched GEMM.
+fn weight_gemm_batched_supported(dtype: DType) -> bool {
+    matches!(
+        dtype,
+        DType::Q8_0
+            | DType::HFQ4G256
+            | DType::MQ4G256
+            | DType::MQ4G256V2
+            | DType::MQ6G256V2
+            | DType::F32
+    )
+}
+
+/// Prompt-fill may use the chunked batched path only for Q8 MTP KV and
+/// projections [`weight_gemm_batched`] can represent. Asym3/Fwht4 and
+/// MQ6G256-v1 keep the tokenwise GEMV / KV-write path.
+pub(crate) fn mtp_prompt_fill_uses_batched(
+    kv_mode: MtpKvMode,
+    projection_dtypes: &[DType],
+) -> bool {
+    kv_mode == MtpKvMode::Q8
+        && projection_dtypes
+            .iter()
+            .copied()
+            .all(weight_gemm_batched_supported)
 }
 
 /// Batched MTP head block forward (Task 11b).
@@ -2196,6 +2316,7 @@ pub fn mtp_head_forward_block_batched(
     n: usize,
     trunk_weights: &Qwen35Weights,
     rotated_x_scratch: Option<&GpuTensor>,
+    kv_only: bool,
 ) -> HipResult<()> {
     let cfg = &head.config;
     let w = &head.weights;
@@ -2225,22 +2346,34 @@ pub fn mtp_head_forward_block_batched(
         );
     }
 
-    // Upload positions (i32 stored in F32-typed buffer; aliasing is fine since
-    // the kernels read raw bytes via memcpy_htod into the F32 buffer).
-    {
-        let bytes = unsafe { std::slice::from_raw_parts(positions.as_ptr() as *const u8, n * 4) };
-        gpu.hip.memcpy_htod(&scratch.positions.buf, bytes)?;
+    // Reuse the raw i32 positions buffer for token ids during embedding, then
+    // overwrite it with absolute positions before RoPE/KV writes.
+    let token_bytes =
+        unsafe { std::slice::from_raw_parts(next_tokens.as_ptr() as *const u8, n * 4) };
+    gpu.hip.memcpy_htod(&scratch.positions.buf, token_bytes)?;
+
+    let tok_embd_view = scratch.tok_embd.sub_offset(0, n * dim);
+    if trunk_weights.embd_format == EmbeddingFormat::Q8_0 {
+        gpu.embedding_lookup_q8_batched(
+            &trunk_weights.token_embd,
+            &tok_embd_view,
+            &scratch.positions,
+            n,
+            dim,
+        )?;
+    } else {
+        for (i, &tok) in next_tokens.iter().enumerate() {
+            let dst = scratch.tok_embd.sub_offset(i * dim, dim);
+            embed_lookup_into(gpu, trunk_weights, &dst, tok, dim)?;
+        }
     }
 
-    // ── 1. Per-slot token embeddings into stacked tok_embd ───────────────
-    // No batched embedding-lookup kernel; per-slot dispatch is cheap (n×fast lookups).
-    for (i, &tok) in next_tokens.iter().enumerate() {
-        let dst = scratch.tok_embd.sub_offset(i * dim, dim);
-        embed_lookup_into(gpu, trunk_weights, &dst, tok, dim)?;
-    }
+    let position_bytes =
+        unsafe { std::slice::from_raw_parts(positions.as_ptr() as *const u8, n * 4) };
+    gpu.hip
+        .memcpy_htod(&scratch.positions.buf, position_bytes)?;
 
     // ── 2. Batched RMSNorm both inputs to NextN projection ───────────────
-    let tok_embd_view = scratch.tok_embd.sub_offset(0, n * dim);
     let e_norm_view = scratch.e_norm.sub_offset(0, n * dim);
     let prev_view = prev_hiddens_stacked.sub_offset(0, n * dim);
     let h_norm_view = scratch.h_norm.sub_offset(0, n * dim);
@@ -2360,30 +2493,24 @@ pub fn mtp_head_forward_block_batched(
     // (single-token softmax = 1). We still write K/V to make the KV cache
     // available for future cycles that wire historical reads.
     //
-    // Per-slot K/V writes use the F32 KV cache write helper. Each write is
-    // `kv_dim` floats; positions[i] is the slot. We construct a per-slot
-    // device pos_buf by sub-offsetting `scratch.positions`, but
-    // kv_cache_write expects a separate i32 device buffer per call. To avoid
-    // n separate allocs, we pass sub-offset views of `scratch.positions`
-    // (each one i32-sized), since the kernel reads `*pos` as the slot index.
-    for i in 0..n {
-        let k_row = scratch.k.sub_offset(i * kv_dim, kv_dim);
-        let v_row = scratch.v.sub_offset(i * kv_dim, kv_dim);
-        let pos_slot = scratch.positions.sub_offset(i, 1);
-        gpu.kv_cache_write_q8_0(
-            &kv.inner.k_gpu[0],
-            &k_row,
-            &pos_slot.buf,
-            cfg.n_head_kv,
-            cfg.head_dim,
-        )?;
-        gpu.kv_cache_write_q8_0(
-            &kv.inner.v_gpu[0],
-            &v_row,
-            &pos_slot.buf,
-            cfg.n_head_kv,
-            cfg.head_dim,
-        )?;
+    gpu.kv_cache_write_q8_0_batched(
+        &kv.inner.k_gpu[0],
+        &k_view,
+        &scratch.positions,
+        cfg.n_head_kv,
+        cfg.head_dim,
+        n,
+    )?;
+    gpu.kv_cache_write_q8_0_batched(
+        &kv.inner.v_gpu[0],
+        &v_view,
+        &scratch.positions,
+        cfg.n_head_kv,
+        cfg.head_dim,
+        n,
+    )?;
+    if kv_only {
+        return Ok(());
     }
 
     // attn_out = V (self-only attention with 1 key collapses softmax to 1).

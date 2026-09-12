@@ -82,7 +82,6 @@ artifacts/
 .codeinsight+research/
 .local-bench-scratch/
 .gm/rs-learn.db
-findings/
 .plugkit-browser-profile/
 .plugkit-browser-profile-*/
 .plugkit-agent-worktree/
@@ -109,8 +108,6 @@ research/
 
 # Scratch research bundles (raw PR diffs, model-conversion test artifacts)
 .codeinsight+research/
-
-bench/coherence-results/
 
 # kld_reduce.py outputs when run from repo root
 result-data.json
@@ -152,7 +149,7 @@ docs/investigations/*/sources/
 autoresearch/db/ar.db
 
 # Redline capture-corpus index — regenerable from redline/corpus/*.jsonl
-# via scripts/harvest_redline.py --ingest
+# via python3 -m tools.capture.harvest_redline --ingest
 redline/db/redline.db
 
 # Local research scratch (agent surveys, microbenches)
@@ -163,6 +160,9 @@ redline/db/redline.db
 
 # Code-intelligence index (per-checkout, machine-local)
 .codegraph/
+
+# graphify knowledge-graph output (regenerable; never track)
+/graphify-out/
 # Gate-run artifacts (parent-calibration manifests, gate logs). Regenerate
 # with examples/ds4_parent_{inventory,codec}_gate; the durable numbers live
 # in commit messages and docs/investigations/.

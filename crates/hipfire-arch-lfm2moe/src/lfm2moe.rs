@@ -235,6 +235,7 @@ fn wt_from_raw(
         19 => DType::MQ2G256Lloyd,
         20 => DType::MQ3G256Lloyd,
         30 => DType::MQ4G256Lloyd,
+        44 => DType::MQ4G256V2,
         1 => DType::F16,
         other => return Err(format!("unsupported quant_type {other}")),
     };
@@ -542,9 +543,23 @@ impl Lfm2MoeWeights {
                     .map_err(|e| format!("lfm2moe: upload embed BF16->F32: {e:?}"))?;
                 (hipfire_runtime::llama::EmbeddingFormat::F32, buf)
             }
+            44 => {
+                // MQ4G256V2 embed (mq4v2 VL recipe; tied lm_head included) →
+                // host-dequant to a F32 gather table. Same decode the GEMV
+                // kernel does per-weight (level*scale[h]+zero[h]) followed by
+                // the FWHT inverse — dequant_f32 owns both.
+                let buf = hipfire_runtime::weight_backend::dequant_f32(
+                    gpu,
+                    44,
+                    &embed_bytes,
+                    cfg.vocab_size * cfg.hidden_size,
+                )
+                .map_err(|e| format!("lfm2moe: dequant qt44 embed: {:?}", e.message))?;
+                (hipfire_runtime::llama::EmbeddingFormat::F32, buf)
+            }
             other => {
                 return Err(format!(
-                    "lfm2moe: unsupported embedding quant_type {other} (expected 1,3,6,16)"
+                    "lfm2moe: unsupported embedding quant_type {other} (expected 1,3,6,16,44)"
                 ))
             }
         };
@@ -1052,6 +1067,7 @@ fn wt_from_source_raw(
         19 => DType::MQ2G256Lloyd,
         20 => DType::MQ3G256Lloyd,
         30 => DType::MQ4G256Lloyd,
+        44 => DType::MQ4G256V2,
         1 => DType::F16,
         other => return Err(format!("unsupported quant_type {other}")),
     };
@@ -1154,9 +1170,21 @@ pub fn load_weights_from_source(
                 .map_err(|e| format!("lfm2moe: upload embed F32: {e:?}"))?;
             (hipfire_runtime::llama::EmbeddingFormat::F32, buf)
         }
+        44 => {
+            // MQ4G256V2 embed → host-dequant to F32 gather table (see the
+            // HFQ-path arm for rationale).
+            let buf = hipfire_runtime::weight_backend::dequant_f32(
+                gpu,
+                44,
+                &embed_bytes,
+                cfg.vocab_size * cfg.hidden_size,
+            )
+            .map_err(|e| format!("lfm2moe: dequant qt44 embed: {:?}", e.message))?;
+            (hipfire_runtime::llama::EmbeddingFormat::F32, buf)
+        }
         other => {
             return Err(format!(
-                "lfm2moe: unsupported embedding quant_type {other} (expected 1,3,6,16)"
+                "lfm2moe: unsupported embedding quant_type {other} (expected 1,3,6,16,44)"
             ))
         }
     };
@@ -1636,6 +1664,7 @@ pub fn batch_weight_formats_supported(weights: &Lfm2MoeWeights) -> Result<(), St
         DType::Q8_0
         | DType::HFQ4G256
         | DType::MQ4G256
+        | DType::MQ4G256V2
         | DType::HFQ6G256
         | DType::MQ6G256
         | DType::MQ3G256
@@ -1653,7 +1682,7 @@ pub fn batch_weight_formats_supported(weights: &Lfm2MoeWeights) -> Result<(), St
             crate::lfm2moe::Mixer::Conv(c) => {
                 for w in [&c.in_proj, &c.out_proj] {
                     match w.gpu_dtype {
-                        DType::Q8_0 | DType::HFQ4G256 | DType::MQ4G256 | DType::F32 | DType::BF16 => {}
+                        DType::Q8_0 | DType::HFQ4G256 | DType::MQ4G256 | DType::MQ4G256V2 | DType::F32 | DType::BF16 => {}
                         other => {
                             return Err(format!(
                                 "batched decode: conv projection dtype {other:?} not supported (expected Q8/HFQ4/MQ4/F32/BF16)"
@@ -1668,6 +1697,7 @@ pub fn batch_weight_formats_supported(weights: &Lfm2MoeWeights) -> Result<(), St
                         DType::Q8_0
                         | DType::HFQ4G256
                         | DType::MQ4G256
+                        | DType::MQ4G256V2
                         | DType::F32
                         | DType::BF16 => {}
                         other => {
@@ -1686,6 +1716,7 @@ pub fn batch_weight_formats_supported(weights: &Lfm2MoeWeights) -> Result<(), St
                         DType::Q8_0
                         | DType::HFQ4G256
                         | DType::MQ4G256
+                        | DType::MQ4G256V2
                         | DType::F32
                         | DType::BF16 => {}
                         other => {

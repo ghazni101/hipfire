@@ -15,7 +15,7 @@ use hip_bridge::{
 use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::atomic::AtomicUsize;
-use std::sync::{Arc, OnceLock};
+use std::sync::Arc;
 
 /// Per-group byte size of the MQ3-Lloyd quantization layout.
 ///
@@ -40,6 +40,16 @@ pub const LLOYD_MQ3_GROUP_BYTES: usize = 112;
 /// stride-mismatch bugs (followup discipline from
 /// docs/plans/mq-lloyd-batched-prefill-followup.md).
 pub const LLOYD_MQ4_GROUP_BYTES: usize = 160;
+
+/// HIP `hipDeviceAttribute_t` ordinal for `hipDeviceAttributeIntegrated`
+/// ("Device is integrated GPU"). Pinned by enumerating the CUDA-compatible
+/// block in the local `hip_runtime_api.h`; the same enumeration reproduces
+/// the repo's existing pins (`HIP_DEVICE_ATTRIBUTE_MULTIPROCESSOR_COUNT` =
+/// 63 in `profiler.rs`). Ordinals HAVE shifted between ROCm releases before
+/// (`ReservedSharedMemPerBlock` was inserted ahead of
+/// `MaxSharedMemoryPerBlock`, moving it 74 → 75), so re-verify on any ROCm
+/// bump — see [`Gpu::is_uma`], the only consumer.
+const HIP_DEVICE_ATTRIBUTE_INTEGRATED: i32 = 16;
 
 // ── MQ*-GL ("global Lloyd") format constants ────────────────────────────
 //
@@ -148,11 +158,10 @@ pub const GL_CB3: [f32; 8] = [
 pub static MMQ_CURRENT_LAYER: AtomicUsize = AtomicUsize::new(0);
 
 fn pm4_dynamic_grid_enabled() -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        hipfire_config::process_value("HIPFIRE_REPLAY_PM4_DYNAMIC_GRID")
-            .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
-    })
+    // Multi-spelling ("1"/"true"/"yes"/"on") predicate preserved verbatim;
+    // only the process-global cache is gone (the snapshot is the cache now).
+    hipfire_config::process_value("HIPFIRE_REPLAY_PM4_DYNAMIC_GRID")
+        .is_some_and(|value| matches!(value.as_str(), "1" | "true" | "yes" | "on"))
 }
 
 /// Minimum batch size at which the FP8 WMMA prefill path is enabled.
@@ -328,9 +337,17 @@ pub enum DType {
     MQ3G256, // MagnumQuant: FWHT-rotated HFQ3-G256 (104 bytes/group, same as HFQ3G256)
     MQ2G256, // MagnumQuant: FWHT-rotated HFQ2-G256 (72 bytes/group, same as HFQ2G256)
     MQ2G256Lloyd, // MagnumQuant 2-bit + Lloyd-Max 4-entry fp16 codebook (72 bytes/group)
+    /// Unrotated MQ2-Lloyd (qt=51). Byte-identical to `MQ2G256Lloyd`
+    /// (72 B/group: 4-entry fp16 codebook + 64 B of 2-bit indices), so the same
+    /// kernels bind — but NOT FWHT-rotated. It consumes x in the natural basis,
+    /// so `needs_x_rot_local` is false for it and it must never be added to the
+    /// rotation chain. Carries native-ternary checkpoints (Maple-Preview)
+    /// losslessly: rotation would destroy the three-value structure that lets a
+    /// K=3 codebook be exact.
+    MQ2G256LloydU,
     MQ3G256Lloyd, // MagnumQuant 3-bit + Lloyd-Max 8-entry fp16 codebook (112 bytes/group)
     MQ4G256Lloyd, // MagnumQuant 4-bit + Lloyd-Max 16-entry fp16 codebook (160 bytes/group)
-    MQ2G256GL, // MagnumQuant 2-bit + TENSOR-GLOBAL 4-entry codebook (GL_CB2), SoA:
+    MQ2G256GL,    // MagnumQuant 2-bit + TENSOR-GLOBAL 4-entry codebook (GL_CB2), SoA:
     // [M*gpr*64 B indices][M*gpr*2 B fp16 per-block scales] = 2.0625 bpw. NOT
     // interleaved — no per-group header. Codebook is a compile-time constant
     // passed as scalar kernel args, not stored in the file. MoE-routed-expert
@@ -409,6 +426,7 @@ impl DType {
             | DType::MQ3G256
             | DType::MQ2G256
             | DType::MQ2G256Lloyd
+            | DType::MQ2G256LloydU
             | DType::MQ3G256Lloyd
             | DType::MQ4G256Lloyd
             | DType::MQ2G256GL
@@ -625,10 +643,26 @@ pub struct Gpu {
     orphan_vmm_arenas: Vec<VmmArena>,
     /// When set, all kernel launches go to this stream instead of null stream.
     pub active_stream: Option<hip_bridge::Stream>,
+    /// Name of the most recently launched kernel on this `Gpu`'s stream.
+    /// Recorded in `launch_maybe_blob_bound` (the shared dispatch funnel) on
+    /// every successful launch so `sync_with_deadline` can name the suspect
+    /// when a sync times out. Scratch-helper converts and the optional CK
+    /// path bypass this funnel and are deliberately not tracked here.
+    last_kernel: Option<String>,
     /// Scratch buffers for FWHT rotation, FP16/FP8 activation conversion, etc.
     pub scratch: crate::scratch::ScratchState,
     /// Model-scoped Redline warmup recorder and fail-closed backend gate.
     pub replay: crate::replay::ReplayController,
+
+    /// Process-pinned optional CK runtime. Loading is explicit and fail-closed;
+    /// individual attention families still decide whether a capability cell is
+    /// eligible after their native layout/tier resolution.
+    #[cfg(feature = "flash-attn-ck")]
+    pub(crate) flash_attn_ck: Option<crate::flash_attn_ck::FlashAttnCk>,
+    #[cfg(feature = "flash-attn-ck")]
+    pub(crate) flash_attn_ck_workspace: Option<hip_bridge::DeviceBuffer>,
+    #[cfg(feature = "flash-attn-ck")]
+    pub(crate) flash_attn_ck_reported_routes: std::collections::HashSet<&'static str>,
 
     // ── MMQ per-weight screening (#87) — extracted to MmqScreenState ──────
     pub mmq_screen: MmqScreenState,
@@ -907,6 +941,31 @@ impl Gpu {
         self.flags.slots_decode_graph
     }
 
+    /// Whether this device is an APU with unified memory (its "VRAM" is
+    /// system RAM). Queried live via
+    /// `hipDeviceGetAttribute(hipDeviceAttributeIntegrated)` instead of an
+    /// arch-string table: APUs and dGPUs share gfx IP across generations, so
+    /// name-based classification drifts every product refresh (gfx1151 is an
+    /// APU while gfx1201 with the same IP family era is not, etc).
+    ///
+    /// Query failure returns `true`, the conservative answer for page-cache
+    /// policy: assuming UMA on a dGPU only costs load speed (eviction is the
+    /// historical behavior), while assuming dGPU on a real APU keeps model
+    /// pages resident next to hipMalloc staging and can OOM the load.
+    // bind_thread: skip — pure device-property query; reads static device
+    // info, touches no stream or per-thread HIP context.
+    pub fn is_uma(&self) -> bool {
+        // bind_thread: skip — pure device-property query; reads static
+        // device info, touches no stream or per-thread HIP context.
+        match self
+            .hip
+            .get_device_attribute(HIP_DEVICE_ATTRIBUTE_INTEGRATED, self.device_id)
+        {
+            Ok(v) => v != 0,
+            Err(_) => true,
+        }
+    }
+
     /// Install a real stream if launches are still going to the null stream.
     ///
     /// HIP refuses to capture the legacy default stream, so anything that
@@ -958,6 +1017,108 @@ impl Gpu {
     /// Returns the active stream ref for kernel launches (None = null stream).
     pub(crate) fn stream_ref(&self) -> Option<&hip_bridge::Stream> {
         self.active_stream.as_ref()
+    }
+
+    /// Default bound for [`Self::sync_with_deadline`]: five minutes. Long
+    /// enough that a healthy prefill/decode sync never trips it, short enough
+    /// that a hung GPU becomes a reportable error in one operator shift.
+    pub const GPU_SYNC_DEADLINE: std::time::Duration = std::time::Duration::from_secs(300);
+
+    /// Name of the kernel most recently launched through the dispatch funnel,
+    /// if any. Used to attribute a timed-out sync to the suspect kernel.
+    pub fn last_launched_kernel(&self) -> Option<&str> {
+        // bind_thread: skip — pure-state getter, no device call.
+        self.last_kernel.as_deref()
+    }
+
+    /// Build the timeout error directly (no device call). Split out so the
+    /// message is unit-testable on CPU-only hosts where the blocking-sync
+    /// path cannot be driven.
+    pub fn deadline_exceeded(
+        last_kernel: Option<&str>,
+        deadline: std::time::Duration,
+    ) -> hip_bridge::HipError {
+        // bind_thread: skip — static error builder, no device call.
+        match last_kernel {
+            Some(kernel) => hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "GPU sync exceeded deadline of {deadline:?}: \
+                     last kernel launched on this stream was '{kernel}' — \
+                     suspect a hang in '{kernel}' (stream still busy; \
+                     state was NOT reset)"
+                ),
+            )
+            .with_kernel(kernel),
+            None => hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "GPU sync exceeded deadline of {deadline:?} with no kernel \
+                     recorded on this stream (stream still busy; state was NOT reset)"
+                ),
+            ),
+        }
+    }
+
+    /// Poll interval for [`Self::sync_with_deadline`]: 2 ms. Coarse enough
+    /// never to spin a core, fine-grained enough for a deadline measured in
+    /// seconds.
+    pub(crate) const SYNC_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(2);
+
+    /// Bounded stream sync: record a completion event on this `Gpu`'s stream
+    /// (or the null stream) and poll `hipEventQuery` until it completes or
+    /// `deadline` elapses.
+    ///
+    /// No helper thread: the query is non-blocking, so the deadline is real —
+    /// on timeout this returns `Err` naming `last_launched_kernel` while the
+    /// GPU work is still outstanding.
+    ///
+    /// Returning `Err` does NOT cancel the outstanding work. The contract is
+    /// "I stopped waiting", not "the GPU stopped": the stream is still busy
+    /// and nothing here resets device state, so the caller must treat the
+    /// device as suspect and must not touch buffers the outstanding work may
+    /// still write.
+    ///
+    /// Existing `sync()` callers keep their unbounded semantics; use this
+    /// where a deadline is already meaningful (collective rendezvous,
+    /// watchdog paths) rather than migrating every sync.
+    pub fn sync_with_deadline(&self, deadline: std::time::Duration) -> HipResult<()> {
+        self.bind_thread()?;
+        // Timing-disabled event: a pure completion probe, no profiling state.
+        let event = self
+            .hip
+            .event_create_with_flags(hip_bridge::HIP_EVENT_DISABLE_TIMING)?;
+        self.hip.event_record(&event, self.active_stream.as_ref())?;
+        let last_kernel = self.last_kernel.clone();
+        let result = Self::poll_until_ready(deadline, last_kernel.as_deref(), || {
+            self.hip.event_query(&event)
+        });
+        // Best-effort teardown. On timeout the outstanding GPU work is NOT
+        // cancelled — this call only stopped waiting. Never shadow the poll
+        // result with a destroy error.
+        let _ = self.hip.event_destroy(event);
+        result
+    }
+
+    /// Poll `query` until it reports ready or `deadline` elapses. Query
+    /// errors propagate immediately; only `hipErrorNotReady` keeps polling.
+    /// Split from [`Self::sync_with_deadline`] so the timeout path is
+    /// unit-testable on CPU with a stubbed query.
+    pub(crate) fn poll_until_ready(
+        deadline: std::time::Duration,
+        last_kernel: Option<&str>,
+        mut query: impl FnMut() -> HipResult<bool>,
+    ) -> HipResult<()> {
+        let start = std::time::Instant::now();
+        loop {
+            if query()? {
+                return Ok(());
+            }
+            if start.elapsed() >= deadline {
+                return Err(Self::deadline_exceeded(last_kernel, deadline));
+            }
+            std::thread::sleep(Self::SYNC_POLL_INTERVAL);
+        }
     }
 
     /// Bind this `Gpu`'s device on the calling thread. Delegates to
@@ -1100,6 +1261,50 @@ impl Gpu {
         let mmq_screen = flags.mmq_screen;
         let mmq_screen_threshold = flags.mmq_screen_threshold;
 
+        #[cfg(feature = "flash-attn-ck")]
+        let flash_attn_ck = flags.flash_attn_ck_lib.as_deref().and_then(|path| {
+            let runtime = match unsafe { crate::flash_attn_ck::FlashAttnCk::load(path) } {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    eprintln!("WARNING: optional CK runtime disabled: {error}");
+                    return None;
+                }
+            };
+            let expected_arch = match arch.as_str() {
+                "gfx1100" => crate::flash_attn_ck::FlashAttnCkArch::Gfx1100 as i32,
+                "gfx1151" => crate::flash_attn_ck::FlashAttnCkArch::Gfx1151 as i32,
+                "gfx1201" => crate::flash_attn_ck::FlashAttnCkArch::Gfx1201 as i32,
+                _ => {
+                    eprintln!(
+                        "WARNING: optional CK runtime disabled: {arch} has no exact-arch ABI cell"
+                    );
+                    return None;
+                }
+            };
+            if !runtime
+                .capabilities()
+                .iter()
+                .any(|cell| cell.arch == expected_arch)
+            {
+                eprintln!(
+                    "WARNING: optional CK runtime disabled: artifact has no {arch} capability"
+                );
+                return None;
+            }
+            eprintln!(
+                "loaded optional CK runtime for {arch}: {} capability cell(s)",
+                runtime.capabilities().len()
+            );
+            Some(runtime)
+        });
+        #[cfg(feature = "flash-attn-ck")]
+        let flash_attn_ck_workspace =
+            if flash_attn_ck.is_some() && flags.flash_attn_ck_workspace_bytes > 0 {
+                Some(hip.malloc(flags.flash_attn_ck_workspace_bytes)?)
+            } else {
+                None
+            };
+
         Ok(Self {
             hip,
             arch,
@@ -1113,6 +1318,7 @@ impl Gpu {
             vmm_arenas: HashMap::new(),
             orphan_vmm_arenas: Vec::new(),
             active_stream: None,
+            last_kernel: None,
             scratch: crate::scratch::ScratchState {
                 mq_signs1: None,
                 mq_signs2: None,
@@ -1141,6 +1347,12 @@ impl Gpu {
                 sample_partials_bytes: 0,
             },
             replay: crate::replay::ReplayController::from_config(),
+            #[cfg(feature = "flash-attn-ck")]
+            flash_attn_ck,
+            #[cfg(feature = "flash-attn-ck")]
+            flash_attn_ck_workspace,
+            #[cfg(feature = "flash-attn-ck")]
+            flash_attn_ck_reported_routes: std::collections::HashSet::new(),
             mmq_screen: MmqScreenState {
                 cache: HashMap::new(),
                 enabled: mmq_screen,
@@ -1155,6 +1367,7 @@ impl Gpu {
                 ar_forward_kernel_dirty: true,
                 ar_forward_replay_enabled: false,
                 ar_graph_eligible: true,
+                ar_segments: Vec::new(),
                 verify: crate::graph::PerBGraphCache {
                     cache: std::collections::HashMap::new(),
                     warmed_up: std::collections::HashSet::new(),
@@ -1974,13 +2187,7 @@ impl Gpu {
         size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        static DUMP: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let dump = *DUMP.get_or_init(|| {
-            hipfire_config::developer_var("HIPFIRE_DTOD_DUMP")
-                .ok()
-                .as_deref()
-                == Some("1")
-        });
+        let dump = hipfire_config::developer_bool("HIPFIRE_DTOD_DUMP", false);
         if dump {
             let loc = std::panic::Location::caller();
             eprintln!("dtod bytes={} at {}:{}", size, loc.file(), loc.line());
@@ -2134,7 +2341,10 @@ impl Gpu {
         blob_builder: impl FnOnce() -> hip_bridge::KernargBlob,
     ) -> HipResult<()> {
         let record = self.replay.is_recording();
-        if record || self.graphs.capture_mode || self.flags.force_blob_path {
+        let result: HipResult<()> = if record
+            || self.graphs.capture_mode
+            || self.flags.force_blob_path
+        {
             let mut blob = blob_builder();
             blob.pad_to(16);
             if record {
@@ -2239,7 +2449,11 @@ impl Gpu {
                     params,
                 )
             }
+        };
+        if result.is_ok() {
+            self.last_kernel = Some(func_name.to_string());
         }
+        result.map_err(|e| e.with_kernel(func_name))
     }
 
     /// Diagnostic oracle for Redline prefix localization: relaunch the exact
@@ -2386,6 +2600,7 @@ impl Gpu {
             self.hip
                 .launch_kernel_blob(func, grid, block, shared_mem, self.stream_ref(), kernargs)
         }
+        .map_err(|e| e.with_kernel(func_name))
     }
 
     /// Compile and load a kernel, caching the result.
@@ -2519,12 +2734,14 @@ impl Gpu {
     /// Together with `self.graphs.capture_blobs.len()`, this must agree for
     /// any body — see the `Gpu` type-level invariant doc.
     pub fn recorded_launch_count(&self) -> usize {
+        // bind_thread: skip — reads the recorded replay tape, no HIP calls.
         self.replay.recorded_launches().len()
     }
 
     /// Returns the number of HipGraph kernarg blobs captured.
     /// See `recorded_launch_count` and the `Gpu` invariant.
     pub fn graph_blob_count(&self) -> usize {
+        // bind_thread: skip — reads a captured-graph counter, no HIP calls.
         self.graphs.capture_blobs.len()
     }
 
@@ -2533,6 +2750,8 @@ impl Gpu {
     /// separate captures of the same body, passing the other count).
     /// A mismatch indicates a helper bypassed the replay recorder.
     pub fn debug_assert_tape_parity(&self, other_blob_count: Option<usize>) {
+        // bind_thread: skip — pure comparison of the two local tapes above;
+        // no HIP calls.
         let replay_len = self.recorded_launch_count();
         let graph_len = other_blob_count.unwrap_or_else(|| self.graph_blob_count());
         debug_assert_eq!(
@@ -2702,8 +2921,7 @@ impl Gpu {
     /// runs fine there (uses WMMA backends on RDNA3, not MFMA) so this is
     /// a useful smoke-path in the absence of an MI300.
     pub(crate) fn rocblas_arch_eligible(&self) -> bool {
-        static CACHE: OnceLock<bool> = OnceLock::new();
-        let all_archs = *CACHE.get_or_init(|| self.flags.rocblas_all_archs);
+        let all_archs = self.flags.rocblas_all_archs;
         if all_archs {
             return self.rocblas.is_some();
         }
@@ -2718,13 +2936,10 @@ impl Gpu {
     /// which disables the rocBLAS path entirely for A/B benchmarking against
     /// the hand-rolled GEMV baseline.
     pub(crate) fn rocblas_min_batch(&self) -> usize {
-        static CACHE: OnceLock<usize> = OnceLock::new();
-        *CACHE.get_or_init(|| {
-            if self.flags.rocblas_off {
-                return usize::MAX;
-            }
-            self.flags.rocblas_min_batch.unwrap_or(4)
-        })
+        if self.flags.rocblas_off {
+            return usize::MAX;
+        }
+        self.flags.rocblas_min_batch.unwrap_or(4)
     }
 
     /// Batched-attention tile size, from `HIPFIRE_ATTN_TILE_SIZE`.
@@ -2739,13 +2954,10 @@ impl Gpu {
     /// needs, which can exceed buffers sized elsewhere against the 128 default.
     pub fn attn_tile_size(&self) -> usize {
         // bind_thread: skip — pure flag read, touches no device state.
-        static CACHE: OnceLock<usize> = OnceLock::new();
-        *CACHE.get_or_init(|| {
-            self.flags
-                .attn_tile_size
-                .filter(|&t| t > 0 && t % 32 == 0)
-                .unwrap_or(128)
-        })
+        self.flags
+            .attn_tile_size
+            .filter(|&t| t > 0 && t % 32 == 0)
+            .unwrap_or(128)
     }
 
     /// Multi-slot attention flash-vs-scalar crossover override, in tokens.
@@ -3166,6 +3378,8 @@ impl Gpu {
         n: usize,
         k: usize,
     ) {
+        // bind_thread: skip — early-returns unless a capture is active, and
+        // capture paths run on an already-bound forward thread.
         if self.active_capture.is_none() {
             return;
         }
@@ -4625,6 +4839,7 @@ impl Drop for Gpu {
 mod tests {
     use super::gen_fwht_signs;
     use super::DType;
+    use super::Gpu;
     use super::HessianCapture;
     use super::MQ2G256V2_GROUP_BYTES;
     use super::MQ3G256V2_GROUP_BYTES;
@@ -5109,5 +5324,64 @@ mod tests {
         use crate::replay::{ReplayBackendRequest, ReplayController};
         let ctrl = ReplayController::new(ReplayBackendRequest::Hip);
         assert_eq!(ctrl.recorded_launches().len(), 0);
+    }
+
+    #[test]
+    fn deadline_error_names_last_kernel() {
+        // Constructor-level pin; the timeout path itself is driven below
+        // through `poll_until_ready` with a stubbed query.
+        let e = Gpu::deadline_exceeded(Some("gemv_hfq4g256"), std::time::Duration::from_secs(5));
+        let s = e.to_string();
+        assert!(s.contains("gemv_hfq4g256"), "names the kernel: {s}");
+        assert!(s.contains("5s"), "names the deadline: {s}");
+        let ctx = e.context.expect("timeout carries launch context");
+        assert_eq!(ctx.kernel, "gemv_hfq4g256");
+    }
+
+    #[test]
+    fn deadline_error_without_kernel_says_so() {
+        let e = Gpu::deadline_exceeded(None, std::time::Duration::from_secs(5));
+        let s = e.to_string();
+        assert!(s.contains("no kernel"), "states nothing was recorded: {s}");
+        assert!(e.context.is_none());
+    }
+
+    #[test]
+    fn sync_timeout_returns_in_bounded_wall_time() {
+        // The test review asked for: a query that never reports ready (a
+        // hung GPU) must produce `Err` within bounded wall-clock time. The
+        // old scoped-thread design would block forever here on the join;
+        // the event poll returns. No GPU needed — the query is stubbed.
+        let deadline = std::time::Duration::from_millis(50);
+        let start = std::time::Instant::now();
+        let err = Gpu::poll_until_ready(deadline, Some("hung_kernel"), || Ok(false))
+            .expect_err("a never-ready query must time out");
+        let elapsed = start.elapsed();
+        assert!(
+            elapsed < std::time::Duration::from_secs(5),
+            "deadline escaped its bound: {elapsed:?}"
+        );
+        assert!(
+            elapsed >= deadline,
+            "returned before the deadline elapsed: {elapsed:?}"
+        );
+        let s = err.to_string();
+        assert!(s.contains("hung_kernel"), "timeout names the kernel: {s}");
+    }
+
+    #[test]
+    fn poll_ready_immediately_returns_ok() {
+        let result = Gpu::poll_until_ready(std::time::Duration::from_secs(5), None, || Ok(true));
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn poll_propagates_query_errors() {
+        // A real query failure (bad handle, lost device) is not "not ready".
+        let err = Gpu::poll_until_ready(std::time::Duration::from_secs(5), Some("k"), || {
+            Err(hip_bridge::HipError::new(999, "boom"))
+        })
+        .expect_err("query errors must propagate");
+        assert!(err.to_string().contains("boom"), "{err}");
     }
 }

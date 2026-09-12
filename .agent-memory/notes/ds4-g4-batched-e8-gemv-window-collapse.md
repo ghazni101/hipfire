@@ -66,7 +66,7 @@ arms against one loaded 80 GB trunk.
 
 ## Bytes/token CORRECTED: 6.04 GB (was quoted 4.68 — understated 29%)
 
-From the HFQ tensor table (`dump_hfq_dtypes`), accounting closes to 0.09% of the
+From the HFQ tensor table (`python3 -m tools.hfq.dump_dtypes`), accounting closes to 0.09% of the
 82.191 GB file:
 
 ```

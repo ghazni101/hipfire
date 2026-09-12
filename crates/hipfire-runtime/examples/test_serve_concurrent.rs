@@ -26,7 +26,7 @@ fn main() {
 fn main() {
     use hipfire_arch_qwen35::serve_engine::{EngineConfig, SlotEngine};
     use hipfire_runtime::hfq::HfqFile;
-    use hipfire_runtime::serve::{Event, SubmitRequest};
+    use hipfire_runtime::serve::{Continuation, Event, SubmitRequest};
     use hipfire_runtime::tokenizer::Tokenizer;
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
@@ -80,13 +80,16 @@ fn main() {
         let (tx, rx) = channel::<Event>();
         engine
             .submit(SubmitRequest {
-                session: None,
                 prompt_tokens: toks,
                 // Single-turn: nothing to continue, so no conversation key and
                 // no continuation tokens.
                 convo: Vec::new(),
-                continuation: Vec::new(),
+                continuation: Continuation::Cold,
                 max_tokens: MAX_TOKENS,
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: 0,
+                seed: 0,
                 reply: tx,
             })
             .expect("submit");

@@ -42,6 +42,9 @@ fn register_plain(registry: &mut KernelRegistry) {
         DType::MQ6G256,
         DType::MQ8G256,
         DType::MQ2G256Lloyd,
+        // Unrotated sibling: Plain only. Deliberately absent from
+        // register_prerotated below — it consumes x in the natural basis.
+        DType::MQ2G256LloydU,
         DType::MQ3G256Lloyd,
         DType::MQ4G256Lloyd,
         DType::MFP4G32,

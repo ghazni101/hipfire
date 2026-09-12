@@ -50,6 +50,22 @@ pub(crate) struct QuantizeArgs {
     #[arg(long, env = "HIPFIRE_QUANT_THREADS", value_name = "N")]
     pub threads: Option<usize>,
 
+    /// `--format maple` only: carrier for `lm_head.weight`.
+    ///
+    /// Maple's head is dense over the full 151,936-row vocab and is read in its
+    /// ENTIRETY every decoded token — 622 MB of BF16 at 205 GB/s, 90% of this
+    /// box's achievable DRAM bandwidth and 36% of the decode token. It is the
+    /// only bandwidth-bound part of the model, so this carrier is a decode-speed
+    /// decision, not a fidelity one. `bf16` (default) preserves existing
+    /// behaviour; `q8` is 331 MB, `mq4` is 195 MB.
+    ///
+    /// Does NOT touch `word_embeddings` (same shape, but only ONE ROW is read
+    /// per token — a RAM question, not a bandwidth one), the ternary expert
+    /// path, or the router.
+    #[arg(long, value_name = "MODE", default_value = "bf16",
+          value_parser = ["bf16", "q8", "mq4"])]
+    pub head_quant: String,
+
     /// Override the architecture ID stamped into the HFQ header.
     #[arg(long, value_name = "ID")]
     pub arch_id: Option<u32>,

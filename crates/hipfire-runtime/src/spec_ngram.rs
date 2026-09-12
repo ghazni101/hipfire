@@ -361,7 +361,7 @@ impl<D: BlockDrafter> Speculator for ChainSpeculator<D> {
         self.sample_temp = cfg.temp;
         self.sample_top_p = cfg.top_p;
         self.sample_top_k = cfg.top_k;
-        self.rng_state = 0x13579BDF;
+        self.rng_state = crate::spec::request_rng_state(cfg.rng_seed);
     }
 
     fn requires_greedy(&self) -> bool {

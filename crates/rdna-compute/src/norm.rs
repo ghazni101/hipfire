@@ -46,15 +46,15 @@ pub fn restore_gdn_requant_frame_checkpoint(frame: u32) {
 /// for MQ4/HFQ; opt in via `HIPFIRE_DN_REQUANT_PER_TOKEN=1` for PARO checkpoints
 /// (shisa-ai A3B). For n_tokens==1 (AR decode / DFlash draft) both are identical.
 fn dn_requant_per_token() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        hipfire_config::developer_var("HIPFIRE_DN_REQUANT_PER_TOKEN")
-            .map(|v| {
-                let v = v.trim();
-                !v.is_empty() && v != "0"
-            })
-            .unwrap_or(false)
-    })
+    // Truthy (non-empty, non-"0") predicate preserved verbatim from the
+    // cached form; only the process-global cache is gone (the snapshot is
+    // the cache now).
+    hipfire_config::developer_var("HIPFIRE_DN_REQUANT_PER_TOKEN")
+        .map(|v| {
+            let v = v.trim();
+            !v.is_empty() && v != "0"
+        })
+        .unwrap_or(false)
 }
 
 /// Use the chunked (parallel) FP32 GDN kernel on the multi-token (n>1) linear
@@ -62,29 +62,24 @@ fn dn_requant_per_token() -> bool {
 /// PoC: each chunk is a separate host-side launch (cross-chunk is serial).
 /// Numerically EQUAL to batch_seq (oracle gdn_chunked_f32, 1.3e-15).
 pub fn gdn_chunked() -> bool {
-    static V: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        hipfire_config::developer_var("HIPFIRE_GDN_CHUNKED")
-            .map(|v| {
-                let v = v.trim();
-                !v.is_empty() && v != "0"
-            })
-            .unwrap_or(false)
-    })
+    // Same truthy-predicate note as `dn_requant_per_token`.
+    hipfire_config::developer_var("HIPFIRE_GDN_CHUNKED")
+        .map(|v| {
+            let v = v.trim();
+            !v.is_empty() && v != "0"
+        })
+        .unwrap_or(false)
 }
 
 /// Chunk size CS for the chunked FP32 GDN kernel. Default 16 (fits 64 KB LDS
 /// with occupancy headroom). Clamped to [1, 32] (CS_MAX). CS=32 is opt-in and
 /// occupancy-1; CS>32 is refused (LDS overflow).
 pub fn gdn_chunk_size() -> usize {
-    static V: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *V.get_or_init(|| {
-        let cs = hipfire_config::developer_var("HIPFIRE_GDN_CHUNK_SIZE")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(16);
-        cs.clamp(1, 32)
-    })
+    let cs = hipfire_config::developer_var("HIPFIRE_GDN_CHUNK_SIZE")
+        .ok()
+        .and_then(|v| v.trim().parse::<usize>().ok())
+        .unwrap_or(16);
+    cs.clamp(1, 32)
 }
 
 impl Gpu {
@@ -1155,6 +1150,12 @@ impl Gpu {
                 "qwen36_27b_fa_prep_gfx1100",
                 kernels::qwen36_27b_fa_prep_gfx1100_src(),
                 "qwen36_27b_fa_prep_gfx1100",
+            )
+        } else if self.arch_caps.is_gfx1201() {
+            (
+                "qwen35_fa_prep_gfx1201",
+                kernels::QWEN35_FA_PREP_GFX1201_SRC,
+                "qwen35_fa_prep_gfx1201",
             )
         } else if self.arch_caps.is_gfx1151() {
             (

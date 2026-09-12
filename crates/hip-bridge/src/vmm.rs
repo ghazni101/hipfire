@@ -269,6 +269,7 @@ impl VmmArena {
                     size,
                     self.granularity,
                 ),
+                context: err.context,
             };
             let mut segment = VmmSegment {
                 offset: self.mapped_bytes,

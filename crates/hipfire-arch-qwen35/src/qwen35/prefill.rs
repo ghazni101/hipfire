@@ -55,6 +55,240 @@ use hipfire_runtime::llama::WeightTensor;
 use rdna_compute::DType;
 use rdna_compute::Gpu;
 use rdna_compute::GpuTensor;
+/// Row-parallel epilogue for dense-TP batched partials.
+/// `Residual` is byte-identical single-GPU/MoE/EP behavior: GEMM adds into
+/// `pbs.x_batch`. `Partial(out)` writes the N×dim GEMM result into `out`
+/// without touching the residual; the caller all-reduces `out` and then
+/// adds it into each rank's `x_batch`. This avoids duplicating full layer
+/// bodies for the two transports.
+pub(crate) enum BatchEpilogue<'a> {
+    Residual,
+    Partial(&'a GpuTensor),
+}
+#[inline]
+fn zero_partial_for_residual(
+    gpu: &mut Gpu,
+    partial: &GpuTensor,
+    n: usize,
+    m: usize,
+) -> HipResult<()> {
+    let elems = n
+        .checked_mul(m)
+        .ok_or_else(|| HipError::new(0, "zero_partial overflow"))?;
+    let view = partial.sub_offset(0, elems);
+    gpu.hip.memset(&view.buf, 0, view.buf.size())?;
+    Ok(())
+}
+
+/// Shared dispatch for batched `wo` / `w_down` with selectable epilogue.
+/// Preserves every dtype-specific residual kernel path; `Partial` reuses the
+/// same kernels into a zeroed `n×m` slice of `out` instead of `pbs.x_batch`.
+fn dispatch_batched_gemm_epilogue(
+    gpu: &mut Gpu,
+    pbs: &PrefillBatchScratch,
+    w: &WeightTensor,
+    input: &GpuTensor,
+    epilogue: &BatchEpilogue<'_>,
+    n: usize,
+    q8_wmma_arch: bool,
+    _arch_has_wmma: bool,
+) -> HipResult<()> {
+    let m = w.m;
+    let k = w.k;
+    let is_6bit = matches!(w.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
+    let is_mq3_lloyd = matches!(w.gpu_dtype, DType::MQ3G256Lloyd);
+    let is_mq3 = matches!(w.gpu_dtype, DType::MQ3G256);
+    let is_fp4 = matches!(w.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
+    let is_q8 = matches!(w.gpu_dtype, DType::Q8_0);
+    let is_lowbit = matches!(w.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
+    match epilogue {
+        BatchEpilogue::Residual => {
+            if is_6bit {
+                return run_residual_gemm_key(
+                    gpu,
+                    hipfire_dispatch::types::KernelKey::GemmHfq6G256Residual,
+                    &w.buf,
+                    w.gpu_dtype,
+                    input,
+                    &pbs.x_batch,
+                    m,
+                    k,
+                    n,
+                );
+            } else if is_q8 && q8_wmma_arch {
+                let x_n = pbs.x_batch.sub_offset(0, n * m);
+                return run_residual_gemm_key(
+                    gpu,
+                    hipfire_dispatch::types::KernelKey::GemmQ8_0ResidualWmma,
+                    &w.buf,
+                    w.gpu_dtype,
+                    input,
+                    &x_n,
+                    m,
+                    k,
+                    n,
+                );
+            } else if is_q8 || is_lowbit {
+                let scratch = pbs.x_rot_batch.sub_offset(0, n * m);
+                run_plain_gemm_key(
+                    gpu,
+                    plain_gemm_key_for(w.gpu_dtype),
+                    &w.buf,
+                    w.gpu_dtype,
+                    input,
+                    &scratch,
+                    m,
+                    k,
+                    n,
+                )?;
+                let x_n = pbs.x_batch.sub_offset(0, n * m);
+                return gpu.add_inplace_f32(&x_n, &scratch);
+            } else if is_mq3_lloyd {
+                return run_residual_gemm_key(
+                    gpu,
+                    hipfire_dispatch::types::KernelKey::GemmMq3G256LloydResidual,
+                    &w.buf,
+                    w.gpu_dtype,
+                    input,
+                    &pbs.x_batch,
+                    m,
+                    k,
+                    n,
+                );
+            } else if is_mq3 {
+                return run_residual_gemm_key(
+                    gpu,
+                    hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
+                    &w.buf,
+                    w.gpu_dtype,
+                    input,
+                    &pbs.x_batch,
+                    m,
+                    k,
+                    n,
+                );
+            } else if is_fp4 {
+                return run_residual_gemm_key(
+                    gpu,
+                    hipfire_dispatch::types::KernelKey::GemmHfp4G32Residual,
+                    &w.buf,
+                    w.gpu_dtype,
+                    input,
+                    &pbs.x_batch,
+                    m,
+                    k,
+                    n,
+                );
+            } else {
+                return run_residual_gemm_key(
+                    gpu,
+                    crate::forward_slots::residual_gemm_key_for(w.gpu_dtype),
+                    &w.buf,
+                    w.gpu_dtype,
+                    input,
+                    &pbs.x_batch,
+                    m,
+                    k,
+                    n,
+                );
+            }
+        }
+        BatchEpilogue::Partial(out) => {
+            let out_n = out.sub_offset(0, n * m);
+            if is_6bit {
+                zero_partial_for_residual(gpu, out, n, m)?;
+                return run_residual_gemm_key(
+                    gpu,
+                    hipfire_dispatch::types::KernelKey::GemmHfq6G256Residual,
+                    &w.buf,
+                    w.gpu_dtype,
+                    input,
+                    &out_n,
+                    m,
+                    k,
+                    n,
+                );
+            } else if is_q8 && q8_wmma_arch {
+                zero_partial_for_residual(gpu, out, n, m)?;
+                return run_residual_gemm_key(
+                    gpu,
+                    hipfire_dispatch::types::KernelKey::GemmQ8_0ResidualWmma,
+                    &w.buf,
+                    w.gpu_dtype,
+                    input,
+                    &out_n,
+                    m,
+                    k,
+                    n,
+                );
+            } else if is_q8 || is_lowbit {
+                return run_plain_gemm_key(
+                    gpu,
+                    plain_gemm_key_for(w.gpu_dtype),
+                    &w.buf,
+                    w.gpu_dtype,
+                    input,
+                    &out_n,
+                    m,
+                    k,
+                    n,
+                );
+            } else if is_mq3_lloyd {
+                zero_partial_for_residual(gpu, out, n, m)?;
+                return run_residual_gemm_key(
+                    gpu,
+                    hipfire_dispatch::types::KernelKey::GemmMq3G256LloydResidual,
+                    &w.buf,
+                    w.gpu_dtype,
+                    input,
+                    &out_n,
+                    m,
+                    k,
+                    n,
+                );
+            } else if is_mq3 {
+                zero_partial_for_residual(gpu, out, n, m)?;
+                return run_residual_gemm_key(
+                    gpu,
+                    hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
+                    &w.buf,
+                    w.gpu_dtype,
+                    input,
+                    &out_n,
+                    m,
+                    k,
+                    n,
+                );
+            } else if is_fp4 {
+                zero_partial_for_residual(gpu, out, n, m)?;
+                return run_residual_gemm_key(
+                    gpu,
+                    hipfire_dispatch::types::KernelKey::GemmHfp4G32Residual,
+                    &w.buf,
+                    w.gpu_dtype,
+                    input,
+                    &out_n,
+                    m,
+                    k,
+                    n,
+                );
+            } else {
+                zero_partial_for_residual(gpu, out, n, m)?;
+                return run_residual_gemm_key(
+                    gpu,
+                    crate::forward_slots::residual_gemm_key_for(w.gpu_dtype),
+                    &w.buf,
+                    w.gpu_dtype,
+                    input,
+                    &out_n,
+                    m,
+                    k,
+                    n,
+                );
+            }
+        }
+    }
+}
 
 /// Batched prefill entry point: processes N prompt tokens in one call,
 /// writing the last token's logits into `scratch.logits` and leaving
@@ -138,33 +372,29 @@ fn explicit_prefill_max_batch() -> Option<usize> {
 fn dense_layers_are_all_mq4v2(weights: &Qwen35Weights) -> bool {
     !weights.layers.is_empty()
         && weights.layers.iter().all(|layer| match layer {
-            LayerWeights::DeltaNet(layer) => {
-                [
-                    &layer.wqkv,
-                    &layer.wz,
-                    &layer.w_alpha,
-                    &layer.w_beta,
-                    &layer.wo,
-                    &layer.w_gate,
-                    &layer.w_up,
-                    &layer.w_down,
-                ]
-                .iter()
-                .all(|weight| weight.gpu_dtype == DType::MQ4G256V2)
-            }
-            LayerWeights::FullAttn(layer) => {
-                [
-                    &layer.wq,
-                    &layer.wk,
-                    &layer.wv,
-                    &layer.wo,
-                    &layer.w_gate,
-                    &layer.w_up,
-                    &layer.w_down,
-                ]
-                .iter()
-                .all(|weight| weight.gpu_dtype == DType::MQ4G256V2)
-            }
+            LayerWeights::DeltaNet(layer) => [
+                &layer.wqkv,
+                &layer.wz,
+                &layer.w_alpha,
+                &layer.w_beta,
+                &layer.wo,
+                &layer.w_gate,
+                &layer.w_up,
+                &layer.w_down,
+            ]
+            .iter()
+            .all(|weight| weight.gpu_dtype == DType::MQ4G256V2),
+            LayerWeights::FullAttn(layer) => [
+                &layer.wq,
+                &layer.wk,
+                &layer.wv,
+                &layer.wo,
+                &layer.w_gate,
+                &layer.w_up,
+                &layer.w_down,
+            ]
+            .iter()
+            .all(|weight| weight.gpu_dtype == DType::MQ4G256V2),
             LayerWeights::DeltaNetMoe(_) | LayerWeights::FullAttnMoe(_) => false,
         })
 }
@@ -1857,7 +2087,8 @@ fn moe_prefill_topk_shape_supported(k_top: usize, num_experts: usize) -> bool {
 }
 
 /// Routed-expert dtypes the batched-prefill grouped-GEMM path (Path 2) serves
-/// natively for a UNIFORM-per-projection file (`expert_dtype_tags == None`).
+/// natively for a UNIFORM-per-projection CODEBOOK file (`expert_dtype_tags == None`
+/// and at least one Lloyd projection). Pure MQ4/MQ4 pairs use the default arm.
 ///
 /// Each has a real `dispatch_grouped_gemm` arm whose launcher covers BOTH gfx11
 /// (`_k2`) and gfx12 (`_gfx12`):
@@ -1873,12 +2104,25 @@ fn moe_prefill_topk_shape_supported(k_top: usize, num_experts: usize) -> bool {
 ///     dtype-tag kernel has no GL branch. Admitting GL would push a
 ///     `[idx][scale]` SoA blob into a per-group-header decoder: OOB reads and
 ///     token soup, with no error.
-///   MQ6G256 — handled by its own `admit_mq6` arm (env/arch gated).
+///   MQ6G256 / MQ6G256V2 — handled by the `admit_mq6` arm (env/arch gated).
+///   MQ4G256V2 — handled by the default MQ4 arm + Path-2
+///     `gemm_mq4g256v2_moe_grouped_wmma_k2` / `_gfx12` (never HFQ4 V1).
+///   MQ2/3/5G256V2 — out of scope for MoE grouped prefill (dense-only V2).
 fn routed_codebook_grouped_supported(dt: DType) -> bool {
     matches!(
         dt,
         DType::MQ4G256 | DType::MQ2G256Lloyd | DType::MQ3G256Lloyd
     )
+}
+
+/// Uniform MQ4V2 / MQ6V2 routed projections Path-2 grouped GEMM serves on
+/// gfx11 (`_k2`) and gfx12 (`_gfx12`) after dispatch. Distinct wire layouts
+/// from V1 (dual-half fp16 headers); never collapse onto HFQ4/HFQ6 launchers.
+/// Used by admission tests and documentation lockstep with
+/// `dispatch_grouped_gemm` / `gemm_mq{4,6}g256v2_moe_grouped_wmma_k2`.
+#[inline]
+fn routed_uniform_mqv2_grouped_supported(dt: DType) -> bool {
+    matches!(dt, DType::MQ4G256V2 | DType::MQ6G256V2)
 }
 
 /// True when the routed pair is a uniform codebook pair the batched grouped-GEMM
@@ -1973,18 +2217,22 @@ fn moe_ffn_batched_admissible_for_dtypes(
 
     if dtypes.routed_mixed_merged {
         // Routed experts handled by the merged kernel (per-expert MQ6/MQ4/MQ3L/
-        // MQ2L). Only require the SHARED expert to be batchable on its dense
-        // path: MQ4 always, MQ6 when this arch admits MQ6 dense kernels.
-        let shared_gu_ok = (matches!(dtypes.shared_expert_gate, DType::MQ4G256 | DType::MQ4G256V2)
-            && matches!(dtypes.shared_expert_up, DType::MQ4G256 | DType::MQ4G256V2))
+        // MQ2L + V2 tags 7..18). Only require the SHARED expert to be batchable
+        // on its dense path: MQ4/MQ4V2 always, MQ6/MQ6V2 when this arch admits
+        // MQ6 dense kernels. Exact V2 dtypes — never V1 aliases. Fused
+        // gate+up requires exact dtype equality (MQ4 != MQ4V2, MQ6 != MQ6V2
+        // have different dual-half vs single-half headers → never collapse).
+        let shared_gu_ok = (dtypes.shared_expert_gate == dtypes.shared_expert_up
+            && matches!(dtypes.shared_expert_gate, DType::MQ4G256 | DType::MQ4G256V2))
             || (admit_mq6
                 && matches!(
                     dtypes.shared_expert_gate,
-                    DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ6G256
+                    DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ6G256 | DType::MQ6G256V2
                 )
                 && dtypes.shared_expert_up == dtypes.shared_expert_gate);
         let shared_dn_ok = matches!(dtypes.shared_expert_down, DType::MQ4G256 | DType::MQ4G256V2)
-            || (admit_mq6 && dtypes.shared_expert_down == DType::MQ6G256);
+            || (admit_mq6
+                && matches!(dtypes.shared_expert_down, DType::MQ6G256 | DType::MQ6G256V2));
         return shared_gu_ok && shared_dn_ok;
     }
 
@@ -2039,7 +2287,7 @@ fn moe_ffn_batched_admissible_for_dtypes(
     // runs Path 2 grouped-WMMA (`dispatch_grouped_gemm` MQ2/MQ3-Lloyd arms), the
     // SwiGLU+FWHT-rotate is weight-agnostic, and the shared expert + router keep
     // their own dense batched paths — which is why the shared side is validated
-    // exactly as in the default MQ4 arm (plus MQ6 when this arch admits MQ6).
+    // exactly as in the default MQ4 arm (plus MQ6/MQ6V2 when this arch admits).
     //
     // Structurally distinct from `routed_mixed_merged` above: that arm covers a
     // GRADED file served by the merged dtype-tag kernel; this one covers a
@@ -2047,16 +2295,17 @@ fn moe_ffn_batched_admissible_for_dtypes(
     if admit_codebook
         && routed_codebook_pair_batched_supported(dtypes.expert_gate_up, dtypes.expert_down)
     {
-        let shared_gu_ok = (matches!(dtypes.shared_expert_gate, DType::MQ4G256 | DType::MQ4G256V2)
-            && matches!(dtypes.shared_expert_up, DType::MQ4G256 | DType::MQ4G256V2))
+        let shared_gu_ok = (dtypes.shared_expert_gate == dtypes.shared_expert_up
+            && matches!(dtypes.shared_expert_gate, DType::MQ4G256 | DType::MQ4G256V2))
             || (admit_mq6
                 && matches!(
                     dtypes.shared_expert_gate,
-                    DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ6G256
+                    DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ6G256 | DType::MQ6G256V2
                 )
                 && dtypes.shared_expert_up == dtypes.shared_expert_gate);
         let shared_dn_ok = matches!(dtypes.shared_expert_down, DType::MQ4G256 | DType::MQ4G256V2)
-            || (admit_mq6 && dtypes.shared_expert_down == DType::MQ6G256);
+            || (admit_mq6
+                && matches!(dtypes.shared_expert_down, DType::MQ6G256 | DType::MQ6G256V2));
         if shared_gu_ok && shared_dn_ok {
             return true;
         }
@@ -2072,33 +2321,48 @@ fn moe_ffn_batched_admissible_for_dtypes(
         return true;
     }
 
+    // Uniform MQ4 / MQ4V2 / MQ6 / MQ6V2 shared+routed (Path 2 grouped after
+    // dispatch on gfx11/gfx12). MQ6* needs `admit_mq6`; MQ4V2 always admits
+    // like MQ4. MQ2/3/5V2 deliberately excluded from MoE grouped prefill.
     if admit_mq6 {
         let shared_gu_dt = dtypes.shared_expert_gate;
         let shared_gu_ok = matches!(
             shared_gu_dt,
-            DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ6G256
+            DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ6G256 | DType::MQ6G256V2
         ) && dtypes.shared_expert_up == shared_gu_dt;
         let shared_dn_ok = matches!(
             dtypes.shared_expert_down,
-            DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ6G256
+            DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ6G256 | DType::MQ6G256V2
         );
         let experts_ok = matches!(
             dtypes.expert_gate_up,
-            DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ6G256
+            DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ6G256 | DType::MQ6G256V2
         ) && matches!(
             dtypes.expert_down,
-            DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ6G256
+            DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ6G256 | DType::MQ6G256V2
+        );
+        // Lockstep: any uniform V2 projection we admit must be a Path-2
+        // grouped-supported dtype (or V1 MQ4/MQ6 which have their own arms).
+        debug_assert!(
+            !matches!(dtypes.expert_gate_up, DType::MQ4G256V2 | DType::MQ6G256V2)
+                || routed_uniform_mqv2_grouped_supported(dtypes.expert_gate_up)
+        );
+        debug_assert!(
+            !matches!(dtypes.expert_down, DType::MQ4G256V2 | DType::MQ6G256V2)
+                || routed_uniform_mqv2_grouped_supported(dtypes.expert_down)
         );
         shared_gu_ok && shared_dn_ok && experts_ok
     } else {
-        matches!(dtypes.shared_expert_gate, DType::MQ4G256 | DType::MQ4G256V2)
-            && matches!(dtypes.shared_expert_up, DType::MQ4G256 | DType::MQ4G256V2)
+        // Exact gate/up dtype equality required even for MQ4-family (MQ4 !=
+        // MQ4V2 have different header layouts; fused kernel handles one layout
+        // per launch → cross-version ordering rejects).
+        dtypes.shared_expert_gate == dtypes.shared_expert_up
+            && matches!(dtypes.shared_expert_gate, DType::MQ4G256 | DType::MQ4G256V2)
             && matches!(dtypes.shared_expert_down, DType::MQ4G256 | DType::MQ4G256V2)
             && matches!(dtypes.expert_gate_up, DType::MQ4G256 | DType::MQ4G256V2)
             && matches!(dtypes.expert_down, DType::MQ4G256 | DType::MQ4G256V2)
     }
 }
-
 /// Threshold below which batching overhead isn't worth the alloc + per-layer
 /// dispatch — single-token prefill must not take the batched path.
 const MIN_BATCH: usize = 2;
@@ -2808,7 +3072,9 @@ pub(crate) fn prefill_moe_ffn_body_batched(
     match ffn.shared_expert.gate.gpu_dtype {
         // #397 Ship 5.2 slice 2: shared-expert fused gate+up → FusedQkvFamily
         // (batched-prefill gate+up variant). Same batched kernel, behavior-preserving.
-        DType::MQ4G256 | DType::MQ4G256V2 => run_fused_gate_up_key(
+        // MQ4G256V2 / MQ6G256V2 select container-specific keys via fused_gate_up_key_for
+        // (never V1 aliases). MQ4G256 falls through to FusedGateUpHfq4G256.
+        DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ6G256V2 => run_fused_gate_up_key(
             gpu,
             crate::forward_slots::fused_gate_up_key_for(ffn.shared_expert.gate.gpu_dtype),
             &ffn.shared_expert.gate.buf,
@@ -3063,16 +3329,15 @@ pub(crate) fn prefill_moe_ffn_body_batched(
     // Per-projection dispatch: MQ4 → HFQ4 kernel, MQ6 → HFQ6 sister
     // (shipped via feat/hfq6-sigmoid-scaled-batched).
     match ffn.shared_expert.down.gpu_dtype {
-        DType::MQ4G256 | DType::MQ4G256V2 => gpu
-            .gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched(
-                &ffn.shared_expert.down.buf,
-                shared_rot,
-                &pbs.x_batch,
-                shared_scalar,
-                ffn.shared_expert.down.m,
-                ffn.shared_expert.down.k,
-                n,
-            )?,
+        DType::MQ4G256 => gpu.gemv_hfq4g256_residual_sigmoid_scaled_gpu_batched(
+            &ffn.shared_expert.down.buf,
+            shared_rot,
+            &pbs.x_batch,
+            shared_scalar,
+            ffn.shared_expert.down.m,
+            ffn.shared_expert.down.k,
+            n,
+        )?,
         DType::MQ6G256 => gpu.gemv_hfq6g256_residual_sigmoid_scaled_gpu_batched(
             &ffn.shared_expert.down.buf,
             shared_rot,
@@ -3082,6 +3347,40 @@ pub(crate) fn prefill_moe_ffn_body_batched(
             ffn.shared_expert.down.k,
             n,
         )?,
+        // MQ4G256V2 / MQ6G256V2: exact dense V2 residual GEMM into temp +
+        // sigmoid scale (no V1 HFQ4/HFQ6 residual_sigmoid alias — dual-half
+        // headers differ from V1). Mirrors the Q8_0 split below.
+        DType::MQ4G256V2 | DType::MQ6G256V2 => {
+            let down_tmp = GpuTensor {
+                buf: unsafe { down_expanded.buf.alias() },
+                shape: vec![n * dim],
+                dtype: DType::F32,
+            };
+            let bytes = n * dim * 4;
+            if let Some(stream) = gpu.active_stream.as_ref() {
+                gpu.hip.memset_async(&down_tmp.buf, 0, bytes, stream)?;
+            } else {
+                gpu.hip.memset(&down_tmp.buf, 0, bytes)?;
+            }
+            run_residual_gemm_key(
+                gpu,
+                crate::forward_slots::residual_gemm_key_for(ffn.shared_expert.down.gpu_dtype),
+                &ffn.shared_expert.down.buf,
+                ffn.shared_expert.down.gpu_dtype,
+                shared_rot,
+                &down_tmp,
+                ffn.shared_expert.down.m,
+                ffn.shared_expert.down.k,
+                n,
+            )?;
+            gpu.sigmoid_scaled_residual_add_batched_f32(
+                &pbs.x_batch,
+                &down_tmp,
+                shared_scalar,
+                n,
+                dim,
+            )?;
+        }
         // Phase 2: HFQ4G128 batched residual+sigmoid-scaled kernel. Single
         // launch, same semantics as the HFQ4G256 sister — reads shared_rot
         // (already silu-mul-rotated by the PARO fused kernel above), GEMVs
@@ -3193,11 +3492,13 @@ pub(crate) fn prefill_moe_ffn_body_batched(
         shared_expert_up: ffn.shared_expert.up.gpu_dtype,
         shared_expert_down: ffn.shared_expert.down.gpu_dtype,
         experts_all_gate_up_mq4: if let Some(global) = ffn.global_expert_dtypes.as_ref() {
-            global.iter().all(|(g, _)| *g == DType::MQ4G256)
+            global
+                .iter()
+                .all(|(g, _)| matches!(*g, DType::MQ4G256 | DType::MQ4G256V2))
         } else {
             ffn.experts
                 .iter()
-                .all(|e| e.gate_up.gpu_dtype == DType::MQ4G256)
+                .all(|e| matches!(e.gate_up.gpu_dtype, DType::MQ4G256 | DType::MQ4G256V2))
         },
         routed_gate_up: if let Some(global) = ffn.global_expert_dtypes.as_ref() {
             global[0].0
@@ -3563,7 +3864,7 @@ fn batch_chunk_validate_independent(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn batch_chunk_embed_tokens(
+pub(crate) fn batch_chunk_embed_tokens(
     gpu: &mut Gpu,
     weights: &Qwen35Weights,
     tokens: &[u32],
@@ -3691,7 +3992,7 @@ fn batch_chunk_embed_tokens(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn batch_chunk_upload_positions(
+pub(crate) fn batch_chunk_upload_positions(
     gpu: &mut Gpu,
     pbs: &PrefillBatchScratch,
     batch_semantics: BatchSemantics<'_>,
@@ -3751,7 +4052,7 @@ fn batch_chunk_upload_positions(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn batch_chunk_delta_net_attn(
+pub(crate) fn batch_chunk_delta_net_attn(
     gpu: &mut Gpu,
     layer: &DeltaNetLayerWeights,
     config: &Qwen35Config,
@@ -3770,6 +4071,7 @@ fn batch_chunk_delta_net_attn(
     delta_layer_idx: usize,
     q8_wmma_arch: bool,
     arch_has_wmma: bool,
+    epilogue: BatchEpilogue<'_>,
 ) -> HipResult<()> {
     // Per-layer dtype branch: MQ4 needs FWHT-rotation on the
     // activation to match its pre-rotated weights; HFQ4 uses
@@ -4351,7 +4653,7 @@ fn batch_chunk_delta_net_attn(
         n,
     )?;
 
-    // Batched wo + residual.
+    // Batched wo + residual/partial.
     //
     // For MQ weights, the decode path's weight_gemv_residual
     // internally FWHT-rotates dn_normed into mq_x_rot before
@@ -4373,18 +4675,7 @@ fn batch_chunk_delta_net_attn(
             | DType::MQ3G256Lloyd
             | DType::MFP4G32
     );
-    let wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
-    let wo_is_mq3 = matches!(layer.wo.gpu_dtype, DType::MQ3G256);
-    let wo_is_mq3_lloyd = matches!(layer.wo.gpu_dtype, DType::MQ3G256Lloyd);
-    let wo_is_fp4 = matches!(layer.wo.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
-    let wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
-    // TQ2G128/BQ1G128 have no fused qkvza/gate_up/qkv kernel, so they take
-    // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
-    // to the HFQ4 arm, which would read these packed blocks at the wrong
-    // stride and produce fluent-but-wrong tokens.
-    let wo_is_lowbit = matches!(layer.wo.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
     let wo_input = if wo_is_mq {
-        // F2: AWQ-aware rotate for linear_attn wo (out_proj) input.
         rotate_x_mq_batched_for(
             gpu,
             &layer.wo,
@@ -4397,118 +4688,22 @@ fn batch_chunk_delta_net_attn(
     } else {
         &pbs.dn_normed_batch
     };
-    if wo_is_6bit {
-        run_residual_gemm_key(
-            gpu,
-            hipfire_dispatch::types::KernelKey::GemmHfq6G256Residual,
-            &layer.wo.buf,
-            layer.wo.gpu_dtype,
-            wo_input,
-            &pbs.x_batch,
-            layer.wo.m,
-            layer.wo.k,
-            n,
-        )?;
-    } else if wo_is_q8 && q8_wmma_arch {
-        let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
-        run_residual_gemm_key(
-            gpu,
-            hipfire_dispatch::types::KernelKey::GemmQ8_0ResidualWmma,
-            &layer.wo.buf,
-            layer.wo.gpu_dtype,
-            wo_input,
-            &x_n,
-            layer.wo.m,
-            layer.wo.k,
-            n,
-        )?;
-    } else if wo_is_q8 || wo_is_lowbit {
-        // Tier 2 fallback (non-WMMA archs): GEMM into x_rot_batch as
-        // scratch (safe — next consumer is the FFN rmsnorm), then
-        // add into residual.
-        let scratch = pbs.x_rot_batch.sub_offset(0, n * layer.wo.m);
-        run_plain_gemm_key(
-            gpu,
-            plain_gemm_key_for(layer.wo.gpu_dtype),
-            &layer.wo.buf,
-            layer.wo.gpu_dtype,
-            wo_input,
-            &scratch,
-            layer.wo.m,
-            layer.wo.k,
-            n,
-        )?;
-        let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
-        gpu.add_inplace_f32(&x_n, &scratch)?;
-    } else if wo_is_mq3_lloyd {
-        run_residual_gemm_key(
-            gpu,
-            hipfire_dispatch::types::KernelKey::GemmMq3G256LloydResidual,
-            &layer.wo.buf,
-            layer.wo.gpu_dtype,
-            wo_input,
-            &pbs.x_batch,
-            layer.wo.m,
-            layer.wo.k,
-            n,
-        )?;
-    } else if wo_is_mq3 {
-        if arch_has_wmma {
-            run_residual_gemm_key(
-                gpu,
-                hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
-                &layer.wo.buf,
-                layer.wo.gpu_dtype,
-                wo_input,
-                &pbs.x_batch,
-                layer.wo.m,
-                layer.wo.k,
-                n,
-            )?;
-        } else {
-            run_residual_gemm_key(
-                gpu,
-                hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
-                &layer.wo.buf,
-                layer.wo.gpu_dtype,
-                wo_input,
-                &pbs.x_batch,
-                layer.wo.m,
-                layer.wo.k,
-                n,
-            )?;
-        }
-    } else if wo_is_fp4 {
-        run_residual_gemm_key(
-            gpu,
-            hipfire_dispatch::types::KernelKey::GemmHfp4G32Residual,
-            &layer.wo.buf,
-            layer.wo.gpu_dtype,
-            wo_input,
-            &pbs.x_batch,
-            layer.wo.m,
-            layer.wo.k,
-            n,
-        )?;
-    } else {
-        run_residual_gemm_key(
-            gpu,
-            crate::forward_slots::residual_gemm_key_for(layer.wo.gpu_dtype),
-            &layer.wo.buf,
-            layer.wo.gpu_dtype,
-            wo_input,
-            &pbs.x_batch,
-            layer.wo.m,
-            layer.wo.k,
-            n,
-        )?;
-    }
+    dispatch_batched_gemm_epilogue(
+        gpu,
+        pbs,
+        &layer.wo,
+        wo_input,
+        &epilogue,
+        n,
+        q8_wmma_arch,
+        arch_has_wmma,
+    )?;
 
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-fn batch_chunk_delta_net_ffn(
+pub(crate) fn batch_chunk_delta_net_ffn(
     gpu: &mut Gpu,
     layer: &DeltaNetLayerWeights,
     config: &Qwen35Config,
@@ -4518,6 +4713,7 @@ fn batch_chunk_delta_net_ffn(
     hidden_dim: usize,
     q8_wmma_arch: bool,
     arch_has_wmma: bool,
+    epilogue: BatchEpilogue<'_>,
 ) -> HipResult<()> {
     // FFN: rmsnorm (+ rotate for MQ).
     let ffn_is_mq = matches!(
@@ -4707,16 +4903,6 @@ fn batch_chunk_delta_net_ffn(
             | DType::MQ3G256Lloyd
             | DType::MFP4G32
     );
-    let w_down_is_6bit = matches!(layer.w_down.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
-    let w_down_is_mq3 = matches!(layer.w_down.gpu_dtype, DType::MQ3G256);
-    let w_down_is_mq3_lloyd = matches!(layer.w_down.gpu_dtype, DType::MQ3G256Lloyd);
-    let w_down_is_fp4 = matches!(layer.w_down.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
-    let w_down_is_q8 = matches!(layer.w_down.gpu_dtype, DType::Q8_0);
-    // TQ2G128/BQ1G128 have no fused qkvza/gate_up/qkv kernel, so they take
-    // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
-    // to the HFQ4 arm, which would read these packed blocks at the wrong
-    // stride and produce fluent-but-wrong tokens.
-    let w_down_is_lowbit = matches!(layer.w_down.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
     if w_down_is_mq {
         // F2: AWQ-aware silu_mul+rotate for w_down input.
         fused_silu_mul_rotate_mq_batched_for(
@@ -4731,117 +4917,23 @@ fn batch_chunk_delta_net_ffn(
     } else {
         gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
     }
-
-    // Batched w_down + residual.
-    if w_down_is_6bit {
-        run_residual_gemm_key(
-            gpu,
-            hipfire_dispatch::types::KernelKey::GemmHfq6G256Residual,
-            &layer.w_down.buf,
-            layer.w_down.gpu_dtype,
-            &pbs.ffn_hidden_batch,
-            &pbs.x_batch,
-            layer.w_down.m,
-            layer.w_down.k,
-            n,
-        )?;
-    } else if w_down_is_q8 && q8_wmma_arch {
-        let x_n = pbs.x_batch.sub_offset(0, n * layer.w_down.m);
-        run_residual_gemm_key(
-            gpu,
-            hipfire_dispatch::types::KernelKey::GemmQ8_0ResidualWmma,
-            &layer.w_down.buf,
-            layer.w_down.gpu_dtype,
-            &pbs.ffn_hidden_batch,
-            &x_n,
-            layer.w_down.m,
-            layer.w_down.k,
-            n,
-        )?;
-    } else if w_down_is_q8 || w_down_is_lowbit {
-        let scratch = pbs.x_rot_batch.sub_offset(0, n * layer.w_down.m);
-        run_plain_gemm_key(
-            gpu,
-            plain_gemm_key_for(layer.w_down.gpu_dtype),
-            &layer.w_down.buf,
-            layer.w_down.gpu_dtype,
-            &pbs.ffn_hidden_batch,
-            &scratch,
-            layer.w_down.m,
-            layer.w_down.k,
-            n,
-        )?;
-        let x_n = pbs.x_batch.sub_offset(0, n * layer.w_down.m);
-        gpu.add_inplace_f32(&x_n, &scratch)?;
-    } else if w_down_is_mq3_lloyd {
-        run_residual_gemm_key(
-            gpu,
-            hipfire_dispatch::types::KernelKey::GemmMq3G256LloydResidual,
-            &layer.w_down.buf,
-            layer.w_down.gpu_dtype,
-            &pbs.ffn_hidden_batch,
-            &pbs.x_batch,
-            layer.w_down.m,
-            layer.w_down.k,
-            n,
-        )?;
-    } else if w_down_is_mq3 {
-        if arch_has_wmma {
-            run_residual_gemm_key(
-                gpu,
-                hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
-                &layer.w_down.buf,
-                layer.w_down.gpu_dtype,
-                &pbs.ffn_hidden_batch,
-                &pbs.x_batch,
-                layer.w_down.m,
-                layer.w_down.k,
-                n,
-            )?;
-        } else {
-            run_residual_gemm_key(
-                gpu,
-                hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
-                &layer.w_down.buf,
-                layer.w_down.gpu_dtype,
-                &pbs.ffn_hidden_batch,
-                &pbs.x_batch,
-                layer.w_down.m,
-                layer.w_down.k,
-                n,
-            )?;
-        }
-    } else if w_down_is_fp4 {
-        run_residual_gemm_key(
-            gpu,
-            hipfire_dispatch::types::KernelKey::GemmHfp4G32Residual,
-            &layer.w_down.buf,
-            layer.w_down.gpu_dtype,
-            &pbs.ffn_hidden_batch,
-            &pbs.x_batch,
-            layer.w_down.m,
-            layer.w_down.k,
-            n,
-        )?;
-    } else {
-        run_residual_gemm_key(
-            gpu,
-            crate::forward_slots::residual_gemm_key_for(layer.w_down.gpu_dtype),
-            &layer.w_down.buf,
-            layer.w_down.gpu_dtype,
-            &pbs.ffn_hidden_batch,
-            &pbs.x_batch,
-            layer.w_down.m,
-            layer.w_down.k,
-            n,
-        )?;
-    }
+    // Batched w_down + residual/partial.
+    dispatch_batched_gemm_epilogue(
+        gpu,
+        pbs,
+        &layer.w_down,
+        &pbs.ffn_hidden_batch,
+        &epilogue,
+        n,
+        q8_wmma_arch,
+        arch_has_wmma,
+    )?;
 
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-fn batch_chunk_full_attn_attn(
+pub(crate) fn batch_chunk_full_attn_attn(
     gpu: &mut Gpu,
     layer: &FullAttnLayerWeights,
     config: &Qwen35Config,
@@ -4859,6 +4951,7 @@ fn batch_chunk_full_attn_attn(
     arch_has_wmma: bool,
     kv_layer_idx: usize,
     layer_idx: usize,
+    epilogue: BatchEpilogue<'_>,
 ) -> HipResult<()> {
     // Fully batched FA layer. Mirrors the FA branch of
     // forward_scratch_layers kernel-for-kernel, but every
@@ -5263,18 +5356,7 @@ fn batch_chunk_full_attn_attn(
             | DType::MQ3G256Lloyd
             | DType::MFP4G32
     );
-    let fa_wo_is_6bit = matches!(layer.wo.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
-    let fa_wo_is_mq3 = matches!(layer.wo.gpu_dtype, DType::MQ3G256);
-    let fa_wo_is_mq3_lloyd = matches!(layer.wo.gpu_dtype, DType::MQ3G256Lloyd);
-    let fa_wo_is_fp4 = matches!(layer.wo.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
-    let fa_wo_is_q8 = matches!(layer.wo.gpu_dtype, DType::Q8_0);
-    // TQ2G128/BQ1G128 have no fused qkvza/gate_up/qkv kernel, so they take
-    // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
-    // to the HFQ4 arm, which would read these packed blocks at the wrong
-    // stride and produce fluent-but-wrong tokens.
-    let fa_wo_is_lowbit = matches!(layer.wo.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
     let fa_wo_input = if fa_wo_is_mq {
-        // F2: AWQ-aware rotate for FullAttention wo (o_proj) input.
         rotate_x_mq_batched_for(
             gpu,
             &layer.wo,
@@ -5287,115 +5369,22 @@ fn batch_chunk_full_attn_attn(
     } else {
         &pbs.fa_attn_out_batch
     };
-    if fa_wo_is_6bit {
-        run_residual_gemm_key(
-            gpu,
-            hipfire_dispatch::types::KernelKey::GemmHfq6G256Residual,
-            &layer.wo.buf,
-            layer.wo.gpu_dtype,
-            fa_wo_input,
-            &pbs.x_batch,
-            layer.wo.m,
-            layer.wo.k,
-            n,
-        )?;
-    } else if fa_wo_is_q8 && q8_wmma_arch {
-        let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
-        run_residual_gemm_key(
-            gpu,
-            hipfire_dispatch::types::KernelKey::GemmQ8_0ResidualWmma,
-            &layer.wo.buf,
-            layer.wo.gpu_dtype,
-            fa_wo_input,
-            &x_n,
-            layer.wo.m,
-            layer.wo.k,
-            n,
-        )?;
-    } else if fa_wo_is_q8 || fa_wo_is_lowbit {
-        let scratch = pbs.x_rot_batch.sub_offset(0, n * layer.wo.m);
-        run_plain_gemm_key(
-            gpu,
-            plain_gemm_key_for(layer.wo.gpu_dtype),
-            &layer.wo.buf,
-            layer.wo.gpu_dtype,
-            fa_wo_input,
-            &scratch,
-            layer.wo.m,
-            layer.wo.k,
-            n,
-        )?;
-        let x_n = pbs.x_batch.sub_offset(0, n * layer.wo.m);
-        gpu.add_inplace_f32(&x_n, &scratch)?;
-    } else if fa_wo_is_mq3_lloyd {
-        run_residual_gemm_key(
-            gpu,
-            hipfire_dispatch::types::KernelKey::GemmMq3G256LloydResidual,
-            &layer.wo.buf,
-            layer.wo.gpu_dtype,
-            fa_wo_input,
-            &pbs.x_batch,
-            layer.wo.m,
-            layer.wo.k,
-            n,
-        )?;
-    } else if fa_wo_is_mq3 {
-        if arch_has_wmma {
-            run_residual_gemm_key(
-                gpu,
-                hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
-                &layer.wo.buf,
-                layer.wo.gpu_dtype,
-                fa_wo_input,
-                &pbs.x_batch,
-                layer.wo.m,
-                layer.wo.k,
-                n,
-            )?;
-        } else {
-            run_residual_gemm_key(
-                gpu,
-                hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
-                &layer.wo.buf,
-                layer.wo.gpu_dtype,
-                fa_wo_input,
-                &pbs.x_batch,
-                layer.wo.m,
-                layer.wo.k,
-                n,
-            )?;
-        }
-    } else if fa_wo_is_fp4 {
-        run_residual_gemm_key(
-            gpu,
-            hipfire_dispatch::types::KernelKey::GemmHfp4G32Residual,
-            &layer.wo.buf,
-            layer.wo.gpu_dtype,
-            fa_wo_input,
-            &pbs.x_batch,
-            layer.wo.m,
-            layer.wo.k,
-            n,
-        )?;
-    } else {
-        run_residual_gemm_key(
-            gpu,
-            crate::forward_slots::residual_gemm_key_for(layer.wo.gpu_dtype),
-            &layer.wo.buf,
-            layer.wo.gpu_dtype,
-            fa_wo_input,
-            &pbs.x_batch,
-            layer.wo.m,
-            layer.wo.k,
-            n,
-        )?;
-    }
+    dispatch_batched_gemm_epilogue(
+        gpu,
+        pbs,
+        &layer.wo,
+        fa_wo_input,
+        &epilogue,
+        n,
+        q8_wmma_arch,
+        arch_has_wmma,
+    )?;
 
     Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
-fn batch_chunk_full_attn_ffn(
+pub(crate) fn batch_chunk_full_attn_ffn(
     gpu: &mut Gpu,
     layer: &FullAttnLayerWeights,
     config: &Qwen35Config,
@@ -5405,6 +5394,7 @@ fn batch_chunk_full_attn_ffn(
     hidden_dim: usize,
     q8_wmma_arch: bool,
     arch_has_wmma: bool,
+    epilogue: BatchEpilogue<'_>,
 ) -> HipResult<()> {
     // 10. FFN: rmsnorm (+ rotate for MQ), gate+up, silu_mul
     // (+ rotate for MQ), w_down residual.
@@ -5584,18 +5574,7 @@ fn batch_chunk_full_attn_ffn(
             | DType::MQ3G256Lloyd
             | DType::MFP4G32
     );
-    let fa_w_down_is_6bit = matches!(layer.w_down.gpu_dtype, DType::MQ6G256 | DType::HFQ6G256);
-    let fa_w_down_is_mq3 = matches!(layer.w_down.gpu_dtype, DType::MQ3G256);
-    let fa_w_down_is_mq3_lloyd = matches!(layer.w_down.gpu_dtype, DType::MQ3G256Lloyd);
-    let fa_w_down_is_fp4 = matches!(layer.w_down.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
-    let fa_w_down_is_q8 = matches!(layer.w_down.gpu_dtype, DType::Q8_0);
-    // TQ2G128/BQ1G128 have no fused qkvza/gate_up/qkv kernel, so they take
-    // the same UNFUSED plain-GEMM strategy as Q8 rather than falling through
-    // to the HFQ4 arm, which would read these packed blocks at the wrong
-    // stride and produce fluent-but-wrong tokens.
-    let fa_w_down_is_lowbit = matches!(layer.w_down.gpu_dtype, DType::TQ2G128 | DType::BQ1G128);
     if fa_w_down_is_mq {
-        // F2: AWQ-aware silu_mul+rotate for FullAttention w_down input.
         fused_silu_mul_rotate_mq_batched_for(
             gpu,
             &layer.w_down,
@@ -5608,109 +5587,16 @@ fn batch_chunk_full_attn_ffn(
     } else {
         gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
     }
-    if fa_w_down_is_6bit {
-        run_residual_gemm_key(
-            gpu,
-            hipfire_dispatch::types::KernelKey::GemmHfq6G256Residual,
-            &layer.w_down.buf,
-            layer.w_down.gpu_dtype,
-            &pbs.ffn_hidden_batch,
-            &pbs.x_batch,
-            layer.w_down.m,
-            layer.w_down.k,
-            n,
-        )?;
-    } else if fa_w_down_is_q8 && q8_wmma_arch {
-        let x_n = pbs.x_batch.sub_offset(0, n * layer.w_down.m);
-        run_residual_gemm_key(
-            gpu,
-            hipfire_dispatch::types::KernelKey::GemmQ8_0ResidualWmma,
-            &layer.w_down.buf,
-            layer.w_down.gpu_dtype,
-            &pbs.ffn_hidden_batch,
-            &x_n,
-            layer.w_down.m,
-            layer.w_down.k,
-            n,
-        )?;
-    } else if fa_w_down_is_q8 || fa_w_down_is_lowbit {
-        let scratch = pbs.x_rot_batch.sub_offset(0, n * layer.w_down.m);
-        run_plain_gemm_key(
-            gpu,
-            plain_gemm_key_for(layer.w_down.gpu_dtype),
-            &layer.w_down.buf,
-            layer.w_down.gpu_dtype,
-            &pbs.ffn_hidden_batch,
-            &scratch,
-            layer.w_down.m,
-            layer.w_down.k,
-            n,
-        )?;
-        let x_n = pbs.x_batch.sub_offset(0, n * layer.w_down.m);
-        gpu.add_inplace_f32(&x_n, &scratch)?;
-    } else if fa_w_down_is_mq3_lloyd {
-        run_residual_gemm_key(
-            gpu,
-            hipfire_dispatch::types::KernelKey::GemmMq3G256LloydResidual,
-            &layer.w_down.buf,
-            layer.w_down.gpu_dtype,
-            &pbs.ffn_hidden_batch,
-            &pbs.x_batch,
-            layer.w_down.m,
-            layer.w_down.k,
-            n,
-        )?;
-    } else if fa_w_down_is_mq3 {
-        if arch_has_wmma {
-            run_residual_gemm_key(
-                gpu,
-                hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
-                &layer.w_down.buf,
-                layer.w_down.gpu_dtype,
-                &pbs.ffn_hidden_batch,
-                &pbs.x_batch,
-                layer.w_down.m,
-                layer.w_down.k,
-                n,
-            )?;
-        } else {
-            run_residual_gemm_key(
-                gpu,
-                hipfire_dispatch::types::KernelKey::GemmHfq3G256Residual,
-                &layer.w_down.buf,
-                layer.w_down.gpu_dtype,
-                &pbs.ffn_hidden_batch,
-                &pbs.x_batch,
-                layer.w_down.m,
-                layer.w_down.k,
-                n,
-            )?;
-        }
-    } else if fa_w_down_is_fp4 {
-        run_residual_gemm_key(
-            gpu,
-            hipfire_dispatch::types::KernelKey::GemmHfp4G32Residual,
-            &layer.w_down.buf,
-            layer.w_down.gpu_dtype,
-            &pbs.ffn_hidden_batch,
-            &pbs.x_batch,
-            layer.w_down.m,
-            layer.w_down.k,
-            n,
-        )?;
-    } else {
-        run_residual_gemm_key(
-            gpu,
-            crate::forward_slots::residual_gemm_key_for(layer.w_down.gpu_dtype),
-            &layer.w_down.buf,
-            layer.w_down.gpu_dtype,
-            &pbs.ffn_hidden_batch,
-            &pbs.x_batch,
-            layer.w_down.m,
-            layer.w_down.k,
-            n,
-        )?;
-    }
+    dispatch_batched_gemm_epilogue(
+        gpu,
+        pbs,
+        &layer.w_down,
+        &pbs.ffn_hidden_batch,
+        &epilogue,
+        n,
+        q8_wmma_arch,
+        arch_has_wmma,
+    )?;
 
     Ok(())
 }
@@ -7336,6 +7222,7 @@ pub(crate) fn forward_batch_chunk_impl(
                     delta_layer_idx,
                     q8_wmma_arch,
                     arch_has_wmma,
+                    BatchEpilogue::Residual,
                 )?;
                 batch_chunk_delta_net_ffn(
                     gpu,
@@ -7347,6 +7234,7 @@ pub(crate) fn forward_batch_chunk_impl(
                     hidden_dim,
                     q8_wmma_arch,
                     arch_has_wmma,
+                    BatchEpilogue::Residual,
                 )?;
                 if let Some(rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
@@ -7375,6 +7263,7 @@ pub(crate) fn forward_batch_chunk_impl(
                     arch_has_wmma,
                     kv_layer_idx,
                     layer_idx,
+                    BatchEpilogue::Residual,
                 )?;
                 batch_chunk_full_attn_ffn(
                     gpu,
@@ -7386,6 +7275,7 @@ pub(crate) fn forward_batch_chunk_impl(
                     hidden_dim,
                     q8_wmma_arch,
                     arch_has_wmma,
+                    BatchEpilogue::Residual,
                 )?;
                 if let Some(rb) = hidden_rb {
                     if let Some(slot) = rb.extract_slot(layer_idx) {
@@ -8742,6 +8632,167 @@ mod tests {
         ));
     }
 
+    /// Uniform MQ4G256V2 shared+routed: always admissible (no MQ6 gate). Path-2
+    /// uses `gemm_mq4g256v2_moe_grouped_wmma_k2` / `_gfx12` after dispatch —
+    /// never HFQ4 V1. Router/scalar-gate stay MQ4V2 (admitted like MQ4).
+    #[test]
+    fn moe_prefill_admits_uniform_mq4v2_without_mq6_gate() {
+        let dtypes = MoePrefillDtypes::uniform(DType::MQ4G256V2);
+        assert!(moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, false, false, false, false
+        ));
+        assert!(moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, true, false, false, false
+        ));
+        assert!(routed_uniform_mqv2_grouped_supported(DType::MQ4G256V2));
+        assert!(!routed_codebook_grouped_supported(DType::MQ4G256V2));
+    }
+
+    /// Uniform MQ6G256V2 shared+routed: requires `admit_mq6` (same gate as V1
+    /// MQ6). Router stays MQ4 so router_ok holds; shared/routed projections
+    /// are exact MQ6V2 — Path-2 `gemm_mq6g256v2_moe_grouped_wmma_k2`.
+    #[test]
+    fn moe_prefill_admits_uniform_mq6v2_only_with_mq6_gate() {
+        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+        dtypes.shared_expert_scalar_gate = DType::Q8_0;
+        dtypes.shared_expert_gate = DType::MQ6G256V2;
+        dtypes.shared_expert_up = DType::MQ6G256V2;
+        dtypes.shared_expert_down = DType::MQ6G256V2;
+        dtypes.expert_gate_up = DType::MQ6G256V2;
+        dtypes.expert_down = DType::MQ6G256V2;
+        assert!(!moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, false, false, false, false
+        ));
+        assert!(moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, true, false, false, false
+        ));
+        assert!(routed_uniform_mqv2_grouped_supported(DType::MQ6G256V2));
+        assert!(!routed_codebook_grouped_supported(DType::MQ6G256V2));
+    }
+
+    /// MQ4V2 shared + MQ6V2 routed (and the reverse) under admit_mq6 — exact
+    /// dual-half dtypes, no V1 collapse. Cross-family pairs still go through
+    /// the main admit arm once MQ6 is gated on.
+    #[test]
+    fn moe_prefill_admits_mq4v2_mq6v2_cross_with_mq6_gate() {
+        // MQ4V2 shared, MQ6V2 routed.
+        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256V2);
+        dtypes.expert_gate_up = DType::MQ6G256V2;
+        dtypes.expert_down = DType::MQ6G256V2;
+        assert!(!moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, false, false, false, false
+        ));
+        assert!(moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, true, false, false, false
+        ));
+
+        // MQ6V2 shared, MQ4V2 routed.
+        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+        dtypes.shared_expert_scalar_gate = DType::Q8_0;
+        dtypes.shared_expert_gate = DType::MQ6G256V2;
+        dtypes.shared_expert_up = DType::MQ6G256V2;
+        dtypes.shared_expert_down = DType::MQ6G256V2;
+        dtypes.expert_gate_up = DType::MQ4G256V2;
+        dtypes.expert_down = DType::MQ4G256V2;
+        assert!(moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, true, false, false, false
+        ));
+    }
+
+    /// Graded mixed-tag files (tags 7..18) only need the SHARED expert batchable;
+    /// MQ4V2 shared always works, MQ6V2 shared needs admit_mq6.
+    #[test]
+    fn moe_prefill_graded_mixed_admits_mqv2_shared() {
+        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256V2);
+        dtypes.routed_mixed_merged = true;
+        dtypes.expert_gate_up_uniform = false;
+        dtypes.expert_down_uniform = false;
+        dtypes.expert_down = DType::MQ3G256Lloyd;
+        assert!(moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, false, false, false, false
+        ));
+
+        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+        dtypes.shared_expert_scalar_gate = DType::Q8_0;
+        dtypes.shared_expert_gate = DType::MQ6G256V2;
+        dtypes.shared_expert_up = DType::MQ6G256V2;
+        dtypes.shared_expert_down = DType::MQ6G256V2;
+        dtypes.routed_mixed_merged = true;
+        dtypes.expert_gate_up_uniform = false;
+        dtypes.expert_down_uniform = false;
+        assert!(!moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, false, false, false, false
+        ));
+        assert!(moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, true, false, false, false
+        ));
+    }
+
+    /// MQ2/3/5V2 are dense-only V2 — never MoE grouped prefill admissible.
+    #[test]
+    fn moe_prefill_rejects_mq235v2_routed() {
+        for v2 in [DType::MQ2G256V2, DType::MQ3G256V2, DType::MQ5G256V2] {
+            let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+            dtypes.expert_gate_up = v2;
+            dtypes.expert_down = v2;
+            assert!(
+                !moe_ffn_batched_admissible_for_dtypes(&dtypes, true, true, true, true),
+                "{v2:?} must not be MoE batched-prefill admissible"
+            );
+            assert!(!routed_uniform_mqv2_grouped_supported(v2));
+            assert!(!routed_codebook_grouped_supported(v2));
+        }
+    }
+
+    /// Dense residual / fused-gate-up keys for shared-expert V2 stay exact —
+    /// never HFQ4/HFQ6 V1 residual_sigmoid aliases.
+    #[test]
+    fn moe_shared_mqv2_dense_keys_never_collapse_to_v1() {
+        use crate::forward_slots::{fused_gate_up_key_for, residual_gemm_key_for};
+        use hipfire_dispatch::types::KernelKey;
+
+        assert_eq!(
+            fused_gate_up_key_for(DType::MQ4G256V2),
+            KernelKey::FusedGateUpMq4G256V2
+        );
+        assert_eq!(
+            fused_gate_up_key_for(DType::MQ6G256V2),
+            KernelKey::FusedGateUpMq6G256V2
+        );
+        assert_ne!(
+            fused_gate_up_key_for(DType::MQ4G256V2),
+            KernelKey::FusedGateUpHfq4G256
+        );
+        assert_ne!(
+            fused_gate_up_key_for(DType::MQ6G256V2),
+            KernelKey::FusedGateUpHfq6G256
+        );
+
+        assert_eq!(
+            residual_gemm_key_for(DType::MQ4G256V2),
+            KernelKey::GemmMq4G256V2Residual
+        );
+        assert_eq!(
+            residual_gemm_key_for(DType::MQ6G256V2),
+            KernelKey::GemmMq6G256V2Residual
+        );
+        assert_ne!(
+            residual_gemm_key_for(DType::MQ4G256V2),
+            KernelKey::GemmHfq4G256Residual
+        );
+        assert_ne!(
+            residual_gemm_key_for(DType::MQ6G256V2),
+            KernelKey::GemmHfq6G256Residual
+        );
+
+        // Grouped-supported lockstep with Path-2 launchers (gfx11+gfx12).
+        assert!(routed_uniform_mqv2_grouped_supported(DType::MQ4G256V2));
+        assert!(routed_uniform_mqv2_grouped_supported(DType::MQ6G256V2));
+        // V1 stays on the codebook/default arms, not the V2 helper.
+        assert!(!routed_uniform_mqv2_grouped_supported(DType::MQ4G256));
+        assert!(!routed_uniform_mqv2_grouped_supported(DType::MQ6G256));
+    }
+
     #[test]
     fn moe_prefill_rejects_nonuniform_expert_projections() {
         let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
@@ -8762,6 +8813,110 @@ mod tests {
         let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
         dtypes.shared_expert_up = DType::MQ6G256;
         assert!(!moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, true, false, false, false
+        ));
+    }
+
+    #[test]
+    fn moe_prefill_rejects_cross_version_shared_gate_mq4_up_mq4v2() {
+        // Fused shared gate+up handles one layout per launch (MQ4 vs MQ4V2
+        // dual-half headers differ → stride/decoder mismatch). Exact equality
+        // required in every fused admission arm (uniform, graded merged,
+        // codebook). Both orderings reject; uniform V2 still admits.
+        for (gate, up) in [
+            (DType::MQ4G256, DType::MQ4G256V2),
+            (DType::MQ4G256V2, DType::MQ4G256),
+        ] {
+            // Uniform arm (no mixed tags, no codebook).
+            let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+            dtypes.shared_expert_gate = gate;
+            dtypes.shared_expert_up = up;
+            assert!(
+                !moe_ffn_batched_admissible_for_dtypes(&dtypes, false, false, false, false),
+                "uniform gate={gate:?} up={up:?} must reject without mq6 gate"
+            );
+            assert!(
+                !moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false, false, false),
+                "uniform gate={gate:?} up={up:?} must reject with mq6 gate"
+            );
+            // Graded merged arm (routed_mixed_merged = true).
+            let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+            dtypes.routed_mixed_merged = true;
+            dtypes.expert_gate_up_uniform = false;
+            dtypes.expert_down_uniform = false;
+            dtypes.shared_expert_gate = gate;
+            dtypes.shared_expert_up = up;
+            assert!(
+                !moe_ffn_batched_admissible_for_dtypes(&dtypes, false, false, false, false),
+                "graded gate={gate:?} up={up:?} must reject"
+            );
+            assert!(
+                !moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false, false, false),
+                "graded gate={gate:?} up={up:?} must reject with mq6"
+            );
+            // Codebook arm (uniform codebook pair admitted via grouped GEMM).
+            let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+            dtypes.expert_gate_up = DType::MQ2G256Lloyd;
+            dtypes.expert_down = DType::MQ3G256Lloyd;
+            dtypes.shared_expert_gate = gate;
+            dtypes.shared_expert_up = up;
+            assert!(
+                !moe_ffn_batched_admissible_for_dtypes(&dtypes, false, false, false, true),
+                "codebook gate={gate:?} up={up:?} must reject"
+            );
+        }
+        // Exact V2 support preserved: uniform MQ4V2 gate/up admits.
+        let dtypes = MoePrefillDtypes::uniform(DType::MQ4G256V2);
+        assert!(moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, false, false, false, false
+        ));
+        assert!(moe_ffn_batched_admissible_for_dtypes(
+            &dtypes, true, false, false, false
+        ));
+    }
+
+    #[test]
+    fn moe_prefill_rejects_cross_version_shared_gate_mq6_up_mq6v2() {
+        // Same exact-equality rule for MQ6 vs MQ6V2 (qt46 vs qt47): different
+        // G256 packing (HFQ6 vs dual-half MQ6V2) → never collapse.
+        for (gate, up) in [
+            (DType::MQ6G256, DType::MQ6G256V2),
+            (DType::MQ6G256V2, DType::MQ6G256),
+        ] {
+            let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+            dtypes.shared_expert_scalar_gate = DType::Q8_0;
+            dtypes.shared_expert_gate = gate;
+            dtypes.shared_expert_up = up;
+            dtypes.shared_expert_down = gate;
+            dtypes.expert_gate_up = gate;
+            dtypes.expert_down = gate;
+            assert!(
+                !moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false, false, false),
+                "mq6 uniform gate={gate:?} up={up:?} must reject"
+            );
+            // Graded merged arm with MQ6 cross-version shared expert.
+            let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+            dtypes.shared_expert_scalar_gate = DType::Q8_0;
+            dtypes.shared_expert_gate = gate;
+            dtypes.shared_expert_up = up;
+            dtypes.shared_expert_down = gate;
+            dtypes.routed_mixed_merged = true;
+            dtypes.expert_gate_up_uniform = false;
+            dtypes.expert_down_uniform = false;
+            assert!(
+                !moe_ffn_batched_admissible_for_dtypes(&dtypes, true, false, false, false),
+                "mq6 graded gate={gate:?} up={up:?} must reject"
+            );
+        }
+        // Exact V2 support preserved: uniform MQ6V2 gate/up admits with mq6 gate.
+        let mut dtypes = MoePrefillDtypes::uniform(DType::MQ4G256);
+        dtypes.shared_expert_scalar_gate = DType::Q8_0;
+        dtypes.shared_expert_gate = DType::MQ6G256V2;
+        dtypes.shared_expert_up = DType::MQ6G256V2;
+        dtypes.shared_expert_down = DType::MQ6G256V2;
+        dtypes.expert_gate_up = DType::MQ6G256V2;
+        dtypes.expert_down = DType::MQ6G256V2;
+        assert!(moe_ffn_batched_admissible_for_dtypes(
             &dtypes, true, false, false, false
         ));
     }

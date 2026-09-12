@@ -32,7 +32,7 @@
 #
 # Format:  <crate>  <status>  <bypass>  <registry>  [note]
 
-hipfire-arch-qwen35        partial   117   189   migrate last; dual system, highest reconciliation cost
+hipfire-arch-qwen35        partial   127   191   migrate last; MTP routed MoE now dispatch-layer owned
 hipfire-arch-deepseek4     debt       19     0   cheapest full conversion; no registry use to reconcile
 hipfire-arch-gemma4        partial    17     4
 hipfire-arch-lfm2moe       debt       17     0   cheapest full conversion; no registry use to reconcile
@@ -41,5 +41,7 @@ hipfire-arch-muse-glimmer  partial    12    17
 hipfire-arch-llama         debt       10     0
 hipfire-arch-dots-ocr      partial     7     4
 hipfire-arch-cohere2moe    debt        6     0
+hipfire-arch-maple         debt        4     0   arch 15; no registry use to reconcile
 hipfire-arch-qwen2         debt        2     0
+hipfire-arch-lfm2-vl       debt        2     0   arch 11; tower/projector GEMMs (gemm_f16_wmma_mb8, gemm_f16)
 hipfire-arch-qwen35-vl     debt        2     0

@@ -29,15 +29,15 @@ use rdna_compute::Gpu;
 /// Env `HIPFIRE_NGRAM_MOD_{N_MATCH,N_MIN,N_MAX}` with production defaults.
 /// `None` when the triple is invalid (max>64, zero match/max, or min>max).
 fn ngram_mod_env_config() -> Option<NgramModConfig> {
-    let n_match: usize = std::env::var("HIPFIRE_NGRAM_MOD_N_MATCH")
+    let n_match: usize = hipfire_config::developer_var("HIPFIRE_NGRAM_MOD_N_MATCH")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(24);
-    let n_min: usize = std::env::var("HIPFIRE_NGRAM_MOD_N_MIN")
+    let n_min: usize = hipfire_config::developer_var("HIPFIRE_NGRAM_MOD_N_MIN")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(48);
-    let n_max: usize = std::env::var("HIPFIRE_NGRAM_MOD_N_MAX")
+    let n_max: usize = hipfire_config::developer_var("HIPFIRE_NGRAM_MOD_N_MAX")
         .ok()
         .and_then(|s| s.parse().ok())
         .unwrap_or(64);
@@ -106,7 +106,11 @@ impl Qwen35MtpDrafter {
     /// Install sampling without changing the independent MTP draft-confidence
     /// cutoff initialized by `MtpSpecState` from its arch/env default.
     fn apply_request(state: &mut MtpSpecState, cfg: SpecRequestConfig) {
-        let top_p = if cfg.top_p > 0.0 { cfg.top_p.min(1.0) } else { 1.0 };
+        let top_p = if cfg.top_p > 0.0 {
+            cfg.top_p.min(1.0)
+        } else {
+            1.0
+        };
         state.set_sampling(
             MtpSamplingConfig {
                 temp: cfg.temp,
@@ -164,14 +168,17 @@ impl Qwen35MtpDrafter {
     /// n-gram-mod without reallocating/destroying warm prefix state.
     fn ensure_state(&mut self, gpu: &mut Gpu, slot: &ModelSlot) -> Result<(), String> {
         if self.state.is_none() {
-            let verify_capacity =
-                if std::env::var("HIPFIRE_MTP_NGRAM").ok().as_deref() == Some("1") {
-                    ngram_mod_env_config()
-                        .map(|cfg| self.max_n.max(cfg.n_max))
-                        .unwrap_or(self.max_n)
-                } else {
-                    self.max_n
-                };
+            let verify_capacity = if hipfire_config::developer_var("HIPFIRE_MTP_NGRAM")
+                .ok()
+                .as_deref()
+                == Some("1")
+            {
+                ngram_mod_env_config()
+                    .map(|cfg| self.max_n.max(cfg.n_max))
+                    .unwrap_or(self.max_n)
+            } else {
+                self.max_n
+            };
             let mut st = MtpSpecState::new_for_slot_with_kv_mode_and_verify_capacity(
                 gpu,
                 slot,
@@ -352,10 +359,7 @@ impl MtpDrafter for Qwen35MtpDrafter {
             self.stats.ngram_mod_drafts += r.drafts_generated;
             self.stats.ngram_mod_accepted += r.accept_count;
             if let Some(pool) = self.ngram_pool.as_mut() {
-                let _ = pool.record_draft_result(
-                    r.drafts_generated as u32,
-                    r.accept_count as u32,
-                );
+                let _ = pool.record_draft_result(r.drafts_generated as u32, r.accept_count as u32);
             }
             if r.accept_count > 0 {
                 self.ngram_retired = true;

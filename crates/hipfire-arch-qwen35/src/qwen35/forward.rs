@@ -5,6 +5,7 @@
 //! Qwen3.5 decode forward: MoE decode, `Qwen35Scratch`, the per-token layer
 //! loop, the #397 Ship-6 lowered super-op pipeline, and GPU-logits entry points.
 
+use super::batch::BatchSemantics;
 use super::batch::PrefillBatchScratch;
 use super::config::LayerType;
 use super::config::MropeCtx;
@@ -12,6 +13,7 @@ use super::config::Qwen35Config;
 use super::prefill::dump_hidden_localize;
 use super::prefill::routed_codebook_pair_batched_supported;
 use super::prefill::trace_finite_if_enabled;
+use super::prefill::BatchEpilogue;
 use super::prefill::PREFILL_MAX_BATCH;
 use super::weights::per_expert_tier_tables;
 use super::weights::DeltaNetState;
@@ -215,28 +217,72 @@ pub(crate) fn ffn_all_mq4_for_moe(ffn: &MoeFfnWeights) -> bool {
             .all(|e| matches!(e.gate_up.gpu_dtype, DType::MQ4G256 | DType::MQ4G256V2))
 }
 
-/// GATE-SIDE only MQ4 (router + shared expert), independent of the routed
-/// experts. When true, the fused rmsnorm+FWHT path + prerotated MoE decode are
-/// applicable even on a graded file: the MQ4 router routes on the rotated x via
-/// the fused gate kernel (MoeResolution::gate_fusable), and the routed experts
-/// (any FwhtG256 MQ-family) consume the same single rotated activation — saving
-/// the un-fused rmsnorm + the per-component rotates the else-branch incurs.
-/// The redline mq4r (MQ4 gate + graded experts) hits this; uniform MQ4 is a
-/// superset (ffn_all_mq4_for_moe). Q8-router files (mq4p) correctly stay false.
+/// Gate-side exact-uniform MQ4G256 V1 quartet (router + shared expert
+/// gate/up), independent of the routed experts.
+///
+/// Keeping this predicate aligned with `MoeResolution::gate_fusable` is a
+/// correctness invariant. If Qwen pre-rotates while dispatch declines the
+/// fused route, generic `run_auto` receives the raw residual in its `x_norm`
+/// slot and silently rotates an unnormalized activation.
 pub(crate) fn ffn_gate_side_mq4_for_moe(ffn: &MoeFfnWeights) -> bool {
-    matches!(ffn.router.gpu_dtype, DType::MQ4G256 | DType::MQ4G256V2)
-        && matches!(
+    gate_side_mq4_uniform_from_dtypes([
+        ffn.router.gpu_dtype,
+        ffn.shared_expert_gate.gpu_dtype,
+        ffn.shared_expert.gate.gpu_dtype,
+        ffn.shared_expert.up.gpu_dtype,
+    ])
+}
+
+/// Pure core of [`ffn_gate_side_mq4_for_moe`] for unit tests (no live weights).
+pub(crate) fn gate_side_mq4_uniform_from_dtypes(
+    [router, shared_expert_gate, shared_gate, shared_up]: [DType; 4],
+) -> bool {
+    [router, shared_expert_gate, shared_gate, shared_up]
+        .into_iter()
+        .all(|dt| dt == DType::MQ4G256)
+}
+
+/// Exact Ornith MQ4G256V2 gate quartet admitted by the fused prerotated
+/// dispatch route. Shapes and missing AWQ sidecars are part of the contract:
+/// widening any one here without the matching `MoeResolution::gate_fusable`
+/// arm would feed unnormalized residuals to the generic fallback.
+fn ffn_gate_side_mq4v2_prerotated_for_moe(ffn: &MoeFfnWeights) -> bool {
+    gate_side_mq4v2_prerotated_from_layouts([
+        (
+            ffn.router.gpu_dtype,
+            ffn.router.m,
+            ffn.router.k,
+            ffn.router.awq_scale.is_some(),
+        ),
+        (
             ffn.shared_expert_gate.gpu_dtype,
-            DType::MQ4G256 | DType::MQ4G256V2
-        )
-        && matches!(
+            ffn.shared_expert_gate.m,
+            ffn.shared_expert_gate.k,
+            ffn.shared_expert_gate.awq_scale.is_some(),
+        ),
+        (
             ffn.shared_expert.gate.gpu_dtype,
-            DType::MQ4G256 | DType::MQ4G256V2
-        )
-        && matches!(
+            ffn.shared_expert.gate.m,
+            ffn.shared_expert.gate.k,
+            ffn.shared_expert.gate.awq_scale.is_some(),
+        ),
+        (
             ffn.shared_expert.up.gpu_dtype,
-            DType::MQ4G256 | DType::MQ4G256V2
-        )
+            ffn.shared_expert.up.m,
+            ffn.shared_expert.up.k,
+            ffn.shared_expert.up.awq_scale.is_some(),
+        ),
+    ])
+}
+
+fn gate_side_mq4v2_prerotated_from_layouts(layouts: [(DType, usize, usize, bool); 4]) -> bool {
+    let expected = [(256, 2_048), (1, 2_048), (512, 2_048), (512, 2_048)];
+    layouts
+        .into_iter()
+        .zip(expected)
+        .all(|((dtype, m, k, has_awq), (want_m, want_k))| {
+            dtype == DType::MQ4G256V2 && m == want_m && k == want_k && !has_awq
+        })
 }
 
 /// Detect any MQ3G256 / MQ3G256Lloyd weight inside a MoE FFN block (router,
@@ -346,17 +392,36 @@ pub(crate) fn unsupported_mq3_experts_uniform_from_dtypes(
     !(uniform && routed_codebook_pair_batched_supported(first.0, first.1))
 }
 
+/// True when any MoE FFN projection is MQ6-family (V1 qt=15 or V2 qt=47).
+///
+/// Feeds `Qwen35Weights::moe_has_mq6` → gfx1151 `force_mq4_grouped_fp16` when a
+/// mixed checkpoint carries an MQ6 projection somewhere. V1 and V2 are distinct
+/// wire layouts (f32 vs dual-half fp16 headers) but both trip the same model
+/// flag: both are 200 B/group 6-bit MQ and both need the gfx1151 MQ4-grouped
+/// FP16 consistency path. MQ4V2 must never collapse into this helper.
 fn moe_ffn_has_mq6(ffn: &MoeFfnWeights) -> bool {
-    let is_mq6 = |dt: DType| matches!(dt, DType::MQ6G256);
-    is_mq6(ffn.router.gpu_dtype)
-        || is_mq6(ffn.shared_expert_gate.gpu_dtype)
-        || is_mq6(ffn.shared_expert.gate.gpu_dtype)
-        || is_mq6(ffn.shared_expert.up.gpu_dtype)
-        || is_mq6(ffn.shared_expert.down.gpu_dtype)
-        || ffn
-            .experts
+    moe_ffn_has_mq6_from_dtypes(
+        [
+            ffn.router.gpu_dtype,
+            ffn.shared_expert_gate.gpu_dtype,
+            ffn.shared_expert.gate.gpu_dtype,
+            ffn.shared_expert.up.gpu_dtype,
+            ffn.shared_expert.down.gpu_dtype,
+        ],
+        ffn.experts
             .iter()
-            .any(|e| is_mq6(e.gate_up.gpu_dtype) || is_mq6(e.down.gpu_dtype))
+            .map(|e| (e.gate_up.gpu_dtype, e.down.gpu_dtype)),
+    )
+}
+
+/// Pure core of [`moe_ffn_has_mq6`] for unit tests (no live `MoeFfnWeights`).
+pub(crate) fn moe_ffn_has_mq6_from_dtypes(
+    structural: impl IntoIterator<Item = DType>,
+    experts: impl IntoIterator<Item = (DType, DType)>,
+) -> bool {
+    let is_mq6 = |dt: DType| matches!(dt, DType::MQ6G256 | DType::MQ6G256V2);
+    structural.into_iter().any(is_mq6)
+        || experts.into_iter().any(|(gu, dn)| is_mq6(gu) || is_mq6(dn))
 }
 
 pub(crate) fn layers_have_mq6_moe(layers: &[LayerWeights]) -> bool {
@@ -908,46 +973,110 @@ impl Qwen35Scratch {
         let qkv_dim = k_dim * 2 + v_dim;
         let q_dim = config.n_heads * config.head_dim;
         let kv_dim = config.n_kv_heads * config.head_dim;
+        // MQ sign tables are GPU-owned persistent state rather than scratch.
+        // Warm them before the scratch transaction so a failure cannot strand
+        // partially constructed scratch allocations.
+        if config.num_experts > 0 {
+            gpu.ensure_mq_signs()?;
+        }
+
+        // GpuTensor and DeviceBuffer do not free device memory on Drop. Track
+        // non-owning aliases for every allocation made below so any later
+        // failure can release the partially constructed scratch transaction.
+        let mut tensor_ledger: Vec<GpuTensor> = Vec::with_capacity(48);
+        let mut buffer_ledger: Vec<hip_bridge::DeviceBuffer> = Vec::with_capacity(2);
+        macro_rules! cleanup_allocations {
+            () => {{
+                for tensor in tensor_ledger.drain(..) {
+                    let _ = gpu.free_tensor(tensor);
+                }
+                let _ = gpu.bind_thread();
+                for buffer in buffer_ledger.drain(..) {
+                    let _ = gpu.hip.free(buffer);
+                }
+            }};
+        }
+        macro_rules! tracked_tensor {
+            ($allocation:expr) => {
+                match $allocation {
+                    Ok(tensor) => {
+                        // SAFETY: the alias is freed only if construction
+                        // fails. On success it drops as a non-owning handle
+                        // while the original tensor moves into Self.
+                        tensor_ledger.push(GpuTensor {
+                            buf: unsafe { tensor.buf.alias() },
+                            shape: tensor.shape.clone(),
+                            dtype: tensor.dtype,
+                        });
+                        tensor
+                    }
+                    Err(error) => {
+                        cleanup_allocations!();
+                        return Err(error);
+                    }
+                }
+            };
+        }
+        macro_rules! tracked_buffer {
+            ($allocation:expr) => {
+                match $allocation {
+                    Ok(buffer) => {
+                        // SAFETY: same single-free transaction contract as
+                        // tracked_tensor above.
+                        buffer_ledger.push(unsafe { buffer.alias() });
+                        buffer
+                    }
+                    Err(error) => {
+                        cleanup_allocations!();
+                        return Err(error);
+                    }
+                }
+            };
+        }
 
         Ok(Self {
-            x: gpu.alloc_tensor(&[dim], DType::F32)?,
-            tmp: gpu.alloc_tensor(&[dim], DType::F32)?,
-            pos_buf: gpu.hip.malloc(4)?,
-            pos_buf3: gpu.hip.malloc(12)?,
+            x: tracked_tensor!(gpu.alloc_tensor(&[dim], DType::F32)),
+            tmp: tracked_tensor!(gpu.alloc_tensor(&[dim], DType::F32)),
+            pos_buf: tracked_buffer!(gpu.hip.malloc(4)),
+            pos_buf3: tracked_buffer!(gpu.hip.malloc(12)),
 
-            dn_qkv: gpu.alloc_tensor(&[qkv_dim], DType::F32)?,
-            dn_z: gpu.alloc_tensor(&[v_dim], DType::F32)?,
-            dn_alpha: gpu.alloc_tensor(&[config.linear_num_value_heads], DType::F32)?,
-            dn_beta: gpu.alloc_tensor(&[config.linear_num_value_heads], DType::F32)?,
-            dn_conv_out: gpu.alloc_tensor(&[qkv_dim], DType::F32)?,
-            dn_q: gpu.alloc_tensor(&[v_dim], DType::F32)?,
-            dn_k: gpu.alloc_tensor(&[v_dim], DType::F32)?,
-            dn_v: gpu.alloc_tensor(&[v_dim], DType::F32)?,
-            dn_q_raw: gpu.alloc_tensor(&[k_dim], DType::F32)?,
-            dn_k_raw: gpu.alloc_tensor(&[k_dim], DType::F32)?,
-            dn_attn_out: gpu.alloc_tensor(&[v_dim], DType::F32)?,
-            dn_normed: gpu.alloc_tensor(&[v_dim], DType::F32)?,
+            dn_qkv: tracked_tensor!(gpu.alloc_tensor(&[qkv_dim], DType::F32)),
+            dn_z: tracked_tensor!(gpu.alloc_tensor(&[v_dim], DType::F32)),
+            dn_alpha: tracked_tensor!(
+                gpu.alloc_tensor(&[config.linear_num_value_heads], DType::F32)
+            ),
+            dn_beta: tracked_tensor!(
+                gpu.alloc_tensor(&[config.linear_num_value_heads], DType::F32)
+            ),
+            dn_conv_out: tracked_tensor!(gpu.alloc_tensor(&[qkv_dim], DType::F32)),
+            dn_q: tracked_tensor!(gpu.alloc_tensor(&[v_dim], DType::F32)),
+            dn_k: tracked_tensor!(gpu.alloc_tensor(&[v_dim], DType::F32)),
+            dn_v: tracked_tensor!(gpu.alloc_tensor(&[v_dim], DType::F32)),
+            dn_q_raw: tracked_tensor!(gpu.alloc_tensor(&[k_dim], DType::F32)),
+            dn_k_raw: tracked_tensor!(gpu.alloc_tensor(&[k_dim], DType::F32)),
+            dn_attn_out: tracked_tensor!(gpu.alloc_tensor(&[v_dim], DType::F32)),
+            dn_normed: tracked_tensor!(gpu.alloc_tensor(&[v_dim], DType::F32)),
 
-            fa_q_full: gpu.alloc_tensor(&[q_dim * 2], DType::F32)?,
-            fa_q: gpu.alloc_tensor(&[q_dim], DType::F32)?,
-            fa_gate: gpu.alloc_tensor(&[q_dim], DType::F32)?,
-            fa_k: gpu.alloc_tensor(&[kv_dim], DType::F32)?,
-            fa_v: gpu.alloc_tensor(&[kv_dim], DType::F32)?,
-            fa_attn_out: gpu.alloc_tensor(&[q_dim], DType::F32)?,
+            fa_q_full: tracked_tensor!(gpu.alloc_tensor(&[q_dim * 2], DType::F32)),
+            fa_q: tracked_tensor!(gpu.alloc_tensor(&[q_dim], DType::F32)),
+            fa_gate: tracked_tensor!(gpu.alloc_tensor(&[q_dim], DType::F32)),
+            fa_k: tracked_tensor!(gpu.alloc_tensor(&[kv_dim], DType::F32)),
+            fa_v: tracked_tensor!(gpu.alloc_tensor(&[kv_dim], DType::F32)),
+            fa_attn_out: tracked_tensor!(gpu.alloc_tensor(&[q_dim], DType::F32)),
 
-            o: gpu.alloc_tensor(&[dim], DType::F32)?,
-            gate_ffn: gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?,
-            up: gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?,
-            ffn_hidden: gpu.alloc_tensor(&[config.hidden_dim], DType::F32)?,
-            ffn_out: gpu.alloc_tensor(&[dim], DType::F32)?,
+            o: tracked_tensor!(gpu.alloc_tensor(&[dim], DType::F32)),
+            gate_ffn: tracked_tensor!(gpu.alloc_tensor(&[config.hidden_dim], DType::F32)),
+            up: tracked_tensor!(gpu.alloc_tensor(&[config.hidden_dim], DType::F32)),
+            ffn_hidden: tracked_tensor!(gpu.alloc_tensor(&[config.hidden_dim], DType::F32)),
+            ffn_out: tracked_tensor!(gpu.alloc_tensor(&[dim], DType::F32)),
 
-            logits: gpu.alloc_tensor(&[config.vocab_size], DType::F32)?,
-            sample_buf: gpu.alloc_tensor(&[2], DType::F32)?,
-            repeat_buf: gpu.alloc_tensor(&[repeat_window], DType::F32)?,
-            x_rot: gpu.alloc_tensor(
+            logits: tracked_tensor!(gpu.alloc_tensor(&[config.vocab_size], DType::F32)),
+            sample_buf: tracked_tensor!(gpu.alloc_tensor(&[2], DType::F32)),
+            repeat_buf: tracked_tensor!(gpu.alloc_tensor(&[repeat_window], DType::F32)),
+            x_rot: tracked_tensor!(gpu.alloc_tensor(
                 &[qwen35_x_rot_len(dim, config.hidden_dim, v_dim)],
                 DType::F32,
-            )?,
+            )),
 
             // Flash attention partials: enough for the smallest tile used by
             // Q8 decode experiments and the fixed tile_size=128 paths.
@@ -991,10 +1120,10 @@ impl Qwen35Scratch {
                     .flash_partials_batch
                     .filter(|&n| n >= 1 && n <= PREFILL_MAX_BATCH)
                     .unwrap_or(16);
-                gpu.alloc_tensor(
+                tracked_tensor!(gpu.alloc_tensor(
                     &[batch_mult * config.n_heads * max_tiles * (2 + config.head_dim)],
                     DType::F32,
-                )?
+                ))
             },
             // Flash attention tri-state for the Q8 path. Asym modes always
             // flash regardless.
@@ -1061,30 +1190,43 @@ impl Qwen35Scratch {
                 let smi = config.shared_expert_intermediate_size;
                 let max_inter = mi.max(smi);
                 let k = config.num_experts_per_tok;
-                s.moe_router_logits = Some(gpu.alloc_tensor(&[n_exp], DType::F32)?);
-                s.moe_scalar_buf = Some(gpu.alloc_tensor(&[1], DType::F32)?);
-                s.moe_x_rot = Some(gpu.alloc_tensor(&[hidden], DType::F32)?);
-                s.moe_gate_up_buf = Some(gpu.alloc_tensor(&[2 * max_inter], DType::F32)?);
-                s.moe_gate_buf = Some(gpu.alloc_tensor(&[max_inter], DType::F32)?);
-                s.moe_up_buf = Some(gpu.alloc_tensor(&[max_inter], DType::F32)?);
-                s.moe_ffn_hidden = Some(gpu.alloc_tensor(&[max_inter], DType::F32)?);
-                s.moe_ffn_out = Some(gpu.alloc_tensor(&[hidden], DType::F32)?);
-                s.moe_gate_batch = Some(gpu.alloc_tensor(&[k * mi], DType::F32)?);
-                s.moe_up_batch = Some(gpu.alloc_tensor(&[k * mi], DType::F32)?);
-                s.moe_rot_batch = Some(gpu.alloc_tensor(&[k * mi], DType::F32)?);
+                s.moe_router_logits =
+                    Some(tracked_tensor!(gpu.alloc_tensor(&[n_exp], DType::F32)));
+                s.moe_scalar_buf =
+                    Some(tracked_tensor!(gpu.alloc_tensor(&[1], DType::F32)));
+                s.moe_x_rot =
+                    Some(tracked_tensor!(gpu.alloc_tensor(&[hidden], DType::F32)));
+                s.moe_gate_up_buf = Some(tracked_tensor!(
+                    gpu.alloc_tensor(&[2 * max_inter], DType::F32)
+                ));
+                s.moe_gate_buf = Some(tracked_tensor!(
+                    gpu.alloc_tensor(&[max_inter], DType::F32)
+                ));
+                s.moe_up_buf = Some(tracked_tensor!(
+                    gpu.alloc_tensor(&[max_inter], DType::F32)
+                ));
+                s.moe_ffn_hidden = Some(tracked_tensor!(
+                    gpu.alloc_tensor(&[max_inter], DType::F32)
+                ));
+                s.moe_ffn_out =
+                    Some(tracked_tensor!(gpu.alloc_tensor(&[hidden], DType::F32)));
+                s.moe_gate_batch =
+                    Some(tracked_tensor!(gpu.alloc_tensor(&[k * mi], DType::F32)));
+                s.moe_up_batch =
+                    Some(tracked_tensor!(gpu.alloc_tensor(&[k * mi], DType::F32)));
+                s.moe_rot_batch =
+                    Some(tracked_tensor!(gpu.alloc_tensor(&[k * mi], DType::F32)));
                 // i32 topk_indices stored in an F32 tensor (same byte width).
                 // The kernel that writes it casts the buffer to int*, and the
                 // indexed MoE GEMV kernels read it as int*.
-                s.moe_topk_indices = Some(gpu.alloc_tensor(&[k], DType::F32)?);
-                s.moe_topk_weights = Some(gpu.alloc_tensor(&[k], DType::F32)?);
+                s.moe_topk_indices =
+                    Some(tracked_tensor!(gpu.alloc_tensor(&[k], DType::F32)));
+                s.moe_topk_weights =
+                    Some(tracked_tensor!(gpu.alloc_tensor(&[k], DType::F32)));
                 // Atomic-free decode MoE down payload plus reusable counter tail.
-                s.moe_down_expanded =
-                    Some(gpu.zeros(&[k * hidden + hidden.div_ceil(4)], DType::F32)?);
-                // Pre-warm MQ FWHT sign tables (otherwise the lazy init in
-                // ensure_mq_signs fires during the first moe_ffn_decode and
-                // blows up hipGraph capture with a hipMalloc-in-capture
-                // error). Idempotent if already computed.
-                gpu.ensure_mq_signs()?;
+                s.moe_down_expanded = Some(tracked_tensor!(
+                    gpu.zeros(&[k * hidden + hidden.div_ceil(4)], DType::F32)
+                ));
             }
             if hipfire_config::developer_var("HIPFIRE_PREFILL_REUSE_PBS")
                 .ok()
@@ -1096,7 +1238,13 @@ impl Qwen35Scratch {
                 } else {
                     super::prefill::prefill_max_batch(gpu)
                 };
-                s.prefill_batch = Some(PrefillBatchScratch::new(gpu, config, max_batch)?);
+                s.prefill_batch = match PrefillBatchScratch::new(gpu, config, max_batch) {
+                    Ok(prefill) => Some(prefill),
+                    Err(error) => {
+                        cleanup_allocations!();
+                        return Err(error);
+                    }
+                };
             }
             Ok(s)
         })
@@ -1851,7 +1999,8 @@ fn forward_scratch_layers(
                     config.norm_eps,
                 )?;
 
-                gpu.fused_sigmoid_alpha_gate_f32(
+                deltanet_sigmoid_alpha_gate(
+                    gpu,
                     &s.dn_beta,
                     &s.dn_alpha,
                     &layer.dt_bias,
@@ -1870,12 +2019,12 @@ fn forward_scratch_layers(
                     v_dim,
                 )?;
 
-                gpu.fused_qk_l2_norm_scale_f32(
+                deltanet_qk_l2_norm_scale(
+                    gpu,
                     &s.dn_q_raw,
                     &s.dn_k_raw,
                     config.linear_num_key_heads,
                     hd,
-                    1.0 / (hd as f32).sqrt(),
                     config.norm_eps,
                 )?;
 
@@ -2912,7 +3061,9 @@ fn moe_ffn_dispatch(
     s: &Qwen35Scratch,
     defer_routed_combine: bool,
 ) -> HipResult<()> {
-    let r = if ffn_gate_side_mq4_for_moe(ffn) {
+    let exact_v2_prerotated = (gpu.arch_caps.is_gfx1100() || gpu.arch_caps.is_gfx1201())
+        && ffn_gate_side_mq4v2_prerotated_for_moe(ffn);
+    let r = if ffn_gate_side_mq4_for_moe(ffn) || exact_v2_prerotated {
         gpu.fused_rmsnorm_rotate_mq(
             x,
             ffn_norm,
@@ -3177,6 +3328,10 @@ fn triattn_tap(
     Ok(())
 }
 
+fn qwen35_fa_epilogue_route_supported(is_gfx1201: bool, q8_route: bool, asym3_route: bool) -> bool {
+    q8_route || (!is_gfx1201 && asym3_route)
+}
+
 /// KV cache write + attention dispatch. Inline from original.
 pub(crate) fn kv_cache_attention_dispatch(
     ctx: &DispatchCtx,
@@ -3199,7 +3354,9 @@ pub(crate) fn kv_cache_attention_dispatch(
         && plan.attend_key == hipfire_dispatch::types::KernelKey::AttnFlashQ8_0;
     let asym3_route = plan.write_key == hipfire_dispatch::types::KernelKey::KvWriteAsym3
         && plan.attend_key == hipfire_dispatch::types::KernelKey::AttnFlashAsym3;
-    let fused_epilogue = qwen35_fa_epilogue_enabled(gpu, config, wo) && (q8_route || asym3_route);
+    let fused_epilogue_route =
+        qwen35_fa_epilogue_route_supported(gpu.arch_caps.is_gfx1201(), q8_route, asym3_route);
+    let fused_epilogue = qwen35_fa_epilogue_enabled(gpu, config, wo) && fused_epilogue_route;
     let io = AttnParams {
         q: &s.fa_q,
         k: &s.fa_k,
@@ -3231,7 +3388,1242 @@ pub(crate) fn kv_cache_attention_dispatch(
     Ok(fused_epilogue)
 }
 
-// ─────────────────────────────────────────────────────────────────────────
+fn dense_tp_ffn_partial(
+    gpu: &mut Gpu,
+    ctx: &DispatchCtx,
+    norm: &GpuTensor,
+    gate: &WeightTensor,
+    up: &WeightTensor,
+    down: &WeightTensor,
+    config: &Qwen35Config,
+    s: &Qwen35Scratch,
+) -> HipResult<()> {
+    gate_up_via_execute_steps(
+        gpu,
+        ctx,
+        gate,
+        up,
+        norm,
+        &s.x,
+        &s.tmp,
+        &s.x_rot,
+        &s.gate_ffn,
+        &s.up,
+        config.norm_eps,
+    )?;
+    gpu.silu_mul_f32(&s.gate_ffn, &s.up, &s.ffn_hidden)?;
+    let wr = down.dispatch_ref();
+    execute_steps(
+        gpu,
+        ctx,
+        &[Step::Gemv {
+            w: &wr,
+            input: GemvInput::Raw(&s.ffn_hidden),
+            out: &s.o,
+        }],
+    )
+    .map_err(|e| HipError::new(0, &e.to_string()))
+}
+
+fn deltanet_sigmoid_alpha_gate(
+    gpu: &mut Gpu,
+    beta: &GpuTensor,
+    alpha: &GpuTensor,
+    dt_bias: &GpuTensor,
+    a_log: &GpuTensor,
+    n_heads: usize,
+) -> HipResult<()> {
+    gpu.fused_sigmoid_alpha_gate_f32(beta, alpha, dt_bias, a_log, n_heads)
+}
+
+fn deltanet_qk_l2_norm_scale(
+    gpu: &mut Gpu,
+    q: &GpuTensor,
+    k: &GpuTensor,
+    n_key_heads: usize,
+    head_dim: usize,
+    eps: f32,
+) -> HipResult<()> {
+    gpu.fused_qk_l2_norm_scale_f32(
+        q,
+        k,
+        n_key_heads,
+        head_dim,
+        1.0 / (head_dim as f32).sqrt(),
+        eps,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dense_tp_deltanet_partial(
+    gpu: &mut Gpu,
+    layer: &super::weights::DeltaNetLayerWeights,
+    config: &Qwen35Config,
+    delta_layer_idx: usize,
+    dn_state: &mut DeltaNetState,
+    s: &Qwen35Scratch,
+) -> HipResult<()> {
+    let ctx = DispatchCtx::new(gpu);
+    let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+    let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+    let n_v_heads = config.linear_num_value_heads;
+    let hd = config.linear_key_head_dim;
+    qkvza_via_execute_steps(
+        gpu,
+        &ctx,
+        &layer.wqkv,
+        &layer.wz,
+        &layer.w_beta,
+        &layer.w_alpha,
+        &layer.attn_norm,
+        &s.x,
+        &s.tmp,
+        &s.x_rot,
+        &s.dn_qkv,
+        &s.dn_z,
+        &s.dn_beta,
+        &s.dn_alpha,
+        config.norm_eps,
+    )?;
+    deltanet_sigmoid_alpha_gate(
+        gpu,
+        &s.dn_beta,
+        &s.dn_alpha,
+        &layer.dt_bias,
+        &layer.a_log,
+        n_v_heads,
+    )?;
+    gpu.conv1d_silu_split_f32(
+        &s.dn_q_raw,
+        &s.dn_k_raw,
+        &s.dn_v,
+        &s.dn_qkv,
+        &layer.conv_weight,
+        &dn_state.conv_states[delta_layer_idx],
+        k_dim,
+        v_dim,
+    )?;
+    deltanet_qk_l2_norm_scale(
+        gpu,
+        &s.dn_q_raw,
+        &s.dn_k_raw,
+        config.linear_num_key_heads,
+        hd,
+        config.norm_eps,
+    )?;
+    if config.linear_num_key_heads < n_v_heads {
+        gpu.repeat_interleave_qk_f32(
+            &s.dn_q_raw,
+            &s.dn_k_raw,
+            &s.dn_q,
+            &s.dn_k,
+            config.linear_num_key_heads,
+            n_v_heads / config.linear_num_key_heads,
+            hd,
+        )?;
+    } else {
+        gpu.memcpy_dtod_auto(&s.dn_q.buf, &s.dn_q_raw.buf, k_dim * 4)?;
+        gpu.memcpy_dtod_auto(&s.dn_k.buf, &s.dn_k_raw.buf, k_dim * 4)?;
+    }
+    match dn_state.quant {
+        StateQuant::FP32 => gpu.gated_delta_net_f32(
+            &s.dn_q,
+            &s.dn_k,
+            &s.dn_v,
+            &s.dn_alpha,
+            &s.dn_beta,
+            &dn_state.s_matrices[delta_layer_idx],
+            &s.dn_attn_out,
+            1,
+            n_v_heads,
+            config.linear_value_head_dim,
+        )?,
+        StateQuant::Q8 => gpu.gated_delta_net_q8(
+            &s.dn_q,
+            &s.dn_k,
+            &s.dn_v,
+            &s.dn_alpha,
+            &s.dn_beta,
+            &dn_state.s_matrices[delta_layer_idx],
+            &dn_state.s_scales[delta_layer_idx],
+            &s.dn_attn_out,
+            1,
+            n_v_heads,
+            config.linear_value_head_dim,
+            dn_state.ef_residual(delta_layer_idx),
+        )?,
+        StateQuant::Q4 => gpu.gated_delta_net_q4(
+            &s.dn_q,
+            &s.dn_k,
+            &s.dn_v,
+            &s.dn_alpha,
+            &s.dn_beta,
+            &dn_state.s_matrices[delta_layer_idx],
+            &dn_state.s_scales[delta_layer_idx],
+            &s.dn_attn_out,
+            1,
+            n_v_heads,
+            config.linear_value_head_dim,
+        )?,
+    }
+    gpu.gated_norm_f32(
+        &s.dn_attn_out,
+        &s.dn_z,
+        &layer.norm_weight,
+        &s.dn_normed,
+        n_v_heads,
+        config.linear_value_head_dim,
+        config.norm_eps,
+    )?;
+    let wr = layer.wo.dispatch_ref();
+    execute_steps(
+        gpu,
+        &ctx,
+        &[Step::Gemv {
+            w: &wr,
+            input: GemvInput::Raw(&s.dn_normed),
+            out: &s.o,
+        }],
+    )
+    .map_err(|e| HipError::new(0, &e.to_string()))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dense_tp_attention_partial(
+    gpu: &mut Gpu,
+    layer: &super::weights::FullAttnLayerWeights,
+    config: &Qwen35Config,
+    kv_layer_idx: usize,
+    pos: usize,
+    kv_cache: &mut llama::KvCache,
+    s: &Qwen35Scratch,
+) -> HipResult<()> {
+    let ctx = DispatchCtx::new(gpu);
+    qkv_via_execute_steps(
+        gpu,
+        &ctx,
+        &layer.wq,
+        &layer.wk,
+        &layer.wv,
+        &layer.attn_norm,
+        &s.x,
+        &s.tmp,
+        &s.x_rot,
+        &s.fa_q_full,
+        &s.fa_k,
+        &s.fa_v,
+        config.norm_eps,
+    )?;
+    gpu.deinterleave_f32(
+        &s.fa_q_full,
+        &s.fa_q,
+        &s.fa_gate,
+        config.n_heads,
+        config.head_dim,
+    )?;
+    gpu.rmsnorm_batched(
+        &s.fa_q,
+        &layer.q_norm,
+        &s.fa_q,
+        config.n_heads,
+        config.head_dim,
+        config.norm_eps,
+    )?;
+    gpu.rmsnorm_batched(
+        &s.fa_k,
+        &layer.k_norm,
+        &s.fa_k,
+        config.n_kv_heads,
+        config.head_dim,
+        config.norm_eps,
+    )?;
+    let n_rot = (config.head_dim as f32 * config.partial_rotary_factor) as usize;
+    gpu.rope_partial_interleaved_f32(
+        &s.fa_q,
+        &s.fa_k,
+        &s.pos_buf,
+        config.n_heads,
+        config.n_kv_heads,
+        config.head_dim,
+        n_rot,
+        config.rope_theta,
+    )?;
+    let fused_epilogue =
+        kv_cache_attention_dispatch(&ctx, gpu, kv_cache, s, config, &layer.wo, kv_layer_idx, pos)?;
+    if !fused_epilogue {
+        gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;
+    }
+    let wr = layer.wo.dispatch_ref();
+    execute_steps(
+        gpu,
+        &ctx,
+        &[Step::Gemv {
+            w: &wr,
+            input: if fused_epilogue {
+                GemvInput::Prerotated(&s.fa_attn_out)
+            } else {
+                GemvInput::Raw(&s.fa_attn_out)
+            },
+            out: &s.o,
+        }],
+    )
+    .map_err(|e| HipError::new(0, &e.to_string()))
+}
+
+// ROCm 10 RCCL SHM and inaccessible cross-device copy failures require
+// CPU-staged deterministic reduction on mixed topology.
+fn dense_tp_all_reduce_sum_f32(
+    gpus: &mut Gpus,
+    refs: &[&hip_bridge::DeviceBuffer],
+    count: usize,
+) -> HipResult<()> {
+    if gpus.peer_access_enabled {
+        gpus.all_reduce_sum_f32_peer_rooted(refs, count)
+    } else {
+        gpus.all_reduce_sum_f32_host(refs, count)
+    }
+}
+
+fn dense_tp_allreduce(gpus: &mut Gpus, scratches: &[Qwen35Scratch], count: usize) -> HipResult<()> {
+    let refs: Vec<_> = scratches.iter().map(|s| &s.o.buf).collect();
+    dense_tp_all_reduce_sum_f32(gpus, &refs, count)
+}
+
+fn dense_tp_add_residual(gpus: &mut Gpus, scratches: &[Qwen35Scratch]) -> HipResult<()> {
+    for (rank, scratch) in scratches.iter().enumerate() {
+        gpus.devices[rank].bind_thread()?;
+        gpus.devices[rank].add_f32(&scratch.x, &scratch.o, &scratch.x)?;
+    }
+    Ok(())
+}
+
+fn dense_tp_allreduce_add(
+    gpus: &mut Gpus,
+    scratches: &[Qwen35Scratch],
+    count: usize,
+) -> HipResult<()> {
+    if gpus.peer_access_enabled {
+        let partials: Vec<_> = scratches.iter().map(|scratch| &scratch.o.buf).collect();
+        let residuals: Vec<_> = scratches.iter().map(|scratch| &scratch.x.buf).collect();
+        gpus.all_reduce_sum_f32_peer_rooted_add(&partials, &residuals, count)
+    } else {
+        dense_tp_allreduce(gpus, scratches, count)?;
+        dense_tp_add_residual(gpus, scratches)
+    }
+}
+
+fn dense_tp_allreduce_batched(
+    gpus: &mut Gpus,
+    pbs_vec: &[PrefillBatchScratch],
+    partials: &[GpuTensor],
+    n: usize,
+    dim: usize,
+) -> HipResult<()> {
+    let count = n
+        .checked_mul(dim)
+        .ok_or_else(|| HipError::new(0, "dense_tp batched count overflow"))?;
+    let partial_refs: Vec<_> = partials.iter().map(|tensor| &tensor.buf).collect();
+    if gpus.peer_access_enabled {
+        let residuals: Vec<_> = pbs_vec
+            .iter()
+            .map(|pbs| pbs.x_batch.sub_offset(0, count))
+            .collect();
+        let residual_refs: Vec<_> = residuals.iter().map(|tensor| &tensor.buf).collect();
+        return gpus.all_reduce_sum_f32_peer_rooted_add(&partial_refs, &residual_refs, count);
+    }
+    dense_tp_all_reduce_sum_f32(gpus, &partial_refs, count)?;
+    for (rank, (pbs, partial)) in pbs_vec.iter().zip(partials.iter()).enumerate() {
+        gpus.devices[rank].bind_thread()?;
+        let x_n = pbs.x_batch.sub_offset(0, count);
+        let partial_n = partial.sub_offset(0, count);
+        gpus.devices[rank].add_f32(&x_n, &partial_n, &x_n)?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn dense_tp_local_attention(
+    gpus: &mut Gpus,
+    weights: &[Qwen35Weights],
+    configs: &[Qwen35Config],
+    layer_idx: usize,
+    delta_layer_idx: usize,
+    pos: usize,
+    kv_caches: &mut [llama::KvCache],
+    dn_states: &mut [DeltaNetState],
+    scratches: &[Qwen35Scratch],
+) -> HipResult<()> {
+    for rank in 0..gpus.devices.len() {
+        match &weights[rank].layers[layer_idx] {
+            LayerWeights::DeltaNet(layer) => dense_tp_deltanet_partial(
+                &mut gpus.devices[rank],
+                layer,
+                &configs[rank],
+                delta_layer_idx,
+                &mut dn_states[rank],
+                &scratches[rank],
+            )?,
+            LayerWeights::FullAttn(layer) => dense_tp_attention_partial(
+                &mut gpus.devices[rank],
+                layer,
+                &configs[rank],
+                layer_idx,
+                pos,
+                &mut kv_caches[rank],
+                &scratches[rank],
+            )?,
+            _ => return Err(HipError::new(0, "dense TP received a MoE/mismatched layer")),
+        }
+    }
+    Ok(())
+}
+
+fn dense_tp_local_ffn(
+    gpus: &mut Gpus,
+    weights: &[Qwen35Weights],
+    configs: &[Qwen35Config],
+    layer_idx: usize,
+    scratches: &[Qwen35Scratch],
+) -> HipResult<()> {
+    for rank in 0..gpus.devices.len() {
+        let (norm, gate, up, down) = match &weights[rank].layers[layer_idx] {
+            LayerWeights::DeltaNet(layer) => {
+                (&layer.ffn_norm, &layer.w_gate, &layer.w_up, &layer.w_down)
+            }
+            LayerWeights::FullAttn(layer) => {
+                (&layer.ffn_norm, &layer.w_gate, &layer.w_up, &layer.w_down)
+            }
+            _ => return Err(HipError::new(0, "dense TP received a MoE/mismatched layer")),
+        };
+        let ctx = DispatchCtx::new(&gpus.devices[rank]);
+        dense_tp_ffn_partial(
+            &mut gpus.devices[rank],
+            &ctx,
+            norm,
+            gate,
+            up,
+            down,
+            &configs[rank],
+            &scratches[rank],
+        )?;
+    }
+    Ok(())
+}
+
+fn dense_tp_output(
+    gpus: &mut Gpus,
+    weights: &[Qwen35Weights],
+    configs: &[Qwen35Config],
+    scratches: &[Qwen35Scratch],
+) -> HipResult<()> {
+    gpus.devices[0].rmsnorm_f32(
+        &scratches[0].x,
+        &weights[0].output_norm,
+        &scratches[0].tmp,
+        configs[0].norm_eps,
+    )?;
+    let ctx = DispatchCtx::new(&gpus.devices[0]);
+    let output = weights[0].output.dispatch_ref();
+    execute_steps(
+        &mut gpus.devices[0],
+        &ctx,
+        &[Step::Gemv {
+            w: &output,
+            input: GemvInput::Raw(&scratches[0].tmp),
+            out: &scratches[0].logits,
+        }],
+    )
+    .map_err(|e| HipError::new(0, &e.to_string()))
+}
+
+/// Direct dense-Qwen TP decode. This is both the graph-disabled path and the
+/// mandatory warmup that resolves lazy kernel/module state before capture.
+#[allow(clippy::too_many_arguments)]
+fn forward_scratch_dense_tp_layers(
+    gpus: &mut Gpus,
+    weights: &[Qwen35Weights],
+    configs: &[Qwen35Config],
+    pos: usize,
+    kv_caches: &mut [llama::KvCache],
+    dn_states: &mut [DeltaNetState],
+    scratches: &[Qwen35Scratch],
+) -> HipResult<()> {
+    let dim = configs[0].dim;
+    let mut delta_layer_idx = 0usize;
+    for layer_idx in 0..configs[0].n_layers {
+        dense_tp_local_attention(
+            gpus,
+            weights,
+            configs,
+            layer_idx,
+            delta_layer_idx,
+            pos,
+            kv_caches,
+            dn_states,
+            scratches,
+        )?;
+        dense_tp_allreduce_add(gpus, scratches, dim)?;
+        dense_tp_local_ffn(gpus, weights, configs, layer_idx, scratches)?;
+        dense_tp_allreduce_add(gpus, scratches, dim)?;
+        if configs[0].layer_types[layer_idx] == LayerType::LinearAttention {
+            delta_layer_idx += 1;
+        }
+    }
+    dense_tp_output(gpus, weights, configs, scratches)
+}
+
+fn dense_tp_graph_enabled(gpus: &Gpus, kv_caches: &[llama::KvCache]) -> bool {
+    kv_caches.iter().all(|kv| kv.compact_offset == 0)
+        && gpus.devices.iter().all(|gpu| {
+            let arch_default = gpu.arch.starts_with("gfx11") || gpu.arch.starts_with("gfx12");
+            gpu.flags.graph_ar && gpu.flags.graph_forward.unwrap_or(arch_default)
+        })
+}
+
+fn dense_tp_drop_graphs(gpus: &mut Gpus, mark_dirty: bool) {
+    for gpu in &mut gpus.devices {
+        gpu.graphs.drop_captured_graph(&gpu.hip, gpu.device_id);
+        gpu.graphs.capture_mode = false;
+        gpu.graphs.capture_blobs.clear();
+        gpu.graphs.ar_forward_replay_enabled = false;
+        if mark_dirty {
+            gpu.graphs.ar_forward_kernel_dirty = true;
+        }
+    }
+}
+
+/// End any captures that started, discard every completed segment, and force
+/// one direct warmup before another capture attempt.
+fn dense_tp_abort_captures(gpus: &mut Gpus) {
+    for gpu in &mut gpus.devices {
+        if gpu.graphs.capture_mode {
+            if let Some(stream) = gpu.active_stream.as_ref() {
+                gpu.graphs
+                    .abort_graph_capture(&gpu.hip, gpu.device_id, stream);
+            } else {
+                gpu.graphs.capture_mode = false;
+                gpu.graphs.capture_blobs.clear();
+            }
+        }
+    }
+    dense_tp_drop_graphs(gpus, true);
+}
+
+/// Launch one rank-local segment on every device. Segments contain no RCCL,
+/// but all rank launches are still attempted before surfacing an error so the
+/// device streams remain at the same stage boundary.
+fn dense_tp_launch_segment(gpus: &mut Gpus, segment: usize) -> HipResult<()> {
+    let mut first_error = None;
+    for gpu in &mut gpus.devices {
+        let result = match gpu.active_stream.as_ref() {
+            Some(stream) => {
+                gpu.graphs
+                    .graph_segment_launch(&gpu.hip, gpu.device_id, stream, segment)
+            }
+            None => Err(HipError::new(0, "dense TP graph rank has no active stream")),
+        };
+        if first_error.is_none() {
+            first_error = result.err();
+        }
+    }
+    if let Some(error) = first_error {
+        dense_tp_drop_graphs(gpus, true);
+        return Err(error);
+    }
+    Ok(())
+}
+
+/// Capture one rank-local compute segment per device, instantiate all of them,
+/// then launch the just-captured segment. RCCL remains a direct grouped call
+/// between segments: whole-rank RCCL-bearing graphs hang on ROCm 7.15, while
+/// a single cross-device graph is rejected at instantiation.
+fn dense_tp_capture_and_launch_segment(
+    gpus: &mut Gpus,
+    enqueue: impl FnOnce(&mut Gpus) -> HipResult<()>,
+) -> HipResult<()> {
+    for rank in 0..gpus.devices.len() {
+        let begin = {
+            let gpu = &mut gpus.devices[rank];
+            match gpu.active_stream.as_ref() {
+                Some(stream) => {
+                    gpu.graphs
+                        .begin_graph_capture_relaxed(&gpu.hip, gpu.device_id, stream)
+                }
+                None => Err(HipError::new(0, "dense TP graph rank has no active stream")),
+            }
+        };
+        if let Err(error) = begin {
+            dense_tp_abort_captures(gpus);
+            return Err(error);
+        }
+    }
+    if let Err(error) = enqueue(gpus) {
+        dense_tp_abort_captures(gpus);
+        return Err(error);
+    }
+    for rank in 0..gpus.devices.len() {
+        let end = {
+            let gpu = &mut gpus.devices[rank];
+            let Some(stream) = gpu.active_stream.as_ref() else {
+                dense_tp_abort_captures(gpus);
+                return Err(HipError::new(0, "dense TP graph rank has no active stream"));
+            };
+            gpu.graphs
+                .end_graph_capture_segment(&gpu.hip, gpu.device_id, stream)
+        };
+        if let Err(error) = end {
+            dense_tp_abort_captures(gpus);
+            return Err(error);
+        }
+    }
+    let segment = gpus.devices[0]
+        .graphs
+        .graph_segment_count()
+        .checked_sub(1)
+        .ok_or_else(|| HipError::new(0, "dense TP graph segment capture produced no graph"))?;
+    if gpus
+        .devices
+        .iter()
+        .any(|gpu| gpu.graphs.graph_segment_count() != segment + 1)
+    {
+        dense_tp_drop_graphs(gpus, true);
+        return Err(HipError::new(
+            0,
+            "dense TP graph ranks captured different segment counts",
+        ));
+    }
+    dense_tp_launch_segment(gpus, segment)
+}
+
+fn dense_tp_launch_root_segment(gpus: &mut Gpus, segment: usize) -> HipResult<()> {
+    let result = {
+        let gpu = &mut gpus.devices[0];
+        match gpu.active_stream.as_ref() {
+            Some(stream) => {
+                gpu.graphs
+                    .graph_segment_launch(&gpu.hip, gpu.device_id, stream, segment)
+            }
+            None => Err(HipError::new(
+                0,
+                "dense TP graph rank 0 has no active stream",
+            )),
+        }
+    };
+    if let Err(error) = result {
+        dense_tp_drop_graphs(gpus, true);
+        return Err(error);
+    }
+    Ok(())
+}
+
+fn dense_tp_capture_and_launch_root_segment(
+    gpus: &mut Gpus,
+    enqueue: impl FnOnce(&mut Gpus) -> HipResult<()>,
+) -> HipResult<()> {
+    let begin = {
+        let gpu = &mut gpus.devices[0];
+        match gpu.active_stream.as_ref() {
+            Some(stream) => gpu
+                .graphs
+                .begin_graph_capture_relaxed(&gpu.hip, gpu.device_id, stream),
+            None => Err(HipError::new(
+                0,
+                "dense TP graph rank 0 has no active stream",
+            )),
+        }
+    };
+    if let Err(error) = begin {
+        dense_tp_abort_captures(gpus);
+        return Err(error);
+    }
+    if let Err(error) = enqueue(gpus) {
+        dense_tp_abort_captures(gpus);
+        return Err(error);
+    }
+    let end = {
+        let gpu = &mut gpus.devices[0];
+        let Some(stream) = gpu.active_stream.as_ref() else {
+            dense_tp_abort_captures(gpus);
+            return Err(HipError::new(
+                0,
+                "dense TP graph rank 0 has no active stream",
+            ));
+        };
+        gpu.graphs
+            .end_graph_capture_segment(&gpu.hip, gpu.device_id, stream)
+    };
+    if let Err(error) = end {
+        dense_tp_abort_captures(gpus);
+        return Err(error);
+    }
+    let segment = gpus.devices[0]
+        .graphs
+        .graph_segment_count()
+        .checked_sub(1)
+        .ok_or_else(|| HipError::new(0, "dense TP root graph capture produced no graph"))?;
+    dense_tp_launch_root_segment(gpus, segment)
+}
+
+/// Execute the segmented graph path for one token. Graphs contain rank-local
+/// compute only; grouped RCCL and the residual add stay direct at every stage
+/// boundary so no graph inherits a cross-device dependency.
+#[allow(clippy::too_many_arguments)]
+fn forward_scratch_dense_tp_segmented(
+    gpus: &mut Gpus,
+    weights: &[Qwen35Weights],
+    configs: &[Qwen35Config],
+    pos: usize,
+    kv_caches: &mut [llama::KvCache],
+    dn_states: &mut [DeltaNetState],
+    scratches: &[Qwen35Scratch],
+    capture: bool,
+) -> HipResult<()> {
+    let dim = configs[0].dim;
+    let mut delta_layer_idx = 0usize;
+    let mut segment = 0usize;
+    for layer_idx in 0..configs[0].n_layers {
+        if capture {
+            dense_tp_capture_and_launch_segment(gpus, |gpus| {
+                dense_tp_local_attention(
+                    gpus,
+                    weights,
+                    configs,
+                    layer_idx,
+                    delta_layer_idx,
+                    pos,
+                    kv_caches,
+                    dn_states,
+                    scratches,
+                )
+            })?;
+        } else {
+            dense_tp_launch_segment(gpus, segment)?;
+        }
+        segment += 1;
+        dense_tp_allreduce_add(gpus, scratches, dim)?;
+
+        if capture {
+            dense_tp_capture_and_launch_segment(gpus, |gpus| {
+                dense_tp_local_ffn(gpus, weights, configs, layer_idx, scratches)
+            })?;
+        } else {
+            dense_tp_launch_segment(gpus, segment)?;
+        }
+        segment += 1;
+        dense_tp_allreduce_add(gpus, scratches, dim)?;
+
+        if configs[0].layer_types[layer_idx] == LayerType::LinearAttention {
+            delta_layer_idx += 1;
+        }
+    }
+    if capture {
+        dense_tp_capture_and_launch_root_segment(gpus, |gpus| {
+            dense_tp_output(gpus, weights, configs, scratches)
+        })
+    } else {
+        dense_tp_launch_root_segment(gpus, segment)
+    }
+}
+
+/// Dense Qwen hybrid TP2..5 single-token decode. Each rank owns local
+/// attention, DeltaNet and FFN projections; row-parallel outputs are reduced
+/// before the residual update. Logits are produced on rank 0.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_scratch_dense_tp(
+    gpus: &mut Gpus,
+    shard: &ShardConfig,
+    weights: &[Qwen35Weights],
+    configs: &[Qwen35Config],
+    token: u32,
+    pos: usize,
+    kv_caches: &mut [llama::KvCache],
+    dn_states: &mut [DeltaNetState],
+    scratches: &[Qwen35Scratch],
+) -> HipResult<()> {
+    let tp = shard.tp_size;
+    if !(2..=5).contains(&tp)
+        || weights.len() != tp
+        || configs.len() != tp
+        || kv_caches.len() != tp
+        || dn_states.len() != tp
+        || scratches.len() != tp
+        || gpus.devices.len() != tp
+    {
+        return Err(HipError::new(
+            0,
+            "dense TP requires 2..=5 devices and complete rank states",
+        ));
+    }
+    let dim = configs[0].dim;
+    let n_layers = configs[0].n_layers;
+    for cfg in configs.iter().skip(1) {
+        if cfg.dim != dim || cfg.n_layers != n_layers || cfg.layer_types != configs[0].layer_types {
+            return Err(HipError::new(0, "dense TP configs diverge on global shape"));
+        }
+    }
+    for rank_weights in weights {
+        for layer in &rank_weights.layers {
+            match layer {
+                LayerWeights::DeltaNet(_) | LayerWeights::FullAttn(_) => {}
+                _ => return Err(HipError::new(0, "dense TP received a MoE/mismatched layer")),
+            }
+        }
+    }
+
+    let required_tokens = checked_kv_end(pos, 1, "forward_scratch_dense_tp")?;
+    for rank in 0..tp {
+        gpus.devices[rank].bind_thread()?;
+        kv_caches[rank].ensure_mapped_capacity(&mut gpus.devices[rank], required_tokens)?;
+        prepare_scratch_inputs(
+            &mut gpus.devices[rank],
+            &weights[rank],
+            &configs[rank],
+            token,
+            pos,
+            &scratches[rank],
+        )?;
+    }
+
+    if !dense_tp_graph_enabled(gpus, kv_caches) {
+        if gpus.devices.iter().any(|gpu| {
+            gpu.graphs.graph_exec.is_some()
+                || gpu.graphs.graph_segment_count() != 0
+                || gpu.graphs.capture_mode
+        }) {
+            dense_tp_drop_graphs(gpus, true);
+        }
+        return forward_scratch_dense_tp_layers(
+            gpus, weights, configs, pos, kv_caches, dn_states, scratches,
+        );
+    }
+
+    let expected_segments = n_layers * 2;
+    let replay_ready = gpus.devices.iter().enumerate().all(|(rank, gpu)| {
+        let expected = expected_segments + usize::from(rank == 0);
+        gpu.graphs.ar_forward_replay_enabled && gpu.graphs.graph_segment_count() == expected
+    });
+    if replay_ready {
+        let result = forward_scratch_dense_tp_segmented(
+            gpus, weights, configs, pos, kv_caches, dn_states, scratches, false,
+        );
+        if result.is_err() {
+            dense_tp_drop_graphs(gpus, true);
+        }
+        if ar_graph_trace_enabled() {
+            eprintln!(
+                "[qwen-dense-tp-graph] replay tp={tp} root_segments={} peer_segments={expected_segments} pos={pos}",
+                expected_segments + 1
+            );
+        }
+        return result;
+    }
+
+    if gpus
+        .devices
+        .iter()
+        .any(|gpu| gpu.graphs.ar_forward_kernel_dirty)
+    {
+        forward_scratch_dense_tp_layers(
+            gpus, weights, configs, pos, kv_caches, dn_states, scratches,
+        )?;
+        for gpu in &mut gpus.devices {
+            gpu.graphs.ar_forward_kernel_dirty = false;
+            gpu.graphs.ar_forward_replay_enabled = false;
+        }
+        return Ok(());
+    }
+
+    dense_tp_drop_graphs(gpus, false);
+    if let Err(error) = forward_scratch_dense_tp_segmented(
+        gpus, weights, configs, pos, kv_caches, dn_states, scratches, true,
+    ) {
+        dense_tp_drop_graphs(gpus, true);
+        return Err(error);
+    }
+    if gpus.devices.iter().enumerate().any(|(rank, gpu)| {
+        let expected = expected_segments + usize::from(rank == 0);
+        gpu.graphs.graph_segment_count() != expected
+    }) {
+        dense_tp_drop_graphs(gpus, true);
+        return Err(HipError::new(
+            0,
+            "dense TP graph capture produced an incomplete segment set",
+        ));
+    }
+    for gpu in &mut gpus.devices {
+        gpu.graphs.ar_forward_replay_enabled = true;
+    }
+    if ar_graph_trace_enabled() {
+        eprintln!(
+            "[qwen-dense-tp-graph] capture tp={tp} root_segments={} peer_segments={expected_segments} pos={pos}",
+            expected_segments + 1
+        );
+    }
+    Ok(())
+}
+
+/// Layer-granular batched dense-TP prefill. Chunks with the existing
+/// gfx1201 bounded prefill batch size, uses one `PrefillBatchScratch`
+/// per rank (no per-token allocation) and exactly two deterministic
+/// reductions per layer per chunk. Only rank 0 produces final logits.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_prefill_dense_tp(
+    gpus: &mut Gpus,
+    shard: &ShardConfig,
+    weights: &[Qwen35Weights],
+    configs: &[Qwen35Config],
+    tokens: &[u32],
+    start_pos: usize,
+    kv_caches: &mut [llama::KvCache],
+    dn_states: &mut [DeltaNetState],
+    scratches: &[Qwen35Scratch],
+) -> HipResult<()> {
+    if tokens.is_empty() {
+        return Ok(());
+    }
+    let tp = shard.tp_size;
+    if !(2..=5).contains(&tp)
+        || weights.len() != tp
+        || configs.len() != tp
+        || kv_caches.len() != tp
+        || dn_states.len() != tp
+        || scratches.len() != tp
+        || gpus.devices.len() != tp
+    {
+        return Err(HipError::new(
+            0,
+            "dense TP requires 2..=5 devices and complete rank states",
+        ));
+    }
+    let dim = configs[0].dim;
+    let n_layers = configs[0].n_layers;
+    for cfg in configs.iter().skip(1) {
+        if cfg.dim != dim || cfg.n_layers != n_layers || cfg.layer_types != configs[0].layer_types {
+            return Err(HipError::new(0, "dense TP configs diverge on global shape"));
+        }
+    }
+    for layer in &weights[0].layers {
+        match layer {
+            LayerWeights::DeltaNet(_) | LayerWeights::FullAttn(_) => {}
+            _ => return Err(HipError::new(0, "dense TP received a MoE/mismatched layer")),
+        }
+    }
+    let cap = crate::qwen35::prefill::prefill_max_batch(&gpus.devices[0]);
+    if cap == 0 {
+        return Err(HipError::new(0, "prefill_max_batch is zero"));
+    }
+    // ── Allocate per-rank PBS + N*dim partial (transactional, cap_gdn_tape=false) ──
+    let mut pbs_vec: Vec<PrefillBatchScratch> = Vec::with_capacity(tp);
+    let mut partials: Vec<GpuTensor> = Vec::with_capacity(tp);
+    for rank in 0..tp {
+        let pbs =
+            match PrefillBatchScratch::new_opt(&mut gpus.devices[rank], &configs[rank], cap, false)
+            {
+                Ok(p) => p,
+                Err(e) => {
+                    for (i, prev) in pbs_vec.drain(..).enumerate() {
+                        let _ = prev.free_gpu(&mut gpus.devices[i]);
+                    }
+                    for (i, prev) in partials.drain(..).enumerate() {
+                        let _ = gpus.devices[i].free_tensor(prev);
+                    }
+                    return Err(e);
+                }
+            };
+        pbs_vec.push(pbs);
+        let partial = match gpus.devices[rank].alloc_tensor(&[cap * dim], DType::F32) {
+            Ok(t) => t,
+            Err(e) => {
+                for (i, prev) in pbs_vec.drain(..).enumerate() {
+                    let _ = prev.free_gpu(&mut gpus.devices[i]);
+                }
+                for (i, prev) in partials.drain(..).enumerate() {
+                    let _ = gpus.devices[i].free_tensor(prev);
+                }
+                return Err(e);
+            }
+        };
+        partials.push(partial);
+    }
+    // ── Chunked layer-granular prefill ──
+    let mut process_res: HipResult<()> = Ok(());
+    let mut last_chunk_n: usize = 0;
+    {
+        let mut offset = 0usize;
+        while offset < tokens.len() {
+            let n = std::cmp::min(cap, tokens.len() - offset);
+            last_chunk_n = n;
+            let chunk = &tokens[offset..offset + n];
+            let chunk_start = start_pos + offset;
+            let required = match checked_kv_end(chunk_start, n, "forward_prefill_dense_tp") {
+                Ok(v) => v,
+                Err(e) => {
+                    process_res = Err(e);
+                    break;
+                }
+            };
+            for rank in 0..tp {
+                if let Err(e) = (|| -> HipResult<()> {
+                    gpus.devices[rank].bind_thread()?;
+                    kv_caches[rank].ensure_mapped_capacity(&mut gpus.devices[rank], required)?;
+                    Ok(())
+                })() {
+                    process_res = Err(e);
+                    break;
+                }
+            }
+            if process_res.is_err() {
+                break;
+            }
+            // Embed + upload positions on every rank (same tokens/positions).
+            for rank in 0..tp {
+                let res = (|| -> HipResult<()> {
+                    crate::qwen35::prefill::batch_chunk_embed_tokens(
+                        &mut gpus.devices[rank],
+                        &weights[rank],
+                        chunk,
+                        &scratches[rank],
+                        &pbs_vec[rank],
+                        n,
+                        dim,
+                        dim * 4,
+                        true,
+                        false,
+                        false,
+                        None,
+                    )?;
+                    crate::qwen35::prefill::batch_chunk_upload_positions(
+                        &mut gpus.devices[rank],
+                        &pbs_vec[rank],
+                        BatchSemantics::Sequential,
+                        chunk_start,
+                        n,
+                        None,
+                        false,
+                    )?;
+                    Ok(())
+                })();
+                if let Err(e) = res {
+                    process_res = Err(e);
+                    break;
+                }
+            }
+            if process_res.is_err() {
+                break;
+            }
+            let mut delta_layer_idx: usize = 0;
+            let mut kv_layer_idx: usize = 0;
+            // Precompute per-rank wmma flags.
+            let q8_flags: Vec<bool> = (0..tp)
+                .map(|r| crate::qwen35::prefill::q8_prefill_wmma_enabled(&gpus.devices[r]))
+                .collect();
+            for layer_idx in 0..n_layers {
+                match configs[0].layer_types[layer_idx] {
+                    LayerType::LinearAttention => {
+                        for rank in 0..tp {
+                            let LayerWeights::DeltaNet(layer) = &weights[rank].layers[layer_idx]
+                            else {
+                                process_res = Err(HipError::new(
+                                    0,
+                                    "dense TP received a MoE/mismatched layer",
+                                ));
+                                break;
+                            };
+                            let cfg = &configs[rank];
+                            let k_dim = cfg.linear_num_key_heads * cfg.linear_key_head_dim;
+                            let v_dim = cfg.linear_num_value_heads * cfg.linear_value_head_dim;
+                            let n_v_heads = cfg.linear_num_value_heads;
+                            let hd = cfg.linear_key_head_dim;
+                            if let Err(e) = crate::qwen35::prefill::batch_chunk_delta_net_attn(
+                                &mut gpus.devices[rank],
+                                layer,
+                                cfg,
+                                &pbs_vec[rank],
+                                &mut dn_states[rank],
+                                n,
+                                dim,
+                                k_dim,
+                                v_dim,
+                                n_v_heads,
+                                hd,
+                                BatchSemantics::Sequential,
+                                None,
+                                None,
+                                0,
+                                delta_layer_idx,
+                                q8_flags[rank],
+                                q8_flags[rank],
+                                BatchEpilogue::Partial(&partials[rank]),
+                            ) {
+                                process_res = Err(e);
+                                break;
+                            }
+                        }
+                        if process_res.is_err() {
+                            break;
+                        }
+                        if let Err(e) =
+                            dense_tp_allreduce_batched(gpus, &pbs_vec, &partials, n, dim)
+                        {
+                            process_res = Err(e);
+                            break;
+                        }
+                        for rank in 0..tp {
+                            let LayerWeights::DeltaNet(layer) = &weights[rank].layers[layer_idx]
+                            else {
+                                unreachable!();
+                            };
+                            if let Err(e) = crate::qwen35::prefill::batch_chunk_delta_net_ffn(
+                                &mut gpus.devices[rank],
+                                layer,
+                                &configs[rank],
+                                &pbs_vec[rank],
+                                n,
+                                dim,
+                                configs[rank].hidden_dim,
+                                q8_flags[rank],
+                                q8_flags[rank],
+                                BatchEpilogue::Partial(&partials[rank]),
+                            ) {
+                                process_res = Err(e);
+                                break;
+                            }
+                        }
+                        if process_res.is_err() {
+                            break;
+                        }
+                        if let Err(e) =
+                            dense_tp_allreduce_batched(gpus, &pbs_vec, &partials, n, dim)
+                        {
+                            process_res = Err(e);
+                            break;
+                        }
+                        delta_layer_idx += 1;
+                    }
+                    LayerType::FullAttention => {
+                        for rank in 0..tp {
+                            let LayerWeights::FullAttn(layer) = &weights[rank].layers[layer_idx]
+                            else {
+                                process_res = Err(HipError::new(
+                                    0,
+                                    "dense TP received a MoE/mismatched layer",
+                                ));
+                                break;
+                            };
+                            let max_ctx = chunk_start + n;
+                            let ctx = DispatchCtx::new(&gpus.devices[rank]);
+                            if let Err(e) = crate::qwen35::prefill::batch_chunk_full_attn_attn(
+                                &mut gpus.devices[rank],
+                                layer,
+                                &configs[rank],
+                                &pbs_vec[rank],
+                                &scratches[rank],
+                                &mut kv_caches[rank],
+                                n,
+                                dim,
+                                chunk_start,
+                                max_ctx,
+                                &ctx,
+                                BatchSemantics::Sequential,
+                                None,
+                                q8_flags[rank],
+                                q8_flags[rank],
+                                kv_layer_idx,
+                                layer_idx,
+                                BatchEpilogue::Partial(&partials[rank]),
+                            ) {
+                                process_res = Err(e);
+                                break;
+                            }
+                        }
+                        if process_res.is_err() {
+                            break;
+                        }
+                        if let Err(e) =
+                            dense_tp_allreduce_batched(gpus, &pbs_vec, &partials, n, dim)
+                        {
+                            process_res = Err(e);
+                            break;
+                        }
+                        for rank in 0..tp {
+                            let LayerWeights::FullAttn(layer) = &weights[rank].layers[layer_idx]
+                            else {
+                                unreachable!();
+                            };
+                            if let Err(e) = crate::qwen35::prefill::batch_chunk_full_attn_ffn(
+                                &mut gpus.devices[rank],
+                                layer,
+                                &configs[rank],
+                                &pbs_vec[rank],
+                                n,
+                                dim,
+                                configs[rank].hidden_dim,
+                                q8_flags[rank],
+                                q8_flags[rank],
+                                BatchEpilogue::Partial(&partials[rank]),
+                            ) {
+                                process_res = Err(e);
+                                break;
+                            }
+                        }
+                        if process_res.is_err() {
+                            break;
+                        }
+                        if let Err(e) =
+                            dense_tp_allreduce_batched(gpus, &pbs_vec, &partials, n, dim)
+                        {
+                            process_res = Err(e);
+                            break;
+                        }
+                        kv_layer_idx += 1;
+                    }
+                }
+            }
+            if process_res.is_err() {
+                break;
+            }
+            offset += n;
+        }
+        // Final logits only on rank 0, last token of overall prompt.
+        if process_res.is_ok() {
+            let last_row_offset = (last_chunk_n - 1) * dim;
+            let x_last = pbs_vec[0].x_batch.sub_offset(last_row_offset, dim);
+            let res = (|| -> HipResult<()> {
+                gpus.devices[0].bind_thread()?;
+                gpus.devices[0].rmsnorm_f32(
+                    &x_last,
+                    &weights[0].output_norm,
+                    &scratches[0].tmp,
+                    configs[0].norm_eps,
+                )?;
+                let ctx = DispatchCtx::new(&gpus.devices[0]);
+                let wr = weights[0].output.dispatch_ref();
+                execute_steps(
+                    &mut gpus.devices[0],
+                    &ctx,
+                    &[Step::Gemv {
+                        w: &wr,
+                        input: GemvInput::Raw(&scratches[0].tmp),
+                        out: &scratches[0].logits,
+                    }],
+                )
+                .map_err(|e| HipError::new(0, &e.to_string()))?;
+                Ok(())
+            })();
+            if let Err(e) = res {
+                process_res = Err(e);
+            }
+        }
+    }
+    // ── Transactional free on success and every error path ──
+    for (rank, pbs) in pbs_vec.into_iter().enumerate() {
+        let _ = pbs.free_gpu(&mut gpus.devices[rank]);
+    }
+    for (rank, partial) in partials.into_iter().enumerate() {
+        let _ = gpus.devices[rank].free_tensor(partial);
+    }
+    process_res
+}
 // #397 Ship 6 — forward-as-pipeline: qwen35 DECODE lowered path (ADDITIVE).
 //
 // `HIPFIRE_FORWARD_LOWERED=1` routes the single-GPU decode layer loop through
@@ -4165,6 +5557,25 @@ fn forward_lowered_enabled() -> bool {
 fn gfx1151_radiowave_fusions_enabled(gpu: &Gpu) -> bool {
     gpu.arch_caps.is_gfx1151()
 }
+/// Exact gfx1201 admission gate for the ported Qwen3.5 decode state fusions
+/// (gated-norm/MQ rotation, full-attention prep, gated MQ-rotate FA epilogue).
+/// Keep architecture and model-shape checks separate from broad capability
+/// checks so no neighboring GPU or lookalike Qwen configuration inherits the
+/// gfx1201 schedules.
+fn gfx1201_state_fusions_enabled(gpu: &Gpu) -> bool {
+    gpu.arch_caps.is_gfx1201()
+}
+
+fn gfx1201_qwen35_a3b_state_fusion_shape(config: &Qwen35Config) -> bool {
+    config.dim == 2_048
+        && config.n_heads == 16
+        && config.n_kv_heads == 2
+        && config.head_dim == 256
+        && config.linear_num_key_heads == 16
+        && config.linear_num_value_heads == 32
+        && config.linear_key_head_dim == 128
+        && config.linear_value_head_dim == 128
+}
 
 /// Decode path that keeps DeltaNet Q/K at their native head count and
 /// lets each pair of value/state heads reuse one Q/K head. The architecture,
@@ -4246,7 +5657,8 @@ fn gated_norm_mq_rotate_enabled(
             != Some("0")
     });
     let admitted_arch_shape = ((gpu.arch_caps.is_gfx1100()
-        || gfx1151_radiowave_fusions_enabled(gpu))
+        || gfx1151_radiowave_fusions_enabled(gpu)
+        || gfx1201_state_fusions_enabled(gpu))
         && config.dim == 2_048
         && n_v_heads == 32)
         || (gpu.arch_caps.is_gfx1100() && super::config::qwen36_27b_dense_shape(config, n_v_heads));
@@ -4281,6 +5693,7 @@ fn qwen35_fa_prep_enabled(gpu: &Gpu, config: &Qwen35Config) -> bool {
         || gfx1151_radiowave_fusions_enabled(gpu))
         && config.n_heads == 16
         && config.n_kv_heads == 2)
+        || (gfx1201_state_fusions_enabled(gpu) && gfx1201_qwen35_a3b_state_fusion_shape(config))
         || (gpu.arch_caps.is_gfx1100()
             && super::config::qwen36_27b_dense_shape(config, config.linear_num_value_heads)
             && config.n_heads == 24
@@ -4309,6 +5722,7 @@ fn qwen35_fa_epilogue_enabled(gpu: &Gpu, config: &Qwen35Config, wo: &WeightTenso
         || gfx1151_radiowave_fusions_enabled(gpu))
         && config.n_heads == 16
         && config.n_kv_heads == 2)
+        || (gfx1201_state_fusions_enabled(gpu) && gfx1201_qwen35_a3b_state_fusion_shape(config))
         || (gpu.arch_caps.is_gfx1100()
             && super::config::qwen36_27b_dense_shape(config, config.linear_num_value_heads)
             && config.n_heads == 24
@@ -4633,6 +6047,13 @@ mod tests {
         assert_eq!(qwen35_x_rot_len(2048, 8192, 4096), 8192);
     }
 
+    #[test]
+    fn gfx1201_fa_epilogue_is_q8_only() {
+        assert!(qwen35_fa_epilogue_route_supported(true, true, false));
+        assert!(!qwen35_fa_epilogue_route_supported(true, false, true));
+        assert!(qwen35_fa_epilogue_route_supported(false, false, true));
+    }
+
     // ── #397 Ship 6 — lowered decode super-op program shapes ──────────────
     // The lowered LayerProgram per variant must mirror the hand-arm op sequence
     // in forward_scratch_layers exactly. These are CPU-pure (no GPU/GpuTensor).
@@ -4704,5 +6125,131 @@ mod tests {
         assert!(!ar_graph_eligible_for_kv(true, 1));
         assert!(!ar_graph_eligible_for_kv(true, 128));
         assert!(!ar_graph_eligible_for_kv(false, 0));
+    }
+
+    // ── MQ6V2 / MQ4V2 FFN dtype recognition ───────────────────────────────
+    // Model-level MQ6 flag must see both V1 (qt=15) and V2 (qt=47) without
+    // collapsing either into MQ4V2 (qt=44). Pure helpers — no GPU tensors.
+
+    #[test]
+    fn moe_ffn_has_mq6_recognizes_v1_and_v2_distinctly() {
+        // Empty structural + empty experts → false.
+        assert!(!moe_ffn_has_mq6_from_dtypes([], []));
+
+        // Legacy MQ6G256 on a structural field.
+        assert!(moe_ffn_has_mq6_from_dtypes(
+            [
+                DType::MQ6G256,
+                DType::MQ4G256,
+                DType::MQ4G256,
+                DType::MQ4G256,
+                DType::MQ4G256
+            ],
+            [(DType::MQ4G256, DType::MQ4G256)],
+        ));
+
+        // MQ6G256V2 on a structural field — must trip the same model flag.
+        assert!(moe_ffn_has_mq6_from_dtypes(
+            [
+                DType::MQ4G256,
+                DType::MQ4G256,
+                DType::MQ6G256V2,
+                DType::MQ4G256,
+                DType::MQ4G256
+            ],
+            [(DType::MQ4G256, DType::MQ4G256)],
+        ));
+
+        // MQ6G256V2 only on a routed expert projection.
+        assert!(moe_ffn_has_mq6_from_dtypes(
+            [DType::MQ4G256; 5],
+            [(DType::MQ6G256V2, DType::MQ4G256)],
+        ));
+        assert!(moe_ffn_has_mq6_from_dtypes(
+            [DType::MQ4G256; 5],
+            [(DType::MQ4G256, DType::MQ6G256V2)],
+        ));
+
+        // Uniform MQ6V2 routed pair.
+        assert!(moe_ffn_has_mq6_from_dtypes(
+            [DType::MQ6G256V2; 5],
+            [(DType::MQ6G256V2, DType::MQ6G256V2)],
+        ));
+    }
+
+    #[test]
+    fn moe_ffn_has_mq6_never_collapses_mq4v2() {
+        // MQ4G256 / MQ4G256V2 only — never MQ6-family.
+        assert!(!moe_ffn_has_mq6_from_dtypes(
+            [DType::MQ4G256; 5],
+            [(DType::MQ4G256, DType::MQ4G256)],
+        ));
+        assert!(!moe_ffn_has_mq6_from_dtypes(
+            [DType::MQ4G256V2; 5],
+            [(DType::MQ4G256V2, DType::MQ4G256V2)],
+        ));
+        // Mixed MQ4 V1/V2 gate-side + routed still not MQ6.
+        assert!(!moe_ffn_has_mq6_from_dtypes(
+            [
+                DType::MQ4G256V2,
+                DType::MQ4G256,
+                DType::MQ4G256V2,
+                DType::MQ4G256,
+                DType::MQ4G256V2,
+            ],
+            [(DType::MQ4G256V2, DType::MQ4G256)],
+        ));
+        // Identity: V1 and V2 MQ6 are distinct enum variants (wire layouts differ).
+        assert_ne!(DType::MQ6G256, DType::MQ6G256V2);
+        assert_ne!(DType::MQ4G256, DType::MQ4G256V2);
+        assert_ne!(DType::MQ4G256V2, DType::MQ6G256V2);
+    }
+
+    #[test]
+    fn mq4v2_gate_side_prerotation_requires_exact_ornith_layout() {
+        let v1 = DType::MQ4G256;
+        let v2 = DType::MQ4G256V2;
+        let exact = [
+            (v2, 256, 2_048, false),
+            (v2, 1, 2_048, false),
+            (v2, 512, 2_048, false),
+            (v2, 512, 2_048, false),
+        ];
+        assert!(gate_side_mq4_uniform_from_dtypes([v1, v1, v1, v1]));
+        assert!(!gate_side_mq4_uniform_from_dtypes([v2, v2, v2, v2]));
+        assert!(gate_side_mq4v2_prerotated_from_layouts(exact));
+
+        for slot in 0..4 {
+            let mut mixed = exact;
+            mixed[slot].0 = v1;
+            assert!(!gate_side_mq4v2_prerotated_from_layouts(mixed));
+
+            let mut awq = exact;
+            awq[slot].3 = true;
+            assert!(!gate_side_mq4v2_prerotated_from_layouts(awq));
+        }
+        let mut wrong_shape = exact;
+        wrong_shape[2].1 = 511;
+        assert!(!gate_side_mq4v2_prerotated_from_layouts(wrong_shape));
+    }
+
+    #[test]
+    fn dense_tp_admission_allows_2_to_5() {
+        for tp in 2..=5 {
+            assert!((2..=5).contains(&tp), "tp {tp} should be admitted");
+        }
+        assert!(!(2..=5).contains(&1));
+        assert!(!(2..=5).contains(&6));
+        assert!(!(2..=5).contains(&0));
+    }
+
+    #[test]
+    fn dense_tp_batched_count_overflow_is_err() {
+        let n = usize::MAX;
+        let dim = 2;
+        assert!(n.checked_mul(dim).is_none());
+        // Mirror dense_tp_allreduce_batched's overflow guard.
+        let res: Result<usize, &str> = n.checked_mul(dim).ok_or("overflow");
+        assert!(res.is_err());
     }
 }

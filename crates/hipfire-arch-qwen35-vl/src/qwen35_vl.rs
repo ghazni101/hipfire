@@ -5,7 +5,7 @@
 //! Qwen3.5-VL vision encoder: SigLIP-2 ViT + spatial merger.
 //! GPU path: gemm_f16 (9 VGPRs), layernorm (13), gelu (8), vit_attention, transpose.
 
-use hip_bridge::HipResult;
+use hip_bridge::{HipError, HipResult};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::llama::{f16_to_f32, f32_to_f16};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -179,6 +179,76 @@ fn load_f32_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult
     gpu.upload_f32(&vals, &[n])
 }
 
+/// Finite F16 range: ±65504 is the largest finite half-precision value.
+const F16_FINITE_MAX: f32 = 65504.0;
+
+/// Validate a single F32 oracle element before narrowing to F16.
+///
+/// Rejects non-finite values (NaN, ±Inf) and finite magnitudes outside the
+/// finite IEEE 754 binary16 range. Returns a descriptive `HipError` (invalid
+/// value) naming the tensor, element index, and offending value so the loader
+/// caller can surface the exact source tensor.
+fn checked_f32_to_f16(value: f32, tensor: &str, index: usize) -> HipResult<u16> {
+    if !value.is_finite() {
+        return Err(HipError::new(
+            1,
+            &format!(
+                "{tensor}: element {index} is non-finite ({value}) — cannot narrow F32 oracle to F16 without producing Inf/NaN"
+            ),
+        ));
+    }
+    if value.abs() > F16_FINITE_MAX {
+        return Err(HipError::new(
+            1,
+            &format!(
+                "{tensor}: element {index} value {value} exceeds finite F16 range (±{F16_FINITE_MAX})"
+            ),
+        ));
+    }
+    Ok(f32_to_f16(value))
+}
+
+/// Pure bulk helper: validate every F32 element then narrow to little-endian F16 bytes.
+/// Operates on the raw little-endian F32 byte payload (`data`) and the expected
+/// element count `n` so the production loader and focused tests share the same
+/// truncation/length validation. Rejects payloads with fewer than `n` complete
+/// F32 elements or a non-multiple-of-4 length before narrowing each element
+/// through [`checked_f32_to_f16`].
+fn f32_bytes_to_f16_bytes_checked(data: &[u8], n: usize, tensor: &str) -> HipResult<Vec<u8>> {
+    let need = n.checked_mul(4).ok_or_else(|| {
+        HipError::new(
+            1,
+            &format!("{tensor}: tensor length overflow for {n} F32 elements"),
+        )
+    })?;
+    if data.len() < need {
+        return Err(HipError::new(
+            1,
+            &format!(
+                "{tensor}: F32 payload too short: need {need} bytes for {n} elements, got {}",
+                data.len()
+            ),
+        ));
+    }
+    if !data.len().is_multiple_of(4) {
+        return Err(HipError::new(
+            1,
+            &format!(
+                "{tensor}: F32 payload length {} is not a multiple of 4 (trailing malformed bytes)",
+                data.len()
+            ),
+        ));
+    }
+    let mut out = Vec::with_capacity(n * 2);
+    for idx in 0..n {
+        let off = idx * 4;
+        let v = f32::from_le_bytes([data[off], data[off + 1], data[off + 2], data[off + 3]]);
+        let bits = checked_f32_to_f16(v, tensor, idx)?;
+        out.extend_from_slice(&bits.to_le_bytes());
+    }
+    Ok(out)
+}
+
 fn load_f16_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> HipResult<GpuTensor> {
     let (info, data) = hfq
         .tensor_data(name)
@@ -193,13 +263,12 @@ fn load_f16_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> HipResult<GpuTensor
             // F32 oracle — the vision kernels consume F16 matrices, so narrow
             // the lossless decoder-oracle container at load time just as the
             // ordinary --include-vision ingest does before writing F16.
-            let f16_bytes: Vec<u8> = data
-                .chunks_exact(4)
-                .take(n)
-                .flat_map(|c| {
-                    f32_to_f16(f32::from_le_bytes([c[0], c[1], c[2], c[3]])).to_le_bytes()
-                })
-                .collect();
+            // Every element is validated before narrowing so non-finite or
+            // out-of-range values surface as a load error instead of silent Inf/NaN.
+            // The shared `f32_bytes_to_f16_bytes_checked` helper owns both
+            // truncation/length checks and the per-element F16-range validation
+            // so the production path is mechanically tied to focused tests.
+            let f16_bytes = f32_bytes_to_f16_bytes_checked(data, n, name)?;
             gpu.upload_raw(&f16_bytes, &[n])
         }
         6 | 7 => {
@@ -718,6 +787,125 @@ mod tests {
         let any_diff = c1.iter().zip(&c2).any(|(a, b)| (a - b).abs() > 1e-5);
         assert!(any_diff, "theta change must shift at least one trig value");
     }
+
+    // ── F32-oracle → F16 validation (pure helper, no GPU) ────────────────────
+
+    #[test]
+    fn checked_f32_to_f16_accepts_boundaries_and_zero() {
+        // Finite boundaries and zero must succeed, and must produce the same
+        // bits as the unchecked f32_to_f16 (sanity: we didn't change accepted inputs).
+        let valid: &[f32] = &[0.0, -0.0, 65504.0, -65504.0, 1.0, -1.0, 6.1035e-5];
+        for (idx, &v) in valid.iter().enumerate() {
+            let bits =
+                checked_f32_to_f16(v, "test_tensor", idx).expect("valid F32 should narrow to F16");
+            assert_eq!(
+                bits,
+                f32_to_f16(v),
+                "value {v} at {idx} mismatched unchecked conversion"
+            );
+        }
+        // Bulk helper (production path) must also accept the same payload via bytes.
+        let data: Vec<u8> = valid.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let bytes =
+            f32_bytes_to_f16_bytes_checked(&data, valid.len(), "test_tensor").expect("bulk valid");
+        assert_eq!(bytes.len(), valid.len() * 2);
+        for (i, &v) in valid.iter().enumerate() {
+            let bits = u16::from_le_bytes([bytes[2 * i], bytes[2 * i + 1]]);
+            assert_eq!(bits, f32_to_f16(v));
+        }
+    }
+
+    #[test]
+    fn checked_f32_to_f16_rejects_nan() {
+        let err = checked_f32_to_f16(f32::NAN, "vision.test_nan", 3).unwrap_err();
+        assert_eq!(err.code, 1);
+        assert!(
+            err.message.contains("vision.test_nan"),
+            "error must name tensor: {}",
+            err.message
+        );
+        assert!(
+            err.message.contains("3"),
+            "error must name element index: {}",
+            err.message
+        );
+        // Production bytes helper propagates the same error with correct index.
+        let vals = [1.0, f32::NAN, 2.0];
+        let data: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let err2 =
+            f32_bytes_to_f16_bytes_checked(&data, vals.len(), "vision.test_nan").unwrap_err();
+        assert_eq!(err2.code, 1);
+        assert!(err2.message.contains("vision.test_nan"));
+        assert!(err2.message.contains('1'));
+    }
+
+    #[test]
+    fn checked_f32_to_f16_rejects_infinities() {
+        for &inf in &[f32::INFINITY, f32::NEG_INFINITY] {
+            let err = checked_f32_to_f16(inf, "vision.test_inf", 0).unwrap_err();
+            assert_eq!(err.code, 1);
+            assert!(err.message.contains("vision.test_inf"));
+            // Must not silently become Inf bits (0x7C00 / 0xFC00).
+            assert!(err.message.contains("non-finite") || err.message.contains("Inf"));
+        }
+        let vals = [0.0, f32::INFINITY];
+        let data: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let err = f32_bytes_to_f16_bytes_checked(&data, vals.len(), "vision.test_inf").unwrap_err();
+        assert_eq!(err.code, 1);
+        assert!(err.message.contains("1"));
+    }
+
+    #[test]
+    fn checked_f32_to_f16_rejects_finite_overflow() {
+        // Finite magnitudes just beyond F16 max must be rejected, not saturated to Inf.
+        let overflows: &[f32] = &[65505.0, 70000.0, 1e6, -65505.0, -1e5];
+        for (idx, &v) in overflows.iter().enumerate() {
+            let err = checked_f32_to_f16(v, "vision.test_overflow", idx).unwrap_err();
+            assert_eq!(
+                err.code, 1,
+                "overflow {v} should error with invalid-value code"
+            );
+            assert!(
+                err.message.contains("vision.test_overflow"),
+                "tensor name missing: {}",
+                err.message
+            );
+            assert!(err.message.contains(&idx.to_string()));
+            // Message should mention the offending value or range.
+            assert!(
+                err.message.contains("65504") || err.message.contains(&v.to_string()),
+                "overflow message should describe range/value: {}",
+                err.message
+            );
+        }
+        // Production bytes helper on overflow slice must fail at first overflow element.
+        let vals: [f32; 3] = [0.0, 70000.0, 1.0];
+        let data: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        let err =
+            f32_bytes_to_f16_bytes_checked(&data, vals.len(), "vision.test_overflow").unwrap_err();
+        assert_eq!(err.code, 1);
+        assert!(err.message.contains("1"));
+    }
+
+    #[test]
+    fn f32_bytes_helper_rejects_short_and_malformed_payload() {
+        // Payload too short: fewer than n complete F32 elements.
+        let vals = [1.0f32, 2.0, 3.0];
+        let mut data: Vec<u8> = vals.iter().flat_map(|v| v.to_le_bytes()).collect();
+        // Request 3 elements but supply only bytes for 2.
+        let short = &data[..8];
+        let err = f32_bytes_to_f16_bytes_checked(short, 3, "vision.test_short").unwrap_err();
+        assert_eq!(err.code, 1);
+        assert!(err.message.contains("vision.test_short"));
+        assert!(err.message.contains("too short") || err.message.contains("need"));
+        // Non-multiple-of-4 trailing bytes.
+        data.push(0xFF);
+        let err2 =
+            f32_bytes_to_f16_bytes_checked(&data, vals.len(), "vision.test_malformed").unwrap_err();
+        assert_eq!(err2.code, 1);
+        assert!(err2.message.contains("vision.test_malformed"));
+        assert!(err2.message.contains("multiple of 4") || err2.message.contains("trailing"));
+    }
 }
 
 // ─── GPU vision forward (no CPU roundtrips for compute) ──────────────────────
@@ -806,12 +994,10 @@ pub fn vision_forward(
     let n = grid_h * grid_w;
     let patch_dim = 3 * config.temporal_patch_size * config.patch_size * config.patch_size;
     let t0 = std::time::Instant::now();
-    let dump_dir = std::env::var_os("HIPFIRE_VL_DUMP_DIR").map(std::path::PathBuf::from);
-    let dump_dir = dump_dir.as_deref();
-
     // Diagnostic stage dumps (env-gated; see `vl_dump_slice`).
-    let dump_dir: Option<std::path::PathBuf> =
-        std::env::var("HIPFIRE_VL_DUMP_DIR").ok().map(Into::into);
+    let dump_dir: Option<std::path::PathBuf> = hipfire_config::developer_var("HIPFIRE_VL_DUMP_DIR")
+        .ok()
+        .map(Into::into);
     let dd = dump_dir.as_deref();
     if dd.is_some() {
         eprintln!(

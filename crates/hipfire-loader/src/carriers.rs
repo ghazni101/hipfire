@@ -142,6 +142,7 @@ impl Carrier for Qwen2Carrier {
             semantic_contract_version: None,
             has_deltanet: false,
             supports_images: false,
+            reasoning_contract: saddle_core::caps::ReasoningContract::Unsupported,
         }
     }
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
@@ -271,6 +272,16 @@ fn load_qwen35_pp(
         None => hipfire_runtime::multi_gpu::Gpus::init_uniform(pp, config.n_layers)
             .map_err(|e| format!("{e}"))?,
     };
+    // Discrete GPUs: keep model pages in the page cache across reads —
+    // fadvise(DONTNEED)-per-tensor forces a full disk re-read on every load.
+    // UMA keeps eviction (default) to avoid OOM vs hipMalloc staging.
+    hfq_file.set_evict_page_cache(
+        std::env::var("HIPFIRE_PAGE_EVICTION")
+            .ok()
+            .map(|v| v != "0")
+            .unwrap_or_else(|| gpus.devices.iter().any(|g| g.is_uma())),
+    );
+    let _hfq_cache_warmer = hfq_file.start_cache_warmup();
     let layout = hipfire_arch_qwen35::qwen35::Layout::from_gpus(&gpus, config.n_layers);
     let mut hfq_source = hipfire_arch_qwen35::qwen35::HfqSource::new(&mut hfq_file, &config);
     let weights =
@@ -387,6 +398,7 @@ impl Carrier for Qwen35Carrier {
             // declares that the arch CAN accept images when that tower is
             // present. Per-instance gating still checks `LoadedModel::vision_config`.
             supports_images: true,
+            reasoning_contract: saddle_core::caps::ReasoningContract::QwenJinja,
         }
     }
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
@@ -493,6 +505,17 @@ impl Carrier for Qwen35Carrier {
                 if ctx.pp > 1 {
                     return load_qwen35_pp(hfq_file, meta, ctx);
                 }
+                // Discrete GPUs: keep model pages in the page cache across
+                // reads — fadvise(DONTNEED)-per-tensor forces a full disk
+                // re-read on every load. UMA keeps eviction (default) to
+                // avoid OOM vs hipMalloc staging.
+                hfq_file.set_evict_page_cache(
+                    std::env::var("HIPFIRE_PAGE_EVICTION")
+                        .ok()
+                        .map(|v| v != "0")
+                        .unwrap_or_else(|| ctx.gpu.is_uma()),
+                );
+                let _hfq_cache_warmer = hfq_file.start_cache_warmup();
 
                 // ── pp=1 path (single-GPU) ────────────────────
                 let physical_cap = ctx.cask.physical_cap(ctx.max_seq)?;
@@ -723,6 +746,7 @@ impl Carrier for LlamaCarrier {
             semantic_contract_version: None,
             has_deltanet: false,
             supports_images: false,
+            reasoning_contract: saddle_core::caps::ReasoningContract::Unsupported,
         }
     }
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
@@ -1015,6 +1039,7 @@ impl Carrier for DotsOcrCarrier {
             semantic_contract_version: None,
             has_deltanet: false,
             supports_images: true,
+            reasoning_contract: saddle_core::caps::ReasoningContract::Unsupported,
         }
     }
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
@@ -1130,6 +1155,7 @@ impl Carrier for Deepseek4Carrier {
             semantic_contract_version: None,
             has_deltanet: false,
             supports_images: false,
+            reasoning_contract: saddle_core::caps::ReasoningContract::DeepSeek4,
         }
     }
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
@@ -1341,6 +1367,7 @@ impl Carrier for MinimaxCarrier {
             semantic_contract_version: None,
             has_deltanet: false,
             supports_images: false,
+            reasoning_contract: saddle_core::caps::ReasoningContract::Unsupported,
         }
     }
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
@@ -1447,7 +1474,12 @@ impl Carrier for Lfm2MoeCarrier {
             spec_excludes_adaptive: false,
             semantic_contract_version: None,
             has_deltanet: false,
-            supports_images: false,
+            // lfm2_vl artifacts carry the SigLIP2 tower + projector. The
+            // declared-capability model works exactly like qwen35-vl here:
+            // artifacts WITHOUT vision tensors still load fine and refuse
+            // images at the daemon gate via `has_vision_encoder() == false`.
+            supports_images: true,
+            reasoning_contract: saddle_core::caps::ReasoningContract::Unsupported,
         }
     }
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
@@ -1488,7 +1520,62 @@ impl Carrier for Lfm2MoeCarrier {
         }
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
-        let bundle = hipfire_arch_lfm2moe::load_lfm2moe_bundle(src, ctx)?;
+
+        // ── LFM2-VL detection + tower/projector upload ────────────────────
+        // Mirrors the qwen35 HFQ arm: HFQ is single-pass, so the vision
+        // stack MUST be read from the same file handle BEFORE
+        // `load_lfm2moe_bundle` consumes it for the text trunk.
+        let mut vision_cfg_out: Option<hipfire_arch_lfm2_vl::VisionConfig> = None;
+        let mut vision_w_out: Option<hipfire_arch_lfm2_vl::VisionWeights> = None;
+        if let ModelSource::Hfq(hfq_file) = &src {
+            if hfq_file
+                .tensor_data("model.vision_tower.vision_model.embeddings.patch_embedding.weight")
+                .is_some()
+            {
+                match hipfire_arch_lfm2_vl::vision_config_from_hfq(hfq_file) {
+                    Some(vc) => {
+                        eprintln!(
+                            "  LFM2-VL model: SigLIP2-NaFlex tower (hidden={}, layers={}) + projector",
+                            vc.hidden_size, vc.num_layers
+                        );
+                        match hipfire_arch_lfm2_vl::load_vision_weights(hfq_file, &vc, ctx.gpu) {
+                            Ok(vw) => {
+                                vision_cfg_out = Some(vc);
+                                vision_w_out = Some(vw);
+                            }
+                            Err(e) => {
+                                return Err(format!(
+                                    "lfm2moe: LFM2-VL vision weight load failed: {e:?}"
+                                ));
+                            }
+                        }
+                    }
+                    None => {
+                        return Err(
+                            "lfm2moe: artifact carries vision tensors but no vision_config \
+                             metadata — requantize with --include-vision"
+                                .into(),
+                        );
+                    }
+                }
+            }
+        }
+
+        let bundle = match hipfire_arch_lfm2moe::load_lfm2moe_bundle(src, ctx) {
+            Ok(mut b) => {
+                b.vision_config = vision_cfg_out;
+                b.vision_weights = vision_w_out;
+                b
+            }
+            Err(e) => {
+                // Trunk failed after the tower is already on-device — reclaim
+                // it or the unload drain will miss these buffers entirely.
+                if let Some(vw) = vision_w_out {
+                    vw.free_gpu(ctx.gpu);
+                }
+                return Err(e);
+            }
+        };
         let speculator = crate::spec_build::build_speculator(
             meta.arch_id,
             None,
@@ -1560,6 +1647,7 @@ impl Carrier for Cohere2MoeCarrier {
             semantic_contract_version: None,
             has_deltanet: false,
             supports_images: false,
+            reasoning_contract: saddle_core::caps::ReasoningContract::Unsupported,
         }
     }
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
@@ -1645,6 +1733,103 @@ impl Carrier for Cohere2MoeCarrier {
     }
 }
 
+// ─── MapleCarrier ────────────────────────────────────────────────────
+// maple (arch_id 15, HFQ-only). Maple-Preview's weights are natively ternary
+// and are carried losslessly by qt=51 MQ2G256LloydU; there is no
+// safetensors-Dir path, so `claims_arch_id` answers for the HFQ namespace only
+// in practice and the Dir case is refused inside `load_maple_bundle` with a
+// message naming the convert command.
+pub struct MapleCarrier;
+impl Carrier for MapleCarrier {
+    fn name(&self) -> &'static str {
+        "maple"
+    }
+    fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
+        arch_id == 15
+    }
+    fn caps(&self) -> saddle_core::caps::ArchCaps {
+        saddle_core::caps::ArchCaps {
+            reasoning_contract: saddle_core::caps::ReasoningContract::QwenJinja,
+            supports_continuous_batch: false,
+            supports_ep_batch: false,
+            dflash: None,
+            supports_mtp: false,
+            spec_excludes_adaptive: false,
+            semantic_contract_version: None,
+            has_deltanet: false,
+            supports_images: false,
+        }
+    }
+    fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
+        saddle_core::sampling::SamplingDefaults::new(1.0, 0.95, 1.0)
+    }
+    /// Batched prefill over `MAPLE_PREFILL_CHUNK`-sized chunks. `forward_batch`
+    /// ERRORS above `MAPLE_PREFILL_MAX_B` rather than splitting silently, so the
+    /// chunking here is mandatory, not an optimisation.
+    ///
+    /// The failure string is propagated through `prefill_err`, which the daemon
+    /// interpolates into `bench_prefill forward failed: {e}` for every carrier —
+    /// not just Glimmer. Dropping it would reduce an unsupported-tier refusal
+    /// (which names the qt51 and router-mirror requirements) to a bare
+    /// "forward failed".
+    fn bench_prefill(
+        &self,
+        m: &mut crate::LoadedModel,
+        gpu: &mut rdna_compute::Gpu,
+        synthetic: &[u32],
+        _n: usize,
+        prefill_err: &mut Option<String>,
+    ) -> Option<bool> {
+        let b = (m.state.as_mut()?.as_mut() as &mut dyn Any)
+            .downcast_mut::<hipfire_arch_maple::MapleBundle>()?;
+        for (start, len) in hipfire_arch_maple::batch::prefill_chunks(
+            synthetic.len(),
+            hipfire_arch_maple::batch::MAPLE_PREFILL_CHUNK,
+        ) {
+            if let Err(e) = hipfire_arch_maple::forward::forward_batch(
+                &b.config,
+                &b.weights,
+                &mut b.state,
+                gpu,
+                &synthetic[start..start + len],
+                start,
+            ) {
+                *prefill_err = Some(e);
+                return Some(false);
+            }
+        }
+        Some(true)
+    }
+    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+        if ctx.pp > 1 {
+            return Err("maple: pp>1 unsupported via registry".into());
+        }
+        dir_diag(&src);
+        let meta = resolve_source_meta(&src, ctx.path)?;
+        let bundle = hipfire_arch_maple::load_maple_bundle(src, ctx)?;
+        let speculator = crate::spec_build::build_speculator(
+            meta.arch_id,
+            None,
+            None,
+            true,
+            ctx.max_seq,
+            ctx.spec,
+        );
+        Ok(LoadedModel {
+            state: Some(Box::new(bundle)),
+            speculator,
+            ..LoadedModel::skeleton(
+                meta.arch_id,
+                meta.tokenizer,
+                ctx.max_seq,
+                ctx.max_seq,
+                ctx.path.to_string(),
+                meta.chat_template,
+            )
+        })
+    }
+}
+
 // ─── Gemma4Carrier ───────────────────────────────────────────────────
 
 fn gemma4_use_lowered(
@@ -1702,6 +1887,7 @@ impl Carrier for Gemma4Carrier {
             semantic_contract_version: None,
             has_deltanet: false,
             supports_images: false,
+            reasoning_contract: saddle_core::caps::ReasoningContract::GemmaBoolean,
         }
     }
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
@@ -1943,6 +2129,7 @@ impl Carrier for MuseGlimmerCarrier {
             semantic_contract_version: Some(2),
             has_deltanet: false,
             supports_images: false,
+            reasoning_contract: saddle_core::caps::ReasoningContract::MuseGlimmer,
         }
     }
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
@@ -2306,7 +2493,7 @@ impl Carrier for MuseGlimmerCarrier {
 
 // ─── K2HorizonCarrier ──────────────────────────────────────────────────
 //
-// Stub carrier for K2-Horizon (MoVA-36B-A4B, arch_id=15). Claims the arch_id
+// Stub carrier for K2-Horizon (MoVA-36B-A4B, arch_id=16). Claims the arch_id
 // so the loader fails with a clean "not yet implemented" error instead of
 // "no carrier". The full load path (config parse, weight upload, forward)
 // lands in Phase 6 of the k2-horizon-arch-spec.
@@ -2330,7 +2517,7 @@ impl Carrier for K2HorizonCarrier {
         Err("k2_horizon: spec emitter not yet wired".into())
     }
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
-        arch_id == 15
+        arch_id == 16
     }
     fn bench_decode_prime(
         &self,
@@ -2392,6 +2579,7 @@ impl Carrier for K2HorizonCarrier {
     }
     fn caps(&self) -> saddle_core::caps::ArchCaps {
         saddle_core::caps::ArchCaps {
+            reasoning_contract: saddle_core::caps::ReasoningContract::QwenJinja,
             supports_continuous_batch: false,
             supports_ep_batch: false,
             dflash: None,

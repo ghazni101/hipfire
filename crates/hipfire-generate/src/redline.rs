@@ -34,6 +34,7 @@ use hipfire_engine::redline::{
 };
 use hipfire_loader::spec_build::Qwen35SlotGuard;
 use hipfire_loader::LoadedModel;
+
 use rdna_compute::replay::ReplayQuiescence;
 use std::any::Any;
 use std::io::Read;
@@ -145,6 +146,15 @@ impl RedlineSnapshot {
         }
     }
 
+    /// Q8 GatedDeltaNet stochastic-rounding frame. Non-Qwen snapshots do not
+    /// carry this host-side state and therefore compare as `None`.
+    pub fn gdn_frame(&self) -> Option<u32> {
+        match self {
+            Self::Qwen(snapshot) => Some(snapshot.gdn_frame),
+            Self::Deepseek4(_) | Self::Lfm2Moe(_) | Self::K2Horizon(_) => None,
+        }
+    }
+
     pub fn json(&self) -> serde_json::Value {
         match self {
             Self::Qwen(snapshot) => snapshot.json(),
@@ -153,6 +163,13 @@ impl RedlineSnapshot {
             Self::K2Horizon(snapshot) => snapshot.json(),
         }
     }
+}
+
+fn redline_snapshots_bit_exact(lhs: &RedlineSnapshot, rhs: &RedlineSnapshot) -> bool {
+    lhs.logits() == rhs.logits()
+        && lhs.kv() == rhs.kv()
+        && lhs.recurrent() == rhs.recurrent()
+        && lhs.gdn_frame() == rhs.gdn_frame()
 }
 
 pub fn redline_qwen_snapshot(
@@ -1547,9 +1564,9 @@ pub fn redline_shadow_deepseek4(
             let logits_equal = aql_snapshot.logits() == hip_snapshot.logits();
             let kv_equal = aql_snapshot.kv() == hip_snapshot.kv();
             let recurrent_equal = aql_snapshot.recurrent() == hip_snapshot.recurrent();
-            let blob_bit_exact = aql_snapshot.logits() == blob_snapshot.logits()
-                && aql_snapshot.kv() == blob_snapshot.kv()
-                && aql_snapshot.recurrent() == blob_snapshot.recurrent();
+            let gdn_frame_equal = aql_snapshot.gdn_frame() == hip_snapshot.gdn_frame();
+            let blob_gdn_frame_equal = aql_snapshot.gdn_frame() == blob_snapshot.gdn_frame();
+            let blob_bit_exact = redline_snapshots_bit_exact(&aql_snapshot, &blob_snapshot);
             Ok(serde_json::json!({
                 "type": "redline_shadow_result",
                 "backend": if pm4 { "pm4_ib" } else { "aql_packets" },
@@ -1559,11 +1576,13 @@ pub fn redline_shadow_deepseek4(
                 "packets": prepared.1,
                 "queue_id": prepared.2,
                 "command_dwords": prepared.3,
-                "bit_exact": logits_equal && kv_equal && recurrent_equal,
+                "bit_exact": redline_snapshots_bit_exact(&aql_snapshot, &hip_snapshot),
                 "blob_bit_exact": blob_bit_exact,
                 "logits_equal": logits_equal,
                 "kv_equal": kv_equal,
                 "recurrent_equal": recurrent_equal,
+                "gdn_frame_equal": gdn_frame_equal,
+                "blob_gdn_frame_equal": blob_gdn_frame_equal,
                 "aql_host_us": aql_host_us,
                 "aql_gpu_us": gpu_us,
                 "hip_host_us": hip_host_us,
@@ -1655,9 +1674,9 @@ pub fn redline_shadow_deepseek4(
             let logits_equal = aql_snapshot.logits() == hip_snapshot.logits();
             let kv_equal = aql_snapshot.kv() == hip_snapshot.kv();
             let recurrent_equal = aql_snapshot.recurrent() == hip_snapshot.recurrent();
-            let blob_bit_exact = aql_snapshot.logits() == blob_snapshot.logits()
-                && aql_snapshot.kv() == blob_snapshot.kv()
-                && aql_snapshot.recurrent() == blob_snapshot.recurrent();
+            let gdn_frame_equal = aql_snapshot.gdn_frame() == hip_snapshot.gdn_frame();
+            let blob_gdn_frame_equal = aql_snapshot.gdn_frame() == blob_snapshot.gdn_frame();
+            let blob_bit_exact = redline_snapshots_bit_exact(&aql_snapshot, &blob_snapshot);
             Ok(serde_json::json!({
                 "type": "redline_shadow_result",
                 "backend": if pm4 { "pm4_ib" } else { "aql_packets" },
@@ -1667,11 +1686,13 @@ pub fn redline_shadow_deepseek4(
                 "packets": prepared.1,
                 "queue_id": prepared.2,
                 "command_dwords": prepared.3,
-                "bit_exact": logits_equal && kv_equal && recurrent_equal,
+                "bit_exact": redline_snapshots_bit_exact(&aql_snapshot, &hip_snapshot),
                 "blob_bit_exact": blob_bit_exact,
                 "logits_equal": logits_equal,
                 "kv_equal": kv_equal,
                 "recurrent_equal": recurrent_equal,
+                "gdn_frame_equal": gdn_frame_equal,
+                "blob_gdn_frame_equal": blob_gdn_frame_equal,
                 "aql_host_us": aql_host_us,
                 "aql_gpu_us": gpu_us,
                 "hip_host_us": hip_host_us,
@@ -2204,11 +2225,15 @@ pub fn handle_redline_dspark_shadow_pm4(
 
 const DFLASH_SHADOW_EXTRACT_LAYERS: [usize; 5] = [5, 19, 33, 47, 61];
 
-/// Unconditional Q8 byte parity is not a correctness oracle: Q8 DeltaNet
-/// uses stochastic rounding keyed on the GDN frame. Every arm resets the
-/// same frame checkpoint; tokens/argmax/indices stay bit-exact, and
-/// dequantized recurrent/hidden/logit regions are claim-scoped max-abs/rel.
+/// Legacy stochastic Q8 (no error-feedback residual) is not a byte-parity
+/// oracle: GDN requant uses stochastic rounding keyed on the frame. Retained
+/// only when `StateQuant::Q8` runs without EF. Deterministic Q8+EF and non-Q8
+/// state claim bit-exact recurrent bytes instead.
 const DFLASH_Q8_BYTE_PARITY_INVALID: &str = "unconditional Q8 recurrent-state byte parity is not a correctness oracle (stochastic GDN rounding); arms share a GDN frame checkpoint and compare tokens/argmax/indices bit-exact plus claim-scoped max-abs/rel on dequantized regions";
+
+/// Deterministic recurrent state (Q8+EF residual or non-Q8) may claim
+/// bit-exact DeltaNet bytes across arms, including the EF residual itself.
+const DFLASH_DETERMINISTIC_BYTE_PARITY: &str = "deterministic DeltaNet state (Q8 error-feedback residual or non-Q8) admits bit-exact recurrent-state byte parity across arms; tokens/argmax/indices stay bit-exact and claim-scoped max-abs/rel cover dequantized regions";
 
 struct RedlineDflashFixtures {
     hidden_rb: HiddenStateRingBuffer,
@@ -2239,9 +2264,11 @@ struct RedlineDflashWindowSnap {
     dn_s_after_forward: Vec<u8>,
     dn_scales_after_forward: Vec<u8>,
     dn_conv_after_forward: Vec<u8>,
+    dn_ef_after_forward: Vec<u8>,
     dn_s_after_rollback: Vec<u8>,
     dn_scales_after_rollback: Vec<u8>,
     dn_conv_after_rollback: Vec<u8>,
+    dn_ef_after_rollback: Vec<u8>,
     kv_active_hash: u64,
     kv_guard: Vec<u8>,
     hidden_staging: Vec<u8>,
@@ -2434,7 +2461,7 @@ fn redline_dflash_zero_fixtures(
 fn redline_append_dn_parts(
     gpu: &rdna_compute::Gpu,
     slot: &ModelSlot,
-) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>), String> {
+) -> Result<(Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>), String> {
     let mut s = Vec::new();
     for tensor in &slot.dn_state.s_matrices {
         redline_append_buffer(gpu, &mut s, &tensor.buf)?;
@@ -2447,7 +2474,11 @@ fn redline_append_dn_parts(
     for tensor in &slot.dn_state.conv_states {
         redline_append_buffer(gpu, &mut conv, &tensor.buf)?;
     }
-    Ok((s, scales, conv))
+    let mut ef = Vec::new();
+    for tensor in &slot.dn_state.s_ef_residual {
+        redline_append_buffer(gpu, &mut ef, &tensor.buf)?;
+    }
+    Ok((s, scales, conv, ef))
 }
 
 fn redline_dflash_kv_regions(
@@ -2508,8 +2539,8 @@ fn redline_dflash_snapshot_window(
     position: usize,
     tokens: Vec<u32>,
     argmax: Vec<u32>,
-    after_forward: (Vec<u8>, Vec<u8>, Vec<u8>),
-    after_rollback: (Vec<u8>, Vec<u8>, Vec<u8>),
+    after_forward: (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>),
+    after_rollback: (Vec<u8>, Vec<u8>, Vec<u8>, Vec<u8>),
 ) -> Result<RedlineDflashWindowSnap, String> {
     let batch = tokens.len();
     let dim = fixtures.verify_scratch.dim;
@@ -2588,9 +2619,11 @@ fn redline_dflash_snapshot_window(
         dn_s_after_forward: after_forward.0,
         dn_scales_after_forward: after_forward.1,
         dn_conv_after_forward: after_forward.2,
+        dn_ef_after_forward: after_forward.3,
         dn_s_after_rollback: after_rollback.0,
         dn_scales_after_rollback: after_rollback.1,
         dn_conv_after_rollback: after_rollback.2,
+        dn_ef_after_rollback: after_rollback.3,
         kv_active_hash,
         kv_guard,
         hidden_staging,
@@ -2775,9 +2808,11 @@ fn redline_dflash_compare_window(
         "dn_s_after_forward": err(&reference.dn_s_after_forward, &other.dn_s_after_forward),
         "dn_scales_after_forward": err(&reference.dn_scales_after_forward, &other.dn_scales_after_forward),
         "dn_conv_after_forward": err(&reference.dn_conv_after_forward, &other.dn_conv_after_forward),
+        "dn_ef_after_forward_equal": bit(&reference.dn_ef_after_forward, &other.dn_ef_after_forward),
         "dn_s_after_rollback": err(&reference.dn_s_after_rollback, &other.dn_s_after_rollback),
         "dn_scales_after_rollback": err(&reference.dn_scales_after_rollback, &other.dn_scales_after_rollback),
         "dn_conv_after_rollback": err(&reference.dn_conv_after_rollback, &other.dn_conv_after_rollback),
+        "dn_ef_after_rollback_equal": bit(&reference.dn_ef_after_rollback, &other.dn_ef_after_rollback),
     })
 }
 
@@ -3178,6 +3213,18 @@ pub fn redline_shadow_dflash_verify_pm4(
             .as_ref()
             .and_then(|s| s.verify_pm4_report());
 
+        // Q8+EF (default-on) and non-Q8 state are deterministic byte-parity
+        // oracles. Only legacy stochastic Q8 without an EF residual keeps the
+        // invalid-parity warning — decide from StateQuant, not vector emptiness.
+        let is_q8 = matches!(slot.dn_state.quant, qwen35::StateQuant::Q8);
+        let q8_error_feedback_enabled = is_q8 && !slot.dn_state.s_ef_residual.is_empty();
+        let q8_byte_parity_invalid = is_q8 && !q8_error_feedback_enabled;
+        let oracle = if q8_byte_parity_invalid {
+            DFLASH_Q8_BYTE_PARITY_INVALID
+        } else {
+            DFLASH_DETERMINISTIC_BYTE_PARITY
+        };
+
         Ok(serde_json::json!({
             "type": "redline_dflash_shadow_result",
             "backend": "pm4_ib",
@@ -3190,7 +3237,7 @@ pub fn redline_shadow_dflash_verify_pm4(
             "arch_id": loaded.arch_id,
             "physical_cap": loaded.physical_cap,
             "model": redline_artifact_fingerprint(&loaded.model_path),
-            "oracle": DFLASH_Q8_BYTE_PARITY_INVALID,
+            "oracle": oracle,
             "arms": {
                 "hip_auto": redline_dflash_arm_json(&hip_auto),
                 "direct_capture_safe": redline_dflash_arm_json(&direct_capture_safe),
@@ -3198,7 +3245,8 @@ pub fn redline_shadow_dflash_verify_pm4(
                 "pm4": redline_dflash_arm_json(&pm4),
             },
             "parity": {
-                "q8_byte_parity_invalid": true,
+                "q8_error_feedback_enabled": q8_error_feedback_enabled,
+                "q8_byte_parity_invalid": q8_byte_parity_invalid,
                 "windows": parity_windows,
             },
             "capture": {
@@ -3309,6 +3357,17 @@ pub fn handle_redline_shadow(
         .get("iterations")
         .and_then(|value| value.as_u64())
         .unwrap_or(1) as usize;
+    let position_step = msg
+        .get("position_step")
+        .and_then(|value| value.as_u64())
+        .unwrap_or(1) as usize;
+    let position =
+        |iteration: usize| context.saturating_add(iteration.saturating_mul(position_step));
+    let replay_only = pm4
+        && msg
+            .get("replay_only")
+            .and_then(|value| value.as_bool())
+            .unwrap_or(false);
     if model.as_ref().is_some_and(|loaded| {
         loaded.state.as_ref().is_some_and(|s| {
             (s.as_ref() as &dyn Any).is::<hipfire_arch_deepseek4::Deepseek4Bundle>()
@@ -3392,20 +3451,24 @@ pub fn handle_redline_shadow(
         let started = Instant::now();
         let mut gpu_us = 0.0;
         for i in 0..iterations {
+            bundle
+                .kv_cache
+                .ensure_mapped_capacity(gpu, position(i).saturating_add(1))
+                .map_err(|error| error.to_string())?;
             qwen35::prepare_scratch_inputs(
                 gpu,
                 &bundle.weights,
                 &bundle.config,
                 101 + i as u32,
-                context + i,
+                position(i),
                 &bundle.scratch,
             )
             .map_err(|error| error.to_string())?;
             if pm4 {
-                let timing = unsafe { gpu.replay.replay_pm4(context + i) }?;
+                let timing = unsafe { gpu.replay.replay_pm4(position(i)) }?;
                 gpu_us += timing.span_microseconds();
             } else {
-                let timing = unsafe { gpu.replay.replay_linear_aql(context + i) }?;
+                let timing = unsafe { gpu.replay.replay_linear_aql(position(i)) }?;
                 gpu_us += timing.span_microseconds();
             }
         }
@@ -3431,8 +3494,24 @@ pub fn handle_redline_shadow(
             return;
         }
     };
+    if replay_only {
+        let response = serde_json::json!({
+            "type": "redline_shadow_pm4",
+            "replay_only": true,
+            "context_tokens": context,
+            "iterations": iterations,
+            "position_step": position_step,
+            "queue_id": prepared.2,
+            "aql_host_us": aql_host_us,
+            "aql_gpu_us": aql_gpu_us,
+        });
+        let _ = writeln!(stdout, "{response}");
+        let _ = stdout.flush();
+        return;
+    }
 
     let blob_result = (|| -> Result<RedlineQwenSnapshot, String> {
+        rdna_compute::norm::restore_gdn_requant_frame_checkpoint(frame_checkpoint);
         let loaded = model.as_mut().expect("eligibility checked");
         let Some(bundle) = loaded.state.as_mut().and_then(|s| {
             (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
@@ -3447,11 +3526,11 @@ pub fn handle_redline_shadow(
                 &bundle.weights,
                 &bundle.config,
                 101 + i as u32,
-                context + i,
+                position(i),
                 &bundle.scratch,
             )
             .map_err(|error| error.to_string())?;
-            gpu.replay_recorded_hip_prefix(prepared.0)
+            gpu.replay_recorded_hip_prefix_at(prepared.0, position(i))
                 .map_err(|error| error.to_string())?;
         }
         gpu.hip
@@ -3495,7 +3574,7 @@ pub fn handle_redline_shadow(
                 &bundle.weights,
                 &bundle.config,
                 101 + i as u32,
-                context + i,
+                position(i),
                 &mut bundle.kv_cache,
                 &mut bundle.dn_state,
                 &bundle.scratch,
@@ -3527,10 +3606,10 @@ pub fn handle_redline_shadow(
     let logits_equal = aql_snapshot.logits == hip_snapshot.logits;
     let kv_equal = aql_snapshot.kv == hip_snapshot.kv;
     let recurrent_equal = aql_snapshot.recurrent == hip_snapshot.recurrent;
-    let bit_exact = logits_equal && kv_equal && recurrent_equal;
-    let blob_bit_exact = aql_snapshot.logits == blob_snapshot.logits
-        && aql_snapshot.kv == blob_snapshot.kv
-        && aql_snapshot.recurrent == blob_snapshot.recurrent;
+    let gdn_frame_equal = aql_snapshot.gdn_frame == hip_snapshot.gdn_frame;
+    let blob_gdn_frame_equal = aql_snapshot.gdn_frame == blob_snapshot.gdn_frame;
+    let bit_exact = aql_snapshot == hip_snapshot;
+    let blob_bit_exact = aql_snapshot == blob_snapshot;
     let _ = writeln!(
         stdout,
         "{}",
@@ -3548,6 +3627,8 @@ pub fn handle_redline_shadow(
             "logits_equal": logits_equal,
             "kv_equal": kv_equal,
             "recurrent_equal": recurrent_equal,
+            "gdn_frame_equal": gdn_frame_equal,
+            "blob_gdn_frame_equal": blob_gdn_frame_equal,
             "aql_host_us": aql_host_us,
             "aql_gpu_us": aql_gpu_us,
             "hip_host_us": hip_host_us,
@@ -3889,7 +3970,7 @@ pub fn handle_redline_pm4_prefix_profile(
             "redline_pm4_prefix_profile requires captured single-GPU Qwen3.5 and valid start/step/repeats",
             "validation",
             false,
-            false
+            false,
         );
         let _ = stdout.flush();
         return;
@@ -4410,4 +4491,30 @@ pub fn handle_redline_prefix_shadow(
         })
     );
     let _ = stdout.flush();
+}
+
+#[cfg(test)]
+mod redline_snapshot_tests {
+    use super::{redline_snapshots_bit_exact, RedlineQwenSnapshot, RedlineSnapshot};
+
+    fn qwen_snapshot(gdn_frame: u32) -> RedlineSnapshot {
+        RedlineSnapshot::Qwen(RedlineQwenSnapshot {
+            logits: vec![1, 2],
+            kv: vec![3, 4],
+            recurrent: vec![5, 6],
+            gdn_frame,
+        })
+    }
+
+    #[test]
+    fn q8_gdn_frame_participates_in_shadow_bit_exactness() {
+        assert!(redline_snapshots_bit_exact(
+            &qwen_snapshot(17),
+            &qwen_snapshot(17)
+        ));
+        assert!(!redline_snapshots_bit_exact(
+            &qwen_snapshot(17),
+            &qwen_snapshot(18)
+        ));
+    }
 }

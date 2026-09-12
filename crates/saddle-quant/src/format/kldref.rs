@@ -800,6 +800,7 @@ mod tests {
             },
             oracle: OracleStats {
                 mean_nll: 1.0,
+                #[allow(clippy::approx_constant)] // fixture pins a measured-looking PPL, not E
                 ppl: 2.718,
                 n_scored: 0,
             },

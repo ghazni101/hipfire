@@ -3213,3 +3213,285 @@ fn lowbit_ptq_gate(format: GgufFormat, allowed: bool) -> Result<(), String> {
         format.label(),
     ))
 }
+
+// ─── Maple native-ternary packing (MQ2G256LloydU, qt=51) ────────────────────
+
+/// Pack natively-ternary weights into the MQ2-Lloyd container EXACTLY.
+///
+/// Unlike [`quantize_mq2g256_lloyd_k3`], this applies **no FWHT**. The rotation
+/// is orthogonal so the dot product is preserved in principle, but it destroys
+/// the three-value structure that is precisely what lets a K=3 codebook be
+/// exact — post-rotation the block is dense and the codebook can only
+/// approximate it. Weights therefore stay in the natural basis, and the runtime
+/// must not rotate x for this dtype (`DType::MQ2G256LloydU`,
+/// `RotationPlan::None`).
+///
+/// Each 256-block must hold at most 3 distinct values; those become the
+/// codebook, sorted ascending as the kernel requires. Slot 3 duplicates the top
+/// slot and is never indexed.
+///
+/// Returns `Err` rather than approximating. A non-ternary block means the
+/// caller's premise about the checkpoint is wrong, and silently falling back to
+/// a lossy encode would make every downstream exactness claim vacuous while
+/// looking like success.
+pub(crate) fn quantize_mq2g256_ternary_exact(f32_data: &[f32]) -> Result<Vec<u8>, String> {
+    const GROUP_SIZE: usize = 256;
+    const BLOCK_BYTES: usize = 72;
+
+    let n = f32_data.len();
+    if n % GROUP_SIZE != 0 {
+        return Err(format!("length {n} is not a multiple of {GROUP_SIZE}"));
+    }
+    let n_blocks = n / GROUP_SIZE;
+    let mut output = vec![0u8; n_blocks * BLOCK_BYTES];
+
+    for (b, out_chunk) in output.chunks_mut(BLOCK_BYTES).enumerate() {
+        let group = &f32_data[b * GROUP_SIZE..(b + 1) * GROUP_SIZE];
+
+        // Distinct values, at most 3. Note `-0.0 == 0.0` in IEEE comparison, so
+        // the ~19% of Maple weights stored as -0.0 collapse onto the single
+        // zero codepoint instead of counting as a fourth level.
+        let mut levels: Vec<f32> = Vec::with_capacity(4);
+        for &w in group {
+            // Canonicalise -0.0 to +0.0. IEEE `==` already collapses them into
+            // one level, but without this the stored representative would be
+            // whichever SIGN happened to appear first in the block, so the same
+            // tensor could pack to two different byte strings. Invisible
+            // numerically (both are zero, and both contribute identically to a
+            // dot product) but it breaks reproducible, content-hashed
+            // artifacts — so pin the representative.
+            let w = if w == 0.0 { 0.0 } else { w };
+            if !levels.iter().any(|&l| l == w) {
+                levels.push(w);
+                if levels.len() > 3 {
+                    return Err(format!(
+                        "block {b} is not ternary: more than 3 distinct values"
+                    ));
+                }
+            }
+        }
+        levels.sort_by(|a, b| a.partial_cmp(b).unwrap_or(std::cmp::Ordering::Equal));
+
+        // Codebook padded to 4 by repeating the top level (never indexed).
+        let mut cb16 = [0u16; 4];
+        for i in 0..4 {
+            let idx = i.min(levels.len() - 1);
+            cb16[i] = f32_to_f16(levels[idx]);
+        }
+
+        // The GPU decodes these as fp16. Verify the round-trip is lossless for
+        // THESE values before committing to the encoding — an approximate scale
+        // here would be a silent precision loss, not an error.
+        for (i, &l) in levels.iter().enumerate() {
+            if f16_to_f32(cb16[i]) != l {
+                return Err(format!(
+                    "block {b}: level {l} is not exactly representable in fp16"
+                ));
+            }
+        }
+        for i in 0..4 {
+            out_chunk[2 * i..2 * i + 2].copy_from_slice(&cb16[i].to_le_bytes());
+        }
+
+        // 2-bit indices, 4 per byte, LSB-first — identical to MQ2-Lloyd.
+        for i in 0..64 {
+            let mut byte_val = 0u8;
+            for j in 0..4 {
+                let w = group[4 * i + j];
+                // Same canonicalisation as above: a -0.0 weight must find the
+                // +0.0 level. IEEE `==` makes this hold either way, but keep
+                // the two sites visibly symmetric.
+                let w = if w == 0.0 { 0.0 } else { w };
+                let idx = levels.iter().position(|&l| l == w).unwrap_or(0) as u8;
+                byte_val |= (idx & 0x3) << (j * 2);
+            }
+            out_chunk[8 + i] = byte_val;
+        }
+    }
+    Ok(output)
+}
+
+/// Dequantize `MQ2G256LloydU`. Identical to [`dequantize_mq2g256_lloyd_to_f32`]
+/// minus the `cpu_inv_fwht_256` step: these weights are already in the natural
+/// basis.
+pub(crate) fn dequantize_mq2g256_lloyd_u_to_f32(data: &[u8], n_weights: usize) -> Vec<f32> {
+    const GROUP_SIZE: usize = 256;
+    const BLOCK_BYTES: usize = 72;
+
+    let n_blocks = n_weights.div_ceil(GROUP_SIZE);
+    assert!(
+        data.len() == n_blocks * BLOCK_BYTES,
+        "expected {} bytes for {} weights, got {}",
+        n_blocks * BLOCK_BYTES,
+        n_weights,
+        data.len()
+    );
+    let mut out = vec![0.0f32; n_weights];
+    for (b, out_chunk) in out.chunks_mut(GROUP_SIZE).enumerate() {
+        let blk = &data[b * BLOCK_BYTES..(b + 1) * BLOCK_BYTES];
+        let cb: [f32; 4] = [
+            f16_to_f32(u16::from_le_bytes([blk[0], blk[1]])),
+            f16_to_f32(u16::from_le_bytes([blk[2], blk[3]])),
+            f16_to_f32(u16::from_le_bytes([blk[4], blk[5]])),
+            f16_to_f32(u16::from_le_bytes([blk[6], blk[7]])),
+        ];
+        for i in 0..64 {
+            let byte_val = blk[8 + i];
+            for j in 0..4 {
+                let pos = 4 * i + j;
+                if pos >= out_chunk.len() {
+                    break;
+                }
+                out_chunk[pos] = cb[((byte_val >> (j * 2)) & 0x3) as usize];
+            }
+        }
+    }
+    out
+}
+
+#[cfg(test)]
+mod maple_ternary_exact_tests {
+    use super::*;
+
+    /// A real Maple row scale, read off the published checkpoint.
+    const S: f32 = 0.024169922;
+
+    fn ternary_block(n: usize, s: f32) -> Vec<f32> {
+        (0..n)
+            .map(|i| match i % 3 {
+                0 => -s,
+                1 => 0.0,
+                _ => s,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn ternary_exact_round_trips_with_zero_error() {
+        let vals = ternary_block(512, S);
+        let packed = quantize_mq2g256_ternary_exact(&vals).expect("ternary input");
+        assert_eq!(packed.len(), 2 * 72, "72 B per 256-weight group");
+
+        let recon = dequantize_mq2g256_lloyd_u_to_f32(&packed, vals.len());
+        let max_err = vals
+            .iter()
+            .zip(&recon)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert_eq!(max_err, 0.0, "ternary packing must be exact");
+    }
+
+    #[test]
+    fn ternary_exact_codebook_is_ascending_with_top_slot_duplicated() {
+        let vals = ternary_block(256, 0.03125);
+        let packed = quantize_mq2g256_ternary_exact(&vals).unwrap();
+        let cb: Vec<f32> = (0..4)
+            .map(|i| f16_to_f32(u16::from_le_bytes([packed[2 * i], packed[2 * i + 1]])))
+            .collect();
+        assert!(
+            cb[0] <= cb[1] && cb[1] <= cb[2] && cb[2] <= cb[3],
+            "kernel requires ascending codebook: {cb:?}"
+        );
+        assert_eq!(cb[3], cb[2], "slot 3 duplicates the top slot");
+        assert_eq!(cb[0], -0.03125);
+        assert_eq!(cb[1], 0.0);
+        assert_eq!(cb[2], 0.03125);
+    }
+
+    #[test]
+    fn ternary_exact_refuses_non_ternary_input() {
+        // NEGATIVE CONTROL. Without a hard refusal the packer could silently
+        // emit a lossy approximation and every downstream exactness claim
+        // would be vacuous.
+        let vals: Vec<f32> = (0..256).map(|i| i as f32 * 0.001).collect();
+        let err = quantize_mq2g256_ternary_exact(&vals).unwrap_err();
+        assert!(err.contains("not ternary"), "got: {err}");
+    }
+
+    #[test]
+    fn ternary_exact_accepts_degenerate_all_zero_block() {
+        let vals = vec![0.0f32; 256];
+        let packed = quantize_mq2g256_ternary_exact(&vals).unwrap();
+        let recon = dequantize_mq2g256_lloyd_u_to_f32(&packed, 256);
+        assert!(recon.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn ternary_exact_treats_negative_zero_as_zero() {
+        // ~19% of published Maple weights are -0.0. They must collapse onto the
+        // single zero codepoint rather than counting as a fourth distinct level.
+        let mut vals = ternary_block(256, S);
+        for (i, v) in vals.iter_mut().enumerate() {
+            if *v == 0.0 && i % 2 == 0 {
+                *v = -0.0;
+            }
+        }
+        let packed = quantize_mq2g256_ternary_exact(&vals).expect("-0.0 is still ternary");
+        let recon = dequantize_mq2g256_lloyd_u_to_f32(&packed, vals.len());
+        let max_err = vals
+            .iter()
+            .zip(&recon)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0.0f32, f32::max);
+        assert_eq!(max_err, 0.0, "signed zero must not perturb any value");
+    }
+
+    #[test]
+    fn ternary_exact_index_bytes_match_a_hand_computed_layout() {
+        // INDEPENDENT ORACLE. The round-trip tests above use our own
+        // dequantizer, so a shared misunderstanding of the byte layout would
+        // round-trip perfectly and still feed the GPU kernel garbage. These
+        // expected bytes are computed by hand from the layout the kernel
+        // documents: [0..8) four fp16 codebook entries ascending, then 64 B of
+        // 2-bit indices, 4 per byte, LSB-first.
+        let vals = ternary_block(256, S);
+        let packed = quantize_mq2g256_ternary_exact(&vals).unwrap();
+
+        // levels ascending = [-S, 0.0, +S] -> index 0, 1, 2.
+        assert_eq!(&packed[0..2], &f32_to_f16(-S).to_le_bytes());
+        assert_eq!(&packed[2..4], &f32_to_f16(0.0).to_le_bytes());
+        assert_eq!(&packed[4..6], &f32_to_f16(S).to_le_bytes());
+        assert_eq!(
+            &packed[6..8],
+            &f32_to_f16(S).to_le_bytes(),
+            "slot 3 = slot 2"
+        );
+
+        // Byte 8 covers weights 0..3, whose i%3 gives levels -S,0,+S,-S
+        // => indices 0,1,2,0 => 0 | 1<<2 | 2<<4 | 0<<6 = 0x24.
+        assert_eq!(packed[8], 0x24, "weights 0..3");
+        // Byte 9 covers weights 4..7 => i%3 = 1,2,0,1 => indices 1,2,0,1
+        // => 1 | 2<<2 | 0<<4 | 1<<6 = 0x49.
+        assert_eq!(packed[9], 0x49, "weights 4..7");
+    }
+
+    #[test]
+    fn ternary_exact_is_byte_deterministic_regardless_of_zero_sign() {
+        // REGRESSION. Caught by cross-checking against an independent packer on
+        // real weights: IEEE `==` collapses -0.0 and +0.0 into one level, so
+        // the stored representative used to be whichever sign appeared FIRST in
+        // the block. Numerically invisible, but the same tensor could pack to
+        // two different byte strings, which breaks content-hashed artifacts.
+        let pos = ternary_block(256, S);
+        let neg: Vec<f32> = pos
+            .iter()
+            .map(|&w| if w == 0.0 { -0.0 } else { w })
+            .collect();
+        let a = quantize_mq2g256_ternary_exact(&pos).unwrap();
+        let b = quantize_mq2g256_ternary_exact(&neg).unwrap();
+        assert_eq!(a, b, "zero sign must not change the emitted bytes");
+        // And the canonical representative is +0.0 (0x0000), not -0.0 (0x8000).
+        assert_eq!(&a[2..4], &0u16.to_le_bytes(), "zero level must be +0.0");
+    }
+
+    #[test]
+    fn ternary_exact_rejects_a_scale_that_fp16_cannot_hold() {
+        // Guards the exactness precondition. bf16 scales in Maple's measured
+        // range are fine, but a value needing >10 mantissa bits must be
+        // refused rather than silently rounded.
+        let s = f32::from_bits(0x3C80_0F00); // ~1.0037, more mantissa than fp16
+        let vals = ternary_block(256, s);
+        let err = quantize_mq2g256_ternary_exact(&vals).unwrap_err();
+        assert!(err.contains("fp16"), "got: {err}");
+    }
+}

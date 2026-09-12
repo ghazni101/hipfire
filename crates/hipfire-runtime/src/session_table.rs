@@ -166,25 +166,58 @@ impl SessionTable {
     /// Exactly one turn shorter, not merely a prefix: a session two turns
     /// behind is missing an assistant reply that never entered its KV, so
     /// appending the newest user turn to it would skip a turn.
+    /// Returns None when more than one non-busy matching candidate exists —
+    /// an LRU pick among duplicates would append to the wrong session.
     pub fn find_continuation(&self, want: &[u64], busy: &[SessionId]) -> Option<SessionId> {
         if want.len() < 2 {
             return None;
         }
         let expect = &want[..want.len() - 1];
-        self.sessions
-            .iter()
-            .filter(|(id, s)| {
-                // Residency is deliberately NOT a filter. A swapped session is
-                // exactly the case swap exists for: its snapshot holds the KV
-                // this turn wants. The caller restores it before use. Cold
-                // sessions have no snapshot, so they are excluded.
-                s.residency != Residency::Cold
-                    && s.convo.as_slice() == expect
-                    && !s.tokens.is_empty()
-                    && !busy.iter().any(|b| b.0 == **id)
-            })
-            .max_by_key(|(_, s)| s.last_used)
-            .map(|(id, _)| SessionId(*id))
+        let mut candidates: Vec<(u64, u64)> = Vec::new();
+        for (id, s) in self.sessions.iter() {
+            if s.residency == Residency::Cold {
+                continue;
+            }
+            if s.convo.as_slice() != expect {
+                continue;
+            }
+            if s.tokens.is_empty() {
+                continue;
+            }
+            if busy.iter().any(|b| b.0 == *id) {
+                continue;
+            }
+            candidates.push((*id, s.last_used));
+        }
+        if candidates.len() != 1 {
+            return None;
+        }
+        Some(SessionId(candidates[0].0))
+    }
+
+    /// Confirm that `id` is the session a tool-result iteration names, and that
+    /// it may be extended in place.
+    ///
+    /// A tool-result turn adds no user turn, so `want` matches the session's
+    /// conversation exactly — which is precisely why it must NOT be searched
+    /// for: every duplicate of the same conversation matches equally well, and
+    /// an LRU pick among them appends `<tool_response>` blocks to whichever
+    /// session was touched last, not to the one that emitted the calls being
+    /// answered. The caller identifies the session from the tool-call ids it
+    /// handed the client; this only re-checks the session is still that
+    /// conversation, so a stale or evicted id falls back to a cold prefill.
+    pub fn confirm_reentry(
+        &self,
+        id: SessionId,
+        want: &[u64],
+        busy: &[SessionId],
+    ) -> Option<SessionId> {
+        if want.is_empty() || busy.iter().any(|b| b.0 == id.0) {
+            return None;
+        }
+        let s = self.sessions.get(&id.0)?;
+        (s.residency != Residency::Cold && s.convo.as_slice() == want && !s.tokens.is_empty())
+            .then_some(id)
     }
 
     /// Mark a session as most-recently used, for LRU.
@@ -463,6 +496,70 @@ mod tests {
             None,
             "turn 1 is not a continuation"
         );
+    }
+
+    #[test]
+    fn confirm_reentry_accepts_the_named_session_holding_that_conversation() {
+        let (mut pool, mut adm, mut t) = rig(2);
+        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
+        {
+            let s = t.get_mut(a).unwrap();
+            s.convo = vec![11, 22];
+            s.tokens = vec![1, 2, 3];
+        }
+        assert_eq!(t.confirm_reentry(a, &[11, 22], &[]), Some(a));
+    }
+
+    #[test]
+    fn confirm_reentry_never_falls_through_to_a_duplicate_conversation() {
+        // Two sessions, same user turns, different generated tool calls. The
+        // caller names the one that emitted the calls being answered; the other
+        // must not stand in for it however recently it was used.
+        let (mut pool, mut adm, mut t) = rig(2);
+        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
+        let b = t.open(&mut pool, &mut adm, 1024).unwrap();
+        for id in [a, b] {
+            let s = t.get_mut(id).unwrap();
+            s.convo = vec![11];
+            s.tokens = vec![1, 2, 3];
+        }
+        t.touch(b);
+        assert_eq!(t.confirm_reentry(a, &[11], &[]), Some(a));
+        t.close(&mut pool, &mut adm, a);
+        assert_eq!(
+            t.confirm_reentry(a, &[11], &[]),
+            None,
+            "a closed session must not resolve to its surviving twin"
+        );
+    }
+
+    #[test]
+    fn confirm_reentry_refuses_a_session_whose_conversation_moved_on() {
+        let (mut pool, mut adm, mut t) = rig(2);
+        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
+        {
+            let s = t.get_mut(a).unwrap();
+            s.convo = vec![11, 22];
+            s.tokens = vec![1, 2, 3];
+        }
+        assert_eq!(t.confirm_reentry(a, &[11], &[]), None);
+    }
+
+    #[test]
+    fn confirm_reentry_refuses_cold_busy_and_empty_sessions() {
+        let (mut pool, mut adm, mut t) = rig(2);
+        let a = t.open(&mut pool, &mut adm, 1024).unwrap();
+        {
+            let s = t.get_mut(a).unwrap();
+            s.convo = vec![11];
+            s.tokens = vec![1];
+        }
+        assert_eq!(t.confirm_reentry(a, &[11], &[a]), None, "busy");
+        t.get_mut(a).unwrap().tokens.clear();
+        assert_eq!(t.confirm_reentry(a, &[11], &[]), None, "nothing in its KV");
+        t.get_mut(a).unwrap().tokens = vec![1];
+        t.mark_cold(&mut pool, a);
+        assert_eq!(t.confirm_reentry(a, &[11], &[]), None, "cold");
     }
 
     #[test]

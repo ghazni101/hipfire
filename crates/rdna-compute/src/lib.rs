@@ -11,6 +11,8 @@ mod compiler;
 mod dispatch;
 pub mod embedding;
 pub mod feature_flags;
+#[cfg(feature = "flash-attn-ck")]
+pub mod flash_attn_ck;
 pub mod gemm;
 mod gemma4_ops;
 pub mod gemv;
@@ -39,7 +41,7 @@ pub use dispatch::{
 };
 pub use feature_flags::FeatureFlags;
 pub use hip_bridge::{HipError, HipResult};
-use std::sync::OnceLock;
+use hipfire_config::developer_bool;
 
 /// Calibration-only override that forces native-BF16 teachers to stay BF16.
 ///
@@ -52,8 +54,10 @@ use std::sync::OnceLock;
 /// reuse, no LDS, no MFMA). OFF by default so shipped inference is
 /// unaffected.
 pub fn calib_force_bf16() -> bool {
-    static CELL: OnceLock<bool> = OnceLock::new();
-    *CELL.get_or_init(|| std::env::var("HIPFIRE_CALIB_BF16").as_deref() == Ok("1"))
+    // Snapshot-backed (mirrors `FeatureFlags::calib_force_bf16`): no
+    // process-global cache here, the versioned `ProcessConfig` snapshot is
+    // itself resolved once. Arch callers keep calling this free function.
+    developer_bool("HIPFIRE_CALIB_BF16", false)
 }
 pub use kernels::GEMV_SRC;
 /// whose gfx11 and gfx12 kernels are separate translation units. Exported so
@@ -70,14 +74,12 @@ mod tests {
         // Spec requires false when HIPFIRE_CALIB_BF16 is not "1".
         // In CI the var is unset; if a prior test or env sets it to "1"
         // we skip rather than flake — the contract is OFF by default.
-        if std::env::var("HIPFIRE_CALIB_BF16").as_deref() == Ok("1") {
+        if hipfire_config::developer_var("HIPFIRE_CALIB_BF16").as_deref() == Ok("1") {
             return;
         }
-        // Ensure the var is not "1" for this assertion path.
-        // When OnceLock is already cached as true (because some earlier
-        // call saw "1"), the cached true would violate the unset
-        // expectation — but that path is unreachable when the env is
-        // unset at process start, which is the acceptance condition.
+        // Ensure the var is not "1" for this assertion path. The snapshot
+        // is resolved once per process; in CI the var is unset at process
+        // start, which is the acceptance condition.
         assert!(
             !calib_force_bf16(),
             "calib_force_bf16() must be false when HIPFIRE_CALIB_BF16 != \"1\" (OFF by default)"

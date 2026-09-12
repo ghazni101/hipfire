@@ -236,6 +236,9 @@ fn main() {
                 .expect("reference: download logits"),
         );
 
+        // DECODE_STEPS is currently 0 ("was 3"), so this range folds to 0..0;
+        // the loop must stay for the day the mrope decode steps come back.
+        #[allow(clippy::reversed_empty_ranges)]
         for k in 0..DECODE_STEPS {
             // `forward_scratch`, NOT forward_prefill_batch with a 1-token slice.
             //

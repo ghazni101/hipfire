@@ -455,11 +455,23 @@ pub struct QwenArSemanticProducer {
 
 impl QwenArSemanticProducer {
     pub fn new(id: impl Into<String>, started_in_think: bool) -> Self {
+        Self::new_with_tool_protocol(id, started_in_think, true)
+    }
+
+    pub fn new_with_tool_protocol(
+        id: impl Into<String>,
+        started_in_think: bool,
+        tool_protocol_enabled: bool,
+    ) -> Self {
         Self {
             id: id.into(),
             filter: EosFilter::new(qwen_ar_eos_filter_config()),
             think_router: ThinkOutputRouter::new(started_in_think),
-            router: ToolOutputRouter::new(),
+            router: if tool_protocol_enabled {
+                ToolOutputRouter::new()
+            } else {
+                ToolOutputRouter::disabled()
+            },
             visible_acc: String::new(),
             raw_committed: Vec::new(),
             raw_commit_positions: Vec::new(),
@@ -688,17 +700,20 @@ pub fn qwen_ar_eviction_prefill_chunk_limit(
 }
 
 pub fn ckpt_resume_enabled() -> bool {
-    std::env::var("HIPFIRE_CACHE_CKPT_RESUME").ok().as_deref() != Some("0")
+    hipfire_config::developer_var("HIPFIRE_CACHE_CKPT_RESUME")
+        .ok()
+        .as_deref()
+        != Some("0")
 }
 pub fn ckpt_interval() -> usize {
-    std::env::var("HIPFIRE_CACHE_CKPT_INTERVAL")
+    hipfire_config::developer_var("HIPFIRE_CACHE_CKPT_INTERVAL")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(2048)
         .max(256)
 }
 pub fn ckpt_max() -> usize {
-    std::env::var("HIPFIRE_CACHE_CKPT_MAX")
+    hipfire_config::developer_var("HIPFIRE_CACHE_CKPT_MAX")
         .ok()
         .and_then(|v| v.parse().ok())
         .unwrap_or(8)
@@ -736,6 +751,7 @@ pub enum GenerationRoute {
     Deepseek4Spec,
     CohereAr,
     CohereSpec,
+    MapleAr,
     MiniMaxAr,
     MiniMaxEp,
     MiniMaxSpec,
@@ -764,6 +780,7 @@ impl GenerationRoute {
         Self::Deepseek4Spec,
         Self::CohereAr,
         Self::CohereSpec,
+        Self::MapleAr,
         Self::MiniMaxAr,
         Self::MiniMaxEp,
         Self::MiniMaxSpec,
@@ -780,7 +797,20 @@ impl GenerationRoute {
     ];
 
     /// Proven semantic-safe producers for non-empty tools.
-    /// Exactly: Qwen AR, Qwen DFlash/spec, DS4 AR, DS4 EP, DS4 spec, Glimmer AR, Glimmer spec.
+    /// Exactly: Qwen AR, Qwen DFlash/spec, DS4 AR, DS4 EP, DS4 spec, Glimmer
+    /// AR, Glimmer spec, Maple AR.
+    ///
+    /// `MapleAr` is admitted on the LEGACY contract, not semantic v2: its
+    /// carrier keeps `semantic_contract_version: None` (no router-backed
+    /// producer on arch 15, and the v2 fold appends token text verbatim, which
+    /// would misfile Maple's `<think>` span as content instead of reasoning).
+    /// Legacy is a first-class tool carrier — the client fold collects
+    /// `{"type":"tool_calls"}` events and releases them on a
+    /// `finish_reason == "tool_calls"` terminal. `generate_maple` emits exactly
+    /// that, parsing calls with the SAME
+    /// `emit_text::extract_tool_calls_from_text` used for `qwen_ar`, because
+    /// Maple's vendor template emits the identical
+    /// `<tool_call>{json}</tool_call>` shape.
     pub const fn supports_tools(self) -> bool {
         matches!(
             self,
@@ -791,6 +821,7 @@ impl GenerationRoute {
                 | Self::Deepseek4Spec
                 | Self::GlimmerAr
                 | Self::GlimmerSpec
+                | Self::MapleAr
         )
     }
 
@@ -805,6 +836,7 @@ impl GenerationRoute {
             Self::Deepseek4Spec => "deepseek4_spec",
             Self::CohereAr => "cohere_ar",
             Self::CohereSpec => "cohere_spec",
+            Self::MapleAr => "maple_ar",
             Self::MiniMaxAr => "minimax_ar",
             Self::MiniMaxEp => "minimax_ep",
             Self::MiniMaxSpec => "minimax_spec",
@@ -898,6 +930,11 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
                 GenerationRoute::CohereAr
             };
         }
+        // Maple-Preview. No spec variant: `MapleCarrier::caps()` declares no
+        // dflash and no MTP, and there is no maple verify path, so a
+        // speculator built by the carrier must NOT change the route — an
+        // arch-15 turn is always plain AR.
+        15 => return GenerationRoute::MapleAr,
         10 => {
             let spec_ok = i.has_speculator && (i.temp <= 1e-6 || i.ngram_can_sample);
             return if spec_ok {
@@ -915,7 +952,7 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
             };
         }
         8 => return GenerationRoute::DotsOcr,
-        15 => return GenerationRoute::K2HorizonAr,
+        16 => return GenerationRoute::K2HorizonAr,
         _ => {}
     }
 
@@ -1088,8 +1125,14 @@ pub fn generate(
         nonneutral_penalties: repeat_penalty != 1.0
             || presence_penalty != 0.0
             || frequency_penalty != 0.0,
-        force_ar_chat: std::env::var("HIPFIRE_DFLASH_CHAT").ok().as_deref() == Some("0"),
-        temp_spec_env_off: std::env::var("HIPFIRE_DFLASH_TEMP_SPEC").ok().as_deref() == Some("0"),
+        force_ar_chat: hipfire_config::developer_var("HIPFIRE_DFLASH_CHAT")
+            .ok()
+            .as_deref()
+            == Some("0"),
+        temp_spec_env_off: hipfire_config::developer_var("HIPFIRE_DFLASH_TEMP_SPEC")
+            .ok()
+            .as_deref()
+            == Some("0"),
         fast_sample_on: hipfire_runtime::config::get().dflash_fast_sample,
         supports_temp_swor,
         supports_chain_nucleus_verify,
@@ -1101,9 +1144,20 @@ pub fn generate(
         crate::dense::emit_active_attempt_error(
             stdout,
             Some(id),
+            // Derived from `supports_tools`, not hand-listed: the previous
+            // literal had already drifted (it omitted glimmer_ar/glimmer_spec,
+            // which were tool-capable), so a refusal named routes that were in
+            // fact supported. Deriving it keeps the message true by
+            // construction as the whitelist grows.
             &format!(
-                "tools are not supported on producer route {} (semantic-safe producers: qwen_ar, qwen_dflash, deepseek4_ar, deepseek4_ep, deepseek4_spec)",
-                selected_route.name()
+                "tools are not supported on producer route {} (semantic-safe producers: {})",
+                selected_route.name(),
+                GenerationRoute::ALL
+                    .iter()
+                    .filter(|r| r.supports_tools())
+                    .map(|r| r.name())
+                    .collect::<Vec<_>>()
+                    .join(", ")
             ),
             "unsupported",
             false,
@@ -1158,6 +1212,7 @@ pub fn generate(
                 top_p,
                 max_tokens,
                 max_think_tokens,
+                enable_thinking,
                 tools,
                 messages_history,
                 logprobs_top_k,
@@ -1195,6 +1250,7 @@ pub fn generate(
                 max_tokens,
                 max_think_tokens,
                 think_mode,
+                reasoning_effort,
                 tools,
                 messages_history,
             );
@@ -1205,7 +1261,7 @@ pub fn generate(
 
     // hunt3 M-E: seed the process-global CPU sampler RNG with this request's
     // seed so the grammar/CPU-fallback sample stream is isolated per request
-    // and does not carry RNG state across requests. Matches the u32 the GPU
+    // and does not carry RNG state across requests. Matches the u32 the
     // sample path uses (request_seed, derived by hipfire-engine's
     // request_seed_for from the wire `seed` field or the attempt key + counter).
     hipfire_runtime::llama::reset_cpu_sampler_rng(request_seed);
@@ -1236,7 +1292,7 @@ pub fn generate(
             // ladder, all done at the call site above) into the EP decode loops.
             // Previously the EP path dropped these to a hardcoded greedy argmax,
             // which loops on ds4's quantized instruct model (card mandates
-            // temp=1.0/top_p=1.0). reset_cpu_sampler_rng(0x13579BDF) was already
+            // temp=1.0/top_p=1.0). reset_cpu_sampler_rng(request_seed) was already
             // called above, so the host-side draw in ep_serve_* is deterministic.
             let ep_sampling = crate::qwen::EpSampling {
                 temp,
@@ -1257,6 +1313,8 @@ pub fn generate(
                 messages_history,
                 stop,
                 ep_sampling,
+                enable_thinking,
+                reasoning_effort,
             );
             return;
         }
@@ -1281,6 +1339,8 @@ pub fn generate(
                 messages_history,
                 stop,
                 ep_sampling,
+                enable_thinking,
+                reasoning_effort,
             );
             return;
         }
@@ -1305,6 +1365,7 @@ pub fn generate(
                 top_k.map(|k| k as usize).unwrap_or(0),
                 min_p.unwrap_or(0.0),
                 cactus_delta,
+                request_seed as u64,
                 reasoning_effort,
                 enable_thinking,
             ) {
@@ -1364,6 +1425,40 @@ pub fn generate(
             );
             return;
         }
+        GenerationRoute::MapleAr => {
+            // Arch 15 has no pflash/no eviction, but it DOES honour the
+            // QwenJinja reasoning contract: `enable_thinking` (from
+            // `thinking_enabled`), `assistant_prefix` (open/closed/plain) and
+            // the explicit `max_think_tokens` cap are threaded into the
+            // generate path so a user's `reasoning_effort:"none"` or cap is
+            // not silently ignored.
+            let _ = (
+                budget_alert_at_tok,
+                budget_alert_text,
+                pflash_state,
+                pflash_cfg,
+            );
+            let _ = stop;
+            crate::dense::generate_maple(
+                m,
+                gpu,
+                stdout,
+                id,
+                prompt,
+                system_prompt,
+                messages_history,
+                tools,
+                temp,
+                top_p,
+                max_tokens,
+                max_think_tokens,
+                assistant_prefix,
+                enable_thinking,
+                repeat_penalty,
+                repeat_window,
+            );
+            return;
+        }
         GenerationRoute::Deepseek4Spec => {
             let _ = (
                 budget_alert_at_tok,
@@ -1387,6 +1482,7 @@ pub fn generate(
                 top_p,
                 top_k.map(|k| k as usize).unwrap_or(0),
                 cactus_delta,
+                request_seed,
                 think_mode,
                 tools,
                 messages_history,
@@ -1441,6 +1537,7 @@ pub fn generate(
                 top_k.map(|k| k as usize).unwrap_or(0),
                 min_p.unwrap_or(0.0),
                 cactus_delta,
+                request_seed as u64,
                 reasoning_effort,
                 enable_thinking,
             ) {
@@ -1518,6 +1615,7 @@ pub fn generate(
                 top_k.map(|k| k as usize).unwrap_or(0),
                 min_p.unwrap_or(0.0),
                 cactus_delta,
+                request_seed as u64,
                 reasoning_effort,
                 enable_thinking,
             ) {
@@ -1623,6 +1721,7 @@ pub fn generate(
                 top_k.map(|k| k as usize).unwrap_or(0),
                 min_p.unwrap_or(0.0),
                 cactus_delta,
+                request_seed as u64,
                 reasoning_effort,
                 enable_thinking,
             ) {
@@ -1734,6 +1833,7 @@ pub fn generate(
                 stop,
                 reasoning_effort,
                 enable_thinking,
+                request_seed as u64,
             );
             return;
         }
@@ -1788,6 +1888,7 @@ pub fn generate(
                 top_k.map(|k| k as usize).unwrap_or(0),
                 min_p.unwrap_or(0.0),
                 cactus_delta,
+                request_seed as u64,
                 reasoning_effort,
                 enable_thinking,
             ) {
@@ -1849,7 +1950,11 @@ pub fn generate(
     // is OFF, physical grows unbounded up to max_seq; reset when we'd overrun.
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let prompt_est = tokenizer.encode(prompt).len() + 20;
-    if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+    if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         eprintln!(
             "[qwen-cache GEN-ENTRY] conv_tok={} seq_pos={}",
             m.conversation_tokens.len(),
@@ -2018,7 +2123,7 @@ pub fn generate(
             (None, None) => String::new(),
         }
     }
-    if std::env::var("HIPFIRE_PFLASH_DEBUG").is_ok() {
+    if hipfire_config::developer_var("HIPFIRE_PFLASH_DEBUG").is_ok() {
         eprintln!(
             "[pflash] gen: state={} cfg-present seq_pos={} q={} drafter_gpu={}",
             pflash_state.is_some(),
@@ -2143,7 +2248,10 @@ pub fn generate(
     // Jinja default-ON (flipped 2026-06-09): render through the model's chat
     // template for ALL arches; opt out with HIPFIRE_JINJA_CHAT=0 (hand-rolled
     // ChatML/Plain). Falls back to Plain automatically when no template resolves.
-    let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+    let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+        .ok()
+        .as_deref()
+        != Some("0");
     // Jinja renders the FULL conversation every turn (stateless full-render,
     // like crate::qwen::generate_dflash) — fire on every turn, not just `seq_pos == 0`.
     // `render_messages` below replays `messages_history` (all prior turns) and
@@ -2275,7 +2383,10 @@ pub fn generate(
     // (seq_pos=0, conversation_tokens.clear(), zero DeltaNet, KV
     // compact_offset=0) and prefill the FULL rendered prompt — DeltaNet
     // is not reversible to position M<N so partial rollback is unsafe.
-    let cache_kill_switch = std::env::var("HIPFIRE_QWEN_PROMPT_CACHE").ok().as_deref() == Some("0");
+    let cache_kill_switch = hipfire_config::developer_var("HIPFIRE_QWEN_PROMPT_CACHE")
+        .ok()
+        .as_deref()
+        == Some("0");
     let pflash_active = pflash_cfg
         .map(|c| !matches!(c.mode, hipfire_pflash::pflash::PflashMode::Off))
         .unwrap_or(false);
@@ -2291,7 +2402,10 @@ pub fn generate(
     // so the operator gets consistent rendering across all turns.
     // Cache-with-Jinja is a future project (would require Jinja-side
     // assistant-turn replay).
-    let jinja_active = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0")
+    let jinja_active = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+        .ok()
+        .as_deref()
+        != Some("0")
         && m.chat_template.is_some();
     // Cache-with-Jinja (item #37): `jinja_active` is NO LONGER a disqualifier.
     // When jinja is active the prompt-build below routes through
@@ -2303,7 +2417,11 @@ pub fn generate(
         && m.eviction.is_none()
         && !pflash_active
         && !m.conversation_tokens.is_empty();
-    if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+    if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+        .ok()
+        .as_deref()
+        == Some("1")
+    {
         eprintln!(
             "[qwen-cache eligible] eligible={} kill={} hist={} evict_none={} !pflash={} jinja={} conv_tok={}",
             cache_eligible, cache_kill_switch, messages_history.is_some(),
@@ -2313,7 +2431,10 @@ pub fn generate(
     let mut cached_tokens_count: usize = 0;
     let new_tokens: Vec<u32> = if cache_eligible {
         let history = messages_history.unwrap();
-        let trace_cache = std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1");
+        let trace_cache = hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+            .ok()
+            .as_deref()
+            == Some("1");
         // Build the canonical full-conversation token stream, replaying
         // any historical assistant turn whose fingerprint matches a
         // cached emission (BPE-bijective replacement).
@@ -3239,7 +3360,7 @@ pub fn generate(
         // stream as the sample kernel launch, so the copy and compute pipeline
         // naturally.
         let vocab_size = config.vocab_size;
-        let mut rng_state: u32 = 0x13579BDFu32;
+        let mut rng_state: u32 = request_seed;
         // Effective penalty window = request `repeat_window` (default 128),
         // bounded by the GPU repeat_buf capacity (2048). The buffer is sized
         // large so presence/frequency penalties CAN use a wider window when a
@@ -3272,7 +3393,9 @@ pub fn generate(
         //
         // Disable with `HIPFIRE_QWEN35_GRAMMAR=0` for A/B comparison.
         let grammar_enabled = hipfire_runtime::prompt_frame::qwen35_grammar_on(
-            std::env::var("HIPFIRE_QWEN35_GRAMMAR").ok().as_deref(),
+            hipfire_config::developer_var("HIPFIRE_QWEN35_GRAMMAR")
+                .ok()
+                .as_deref(),
             &m.model_path,
         );
         let tool_schemas_qwen: Vec<saddle_core::grammar::json::ToolSchema> = if grammar_enabled {
@@ -3403,16 +3526,15 @@ pub fn generate(
         // and structured tool_calls on this AR path. Raw token commit stays
         // upstream via `commit_and_observe` (conversation_tokens / streamed /
         // seq_pos advance before classify).
-        let mut semantic = QwenArSemanticProducer::new(id, started_in_think);
+        let mut semantic =
+            QwenArSemanticProducer::new_with_tool_protocol(id, started_in_think, tools_nonempty);
         let mut alert_fired = false;
         // max_think_tokens enforcement state. think_count increments only
         // while we observe ourselves to be inside a `<think>...</think>`
         // block via the same decoded-text scan budget_alert uses. When the
         // cap is hit we splice "</think>\n" into the stream (KV write +
-        // stdout emit + advance generated) so the model finishes thinking
-        // and commits to an answer with the remaining max_tokens budget.
-        // Re-armable: if the model later opens another <think> in the same
-        // turn (rare) the counter resets and the cap re-fires.
+        // stdout emit + advance generated), permanently latch force-answer
+        // for any reopened span, and bound the answer tail below.
         let mut think_count: usize = 0;
         let mut prev_in_think: bool = false;
         // Force-answer is a ONE-SHOT signal (check_force_answer clears on read),
@@ -3435,10 +3557,11 @@ pub fn generate(
         // +256 EOS below only counts in-think tokens, so a non-think ramble or a
         // re-open loop after the cap latches would run to max_tokens. Hard-EOS
         // once generation runs this many tokens past the latch.
-        let post_latch_answer_budget: usize = std::env::var("HIPFIRE_POST_LATCH_ANSWER_TOKENS")
-            .ok()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(768);
+        let post_latch_answer_budget: usize =
+            hipfire_config::developer_var("HIPFIRE_POST_LATCH_ANSWER_TOKENS")
+                .ok()
+                .and_then(|s| s.parse().ok())
+                .unwrap_or(768);
         let mut latch_gen_mark: Option<usize> = None;
 
         // N-gram loop detector: track 4-gram token sequences. When any
@@ -3672,12 +3795,21 @@ pub fn generate(
                     prev_in_think = in_think;
                 }
                 let budget_hit = max_think_tokens > 0 && think_count >= max_think_tokens;
+                let request_cap_latched_now = latch_request_think_cap(
+                    budget_hit,
+                    generated,
+                    &mut force_answer_latched,
+                    &mut latch_gen_mark,
+                );
 
                 if in_think && (budget_hit || force_answer_now || force_answer_latched) {
-                    if force_answer_now {
+                    if request_cap_latched_now {
+                        eprintln!(
+                            "[think-cap] id={} — per-request think cap {} reached; closing <think>",
+                            id, max_think_tokens
+                        );
+                    } else if force_answer_now {
                         eprintln!("[force-answer] id={} — closing <think> mid-turn to commit to the answer", id);
-                    } else if force_answer_latched {
-                        eprintln!("[force-answer] id={} — re-closing a re-opened <think> (latched / think-cap)", id);
                     }
                     // Force-close. Encode the continuation and run each token
                     // through the KV write + emit path the same way a normally-
@@ -4209,7 +4341,11 @@ pub fn generate(
                     cached_seq.pop();
                 }
             }
-            if std::env::var("HIPFIRE_QWEN_CACHE_TRACE").ok().as_deref() == Some("1") {
+            if hipfire_config::developer_var("HIPFIRE_QWEN_CACHE_TRACE")
+                .ok()
+                .as_deref()
+                == Some("1")
+            {
                 eprintln!(
                     "[qwen-cache store] cached_seq={} emit_text.len={} tool_calls={} preview={:?}",
                     cached_seq.len(),
@@ -4550,7 +4686,8 @@ pub fn reset_core_arch_key(arch_id: u32) -> &'static str {
         12 => "cohere2moe",
         13 => "gemma4",
         14 => "muse_glimmer",
-        15 => "k2_horizon",
+        15 => "maple",
+        16 => "k2_horizon",
         _ => "unknown",
     }
 }

@@ -150,7 +150,8 @@ pub(crate) fn setup_command(paths: &crate::Paths, args: crate::SetupArgs) -> Res
     }
 
     // --- 4a. Resolve ROCm root (no mutation) ---
-    let rocm_root = resolve_rocm_root_with(args.rocm_root.as_deref(), hipcc_override, strict, args.yes)?;
+    let rocm_root =
+        resolve_rocm_root_with(args.rocm_root.as_deref(), hipcc_override, strict, args.yes)?;
     ensure_rocm_complete(&rocm_root)?;
     ensure_not_interrupted()?;
 
@@ -199,7 +200,6 @@ pub(crate) fn setup_command(paths: &crate::Paths, args: crate::SetupArgs) -> Res
             eprintln!("ROCm root:       {}", rocm_root.display());
         }
     }
-
 
     // --- 4b. Resolve GPU arch (no mutation) ---
     let gpu_arch = resolve_gpu_arch(args.gpu_arch.as_deref(), &rocm_root, args.yes)?;
@@ -436,7 +436,8 @@ fn resolve_rocm_root_with(
         // Prefer the toolchain resolver so a libs-only explicit root with a
         // cross-root compiler is accepted when not strict. Preserve the exact
         // invalid-root wording with the path as given (before canonicalize).
-        let toolchain = hipfire_config::rocm::resolve_toolchain_for_explicit(Some(path), hipcc, strict);
+        let toolchain =
+            hipfire_config::rocm::resolve_toolchain_for_explicit(Some(path), hipcc, strict);
         if toolchain.is_ok() {
             return Ok(canonicalize_or_keep(path));
         }
@@ -532,7 +533,8 @@ fn usable_rocm_roots_with(
             } else {
                 // Check PATH / other roots via the toolchain helper — if a
                 // toolchain can be resolved for this root alone, it is usable.
-                hipfire_config::rocm::resolve_toolchain_for_explicit(Some(&root), hipcc, strict).is_ok()
+                hipfire_config::rocm::resolve_toolchain_for_explicit(Some(&root), hipcc, strict)
+                    .is_ok()
             }
         } else {
             false

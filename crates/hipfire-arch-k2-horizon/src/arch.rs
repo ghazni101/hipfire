@@ -21,7 +21,7 @@ use hipfire_runtime::llama::{f16_to_f32, WeightTensor};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Type marker for the K2-Horizon architecture (MoVA attention +
-/// sigmoid-routed MoE FFN). arch_id = 15.
+/// sigmoid-routed MoE FFN). arch_id = 16.
 pub struct K2Horizon;
 
 // ─── HFQ load helpers (mirrors cohere2moe) ──────────────────────────────
@@ -247,7 +247,7 @@ impl Architecture for K2Horizon {
     type Config = K2HorizonConfig;
 
     fn arch_id() -> u32 {
-        15
+        16
     }
 
     fn name() -> &'static str {

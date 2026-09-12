@@ -1006,7 +1006,7 @@ impl Speculator for GenericDflashSpeculator {
         self.sample_temp = cfg.temp;
         self.sample_top_p = cfg.top_p;
         self.sample_top_k = cfg.top_k;
-        self.rng_state = 0x13579BDF;
+        self.rng_state = crate::spec::request_rng_state(cfg.rng_seed);
     }
 
     fn free(self: Box<Self>, gpu: &mut Gpu) {
@@ -1357,7 +1357,8 @@ mod tests {
         let last_argmax = crate::llama::argmax(&logits);
         assert_eq!(last_argmax, 1);
         let mut rng_g = seed;
-        let (_, gbonus) = crate::ddtree::naive_sample_chain(&logits, &[], vocab, 0.0, 1.0, 0, &mut rng_g);
+        let (_, gbonus) =
+            crate::ddtree::naive_sample_chain(&logits, &[], vocab, 0.0, 1.0, 0, &mut rng_g);
         assert_eq!(gbonus, last_argmax);
         assert_eq!(rng_g, seed, "greedy first token must not advance rng");
     }

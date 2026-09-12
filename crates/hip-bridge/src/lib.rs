@@ -15,15 +15,16 @@ mod rocsolver;
 mod vmm;
 
 pub use error::{
-    HipError, HipResult, HIP_ERROR_INVALID_IMAGE, HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED,
-    HIP_ERROR_PEER_ACCESS_NOT_ENABLED, HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
+    HipError, HipErrorCode, HipResult, LaunchContext, HIP_ERROR_INVALID_IMAGE,
+    HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED, HIP_ERROR_PEER_ACCESS_NOT_ENABLED,
+    HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
 };
 pub use ffi::launch_counters;
 pub use ffi::{
     Event, Function, Graph, GraphExec, HipMemAccessDesc, HipMemAllocationProp,
     HipMemGenericAllocationHandle, HipMemLocation, HipPointerAttribute, HipRuntime, Module, Stream,
-    HIP_EVENT_DISABLE_TIMING, HIP_EVENT_RELEASE_TO_SYSTEM, HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM,
-    HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED,
+    HIP_ERROR_NOT_READY, HIP_EVENT_DISABLE_TIMING, HIP_EVENT_RELEASE_TO_SYSTEM,
+    HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM, HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED,
 };
 pub use kernarg::KernargBlob;
 pub use rccl::{RcclComms, RcclDataType, RcclError, RcclRedOp, RcclResult, NCCL_SUCCESS};
@@ -145,6 +146,46 @@ impl DeviceBuffer {
         DeviceBuffer {
             ptr: self.ptr,
             size: self.size,
+            ownership: DeviceBufferOwnership::Borrowed,
+        }
+    }
+
+    /// Non-owning byte-range view into this allocation: bytes
+    /// `[byte_offset, byte_offset + byte_len)`.
+    ///
+    /// This is the single home of the device-pointer reinterpretation that
+    /// used to be hand-rolled at every callsite (`as_ptr() as *mut u8`
+    /// + `add` + `DeviceBuffer::from_raw`). The range is validated against
+    /// the allocation size with checked arithmetic before any pointer
+    /// arithmetic runs, so the `add` below is always in-bounds.
+    ///
+    /// Like [`DeviceBuffer::alias`], the view is `Borrowed`: it must NOT be
+    /// freed, and it must not outlive the buffer it was cut from.
+    ///
+    /// # Safety
+    ///
+    /// The invariant that holds: `byte_offset + byte_len <= self.size()`,
+    /// enforced by the checked range test below, so the derived pointer
+    /// addresses only bytes of this live device allocation (`u8` has
+    /// alignment 1, so there is no alignment precondition beyond the
+    /// allocation itself). The caller must still ensure the view does not
+    /// outlive the owning buffer and is never passed to a free path.
+    pub fn byte_view(&self, byte_offset: usize, byte_len: usize) -> DeviceBuffer {
+        let end = byte_offset
+            .checked_add(byte_len)
+            .expect("DeviceBuffer::byte_view range overflow");
+        assert!(
+            end <= self.size,
+            "DeviceBuffer::byte_view [{byte_offset}, {end}) exceeds allocation of {} bytes",
+            self.size,
+        );
+        // SAFETY: `end <= self.size` (checked above), so `add(byte_offset)`
+        // stays in-bounds of the same allocation and names only live device
+        // bytes. The wrapper is Borrowed, so drop never frees it.
+        let ptr = unsafe { (self.ptr as *mut u8).add(byte_offset) as *mut std::ffi::c_void };
+        DeviceBuffer {
+            ptr,
+            size: byte_len,
             ownership: DeviceBufferOwnership::Borrowed,
         }
     }

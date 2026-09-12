@@ -10,7 +10,6 @@ use crate::Gpu;
 use crate::GpuTensor;
 use hip_bridge::{DeviceBuffer, HipResult};
 use std::ffi::c_void;
-use std::sync::OnceLock;
 
 /// HIP `hipDeviceAttributeMaxSharedMemoryPerBlock` (CUDA-compatible block).
 /// Verified against ROCm 5.x/6.x/7.x headers: ordinal 74.
@@ -97,33 +96,23 @@ pub fn q8_flash_tile_size(
     head_dim: usize,
     max_seq: usize,
 ) -> usize {
-    static OVERRIDE: OnceLock<Option<usize>> = OnceLock::new();
-    OVERRIDE
-        .get_or_init(|| {
-            hipfire_config::developer_var("HIPFIRE_Q8_FLASH_TILE")
-                .ok()
-                .and_then(|value| value.parse::<usize>().ok())
-                .filter(|value| matches!(value, 16 | 32 | 64 | 128 | 256))
-        })
+    hipfire_config::developer_var("HIPFIRE_Q8_FLASH_TILE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| matches!(value, 16 | 32 | 64 | 128 | 256))
         .unwrap_or_else(|| q8_flash_default_tile_size(arch, n_heads, n_kv_heads, head_dim, max_seq))
 }
 
 const V_MODE_Q8: i32 = 8;
 
 fn gfx1100_asym3_q8_pair_enabled(gpu: &Gpu, head_dim: usize) -> bool {
-    static ENABLED: OnceLock<bool> = OnceLock::new();
+    // Qwen3.6-27B graph-on decode: three fresh-process samples per
+    // arm measured +0.61% by median (+0.11/+0.45/+0.61% paired),
+    // while attribution removed exactly 16 dispatches/token.
     gpu.arch_caps.is_gfx1100()
         && head_dim == 256
         && !gpu.replay.is_recording()
-        && *ENABLED.get_or_init(|| {
-            // Qwen3.6-27B graph-on decode: three fresh-process samples per
-            // arm measured +0.61% by median (+0.11/+0.45/+0.61% paired),
-            // while attribution removed exactly 16 dispatches/token.
-            hipfire_config::developer_var("HIPFIRE_GFX1100_ASYM3_Q8_PAIR")
-                .ok()
-                .as_deref()
-                != Some("0")
-        })
+        && hipfire_config::developer_bool("HIPFIRE_GFX1100_ASYM3_Q8_PAIR", true)
 }
 
 #[inline]
@@ -142,23 +131,15 @@ fn replay_stable_tile_count(
 
 /// Opt-in gate for the WMMA flash-attention prefill path.
 fn is_wmma_fa_enabled() -> bool {
-    use std::sync::OnceLock;
-    static GATE: OnceLock<bool> = OnceLock::new();
-    *GATE.get_or_init(|| {
-        hipfire_config::developer_var("HIPFIRE_WMMA_FA").map_or(false, |v| v == "1")
-    })
+    hipfire_config::developer_bool("HIPFIRE_WMMA_FA", false)
 }
 
 /// Minimum chunk size to engage the WMMA-FA route.
 fn wmma_fa_min_batch() -> usize {
-    use std::sync::OnceLock;
-    static GATE: OnceLock<usize> = OnceLock::new();
-    *GATE.get_or_init(|| {
-        hipfire_config::developer_var("HIPFIRE_WMMA_FA_MIN_BATCH")
-            .ok()
-            .and_then(|s| s.parse::<usize>().ok())
-            .unwrap_or(16)
-    })
+    hipfire_config::developer_var("HIPFIRE_WMMA_FA_MIN_BATCH")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(16)
 }
 
 impl Gpu {
@@ -5041,6 +5022,18 @@ impl Gpu {
         // True when either the inline env-gated ladder fires (scalar→WMMA
         // upgrade) OR the dispatch path explicitly routes to a WMMA variant.
         let use_wmma_grid = wmma_ok || force_wmma_grid;
+        // WMMA owns complete 16-row tiles and has no row-count kernarg. The
+        // capacity-derived sub-batch can be any integer (for example 342 at
+        // PP8192), so round it down before splitting an aligned outer batch.
+        // The dispatch wrappers reject non-aligned outer batches and use the
+        // scalar tile kernel instead.
+        let sub_batch = if use_wmma_grid {
+            debug_assert_eq!(batch_size % WMMA_BLOCK_M, 0);
+            (sub_batch / WMMA_BLOCK_M) * WMMA_BLOCK_M
+        } else {
+            sub_batch
+        };
+        debug_assert!(!use_wmma_grid || sub_batch >= WMMA_BLOCK_M);
         assert!(
             !(use_wmma_grid && (slot_descs.is_some() || row_slot.is_some())),
             "multi-slot descriptors are not supported on the WMMA tile grid; \
@@ -6415,7 +6408,13 @@ impl Gpu {
         tile_size: usize,
         max_tiles: usize,
     ) -> HipResult<()> {
-        let (module, src, kernel) = if self.arch_caps.is_gfx1151() {
+        let (module, src, kernel) = if self.arch_caps.is_gfx1201() {
+            (
+                "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201",
+                kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1201_SRC,
+                "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201",
+            )
+        } else if self.arch_caps.is_gfx1151() {
             (
                 "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1151",
                 kernels::ATTENTION_FLASH_Q8_0_REDUCE_GATED_MQ_ROTATE_GFX1151_SRC,
@@ -8349,7 +8348,10 @@ impl Gpu {
             n_heads > 0 && n_kv_heads > 0,
             "attention_dflash_sliding_f32: n_heads/n_kv_heads must be > 0"
         );
-        assert!(head_dim > 0, "attention_dflash_sliding_f32: head_dim must be > 0");
+        assert!(
+            head_dim > 0,
+            "attention_dflash_sliding_f32: head_dim must be > 0"
+        );
         assert!(
             sliding_window > 0,
             "attention_dflash_sliding_f32: sliding_window must be > 0"
@@ -8474,7 +8476,17 @@ impl Gpu {
         sliding_window: usize,
     ) -> HipResult<()> {
         self.attention_dflash_sliding_f32(
-            q, k, v, out, b, l, n_heads, n_kv_heads, head_dim, ctx_span, sliding_window,
+            q,
+            k,
+            v,
+            out,
+            b,
+            l,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            ctx_span,
+            sliding_window,
         )
     }
 
@@ -11001,14 +11013,7 @@ impl Gpu {
         // `HIPFIRE_HC_CTRL_T1024=1` selects the 1024-thread variant. See
         // `kernels::HC_COMPUTE_CONTROL_T1024_SRC` — same algorithm, wider
         // block, NOT bit-exact (the LDS partial tree widens 8 -> 32).
-        static T1024: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let t1024 = prefer_t1024
-            || *T1024.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_HC_CTRL_T1024")
-                    .ok()
-                    .as_deref()
-                    == Some("1")
-            });
+        let t1024 = prefer_t1024 || hipfire_config::developer_bool("HIPFIRE_HC_CTRL_T1024", false);
         let (logical_name, src, threads) = if t1024 {
             (
                 "hc_compute_control_vec4_finalize_t1024",
@@ -12889,34 +12894,14 @@ impl Gpu {
         max_k: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        static FORCE_SERIAL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let force_serial = *FORCE_SERIAL.get_or_init(|| {
-            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_INDEXER_TOPK_SERIAL")
-                .ok()
-                .as_deref()
-                == Some("1")
-        });
-        static FORCE_BOUNDED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let force_bounded = *FORCE_BOUNDED.get_or_init(|| {
-            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_INDEXER_TOPK_BOUNDED")
-                .ok()
-                .as_deref()
-                == Some("1")
-        });
-        static FORCE_BLOCK1024: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let force_block1024 = *FORCE_BLOCK1024.get_or_init(|| {
-            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_INDEXER_TOPK_BLOCK1024")
-                .ok()
-                .as_deref()
-                == Some("1")
-        });
-        static FORCE_UNROLLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let force_unrolled = *FORCE_UNROLLED.get_or_init(|| {
-            hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_INDEXER_TOPK_UNROLLED")
-                .ok()
-                .as_deref()
-                == Some("1")
-        });
+        let force_serial =
+            hipfire_config::developer_bool("HIPFIRE_DEEPSEEK4_INDEXER_TOPK_SERIAL", false);
+        let force_bounded =
+            hipfire_config::developer_bool("HIPFIRE_DEEPSEEK4_INDEXER_TOPK_BOUNDED", false);
+        let force_block1024 =
+            hipfire_config::developer_bool("HIPFIRE_DEEPSEEK4_INDEXER_TOPK_BLOCK1024", false);
+        let force_unrolled =
+            hipfire_config::developer_bool("HIPFIRE_DEEPSEEK4_INDEXER_TOPK_UNROLLED", false);
         // gfx1151 keeps its certified route selection. gfx1201 reuses the
         // wave-size-independent bounded source, compiled into its own exact
         // device code object after the raw-i32 parity channel passed.
@@ -14660,43 +14645,21 @@ impl Gpu {
         topk_window: i32,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        static WARP_GFX1151: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        static ILP4_GFX1151: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        static SCOREGRID_XLANE_GFX1151: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        static SCOREGRID_LARGE_SERIAL_GFX1151: std::sync::OnceLock<bool> =
-            std::sync::OnceLock::new();
         let scoregrid_arch = self.arch == "gfx1151" || self.arch == "gfx1201";
         let scoregrid = scoregrid_arch && head_dim == 512 && deepseek4_scoregrid_route;
         let ilp4 = self.arch == "gfx1151"
             && head_dim == 512
-            && *ILP4_GFX1151.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_ATTN_ILP4")
-                    .ok()
-                    .as_deref()
-                    == Some("1")
-            });
+            && hipfire_config::developer_bool("HIPFIRE_DEEPSEEK4_ATTN_ILP4", false);
         let warp = self.arch == "gfx1151"
             && head_dim == 512
-            && *WARP_GFX1151.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_ATTN_WARP")
-                    .ok()
-                    .as_deref()
-                    == Some("1")
-            });
+            && hipfire_config::developer_bool("HIPFIRE_DEEPSEEK4_ATTN_WARP", false);
         let scoregrid_xlane = scoregrid
-            && *SCOREGRID_XLANE_GFX1151.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_ATTN_SCOREGRID_XLANE")
-                    .ok()
-                    .as_deref()
-                    == Some("1")
-            });
+            && hipfire_config::developer_bool("HIPFIRE_DEEPSEEK4_ATTN_SCOREGRID_XLANE", false);
         let scoregrid_large_serial = scoregrid
-            && *SCOREGRID_LARGE_SERIAL_GFX1151.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_ATTN_SCOREGRID_LARGE_SERIAL")
-                    .ok()
-                    .as_deref()
-                    == Some("1")
-            });
+            && hipfire_config::developer_bool(
+                "HIPFIRE_DEEPSEEK4_ATTN_SCOREGRID_LARGE_SERIAL",
+                false,
+            );
         let (logical_name, symbol, block, source) = if scoregrid_large_serial {
             (
                 "deepseek4_attn_swa_topk_scoregrid_large_serial_gfx1151",

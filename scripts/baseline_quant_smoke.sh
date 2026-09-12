@@ -177,7 +177,7 @@ for format in "${FORMAT_ARR[@]}"; do
     fi
 done
 
-./scripts/quant_compare_top5.py "$OUT/logits/f32" "${specs[@]}" --wide-margin "$WIDE_MARGIN" \
+python3 -m tools.bench.quant_compare_top5 "$OUT/logits/f32" "${specs[@]}" --wide-margin "$WIDE_MARGIN" \
     > "$OUT/compare.json"
 
 {

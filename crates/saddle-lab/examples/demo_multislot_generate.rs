@@ -322,7 +322,7 @@ fn main() {
     // Greedy for every slot: deterministic output, and it takes
     // `sample_per_slot`'s `argmax_f32_batched` fast path for the whole
     // batch every step rather than one kernel launch per slot.
-    let sample_params: Vec<SlotSampleParams> = (0..n_slots)
+    let mut sample_params: Vec<SlotSampleParams> = (0..n_slots)
         .map(|_| SlotSampleParams {
             temperature: 0.0,
             top_p: 1.0,
@@ -400,7 +400,7 @@ fn main() {
 
         gpu.sample_per_slot(
             &logits_out,
-            &sample_params,
+            &mut sample_params,
             n_slots,
             config.vocab_size,
             &out_tokens,

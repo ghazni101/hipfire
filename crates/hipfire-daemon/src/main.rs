@@ -82,6 +82,7 @@ use hipfire_generate::redline::{
     RedlineDsparkReplayArm, RedlineDsparkVerifySnapshot, RedlineLfm2MoeSnapshot,
     RedlineQwenSnapshot, RedlineSnapshot,
 };
+mod slots;
 use hipfire_generate::vision::{GenerateVLParams, ImageSource};
 use hipfire_loader::{AsstTurnCache, EpArch, EpState, Eviction, LoadedModel};
 use hipfire_runtime::spec::{
@@ -717,6 +718,10 @@ fn main() {
     let mut continuous_batch_size: usize = 1;
     let mut batch_scheduler: Option<ContinuousBatchScheduler> = None;
     let mut batch_poisoned: Option<String> = None;
+    // Experimental multi-slot backend: alternate model owner (one SlotEngine/weight set).
+    // None => ordinary LoadedModel path. Continuous-batching integration is deferred.
+    // Arc allows request workers to hold the model alive only while active; reset/unload/swap refuse while active.
+    let mut slot_backend: Option<std::sync::Arc<slots::SlotBackend>> = None;
 
     // Background stdin reader. Drains stdin into an mpsc channel so
     // the main loop can pull non-blockingly between messages. Abort /
@@ -863,6 +868,229 @@ fn main() {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(1) as usize;
                 let parsed_continuous_batch_size = parse_continuous_batch_size(msg.get("params"));
+                let experimental_multi_slot = msg
+                    .get("params")
+                    .and_then(|p| p.get("experimental_multi_slot"))
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                if experimental_multi_slot {
+                    // Experimental slot backend is an alternate model owner, not a batch-mode switch.
+                    // Validate mutually exclusive knobs before any GPU work.
+                    if let Some(err) = slots::validate_load_caps(&msg) {
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            None,
+                            &err,
+                            "validation",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                    // Refuse model swap while slot requests active; do not keep old Arc alive via workers.
+                    if slot_backend.as_ref().is_some_and(|b| b.active_count() > 0) {
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            None,
+                            "load refused: slot requests active",
+                            "validation",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                    // Unload prior backends safely before loading the slot engine (exactly one weight copy).
+                    // Drop any prior slot backend only after active check.
+                    if let Some(slot) = slot_backend.take() {
+                        match std::sync::Arc::try_unwrap(slot) {
+                            Err(slot) => {
+                                slot_backend = Some(slot);
+                                emit_uncorrelated_error(
+                                    &mut stdout,
+                                    None,
+                                    "load refused: slot requests active (Arc live)",
+                                    "validation",
+                                    false,
+                                    false,
+                                );
+                                let _ = stdout.flush();
+                                continue;
+                            }
+                            Ok(slot) => {
+                                if let Err(reason) = slot.shutdown() {
+                                    emit_uncorrelated_error(
+                                        &mut stdout,
+                                        None,
+                                        &format!("prior slot shutdown failed: {reason}"),
+                                        "internal",
+                                        false,
+                                        false,
+                                    );
+                                    let _ = stdout.flush();
+                                    continue;
+                                }
+                                batch_clear_all_terminals();
+                            }
+                        }
+                    }
+                    // Tear down PFlash / ordinary model (eager; experimental requires pp=tp=1 so no EP deferral).
+                    if let Some(mut pf) = pflash_state.take() {
+                        if let Some(mut dg) = pflash_drafter_gpu.take() {
+                            dg.bind_thread_or_warn();
+                            pf.unload_drafter(&mut dg);
+                            gpu.bind_thread_or_warn();
+                        } else {
+                            pf.unload_drafter(&mut gpu);
+                        }
+                    }
+                    pflash_cfg = None;
+                    if let Some(m) = model.take() {
+                        if let Err(err) = hipfire_loader::unload_model(m, &mut gpu) {
+                            emit_uncorrelated_error(
+                                &mut stdout,
+                                None,
+                                &format!("prior unload failed: {err}"),
+                                "internal",
+                                false,
+                                false,
+                            );
+                            let _ = stdout.flush();
+                            continue;
+                        }
+                    } else if let Err(err) = hipfire_loader::ensure_vmm_ready_for_load(&mut gpu) {
+                        emit_uncorrelated_error(&mut stdout, None, &err, "internal", false, false);
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                    // Continuous-batch state must be cleared — slot backend is not batched.
+                    batch_scheduler = None;
+                    continuous_batch_size = 1;
+                    batch_poisoned = None;
+
+                    let path = msg.get("model").and_then(|v| v.as_str()).unwrap_or("");
+                    if path.is_empty() {
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            None,
+                            "load: missing model path",
+                            "validation",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                    let requested_max_seq = msg
+                        .get("params")
+                        .and_then(|p| p.get("max_seq"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(4096) as usize;
+                    let max_seq = requested_max_seq.min(MAX_REQUESTED_SEQ);
+                    let n_slots = msg
+                        .get("params")
+                        .and_then(|p| p.get("experimental_multi_slot_slots"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(4) as usize;
+                    let cap_tokens = msg
+                        .get("params")
+                        .and_then(|p| p.get("experimental_multi_slot_ctx"))
+                        .and_then(|v| v.as_u64())
+                        .map(|v| v as usize)
+                        .unwrap_or(max_seq);
+                    let prefill_chunk = msg
+                        .get("params")
+                        .and_then(|p| p.get("experimental_multi_slot_prefill_chunk"))
+                        .and_then(|v| v.as_u64())
+                        .unwrap_or(1024) as usize;
+                    match slots::SlotBackend::load(path, n_slots, cap_tokens, prefill_chunk) {
+                        Ok(backend) => {
+                            let arch = backend.arch_str().to_string();
+                            let dim = backend.dim();
+                            let layers = backend.layers();
+                            let vocab = backend.vocab();
+                            // Ensure ordinary model stays None — exactly one weight copy.
+                            model = None;
+                            slot_backend = Some(std::sync::Arc::new(backend));
+                            // Per contract: continuous_batch_capable false, cache_capable true, reasoning_contract qwen_jinja, plus experimental flag.
+                            let ack = serde_json::json!({
+                                "type": "loaded",
+                                "arch": arch,
+                                "dim": dim,
+                                "layers": layers,
+                                "vocab": vocab,
+                                "vl": false,
+                                "reasoning_contract": "qwen_jinja",
+                                "reasoning_effort_native": false,
+                                "reasoning_efforts": [],
+                                "cache_capable": true,
+                                "retry_reset_eligible": false,
+                                "continuous_batch_capable": false,
+                                "experimental_multi_slot": true
+                            });
+                            let _ = writeln!(stdout, "{ack}");
+                            let _ = stdout.flush();
+                        }
+                        Err(e) => {
+                            emit_uncorrelated_error(
+                                &mut stdout,
+                                None,
+                                &format!("load failed: {e}"),
+                                "internal",
+                                false,
+                                false,
+                            );
+                            let _ = stdout.flush();
+                        }
+                    }
+                    continue;
+                }
+                // Ordinary load: refuse while slot requests active, otherwise checked shutdown
+                if slot_backend.as_ref().is_some_and(|b| b.active_count() > 0) {
+                    emit_uncorrelated_error(
+                        &mut stdout,
+                        None,
+                        "load refused: slot requests active",
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
+                if let Some(slot) = slot_backend.take() {
+                    match std::sync::Arc::try_unwrap(slot) {
+                        Err(slot) => {
+                            slot_backend = Some(slot);
+                            emit_uncorrelated_error(
+                                &mut stdout,
+                                None,
+                                "load refused: slot requests active (Arc live)",
+                                "validation",
+                                false,
+                                false,
+                            );
+                            let _ = stdout.flush();
+                            continue;
+                        }
+                        Ok(slot) => {
+                            if let Err(reason) = slot.shutdown() {
+                                emit_uncorrelated_error(
+                                    &mut stdout,
+                                    None,
+                                    &format!("prior slot shutdown failed: {reason}"),
+                                    "internal",
+                                    false,
+                                    false,
+                                );
+                                let _ = stdout.flush();
+                                continue;
+                            }
+                            batch_clear_all_terminals();
+                        }
+                    }
+                }
                 // Unload previous if any. PFlash drafter goes first so
                 // its tensors join the pool before unload_model drains
                 // it -- otherwise free_tensor would queue them into the
@@ -1371,7 +1599,6 @@ fn main() {
                     .and_then(|v| v.as_str())
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string());
-
                 let deepseek4_experts_per_token = msg
                     .get("params")
                     .and_then(|p| p.get("deepseek4_experts_per_token"))
@@ -1417,6 +1644,7 @@ fn main() {
                         tp,
                         kv_mode_override.as_deref(),
                         kv_backend_override.as_deref(),
+                        state_quant_override.as_deref(),
                     )
                 } else {
                     hipfire_loader::load_model_with_gemma4_drafter(
@@ -1498,7 +1726,7 @@ fn main() {
                             12 => "north_mini_code",
                             13 => "gemma4",
                             14 => "muse_glimmer",
-                            15 => "k2_horizon",
+                            16 => "k2_horizon",
                             _ => "qwen3",
                         };
                         let drafter = m.speculator.as_ref().map(|speculator| speculator.name());
@@ -1520,14 +1748,7 @@ fn main() {
                             );
                         }
                         let vl = m.vision_config().is_some() || m.dots_ocr().is_some();
-                        let (dim, layers, vocab) = match m.state.as_ref() {
-                            Some(st) => {
-                                let arch =
-                                    st.as_ref() as &dyn hipfire_runtime::arch_model::ArchModel;
-                                (arch.dim(), arch.n_layers(), arch.vocab_size())
-                            }
-                            None => (0, 0, 0),
-                        };
+                        let (dim, layers, vocab) = m.ack_dims();
 
                         // Apply MTP config from load-message params.
                         m.mtp_mode = mtp_mode;
@@ -1622,16 +1843,44 @@ fn main() {
                         let cache_capable = matches!(m.arch_id, 5 | 6 | 9 | 10 | 12 | 14);
                         let retry_reset_eligible = model_retry_reset_eligible(m.arch_id);
                         let continuous_batch_capable = staged_batch_capable;
+                        let reasoning_contract = hipfire_loader::carrier_for(m.arch_id)
+                            .map(|c| c.caps().reasoning_contract.wire_name())
+                            .unwrap_or("unsupported");
+                        // Probe reasoning effort capability only for QwenJinja;
+                        // all other contracts emit safe false/[] without probing.
+                        let (reasoning_effort_native, reasoning_efforts): (bool, Vec<&str>) = {
+                            let is_qwen_jinja = reasoning_contract == "qwen_jinja";
+                            if is_qwen_jinja {
+                                if let (Some(tok), Some(tmpl)) =
+                                    (m.tokenizer.as_ref(), m.chat_template.as_ref())
+                                {
+                                    let cap =
+                                        hipfire_runtime::prompt_frame::probe_effort_capability(
+                                            tok, tmpl,
+                                        );
+                                    (cap.native, cap.supported)
+                                } else {
+                                    (false, Vec::new())
+                                }
+                            } else {
+                                (false, Vec::new())
+                            }
+                        };
+                        let reasoning_efforts_json = serde_json::to_string(&reasoning_efforts)
+                            .unwrap_or_else(|_| "[]".to_string());
                         // Load ack exposes batch dimensions/capability; EP adds parallelism metadata but never infers operation from logs.
                         if staged_ep_batch {
                             let _ = writeln!(
                                 stdout,
-                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"continuous_batch_slots":{},"continuous_batch_lane_capacity":{},"continuous_batch_parallelism":"expert_parallel","continuous_batch_rank_count":4,"continuous_batch_reduce":"peer_rooted_f32"}}"#,
+                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{},"continuous_batch_slots":{},"continuous_batch_lane_capacity":{},"continuous_batch_parallelism":"expert_parallel","continuous_batch_rank_count":4,"continuous_batch_reduce":"peer_rooted_f32"}}"#,
                                 arch,
                                 dim,
                                 layers,
                                 vocab,
                                 vl,
+                                reasoning_contract,
+                                reasoning_effort_native,
+                                reasoning_efforts_json,
                                 cache_capable,
                                 retry_reset_eligible,
                                 continuous_batch_capable,
@@ -1641,12 +1890,15 @@ fn main() {
                         } else {
                             let _ = writeln!(
                                 stdout,
-                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{}}}"#,
+                                r#"{{"type":"loaded","arch":"{}","dim":{},"layers":{},"vocab":{},"vl":{},"reasoning_contract":"{}","reasoning_effort_native":{},"reasoning_efforts":{},"cache_capable":{},"retry_reset_eligible":{},"continuous_batch_capable":{}}}"#,
                                 arch,
                                 dim,
                                 layers,
                                 vocab,
                                 vl,
+                                reasoning_contract,
+                                reasoning_effort_native,
+                                reasoning_efforts_json,
                                 cache_capable,
                                 retry_reset_eligible,
                                 continuous_batch_capable
@@ -1824,6 +2076,29 @@ fn main() {
                     arm_fault_after_prefill(want);
                     FaultAfterPrefillGuard
                 };
+                // Experimental slot backend dispatches before the ordinary model path.
+                // This preserves byte-for-byte default behavior when absent, and in experimental
+                // mode owns exactly one SlotEngine/weight set with no ordinary-model fallback.
+                // Spawn a bounded request worker so the main loop continues accepting independent generates.
+                if let Some(slot) = slot_backend.clone() {
+                    let msg_clone = msg.clone();
+                    let id_owned = id.to_string();
+                    let slot_clone = slot.clone();
+                    // Bounded: refuse if too many active? The backend's active counter bounds concurrency;
+                    // engine itself is the only GPU worker, so workers serialize on engine submit.
+                    std::thread::spawn(move || {
+                        // Each worker uses its own stdout handle; every event is one serde JSON line.
+                        let mut worker_stdout = std::io::stdout();
+                        let _ = slot_clone.handle_generate(
+                            &msg_clone,
+                            &mut worker_stdout,
+                            &id_owned,
+                            gen_attempt_id,
+                        );
+                        let _ = worker_stdout.flush();
+                    });
+                    continue;
+                }
                 let m = match model.as_mut() {
                     Some(m) => m,
                     None => {
@@ -1890,7 +2165,7 @@ fn main() {
                 // request (rather than silently dropping the fields).
                 let tools_json: Option<Vec<serde_json::Value>> = match msg.get("tools") {
                     Some(v) => match serde_json::from_value::<Vec<serde_json::Value>>(v.clone()) {
-                        Ok(t) => Some(t),
+                        Ok(t) => (!t.is_empty()).then_some(t),
                         Err(e) => {
                             hipfire_generate::dense::emit_active_attempt_error(
                                 &mut stdout,
@@ -2085,6 +2360,11 @@ fn main() {
                     .get("reasoning_effort")
                     .or_else(|| msg.get("thinking_mode"))
                     .and_then(|v| v.as_str());
+                // Typed thinking flag: when present it is authoritative for Jinja
+                // enablement. HTTP normalization always sends it; direct JSONL
+                // clients may omit it and fall back to legacy effort/cap inference.
+                let thinking_enabled: Option<bool> =
+                    msg.get("thinking_enabled").and_then(|v| v.as_bool());
                 let repeat_window = msg
                     .get("repeat_window")
                     .and_then(|v| v.as_u64())
@@ -2161,10 +2441,12 @@ fn main() {
                 };
                 // Budget for tokens emitted INSIDE the model's <think>...</think>
                 // block. 0 = uncapped (model thinks until it naturally closes).
-                // Triggered from the CLI by per-model `max_think_tokens` config,
-                // OpenAI `chat_template_kwargs.enable_thinking=false` (cap=1),
-                // and `reasoning.effort` (none=1, minimal=64, low=256, medium=
-                // 1024, high=4096, xhigh=0).
+                // This is an independent explicit cap (never derived from
+                // effort) — 0 means uncapped, 1 means immediately closed.
+                // Legacy direct JSONL without `thinking_enabled` still infers
+                // disable from `max_think==1` via the helper's fallback, but
+                // new clients send `thinking_enabled` as authority and keep
+                // `max_think_tokens` independent.
                 //
                 // When the cap is reached the daemon force-emits "</think>\n"
                 // through the same KV-write + sample path as a normal token,
@@ -2179,9 +2461,11 @@ fn main() {
                     .and_then(|v| v.as_u64())
                     .unwrap_or(0) as usize;
                 // Derive Jinja `enable_thinking` and `reasoning_effort` via
-                // pure helper (no lowercasing, no empty-drop).
+                // pure helper. `thinking_enabled` is authoritative when
+                // present; legacy effort/max_think inference is preserved
+                // only for direct old JSONL clients that omit it.
                 let (enable_thinking_jinja, reasoning_effort_jinja) =
-                    qwen_jinja_reasoning(raw_reasoning_effort, max_think_tokens);
+                    qwen_jinja_reasoning(thinking_enabled, raw_reasoning_effort, max_think_tokens);
                 // Controls the ChatML framing after the assistant role header.
                 // Propagated through both text and Qwen3.5-VL paths.
                 let assistant_prefix = match msg
@@ -2196,7 +2480,9 @@ fn main() {
 
                 let has_image = image_base64.is_some() || image.is_some();
                 let vision_route = hipfire_loader::vision_route(m.arch_id);
-                let has_vl = m.vision_config().is_some() || m.dots_ocr().is_some();
+                // Covers qwen35-vl (arch 5/6 bundle), dots-ocr (arch 8) AND
+                // lfm2-vl (arch-11 bundle) in one declared-capability probe.
+                let has_vl = m.has_vision_encoder();
 
                 if has_image && !has_vl {
                     write_error(&mut stdout, id, "model has no vision encoder");
@@ -2211,9 +2497,10 @@ fn main() {
                     // from a clean KV state.
                     //
                     // Must mirror the "reset" command handler (line ~2098).
-                    // VL only runs on qwen35-vl (arch_id 5|6) and dots-ocr (arch_id 8), so
-                    // deepseek4_state and llama_kv are None — but clear them anyway
-                    // for defense-in-depth in case a future arch adds VL support.
+                    // VL runs on qwen35-vl (arch_id 5|6), dots-ocr (arch_id 8)
+                    // and lfm2-vl (arch_id 11); other arch states are None
+                    // here — but clear them anyway for defense-in-depth in
+                    // case a future arch adds VL support.
                     if m.seq_pos > 0 {
                         eprintln!("[daemon/vl] non-zero seq_pos ({}) at VL dispatch — resetting conversation", m.seq_pos);
                         m.seq_pos = 0;
@@ -2273,6 +2560,25 @@ fn main() {
                         if let Some(b) = m.deepseek4_mut() {
                             b.state.reset();
                         }
+                        // lfm2-vl (arch 11): KV + conv state live in the
+                        // lfm2moe bundle. generate_lfm2_vl cold-resets again
+                        // before its own prefill, so this arm is
+                        // defense-in-depth parity with the other VL arches —
+                        // without it a failed dispatch between guard and
+                        // generate body would leave stale state behind.
+                        if let Some(b) = m.lfm2moe_mut() {
+                            if let Err(e) = b.state.reset(&mut gpu) {
+                                hipfire_generate::dense::emit_active_attempt_error(
+                                    &mut stdout,
+                                    Some(id),
+                                    &format!("vision lfm2moe reset failed: {e:?}"),
+                                    "gpu",
+                                    true,
+                                    false,
+                                );
+                                continue;
+                            }
+                        }
                         if let Some(ad) = m.kv_adaptive.as_mut() {
                             if let Some(s) = m.state.as_mut() {
                                 if s.arch_key() == "qwen35" {
@@ -2321,6 +2627,19 @@ fn main() {
                     } else {
                         max_think_tokens
                     };
+                    // Same tiered derivation as the text path below: explicit
+                    // wire `seed` wins, else attempt key + counter entropy.
+                    // Out-of-domain seeds (negative, fractional, non-numeric)
+                    // are rejected — never silently treated as unseeded.
+                    let client_seed = match parse_wire_seed(msg.get("seed")) {
+                        Ok(s) => s,
+                        Err(reason) => {
+                            write_error(&mut stdout, id, &reason);
+                            continue;
+                        }
+                    };
+                    let vl_request_seed =
+                        request_seed_for(&AttemptKey::new(id, gen_attempt_id), client_seed);
                     let params = GenerateVLParams {
                         id,
                         prompt,
@@ -2333,10 +2652,19 @@ fn main() {
                         repeat_window,
                         max_think_tokens: vl_max_think_tokens,
                         assistant_prefix,
+                        seed: vl_request_seed,
                     };
                     match vision_route {
                         hipfire_loader::VisionRoute::DotsOcr => {
                             hipfire_generate::vision::generate_vl_dots_ocr(
+                                m,
+                                &mut gpu,
+                                &mut stdout,
+                                &params,
+                            )
+                        }
+                        hipfire_loader::VisionRoute::Lfm2Vl => {
+                            hipfire_generate::vision::generate_lfm2_vl(
                                 m,
                                 &mut gpu,
                                 &mut stdout,
@@ -2514,6 +2842,17 @@ fn main() {
                                 batch_clear_terminal(id, gen_attempt_id);
                                 continue;
                             }
+                            // Explicit wire `seed` must reach the lane RNG on
+                            // the batched route too; out-of-domain values are
+                            // rejected loudly, never silently unseeded.
+                            let client_seed = match parse_wire_seed(msg.get("seed")) {
+                                Ok(s) => s,
+                                Err(reason) => {
+                                    write_error(&mut stdout, id, &reason);
+                                    batch_clear_terminal(id, gen_attempt_id);
+                                    continue;
+                                }
+                            };
                             let pending = BatchPendingRequest {
                                 key: AttemptKey::new(id, gen_attempt_id),
                                 prompt: prompt_owned.clone(),
@@ -2523,6 +2862,7 @@ fn main() {
                                 assistant_prefix,
                                 max_think_tokens,
                                 max_tokens,
+                                client_seed,
                                 sampling: sampling.clone(),
                             };
                             if let Some(sched) = batch_scheduler.as_mut() {
@@ -2660,6 +3000,17 @@ fn main() {
                                 batch_clear_terminal(id, gen_attempt_id);
                                 continue;
                             }
+                            // Explicit wire `seed` must reach the lane RNG on
+                            // the batched route too; out-of-domain values are
+                            // rejected loudly, never silently unseeded.
+                            let client_seed = match parse_wire_seed(msg.get("seed")) {
+                                Ok(s) => s,
+                                Err(reason) => {
+                                    write_error(&mut stdout, id, &reason);
+                                    batch_clear_terminal(id, gen_attempt_id);
+                                    continue;
+                                }
+                            };
                             let pending = BatchPendingRequest {
                                 key: AttemptKey::new(id, gen_attempt_id),
                                 prompt: prompt_owned.clone(),
@@ -2669,6 +3020,7 @@ fn main() {
                                 assistant_prefix,
                                 max_think_tokens,
                                 max_tokens,
+                                client_seed,
                                 sampling: sampling.clone(),
                             };
                             if let Some(sched) = batch_scheduler.as_mut() {
@@ -2874,6 +3226,51 @@ fn main() {
                         continue;
                     }
                 };
+                // Experimental slot backend: alternate owner, reset via engine. Refuse while active, otherwise checked teardown, clear keyed entries, ack only success.
+                if let Some(slot) = slot_backend.as_ref() {
+                    if slot.active_count() > 0 {
+                        hipfire_generate::dense::write_error_envelope(
+                            &mut stdout,
+                            None,
+                            "reset refused: slot requests active",
+                            "validation",
+                            false,
+                            false,
+                            reset_attempt_id,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                    match slot.reset() {
+                        Ok(()) => {
+                            batch_clear_all_terminals();
+                            state_epoch = state_epoch.saturating_add(1);
+                            let ack = serde_json::json!({
+                                "type": "reset",
+                                "rolled_back": true,
+                                "state_epoch": state_epoch,
+                                "seq_pos": 0,
+                                "conversation_len": 0,
+                                "attempt_id": reset_attempt_id,
+                                "retry_reset_eligible": false,
+                            });
+                            let _ = writeln!(stdout, "{ack}");
+                        }
+                        Err(e) => {
+                            hipfire_generate::dense::write_error_envelope(
+                                &mut stdout,
+                                None,
+                                &format!("reset failed: {e}"),
+                                "transient",
+                                true,
+                                false,
+                                reset_attempt_id,
+                            );
+                        }
+                    }
+                    let _ = stdout.flush();
+                    continue;
+                }
                 // Reset conversation state without unloading the model.
                 // Single production epilogue owns ordering + graph/replay
                 // invalidate + sync attestation (same path as fail-closed turns).
@@ -2950,6 +3347,70 @@ fn main() {
             }
 
             "unload" => {
+                // Experimental slot backend owns its own weight copy; unload it exclusively. Refuse while active, otherwise checked teardown, clear keyed entries, ack only success. Do not allow old Arc workers to keep prior model alive.
+                if slot_backend.is_some() {
+                    if slot_backend.as_ref().is_some_and(|b| b.active_count() > 0) {
+                        let attempt = msg.get("attempt_id").and_then(|v| v.as_u64()).unwrap_or(0);
+                        hipfire_generate::dense::write_error_envelope(
+                            &mut stdout,
+                            None,
+                            "unload refused: slot requests active",
+                            "validation",
+                            false,
+                            false,
+                            attempt,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                    if let Some(slot) = slot_backend.take() {
+                        match std::sync::Arc::try_unwrap(slot) {
+                            Err(slot) => {
+                                slot_backend = Some(slot);
+                                let attempt =
+                                    msg.get("attempt_id").and_then(|v| v.as_u64()).unwrap_or(0);
+                                hipfire_generate::dense::write_error_envelope(
+                                    &mut stdout,
+                                    None,
+                                    "unload refused: slot requests active (Arc live)",
+                                    "validation",
+                                    false,
+                                    false,
+                                    attempt,
+                                );
+                                let _ = stdout.flush();
+                            }
+                            Ok(slot) => match slot.shutdown() {
+                                Ok(()) => {
+                                    batch_scheduler = None;
+                                    continuous_batch_size = 1;
+                                    batch_poisoned = None;
+                                    batch_clear_all_terminals();
+                                    let _ = writeln!(stdout, "{}", r#"{"type":"unloaded"}"#);
+                                    let _ = stdout.flush();
+                                }
+                                Err(reason) => {
+                                    let attempt =
+                                        msg.get("attempt_id").and_then(|v| v.as_u64()).unwrap_or(0);
+                                    hipfire_generate::dense::write_error_envelope(
+                                        &mut stdout,
+                                        None,
+                                        &format!("unload failed: {reason}"),
+                                        "internal",
+                                        false,
+                                        false,
+                                        attempt,
+                                    );
+                                    let _ = stdout.flush();
+                                }
+                            },
+                        }
+                    } else {
+                        let _ = writeln!(stdout, "{}", r#"{"type":"unloaded"}"#);
+                        let _ = stdout.flush();
+                    }
+                    continue;
+                }
                 // Batch guard: unload is forbidden while lanes active.
                 if batch_scheduler
                     .as_ref()

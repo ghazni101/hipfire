@@ -63,6 +63,7 @@ pub enum QuantType {
     Mq5G256V2 = 48,
     Mq3G256V2 = 49,
     Mq2G256V2 = 50,
+    Mq2G256LloydU = 51,
 }
 impl QuantType {
     /// Wire tag → enum. `None` for tags this build does not know, which is a
@@ -105,6 +106,7 @@ impl QuantType {
             48 => Mq5G256V2,
             49 => Mq3G256V2,
             50 => Mq2G256V2,
+            51 => Mq2G256LloydU,
             _ => return None,
         })
     }
@@ -236,6 +238,7 @@ mod tests {
         assert_eq!(QuantType::Mq2G256V2 as u8, 50);
         // Unknown tags remain rejected
         assert_eq!(QuantType::from_tag(46), None);
-        assert_eq!(QuantType::from_tag(51), None);
+        assert_eq!(QuantType::from_tag(51), Some(QuantType::Mq2G256LloydU));
+        assert_eq!(QuantType::Mq2G256LloydU as u8, 51);
     }
 }

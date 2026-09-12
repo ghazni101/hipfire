@@ -943,10 +943,8 @@ impl KvCache {
                     "q8_lane_view lane byte range exceeds parent buffer",
                 ));
             }
-            let ptr =
-                unsafe { (t.buf.as_ptr() as *mut u8).add(byte_offset) as *mut std::ffi::c_void };
             Ok(GpuTensor {
-                buf: unsafe { hip_bridge::DeviceBuffer::from_raw(ptr, lane_bytes) },
+                buf: t.buf.byte_view(byte_offset, lane_bytes),
                 shape: vec![lane_elems],
                 dtype: DType::F32,
             })
@@ -1100,7 +1098,6 @@ impl KvCache {
             )),
         }
     }
-
 }
 
 impl KvCache {
@@ -3480,7 +3477,12 @@ impl KvCache {
             "asym3 currently requires head_dim=256 (Qwen 3.5)"
         );
         Self::new_gpu_asym3_capped_inner(
-            gpu, n_layers, n_kv_heads, head_dim, max_seq_len, physical_cap,
+            gpu,
+            n_layers,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            physical_cap,
         )
     }
 
@@ -3500,7 +3502,12 @@ impl KvCache {
             "asym3 (gemma4) requires head_dim=256 or 512 (got {head_dim})"
         );
         Self::new_gpu_asym3_capped_inner(
-            gpu, n_layers, n_kv_heads, head_dim, max_seq_len, physical_cap,
+            gpu,
+            n_layers,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            physical_cap,
         )
     }
 
@@ -3908,7 +3915,6 @@ impl KvCache {
     // The KvCache.givens_cos / .givens_sin fields stay `None` in multi mode
     // — Stage 6 forward dispatch reads from the per-device replicas in
     // `Gpus` instead.
-
 }
 
 /// KV VMM-layout and adaptive-reset contract tests.
@@ -3985,7 +3991,6 @@ mod vmm_layout_tests {
             physical_cap: Some(physical_cap),
         }
     }
-
 
     #[test]
     fn fwht3_vmm_layout_matches_asym3_byte_geometry() {

@@ -1,5 +1,5 @@
 {
-  "_comment": "Curated hipfire model registry overlay. Keep entry shape: { repo, file, size_gb, min_vram_gb, desc }. Empty repo = local-only. Aliases are simple string\u2192string redirects. Run scripts/registry_gen.py after editing.",
+  "_comment": "Curated hipfire model registry overlay. Keep entry shape: { repo, file, size_gb, min_vram_gb, desc }. Empty repo = local-only. Aliases are simple string→string redirects. Run scripts/registry_gen.py after editing.",
   "models": {
     "qwen3.5:0.8b": {
       "repo": "hipfire-models/qwen3.5-0.8b",
@@ -206,7 +206,8 @@
       },
       "recommended_settings": {
         "temperature": 1.0,
-        "top_p": 1.0
+        "top_p": 1.0,
+        "reasoning_effort": "high"
       },
       "desc": "DeepSeek V4 Flash, MQ2-Lloyd routed-expert MoE (arch_id=9). Includes MTP sidecar for K=2 spec-decode (+29% TG on code) and a DSpark 3-stage drafter sidecar (auto-wins over MTP under --spec dspark/auto). temp=1.0 is safety-critical: greedy/low-temp falls into token loops on the quant."
     },
@@ -223,27 +224,23 @@
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 1.0,
-        "reasoning_effort": "low",
-        "thinking_budget": "uncapped"
+        "reasoning_effort": "low"
       },
       "sampling_profiles": {
         "general": {
           "temperature": 1.0,
           "top_p": 1.0,
-          "reasoning_effort": "low",
-          "thinking_budget": "uncapped"
+          "reasoning_effort": "low"
         },
         "coding": {
           "temperature": 1.0,
           "top_p": 0.95,
-          "reasoning_effort": "max",
-          "thinking_budget": "uncapped"
+          "reasoning_effort": "max"
         },
         "instruct": {
           "temperature": 1.0,
           "top_p": 1.0,
-          "reasoning_effort": "none",
-          "thinking_budget": "off"
+          "reasoning_effort": "none"
         }
       },
       "sha256": "521c9687a3f5c12fb3d89bde4a3ed202698b95ae5a102d0b5ba7f3abb87982d0",
@@ -268,27 +265,23 @@
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 1.0,
-        "reasoning_effort": "low",
-        "thinking_budget": "uncapped"
+        "reasoning_effort": "low"
       },
       "sampling_profiles": {
         "general": {
           "temperature": 1.0,
           "top_p": 1.0,
-          "reasoning_effort": "low",
-          "thinking_budget": "uncapped"
+          "reasoning_effort": "low"
         },
         "coding": {
           "temperature": 1.0,
           "top_p": 0.95,
-          "reasoning_effort": "max",
-          "thinking_budget": "uncapped"
+          "reasoning_effort": "max"
         },
         "instruct": {
           "temperature": 1.0,
           "top_p": 1.0,
-          "reasoning_effort": "none",
-          "thinking_budget": "off"
+          "reasoning_effort": "none"
         }
       },
       "quant_recipe": "deepseek4-mq2r-e8-p3-v1",
@@ -313,6 +306,17 @@
         "system_prompt": "You are a helpful assistant. Your name is MiniMax-M2.7 and is built by MiniMax."
       },
       "desc": "MiniMax-M2.7 Mixtral-style 256-expert MoE (arch_id=10). MQ2 SKU (~79GB); fits gfx1151/96GB or multi-GPU EP. Card temp=1.0/top_p=0.95/top_k=40 + default identity system prompt."
+    },
+    "maple-preview": {
+      "repo": "hipfire-models/maple-preview",
+      "file": "maple-preview.mq2lloydu",
+      "size_gb": 6.5,
+      "min_vram_gb": 12,
+      "sampling": {
+        "temperature": 0.6,
+        "top_p": 0.95
+      },
+      "desc": "Deepgrove Maple-Preview 20B-A1B (arch_id=15). NATIVELY TERNARY: every linear weight ships as {-s,0,+s} with one bf16 scale per output row, so MQ2G256LloydU (qt=51, 2.250 bpw) carries the body VALUE-EXACTLY \u2014 a packing, not a quantization; max|err| vs the bf16 master is 0. lm_head is Q8: measured +23.9% decode for +0.00005 nats of mean KL, with top-1 agreement and PPL both slightly BETTER than bf16 (MQ4 head was rejected \u2014 2.6x the KL, concentrated on the model's most-confident positions). 24 layers, 256 experts top-8 on every layer, 3:1 sliding(512)/global-NoPE attention, QK-norm before partial RoPE, clamped SwiGLU. Reasoning model (<think>), Qwen tokenizer, ChatML + <tool_call> tools. ~1530 tok/s prefill, ~158 tok/s decode on gfx1151. NOTE: wikitext PPL ~57 (a peer scores ~7.7) \u2014 that is the MODEL, not the packing: KL vs a bf16 reference is 0.084 and the vendor's own ternary GGUF scores within 0.2%. Upstream calls it a preview with minimal agentic post-training."
     },
     "north-mini-code": {
       "repo": "nwoolmer/hipfire-north-mini-code",
@@ -412,7 +416,7 @@
       "file": "qwen3.6-35b-a3b.mq2",
       "size_gb": 11.6,
       "min_vram_gb": 14,
-      "desc": "Floor SKU \u2014 smallest, coherent but degraded."
+      "desc": "Floor SKU — smallest, coherent but degraded."
     },
     "qwen3.6:35b-a3b-mq3p": {
       "recommended_settings": {
@@ -456,7 +460,7 @@
       "file": "qwen3.6-35b-a3b.mq3p",
       "size_gb": 17.2,
       "min_vram_gb": 20,
-      "desc": "MQ3+P graded \u2014 MQ4 quality at MQ3 size."
+      "desc": "MQ3+P graded — MQ4 quality at MQ3 size."
     },
     "qwen3.6:35b-a3b-mq4p": {
       "recommended_settings": {
@@ -500,7 +504,7 @@
       "file": "qwen3.6-35b-a3b.mq4p",
       "size_gb": 19.8,
       "min_vram_gb": 22,
-      "desc": "MQ4+P graded \u2014 robust 4-bit default, beats uniform MQ4."
+      "desc": "MQ4+P graded — robust 4-bit default, beats uniform MQ4."
     },
     "qwen3.6:35b-a3b-mfp4": {
       "recommended_settings": {
@@ -544,7 +548,7 @@
       "file": "qwen3.6-35b-a3b.mfp4",
       "size_gb": 20.2,
       "min_vram_gb": 22,
-      "desc": "MFP4-E8 vector quant \u2014 the 4-bit quality leader."
+      "desc": "MFP4-E8 vector quant — the 4-bit quality leader."
     },
     "qwen3.6:35b-a3b-mq5": {
       "recommended_settings": {
@@ -588,7 +592,7 @@
       "file": "qwen3.6-35b-a3b.mq5",
       "size_gb": 23.7,
       "min_vram_gb": 26,
-      "desc": "Quality SKU \u2014 ~80% MQ4->f32."
+      "desc": "Quality SKU — ~80% MQ4->f32."
     },
     "qwen3.6:35b-a3b-mq6": {
       "recommended_settings": {
@@ -676,7 +680,7 @@
       "file": "qwen3.6-35b-a3b.mq4r",
       "size_gb": 18.7,
       "min_vram_gb": 22,
-      "desc": "MQ4 Redline speed SKU: uniform MQ4 attention and gate-side weights, graded routed experts, fused gate path. TG128 AR: 253.3 tok/s gfx1100, 115.1 gfx1151, 203.9 gfx1201. Lower quality than protected-attention MQ4P/MFP4."
+      "desc": "MQ4 Redline speed SKU: uniform MQ4G256/qt13 across routed experts, shared experts, attention, router, and lm_head (embed Q8F16 only); zero MQ6 graded experts, zero qt44; fused gate path. TG128 AR: 253.3 tok/s gfx1100, 115.1 gfx1151, 203.9 gfx1201. Lower quality than protected-attention MQ4P/MFP4."
     },
     "qwen3.6:27b": {
       "recommended_settings": {
@@ -709,8 +713,7 @@
         "min_p": 0.0,
         "presence_penalty": 0.0,
         "repeat_penalty": 1.0,
-        "reasoning_effort": "xhigh",
-        "thinking_budget": "uncapped"
+        "reasoning_effort": "xhigh"
       },
       "sampling_profiles": {
         "general": {
@@ -720,8 +723,7 @@
           "min_p": 0.0,
           "presence_penalty": 0.0,
           "repeat_penalty": 1.0,
-          "reasoning_effort": "xhigh",
-          "thinking_budget": "uncapped"
+          "reasoning_effort": "xhigh"
         }
       }
     },
@@ -739,8 +741,7 @@
         "min_p": 0.0,
         "presence_penalty": 0.0,
         "repeat_penalty": 1.0,
-        "reasoning_effort": "xhigh",
-        "thinking_budget": "uncapped"
+        "reasoning_effort": "xhigh"
       },
       "sampling_profiles": {
         "general": {
@@ -750,8 +751,7 @@
           "min_p": 0.0,
           "presence_penalty": 0.0,
           "repeat_penalty": 1.0,
-          "reasoning_effort": "xhigh",
-          "thinking_budget": "uncapped"
+          "reasoning_effort": "xhigh"
         }
       }
     },
@@ -769,8 +769,7 @@
         "min_p": 0.0,
         "presence_penalty": 0.0,
         "repeat_penalty": 1.0,
-        "reasoning_effort": "xhigh",
-        "thinking_budget": "uncapped"
+        "reasoning_effort": "xhigh"
       },
       "sampling_profiles": {
         "general": {
@@ -780,8 +779,7 @@
           "min_p": 0.0,
           "presence_penalty": 0.0,
           "repeat_penalty": 1.0,
-          "reasoning_effort": "xhigh",
-          "thinking_budget": "uncapped"
+          "reasoning_effort": "xhigh"
         }
       }
     },
@@ -799,8 +797,7 @@
         "min_p": 0.0,
         "presence_penalty": 0.0,
         "repeat_penalty": 1.0,
-        "reasoning_effort": "xhigh",
-        "thinking_budget": "uncapped"
+        "reasoning_effort": "xhigh"
       },
       "sampling_profiles": {
         "general": {
@@ -810,8 +807,7 @@
           "min_p": 0.0,
           "presence_penalty": 0.0,
           "repeat_penalty": 1.0,
-          "reasoning_effort": "xhigh",
-          "thinking_budget": "uncapped"
+          "reasoning_effort": "xhigh"
         }
       }
     },
@@ -829,8 +825,7 @@
         "min_p": 0.0,
         "presence_penalty": 0.0,
         "repeat_penalty": 1.0,
-        "reasoning_effort": "xhigh",
-        "thinking_budget": "uncapped"
+        "reasoning_effort": "xhigh"
       },
       "sampling_profiles": {
         "general": {
@@ -840,8 +835,7 @@
           "min_p": 0.0,
           "presence_penalty": 0.0,
           "repeat_penalty": 1.0,
-          "reasoning_effort": "xhigh",
-          "thinking_budget": "uncapped"
+          "reasoning_effort": "xhigh"
         }
       }
     },
@@ -859,8 +853,7 @@
         "min_p": 0.0,
         "presence_penalty": 0.0,
         "repeat_penalty": 1.0,
-        "reasoning_effort": "xhigh",
-        "thinking_budget": "uncapped"
+        "reasoning_effort": "xhigh"
       },
       "sampling_profiles": {
         "general": {
@@ -870,8 +863,7 @@
           "min_p": 0.0,
           "presence_penalty": 0.0,
           "repeat_penalty": 1.0,
-          "reasoning_effort": "xhigh",
-          "thinking_budget": "uncapped"
+          "reasoning_effort": "xhigh"
         }
       }
     },
@@ -889,8 +881,7 @@
         "min_p": 0.0,
         "presence_penalty": 0.0,
         "repeat_penalty": 1.0,
-        "reasoning_effort": "xhigh",
-        "thinking_budget": "uncapped"
+        "reasoning_effort": "xhigh"
       },
       "sampling_profiles": {
         "general": {
@@ -900,8 +891,7 @@
           "min_p": 0.0,
           "presence_penalty": 0.0,
           "repeat_penalty": 1.0,
-          "reasoning_effort": "xhigh",
-          "thinking_budget": "uncapped"
+          "reasoning_effort": "xhigh"
         }
       }
     },
@@ -919,8 +909,7 @@
         "min_p": 0.0,
         "presence_penalty": 0.0,
         "repeat_penalty": 1.0,
-        "reasoning_effort": "xhigh",
-        "thinking_budget": "uncapped"
+        "reasoning_effort": "xhigh"
       },
       "sampling_profiles": {
         "general": {
@@ -930,8 +919,7 @@
           "min_p": 0.0,
           "presence_penalty": 0.0,
           "repeat_penalty": 1.0,
-          "reasoning_effort": "xhigh",
-          "thinking_budget": "uncapped"
+          "reasoning_effort": "xhigh"
         }
       }
     },
@@ -949,8 +937,7 @@
         "min_p": 0.0,
         "presence_penalty": 0.0,
         "repeat_penalty": 1.0,
-        "reasoning_effort": "xhigh",
-        "thinking_budget": "uncapped"
+        "reasoning_effort": "xhigh"
       },
       "sampling_profiles": {
         "general": {
@@ -960,8 +947,7 @@
           "min_p": 0.0,
           "presence_penalty": 0.0,
           "repeat_penalty": 1.0,
-          "reasoning_effort": "xhigh",
-          "thinking_budget": "uncapped"
+          "reasoning_effort": "xhigh"
         }
       }
     },
@@ -979,8 +965,7 @@
         "min_p": 0.0,
         "presence_penalty": 0.0,
         "repeat_penalty": 1.0,
-        "reasoning_effort": "xhigh",
-        "thinking_budget": "uncapped"
+        "reasoning_effort": "xhigh"
       },
       "sampling_profiles": {
         "general": {
@@ -990,8 +975,7 @@
           "min_p": 0.0,
           "presence_penalty": 0.0,
           "repeat_penalty": 1.0,
-          "reasoning_effort": "xhigh",
-          "thinking_budget": "uncapped"
+          "reasoning_effort": "xhigh"
         }
       }
     },
@@ -1009,8 +993,7 @@
         "min_p": 0.0,
         "presence_penalty": 0.0,
         "repeat_penalty": 1.0,
-        "reasoning_effort": "xhigh",
-        "thinking_budget": "uncapped"
+        "reasoning_effort": "xhigh"
       },
       "sampling_profiles": {
         "general": {
@@ -1020,8 +1003,7 @@
           "min_p": 0.0,
           "presence_penalty": 0.0,
           "repeat_penalty": 1.0,
-          "reasoning_effort": "xhigh",
-          "thinking_budget": "uncapped"
+          "reasoning_effort": "xhigh"
         }
       }
     },
@@ -1039,8 +1021,7 @@
         "min_p": 0.0,
         "presence_penalty": 0.0,
         "repeat_penalty": 1.0,
-        "reasoning_effort": "xhigh",
-        "thinking_budget": "uncapped"
+        "reasoning_effort": "xhigh"
       },
       "sampling_profiles": {
         "general": {
@@ -1050,8 +1031,7 @@
           "min_p": 0.0,
           "presence_penalty": 0.0,
           "repeat_penalty": 1.0,
-          "reasoning_effort": "xhigh",
-          "thinking_budget": "uncapped"
+          "reasoning_effort": "xhigh"
         }
       }
     },
@@ -1094,7 +1074,7 @@
       "file": "qwen3.5-9b.mq3",
       "size_gb": 4.57,
       "min_vram_gb": 6.1,
-      "desc": "MQ3 alpha (3.25 bpw, gfx11/gfx12). Smaller than MQ4, comparable decode. Quality eval pending \u2014 see issue #113. Sub-9B MQ3 not shipped \u2014 see #114.",
+      "desc": "MQ3 alpha (3.25 bpw, gfx11/gfx12). Smaller than MQ4, comparable decode. Quality eval pending — see issue #113. Sub-9B MQ3 not shipped — see #114.",
       "default_kv_mode": "q8",
       "quant_recipe": "v3-awq-f1"
     },
@@ -1103,7 +1083,7 @@
       "file": "qwen3.5-27b.mq3",
       "size_gb": 10.7,
       "min_vram_gb": 12,
-      "desc": "MQ3 alpha \u2014 fits 128K asym3 ctx on 24 GB (MQ4 OOMs at ~98K). gfx11/gfx12 only."
+      "desc": "MQ3 alpha — fits 128K asym3 ctx on 24 GB (MQ4 OOMs at ~98K). gfx11/gfx12 only."
     },
     "qwen3.6:27b-mq3": {
       "recommended_settings": {
@@ -1116,14 +1096,14 @@
       "file": "qwen3.6-27b.mq3",
       "size_gb": 10.7,
       "min_vram_gb": 12,
-      "desc": "MQ3 alpha \u2014 fits 128K asym3 ctx on 24 GB. Pairs well with mq4 DFlash draft (126 tok/s \u03c4=7.0)."
+      "desc": "MQ3 alpha — fits 128K asym3 ctx on 24 GB. Pairs well with mq4 DFlash draft (126 tok/s τ=7.0)."
     },
     "qwen3.5:27b-draft-mq3": {
       "repo": "hipfire-models/qwen3.5-27b",
       "file": "qwen35-27b-dflash-mq3.hfq",
       "size_gb": 0.67,
       "min_vram_gb": 12,
-      "desc": "MQ3 DFlash draft for qwen3.5:27b \u2014 671 MB vs 920 MB MQ4 draft. ~30% lower \u03c4 on code prompts; trades draft VRAM for ctx fit."
+      "desc": "MQ3 DFlash draft for qwen3.5:27b — 671 MB vs 920 MB MQ4 draft. ~30% lower τ on code prompts; trades draft VRAM for ctx fit."
     },
     "qwen3.6:27b-draft-mq3": {
       "recommended_settings": {
@@ -1179,7 +1159,7 @@
       "file": "qwen38-27b-dflash-mq4.hfq",
       "size_gb": 1.21,
       "min_vram_gb": 16,
-      "desc": "MQ4 DFlash draft for qwen3.8:27b (arch 20). Recommended controller draft across the MQ3\u2013MQ6 V2 ladder; same-bit mq3/mq5/mq6 alternatives available."
+      "desc": "MQ4 DFlash draft for qwen3.8:27b (arch 20). Recommended controller draft across the MQ3–MQ6 V2 ladder; same-bit mq3/mq5/mq6 alternatives available."
     },
     "qwen3.8:27b-draft-mq5": {
       "repo": "hipfire-models/qwen3.8-27b",
@@ -1200,14 +1180,14 @@
       "file": "qwen35-9b-dflash-mq4.hfq",
       "size_gb": 0.55,
       "min_vram_gb": 6,
-      "desc": "DFlash draft for qwen3.5:9b \u2014 pairs with target for 2-3\u00d7 decode on code/instruct"
+      "desc": "DFlash draft for qwen3.5:9b — pairs with target for 2-3× decode on code/instruct"
     },
     "qwen3.5:27b-draft": {
       "repo": "hipfire-models/qwen3.5-27b",
       "file": "qwen35-27b-dflash-mq4.hfq",
       "size_gb": 0.92,
       "min_vram_gb": 16,
-      "desc": "DFlash draft for qwen3.5:27b \u2014 pairs with target for 4\u00d7 decode on code (212 tok/s peak)"
+      "desc": "DFlash draft for qwen3.5:27b — pairs with target for 4× decode on code (212 tok/s peak)"
     },
     "qwen3.6:27b-draft": {
       "recommended_settings": {
@@ -1220,7 +1200,7 @@
       "file": "qwen36-27b-dflash-mq4.hfq",
       "size_gb": 0.92,
       "min_vram_gb": 16,
-      "desc": "DFlash draft for qwen3.6:27b \u2014 pairs with target for ~4\u00d7 decode on code (refreshed 2026-04-27 from z-lab@0919688)"
+      "desc": "DFlash draft for qwen3.6:27b — pairs with target for ~4× decode on code (refreshed 2026-04-27 from z-lab@0919688)"
     },
     "carnice:9b": {
       "repo": "hipfire-models/carnice-9b",
@@ -1412,8 +1392,7 @@
         "min_p": 0.0,
         "presence_penalty": 0.0,
         "repeat_penalty": 1.0,
-        "reasoning_effort": "xhigh",
-        "thinking_budget": "uncapped"
+        "reasoning_effort": "xhigh"
       },
       "sampling_profiles": {
         "general": {
@@ -1423,8 +1402,7 @@
           "min_p": 0.0,
           "presence_penalty": 0.0,
           "repeat_penalty": 1.0,
-          "reasoning_effort": "xhigh",
-          "thinking_budget": "uncapped"
+          "reasoning_effort": "xhigh"
         }
       }
     },
@@ -1436,7 +1414,7 @@
       "sha256": "47ccfccddbef5b8e14040bae567c87129669fa9451f0c6b15d8f35964fce7503",
       "min_vram_gb": 24,
       "default_kv_mode": "q8",
-      "desc": "Speed SKU of muse-glimmer: MQ4 body AND MQ4 attention with a Q8 lm_head, 2.35 GB smaller and ~14% faster AR decode than the quality trunk (32.3 vs 28.4 tok/s, gfx1201, 2026-08-14 \u2014 registry text, not a live baseline). The .mq4r suffix marks it an MQ4R Redline SKU, but it is not lowered to Redline PM4 yet, so automatic Redline admission is withheld.",
+      "desc": "Speed SKU of muse-glimmer: MQ4 body AND MQ4 attention with a Q8 lm_head, 2.35 GB smaller and ~14% faster AR decode than the quality trunk (32.3 vs 28.4 tok/s, gfx1201, 2026-08-14 — registry text, not a live baseline). The .mq4r suffix marks it an MQ4R Redline SKU, but it is not lowered to Redline PM4 yet, so automatic Redline admission is withheld.",
       "recommended_settings": {
         "temperature": 1.0,
         "top_p": 0.95,
@@ -1444,8 +1422,7 @@
         "min_p": 0.0,
         "presence_penalty": 0.0,
         "repeat_penalty": 1.0,
-        "reasoning_effort": "xhigh",
-        "thinking_budget": "uncapped"
+        "reasoning_effort": "xhigh"
       },
       "sampling_profiles": {
         "general": {
@@ -1455,8 +1432,7 @@
           "min_p": 0.0,
           "presence_penalty": 0.0,
           "repeat_penalty": 1.0,
-          "reasoning_effort": "xhigh",
-          "thinking_budget": "uncapped"
+          "reasoning_effort": "xhigh"
         }
       }
     },
@@ -1467,7 +1443,7 @@
       "size_bytes": 1357990400,
       "sha256": "6fc0988e51689abf24c2e43d5b1f44794be3409484f99a115d36484ea0e23d2d",
       "min_vram_gb": 26,
-      "desc": "DFlash draft for muse-glimmer (muse_glimmer_assistant, arch 23) \u2014 5-layer block-diffusion head that reuses the target's embed and lm_head. Pairs with either SKU. Attach with HIPFIRE_DFLASH_DRAFT; there is no filename auto-pairing."
+      "desc": "DFlash draft for muse-glimmer (muse_glimmer_assistant, arch 23) — 5-layer block-diffusion head that reuses the target's embed and lm_head. Pairs with either SKU. Attach with HIPFIRE_DFLASH_DRAFT; there is no filename auto-pairing."
     },
     "bonsai:27b-bq1": {
       "repo": "hipfire-models/bonsai-27b",
@@ -1486,10 +1462,116 @@
       "default_kv_mode": "q8",
       "desc": "Bonsai-27B ternary (Prism ML, TQ2G128 2.125 bpw). 7.16 GB, native MQ4-teacher KLD 0.505 with f32 KV over the 8-chunk fixture, ~22.4 tok/s decode and ~258 tok/s prefill on gfx1151 (medians of 3, after warmup). Apache-2.0; see the repo NOTICE.",
       "quant_recipe": "prismml-bonsai-q2_0-passthrough"
+    },
+    "ornith-1.5:35b-a3b": {
+      "repo": "hipfire-models/ornith-1.5-35b-a3b",
+      "mtp": {
+        "file": "ornith-1.5-35b-a3b.mtp"
+      },
+      "file": "ornith-1.5-35b-a3b.mq4",
+      "size_gb": 19.02,
+      "min_vram_gb": 22,
+      "default_kv_mode": "q8",
+      "quant_recipe": "published-trunk plus qt13 shared-expert replacement from parent 10fbf86f using MQ4G256V2",
+      "recommended_settings": {
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+        "reasoning_effort": "xhigh"
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 0.6,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "xhigh"
+        },
+        "coding": {
+          "temperature": 0.6,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "xhigh"
+        },
+        "instruct": {
+          "temperature": 0.6,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "none"
+        }
+      },
+      "desc": "MoE 35B/3B-active VL finetune (Qwen3.5 family). Routed experts and all 96 formerly-MQ4V1 shared-expert projections now use MQ4G256V2; census: 20,747 MQ4G256V2, 43 MQ6G256, 112 Q8F16, 191 F16, zero MQ4G256V1. Parent-card sampling (temperature 0.6, top_p 0.95, top_k 20, no presence penalty) is validated with thinking enabled and disabled under VMM. Vision tower ships as ornith-1.5-35b-a3b.vl alongside the trunk. NOTE: the .mtp is a REPLACEMENT draft head derived from shisa-ai/Ornith-1.5-35B-A3B-MTP-ONLY (Apache-2.0), not the head from the Ornith 1.5 release. See the repo README and NOTICE. Low/medium/xhigh effort steering defaults to xhigh and has no implicit think-token cap."
+    },
+    "ornith-1.5:35b-a3b-mq4r": {
+      "repo": "hipfire-models/ornith-1.5-35b-a3b",
+      "mtp": {
+        "file": "ornith-1.5-35b-a3b.mtp"
+      },
+      "file": "ornith-1.5-35b-a3b.mq4r",
+      "size_gb": 18.7,
+      "size_bytes": 18700570368,
+      "sha256": "84103fcc8ade42aa2ac8ec01176df7a4ead5e94810597c9fae2f6763152a3ac6",
+      "min_vram_gb": 22,
+      "quant_recipe": "mq4v2-uniform-no-q8-router@10fbf86f",
+      "default_kv_mode": "q8",
+      "recommended_settings": {
+        "temperature": 0.6,
+        "top_p": 0.95,
+        "top_k": 20,
+        "min_p": 0.0,
+        "presence_penalty": 0.0,
+        "repeat_penalty": 1.0,
+        "reasoning_effort": "xhigh"
+      },
+      "sampling_profiles": {
+        "general": {
+          "temperature": 0.6,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "xhigh"
+        },
+        "coding": {
+          "temperature": 0.6,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "xhigh"
+        },
+        "instruct": {
+          "temperature": 0.6,
+          "top_p": 0.95,
+          "top_k": 20,
+          "min_p": 0.0,
+          "presence_penalty": 0.0,
+          "repeat_penalty": 1.0,
+          "reasoning_effort": "none"
+        }
+      },
+      "desc": "Official Ornith 1.5 35B-A3B uniform MQ4G256V2 Redline SKU, quantized from ornith-ai/Ornith-1.5-35B-A3B@10fbf86f with --format mq4 --no-q8-router --uniform. Census: 20,871 MQ4G256V2 (qt44), 31 Q8F16, 191 F16, zero qt13 and zero qt15. Parent-card sampling is temperature 0.6, top_p 0.95, top_k 20, no presence penalty. The optional .mtp is the separately published replacement head documented by the model card. Low/medium/xhigh effort steering defaults to xhigh and has no implicit think-token cap."
     }
   },
   "aliases": {
     "bonsai": "bonsai:27b-tq2",
+    "ornith": "ornith-1.5:35b-a3b",
+    "ornith-1.5": "ornith-1.5:35b-a3b",
+    "ornith1.5": "ornith-1.5:35b-a3b",
+    "ornith1.5:35b-a3b": "ornith-1.5:35b-a3b",
     "qwen3.5": "qwen3.5:4b",
     "qwen3.5:latest": "qwen3.5:9b",
     "qwen3.5:small": "qwen3.5:0.8b",

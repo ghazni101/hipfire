@@ -169,7 +169,7 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 // ─── Shared rotation gate (mirrors forward.rs) ───────────────────────────
 // HIPFIRE_GLIMMER_SHARED_ROT default ON (=1 or unset), =0 selects old path.
 fn shared_rot_enabled() -> bool {
-    std::env::var("HIPFIRE_GLIMMER_SHARED_ROT").as_deref() != Ok("0")
+    hipfire_config::developer_var("HIPFIRE_GLIMMER_SHARED_ROT").as_deref() != Ok("0")
 }
 
 // ─── Batched projection dispatch (mirrors forward.rs::proj_gemm_batched) ──

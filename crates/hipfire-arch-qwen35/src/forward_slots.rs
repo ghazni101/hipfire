@@ -14,46 +14,53 @@
 // `_slots` entry points SP1 built, and DeltaNet through a per-slot loop
 // over SP2's per-slot `DeltaNetState`.
 //
-// Scope: dense layers admit uniform `Q8_0` or uniform `MQ4G256`. Every weight
-// a `DeltaNet`/`FullAttn` (dense) layer touches (QKV/QKVZA, wo, gate/up, down,
-// and the lm_head) must share one of those two dtypes; the KV cache is
+// Scope: dense layers admit uniform `Q8_0` or a uniform MQ-family projection
+// dtype the multi-slot body already implements (MQ4G256 / MQ4G256V2 /
+// MQ4CG256 / MQ6G256V2 / MQ5G256V2 / MQ3G256V2 / MQ2G256V2). Every weight a
+// `DeltaNet`/`FullAttn` (dense) layer touches (QKV/QKVZA, wo, gate/up, down,
+// and the lm_head) must share one admitted dtype; the KV cache is
 // Q8_0-quantized and DeltaNet state is `StateQuant::Q8` regardless. MQ4G256
 // differs only in that activations are FWHT-rotated before each GEMM and the
 // `*Hfq4G256` kernel keys are used (MQ4 shares HFQ4's byte layout) — the same
 // treatment the MoE bodies already gave their attention projections. This is
 // what lets a dense MQ4 checkpoint such as `qwen3.6-27b.mq4` run multi-slot.
-// MQ6/HFQ6, MQ3, ParoQ4G128 and mixed-dtype-within-layer remain unported. This matches the ABI the multi-slot infrastructure was
-// actually built against — `SlotPool`'s per-slot addressing is documented as
-// a Q8_0 ABI (asym3 is explicitly exempted because its K/V strides differ and
-// it cannot share `k_base`/`v_base`), `kv_cache_write_q8_0_batched_slots` and
-// both `attention_*_batched_masked_slots` entry points are Q8_0-named, and
-// `gated_delta_net_q8_batch_seq` is the Q8 recurrence. The KV cache tier is
-// unconditionally Q8_0 for EVERY layer this file drives, dense or MoE — slot
-// addressing is a KV-cache-tier property, not a weight-quant property, so the
-// attend/KV-write steps below never change no matter what a layer's
-// projection weights are quantized to.
+// MQ4G256V2 (qt=44) and MQ6G256V2 (qt=47) use dedicated V2 residual/fused keys
+// selected by weight CONTAINER (`residual_gemm_key_for` / `fused_*_key_for`) —
+// never the V1 HFQ4 keys. MQ3/ParoQ4G128 and mixed-dtype-within-layer remain
+// unported for the dense body. This matches the ABI the multi-slot
+// infrastructure was actually built against — `SlotPool`'s per-slot addressing
+// is documented as a Q8_0 ABI (asym3 is explicitly exempted because its K/V
+// strides differ and it cannot share `k_base`/`v_base`),
+// `kv_cache_write_q8_0_batched_slots` and both `attention_*_batched_masked_slots`
+// entry points are Q8_0-named, and `gated_delta_net_q8_batch_seq` is the Q8
+// recurrence. The KV cache tier is unconditionally Q8_0 for EVERY layer this
+// file drives, dense or MoE — slot addressing is a KV-cache-tier property, not
+// a weight-quant property, so the attend/KV-write steps below never change no
+// matter what a layer's projection weights are quantized to.
 //
 // `DeltaNetMoe`/`FullAttnMoe` layers (qwen3.6-35b-a3b and similar A3B
-// checkpoints) additionally admit uniformly-`MQ4G256` projection weights,
-// mirroring `forward_prefill_chunk`'s own `is_mq` dispatch fork for these
-// layer kinds (rmsnorm+FWHT-rotate via `fused_rmsnorm_rotate_mq_batched_for`
-// / `rotate_x_mq_batched_for`, then the same `*Hfq4G256` kernel keys the
-// dense HFQ4G256 path already uses — MQ4G256 (qt=13) is byte-identical to HFQ4G256,
-// only the input activations are pre-rotated. This does NOT hold for qt=44
-// (MQ4G256V2): same 136 B stride and nibble payload but the 8 header bytes change
-// meaning from `[0..4) f32 scale, [4..8) f32 zero` (one affine grid per 256 weights)
-// to `[0..2) fp16 s0, [2..4) fp16 z0, [4..6) fp16 s1, [6..8) fp16 z1` (s0/z0 for 0..127,
-// s1/z1 for 128..255). A v1 kernel fed qt=44 bytes bit_casts fp16 pairs to f32 and
-// decodes every weight to ~1e-14 at full speed with no error. The MoE FFN itself is
-// stateless per row (no kv_cache, no dn_state, no positions — confirmed by
-// reading `moe_ffn_decode`'s signature), so it needs no slot machinery at
-// all: `run_deltanet_moe_layer_slots`/`run_fullattn_moe_layer_slots` call
-// the reference's own `prefill_moe_ffn_body_batched` directly over the flat
-// N-row batch, gated by the reference's own `moe_ffn_batched_admissible`.
-// MQ6/PARO/Lloyd/E8/mixed-dtype MoE attention or FFN weights are out of
-// scope here (see `require_batchable_deltanet_moe_layer` /
-// `require_batchable_fullattn_moe_layer` / `require_batchable_moe_ffn`) —
-// each returns a clear `HipError` rather than guessing at an untested path.
+// checkpoints) admit the same uniform attention projection family, mirroring
+// `forward_prefill_chunk`'s own `is_mq` dispatch fork for these layer kinds
+// (rmsnorm+FWHT-rotate via `fused_rmsnorm_rotate_mq_batched_for` /
+// `rotate_x_mq_batched_for`, then container-selected fused keys). This does
+// NOT hold for qt=44 (MQ4G256V2): same 136 B stride and nibble payload but the
+// 8 header bytes change meaning from `[0..4) f32 scale, [4..8) f32 zero` (one
+// affine grid per 256 weights) to `[0..2) fp16 s0, [2..4) fp16 z0, [4..6) fp16
+// s1, [6..8) fp16 z1` (s0/z0 for 0..127, s1/z1 for 128..255). A v1 kernel fed
+// qt=44 bytes bit_casts fp16 pairs to f32 and decodes every weight to ~1e-14
+// at full speed with no error. The MoE FFN itself is stateless per row (no
+// kv_cache, no dn_state, no positions — confirmed by reading
+// `moe_ffn_decode`'s signature), so it needs no slot machinery at all:
+// `run_deltanet_moe_layer_slots`/`run_fullattn_moe_layer_slots` call the
+// reference's own `prefill_moe_ffn_body_batched` directly over the flat N-row
+// batch, gated by the reference's own `moe_ffn_batched_admissible` (uniform
+// MQ4G256V2 / MQ6G256V2 shared+routed paths ride that shared gate — no
+// duplicate MoE dispatch in this file). PARO/Lloyd/E8/mixed-dtype MoE
+// attention outside the shared gate, and mixed-dtype-within-layer attention
+// projections, remain out of scope here (see
+// `require_batchable_deltanet_moe_layer` / `require_batchable_fullattn_moe_layer`
+// / `require_batchable_moe_ffn`) — each returns a clear `HipError` rather than
+// guessing at an untested path.
 //
 // DeltaNet slot-state note: only the GDN recurrence and the conv1d causal
 // state are sequential-per-slot (both carry state across steps: the S
@@ -70,6 +77,7 @@
 // KV write and the attend call, both single launches via the `_slots`
 // entry points — RoPE is slot-agnostic per SP2 Task 2 and needs no split).
 
+use crate::qwen35::prefill::is_batchable_la;
 use crate::qwen35::{
     moe_ffn_batched_admissible, mq6_batched_admit_enabled_from_env, prefill_moe_ffn_body_batched,
     q8_prefill_wmma_enabled, run_fused_gate_up_key, run_fused_qkv_key, run_fused_qkvza_key,
@@ -185,12 +193,47 @@ impl SlotDescStaging {
     }
 }
 
+/// Projection dtypes the multi-slot attention/FFN body can run: Q8_0 is a
+/// separate path; everything else here is the FWHT-rotated MQ family that
+/// routes through `residual_gemm_key_for` / `fused_*_key_for`. Uniformity is
+/// still required per layer (mixed qt=13/qt=44 would mis-decode headers).
+fn slots_mq_proj_family(dt: DType) -> bool {
+    matches!(
+        dt,
+        DType::MQ4G256
+            | DType::MQ4G256V2
+            | DType::MQ4CG256
+            | DType::MQ6G256V2
+            | DType::MQ5G256V2
+            | DType::MQ3G256V2
+            | DType::MQ2G256V2
+    )
+}
+
+/// lm_head dtypes the multi-slot path admits. `Step::Gemv` +
+/// `weights.output.dispatch_ref()` is dtype-generic, so this is an allow-list
+/// of formats whose GEMV/rotate path is known-good. Uniform MQ4G256V2 and
+/// MQ6G256V2 ride the same dispatcher as the single-sequence reference —
+/// no slot-local kernel. Do not silently widen to MQ2/3/5V2 here.
+fn lm_head_slots_admissible(dt: DType) -> bool {
+    matches!(
+        dt,
+        DType::Q8_0 | DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ6G256V2
+    )
+}
+
 /// Uniform-dtype gate for a `DeltaNetLayerWeights`. All eight projections must
-/// share ONE dtype — `Q8_0` or `MQ4G256`. Uniformity is the load-bearing part:
+/// share ONE dtype — `Q8_0` or a slots MQ-family dtype that
+/// [`is_batchable_la`] admits on `arch`. Uniformity is the load-bearing part:
 /// a mixed-dtype layer would silently misroute through one dtype's stride
 /// against a differently-strided weight, the exact corruption class the dense
 /// batched-prefill path guards against at every one of its own dtype branches.
-fn require_batchable_deltanet_layer(layer: &DeltaNetLayerWeights) -> HipResult<AttnProjDtype> {
+/// Arch/env gates (MQ4V2/MQ6V2 WMMA on gfx11/12) come from the shared
+/// `is_batchable_la` predicate — no duplicate MQV2 admit table here.
+fn require_batchable_deltanet_layer(
+    layer: &DeltaNetLayerWeights,
+    arch: &str,
+) -> HipResult<AttnProjDtype> {
     let all = |d: DType| {
         layer.wqkv.gpu_dtype == d
             && layer.wz.gpu_dtype == d
@@ -204,30 +247,27 @@ fn require_batchable_deltanet_layer(layer: &DeltaNetLayerWeights) -> HipResult<A
     if all(DType::Q8_0) {
         return Ok(AttnProjDtype::Q8_0);
     }
-    // Either MQ4 container is admissible, but a layer must be uniform in ONE of
-    // them: the fused kernels serve all projections of a layer in a single launch,
-    // so a mixed qt=13/qt=44 layer would decode half its weights with the wrong
-    // header interpretation.
-    if all(DType::MQ4G256)
-        || all(DType::MQ4G256V2)
-        || all(DType::MQ4CG256)
-        || all(DType::MQ6G256V2)
-        || all(DType::MQ5G256V2)
-        || all(DType::MQ3G256V2)
-        || all(DType::MQ2G256V2)
-    {
+    // Uniform MQ-family: one container across every projection, and that
+    // container must pass the shared batched-prefill LA gate on this arch
+    // (MQ4G256 always; MQ4G256V2/MQ6G256V2 via mqv2 WMMA eligibility).
+    let dt = layer.wqkv.gpu_dtype;
+    if all(dt) && slots_mq_proj_family(dt) && is_batchable_la(dt, arch) {
         return Ok(AttnProjDtype::Mq4G256);
     }
     Err(HipError::new(
         0,
         "forward_batch_slots: dense DeltaNet layer is neither uniformly Q8_0 nor \
-         uniformly MQ4G256; the multi-slot batched path implements those two \
-         (MQ6/HFQ6, MQ3, ParoQ4G128 and mixed-dtype-within-layer are real \
-         reference paths but are not ported here)",
+         a uniformly batchable MQ-family dtype on this arch; the multi-slot \
+         path admits Q8_0 and slots_mq_proj_family ∩ is_batchable_la \
+         (MQ4G256 / MQ4G256V2 / MQ6G256V2 / …). Mixed-dtype-within-layer, \
+         ParoQ4G128, and non-batchable arches stay out of scope",
     ))
 }
 
-fn require_batchable_fullattn_layer(layer: &FullAttnLayerWeights) -> HipResult<AttnProjDtype> {
+fn require_batchable_fullattn_layer(
+    layer: &FullAttnLayerWeights,
+    arch: &str,
+) -> HipResult<AttnProjDtype> {
     let all = |d: DType| {
         layer.wq.gpu_dtype == d
             && layer.wk.gpu_dtype == d
@@ -240,20 +280,15 @@ fn require_batchable_fullattn_layer(layer: &FullAttnLayerWeights) -> HipResult<A
     if all(DType::Q8_0) {
         return Ok(AttnProjDtype::Q8_0);
     }
-    if all(DType::MQ4G256)
-        || all(DType::MQ4G256V2)
-        || all(DType::MQ4CG256)
-        || all(DType::MQ6G256V2)
-        || all(DType::MQ5G256V2)
-        || all(DType::MQ3G256V2)
-        || all(DType::MQ2G256V2)
-    {
+    let dt = layer.wq.gpu_dtype;
+    if all(dt) && slots_mq_proj_family(dt) && is_batchable_la(dt, arch) {
         return Ok(AttnProjDtype::Mq4G256);
     }
     Err(HipError::new(
         0,
         "forward_batch_slots: dense FullAttention layer is neither uniformly \
-         Q8_0 nor uniformly MQ4G256; see require_batchable_deltanet_layer",
+         Q8_0 nor a uniformly batchable MQ-family dtype on this arch; see \
+         require_batchable_deltanet_layer",
     ))
 }
 
@@ -262,9 +297,10 @@ fn require_batchable_fullattn_layer(layer: &FullAttnLayerWeights) -> HipResult<A
 /// and only the FFN downstream differs.
 /// Mirrors the `is_q8` / `is_mq` dtype forks `forward_prefill_chunk` applies
 /// to `DeltaNetMoe`/`FullAttnMoe` layers (qwen35.rs's DeltaNetMoe LA branch
-/// and FullAttnMoe FA branch) — narrowed to the two dtypes this file
-/// actually implements a slot-aware body for. MQ6G256/HFQ6G256, ParoQ4G128,
-/// and mixed-dtype-within-layer are real paths in the reference but are NOT
+/// and FullAttnMoe FA branch) — narrowed to the dtypes this file implements a
+/// slot-aware body for. MQ-family admission further consults the shared
+/// `is_batchable_la` (MQ4G256V2 / MQ6G256V2 on gfx11/gfx12). ParoQ4G128 and
+/// mixed-dtype-within-layer are real paths in the reference but are NOT
 /// ported here; see `require_batchable_deltanet_moe_layer` /
 /// `require_batchable_fullattn_moe_layer`.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
@@ -713,7 +749,7 @@ fn run_deltanet_layer_slots(
     n: usize,
     delta_layer_idx: usize,
 ) -> HipResult<()> {
-    let attn_dtype = require_batchable_deltanet_layer(layer)?;
+    let attn_dtype = require_batchable_deltanet_layer(layer, gpu.arch.as_str())?;
 
     let k_dim = config.linear_num_key_heads * config.linear_key_head_dim;
     let v_dim = config.linear_num_value_heads * config.linear_value_head_dim;
@@ -1555,7 +1591,7 @@ fn run_fullattn_layer_slots(
     single_slot: Option<(u64, usize)>,
     n_tiles: Option<usize>,
 ) -> HipResult<()> {
-    let attn_dtype = require_batchable_fullattn_layer(layer)?;
+    let attn_dtype = require_batchable_fullattn_layer(layer, gpu.arch.as_str())?;
 
     let dim = config.dim;
 
@@ -2143,12 +2179,12 @@ fn final_logits_per_slot(
     // Kept as an allow-list rather than removed: an unsupported dtype should
     // still fail here with a clear message naming the lm_head, not deep inside
     // the dispatcher.
-    if !matches!(weights.output.gpu_dtype, DType::Q8_0 | DType::MQ4G256) {
+    if !lm_head_slots_admissible(weights.output.gpu_dtype) {
         return Err(HipError::new(
             0,
             &format!(
                 "forward_batch_slots: lm_head (weights.output) dtype {:?} is not \
-                 supported by the multi-slot path (expected Q8_0 or MQ4G256)",
+                 supported by the multi-slot path (expected Q8_0, MQ4G256, MQ4G256V2 or MQ6G256V2)",
                 weights.output.gpu_dtype
             ),
         ));
@@ -2415,7 +2451,9 @@ impl SlotDecodeGraph {
         (self.captures, self.replays)
     }
 
-    fn release(&mut self, gpu: &Gpu) {
+    /// Destroy captured exec then graph handles and clear the cache key.
+    /// Safe to call when empty; required before the owning Gpu is torn down.
+    pub fn release(&mut self, gpu: &Gpu) {
         if let Some(exec) = self.exec.take() {
             let _ = gpu.hip.graph_exec_destroy(exec);
         }
@@ -3098,5 +3136,19 @@ mod tests {
         assert_ne!(DType::MQ5G256V2, DType::HFQ4G256);
         assert_ne!(DType::MQ3G256V2, DType::HFQ4G256);
         assert_ne!(DType::MQ2G256V2, DType::HFQ4G256);
+    }
+
+    #[test]
+    fn lm_head_slots_admissible_admits_mq6v2() {
+        assert!(lm_head_slots_admissible(DType::Q8_0));
+        assert!(lm_head_slots_admissible(DType::MQ4G256));
+        assert!(lm_head_slots_admissible(DType::MQ4G256V2));
+        assert!(lm_head_slots_admissible(DType::MQ6G256V2));
+        // Do not silently widen to MQ2/3/5V2.
+        assert!(!lm_head_slots_admissible(DType::MQ5G256V2));
+        assert!(!lm_head_slots_admissible(DType::MQ3G256V2));
+        assert!(!lm_head_slots_admissible(DType::MQ2G256V2));
+        assert!(!lm_head_slots_admissible(DType::MQ4CG256));
+        assert!(!lm_head_slots_admissible(DType::HFQ4G256));
     }
 }

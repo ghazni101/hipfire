@@ -53,7 +53,7 @@ Concrete symptoms visible in-tree today:
    - `crates/hip-bridge/examples/collect_e8_hessian_rocblas.rs` — rocBLAS path
    - `crates/hipfire-ds4-parent/src/hessian.rs` — parent online accumulator
      (same E8H1 wire) behind a backend marked **not** a calibration reference
-   - `scripts/collect_hessian.py`, `scripts/*calib*`, `scripts/verify_calib_artifacts.py`
+   - `scripts/collect_hessian.py`, `scripts/*calib*`, `python3 -m tools.hfq.verify_calib_artifacts`
 
 3. **Alignment / draft training is script-local**, not a scheduled candidate
    loop: `scripts/mtp_train/*`, `scripts/distill/*`, `scripts/dflash_train_poc.py`.
@@ -190,7 +190,7 @@ Until then these paths remain the live owners. “Migrate” means clean cutover
 | `hipfire-ds4-parent/src/plog.rs` | plog read/write/compare | **salvage into `teacher` / `score`** | Format helpers only |
 | `hipfire-ds4-parent/src/manifest.rs` | parent capture manifest schema | **salvage patterns into `waybill`** | Do not import DS4-only fields as global required set without generalization |
 | `scripts/fetch_calibration_corpus.sh` | corpus fetch | `corpus` | |
-| `scripts/verify_calib_artifacts.py` | artifact checks | `corpus` / `waybill` verify | |
+| `python3 -m tools.hfq.verify_calib_artifacts` | artifact checks | `corpus` / `waybill` verify | |
 | `scripts/collect_hessian.py` | Hessian helper | `capture` or delete after cutover | |
 | `scripts/calibrate_multigpu.sh`, `mi300x_calib_rest.sh`, `package_mi300x_calib.sh`, `mq4_masked_calib.py` | campaign wrappers | `schedule` recipes or stay as thin callers | Campaign glue is not product admission |
 | `scripts/mtp_train/*` | MTP head training experiments | `workers/` (dev-only) | Not Path C resurrection; explicit research worker |

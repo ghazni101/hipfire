@@ -395,6 +395,67 @@ impl ShardConfig {
     }
 }
 
+/// Select whole output rows from a row-major, uniform-row packed matrix.
+/// This is the byte-exact column-parallel primitive used by quantized TP
+/// loaders: no quant group is decoded or rewritten.
+pub fn slice_uniform_rows(
+    data: &[u8],
+    rows: usize,
+    start: usize,
+    end: usize,
+) -> Result<Vec<u8>, String> {
+    if start > end || end > rows || rows == 0 || data.len() % rows != 0 {
+        return Err(format!(
+            "invalid uniform-row slice {start}..{end} for rows={rows}, bytes={}",
+            data.len()
+        ));
+    }
+    let row_bytes = data.len() / rows;
+    Ok(data[start * row_bytes..end * row_bytes].to_vec())
+}
+
+/// Select whole quant groups from every row of a row-major packed matrix.
+/// `start` and `end` are input-column indices and must be group aligned.
+pub fn slice_uniform_group_cols(
+    data: &[u8],
+    rows: usize,
+    cols: usize,
+    start: usize,
+    end: usize,
+    group_size: usize,
+) -> Result<Vec<u8>, String> {
+    if rows == 0
+        || group_size == 0
+        || start > end
+        || end > cols
+        || cols % group_size != 0
+        || start % group_size != 0
+        || end % group_size != 0
+        || data.len() % rows != 0
+    {
+        return Err(format!(
+            "invalid uniform-group column slice {start}..{end} for {rows}x{cols}, group={group_size}, bytes={}",
+            data.len()
+        ));
+    }
+    let groups = cols / group_size;
+    let row_bytes = data.len() / rows;
+    if row_bytes % groups != 0 {
+        return Err(format!(
+            "row bytes {row_bytes} are not divisible by {groups} quant groups"
+        ));
+    }
+    let group_bytes = row_bytes / groups;
+    let first_group = start / group_size;
+    let selected_bytes = (end - start) / group_size * group_bytes;
+    let mut out = Vec::with_capacity(rows * selected_bytes);
+    for row in 0..rows {
+        let offset = row * row_bytes + first_group * group_bytes;
+        out.extend_from_slice(&data[offset..offset + selected_bytes]);
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -421,6 +482,38 @@ mod tests {
         let s = ShardConfig::new(2, false, 0, ExpertAssign::Stride).unwrap();
         assert!(s.expert_to_rank.is_empty());
         assert!(s.experts_on_rank(0).is_empty());
+    }
+
+    #[test]
+    fn packed_matrix_slices_tile_without_requantization() {
+        let rows = 4;
+        let cols = 512;
+        let group_size = 256;
+        let group_bytes = 5;
+        let data: Vec<u8> = (0..rows * 2 * group_bytes).map(|i| i as u8).collect();
+
+        let top = slice_uniform_rows(&data, rows, 0, 2).unwrap();
+        let bottom = slice_uniform_rows(&data, rows, 2, 4).unwrap();
+        assert_eq!([top, bottom].concat(), data);
+
+        let left = slice_uniform_group_cols(&data, rows, cols, 0, 256, group_size).unwrap();
+        let right = slice_uniform_group_cols(&data, rows, cols, 256, 512, group_size).unwrap();
+        for row in 0..rows {
+            assert_eq!(
+                [
+                    &left[row * group_bytes..(row + 1) * group_bytes],
+                    &right[row * group_bytes..(row + 1) * group_bytes]
+                ]
+                .concat(),
+                data[row * 2 * group_bytes..(row + 1) * 2 * group_bytes]
+            );
+        }
+    }
+
+    #[test]
+    fn packed_column_slice_rejects_partial_groups() {
+        let data = vec![0u8; 4 * 10];
+        assert!(slice_uniform_group_cols(&data, 4, 512, 128, 384, 256).is_err());
     }
 
     #[test]

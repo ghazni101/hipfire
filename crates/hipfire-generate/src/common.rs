@@ -8,19 +8,41 @@
 //! Families depend on this module; they never copy from it and never
 //! depend on each other.
 
-use std::any::Any;
 use hipfire_arch_deepseek4 as deepseek4;
 use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::speculative;
-use hipfire_loader::{AsstTurnCache, LoadedModel};
-use hipfire_runtime::prompt_frame::ThinkMode;
-use hipfire_runtime::spec::{ClientEvent, EvictRetain, FinishSummary, SpecTarget, Speculator, StopReason};
 use hipfire_engine::emit::*;
 use hipfire_engine::prompt::*;
 use hipfire_engine::redline::*;
 use hipfire_engine::scheduler::*;
 use hipfire_engine::terminal::*;
+use hipfire_loader::{AsstTurnCache, LoadedModel};
+use hipfire_runtime::prompt_frame::ThinkMode;
+use hipfire_runtime::spec::{
+    ClientEvent, EvictRetain, FinishSummary, SpecTarget, Speculator, StopReason,
+};
+use std::any::Any;
 use std::io::Write;
+
+/// Permanently latch a per-request think cap once its numeric budget is hit.
+///
+/// The close-token injection alone is insufficient: a model may reopen
+/// `<think>` or continue an unbounded visible answer. The latch blocks future
+/// openers and activates the existing bounded answer tail.
+pub(crate) fn latch_request_think_cap(
+    budget_hit: bool,
+    generated: usize,
+    force_answer_latched: &mut bool,
+    latch_gen_mark: &mut Option<usize>,
+) -> bool {
+    if !budget_hit {
+        return false;
+    }
+    let newly_latched = !*force_answer_latched;
+    *force_answer_latched = true;
+    latch_gen_mark.get_or_insert(generated);
+    newly_latched
+}
 
 /// Stable fingerprint over an assistant turn — pair of (text content,
 /// tool_calls canonical JSON). Output is identical for two messages
@@ -638,8 +660,12 @@ pub fn emit_committed_event(
     t_ms: u64,
 ) {
     use std::sync::LazyLock;
-    static ENABLED: LazyLock<bool> =
-        LazyLock::new(|| std::env::var("HIPFIRE_EMIT_TOKEN_IDS").ok().as_deref() == Some("1"));
+    static ENABLED: LazyLock<bool> = LazyLock::new(|| {
+        hipfire_config::developer_var("HIPFIRE_EMIT_TOKEN_IDS")
+            .ok()
+            .as_deref()
+            == Some("1")
+    });
     if !*ENABLED {
         return;
     }
@@ -680,10 +706,19 @@ pub fn free_checkpoints(
 /// `s_matrices`, `s_scales`, `conv_states`, and `s_ef_residual` on both
 /// multi-GPU and single-GPU paths. Returns `Err` with the joined failures
 /// (still attempts every surface — does not short-circuit).
-pub fn reset_qwen35_recurrent(m: &mut LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(), String> {
+pub fn reset_qwen35_recurrent(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+) -> Result<(), String> {
     let mut first_err: Option<String> = None;
     if m.pp > 1 {
-        if let (Some(b), Some(gpus), Some(la)) = (m.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()), m.pp_gpus.as_mut(), m.pp_dn_la_to_device.as_ref()) {
+        if let (Some(b), Some(gpus), Some(la)) = (
+            m.state.as_mut().and_then(|s| {
+                (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+            }),
+            m.pp_gpus.as_mut(),
+            m.pp_dn_la_to_device.as_ref(),
+        ) {
             let dn = &b.dn_state;
             for (i, s) in dn.s_matrices.iter().enumerate() {
                 let g = &mut gpus.devices[la[i] as usize];
@@ -932,7 +967,7 @@ pub fn build_deepseek4_dsml_prompt(
                     let normalized =
                         hipfire_runtime::tokenizer::maybe_normalize_prompt(&stripped).into_owned();
                     let fp = asst_turn_fingerprint(&normalized, &msg.tool_calls);
-                    if std::env::var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
+                    if hipfire_config::developer_var("HIPFIRE_DEEPSEEK4_CACHE_TRACE")
                         .ok()
                         .as_deref()
                         == Some("1")
@@ -1097,7 +1132,9 @@ pub fn fail_closed_reset_target_and_spec(
             bundle.reset_session_state();
         }
         if let Some(ad) = m.kv_adaptive.as_mut() {
-            if let Some(b) = m.state.as_mut().and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()) {
+            if let Some(b) = m.state.as_mut().and_then(|s| {
+                (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+            }) {
                 ad.reset_with_cache(gpu, &mut b.kv_cache);
             } else {
                 ad.reset();
@@ -1346,7 +1383,6 @@ pub fn maybe_inject_fault_after_prefill_dflash(
     true
 }
 
-
 // ── test-support helpers, moved with the daemon test modules ──
 
 /// Pure attestation combiner for unit tests / failure injection: every required
@@ -1427,7 +1463,6 @@ pub fn qwen_dflash_epilogue_after_spec_run(run_present: bool) -> bool {
     run_present
 }
 
-
 /// Pure speculative-route terminal decision after `Deepseek4Emit::finish`.
 /// Returns `Some(action)` when the emitter reported malformed protocol.
 pub fn ds4_spec_finish_route(
@@ -1502,4 +1537,37 @@ pub fn token_logprob_fields(
         })
         .collect::<Vec<_>>();
     Some((f64::from(sampled_lp), serde_json::Value::Array(top)))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::latch_request_think_cap;
+
+    #[test]
+    fn numeric_think_cap_latches_once_and_keeps_first_position() {
+        let mut latched = false;
+        let mut mark = None;
+
+        assert!(!latch_request_think_cap(
+            false,
+            100,
+            &mut latched,
+            &mut mark
+        ));
+        assert!(!latched);
+        assert_eq!(mark, None);
+
+        assert!(latch_request_think_cap(true, 4096, &mut latched, &mut mark));
+        assert!(latched);
+        assert_eq!(mark, Some(4096));
+
+        assert!(!latch_request_think_cap(
+            true,
+            5000,
+            &mut latched,
+            &mut mark
+        ));
+        assert!(latched);
+        assert_eq!(mark, Some(4096));
+    }
 }

@@ -72,7 +72,7 @@ const VISION_LDS_MAX_PIXELS: usize = 4_128_768;
 /// Resolve the vision input pixel budget, honouring `HIPFIRE_VL_MAX_PIXELS`
 /// but never exceeding what the attention kernel's LDS can hold.
 fn vision_max_pixels() -> usize {
-    std::env::var("HIPFIRE_VL_MAX_PIXELS")
+    hipfire_config::developer_var("HIPFIRE_VL_MAX_PIXELS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|v| *v > 0)

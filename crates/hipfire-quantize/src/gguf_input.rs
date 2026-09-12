@@ -165,6 +165,26 @@ pub struct GgufFile {
 }
 
 impl GgufFile {
+    /// Test-only: metadata + tensor-table view with no backing file. The
+    /// mmap is a zero-length map of an empty temp file (memmap2 handles
+    /// zero-length files); config translation reads only `metadata` and
+    /// `tensors`.
+    #[cfg(test)]
+    pub fn for_tests(
+        metadata: HashMap<String, MetaValue>,
+        tensors: Vec<TensorInfo>,
+    ) -> io::Result<Self> {
+        let file = tempfile::tempfile()?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        Ok(Self {
+            version: 3,
+            metadata,
+            tensors,
+            tensor_data_offset: 0,
+            mmap,
+        })
+    }
+
     pub fn open(path: &Path) -> io::Result<Self> {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };

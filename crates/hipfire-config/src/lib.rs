@@ -1594,6 +1594,15 @@ pub static FIELDS: &[ConfigField] = &[
         Some("HIPFIRE_DEFAULT_CHATML"),
         "Allow the fallback ChatML frame when no template resolves."
     ),
+    process_bool_field!(
+        "prompt.jinja_chat",
+        "jinja_chat",
+        Prompt,
+        true,
+        false,
+        "HIPFIRE_JINJA_CHAT",
+        "Render chat prompts through the model Jinja template; set HIPFIRE_JINJA_CHAT=0 for the hand-rolled ChatScaffold path."
+    ),
     process_field!(
         "hardware.devices",
         "devices",
@@ -2211,6 +2220,15 @@ pub static FIELDS: &[ConfigField] = &[
         "Enable the no-sync gate/up experiment."
     ),
     process_bool_field!(
+        "kernel.calib_force_bf16",
+        "calib_force_bf16",
+        Kernel,
+        false,
+        true,
+        "HIPFIRE_CALIB_BF16",
+        "Keep native-BF16 calibration teachers in BF16 instead of widening to F32 (calibration only; shipped inference is unaffected)."
+    ),
+    process_bool_field!(
         "kernel.qkvza_split_tail",
         "qkvza_split_tail",
         Kernel,
@@ -2218,6 +2236,26 @@ pub static FIELDS: &[ConfigField] = &[
         true,
         "HIPFIRE_QKVZA_SPLIT_TAIL",
         "Enable the RDNA3 QKVZA split-tail prefill route."
+    ),
+    process_field!(
+        "attention.ck_runtime_lib",
+        "ck_runtime_lib",
+        Attention,
+        DefaultValue::Null,
+        ValueRule::NullableString,
+        true,
+        "HIPFIRE_FLASH_ATTN_CK_LIB",
+        "Optional exact-architecture CK runtime sidecar path; load or capability failure retains native attention."
+    ),
+    process_field!(
+        "attention.ck_workspace_bytes",
+        "ck_workspace_bytes",
+        Attention,
+        DefaultValue::Integer(0),
+        ValueRule::Integer { min: 0, max: 17_179_869_184 },
+        true,
+        "HIPFIRE_FLASH_ATTN_CK_WORKSPACE_BYTES",
+        "Preallocated caller-owned bytes for the optional CK staged attention path."
     ),
     process_bool_field!(
         "kernel.gfx942_gemv_v3",
@@ -3214,6 +3252,29 @@ pub fn developer_var(name: &str) -> std::result::Result<String, std::env::VarErr
 
 pub fn developer_var_os(name: &str) -> Option<std::ffi::OsString> {
     process_value(name).map(Into::into)
+}
+/// Strict process-snapshot boolean for the `HIPFIRE_*` long tail.
+/// Reads exactly one snapshot value: `"1"` is true, `"0"` is false, and
+/// anything else (absent, empty, or any other spelling) falls back to
+/// `default`. The strict table matters: it exactly preserves both ambient
+/// idioms it replaces — `var == "1"` (default off) and `var != "0"`
+/// (default on) — while routing the read through the versioned
+/// [`ProcessConfig`] snapshot so TOML `[developer]` overrides and the
+/// env-beats-config-beats-default precedence apply. Deliberately narrower
+/// than `FeatureFlags::from_lookup`'s `parse_bool`, which also accepts
+/// `true`/`on`/`yes`: call sites that accept those spellings keep their
+/// own predicate.
+pub fn developer_bool(name: &str, default: bool) -> bool {
+    parse_developer_bool(process_value(name).as_deref(), default)
+}
+/// Pure truth table behind [`developer_bool`], split out so unit tests can
+/// pin the contract without touching the process-global snapshot.
+fn parse_developer_bool(raw: Option<&str>, default: bool) -> bool {
+    match raw {
+        Some("1") => true,
+        Some("0") => false,
+        _ => default,
+    }
 }
 
 fn render_compat_value(value: &ConfigValue) -> Option<String> {
@@ -4426,6 +4487,32 @@ mod tests {
     }
 
     #[test]
+    fn developer_bool_truth_table_is_strict() {
+        // "1" is true and "0" is false regardless of the default; every
+        // other spelling (including "true"/"on"/empty) falls back to it,
+        // which is what makes the helper an exact replacement for both
+        // `var == "1"` (default off) and `var != "0"` (default on).
+        for default in [false, true] {
+            assert!(parse_developer_bool(Some("1"), default));
+            assert!(!parse_developer_bool(Some("0"), default));
+            assert_eq!(parse_developer_bool(None, default), default);
+            assert_eq!(parse_developer_bool(Some("true"), default), default);
+            assert_eq!(parse_developer_bool(Some("on"), default), default);
+            assert_eq!(parse_developer_bool(Some("yes"), default), default);
+            assert_eq!(parse_developer_bool(Some(""), default), default);
+            assert_eq!(parse_developer_bool(Some("2"), default), default);
+        }
+    }
+
+    #[test]
+    fn developer_bool_defaults_when_unset() {
+        // A probe name nothing sets must resolve to the caller's default
+        // through the live snapshot (no install, no TOML, no env).
+        assert!(!developer_bool("HIPFIRE_S4_FLAG_PROBE_UNSET_OFF", false));
+        assert!(developer_bool("HIPFIRE_S4_FLAG_PROBE_UNSET_ON", true));
+    }
+
+    #[test]
     fn schema_has_unique_keys_and_legacy_keys() {
         let mut canonical = std::collections::BTreeSet::new();
         let mut legacy = std::collections::BTreeSet::new();
@@ -4775,6 +4862,12 @@ mod tests {
         let mut global = ConfigLayer::default();
         global.set_cli("kernel.mw16", "true").unwrap();
         global.set_cli("diagnostic.kernel.gemv_rows", "4").unwrap();
+        global
+            .set_cli("attention.ck_runtime_lib", "/opt/hipfire/ck.so")
+            .unwrap();
+        global
+            .set_cli("attention.ck_workspace_bytes", "536870912")
+            .unwrap();
         let resolved = resolve([NamedLayer {
             source: ConfigSource::GlobalUser {
                 path: PathBuf::from("config.toml"),
@@ -4785,6 +4878,16 @@ mod tests {
         let process = ProcessConfig::from_resolved(&resolved).unwrap();
 
         assert_eq!(process.legacy_value("HIPFIRE_MW16").as_deref(), Some("1"));
+        assert_eq!(
+            process.legacy_value("HIPFIRE_FLASH_ATTN_CK_LIB").as_deref(),
+            Some("/opt/hipfire/ck.so")
+        );
+        assert_eq!(
+            process
+                .legacy_value("HIPFIRE_FLASH_ATTN_CK_WORKSPACE_BYTES")
+                .as_deref(),
+            Some("536870912")
+        );
         assert_eq!(
             process.legacy_value("HIPFIRE_GEMV_ROWS").as_deref(),
             Some("4")

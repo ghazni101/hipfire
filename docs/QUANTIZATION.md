@@ -60,6 +60,13 @@ zero padding at `[4..8)`, and the 4-bit payload at `+8`.
 parity, but measured Qwen3.8 ladder KLD is catastrophic (~12–14 nats WT2/v6sel).
 **Do not call MQ2V2 a shipping product body.** MQ3–MQ6 V2 cells are measured
 candidates on the product ladder, not automatic registry cards. Full contracts:
+
+Qwen3.x MoE runtime support covers routed `MQ4G256V2` and `MQ6G256V2`
+experts for indexed decode, batched decode, grouped prefill, shared experts,
+slots, and expert-parallel execution. Uniform and frozen mixed V1/V2 expert
+tables preserve the exact per-projection dtype tag. This runtime support does
+not relax the quantizer's direct-MoE output gate for non-MQ4 V2 formats.
+
 [mq4-v2.md](quant-formats/mq4-v2.md), [mq-v2-family.md](quant-formats/mq-v2-family.md),
 [ladder.md](quant-formats/ladder.md).
 

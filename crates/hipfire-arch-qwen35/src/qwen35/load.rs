@@ -11,7 +11,9 @@ use super::config::Qwen35Config;
 use super::forward::layers_have_mq6_moe;
 use super::weights::dtype_from_quant_type;
 use super::weights::mixed_expert_tag;
+use super::weights::DeltaNetLayerWeights;
 use super::weights::ExpertWeights;
+use super::weights::FullAttnLayerWeights;
 use super::weights::LayerWeights;
 use super::weights::MoeFfnWeights;
 use super::weights::MoeParoSidecars;
@@ -93,6 +95,28 @@ fn qwen35_tensor_data_vec<'a>(
     for candidate in qwen35_tensor_name_candidates(name) {
         if let Some(found) = hfq.tensor_data_vec(&candidate) {
             return Some(found);
+        }
+    }
+    None
+}
+
+/// Borrowed-first variant of [`qwen35_tensor_data_vec`]: returns the mmap
+/// slice directly when the mapping is alive (dGPU loads keep it, so weight
+/// uploads DMA straight out of page-cache pages with no heap staging copy);
+/// falls back to the owned pread Vec on UMA (mmap dropped there). Same
+/// candidate resolution.
+fn qwen35_tensor_data_cow<'a>(
+    hfq: &'a HfqFile,
+    name: &str,
+) -> Option<(&'a HfqTensorInfo, std::borrow::Cow<'a, [u8]>)> {
+    for candidate in qwen35_tensor_name_candidates(name) {
+        if let Some((info, data)) = hfq.tensor_data(&candidate) {
+            return Some((info, std::borrow::Cow::Borrowed(data)));
+        }
+    }
+    for candidate in qwen35_tensor_name_candidates(name) {
+        if let Some((info, data)) = hfq.tensor_data_vec(&candidate) {
+            return Some((info, std::borrow::Cow::Owned(data)));
         }
     }
     None
@@ -813,12 +837,20 @@ pub(crate) fn load_weight_tensor(
     k: usize,
     candidates: fn(&str) -> Vec<String>,
 ) -> HipResult<WeightTensor> {
-    // Use pread path to avoid page cache buildup on unified-memory APUs.
+    // Zero-copy first: when the mmap is alive (dGPU loads keep it), DMA
+    // straight from the page-cache-backed slice — no heap staging copy.
+    // Pread fallback preserves UMA behavior (mmap dropped there).
     #[cfg(unix)]
     {
         let mut wt: Option<WeightTensor> = None;
         let mut matched: Option<String> = None;
         for candidate in candidates(name) {
+            if let Some((info, data)) = hfq.tensor_data(&candidate) {
+                let qt = info.quant_type;
+                wt = Some(load_weight_tensor_raw(gpu, qt, data, m, k)?);
+                matched = Some(candidate);
+                break;
+            }
             if let Some((info, buf)) = hfq.tensor_data_pread(&candidate) {
                 let qt = info.quant_type;
                 wt = Some(load_weight_tensor_raw(gpu, qt, &buf, m, k)?);
@@ -2401,6 +2433,9 @@ pub fn load_weights(
     devices: &mut [Gpu],
     layout: &Layout,
 ) -> HipResult<Qwen35Weights> {
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
+    let t_sweep = Instant::now();
     let LoadedWeights {
         token_embd,
         embd_format,
@@ -2409,6 +2444,12 @@ pub fn load_weights(
         layers,
         lm_head_aliases_embd,
     } = rt_load_weights(source, devices, layout)?;
+    eprintln!(
+        "  weight sweep: {} ms (packed-expert host-read {} ms, H2D {} ms)",
+        t_sweep.elapsed().as_millis(),
+        PACKED_READ_MS.load(Ordering::Relaxed),
+        PACKED_UPLOAD_MS.load(Ordering::Relaxed),
+    );
     Ok(Qwen35Weights {
         token_embd,
         embd_format,
@@ -2439,10 +2480,19 @@ impl WeightSource for HfqSource<'_> {
     fn n_layers(&self) -> usize {
         self.c.n_layers
     }
-
     fn prepare(&mut self, n_devices: usize) -> HipResult<()> {
+        // Keep the mmap alive on discrete GPUs (the carrier cleared
+        // `evict_page_cache` there): weight uploads DMA straight out of
+        // page-cache pages with no heap staging copy — measured 11–16 GB/s
+        // end-to-end vs ~4 GB/s through a pread staging buffer.
+        // UMA keeps the drop — evict=true is exactly the carrier's UMA
+        // signal — so cached model pages can't starve hipMalloc of RAM.
+        //
+        // NOTE: do NOT madvise-populate the mapping here. A blocking
+        // MAP_POPULATE measured identical totals (it relocates the same
+        // soft-fault work out of the upload loop into one serial stall).
         #[cfg(unix)]
-        if n_devices == 1 {
+        if n_devices == 1 && self.hfq.evicts_page_cache() {
             self.hfq.drop_mmap();
         }
         let _ = n_devices;
@@ -2463,7 +2513,7 @@ impl WeightSource for HfqSource<'_> {
                 c.mrope_interleaved, c.mrope_section
             );
         }
-        let (embd_meta, embd_data) = qwen35_tensor_data_vec(self.hfq, "embed_tokens.weight")
+        let (embd_meta, embd_data) = qwen35_tensor_data_cow(self.hfq, "embed_tokens.weight")
             .expect("embed_tokens not found");
         let out = load_embedding(gpu, embd_meta.quant_type, &embd_data, c.vocab_size, c.dim)?;
         drop(embd_data);
@@ -2497,11 +2547,11 @@ impl WeightSource for HfqSource<'_> {
             c.dim,
             |gpu| {
                 let (lm_info, lm_data) =
-                    qwen35_tensor_data_vec(hfq, "lm_head.weight").expect("lm_head present");
+                    qwen35_tensor_data_cow(hfq, "lm_head.weight").expect("lm_head present");
                 load_weight_tensor_raw(gpu, lm_info.quant_type, &lm_data, c.vocab_size, c.dim)
             },
             |gpu| {
-                let (embd_meta, embd_data) = qwen35_tensor_data_vec(hfq, "embed_tokens.weight")
+                let (embd_meta, embd_data) = qwen35_tensor_data_cow(hfq, "embed_tokens.weight")
                     .expect("embed_tokens not found");
                 dequant_weight_raw(gpu, embd_meta.quant_type, &embd_data, c.vocab_size, c.dim)
             },
@@ -2691,6 +2741,1169 @@ fn load_layer_into(
     crate::layer_driver::load_layer(&mut b, config, layer_idx, moe)
 }
 
+#[derive(Clone, Copy)]
+enum DenseTpSlice<'a> {
+    Rows(usize, usize),
+    RowsMulti(&'a [(usize, usize)]),
+    Cols(usize, usize),
+}
+
+const MQ4_G256_QT: u8 = 13;
+const MQ4V2_G256_QT: u8 = 44;
+
+#[inline]
+fn is_dense_proj_qt(qt: u8) -> bool {
+    matches!(qt, MQ4_G256_QT | MQ4V2_G256_QT)
+}
+
+fn find_qwen35_tensor<'a>(hfq: &'a HfqFile, bare: &str) -> Option<(&'a HfqTensorInfo, String)> {
+    for cand in qwen35_tensor_name_candidates(bare) {
+        if let Some(info) = hfq.find_tensor_info(&cand) {
+            return Some((info, cand));
+        }
+    }
+    None
+}
+
+fn expected_mq4_bytes(m: usize, k: usize) -> Option<usize> {
+    if k % 256 != 0 {
+        return None;
+    }
+    let gpr = k / 256;
+    m.checked_mul(gpr)?.checked_mul(136)
+}
+
+fn validate_mq4_proj_info(
+    info: &HfqTensorInfo,
+    m: usize,
+    k: usize,
+    name: &str,
+) -> Result<(), String> {
+    if !is_dense_proj_qt(info.quant_type) {
+        return Err(format!(
+            "{name}: dense TP requires qt13 or qt44, got qt={}",
+            info.quant_type
+        ));
+    }
+    if info.group_size != 256 {
+        return Err(format!(
+            "{name}: group_size must be 256, got {}",
+            info.group_size
+        ));
+    }
+    if info.shape != vec![m as u32, k as u32] {
+        return Err(format!(
+            "{name}: shape mismatch {:?} vs [{m} {k}]",
+            info.shape
+        ));
+    }
+    let expected =
+        expected_mq4_bytes(m, k).ok_or_else(|| format!("{name}: K={k} not multiple of 256"))?;
+    if info.data_size != expected {
+        return Err(format!(
+            "{name}: blob length mismatch expected {expected}, got {}",
+            info.data_size
+        ));
+    }
+    Ok(())
+}
+
+fn validate_norm_info(info: &HfqTensorInfo, n: usize, name: &str) -> Result<(), String> {
+    if info.shape != vec![n as u32] {
+        return Err(format!("{name}: shape mismatch {:?} vs [{n}]", info.shape));
+    }
+    let product = n;
+    let expected = match info.quant_type {
+        1 => product.checked_mul(2),
+        2 => product.checked_mul(4),
+        16 => product.checked_mul(2),
+        _ => None,
+    };
+    if let Some(exp) = expected {
+        if info.data_size != exp {
+            return Err(format!(
+                "{name}: blob length mismatch expected {exp}, got {}",
+                info.data_size
+            ));
+        }
+    } else {
+        return Err(format!(
+            "{name}: unsupported norm quant_type {}",
+            info.quant_type
+        ));
+    }
+    Ok(())
+}
+
+fn validate_raw_f32_info(info: &HfqTensorInfo, n: usize, name: &str) -> Result<(), String> {
+    // Canonical raw_f32 is flattened: shape product must equal n (e.g. conv1d
+    // [10240,1,4] -> 40960). Retain exact byte and dtype checks.
+    let product: usize = info
+        .shape
+        .iter()
+        .try_fold(1usize, |a, &b| {
+            a.checked_mul(b as usize)
+                .ok_or_else(|| format!("{name}: shape product overflow {:?}", info.shape))
+        })
+        .map_err(|e| e)?;
+    if product != n {
+        return Err(format!(
+            "{name}: shape product mismatch {:?} (product {product}) vs n={n}",
+            info.shape
+        ));
+    }
+    // group_size check per dtype (qt3 is Q8 group 32)
+    match info.quant_type {
+        3 => {
+            if info.group_size != 32 {
+                return Err(format!(
+                    "{name}: Q8 group_size must be 32, got {}",
+                    info.group_size
+                ));
+            }
+        }
+        1 | 2 | 16 => {
+            if info.group_size != 0 {
+                return Err(format!(
+                    "{name}: group_size must be 0, got {}",
+                    info.group_size
+                ));
+            }
+        }
+        _ => {}
+    }
+    let expected = match info.quant_type {
+        1 => n.checked_mul(2),
+        2 => n.checked_mul(4),
+        16 => n.checked_mul(2),
+        3 => {
+            if n % 32 != 0 {
+                return Err(format!("{name}: Q8 n={n} not multiple of 32"));
+            }
+            (n / 32).checked_mul(34)
+        }
+        _ => None,
+    };
+    if let Some(exp) = expected {
+        if info.data_size != exp {
+            return Err(format!(
+                "{name}: blob length mismatch expected {exp}, got {}",
+                info.data_size
+            ));
+        }
+    } else {
+        return Err(format!(
+            "{name}: unsupported raw_f32 quant_type {}",
+            info.quant_type
+        ));
+    }
+    Ok(())
+}
+
+fn validate_embedding_info(
+    info: &HfqTensorInfo,
+    vocab: usize,
+    dim: usize,
+    name: &str,
+) -> Result<(), String> {
+    if info.shape != vec![vocab as u32, dim as u32] {
+        return Err(format!(
+            "{name}: shape mismatch {:?} vs [{vocab} {dim}]",
+            info.shape
+        ));
+    }
+    match info.quant_type {
+        6 | 13 | 44 => {
+            if info.group_size != 256 {
+                return Err(format!(
+                    "{name}: group_size must be 256, got {}",
+                    info.group_size
+                ));
+            }
+        }
+        3 => {
+            if info.group_size != 32 {
+                return Err(format!(
+                    "{name}: Q8 group_size must be 32, got {}",
+                    info.group_size
+                ));
+            }
+        }
+        1 | 2 | 16 => {
+            if info.group_size != 0 {
+                return Err(format!(
+                    "{name}: group_size must be 0, got {}",
+                    info.group_size
+                ));
+            }
+        }
+        _ => {}
+    }
+    let product = vocab * dim;
+    let expected = match info.quant_type {
+        1 => Some(product * 2),
+        2 => Some(product * 4),
+        3 => {
+            if dim % 32 != 0 {
+                return Err(format!("{name}: Q8 dim {dim} not multiple of 32"));
+            }
+            Some(vocab * (dim / 32) * 34)
+        }
+        6 => expected_mq4_bytes(vocab, dim),
+        13 => expected_mq4_bytes(vocab, dim),
+        44 => expected_mq4_bytes(vocab, dim),
+        16 => Some(product * 2),
+        40 => {
+            if dim % 128 != 0 {
+                return Err(format!("{name}: TQ2 dim not multiple of 128"));
+            }
+            Some(vocab * (dim / 128) * 34)
+        }
+        41 => {
+            if dim % 128 != 0 {
+                return Err(format!("{name}: BQ1 dim not multiple of 128"));
+            }
+            Some(vocab * (dim / 128) * 18)
+        }
+        _ => None,
+    };
+    if let Some(exp) = expected {
+        if info.data_size != exp {
+            return Err(format!(
+                "{name}: embedding blob mismatch expected {exp}, got {}",
+                info.data_size
+            ));
+        }
+    } else {
+        return Err(format!(
+            "{name}: unsupported embedding quant_type {}",
+            info.quant_type
+        ));
+    }
+    Ok(())
+}
+
+fn validate_awq_sidecar(hfq: &HfqFile, weight_cand: &str, k: usize) -> Result<(), String> {
+    let stem = weight_cand.strip_suffix(".weight").unwrap_or(weight_cand);
+    let sidecar = format!("{stem}.awq_scale.weight");
+    let Some(info) = hfq.find_tensor_info(&sidecar) else {
+        return Ok(());
+    };
+    if info.quant_type != 1 {
+        return Err(format!(
+            "AWQ sidecar {sidecar}: quant_type must be 1, got {}",
+            info.quant_type
+        ));
+    }
+    if info.shape != vec![k as u32] {
+        return Err(format!(
+            "AWQ sidecar {sidecar}: shape {:?} vs [{k}]",
+            info.shape
+        ));
+    }
+    if info.data_size != k * 2 {
+        return Err(format!(
+            "AWQ sidecar {sidecar}: blob {} != {}",
+            info.data_size,
+            k * 2
+        ));
+    }
+    if info.group_size != 0 {
+        return Err(format!(
+            "AWQ sidecar {sidecar}: group_size must be 0, got {}",
+            info.group_size
+        ));
+    }
+    Ok(())
+}
+
+/// CPU-only preflight for dense TP2. Validates every tensor the rank loader
+/// requires before any GPU allocation. Covers rank-independent invariants;
+/// rank slicing bounds remain checked in the rank loader.
+pub fn preflight_weights_dense_tp(
+    hfq: &HfqFile,
+    config: &Qwen35Config,
+    shard: &ShardConfig,
+) -> Result<(), String> {
+    crate::qwen35::config::validate_dense_tp(config, shard)
+        .map_err(|e| format!("preflight: {e}"))?;
+
+    // ── Checked blob-range validation before any GPU init ──
+    // HfqFile::open only bounds the index; tensor_data_pread zero-pads short
+    // reads. Reject any tensor whose declared blob extends past EOF.
+    {
+        let identity = hfq
+            .load_identity()
+            .map_err(|e| format!("preflight: load_identity: {e:?}"))?;
+        let file_len = identity.len as usize;
+        for entry in &identity.manifest {
+            let end = entry
+                .data_offset
+                .checked_add(entry.data_size)
+                .ok_or_else(|| {
+                    format!(
+                        "preflight: tensor {} offset+size overflow (offset {} + size {})",
+                        entry.name, entry.data_offset, entry.data_size
+                    )
+                })?;
+            if end > file_len {
+                return Err(format!(
+                    "preflight: tensor {} blob out of file: offset {} + size {} = {} > file_len {}",
+                    entry.name, entry.data_offset, entry.data_size, end, file_len
+                ));
+            }
+        }
+    }
+
+    let dim = config.dim;
+    let head_dim = config.head_dim;
+    let n_heads = config.n_heads;
+    let n_kv = config.n_kv_heads;
+    let hidden = config.hidden_dim;
+    let vocab = config.vocab_size;
+    let n_layers = config.n_layers;
+    let key_heads = config.linear_num_key_heads;
+    let value_heads = config.linear_num_value_heads;
+    let key_w = config.linear_key_head_dim;
+    let value_w = config.linear_value_head_dim;
+    let key_dim = key_heads * key_w;
+    let value_dim = value_heads * value_w;
+    let qkv_dim = 2 * key_dim + value_dim;
+    let conv = config.conv_kernel_dim;
+
+    let validate_proj = |bare: &str, m: usize, k: usize| -> Result<(), String> {
+        let (info, cand) = find_qwen35_tensor(hfq, bare)
+            .ok_or_else(|| format!("preflight: missing tensor {bare}"))?;
+        validate_mq4_proj_info(info, m, k, bare)?;
+        if k % 256 != 0 {
+            return Err(format!("preflight: {bare} K={k} not G256 aligned"));
+        }
+        validate_awq_sidecar(hfq, &cand, k)?;
+        Ok(())
+    };
+    let validate_norm = |bare: &str, n: usize| -> Result<(), String> {
+        let (info, _) = find_qwen35_tensor(hfq, bare)
+            .ok_or_else(|| format!("preflight: missing tensor {bare}"))?;
+        validate_norm_info(info, n, bare)
+    };
+    let validate_raw = |bare: &str, n: usize| -> Result<(), String> {
+        let (info, _) = find_qwen35_tensor(hfq, bare)
+            .ok_or_else(|| format!("preflight: missing tensor {bare}"))?;
+        validate_raw_f32_info(info, n, bare)
+    };
+
+    {
+        let (info, _) = find_qwen35_tensor(hfq, "embed_tokens.weight")
+            .ok_or_else(|| "preflight: missing embed_tokens.weight".to_string())?;
+        validate_embedding_info(info, vocab, dim, "embed_tokens.weight")?;
+    }
+    validate_norm("norm.weight", dim)?;
+    if let Some((info, cand)) = find_qwen35_tensor(hfq, "lm_head.weight") {
+        let ok = validate_mq4_proj_info(info, vocab, dim, "lm_head.weight")
+            .or_else(|_| validate_embedding_info(info, vocab, dim, "lm_head.weight"));
+        ok.map_err(|e| format!("preflight: lm_head: {e}"))?;
+        validate_awq_sidecar(hfq, &cand, dim)?;
+    }
+
+    for idx in 0..n_layers {
+        let lt = config.layer_types[idx];
+        let p = format!("layers.{idx}");
+        validate_norm(&format!("{p}.input_layernorm.weight"), dim)?;
+        validate_norm(&format!("{p}.post_attention_layernorm.weight"), dim)?;
+        match lt {
+            crate::qwen35::config::LayerType::FullAttention => {
+                let q_rows = n_heads * head_dim * 2;
+                let kv_dim = n_kv * head_dim;
+                let o_in = n_heads * head_dim;
+                validate_proj(&format!("{p}.self_attn.q_proj.weight"), q_rows, dim)?;
+                validate_proj(&format!("{p}.self_attn.k_proj.weight"), kv_dim, dim)?;
+                validate_proj(&format!("{p}.self_attn.v_proj.weight"), kv_dim, dim)?;
+                validate_proj(&format!("{p}.self_attn.o_proj.weight"), dim, o_in)?;
+                validate_norm(&format!("{p}.self_attn.q_norm.weight"), head_dim)?;
+                validate_norm(&format!("{p}.self_attn.k_norm.weight"), head_dim)?;
+                validate_proj(&format!("{p}.mlp.gate_proj.weight"), hidden, dim)?;
+                validate_proj(&format!("{p}.mlp.up_proj.weight"), hidden, dim)?;
+                validate_proj(&format!("{p}.mlp.down_proj.weight"), dim, hidden)?;
+                if o_in % 256 != 0 {
+                    return Err(format!(
+                        "preflight: layer {idx} o_in {o_in} not G256 aligned"
+                    ));
+                }
+                if hidden % 256 != 0 {
+                    return Err(format!(
+                        "preflight: layer {idx} hidden {hidden} not G256 aligned"
+                    ));
+                }
+            }
+            crate::qwen35::config::LayerType::LinearAttention => {
+                validate_proj(&format!("{p}.linear_attn.in_proj_qkv.weight"), qkv_dim, dim)?;
+                validate_proj(&format!("{p}.linear_attn.in_proj_z.weight"), value_dim, dim)?;
+                validate_proj(
+                    &format!("{p}.linear_attn.in_proj_a.weight"),
+                    value_heads,
+                    dim,
+                )?;
+                validate_proj(
+                    &format!("{p}.linear_attn.in_proj_b.weight"),
+                    value_heads,
+                    dim,
+                )?;
+                validate_raw(&format!("{p}.linear_attn.A_log"), value_heads)?;
+                validate_raw(&format!("{p}.linear_attn.dt_bias"), value_heads)?;
+                validate_raw(&format!("{p}.linear_attn.conv1d.weight"), qkv_dim * conv)?;
+                validate_raw(
+                    &format!("{p}.linear_attn.norm.weight"),
+                    config.linear_value_head_dim,
+                )?;
+                validate_proj(&format!("{p}.linear_attn.out_proj.weight"), dim, value_dim)?;
+                validate_proj(&format!("{p}.mlp.gate_proj.weight"), hidden, dim)?;
+                validate_proj(&format!("{p}.mlp.up_proj.weight"), hidden, dim)?;
+                validate_proj(&format!("{p}.mlp.down_proj.weight"), dim, hidden)?;
+            }
+        }
+        if config.num_experts != 0 {
+            return Err("preflight: dense TP requires num_experts=0".to_string());
+        }
+    }
+    Ok(())
+}
+
+fn load_weight_tensor_dense_tp(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    name: &str,
+    m: usize,
+    k: usize,
+    slice: DenseTpSlice<'_>,
+) -> HipResult<WeightTensor> {
+    use hipfire_runtime::tp_shard::{slice_uniform_group_cols, slice_uniform_rows};
+
+    // Single metadata lookup for candidate/quant_type; exactly one pread for data below.
+    let (info, candidate) = find_qwen35_tensor(hfq, name)
+        .ok_or_else(|| HipError::new(0, &format!("TP tensor not found: {name}")))?;
+    let quant_type = info.quant_type;
+    let candidate = candidate.clone();
+    if !is_dense_proj_qt(quant_type) {
+        return Err(HipError::new(
+            0,
+            &format!(
+                "dense TP2 requires MQ4-G256 qt13 or MQ4V2 qt44, {candidate} has qt={quant_type}"
+            ),
+        ));
+    }
+    let (bytes, new_m, new_k) = {
+        let (_, data) = hfq
+            .tensor_data_pread(&candidate)
+            .ok_or_else(|| HipError::new(0, "TP tensor disappeared during load"))?;
+        match slice {
+            DenseTpSlice::Rows(start, end) => (
+                slice_uniform_rows(&data, m, start, end).map_err(|e| HipError::new(0, &e))?,
+                end - start,
+                k,
+            ),
+            DenseTpSlice::RowsMulti(ranges) => {
+                let mut out = Vec::new();
+                for &(start, end) in ranges {
+                    out.extend_from_slice(
+                        &slice_uniform_rows(&data, m, start, end)
+                            .map_err(|e| HipError::new(0, &e))?,
+                    );
+                }
+                (out, ranges.iter().map(|(a, b)| b - a).sum(), k)
+            }
+            DenseTpSlice::Cols(start, end) => (
+                slice_uniform_group_cols(&data, m, k, start, end, 256)
+                    .map_err(|e| HipError::new(0, &e))?,
+                m,
+                end - start,
+            ),
+        }
+    };
+    let mut weight = match load_weight_tensor_raw(gpu, quant_type, &bytes, new_m, new_k) {
+        Ok(w) => w,
+        Err(e) => return Err(e),
+    };
+    let stem = candidate.strip_suffix(".weight").unwrap_or(&candidate);
+    let sidecar = format!("{stem}.awq_scale.weight");
+    if let Some((info, data)) = hfq.tensor_data_pread(&sidecar) {
+        if info.quant_type != 1 || data.len() != k * 2 {
+            weight.free_all(gpu);
+            return Err(HipError::new(0, "invalid TP AWQ sidecar"));
+        }
+        let (start, end) = match slice {
+            DenseTpSlice::Cols(start, end) => (start, end),
+            _ => (0, k),
+        };
+        let scales: Vec<f32> = data[start * 2..end * 2]
+            .chunks_exact(2)
+            .map(|v| f16_to_f32(u16::from_le_bytes([v[0], v[1]])))
+            .collect();
+        match gpu.upload_f32(&scales, &[scales.len()]) {
+            Ok(t) => weight.awq_scale = Some(t),
+            Err(e) => {
+                weight.free_all(gpu);
+                return Err(e);
+            }
+        }
+    }
+    Ok(weight)
+}
+
+fn load_raw_f32_sliced(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    bare: &str,
+    n: usize,
+    ranges: &[(usize, usize)],
+) -> HipResult<GpuTensor> {
+    let (info, data) = qwen35_tensor_data_vec(hfq, bare)
+        .ok_or_else(|| HipError::new(0, &format!("tensor not found: {bare}")))?;
+    let total: Vec<f32> = match info.quant_type {
+        1 => data
+            .chunks_exact(2)
+            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect(),
+        2 => data
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        16 => data
+            .chunks_exact(2)
+            .map(|c| {
+                hipfire_runtime::safetensors_source::bf16_to_f32(u16::from_le_bytes([c[0], c[1]]))
+            })
+            .collect(),
+        3 => hipfire_runtime::llama::dequantize_q8_0(&data, n),
+        qt => {
+            return Err(HipError::new(
+                0,
+                &format!("unsupported raw f32 quant {qt} for {bare}"),
+            ))
+        }
+    };
+    if total.len() != n {
+        return Err(HipError::new(
+            0,
+            &format!("{bare} f32 len {} != {n}", total.len()),
+        ));
+    }
+    let mut gathered = Vec::new();
+    let mut total_len = 0usize;
+    for &(s, e) in ranges {
+        if e > n || s > e {
+            return Err(HipError::new(
+                0,
+                &format!("invalid f32 slice {s}..{e} for {bare} n={n}"),
+            ));
+        }
+        total_len += e - s;
+        gathered.extend_from_slice(&total[s..e]);
+    }
+    gpu.upload_f32(&gathered, &[total_len])
+}
+
+fn gather_f32_ranges(
+    gpu: &mut Gpu,
+    source: &GpuTensor,
+    ranges: &[(usize, usize)],
+) -> HipResult<GpuTensor> {
+    let source = gpu.download_f32(source)?;
+    let mut gathered = Vec::new();
+    for &(start, end) in ranges {
+        gathered.extend_from_slice(&source[start..end]);
+    }
+    gpu.upload_f32(&gathered, &[gathered.len()])
+}
+
+struct DenseTpPending {
+    token_embd: Option<GpuTensor>,
+    embd_format: Option<EmbeddingFormat>,
+    output_norm: Option<GpuTensor>,
+    output: Option<WeightTensor>,
+    lm_head_aliases_embd: bool,
+    layers: Vec<LayerWeights>,
+}
+
+impl DenseTpPending {
+    fn new() -> Self {
+        Self {
+            token_embd: None,
+            embd_format: None,
+            output_norm: None,
+            output: None,
+            lm_head_aliases_embd: false,
+            layers: Vec::new(),
+        }
+    }
+    fn free(self, gpu: &mut Gpu) {
+        if let Some(t) = self.token_embd {
+            let _ = gpu.free_tensor(t);
+        }
+        if let Some(t) = self.output_norm {
+            let _ = gpu.free_tensor(t);
+        }
+        if let Some(w) = self.output {
+            // Mirror Qwen35Weights::free_gpu: when lm_head aliases token_embd,
+            // output.buf is a non-owning view of token_embd.buf — do not free
+            // it here (would double-free token_embd). Includes sidecar attach
+            // failure semantics: if output was aliased, its buffer is never
+            // freed separately; any sidecar would have been attached to the
+            // alias view and is not owned separately in the aliased case.
+            if !self.lm_head_aliases_embd {
+                w.free_all(gpu);
+            }
+        }
+        for layer in self.layers {
+            match layer {
+                LayerWeights::DeltaNet(l) => {
+                    let _ = gpu.free_tensor(l.attn_norm);
+                    l.wqkv.free_all(gpu);
+                    l.wz.free_all(gpu);
+                    l.w_alpha.free_all(gpu);
+                    l.w_beta.free_all(gpu);
+                    let _ = gpu.free_tensor(l.a_log);
+                    let _ = gpu.free_tensor(l.dt_bias);
+                    let _ = gpu.free_tensor(l.conv_weight);
+                    let _ = gpu.free_tensor(l.norm_weight);
+                    l.wo.free_all(gpu);
+                    let _ = gpu.free_tensor(l.ffn_norm);
+                    l.w_gate.free_all(gpu);
+                    l.w_up.free_all(gpu);
+                    l.w_down.free_all(gpu);
+                }
+                LayerWeights::FullAttn(l) => {
+                    let _ = gpu.free_tensor(l.attn_norm);
+                    l.wq.free_all(gpu);
+                    l.wk.free_all(gpu);
+                    l.wv.free_all(gpu);
+                    l.wo.free_all(gpu);
+                    let _ = gpu.free_tensor(l.q_norm);
+                    let _ = gpu.free_tensor(l.k_norm);
+                    let _ = gpu.free_tensor(l.ffn_norm);
+                    l.w_gate.free_all(gpu);
+                    l.w_up.free_all(gpu);
+                    l.w_down.free_all(gpu);
+                }
+                _ => {}
+            }
+        }
+    }
+}
+
+/// Load one rank of a dense Qwen TP model (TP2..5). Directly constructs
+/// each rank's `Qwen35Weights` from the exact `DenseTpRankLayout` ranges
+/// without ever allocating the full model or any full projection on this rank.
+/// Transactional: any allocation not yet published is freed on error. The
+/// layout is the model-lifetime static whole-unit sharding produced by
+/// `dense_tp_rank_layouts`; the loader computes all layouts CPU-only before any
+/// GPU allocation and never recomputes even divisions here.
+pub fn load_weights_dense_tp_rank(
+    hfq: &mut HfqFile,
+    config: &Qwen35Config,
+    gpu: &mut Gpu,
+    layout: &crate::qwen35::config::DenseTpRankLayout,
+) -> HipResult<Qwen35Weights> {
+    // Production callers construct every layout and run full blob preflight
+    // before GPU initialization. Keep this rank-local guard for direct callers.
+    let valid_range = |range: &std::ops::Range<usize>, limit: usize| {
+        !range.is_empty() && range.start < range.end && range.end <= limit
+    };
+    if !valid_range(&layout.q_head_range, config.n_heads)
+        || !valid_range(&layout.kv_head_range, config.n_kv_heads)
+        || !valid_range(&layout.delta_key_head_range, config.linear_num_key_heads)
+        || !valid_range(
+            &layout.delta_value_head_range,
+            config.linear_num_value_heads,
+        )
+        || !valid_range(&layout.ffn_hidden_range, config.hidden_dim)
+    {
+        return Err(HipError::new(0, "invalid dense TP rank layout"));
+    }
+    let dim = config.dim;
+    let head_dim = config.head_dim;
+    let q_range = layout.q_head_range.clone();
+    let kv_range = layout.kv_head_range.clone();
+    let kv_dim = config.n_kv_heads * head_dim;
+    let q_rows = q_range.start * head_dim * 2..q_range.end * head_dim * 2;
+    let kv_rows = kv_range.start * head_dim..kv_range.end * head_dim;
+    let attn_cols = q_range.start * head_dim..q_range.end * head_dim;
+    let ffn_range = layout.ffn_hidden_range.clone();
+    let key_dim = config.linear_num_key_heads * config.linear_key_head_dim;
+    let value_dim = config.linear_num_value_heads * config.linear_value_head_dim;
+    let dn_rows = 2 * key_dim + value_dim;
+    let qkv_dim = dn_rows;
+    let dk_range = layout.delta_key_head_range.clone();
+    let dv_range = layout.delta_value_head_range.clone();
+    let key_width = config.linear_key_head_dim;
+    let value_width = config.linear_value_head_dim;
+    let qkv_ranges = [
+        (dk_range.start * key_width, dk_range.end * key_width),
+        (
+            key_dim + dk_range.start * key_width,
+            key_dim + dk_range.end * key_width,
+        ),
+        (
+            2 * key_dim + dv_range.start * value_width,
+            2 * key_dim + dv_range.end * value_width,
+        ),
+    ];
+    let conv = config.conv_kernel_dim;
+    let conv_ranges = [
+        (qkv_ranges[0].0 * conv, qkv_ranges[0].1 * conv),
+        (qkv_ranges[1].0 * conv, qkv_ranges[1].1 * conv),
+        (qkv_ranges[2].0 * conv, qkv_ranges[2].1 * conv),
+    ];
+    let mut pending = DenseTpPending::new();
+    let res: HipResult<Qwen35Weights> = (|| {
+        let (embd_info, embd_data) = qwen35_tensor_data_cow(hfq, "embed_tokens.weight")
+            .ok_or_else(|| HipError::new(0, "embed_tokens.weight not found"))?;
+        let (token_embd, embd_format) = load_embedding(
+            gpu,
+            embd_info.quant_type,
+            &embd_data,
+            config.vocab_size,
+            dim,
+        )?;
+        pending.token_embd = Some(token_embd);
+        pending.embd_format = Some(embd_format);
+        drop(embd_data);
+
+        let output_norm = load_norm_weight(hfq, gpu, "norm.weight", &[dim])?;
+        pending.output_norm = Some(output_norm);
+
+        let has_separate = qwen35_tensor_name_candidates("lm_head.weight")
+            .iter()
+            .any(|n| hfq.find_tensor_info(n).is_some());
+        let token_ref = pending.token_embd.as_ref().unwrap();
+        let fmt = pending.embd_format.unwrap();
+        let (mut output, aliases) = hipfire_runtime::weight_backend::resolve_lm_head(
+            gpu,
+            has_separate,
+            true,
+            token_ref,
+            fmt,
+            config.vocab_size,
+            dim,
+            |gpu| {
+                let (info, data) = qwen35_tensor_data_cow(hfq, "lm_head.weight")
+                    .ok_or_else(|| HipError::new(0, "lm_head.weight not found"))?;
+                load_weight_tensor_raw(gpu, info.quant_type, &data, config.vocab_size, dim)
+            },
+            |gpu| {
+                let (info, data) = qwen35_tensor_data_cow(hfq, "embed_tokens.weight")
+                    .ok_or_else(|| HipError::new(0, "embed_tokens.weight not found"))?;
+                hipfire_runtime::weight_backend::reupload_f16_as_f32(
+                    gpu,
+                    &data,
+                    config.vocab_size,
+                    dim,
+                )
+            },
+        )?;
+        attach_lm_head_awq_sidecar(hfq, gpu, &mut output, dim);
+        pending.output = Some(output);
+        pending.lm_head_aliases_embd = aliases;
+
+        for layer_idx in 0..config.n_layers {
+            let lt = config.layer_types[layer_idx];
+            let p = format!("layers.{layer_idx}");
+            let layer: LayerWeights = match lt {
+                crate::qwen35::config::LayerType::FullAttention => {
+                    let mut attn_norm_opt: Option<GpuTensor> = None;
+                    let mut wq_opt: Option<WeightTensor> = None;
+                    let mut wk_opt: Option<WeightTensor> = None;
+                    let mut wv_opt: Option<WeightTensor> = None;
+                    let mut wo_opt: Option<WeightTensor> = None;
+                    let mut q_norm_opt: Option<GpuTensor> = None;
+                    let mut k_norm_opt: Option<GpuTensor> = None;
+                    let mut ffn_norm_opt: Option<GpuTensor> = None;
+                    let mut w_gate_opt: Option<WeightTensor> = None;
+                    let mut w_up_opt: Option<WeightTensor> = None;
+                    let mut w_down_opt: Option<WeightTensor> = None;
+
+                    let layer_res: HipResult<LayerWeights> = (|| {
+                        let attn_norm = load_norm_weight(
+                            hfq,
+                            gpu,
+                            &format!("{p}.input_layernorm.weight"),
+                            &[dim],
+                        )?;
+                        attn_norm_opt = Some(attn_norm);
+                        let wq = load_weight_tensor_dense_tp(
+                            hfq,
+                            gpu,
+                            &format!("{p}.self_attn.q_proj.weight"),
+                            config.n_heads * head_dim * 2,
+                            dim,
+                            DenseTpSlice::Rows(q_rows.start, q_rows.end),
+                        )?;
+                        wq_opt = Some(wq);
+                        let wk = load_weight_tensor_dense_tp(
+                            hfq,
+                            gpu,
+                            &format!("{p}.self_attn.k_proj.weight"),
+                            kv_dim,
+                            dim,
+                            DenseTpSlice::Rows(kv_rows.start, kv_rows.end),
+                        )?;
+                        wk_opt = Some(wk);
+                        let wv = load_weight_tensor_dense_tp(
+                            hfq,
+                            gpu,
+                            &format!("{p}.self_attn.v_proj.weight"),
+                            kv_dim,
+                            dim,
+                            DenseTpSlice::Rows(kv_rows.start, kv_rows.end),
+                        )?;
+                        wv_opt = Some(wv);
+                        let wo = load_weight_tensor_dense_tp(
+                            hfq,
+                            gpu,
+                            &format!("{p}.self_attn.o_proj.weight"),
+                            dim,
+                            config.n_heads * head_dim,
+                            DenseTpSlice::Cols(attn_cols.start, attn_cols.end),
+                        )?;
+                        wo_opt = Some(wo);
+                        let q_norm = load_norm_weight(
+                            hfq,
+                            gpu,
+                            &format!("{p}.self_attn.q_norm.weight"),
+                            &[head_dim],
+                        )?;
+                        q_norm_opt = Some(q_norm);
+                        let k_norm = load_norm_weight(
+                            hfq,
+                            gpu,
+                            &format!("{p}.self_attn.k_norm.weight"),
+                            &[head_dim],
+                        )?;
+                        k_norm_opt = Some(k_norm);
+                        let ffn_norm = load_norm_weight(
+                            hfq,
+                            gpu,
+                            &format!("{p}.post_attention_layernorm.weight"),
+                            &[dim],
+                        )?;
+                        ffn_norm_opt = Some(ffn_norm);
+                        let w_gate = load_weight_tensor_dense_tp(
+                            hfq,
+                            gpu,
+                            &format!("{p}.mlp.gate_proj.weight"),
+                            config.hidden_dim,
+                            dim,
+                            DenseTpSlice::Rows(ffn_range.start, ffn_range.end),
+                        )?;
+                        w_gate_opt = Some(w_gate);
+                        let w_up = load_weight_tensor_dense_tp(
+                            hfq,
+                            gpu,
+                            &format!("{p}.mlp.up_proj.weight"),
+                            config.hidden_dim,
+                            dim,
+                            DenseTpSlice::Rows(ffn_range.start, ffn_range.end),
+                        )?;
+                        w_up_opt = Some(w_up);
+                        let w_down = load_weight_tensor_dense_tp(
+                            hfq,
+                            gpu,
+                            &format!("{p}.mlp.down_proj.weight"),
+                            dim,
+                            config.hidden_dim,
+                            DenseTpSlice::Cols(ffn_range.start, ffn_range.end),
+                        )?;
+                        w_down_opt = Some(w_down);
+                        Ok(LayerWeights::FullAttn(FullAttnLayerWeights {
+                            attn_norm: attn_norm_opt.take().unwrap(),
+                            wq: wq_opt.take().unwrap(),
+                            wk: wk_opt.take().unwrap(),
+                            wv: wv_opt.take().unwrap(),
+                            wo: wo_opt.take().unwrap(),
+                            q_norm: q_norm_opt.take().unwrap(),
+                            k_norm: k_norm_opt.take().unwrap(),
+                            ffn_norm: ffn_norm_opt.take().unwrap(),
+                            w_gate: w_gate_opt.take().unwrap(),
+                            w_up: w_up_opt.take().unwrap(),
+                            w_down: w_down_opt.take().unwrap(),
+                        }))
+                    })();
+                    match layer_res {
+                        Ok(l) => l,
+                        Err(e) => {
+                            if let Some(t) = attn_norm_opt.take() {
+                                let _ = gpu.free_tensor(t);
+                            }
+                            if let Some(w) = wq_opt.take() {
+                                w.free_all(gpu);
+                            }
+                            if let Some(w) = wk_opt.take() {
+                                w.free_all(gpu);
+                            }
+                            if let Some(w) = wv_opt.take() {
+                                w.free_all(gpu);
+                            }
+                            if let Some(w) = wo_opt.take() {
+                                w.free_all(gpu);
+                            }
+                            if let Some(t) = q_norm_opt.take() {
+                                let _ = gpu.free_tensor(t);
+                            }
+                            if let Some(t) = k_norm_opt.take() {
+                                let _ = gpu.free_tensor(t);
+                            }
+                            if let Some(t) = ffn_norm_opt.take() {
+                                let _ = gpu.free_tensor(t);
+                            }
+                            if let Some(w) = w_gate_opt.take() {
+                                w.free_all(gpu);
+                            }
+                            if let Some(w) = w_up_opt.take() {
+                                w.free_all(gpu);
+                            }
+                            if let Some(w) = w_down_opt.take() {
+                                w.free_all(gpu);
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
+                crate::qwen35::config::LayerType::LinearAttention => {
+                    let mut attn_norm_opt: Option<GpuTensor> = None;
+                    let mut wqkv_opt: Option<WeightTensor> = None;
+                    let mut wz_opt: Option<WeightTensor> = None;
+                    let mut w_alpha_opt: Option<WeightTensor> = None;
+                    let mut w_beta_opt: Option<WeightTensor> = None;
+                    let mut a_log_opt: Option<GpuTensor> = None;
+                    let mut dt_bias_opt: Option<GpuTensor> = None;
+                    let mut conv_weight_opt: Option<GpuTensor> = None;
+                    let mut norm_weight_opt: Option<GpuTensor> = None;
+                    let mut wo_opt: Option<WeightTensor> = None;
+                    let mut ffn_norm_opt: Option<GpuTensor> = None;
+                    let mut w_gate_opt: Option<WeightTensor> = None;
+                    let mut w_up_opt: Option<WeightTensor> = None;
+                    let mut w_down_opt: Option<WeightTensor> = None;
+                    let layer_res: HipResult<LayerWeights> = (|| {
+                        let attn_norm = load_norm_weight(
+                            hfq,
+                            gpu,
+                            &format!("{p}.input_layernorm.weight"),
+                            &[dim],
+                        )?;
+                        attn_norm_opt = Some(attn_norm);
+                        let wqkv = load_weight_tensor_dense_tp(
+                            hfq,
+                            gpu,
+                            &format!("{p}.linear_attn.in_proj_qkv.weight"),
+                            dn_rows,
+                            dim,
+                            DenseTpSlice::RowsMulti(&qkv_ranges),
+                        )?;
+                        wqkv_opt = Some(wqkv);
+                        let wz = load_weight_tensor_dense_tp(
+                            hfq,
+                            gpu,
+                            &format!("{p}.linear_attn.in_proj_z.weight"),
+                            value_dim,
+                            dim,
+                            DenseTpSlice::Rows(
+                                dv_range.start * value_width,
+                                dv_range.end * value_width,
+                            ),
+                        )?;
+                        wz_opt = Some(wz);
+                        let w_alpha = load_weight_tensor_dense_tp(
+                            hfq,
+                            gpu,
+                            &format!("{p}.linear_attn.in_proj_a.weight"),
+                            config.linear_num_value_heads,
+                            dim,
+                            DenseTpSlice::Rows(dv_range.start, dv_range.end),
+                        )?;
+                        w_alpha_opt = Some(w_alpha);
+                        let w_beta = load_weight_tensor_dense_tp(
+                            hfq,
+                            gpu,
+                            &format!("{p}.linear_attn.in_proj_b.weight"),
+                            config.linear_num_value_heads,
+                            dim,
+                            DenseTpSlice::Rows(dv_range.start, dv_range.end),
+                        )?;
+                        w_beta_opt = Some(w_beta);
+                        let a_log = load_raw_f32_sliced(
+                            hfq,
+                            gpu,
+                            &format!("{p}.linear_attn.A_log"),
+                            config.linear_num_value_heads,
+                            &[(dv_range.start, dv_range.end)],
+                        )?;
+                        a_log_opt = Some(a_log);
+                        let dt_bias = load_raw_f32_sliced(
+                            hfq,
+                            gpu,
+                            &format!("{p}.linear_attn.dt_bias"),
+                            config.linear_num_value_heads,
+                            &[(dv_range.start, dv_range.end)],
+                        )?;
+                        dt_bias_opt = Some(dt_bias);
+                        let conv_weight = load_raw_f32_sliced(
+                            hfq,
+                            gpu,
+                            &format!("{p}.linear_attn.conv1d.weight"),
+                            qkv_dim * conv,
+                            &conv_ranges,
+                        )?;
+                        conv_weight_opt = Some(conv_weight);
+                        let norm_weight = load_any_as_f32(
+                            hfq,
+                            gpu,
+                            &format!("{p}.linear_attn.norm.weight"),
+                            config.linear_value_head_dim,
+                        )?;
+                        norm_weight_opt = Some(norm_weight);
+                        let wo = load_weight_tensor_dense_tp(
+                            hfq,
+                            gpu,
+                            &format!("{p}.linear_attn.out_proj.weight"),
+                            dim,
+                            value_dim,
+                            DenseTpSlice::Cols(
+                                dv_range.start * value_width,
+                                dv_range.end * value_width,
+                            ),
+                        )?;
+                        wo_opt = Some(wo);
+                        let ffn_norm = load_norm_weight(
+                            hfq,
+                            gpu,
+                            &format!("{p}.post_attention_layernorm.weight"),
+                            &[dim],
+                        )?;
+                        ffn_norm_opt = Some(ffn_norm);
+                        let w_gate = load_weight_tensor_dense_tp(
+                            hfq,
+                            gpu,
+                            &format!("{p}.mlp.gate_proj.weight"),
+                            config.hidden_dim,
+                            dim,
+                            DenseTpSlice::Rows(ffn_range.start, ffn_range.end),
+                        )?;
+                        w_gate_opt = Some(w_gate);
+                        let w_up = load_weight_tensor_dense_tp(
+                            hfq,
+                            gpu,
+                            &format!("{p}.mlp.up_proj.weight"),
+                            config.hidden_dim,
+                            dim,
+                            DenseTpSlice::Rows(ffn_range.start, ffn_range.end),
+                        )?;
+                        w_up_opt = Some(w_up);
+                        let w_down = load_weight_tensor_dense_tp(
+                            hfq,
+                            gpu,
+                            &format!("{p}.mlp.down_proj.weight"),
+                            dim,
+                            config.hidden_dim,
+                            DenseTpSlice::Cols(ffn_range.start, ffn_range.end),
+                        )?;
+                        w_down_opt = Some(w_down);
+                        Ok(LayerWeights::DeltaNet(DeltaNetLayerWeights {
+                            attn_norm: attn_norm_opt.take().unwrap(),
+                            wqkv: wqkv_opt.take().unwrap(),
+                            wz: wz_opt.take().unwrap(),
+                            w_alpha: w_alpha_opt.take().unwrap(),
+                            w_beta: w_beta_opt.take().unwrap(),
+                            a_log: a_log_opt.take().unwrap(),
+                            dt_bias: dt_bias_opt.take().unwrap(),
+                            conv_weight: conv_weight_opt.take().unwrap(),
+                            norm_weight: norm_weight_opt.take().unwrap(),
+                            wo: wo_opt.take().unwrap(),
+                            ffn_norm: ffn_norm_opt.take().unwrap(),
+                            w_gate: w_gate_opt.take().unwrap(),
+                            w_up: w_up_opt.take().unwrap(),
+                            w_down: w_down_opt.take().unwrap(),
+                        }))
+                    })();
+                    match layer_res {
+                        Ok(l) => l,
+                        Err(e) => {
+                            if let Some(t) = attn_norm_opt.take() {
+                                let _ = gpu.free_tensor(t);
+                            }
+                            if let Some(w) = wqkv_opt.take() {
+                                w.free_all(gpu);
+                            }
+                            if let Some(w) = wz_opt.take() {
+                                w.free_all(gpu);
+                            }
+                            if let Some(w) = w_alpha_opt.take() {
+                                w.free_all(gpu);
+                            }
+                            if let Some(w) = w_beta_opt.take() {
+                                w.free_all(gpu);
+                            }
+                            if let Some(t) = a_log_opt.take() {
+                                let _ = gpu.free_tensor(t);
+                            }
+                            if let Some(t) = dt_bias_opt.take() {
+                                let _ = gpu.free_tensor(t);
+                            }
+                            if let Some(t) = conv_weight_opt.take() {
+                                let _ = gpu.free_tensor(t);
+                            }
+                            if let Some(t) = norm_weight_opt.take() {
+                                let _ = gpu.free_tensor(t);
+                            }
+                            if let Some(w) = wo_opt.take() {
+                                w.free_all(gpu);
+                            }
+                            if let Some(t) = ffn_norm_opt.take() {
+                                let _ = gpu.free_tensor(t);
+                            }
+                            if let Some(w) = w_gate_opt.take() {
+                                w.free_all(gpu);
+                            }
+                            if let Some(w) = w_up_opt.take() {
+                                w.free_all(gpu);
+                            }
+                            if let Some(w) = w_down_opt.take() {
+                                w.free_all(gpu);
+                            }
+                            return Err(e);
+                        }
+                    }
+                }
+                _ => return Err(HipError::new(0, "dense TP does not admit MoE layers")),
+            };
+            pending.layers.push(layer);
+        }
+
+        let token_embd = pending.token_embd.take().unwrap();
+        let embd_format = pending.embd_format.take().unwrap();
+        let output_norm = pending.output_norm.take().unwrap();
+        let output = pending.output.take().unwrap();
+        let lm_head_aliases_embd = pending.lm_head_aliases_embd;
+        let layers = std::mem::take(&mut pending.layers);
+        Ok(Qwen35Weights {
+            token_embd,
+            embd_format,
+            output_norm,
+            output,
+            moe_has_mq6: false,
+            layers,
+            pager: None,
+            lm_head_aliases_embd,
+            ep_shard: None,
+        })
+    })();
+    match res {
+        Ok(w) => Ok(w),
+        Err(e) => {
+            pending.free(gpu);
+            Err(e)
+        }
+    }
+}
+
 thread_local! {
     /// Per-thread EP expert-shard context. When `Some((shard, rank))`,
     /// [`load_moe_ffn`] loads ONLY this rank's owned experts (streaming
@@ -2871,6 +4084,46 @@ fn packed_mq4_experts_supported(gpu: &Gpu) -> bool {
 /// preserving one `WeightTensor` view and one device pointer-table entry per
 /// expert. Returns `None` for every non-uniform/non-MQ4 layout so mixed tiers,
 /// ParoQuant, paged experts, and EP streaming retain their literal behavior.
+
+/// Host-side byte source for a packed blob: either a borrowed mmap slice
+enum HostBlob<'a> {
+    Borrowed(&'a [u8]),
+    Owned(Vec<u8>),
+}
+
+impl AsRef<[u8]> for HostBlob<'_> {
+    fn as_ref(&self) -> &[u8] {
+        match self {
+            Self::Borrowed(s) => s,
+            Self::Owned(v) => v,
+        }
+    }
+}
+
+/// Cumulative packed-expert sweep timings for the current model load, in ms.
+static PACKED_READ_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+static PACKED_UPLOAD_MS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Verify that `names[0..n]` are uniform-`stride` tensors laid out back-to-back
+/// in file order, and return the single borrowed mmap slice covering all of
+/// them. Returns `None` on any gap, overlap, stride mismatch, dropped mmap
+/// (UMA), or attached overlay.
+fn contiguous_tensor_span<'a>(hfq: &'a HfqFile, names: &[&str], stride: usize) -> Option<&'a [u8]> {
+    if names.is_empty() || hfq.has_overlay() {
+        return None;
+    }
+    let first = hfq.find_tensor_info(names[0])?;
+    let mut expect = first.data_offset;
+    for name in names {
+        let info = hfq.find_tensor_info(name)?;
+        if info.data_offset != expect || info.data_size != stride {
+            return None;
+        }
+        expect = info.data_offset.checked_add(info.data_size)?;
+    }
+    hfq.data_range(first.data_offset, expect - first.data_offset)
+}
+
 fn try_load_packed_mq4_experts(
     hfq: &HfqFile,
     gpu: &mut Gpu,
@@ -2879,6 +4132,8 @@ fn try_load_packed_mq4_experts(
     mi: usize,
     dim: usize,
 ) -> HipResult<Option<(Vec<ExpertWeights>, PackedExpertOwners)>> {
+    use std::sync::atomic::Ordering;
+    use std::time::Instant;
     if expert_ids.is_empty() {
         return Ok(None);
     }
@@ -2941,12 +4196,34 @@ fn try_load_packed_mq4_experts(
 
     let gate_up_stride = gate_up_stride.expect("non-empty packed MQ4 expert list");
     let down_stride = down_stride.expect("non-empty packed MQ4 expert list");
-    let (gate_up_host, down_host) = if hfq.has_overlay() {
+    // Zero-copy fast path: when every expert's tensor lies contiguous in-file
+    // (expert 0's gate_up ends exactly where expert 1's begins, etc.) and the
+    // mmap is alive (dGPU, no overlay), upload both blobs straight from the
+    // page cache — no pread staging Vec, no heap copy. Measured dominant cost
+    // of A3B MoE loads otherwise: 512 pread segments per blob into a fresh
+    // heap buffer, then a second copy into hipMalloc'd VRAM.
+    let gate_up_names: Vec<&str> = specs.iter().map(|s| s.gate_up_name.as_str()).collect();
+    let down_names: Vec<&str> = specs.iter().map(|s| s.down_name.as_str()).collect();
+    let gate_up_contig = contiguous_tensor_span(hfq, &gate_up_names, gate_up_stride);
+    let down_contig = contiguous_tensor_span(hfq, &down_names, down_stride);
+
+    let t_read = Instant::now();
+    // Zero-copy only pays when pages are resident: a borrowed-slice H2D from
+    // an evicted cache soft-faults serially inside the copy loop (~0.25 GB/s
+    // off disk), while the parallel-pread fallback reads with multiple lanes.
+    let zero_copy_ok = matches!((gate_up_contig, down_contig), (Some(_), Some(_)))
+        && hfq.mostly_page_cached_memo();
+    let (gate_up_host, down_host) = if zero_copy_ok {
+        let (Some(gu), Some(dn)) = (gate_up_contig, down_contig) else {
+            unreachable!("zero_copy_ok implies both spans resolved");
+        };
+        (HostBlob::Borrowed(gu), HostBlob::Borrowed(dn))
+    } else if hfq.has_overlay() {
         // Overlay offsets belong to a second file; retain the overlay-aware
         // serial path exactly rather than crossing files in reader workers.
-        let mut gate_up_host = Vec::with_capacity(gate_up_stride * specs.len());
-        let mut down_host = Vec::with_capacity(down_stride * specs.len());
-        for spec in &specs {
+        let mut gate_up_host = vec![0u8; gate_up_stride * specs.len()];
+        let mut down_host = vec![0u8; down_stride * specs.len()];
+        for (slot, spec) in specs.iter().enumerate() {
             {
                 let (_, bytes) = hfq.tensor_data_pread(&spec.gate_up_name).ok_or_else(|| {
                     HipError::new(
@@ -2967,7 +4244,8 @@ fn try_load_packed_mq4_experts(
                         ),
                     ));
                 }
-                gate_up_host.extend_from_slice(&bytes);
+                gate_up_host[slot * gate_up_stride..(slot + 1) * gate_up_stride]
+                    .copy_from_slice(&bytes);
             }
             {
                 let (_, bytes) = hfq.tensor_data_pread(&spec.down_name).ok_or_else(|| {
@@ -2986,10 +4264,10 @@ fn try_load_packed_mq4_experts(
                         ),
                     ));
                 }
-                down_host.extend_from_slice(&bytes);
+                down_host[slot * down_stride..(slot + 1) * down_stride].copy_from_slice(&bytes);
             }
         }
-        (gate_up_host, down_host)
+        (HostBlob::Owned(gate_up_host), HostBlob::Owned(down_host))
     } else {
         let jobs = [
             HfqReadJob::packed(
@@ -3009,14 +4287,18 @@ fn try_load_packed_mq4_experts(
             .map_err(|e| HipError::new(0, &format!("qwen35: parallel packed expert read: {e}")))?
             .into_iter();
         (
-            results.next().expect("two packed MQ4 jobs").data,
-            results.next().expect("two packed MQ4 jobs").data,
+            HostBlob::Owned(results.next().expect("two packed MQ4 jobs").data),
+            HostBlob::Owned(results.next().expect("two packed MQ4 jobs").data),
         )
     };
+    let trace = hipfire_config::developer_var_os("HIPFIRE_LOAD_TRACE").is_some();
+    let zero_copy =
+        matches!(gate_up_host, HostBlob::Borrowed(_)) && matches!(down_host, HostBlob::Borrowed(_));
+    let t_upload = Instant::now();
 
-    let gate_up_owner = gpu.upload_raw(&gate_up_host, &[specs.len(), gate_up_stride])?;
+    let gate_up_owner = gpu.upload_raw(gate_up_host.as_ref(), &[specs.len(), gate_up_stride])?;
     drop(gate_up_host);
-    let down_owner = match gpu.upload_raw(&down_host, &[specs.len(), down_stride]) {
+    let down_owner = match gpu.upload_raw(down_host.as_ref(), &[specs.len(), down_stride]) {
         Ok(owner) => owner,
         Err(error) => {
             let _ = gpu.free_tensor(gate_up_owner);
@@ -3024,6 +4306,15 @@ fn try_load_packed_mq4_experts(
         }
     };
     drop(down_host);
+    let upload_ms = t_upload.elapsed().as_millis() as u64;
+    let read_ms = t_read.elapsed().as_millis() as u64 - upload_ms;
+    PACKED_READ_MS.fetch_add(read_ms, Ordering::Relaxed);
+    PACKED_UPLOAD_MS.fetch_add(upload_ms, Ordering::Relaxed);
+    if trace {
+        eprintln!(
+            "  [load-trace] packed experts: host-read {read_ms} ms, H2D {upload_ms} ms, zero-copy={zero_copy}"
+        );
+    }
 
     let expert_dtype = expert_dtype.expect("non-empty packed MQ4 expert list");
     let mut experts = Vec::with_capacity(specs.len());

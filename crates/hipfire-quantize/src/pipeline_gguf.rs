@@ -271,7 +271,7 @@ pub(crate) fn run_gguf_pipeline(
     // values (chat template, vocab, scores, merges, etc.).
     // Strict validation before worker threads — same parser as CLI.
     crate::model_filter::validate_env_fixed_tier_or_exit();
-    let config_json = config_json_from_gguf(&gguf, &arch_str);
+    let config_json = config_json_from_gguf(&gguf, &arch_str, arch_id);
     let metadata = serde_json::json!({
         "architecture": arch_str,
         "source": "gguf",
@@ -356,7 +356,7 @@ pub(crate) fn run_gguf_pipeline(
         let mut counts = [0u32; 4];
         for info in &gguf.tensors {
             let out_name =
-                gguf_to_safetensors_name(&info.name).unwrap_or_else(|| info.name.clone());
+                gguf_to_safetensors_name(&info.name, arch_id).unwrap_or_else(|| info.name.clone());
             let level = kmap_resolve_mode(&out_name, n_layers, is_moe, kmap_mode);
             match level {
                 QuantLevel::F16 => counts[0] += 1,
@@ -410,7 +410,8 @@ pub(crate) fn run_gguf_pipeline(
         // Translate to the safetensors-style name `hipfire_runtime::hfq::load_weights_hfq`
         // expects. If we don't have a translation, keep the original name —
         // the future loader can ignore unknown tensors.
-        let out_name = gguf_to_safetensors_name(&info.name).unwrap_or_else(|| info.name.clone());
+        let out_name =
+            gguf_to_safetensors_name(&info.name, arch_id).unwrap_or_else(|| info.name.clone());
 
         let kmap_level = kmap.get(&out_name).copied().unwrap_or(QuantLevel::Base);
 

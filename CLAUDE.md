@@ -160,7 +160,7 @@ failed so the search space narrows.
 
 Phases 0–4 (ROCm-unlock recon → approach bake-off → E2E validation → first
 forward pass) bootstrapped the engine and are complete. For that archaeology see
-`git log` and the `findings/` / `approaches/` history; day-to-day work now lives
+`git log` and the archived `docs/investigations/dispatch/` / `approaches/` history; day-to-day work now lives
 in `crates/` and the gate suite below — there is no setup phase to re-run.
 
 ## Perf benchmarking (kernel perf changes)
@@ -372,10 +372,12 @@ re-learned per session.
   engine.** A wrong-recipe model (e.g. dense-AWQ on an MoE) lobotomizes output
   and burns engine-debugging cycles. Coherence gates must include a bare factual
   prompt — strong/code prompts mask a lobotomy.
-- **Byte-parity validation is meaningless under stochastic state — pin FP32 +
-  `HIPFIRE_DETERMINISTIC=1`.** Q8 DeltaNet-state stochastic rounding makes an
-  exact TP/seam path look non-bit-exact ("ULP cascade") and mis-attributes the
-  bug. Use FP32 DeltaNet state for any byte-parity claim.
+- **Byte-parity validation requires deterministic recurrent state.** Production
+  Q8 DeltaNet state has default-on error feedback (`q8_ef`,
+  `HIPFIRE_DN_STATE_EF=1`) and is deterministic; leave the production default
+  enabled when validating the shipping route. If explicitly testing legacy
+  stochastic Q8 (`HIPFIRE_DN_STATE_EF=0`), byte parity is meaningless: re-enable
+  EF or pin FP32 plus `HIPFIRE_DETERMINISTIC=1`.
 
 ## GPU Lock Protocol (Multi-Agent)
 

@@ -4,7 +4,7 @@
 
 //! Graph-capture lifecycle for AR forward, DFlash verify, and DeltaNet replay.
 
-use hip_bridge::{Graph, GraphExec, HipResult, HipRuntime, Stream};
+use hip_bridge::{Graph, GraphExec, HipError, HipResult, HipRuntime, Stream};
 use std::cell::Cell;
 use std::collections::{HashMap, HashSet};
 
@@ -122,6 +122,13 @@ pub struct GraphState {
     /// in their non-sequential context.
     pub ar_graph_eligible: bool,
 
+    /// Per-segment AR graphs for dense TP decode. Each entry owns its kernarg
+    /// blobs (drained from shared `capture_blobs` at `end_graph_capture_segment`)
+    /// so segment lifetime is independent of later captures that clear the
+    /// shared blob vec. Destroyed in `drop_graph_segments` / `drop_captured_graph`
+    /// / `graph_destroy`.
+    pub ar_segments: Vec<(Graph, GraphExec, Vec<Vec<u8>>)>,
+
     // Verify (DFlash, per-B)
     pub verify: PerBGraphCache,
 
@@ -160,7 +167,12 @@ impl GraphState {
         bind_thread(hip, device_id)?;
         self.capture_blobs.clear();
         self.capture_mode = true;
-        hip.stream_begin_capture(stream, 2) // 2 = hipStreamCaptureModeRelaxed
+        if let Err(e) = hip.stream_begin_capture(stream, 2) {
+            // 2 = hipStreamCaptureModeRelaxed
+            self.capture_mode = false;
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// End capture, instantiate the graph for replay.
@@ -185,6 +197,87 @@ impl GraphState {
         self.ar_forward_blobs = std::mem::take(&mut self.capture_blobs);
         Ok(())
     }
+
+    /// End a per-segment capture (typically after `begin_graph_capture_relaxed`),
+    /// instantiate, and push ownership of the graph + kernarg blobs.
+    pub fn end_graph_capture_segment(
+        &mut self,
+        hip: &HipRuntime,
+        device_id: i32,
+        stream: &Stream,
+    ) -> HipResult<()> {
+        // Always exit capture mode — even when bind/end/instantiate fails —
+        // so a partial segment attempt cannot leave dispatch in blob mode.
+        self.capture_mode = false;
+        if let Err(e) = bind_thread(hip, device_id) {
+            self.capture_blobs.clear();
+            return Err(e);
+        }
+        let graph = match hip.stream_end_capture(stream) {
+            Ok(g) => g,
+            Err(e) => {
+                self.capture_blobs.clear();
+                return Err(e);
+            }
+        };
+        let exec = match hip.graph_instantiate(&graph) {
+            Ok(exec) => exec,
+            Err(e) => {
+                let _ = hip.graph_destroy(graph);
+                self.capture_blobs.clear();
+                return Err(e);
+            }
+        };
+        mark_graph_captured();
+        // Only move blobs into the segment after instantiate succeeds.
+        let blobs = std::mem::take(&mut self.capture_blobs);
+        self.ar_segments.push((graph, exec, blobs));
+        Ok(())
+    }
+
+    /// How many captured AR segment graphs are retained.
+    pub fn graph_segment_count(&self) -> usize {
+        self.ar_segments.len()
+    }
+
+    /// Abort an in-flight capture without instantiating or retaining a graph.
+    /// Used when the capture body fails: leaves capture_mode off, drops partial
+    /// blobs, ends the stream capture, and destroys the returned Graph.
+    pub fn abort_graph_capture(&mut self, hip: &HipRuntime, device_id: i32, stream: &Stream) {
+        self.capture_mode = false;
+        self.capture_blobs.clear();
+        bind_thread_or_warn(hip, device_id);
+        if let Ok(graph) = hip.stream_end_capture(stream) {
+            let _ = hip.graph_destroy(graph);
+        }
+    }
+
+    /// Replay a previously captured AR segment by index.
+    pub fn graph_segment_launch(
+        &self,
+        hip: &HipRuntime,
+        device_id: i32,
+        stream: &Stream,
+        segment: usize,
+    ) -> HipResult<()> {
+        bind_thread(hip, device_id)?;
+        let entry = self
+            .ar_segments
+            .get(segment)
+            .ok_or_else(|| HipError::new(0, &format!("no captured AR graph segment {segment}")))?;
+        hip.graph_launch(&entry.1, stream)
+    }
+
+    /// Destroy every per-segment AR graph and clear shared capture blobs.
+    pub fn drop_graph_segments(&mut self, hip: &HipRuntime, device_id: i32) {
+        bind_thread_or_warn(hip, device_id);
+        for (graph, exec, _blobs) in self.ar_segments.drain(..) {
+            let _ = hip.graph_exec_destroy(exec);
+            let _ = hip.graph_destroy(graph);
+        }
+        self.capture_blobs.clear();
+    }
+
     /// Replay the captured graph.
     pub fn graph_launch(&self, hip: &HipRuntime, device_id: i32, stream: &Stream) -> HipResult<()> {
         bind_thread(hip, device_id)?;
@@ -221,6 +314,7 @@ impl GraphState {
         }
         self.capture_blobs.clear();
         self.ar_forward_blobs.clear();
+        self.drop_graph_segments(hip, device_id);
     }
 
     /// Caller signals a kernel-module change (model load, dtype switch, etc).
@@ -245,6 +339,7 @@ impl GraphState {
         self.ar_forward_blobs.clear();
         self.ar_forward_kernel_dirty = true;
         self.ar_forward_replay_enabled = false;
+        self.drop_graph_segments(hip, device_id);
     }
 
     // ── Per-B verify-forward graph cache ─────────────────────────────────

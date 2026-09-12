@@ -187,7 +187,7 @@ impl Gemma4DrafterConfig {
                 v
             });
 
-        let norm_plus_one = std::env::var("HIPFIRE_GEMMA4_NORM_PLUS_ONE")
+        let norm_plus_one = hipfire_config::developer_var("HIPFIRE_GEMMA4_NORM_PLUS_ONE")
             .ok()
             .as_deref()
             == Some("1");

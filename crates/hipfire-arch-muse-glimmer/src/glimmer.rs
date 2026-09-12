@@ -167,7 +167,7 @@ pub fn hidden_can_rewind_to(
 /// unless set; may synchronize and download.
 #[inline]
 pub fn device_capture_audit_enabled() -> bool {
-    std::env::var("HIPFIRE_GLIMMER_DEVICE_CAPTURE_AUDIT")
+    hipfire_config::developer_var("HIPFIRE_GLIMMER_DEVICE_CAPTURE_AUDIT")
         .ok()
         .as_deref()
         == Some("1")
@@ -1043,7 +1043,7 @@ fn load_norm_with(
 ) -> Result<GpuTensor, String> {
     let mut f32_data = load_f32_vec(hfq, name, dim)?;
     if centered
-        && std::env::var("HIPFIRE_GLIMMER_NO_CENTERED_NORM")
+        && hipfire_config::developer_var("HIPFIRE_GLIMMER_NO_CENTERED_NORM")
             .ok()
             .as_deref()
             != Some("1")
@@ -1784,7 +1784,7 @@ impl GlimmerState {
     ) -> Result<Self, String> {
         // `HIPFIRE_GLIMMER_KV_VMM=0` falls back to the contiguous allocator.
         // Default remains VMM so examples/tools keep working without a LoadCtx.
-        let use_vmm = std::env::var("HIPFIRE_GLIMMER_KV_VMM")
+        let use_vmm = hipfire_config::developer_var("HIPFIRE_GLIMMER_KV_VMM")
             .map(|v| v != "0" && !v.is_empty())
             .unwrap_or(true);
         let backend = if use_vmm {

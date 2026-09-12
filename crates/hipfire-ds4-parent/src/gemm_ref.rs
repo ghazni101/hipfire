@@ -348,11 +348,7 @@ pub fn fp4_gemm_ref(
                             let av = e4m3_to_f32(a[mi * k + ki]) as f64;
                             // Packed E2M1: low nibble = even k, high = odd k.
                             let byte = b[ni * b_packed_row + ki / 2];
-                            let nibble = if ki & 1 == 0 {
-                                byte & 0x0f
-                            } else {
-                                byte >> 4
-                            };
+                            let nibble = if ki & 1 == 0 { byte & 0x0f } else { byte >> 4 };
                             let bv = e2m1_to_f32(nibble) as f64;
                             acc += sa * sb * av * bv;
                         }
@@ -377,11 +373,7 @@ pub fn fp4_gemm_ref(
                             let ki = k0 + kk;
                             let av = e4m3_to_f32(a[mi * k + ki]);
                             let byte = b[ni * b_packed_row + ki / 2];
-                            let nibble = if ki & 1 == 0 {
-                                byte & 0x0f
-                            } else {
-                                byte >> 4
-                            };
+                            let nibble = if ki & 1 == 0 { byte & 0x0f } else { byte >> 4 };
                             let bv = e2m1_to_f32(nibble);
                             c_local += av * bv;
                         }
@@ -459,7 +451,10 @@ mod tests {
     fn ue8(exp_offset: i32) -> u8 {
         // value = 2^exp_offset → byte = exp_offset + 127
         let b = exp_offset + 127;
-        assert!((0..=254).contains(&b), "ue8 offset {exp_offset} out of range");
+        assert!(
+            (0..=254).contains(&b),
+            "ue8 offset {exp_offset} out of range"
+        );
         b as u8
     }
 
@@ -537,7 +532,7 @@ mod tests {
         let n = 1usize;
         let k = 128usize;
         let a = vec![0x38u8; m * k]; // 1.0
-        // Pack E2M1 code 4 (value 2.0) into both nibbles of every byte.
+                                     // Pack E2M1 code 4 (value 2.0) into both nibbles of every byte.
         let b = vec![0x44u8; n * (k / 2)];
         let a_s = vec![ue8(1)]; // 2.0 — one act group
         let b_s = vec![ue8(2); k / 32]; // 4.0 — four weight groups
@@ -587,11 +582,13 @@ mod tests {
         }
 
         let exact = fp8_gemm_ref(&a, &a_s, &b, &b_s, m, n, k, AccumMode::Exact).unwrap();
-        let pref =
-            fp8_gemm_ref(&a, &a_s, &b, &b_s, m, n, k, AccumMode::ReferenceOrder).unwrap();
+        let pref = fp8_gemm_ref(&a, &a_s, &b, &b_s, m, n, k, AccumMode::ReferenceOrder).unwrap();
 
         // Not bit-identical.
-        let any_diff = exact.iter().zip(pref.iter()).any(|(e, r)| e.to_bits() != r.to_bits());
+        let any_diff = exact
+            .iter()
+            .zip(pref.iter())
+            .any(|(e, r)| e.to_bits() != r.to_bits());
         assert!(
             any_diff,
             "ReferenceOrder is bit-identical to Exact — f32 block accum is not engaged"
@@ -601,10 +598,7 @@ mod tests {
         // Expectation: roughly sqrt(K) * 2^-24 ≈ 64 * 5.96e-8 ≈ 3.8e-6.
         // Allow a generous band; the point is "same order", not a tight bound.
         let expect = (k as f64).sqrt() * (2.0f64).powi(-24);
-        assert!(
-            err > 0.0,
-            "err_ref must be > 0 (got {err})"
-        );
+        assert!(err > 0.0, "err_ref must be > 0 (got {err})");
         assert!(
             err < 50.0 * expect,
             "err_ref={err} far exceeds ~sqrt(K)*2^-24={expect}"
@@ -649,10 +643,12 @@ mod tests {
         }
 
         let exact = fp4_gemm_ref(&a, &a_s, &b, &b_s, m, n, k, AccumMode::Exact).unwrap();
-        let pref =
-            fp4_gemm_ref(&a, &a_s, &b, &b_s, m, n, k, AccumMode::ReferenceOrder).unwrap();
+        let pref = fp4_gemm_ref(&a, &a_s, &b, &b_s, m, n, k, AccumMode::ReferenceOrder).unwrap();
 
-        let any_diff = exact.iter().zip(pref.iter()).any(|(e, r)| e.to_bits() != r.to_bits());
+        let any_diff = exact
+            .iter()
+            .zip(pref.iter())
+            .any(|(e, r)| e.to_bits() != r.to_bits());
         assert!(
             any_diff,
             "ReferenceOrder is bit-identical to Exact — f32 block accum is not engaged"
@@ -707,6 +703,7 @@ mod tests {
 
     /// Perturb a single `scales_a` entry and assert only that row moves.
     #[test]
+    #[allow(clippy::erasing_op)] // perturbing scales_a row 0 exercises 0 * m + n
     fn fp8_scale_a_axis() {
         let m = 2usize;
         let n = 128usize;
@@ -745,7 +742,7 @@ mod tests {
         let n = 1usize;
         let k = 256usize;
         let a = vec![0x38u8; m * k]; // 1.0
-        // E2M1 = 1.0 (code 2) in every nibble.
+                                     // E2M1 = 1.0 (code 2) in every nibble.
         let b = vec![0x22u8; n * (k / 2)];
         assert_eq!(e2m1_to_f32(2), 1.0);
 
@@ -779,9 +776,9 @@ mod tests {
         // Also verify that flipping only act scale group 1 moves only kb4..7.
         let mut a_s2 = a_s.clone();
         a_s2[1] = ue8(2); // 4.0 instead of 2.0
-        // kb0..3 unchanged: 32+64+128+32 = 256
-        // kb4: 32*4*2=256, kb5:32*4*4=512, kb6:32*4*1=128, kb7:32*4*2=256
-        // sum = 256+256+512+128+256 = 1408
+                          // kb0..3 unchanged: 32+64+128+32 = 256
+                          // kb4: 32*4*2=256, kb5:32*4*4=512, kb6:32*4*1=128, kb7:32*4*2=256
+                          // sum = 256+256+512+128+256 = 1408
         let c2 = fp4_gemm_ref(&a, &a_s2, &b, &b_s, m, n, k, AccumMode::Exact).unwrap();
         assert_eq!(c2[0], 1408.0);
     }
@@ -816,8 +813,7 @@ mod tests {
         let b = vec![0x38u8; n * k]; // 1.0 codes
         let b_s = vec![ue8(0)]; // 1.0
 
-        let via_linear =
-            linear_fp8_ref(&x, &b, &b_s, m, n, k, AccumMode::ReferenceOrder).unwrap();
+        let via_linear = linear_fp8_ref(&x, &b, &b_s, m, n, k, AccumMode::ReferenceOrder).unwrap();
         let (a, a_s) = act_quant_fp8_codes(&x, k, 128).unwrap();
         let via_parts =
             fp8_gemm_ref(&a, &a_s, &b, &b_s, m, n, k, AccumMode::ReferenceOrder).unwrap();
@@ -844,8 +840,7 @@ mod tests {
         let b = vec![0x22u8; n * (k / 2)]; // E2M1 = 1.0
         let b_s = vec![ue8(0); n * (k / 32)];
 
-        let via_linear =
-            linear_fp4_ref(&x, &b, &b_s, m, n, k, AccumMode::ReferenceOrder).unwrap();
+        let via_linear = linear_fp4_ref(&x, &b, &b_s, m, n, k, AccumMode::ReferenceOrder).unwrap();
         let (a, a_s) = act_quant_fp8_codes(&x, k, 128).unwrap();
         let via_parts =
             fp4_gemm_ref(&a, &a_s, &b, &b_s, m, n, k, AccumMode::ReferenceOrder).unwrap();
@@ -881,25 +876,34 @@ mod tests {
     #[test]
     fn rejects_bad_shapes() {
         // k not multiple of 128
-        let err = fp8_gemm_ref(&[0; 100], &[0], &[0; 100], &[0], 1, 1, 100, AccumMode::Exact)
-            .unwrap_err();
+        let err = fp8_gemm_ref(
+            &[0; 100],
+            &[0],
+            &[0; 100],
+            &[0],
+            1,
+            1,
+            100,
+            AccumMode::Exact,
+        )
+        .unwrap_err();
         assert!(err.contains("not divisible by 128"), "{err}");
 
         // a length mismatch
-        let err = fp8_gemm_ref(&[0; 10], &[0], &[0; 128], &[0], 1, 1, 128, AccumMode::Exact)
-            .unwrap_err();
+        let err =
+            fp8_gemm_ref(&[0; 10], &[0], &[0; 128], &[0], 1, 1, 128, AccumMode::Exact).unwrap_err();
         assert!(err.contains("a len"), "{err}");
 
         // fp4: k=100 is even but not % 128
-        let err = fp4_gemm_ref(&[0; 100], &[0], &[0; 50], &[0], 1, 1, 100, AccumMode::Exact)
-            .unwrap_err();
+        let err =
+            fp4_gemm_ref(&[0; 100], &[0], &[0; 50], &[0], 1, 1, 100, AccumMode::Exact).unwrap_err();
         assert!(
             err.contains("not divisible by 128") || err.contains("even"),
             "{err}"
         );
 
-        let err = fp4_gemm_ref(&[0; 127], &[0], &[0; 64], &[0], 1, 1, 127, AccumMode::Exact)
-            .unwrap_err();
+        let err =
+            fp4_gemm_ref(&[0; 127], &[0], &[0; 64], &[0], 1, 1, 127, AccumMode::Exact).unwrap_err();
         assert!(err.contains("even"), "{err}");
 
         // act_quant bad block
@@ -907,8 +911,8 @@ mod tests {
         assert!(err.contains("not divisible"), "{err}");
 
         // linear length mismatch
-        let err = linear_fp8_ref(&[0.0; 10], &[0; 128], &[0], 1, 1, 128, AccumMode::Exact)
-            .unwrap_err();
+        let err =
+            linear_fp8_ref(&[0.0; 10], &[0; 128], &[0], 1, 1, 128, AccumMode::Exact).unwrap_err();
         assert!(err.contains("x len"), "{err}");
     }
 
@@ -965,9 +969,7 @@ mod tests {
             let k_act = k / 128;
             let k_wgt = k / 32;
             let a_s: Vec<u8> = (0..m * k_act).map(|i| ue8((i % 3) as i32 - 1)).collect();
-            let b_s: Vec<u8> = (0..n * k_wgt)
-                .map(|i| ue8(((i % 5) as i32) - 2))
-                .collect();
+            let b_s: Vec<u8> = (0..n * k_wgt).map(|i| ue8(((i % 5) as i32) - 2)).collect();
             let exact = fp4_gemm_ref(&a, &a_s, &b, &b_s, m, n, k, AccumMode::Exact).unwrap();
             let pref =
                 fp4_gemm_ref(&a, &a_s, &b, &b_s, m, n, k, AccumMode::ReferenceOrder).unwrap();

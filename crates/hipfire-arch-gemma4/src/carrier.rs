@@ -15,8 +15,8 @@
 use crate::config::Gemma4Config;
 use crate::gemma4::{Gemma4State, Gemma4Weights};
 use crate::lowered;
-use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
 use hipfire_runtime::llama::KvCache;
+use hipfire_runtime::loader_api::{LoadCtx, ModelSource};
 
 // ─── Helpers moved verbatim from carriers.rs ─────────────────────────────
 
@@ -60,6 +60,15 @@ pub enum Gemma4Bundle {
     Lowered(Gemma4LoweredBundle),
 }
 
+fn lowered_kv_layer_counts(layer_types: &[lowered::LayerType]) -> (usize, usize) {
+    layer_types
+        .iter()
+        .fold((0, 0), |(sliding, full), layer_type| match layer_type {
+            lowered::LayerType::Sliding => (sliding + 1, full),
+            lowered::LayerType::Full => (sliding, full + 1),
+        })
+}
+
 /// Build the Gemma 4 GPU bundle from an HFQ source.
 ///
 /// `ModelSource::Dir` returns the same error string the carrier previously
@@ -93,9 +102,9 @@ pub fn load_gemma4_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Gemma4B
     } else {
         Some(Gemma4Config::from_hfq(&hfq)?)
     };
-    let is_e_series = eager_config.as_ref().is_some_and(|cfg| {
-        cfg.hidden_size_per_layer_input != 0 || cfg.num_kv_shared_layers != 0
-    });
+    let is_e_series = eager_config
+        .as_ref()
+        .is_some_and(|cfg| cfg.hidden_size_per_layer_input != 0 || cfg.num_kv_shared_layers != 0);
     if is_e_series {
         eager_config.as_ref().unwrap().e_series_variant()?;
     }
@@ -112,6 +121,7 @@ pub fn load_gemma4_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Gemma4B
     };
     if use_lowered {
         let lcfg = lowered_cfg.unwrap();
+        let (n_sliding_layers, n_full_layers) = lowered_kv_layer_counts(&lcfg.layer_types);
         let mut hfq2 = hfq;
         let weights = lowered::load_weights(&mut hfq2, &lcfg, ctx.gpu)
             .map_err(|e| format!("gemma4 (lowered) load_weights: {e:?}"))?;
@@ -121,7 +131,7 @@ pub fn load_gemma4_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Gemma4B
             .map_err(|e| format!("gemma4 (lowered) init_scratch_constants: {e:?}"))?;
         let kv_sliding = KvCache::new_gpu_q8_capped(
             ctx.gpu,
-            lcfg.n_layers,
+            n_sliding_layers,
             lcfg.sliding_n_kv_heads,
             lcfg.sliding_head_dim,
             ctx.max_seq,
@@ -130,7 +140,7 @@ pub fn load_gemma4_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Gemma4B
         .map_err(|e| format!("gemma4 (lowered) sliding KV alloc (q8 ring): {e:?}"))?;
         let kv_full = KvCache::new_gpu_asym3_gemma4(
             ctx.gpu,
-            lcfg.n_layers,
+            n_full_layers,
             lcfg.full_n_kv_heads,
             lcfg.full_head_dim,
             ctx.max_seq,
@@ -172,3 +182,22 @@ pub fn load_gemma4_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Gemma4B
 
 // Alias for task's naming convention if callers use `load_bundle`.
 pub use load_gemma4_bundle as load_bundle;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lowered_kv_counts_follow_attention_layer_types() {
+        let layer_types = (0..48)
+            .map(|layer_idx| {
+                if (layer_idx + 1) % 6 == 0 {
+                    lowered::LayerType::Full
+                } else {
+                    lowered::LayerType::Sliding
+                }
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(lowered_kv_layer_counts(&layer_types), (40, 8));
+    }
+}

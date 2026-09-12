@@ -86,6 +86,7 @@ impl QuantType {
             48 => Some(Self::MQ5G256V2),
             49 => Some(Self::MQ3G256V2),
             50 => Some(Self::MQ2G256V2),
+            51 => Some(Self::MQ2G256LloydU),
             _ => None,
         }
     }
@@ -215,6 +216,25 @@ pub(crate) enum QuantType {
     /// Layout: [0..2) fp16 s0, [2..4) fp16 z0, [4..6) fp16 s1, [6..8) fp16 z1, [8..72) 64 B packed 2-bit.
     /// Half 0 covers q[0..128), half 1 q[128..256); degenerate half uses scale=0, zero=f16(lo), q=0.
     MQ2G256V2 = 50,
+    /// MQ2G256LloydU (qt=51): **UNROTATED** sibling of MQ2G256Lloyd (qt=19).
+    ///
+    /// Byte layout is IDENTICAL — 72 B per 256-weight group: `[0..8)` four fp16
+    /// codebook entries sorted ascending, `[8..72)` 64 B of 2-bit indices, 4 per
+    /// byte LSB-first — so every existing MQ2-Lloyd kernel binds unchanged.
+    ///
+    /// The ONLY difference is that no FWHT is applied at pack time, so the
+    /// runtime MUST NOT rotate x for these weights (`needs_x_rot_local ==
+    /// false`). Feeding a rotated x to unrotated weights is silent garbage
+    /// output, so the MoE resolver gates this explicitly and deliberately
+    /// omits this dtype from the rotation chain.
+    ///
+    /// Purpose: carry natively-ternary checkpoints (Maple-Preview) losslessly.
+    /// Those weights are already `{-s, 0, +s}` per row, so a 3-entry codebook
+    /// reproduces them exactly; FWHT would destroy that structure and force an
+    /// approximation. Three slots are used, slot 3 duplicates slot 2 and is
+    /// never indexed. 2.25 bpw. `K % 256 == 0`.
+    /// See `docs/design/2026-08-22-maple-preview-20b-a1b.md`.
+    MQ2G256LloydU = 51,
 }
 
 /// Per-tensor precision level assigned by the K-map pre-pass.
@@ -780,4 +800,29 @@ pub(crate) fn write_hfq(
     }
 
     Ok(())
+}
+
+#[cfg(test)]
+mod maple_dtype_tests {
+    use super::*;
+
+    #[test]
+    fn mq2g256_lloyd_u_is_qt51_and_round_trips() {
+        assert_eq!(QuantType::MQ2G256LloydU as u8, 51);
+        assert_eq!(QuantType::from_u8(51), Some(QuantType::MQ2G256LloydU));
+    }
+
+    #[test]
+    fn mq2g256_lloyd_u_does_not_collide_with_an_existing_id() {
+        // 51 must be genuinely free: every other id must map elsewhere.
+        for v in 0u8..=50 {
+            if let Some(qt) = QuantType::from_u8(v) {
+                assert_ne!(
+                    qt,
+                    QuantType::MQ2G256LloydU,
+                    "id {v} already resolves to MQ2G256LloydU"
+                );
+            }
+        }
+    }
 }

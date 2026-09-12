@@ -12,10 +12,10 @@ Compares against hipfire's HIPFIRE_GEMMA4_DUMP=1 output.
 
 Usage:
   # Quick test with short prompt
-  .venv-rocm/bin/python3 scripts/oracle_gemma4_26b.py --ids 2,105,2364,107 --out findings/oracle_26b_short.json
+  .venv-rocm/bin/python3 scripts/oracle_gemma4_26b.py --ids 2,105,2364,107 --out .codeinsight+research/oracle-gemma4-26b/oracle_26b_short.json
 
   # Full framed prompt
-  .venv-rocm/bin/python3 scripts/oracle_gemma4_26b.py --ids-file /tmp/ids.txt --out findings/oracle_26b.json
+  .venv-rocm/bin/python3 scripts/oracle_gemma4_26b.py --ids-file /tmp/ids.txt --out .codeinsight+research/oracle-gemma4-26b/oracle_26b.json
 """
 import argparse, json, sys, os
 import torch

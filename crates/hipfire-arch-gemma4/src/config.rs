@@ -240,7 +240,7 @@ impl Gemma4Config {
             .collect::<Result<_, _>>()?;
         validate_layer_metadata(n_layers, num_kv_shared_layers, &layer_types)?;
 
-        let norm_plus_one = std::env::var("HIPFIRE_GEMMA4_NORM_PLUS_ONE")
+        let norm_plus_one = hipfire_config::developer_var("HIPFIRE_GEMMA4_NORM_PLUS_ONE")
             .ok()
             .as_deref()
             == Some("1");

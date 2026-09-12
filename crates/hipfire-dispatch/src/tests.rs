@@ -973,6 +973,99 @@ fn dtypes_all_mq4() -> MoeDtypes {
 }
 
 #[test]
+fn moe_res_mq2_lloyd_u_is_indexable_but_never_rotates() {
+    // MQ2G256LloydU carries UNROTATED weights. It must reach the same indexed
+    // decode arms as its rotated sibling (same kernels, same byte layout) but
+    // must NOT request the x rotation — feeding a FWHT-rotated x to unrotated
+    // weights is silent garbage output, not an error.
+    let mut d = dtypes_all_mq4();
+    d.router = DType::F32;
+    d.experts_all_gate_up_mq4 = false;
+    d.routed_gate_up = DType::MQ2G256LloydU;
+    d.routed_down = DType::MQ2G256LloydU;
+    let r = MoeResolution::resolve(&d, 8);
+    assert!(
+        r.routed_indexable_mq2lloyd_u,
+        "must reach the indexed MoE decode arms"
+    );
+    assert!(r.use_gpu_topk, "k=8 + indexable implies device-side top-K");
+    assert!(
+        !r.needs_x_rot_local,
+        "UNROTATED dtype must never request the FWHT rotation"
+    );
+}
+
+#[test]
+fn unrotated_dtype_skips_both_rotations() {
+    // THE invariant tying the resolver to the executor: a dtype is either
+    // rotated in BOTH places (x before gate_up, and the intermediate before
+    // down) or in NEITHER. A dtype that resolved `needs_x_rot_local == false`
+    // but still took the rotating gate→down step would feed a rotated
+    // activation to unrotated down weights — silent garbage, no error.
+    //
+    // Built as a differential over dtypes so it cannot pass vacuously: the
+    // rotated and unrotated arms must DISAGREE on both flags.
+    for (dt, expect_rotation) in [
+        (DType::MQ2G256LloydU, false),
+        (DType::MQ2G256Lloyd, true),
+        (DType::MQ4G256, true),
+        (DType::MQ6G256, true),
+    ] {
+        let mut d = dtypes_all_mq4();
+        d.router = DType::F32;
+        d.experts_all_gate_up_mq4 = false;
+        d.routed_gate_up = dt;
+        d.routed_down = dt;
+        let r = MoeResolution::resolve(&d, 8);
+        assert_eq!(
+            r.needs_x_rot_local, expect_rotation,
+            "{dt:?}: needs_x_rot_local"
+        );
+        assert_eq!(
+            crate::pipeline::gate_down_skips_rotation(dt),
+            !expect_rotation,
+            "{dt:?}: gate→down rotation must agree with needs_x_rot_local"
+        );
+    }
+}
+
+#[test]
+fn moe_res_mq2_lloyd_rotated_sibling_still_rotates() {
+    // Guard: adding the unrotated arm must not disable rotation for qt19.
+    let mut d = dtypes_all_mq4();
+    d.router = DType::F32;
+    d.experts_all_gate_up_mq4 = false;
+    d.routed_gate_up = DType::MQ2G256Lloyd;
+    d.routed_down = DType::MQ2G256Lloyd;
+    let r = MoeResolution::resolve(&d, 8);
+    assert!(
+        r.needs_x_rot_local,
+        "qt19 is FWHT-rotated and MUST still rotate"
+    );
+}
+
+#[test]
+fn moe_res_mixed_rotated_and_unrotated_experts_is_not_indexable() {
+    // A layer whose gate_up is rotated and whose down is not (or vice versa)
+    // has no coherent single rotation decision. It must fall out of the
+    // indexed path rather than silently picking one and corrupting the other.
+    let mut d = dtypes_all_mq4();
+    d.router = DType::F32;
+    d.experts_all_gate_up_mq4 = false;
+    d.routed_gate_up = DType::MQ2G256LloydU;
+    d.routed_down = DType::MQ2G256Lloyd;
+    let r = MoeResolution::resolve(&d, 8);
+    assert!(
+        !r.routed_indexable_mq2lloyd_u,
+        "rotated/unrotated mix must not resolve to the unrotated indexed arm"
+    );
+    assert!(
+        !r.use_gpu_topk,
+        "no coherent rotation decision, so no indexed decode at all"
+    );
+}
+
+#[test]
 fn moe_res_all_mq4_k8_uses_gpu_topk_and_xrot() {
     let r = MoeResolution::resolve(&dtypes_all_mq4(), 8);
     assert!(r.gate_side_mq4);
@@ -1002,6 +1095,142 @@ fn moe_res_k6_disables_gpu_topk_even_when_indexable() {
     let r = MoeResolution::resolve(&dtypes_all_mq4(), 6);
     assert!(r.routed_indexable_mq4);
     assert!(!r.use_gpu_topk);
+}
+
+#[test]
+fn moe_res_mq4v2_routed_indexable() {
+    // qt44 uniform: both projections MQ4G256V2 => indexable, GPU top-K on.
+    let mut d = dtypes_all_mq4();
+    d.routed_gate_up = DType::MQ4G256V2;
+    d.routed_down = DType::MQ4G256V2;
+    d.experts_all_gate_up_mq4 = false;
+    let r = MoeResolution::resolve(&d, 8);
+    assert!(r.routed_indexable_mq4v2);
+    assert!(!r.routed_indexable_mq4, "must not claim the qt13 arm");
+    assert!(r.use_gpu_topk);
+    // qt44 is a FWHT-G256 format: its kernels read ROTATED activations.
+    assert!(r.needs_x_rot_local);
+}
+
+#[test]
+fn moe_res_all_mq4v2_gate_quartet_is_fusable_mq4v2() {
+    // Exact-uniform V2 gate-side quartet admits the V2 fused route (one launch),
+    // never the V1 fused route. Still needs the rotated activation.
+    let mut d = dtypes_all_mq4();
+    d.router = DType::MQ4G256V2;
+    d.shared_gate = DType::MQ4G256V2;
+    d.shared_expert_gate = DType::MQ4G256V2;
+    d.shared_expert_up = DType::MQ4G256V2;
+    d.shared_expert_down = DType::MQ4G256V2;
+    d.routed_gate_up = DType::MQ4G256V2;
+    d.routed_down = DType::MQ4G256V2;
+    d.experts_all_gate_up_mq4 = true;
+    let r = MoeResolution::resolve(&d, 8);
+    assert!(
+        r.gate_fusable_mq4v2,
+        "uniform all-gate-side V2 must admit gate_fusable_mq4v2"
+    );
+    assert!(
+        !r.gate_fusable,
+        "V2 gate quartet must not claim the V1 fused route"
+    );
+    assert!(!r.gate_side_mq4);
+    assert!(r.needs_x_rot_local, "V2 fused gate requires rotated x");
+    assert!(r.routed_indexable_mq4v2);
+    assert!(r.use_gpu_topk);
+}
+
+#[test]
+fn moe_res_mixed_v1_v2_gate_quartet_is_not_fusable() {
+    // Mixed V1/V2 gate-side is never fusable on either predicate: V1 f32 header
+    // vs V2 dual-f16 header share stride; wrong launcher is silent garbage.
+    // Routed V2 indexability is independent and stays on.
+    let mut d = dtypes_all_mq4();
+    d.router = DType::MQ4G256V2; // V2 router, rest V1
+    d.routed_gate_up = DType::MQ4G256V2;
+    d.routed_down = DType::MQ4G256V2;
+    d.experts_all_gate_up_mq4 = false;
+    let r = MoeResolution::resolve(&d, 8);
+    assert!(!r.gate_fusable, "mixed V1/V2 gate quartet must not fuse V1");
+    assert!(
+        !r.gate_fusable_mq4v2,
+        "mixed V1/V2 gate quartet must not fuse V2"
+    );
+    assert!(!r.gate_side_mq4);
+    assert!(
+        r.routed_indexable_mq4v2,
+        "routed V2 indexability unchanged by gate mix"
+    );
+    assert!(r.use_gpu_topk);
+    assert!(r.needs_x_rot_local);
+
+    // V1 router + one V2 shared half
+    let mut d = dtypes_all_mq4();
+    d.shared_expert_up = DType::MQ4G256V2;
+    let r = MoeResolution::resolve(&d, 8);
+    assert!(!r.gate_fusable, "single V2 shared-up disqualifies V1 fuse");
+    assert!(
+        !r.gate_fusable_mq4v2,
+        "single V2 shared-up disqualifies V2 fuse"
+    );
+}
+
+#[test]
+fn moe_res_shipped_ornith15_takes_the_indexed_path() {
+    // The dtype combination of the PUBLISHED artifact
+    // hipfire-models/ornith1.5-35b-a3b (read from its HFQ index: 20,651 of
+    // 21,093 tensors are qt44, including every routed expert).
+    //
+    // Note the router and shared_expert_gate are Q8, not MQ4, so `gate_fusable`
+    // is FALSE here — the fused gate-side GEMV does not apply. That does not
+    // disqualify the routed path: the routed experts are uniform qt44, which is
+    // what drives `use_gpu_topk`. Same coupling `moe_res_q8_router_still_gpu_topk`
+    // pins for qt13.
+    //
+    // Before qt44 had indexed MoE GEMVs this resolved to use_gpu_topk=false and
+    // the shipped model decoded through the resident CPU-fallback path.
+    let mut d = dtypes_all_mq4();
+    d.router = DType::Q8_0;
+    d.shared_gate = DType::Q8_0;
+    d.shared_expert_gate = DType::MQ6G256;
+    d.shared_expert_up = DType::MQ6G256;
+    d.shared_expert_down = DType::MQ6G256;
+    d.routed_gate_up = DType::MQ4G256V2;
+    d.routed_down = DType::MQ4G256V2;
+    d.experts_all_gate_up_mq4 = false;
+    let r = MoeResolution::resolve(&d, 8);
+    assert!(
+        !r.gate_fusable,
+        "Q8 router disqualifies the fused gate side"
+    );
+    assert!(r.routed_indexable_mq4v2, "routed experts are uniform qt44");
+    assert!(
+        r.use_gpu_topk,
+        "shipped Ornith must take the indexed decode path"
+    );
+    assert!(r.needs_x_rot_local, "qt44 kernels read ROTATED activations");
+}
+
+#[test]
+fn moe_res_mq4v2_mixed_with_qt13_is_not_indexable() {
+    // The hazard this pairing guards: qt13 and qt44 share a 136 B group stride
+    // and identical nibble packing, differing ONLY in the 8-byte header (one
+    // f32 scale+zero vs two f16 scale/zero pairs). A kernel handed the wrong
+    // one reads plausible garbage and emits fluent, wrong text rather than
+    // faulting. So a split pairing must NOT be indexable on either arm.
+    for (gu, dn) in [
+        (DType::MQ4G256V2, DType::MQ4G256),
+        (DType::MQ4G256, DType::MQ4G256V2),
+    ] {
+        let mut d = dtypes_all_mq4();
+        d.routed_gate_up = gu;
+        d.routed_down = dn;
+        d.experts_all_gate_up_mq4 = false;
+        let r = MoeResolution::resolve(&d, 8);
+        assert!(!r.routed_indexable_mq4v2, "{gu:?}/{dn:?}");
+        assert!(!r.routed_indexable_mq4, "{gu:?}/{dn:?}");
+        assert!(!r.use_gpu_topk, "{gu:?}/{dn:?} must fall back, not guess");
+    }
 }
 
 #[test]
@@ -1178,6 +1407,192 @@ fn moe_res_paro_needs_sidecar() {
     assert!(r.use_gpu_topk);
 }
 
+// ── MQV2 resolver contracts (mixed gate precedence / MQ6V2 / D3) ─────────────
+//
+// Pure helpers exposed by `pipeline` + `MoeResolution` lattice. These pin the
+// three silent-corruption hazards from the MQV2 fix wave: mixed gate before
+// representative V1/V2 arms, uniform MQ6V2 indexability without V1 collapse,
+// and V2 never calling the HFQ4 ninepath D3 gate.
+
+use crate::pipeline::{
+    decode_gate_uses_mixed, gate_up_varies, ninepath_d3_family, ninepath_d4_family,
+    prefill_path1_down_kind_tag_aware, prefill_path1_gate_up_kind_tag_aware,
+};
+
+#[test]
+fn moe_res_mq6v2_routed_indexable() {
+    // qt47 uniform: BOTH projections MQ6G256V2 ⇒ indexable, GPU top-K on.
+    // Dual-half f16 header is wire-incompatible with V1 MQ6G256's f32 header;
+    // the arm must not claim the V1 mq6 or mq4/mq4v2 flags.
+    let mut d = dtypes_all_mq4();
+    d.routed_gate_up = DType::MQ6G256V2;
+    d.routed_down = DType::MQ6G256V2;
+    d.experts_all_gate_up_mq4 = false;
+    let r = MoeResolution::resolve(&d, 8);
+    assert!(r.routed_indexable_mq6v2);
+    assert!(!r.routed_indexable_mq6, "must not claim the V1 MQ6 arm");
+    assert!(!r.routed_indexable_mq4);
+    assert!(!r.routed_indexable_mq4v2);
+    assert!(r.use_gpu_topk);
+    assert!(r.needs_x_rot_local, "qt47 kernels read ROTATED activations");
+    assert!(r.routed_indexable());
+}
+
+#[test]
+fn moe_res_mq6v2_mixed_with_v1_is_not_indexable() {
+    // Same dual-half hazard as mq4v2/qt13: V1 and V2 share the 200 B group
+    // stride and 6-bit packing, differing ONLY in the 8-byte header. A split
+    // pairing must NOT be indexable on either arm — wrong header is silent
+    // fluent garbage, not a fault.
+    for (gu, dn) in [
+        (DType::MQ6G256V2, DType::MQ6G256),
+        (DType::MQ6G256, DType::MQ6G256V2),
+        (DType::MQ6G256V2, DType::MQ4G256),
+        (DType::MQ4G256V2, DType::MQ6G256V2),
+    ] {
+        let mut d = dtypes_all_mq4();
+        d.routed_gate_up = gu;
+        d.routed_down = dn;
+        d.experts_all_gate_up_mq4 = false;
+        let r = MoeResolution::resolve(&d, 8);
+        assert!(!r.routed_indexable_mq6v2, "{gu:?}/{dn:?}");
+        assert!(!r.routed_indexable_mq6, "{gu:?}/{dn:?}");
+        assert!(
+            !r.use_gpu_topk,
+            "{gu:?}/{dn:?} must fall back, not guess a layout"
+        );
+    }
+}
+
+#[test]
+fn moe_res_mq6v2_k_ne_8_disables_gpu_topk() {
+    let mut d = dtypes_all_mq4();
+    d.routed_gate_up = DType::MQ6G256V2;
+    d.routed_down = DType::MQ6G256V2;
+    d.experts_all_gate_up_mq4 = false;
+    let r = MoeResolution::resolve(&d, 6);
+    assert!(r.routed_indexable_mq6v2);
+    assert!(!r.use_gpu_topk);
+}
+
+/// Exact mixed V1/V2 gate precedence: whenever gate_up exact dtype varies,
+/// the mixed gate kernel runs before any representative MQ4V2/MQ6V2/V1 arm.
+/// Uniform shortcut is allowed only when every gate_up DType is equal.
+#[test]
+fn mixed_v1_v2_gate_precedence_requires_exact_variation() {
+    // No table / all-equal table ⇒ no variation ⇒ uniform shortcut.
+    assert!(!gate_up_varies(None));
+    assert!(!gate_up_varies(Some(&[])));
+    assert!(!gate_up_varies(Some(&[DType::MQ4G256V2, DType::MQ4G256V2])));
+    assert!(!gate_up_varies(Some(&[DType::MQ6G256V2; 4])));
+
+    // Exact DType inequality (V1 vs V2, or V2 vs V2 sibling) ⇒ varies.
+    // Family-level sameness (both "MQ4") is NOT enough — headers differ.
+    assert!(gate_up_varies(Some(&[DType::MQ4G256, DType::MQ4G256V2])));
+    assert!(gate_up_varies(Some(&[DType::MQ4G256V2, DType::MQ6G256V2])));
+    assert!(gate_up_varies(Some(&[
+        DType::MQ4G256V2,
+        DType::MQ4G256V2,
+        DType::MQ4G256,
+    ])));
+
+    // Mixed gate fires only when tags exist AND gate_up varies.
+    assert!(decode_gate_uses_mixed(true, true));
+    assert!(
+        !decode_gate_uses_mixed(true, false),
+        "tags alone must not force mixed when every gate_up DType is equal"
+    );
+    assert!(
+        !decode_gate_uses_mixed(false, true),
+        "variation without a tag table has no mixed kernel to dispatch"
+    );
+    assert!(!decode_gate_uses_mixed(false, false));
+
+    // Path1 tag-aware kinds: mixed precedes representative V1/V2 arms.
+    assert_eq!(
+        prefill_path1_gate_up_kind_tag_aware(DType::MQ4G256V2, true, true),
+        Some("mixed"),
+        "varying gate_up + tags ⇒ mixed, not mq4v2 representative"
+    );
+    assert_eq!(
+        prefill_path1_gate_up_kind_tag_aware(DType::MQ6G256V2, true, true),
+        Some("mixed"),
+        "varying gate_up + tags ⇒ mixed, not mq6v2 representative"
+    );
+    assert_eq!(
+        prefill_path1_gate_up_kind_tag_aware(DType::MQ4G256, true, true),
+        Some("mixed"),
+        "varying gate_up + tags ⇒ mixed, not hfq4 representative"
+    );
+    // Uniform shortcut only with exact equality (no variation).
+    assert_eq!(
+        prefill_path1_gate_up_kind_tag_aware(DType::MQ4G256V2, true, false),
+        Some("mq4v2"),
+        "tags + uniform gate_up may take the V2 uniform arm"
+    );
+    assert_eq!(
+        prefill_path1_gate_up_kind_tag_aware(DType::MQ6G256V2, false, false),
+        Some("mq6v2")
+    );
+    // Path1 down: any tag table forces the mixed down launcher — never a
+    // representative V1/V2 dispatch of a tagged layer.
+    assert_eq!(
+        prefill_path1_down_kind_tag_aware(DType::MQ4G256V2, true),
+        Some("mixed")
+    );
+    assert_eq!(
+        prefill_path1_down_kind_tag_aware(DType::MQ6G256V2, true),
+        Some("mixed")
+    );
+    assert_eq!(
+        prefill_path1_down_kind_tag_aware(DType::MQ6G256V2, false),
+        Some("mq6v2")
+    );
+}
+
+/// V2 D3 restriction: only HFQ4/MQ4V1 may call `gemv_hfq4g256_moe_ninepath_d3`.
+/// V2 uniform pairs use exact native indexed gate + V2 D4 — never the HFQ4 D3
+/// gate (dual-half header is silent fluent corruption on the same stride).
+#[test]
+fn ninepath_d3_restricts_v2_to_native_gate_and_d4() {
+    // Sole admitted D3 pair.
+    assert_eq!(
+        ninepath_d3_family(DType::MQ4G256, DType::MQ4G256),
+        Some("hfq4")
+    );
+
+    // V2 uniforms have D4 families but NEVER a D3 family.
+    assert_eq!(ninepath_d3_family(DType::MQ4G256V2, DType::MQ4G256V2), None);
+    assert_eq!(ninepath_d3_family(DType::MQ6G256V2, DType::MQ6G256V2), None);
+    assert_eq!(
+        ninepath_d4_family(DType::MQ4G256V2, DType::MQ4G256V2),
+        Some("mq4v2"),
+        "V2 still has its own D4 path"
+    );
+    assert_eq!(
+        ninepath_d4_family(DType::MQ6G256V2, DType::MQ6G256V2),
+        Some("mq6v2"),
+        "V2 still has its own D4 path"
+    );
+
+    // Lloyd D4 pair is not D3 either (D3 is HFQ4-only).
+    assert_eq!(
+        ninepath_d3_family(DType::MQ2G256Lloyd, DType::MQ3G256Lloyd),
+        None
+    );
+
+    // Split V1/V2 pairings share neither D3 nor D4.
+    for (g, dn) in [
+        (DType::MQ4G256V2, DType::MQ4G256),
+        (DType::MQ4G256, DType::MQ4G256V2),
+        (DType::MQ6G256V2, DType::MQ6G256),
+        (DType::MQ4G256V2, DType::MQ6G256V2),
+    ] {
+        assert_eq!(ninepath_d3_family(g, dn), None, "{g:?}/{dn:?}");
+        assert_eq!(ninepath_d4_family(g, dn), None, "{g:?}/{dn:?}");
+    }
+}
+
 // ── op-list interpreter: match_prefix (pure logic) ──────────────────────────
 
 use crate::families::gemv::WeightRef;
@@ -1315,8 +1730,9 @@ fn match_prefix_guard_receives_correct_window() {
 
 use crate::pipeline::steps::{
     guard_gate_up_hfq4g256, guard_gate_up_hfq6g256, guard_gate_up_mq3g256lloyd,
-    guard_gate_up_mq4g256lloyd, guard_qkv_hfq4g256, guard_qkv_hfq6g256, guard_qkv_mq3g256lloyd,
-    guard_qkv_mq4g256lloyd,
+    guard_gate_up_mq4g256lloyd, guard_gate_up_mq4g256v2, guard_qkv_hfq4g256, guard_qkv_hfq6g256,
+    guard_qkv_mq3g256lloyd, guard_qkv_mq4g256lloyd, guard_qkv_mq4g256v2, guard_qkvza_mq4g256v2,
+    match_fused_prefix,
 };
 
 fn make_qkv3_steps<'a>(
@@ -1577,6 +1993,186 @@ fn guard_gate_up_mq4g256lloyd_fires() {
     };
     let steps = make_gate_up2_steps(&dummy, &wr, RotationPlan::FwhtG256);
     assert!(guard_gate_up_mq4g256lloyd(&steps, &ctx_rdna3()));
+}
+
+#[test]
+fn match_fused_prefix_admits_exact_mq4g256v2_qkv() {
+    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let wr = WeightRef {
+        buf: &dummy,
+        dtype: DType::MQ4G256V2,
+        m: 4096,
+        k: 4096,
+        row_stride: 0,
+        rotation: None,
+        awq_scale: None,
+    };
+    let steps = make_qkv3_steps(&dummy, &wr, RotationPlan::FwhtG256);
+    assert!(guard_qkv_mq4g256v2(&steps, &ctx_rdna3()));
+    assert_eq!(
+        match_fused_prefix(&steps, &ctx_rdna3()),
+        Some((KernelKey::FusedQkvMq4G256V2, 4))
+    );
+}
+
+#[test]
+fn match_fused_prefix_admits_exact_mq4g256v2_qkvza() {
+    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let wr = WeightRef {
+        buf: &dummy,
+        dtype: DType::MQ4G256V2,
+        m: 4096,
+        k: 4096,
+        row_stride: 0,
+        rotation: None,
+        awq_scale: None,
+    };
+    // QKVZA = QKV3 window + one extra Gemv (reuse builder, no new abstraction).
+    let mut steps = make_qkv3_steps(&dummy, &wr, RotationPlan::FwhtG256);
+    steps.push(Step::Gemv {
+        w: &wr,
+        input: GemvInput::Prerotated(&dummy),
+        out: &dummy,
+    });
+    assert!(guard_qkvza_mq4g256v2(&steps, &ctx_rdna3()));
+    assert_eq!(
+        match_fused_prefix(&steps, &ctx_rdna3()),
+        Some((KernelKey::FusedQkvzaMq4G256V2, 5))
+    );
+}
+
+#[test]
+fn match_fused_prefix_admits_exact_mq4g256v2_gate_up() {
+    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let wr = WeightRef {
+        buf: &dummy,
+        dtype: DType::MQ4G256V2,
+        m: 4096,
+        k: 4096,
+        row_stride: 0,
+        rotation: None,
+        awq_scale: None,
+    };
+    let steps = make_gate_up2_steps(&dummy, &wr, RotationPlan::FwhtG256);
+    assert!(guard_gate_up_mq4g256v2(&steps, &ctx_rdna3()));
+    assert_eq!(
+        match_fused_prefix(&steps, &ctx_rdna3()),
+        Some((KernelKey::FusedGateUpMq4G256V2, 3))
+    );
+}
+
+#[test]
+fn match_fused_prefix_rejects_mixed_v1_v2_mq4_window() {
+    // Mixed V1/V2 must not admit any exact V2 fused key (clean exact-dtype only).
+    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let wr_v2 = WeightRef {
+        buf: &dummy,
+        dtype: DType::MQ4G256V2,
+        m: 4096,
+        k: 4096,
+        row_stride: 0,
+        rotation: None,
+        awq_scale: None,
+    };
+    let wr_v1 = WeightRef {
+        buf: &dummy,
+        dtype: DType::MQ4G256,
+        m: 4096,
+        k: 4096,
+        row_stride: 0,
+        rotation: None,
+        awq_scale: None,
+    };
+    let steps = vec![
+        Step::RmsnormAutomatic {
+            x: &dummy,
+            norm_weight: &dummy,
+            x_plain: &dummy,
+            out: &dummy,
+            awq_scale: None,
+            k: 4096,
+            eps: 1e-6,
+            rotation: RotationPlan::FwhtG256,
+        },
+        Step::Gemv {
+            w: &wr_v2,
+            input: GemvInput::Prerotated(&dummy),
+            out: &dummy,
+        },
+        Step::Gemv {
+            w: &wr_v1,
+            input: GemvInput::Prerotated(&dummy),
+            out: &dummy,
+        },
+        Step::Gemv {
+            w: &wr_v2,
+            input: GemvInput::Prerotated(&dummy),
+            out: &dummy,
+        },
+    ];
+    assert!(!guard_qkv_mq4g256v2(&steps, &ctx_rdna3()));
+    let got = match_fused_prefix(&steps, &ctx_rdna3());
+    assert!(
+        !matches!(
+            got,
+            Some((
+                KernelKey::FusedQkvMq4G256V2
+                    | KernelKey::FusedQkvzaMq4G256V2
+                    | KernelKey::FusedGateUpMq4G256V2,
+                _
+            ))
+        ),
+        "mixed V1/V2 must not admit V2 fused key, got {got:?}"
+    );
+}
+
+#[test]
+fn match_fused_prefix_rejects_mq4g256v2_on_unsupported_arch() {
+    // Exact V2 windows must not admit scalar V2 fusion off gfx1100/gfx1201.
+    // gfx1200 is a near-miss RDNA4 sibling — still fail-closed.
+    let dummy = rdna_compute::GpuTensor::null_for_test();
+    let wr = WeightRef {
+        buf: &dummy,
+        dtype: DType::MQ4G256V2,
+        m: 4096,
+        k: 4096,
+        row_stride: 0,
+        rotation: None,
+        awq_scale: None,
+    };
+    let ctx = ctx_rdna4(); // gfx1200 — not gfx1201
+    let qkv = make_qkv3_steps(&dummy, &wr, RotationPlan::FwhtG256);
+    assert!(!guard_qkv_mq4g256v2(&qkv, &ctx));
+    assert!(
+        !matches!(
+            match_fused_prefix(&qkv, &ctx),
+            Some((KernelKey::FusedQkvMq4G256V2, _))
+        ),
+        "unsupported arch must not admit FusedQkvMq4G256V2"
+    );
+    let mut qkvza = make_qkv3_steps(&dummy, &wr, RotationPlan::FwhtG256);
+    qkvza.push(Step::Gemv {
+        w: &wr,
+        input: GemvInput::Prerotated(&dummy),
+        out: &dummy,
+    });
+    assert!(!guard_qkvza_mq4g256v2(&qkvza, &ctx));
+    assert!(
+        !matches!(
+            match_fused_prefix(&qkvza, &ctx),
+            Some((KernelKey::FusedQkvzaMq4G256V2, _))
+        ),
+        "unsupported arch must not admit FusedQkvzaMq4G256V2"
+    );
+    let gate_up = make_gate_up2_steps(&dummy, &wr, RotationPlan::FwhtG256);
+    assert!(!guard_gate_up_mq4g256v2(&gate_up, &ctx));
+    assert!(
+        !matches!(
+            match_fused_prefix(&gate_up, &ctx),
+            Some((KernelKey::FusedGateUpMq4G256V2, _))
+        ),
+        "unsupported arch must not admit FusedGateUpMq4G256V2"
+    );
 }
 
 // ── MoePrefillResolution cells (Ship 4.2) ─────────────────────────

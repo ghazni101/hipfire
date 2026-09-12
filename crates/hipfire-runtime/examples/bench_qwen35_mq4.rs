@@ -137,7 +137,7 @@ fn main() {
 
     let kv_seq = (prefill_len + warmup_len + gen_len + 16).max(512);
     // KV cache mode via resolved TOML policy:
-    //   q8 (default) | asym4 | asym3 | asym2
+    //   q8 (default) | asym4 | asym3 | fwht3 | asym2
     let kv_mode = match hipfire_runtime::config::get().kv_mode.as_str() {
         "auto" => "q8".to_string(),
         mode => mode.to_string(),
@@ -168,6 +168,14 @@ fn main() {
             kv_seq,
         )
         .unwrap(),
+        "fwht3" => KvCache::new_gpu_fwht3_filtered(
+            &mut gpu,
+            &vec![true; config.n_layers],
+            config.n_kv_heads,
+            config.head_dim,
+            kv_seq,
+        )
+        .unwrap(),
         "asym2" | "turbo2" => KvCache::new_gpu_asym2(
             &mut gpu,
             config.n_layers,
@@ -176,7 +184,7 @@ fn main() {
             kv_seq,
         )
         .unwrap(),
-        other => panic!("unknown HIPFIRE_KV_MODE: {other}  (use q8|asym4|asym3|asym2)"),
+        other => panic!("unknown HIPFIRE_KV_MODE: {other}  (use q8|asym4|asym3|fwht3|asym2)"),
     };
     let mut dn_state = DeltaNetState::new(&mut gpu, &config).unwrap();
     let scratch = Qwen35Scratch::new_with_kv_max(&mut gpu, &config, 128, kv_seq).unwrap();
@@ -250,6 +258,14 @@ fn main() {
             "asym3" | "turbo3" | "turbo" => KvCache::new_gpu_asym3(
                 &mut gpu,
                 config.n_layers,
+                config.n_kv_heads,
+                config.head_dim,
+                kv_seq,
+            )
+            .unwrap(),
+            "fwht3" => KvCache::new_gpu_fwht3_filtered(
+                &mut gpu,
+                &vec![true; config.n_layers],
                 config.n_kv_heads,
                 config.head_dim,
                 kv_seq,
@@ -426,6 +442,14 @@ fn main() {
                     "asym3" | "turbo3" | "turbo" => KvCache::new_gpu_asym3(
                         &mut gpu,
                         config.n_layers,
+                        config.n_kv_heads,
+                        config.head_dim,
+                        kv_seq,
+                    )
+                    .unwrap(),
+                    "fwht3" => KvCache::new_gpu_fwht3_filtered(
+                        &mut gpu,
+                        &vec![true; config.n_layers],
                         config.n_kv_heads,
                         config.head_dim,
                         kv_seq,
@@ -676,6 +700,7 @@ fn main() {
     // Read logits to get a valid next token
     let logits = gpu.download_f32(&scratch.logits).unwrap();
     let mut next_token = llama::argmax(&logits);
+    eprintln!("PREFILL_NEXT_TOKEN  token_id={next_token}");
 
     // === WARMUP ===
     eprintln!("\n=== warmup ({warmup_len} tokens — untimed, lets JIT settle) ===");

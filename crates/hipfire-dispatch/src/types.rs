@@ -129,6 +129,14 @@ pub fn dtype_rotation_plan(dtype: DType) -> RotationPlan {
         MQ4G128 => RotationPlan::FwhtG128,
         MQ8G256 => RotationPlan::Mq8Internal,
         ParoQ4G128 => RotationPlan::Givens,
+        // MQ2G256LloydU is the UNROTATED Lloyd sibling: its weights are encoded
+        // in the natural basis, so x must NOT be rotated. Stated explicitly
+        // rather than left to the `_` fallthrough below — by the same argument
+        // as the comment above, a dtype that lands on `None` by accident rather
+        // than by intent is precisely the silent-garbage failure mode, and
+        // whoever adds the next Lloyd variant should be forced to decide which
+        // side of this line it belongs on.
+        MQ2G256LloydU => RotationPlan::None,
         _ => RotationPlan::None,
     }
 }
@@ -694,6 +702,10 @@ impl KernelKey {
             (MQ6G256, Plain) => Ok(Self::GemvMq6G256),
             (MQ8G256, Plain) => Ok(Self::GemvMq8G256),
             (MQ2G256Lloyd, Plain) => Ok(Self::GemvMq2G256Lloyd),
+            // Byte-identical layout, so the same kernel decodes it. The
+            // difference is only which basis x arrives in, which is the
+            // caller's business (RotationPlan::None for this dtype).
+            (MQ2G256LloydU, Plain) => Ok(Self::GemvMq2G256Lloyd),
             (MQ3G256Lloyd, Plain) => Ok(Self::GemvMq3G256Lloyd),
             (MQ4G256Lloyd, Plain) => Ok(Self::GemvMq4G256Lloyd),
             (MFP4G32, Plain) => Ok(Self::GemvMfp4G32),
@@ -865,7 +877,9 @@ impl KernelKey {
             MQ3G256 => ArchPredicate::HasWave32,
             MQ5G256 => ArchPredicate::HasMmq,
             MQ6G256 | HFQ6G256 => ArchPredicate::HasMmq,
-            MQ2G256Lloyd | MQ3G256Lloyd | MQ4G256Lloyd => ArchPredicate::HasWave32,
+            // MQ2G256LloydU shares MQ2G256Lloyd's kernels byte-for-byte, so it
+            // inherits the identical arch gating.
+            MQ2G256Lloyd | MQ2G256LloydU | MQ3G256Lloyd | MQ4G256Lloyd => ArchPredicate::HasWave32,
             MQ2G256GL | MQ3G256GL | MQ4G256V2 | MQ2G256V2 | MQ3G256V2 | MQ5G256V2 | MQ6G256V2 | MQ4CG256 => ArchPredicate::HasWave32,
             Q8HFQ | Raw => ArchPredicate::Always,
         }

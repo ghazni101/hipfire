@@ -7,7 +7,6 @@
 //! Per-architecture generation bodies lifted verbatim from `crates/hipfire-daemon/src/main.rs`
 //! (wave 5 / D3). See `lib.rs` for layering rationale.
 
-use std::any::Any;
 use base64::Engine;
 use hipfire_arch_dots_ocr::dots_ocr;
 use hipfire_arch_qwen2::qwen2;
@@ -15,15 +14,21 @@ use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::speculative;
 use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl;
-use hipfire_engine::emit::{emit_active_attempt_error, emit_qwen_ar_cancelled, write_error};
+use hipfire_engine::emit::{
+    emit_active_attempt_error, emit_gen_start, emit_qwen_ar_cancelled, emit_reasoning_token,
+    emit_visible_token, write_error,
+};
 use hipfire_engine::scheduler::block_attractor_unclosed_cpu;
 use hipfire_engine::terminal::{
     active_attempt_id, await_client_terminal_commit, check_abort, emit_staged_terminal_done,
     ClientTerminalDecision,
 };
 use hipfire_loader::LoadedModel;
+use hipfire_runtime::emit_text::{ThinkOutputRouter, ThinkRouteEvent};
+use hipfire_runtime::eos_filter::{EosFilter, FilterAction};
 use hipfire_runtime::sampler::{self, SamplerConfig};
 use hipfire_runtime::spec::{PrefillOutcome, Speculator};
+use std::any::Any;
 use std::io::Write;
 use std::path::Path;
 use std::time::Instant;
@@ -52,10 +57,7 @@ fn emit_committed_event(
     pos: usize,
     t_ms: u64,
 ) {
-    use std::sync::LazyLock;
-    static ENABLED: LazyLock<bool> =
-        LazyLock::new(|| std::env::var("HIPFIRE_EMIT_TOKEN_IDS").ok().as_deref() == Some("1"));
-    if !*ENABLED {
+    if !hipfire_config::developer_bool("HIPFIRE_EMIT_TOKEN_IDS", false) {
         return;
     }
     // Build through `serde_json::json!` for the same reason
@@ -73,6 +75,79 @@ fn emit_committed_event(
     let _ = writeln!(stdout, "{}", envelope);
 }
 
+/// Feed one decode-step's new bytes through the v2 typed emission contract:
+/// EosFilter (UTF-8 boundary + EOT marker suppression) → ThinkOutputRouter
+/// (think-channel split) → `token` / `reasoning` envelopes.
+///
+/// Arch 5/6 advertises `gen_start.contract_version = 2`, under which the CLI
+/// appends token text to `content` VERBATIM — no marker scan (complete.rs
+/// SemanticEventFold). The producer therefore owns think-splitting and marker
+/// suppression; before this helper the VL loop emitted every decoded byte as
+/// a bare token envelope, so image turns shipped the whole think block plus
+/// literal `</think>` / `<|im_end|>` markers inside `content` with zero
+/// `reasoning_content` (2026-08-27 ledger, post-thinking garble).
+///
+/// Mirrors `ar::qwen_ar_observe_and_route` minus the ToolOutputRouter: VL
+/// image turns carry no tool contract, so reserved-looking text stays visible
+/// instead of being buffered or failing closed.
+fn vl_route_decode_text(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    filter: &mut EosFilter,
+    think: &mut ThinkOutputRouter,
+    new_bytes: &[u8],
+) -> bool {
+    let (bytes, is_stop) = match filter.observe(new_bytes) {
+        FilterAction::Emit(b) => (b, false),
+        FilterAction::EmitAndStop(b) => (b, true),
+        FilterAction::Hold => return false,
+        FilterAction::Stop => return true,
+    };
+    if let Ok(text) = std::str::from_utf8(&bytes) {
+        if !text.is_empty() {
+            let mut routed = Vec::new();
+            think.push_into(text, &mut routed);
+            for ev in routed {
+                match ev {
+                    ThinkRouteEvent::Reasoning(t) => emit_reasoning_token(stdout, id, &t),
+                    ThinkRouteEvent::Content(t) => emit_visible_token(stdout, id, &t),
+                }
+            }
+        }
+    }
+    is_stop
+}
+
+fn vl_finish_think_routing(
+    stdout: &mut impl std::io::Write,
+    id: &str,
+    filter: &mut EosFilter,
+    think: &mut ThinkOutputRouter,
+) {
+    let pending = filter.flush_pending();
+    if !pending.is_empty() {
+        if let Ok(text) = std::str::from_utf8(&pending) {
+            if !text.is_empty() {
+                let mut routed = Vec::new();
+                think.push_into(text, &mut routed);
+                for ev in routed {
+                    match ev {
+                        ThinkRouteEvent::Reasoning(t) => emit_reasoning_token(stdout, id, &t),
+                        ThinkRouteEvent::Content(t) => emit_visible_token(stdout, id, &t),
+                    }
+                }
+            }
+        }
+    }
+    let mut routed = Vec::new();
+    think.finish_into(&mut routed);
+    for ev in routed {
+        match ev {
+            ThinkRouteEvent::Reasoning(t) => emit_reasoning_token(stdout, id, &t),
+            ThinkRouteEvent::Content(t) => emit_visible_token(stdout, id, &t),
+        }
+    }
+}
 
 pub enum ImageSource<'a> {
     Path(&'a str),
@@ -91,6 +166,8 @@ pub struct GenerateVLParams<'a> {
     pub repeat_window: usize,
     pub max_think_tokens: usize,
     pub assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    /// Per-request sampler seed (see `hipfire_engine::request_seed_for`).
+    pub seed: u32,
 }
 
 pub fn vl_no_eviction_kv_cap(physical_cap: usize, max_seq: usize, adaptive_engaged: bool) -> usize {
@@ -318,12 +395,26 @@ pub fn generate_vl(
     stdout: &mut std::io::Stdout,
     params: &GenerateVLParams,
 ) {
-    // hunt3 M-E: seed the process-global CPU sampler RNG with this request's
-    // fixed seed. The VL path samples exclusively via sampler::sample_cpu, which
-    // draws from this global; without the per-request reset it carried RNG state
-    // across requests (and across earlier text-path requests) → cross-request
-    // nondeterminism. Matches the GPU path's u32 (0x13579BDF).
-    hipfire_runtime::llama::reset_cpu_sampler_rng(0x13579BDF);
+    // Stream-contract opener. MUST be the first event on this request's
+    // stream: the HTTP CLI's StreamContractGate rejects any later event that
+    // arrives without a preceding gen_start for this id — which stranded
+    // image turns after the encoder finished ("no response bytes", wedged
+    // slot; 2026-08-27 ledger finding b). Text-path generate() has emitted
+    // this since the e99583afa-class fixes.
+    let gen_contract = crate::common::gen_start_contract_version_for_arch(m.arch_id);
+    // started_in_think mirrors the ChatFrame builder's own conditions: the
+    // `<think>` opener lands in the prompt only for AssistantPrefix::OpenThink
+    // AND a tokenizer that carries the special token (the builder falls back
+    // to Plain otherwise). v2 consumers ignore the field, but the envelope
+    // stays honest for any contract that consults it.
+    let started_in_think = matches!(
+        params.assistant_prefix,
+        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+    ) && m
+        .tokenizer
+        .as_ref()
+        .is_some_and(|t| t.special_token_id("<think>").is_some());
+    emit_gen_start(stdout, params.id, started_in_think, gen_contract);
     // INVARIANT: all early returns before the `vision_forward` call (the
     // first expensive GPU allocation in this function) use `write_error`
     // and return without owning any GPU buffers. If you add a GPU
@@ -342,7 +433,15 @@ pub fn generate_vl(
         repeat_window,
         max_think_tokens,
         assistant_prefix,
+        seed,
     } = *params;
+    // hunt3 M-E: seed the process-global CPU sampler RNG per request. The VL
+    // path samples exclusively via sampler::sample_cpu, which draws from this
+    // global; without the per-request reset it carried RNG state across
+    // requests (and across earlier text-path requests) → cross-request
+    // nondeterminism. Seeded by hipfire-engine::request_seed_for (wire `seed`
+    // wins, else attempt key + counter), matching the sequential text path.
+    hipfire_runtime::llama::reset_cpu_sampler_rng(seed);
     // Adaptive KV poison is sticky until unload/reload. Refuse VL generation so a
     // partial tier transition cannot continue writing into mixed-tier state.
     // Mirror generate() — reset preserves poison, so VL must refuse independently.
@@ -486,11 +585,9 @@ pub fn generate_vl(
         // (ModelState::Qwen35), not the always-None m.dn_state/m.kv_cache.
         // Inlined (disjoint field access) because a `&tokenizer` borrow of `m`
         // is live here.
-        if let Some(b) = m
-            .state
-            .as_mut()
-            .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
-        {
+        if let Some(b) = m.state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+        }) {
             let dn = &b.dn_state;
             for s in &dn.s_matrices {
                 let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
@@ -505,19 +602,15 @@ pub fn generate_vl(
                 let _ = gpu.hip.memset(&s.buf, 0, s.buf.size());
             }
         }
-        if let Some(b) = m
-            .state
-            .as_mut()
-            .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
-        {
+        if let Some(b) = m.state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+        }) {
             b.kv_cache.compact_offset = 0;
         }
         if let Some(ad) = m.kv_adaptive.as_mut() {
-            if let Some(b) = m
-                .state
-                .as_mut()
-                .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
-            {
+            if let Some(b) = m.state.as_mut().and_then(|s| {
+                (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+            }) {
                 ad.reset_with_cache(gpu, &mut b.kv_cache);
             } else {
                 ad.reset();
@@ -538,11 +631,9 @@ pub fn generate_vl(
         return;
     }
 
-    let Some(b) = m
-        .state
-        .as_mut()
-        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>())
-    else {
+    let Some(b) = m.state.as_mut().and_then(|s| {
+        (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
+    }) else {
         unreachable!()
     };
     let config = &b.config;
@@ -698,6 +789,17 @@ pub fn generate_vl(
     // transition errors are request-scoped (no panic, no later token emit).
     let mut visual_idx = 0usize;
     for &token in prompt_tokens.iter() {
+        // Client-cancel poll. The encoder phase before this loop cannot be
+        // interrupted mid-kernel, so prefill's first iteration is where an
+        // abort signalled during vision_forward takes effect. The terminal
+        // MUST be the canonical cancelled pair: falling through to the done
+        // handshake on an aborted attempt strands the serve admission guard
+        // permanently (2026-08-27 ledger finding c — slot wedged ≥3 min on
+        // every mid-encode disconnect before these polls existed).
+        if check_abort(id) {
+            emit_qwen_ar_cancelled(stdout, id, 0);
+            return;
+        }
         if token == image_pad_id && visual_idx < n_visual_tokens {
             let emb = &visual_tokens[visual_idx * config.dim..(visual_idx + 1) * config.dim];
             if let Err(e) = qwen35::forward_scratch_embed_mrope(
@@ -873,6 +975,14 @@ pub fn generate_vl(
     let mut generated = 0;
     let mut streamed_tokens: Vec<u32> = Vec::new();
     let mut emitted_bytes = 0usize;
+    // Typed-emission state for the v2 stream contract (see
+    // `vl_route_decode_text`): EosFilter owns UTF-8 boundaries + EOT marker
+    // suppression, ThinkOutputRouter owns the reasoning/content channel
+    // split. `emitted_bytes` above becomes the bytes-FED-to-filter cursor —
+    // the filter holds back partial UTF-8/marker tails internally, so the
+    // old valid-prefix arithmetic is gone.
+    let mut vl_filter = EosFilter::new(crate::ar::qwen_ar_eos_filter_config());
+    let mut vl_think = ThinkOutputRouter::new(started_in_think);
     // Think-depth tracking via token IDs (not UTF-8 rfind).
     // The previous implementation decoded the full streamed output to a
     // string and ran rfind on every token — O(N²) total, fragile to
@@ -886,7 +996,15 @@ pub fn generate_vl(
     let loop_guard =
         hipfire_runtime::loop_guard::LoopGuard::from_config(hipfire_runtime::config::get());
 
-    while generated < max_tokens {
+    'vl_generate: while generated < max_tokens {
+        // Decode-side client-cancel poll — same canonical-terminal rule as
+        // the prefill poll above; partial per-call state (seq_pos,
+        // conversation_tokens) is reclaimed by the next dispatch's
+        // non-zero-seq_pos reset, matching the dots.ocr cancel path.
+        if check_abort(id) {
+            emit_qwen_ar_cancelled(stdout, id, generated);
+            return;
+        }
         // Commit KV for this sampled token BEFORE any client-visible emit so a
         // lazy VMM map/growth failure cannot stream an uncommitted token.
         // Order: forward → seq_pos++ → evict → downshift → then
@@ -967,23 +1085,10 @@ pub fn generate_vl(
 
         let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
         let new_bytes = &all_bytes[emitted_bytes..];
-        let valid_len = match std::str::from_utf8(new_bytes) {
-            Ok(_) => new_bytes.len(),
-            Err(e) => e.valid_up_to(),
-        };
-        if valid_len > 0 {
-            let text = std::str::from_utf8(&new_bytes[..valid_len]).unwrap();
-            let _ = writeln!(
-                stdout,
-                r#"{{"type":"token","id":"{}","text":{},"attempt_id":{}}}"#,
-                id,
-                serde_json::to_string(&text).unwrap_or_default(),
-                active_attempt_id()
-            );
-            let _ = stdout.flush();
-            emitted_bytes += valid_len;
+        emitted_bytes = all_bytes.len();
+        if vl_route_decode_text(stdout, id, &mut vl_filter, &mut vl_think, new_bytes) {
+            break;
         }
-
         if next_token == config.eos_token {
             break;
         }
@@ -1140,21 +1245,19 @@ pub fn generate_vl(
 
                         let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
                         let new_bytes = &all_bytes[emitted_bytes..];
-                        let vl = match std::str::from_utf8(new_bytes) {
-                            Ok(_) => new_bytes.len(),
-                            Err(e) => e.valid_up_to(),
-                        };
-                        if vl > 0 {
-                            let text = std::str::from_utf8(&new_bytes[..vl]).unwrap();
-                            let _ = writeln!(
-                                stdout,
-                                r#"{{"type":"token","id":"{}","text":{},"attempt_id":{}}}"#,
-                                id,
-                                serde_json::to_string(&text).unwrap_or_default(),
-                                active_attempt_id()
-                            );
-                            let _ = stdout.flush();
-                            emitted_bytes += vl;
+                        emitted_bytes = all_bytes.len();
+                        // Same typed routing as the main decode site: the
+                        // forced `</think>` closer is consumed by the router
+                        // (channel flips to content), never emitted literally.
+                        if vl_route_decode_text(
+                            stdout,
+                            id,
+                            &mut vl_filter,
+                            &mut vl_think,
+                            new_bytes,
+                        ) {
+                            generated += 1;
+                            break 'vl_generate;
                         }
                         generated += 1;
                     }
@@ -1271,6 +1374,13 @@ pub fn generate_vl(
         }
     }
 
+    if check_abort(id) {
+        emit_qwen_ar_cancelled(stdout, id, generated);
+        return;
+    }
+    // Flush any trailing partial think marker as ordinary text in its
+    // current channel (text-AR finish parity) before the terminal.
+    vl_finish_think_routing(stdout, id, &mut vl_filter, &mut vl_think);
     let t_end = Instant::now();
     let total_s = t_end.duration_since(t0).as_secs_f64();
     let prefill_s = t_prefill.duration_since(t0).as_secs_f64();
@@ -1304,7 +1414,9 @@ pub fn generate_vl(
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
         ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
-        ClientTerminalDecision::Abort => {}
+        ClientTerminalDecision::Abort => {
+            emit_qwen_ar_cancelled(stdout, id, generated);
+        }
     }
 }
 
@@ -1315,6 +1427,13 @@ pub fn generate_vl_dots_ocr(
     params: &GenerateVLParams,
 ) {
     use hipfire_arch_dots_ocr::image as dots_image;
+    // Stream-contract opener — same HTTP-gate rationale as generate_vl above.
+    emit_gen_start(
+        stdout,
+        params.id,
+        false,
+        crate::common::gen_start_contract_version_for_arch(m.arch_id),
+    );
     let t0 = Instant::now();
     let GenerateVLParams {
         id,
@@ -1381,14 +1500,13 @@ pub fn generate_vl_dots_ocr(
     let text_cfg = config.text.clone();
     let dim = text_cfg.hidden_size;
     // Weights/state via raw pointers to allow owned config while keeping disjoint borrows.
-    let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle = match m
-        .state
-        .as_mut()
-        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>())
-    {
-        Some(b) => b as *mut _,
-        None => unreachable!(),
-    };
+    let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle =
+        match m.state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>()
+        }) {
+            Some(b) => b as *mut _,
+            None => unreachable!(),
+        };
     let weights = unsafe { &(*bundle_ptr).weights };
     let state = unsafe { &mut (*bundle_ptr).state };
     // 3. Build the prompt (HF-exact framing; imgpad count == n_visual by construction).
@@ -1397,6 +1515,10 @@ pub fn generate_vl_dots_ocr(
         write_error(stdout, id, &format!(
             "dots.ocr request ({} prompt + {} gen) exceeds KV budget ({}); reload with a larger --max-seq",
             prompt_ids.len(), max_tokens, max_seq));
+        return;
+    }
+    if check_abort(id) {
+        emit_qwen_ar_cancelled(stdout, id, 0);
         return;
     }
 
@@ -1416,8 +1538,14 @@ pub fn generate_vl_dots_ocr(
         &patches_gpu,
         img.grid_h,
         img.grid_w,
+        || check_abort(id),
     ) {
-        Ok(t) => t,
+        Ok(Some(t)) => t,
+        Ok(None) => {
+            let _ = gpu.free_tensor(patches_gpu);
+            emit_qwen_ar_cancelled(stdout, id, 0);
+            return;
+        }
         Err(e) => {
             let _ = gpu.free_tensor(patches_gpu);
             write_error(
@@ -1477,6 +1605,11 @@ pub fn generate_vl_dots_ocr(
     let mut visual_idx = 0usize;
     let mut embed_err: Option<String> = None;
     for (pos, &token) in prompt_ids.iter().enumerate() {
+        if check_abort(id) {
+            let _ = gpu.free_tensor(emb_scratch);
+            emit_qwen_ar_cancelled(stdout, id, 0);
+            return;
+        }
         if token == dots_ocr::IMGPAD_ID {
             embeds[pos * dim..(pos + 1) * dim]
                 .copy_from_slice(&merged[visual_idx * dim..(visual_idx + 1) * dim]);
@@ -1510,6 +1643,10 @@ pub fn generate_vl_dots_ocr(
         }
     }
     let _ = gpu.free_tensor(emb_scratch);
+    if check_abort(id) {
+        emit_qwen_ar_cancelled(stdout, id, 0);
+        return;
+    }
     if let Some(e) = embed_err {
         write_error(
             stdout,
@@ -1526,6 +1663,10 @@ pub fn generate_vl_dots_ocr(
             id,
             &format!("dots.ocr batched prefill failed: {e:?}"),
         );
+        return;
+    }
+    if check_abort(id) {
+        emit_qwen_ar_cancelled(stdout, id, 0);
         return;
     }
     let prefill_tokens = prompt_ids.len();
@@ -1557,14 +1698,13 @@ pub fn generate_vl_dots_ocr(
     let tokenizer = m.tokenizer.as_ref().unwrap();
     let config = m.dots_ocr().unwrap().config.clone();
     let text_cfg = config.text.clone();
-    let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle = match m
-        .state
-        .as_mut()
-        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>())
-    {
-        Some(b) => b as *mut _,
-        None => unreachable!(),
-    };
+    let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle =
+        match m.state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>()
+        }) {
+            Some(b) => b as *mut _,
+            None => unreachable!(),
+        };
     let weights = unsafe { &(*bundle_ptr).weights };
     let state = unsafe { &mut (*bundle_ptr).state };
     // Greedy decode, streaming in the daemon JSONL protocol.
@@ -1591,6 +1731,10 @@ pub fn generate_vl_dots_ocr(
     // straight to EOS without a guard; see DotsOcr::loop_guard_overrides.
 
     while generated < max_tokens {
+        if check_abort(id) {
+            emit_qwen_ar_cancelled(stdout, id, generated);
+            return;
+        }
         if eos_set.contains(&next) {
             break;
         }
@@ -1627,6 +1771,11 @@ pub fn generate_vl_dots_ocr(
         }
     }
 
+    if check_abort(id) {
+        emit_qwen_ar_cancelled(stdout, id, generated);
+        return;
+    }
+
     let decode_s = t_gen.elapsed().as_secs_f64();
     let total_s = t0.elapsed().as_secs_f64();
     let tok_s = if total_s > 0.0 {
@@ -1658,7 +1807,9 @@ pub fn generate_vl_dots_ocr(
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {
         ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
-        ClientTerminalDecision::Abort => {}
+        ClientTerminalDecision::Abort => {
+            emit_qwen_ar_cancelled(stdout, id, generated);
+        }
     }
 }
 
@@ -1674,8 +1825,10 @@ pub fn decode_vl_dots_ocr_ngram(
     prefill_s: f64,
 ) {
     use hipfire_arch_dots_ocr::DotsOcrBundle;
-        // Move the live decoder state into a SpecTarget bundle; restored on return.
-    let mut bundle = * (m.state.take().unwrap() as Box<dyn std::any::Any>).downcast::<DotsOcrBundle>().unwrap();
+    // Move the live decoder state into a SpecTarget bundle; restored on return.
+    let mut bundle = *(m.state.take().unwrap() as Box<dyn std::any::Any>)
+        .downcast::<DotsOcrBundle>()
+        .unwrap();
     let mut spec = m.speculator.take().unwrap();
     // `m.tokenizer` is a disjoint field → coexists with the takes above and the
     // restore below; the loop never touches `m`.
@@ -1801,10 +1954,14 @@ pub fn run_dots_ocr_ngram_loop(
         if generated >= max_tokens {
             break;
         }
-        // Decode-side cancel: stop early. The next request resets state at
-        // prefill, so no cross-request bleed; the caller restores bundle/spec.
+        // Decode-side cancel: emit the canonical cancelled pair and stop —
+        // falling through to the done handshake on an aborted attempt strands
+        // the serve admission guard (2026-08-27 ledger finding-c class; same
+        // rule as the prefill-cancel site above). The caller restores
+        // bundle/spec state on return; the next request resets at prefill.
         if check_abort(id) {
-            break;
+            emit_qwen_ar_cancelled(stdout, id, generated);
+            return;
         }
         // Context-overflow guard (matches generate_spec): one window writes up
         // to `block_size` KV slots.
@@ -1896,14 +2053,13 @@ pub fn generate_dots_ocr_text(
     let text_cfg = config.text.clone();
     let dim = text_cfg.hidden_size;
     // Weights/state via raw pointers to allow owned config while keeping disjoint borrows.
-    let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle = match m
-        .state
-        .as_mut()
-        .and_then(|s| (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>())
-    {
-        Some(b) => b as *mut _,
-        None => unreachable!(),
-    };
+    let bundle_ptr: *mut hipfire_arch_dots_ocr::DotsOcrBundle =
+        match m.state.as_mut().and_then(|s| {
+            (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_dots_ocr::DotsOcrBundle>()
+        }) {
+            Some(b) => b as *mut _,
+            None => unreachable!(),
+        };
     let weights = unsafe { &(*bundle_ptr).weights };
     let state = unsafe { &mut (*bundle_ptr).state };
     // Tokenize the text prompt directly (no image tokens).
@@ -2065,3 +2221,719 @@ pub fn generate_dots_ocr_text(
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{vl_finish_think_routing, vl_route_decode_text};
+    use hipfire_runtime::emit_text::ThinkOutputRouter;
+    use hipfire_runtime::eos_filter::EosFilter;
+
+    /// Drive byte chunks through the VL typed-emission pipeline and collect
+    /// (channel, text) wire events parsed back from the JSONL lines.
+    fn drive(started_in_think: bool, chunks: &[&[u8]]) -> Vec<(String, String)> {
+        let mut filter = EosFilter::new(crate::ar::qwen_ar_eos_filter_config());
+        let mut think = ThinkOutputRouter::new(started_in_think);
+        let mut out = Vec::new();
+        for chunk in chunks {
+            let _ = vl_route_decode_text(&mut out, "t-id", &mut filter, &mut think, chunk);
+        }
+        vl_finish_think_routing(&mut out, "t-id", &mut filter, &mut think);
+        let out = String::from_utf8_lossy(&out);
+        out.lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .map(|v| {
+                (
+                    v.get("type")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    v.get("text")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                )
+            })
+            .collect()
+    }
+
+    fn joined(events: &[(String, String)], channel: &str) -> String {
+        events
+            .iter()
+            .filter(|(t, _)| t == channel)
+            .map(|(_, s)| s.as_str())
+            .collect()
+    }
+
+    #[test]
+    fn thinking_turn_splits_reasoning_from_content() {
+        // OpenThink prefix: generation starts inside think (no opener in the
+        // generated bytes); closer flips to content; trailing EOT suppressed.
+        let events = drive(
+            true,
+            &[
+                b"The user wants a description.\n\n",
+                b"</think>\n\n",
+                b"A Shiba Inu dog naps on its back.",
+                b"<|im_end|>",
+            ],
+        );
+        assert_eq!(
+            joined(&events, "reasoning"),
+            "The user wants a description.\n\n"
+        );
+        assert_eq!(
+            joined(&events, "token"),
+            "A Shiba Inu dog naps on its back."
+        );
+        let all = events.iter().map(|(_, s)| s.clone()).collect::<String>();
+        assert!(!all.contains("</think>"), "closer leaked: {all:?}");
+        assert!(!all.contains("<|im_end|>"), "EOT leaked: {all:?}");
+    }
+
+    #[test]
+    fn marker_split_across_chunks_still_routes() {
+        // `</thi` + `nk>` arriving as separate decode deltas (token boundary)
+        // must not leak a partial marker as visible text.
+        let events = drive(true, &[b"plan</thi", b"nk>\nanswer", b"<|im_end|>"]);
+        assert_eq!(joined(&events, "reasoning"), "plan");
+        assert_eq!(joined(&events, "token"), "answer");
+    }
+
+    #[test]
+    fn plain_prefix_spontaneous_think_markers_route() {
+        // assistant_prefix=Plain and the model opens think itself.
+        let events = drive(
+            false,
+            &[
+                b"<think>private</think>",
+                b"\n\nvisible answer",
+                b"<|im_end|>",
+            ],
+        );
+        assert_eq!(joined(&events, "reasoning"), "private");
+        assert_eq!(joined(&events, "token"), "visible answer");
+    }
+
+    #[test]
+    fn no_think_turn_is_pure_content() {
+        let events = drive(false, &[b"Pointy teeths wow.", b"<|im_end|>"]);
+        assert!(joined(&events, "reasoning").is_empty());
+        assert_eq!(joined(&events, "token"), "Pointy teeths wow.");
+    }
+
+    #[test]
+    fn hostile_request_id_stays_json_escaped() {
+        // The old hand-rolled envelope spliced `id` into the JSON unescaped;
+        // the typed emitters must survive a quote-bearing id.
+        let mut filter = EosFilter::new(crate::ar::qwen_ar_eos_filter_config());
+        let mut think = ThinkOutputRouter::new(false);
+        let mut out = Vec::new();
+        let _ = vl_route_decode_text(&mut out, "bad\"id\\", &mut filter, &mut think, b"text");
+        vl_finish_think_routing(&mut out, "bad\"id\\", &mut filter, &mut think);
+        let out = String::from_utf8_lossy(&out);
+        for line in out.lines() {
+            assert!(
+                serde_json::from_str::<serde_json::Value>(line).is_ok(),
+                "{line}"
+            );
+        }
+    }
+
+    #[test]
+    fn ordinary_emit_returns_false() {
+        let mut filter = EosFilter::new(crate::ar::qwen_ar_eos_filter_config());
+        let mut think = ThinkOutputRouter::new(false);
+        let mut out = Vec::new();
+        let stopped = vl_route_decode_text(&mut out, "t-id", &mut filter, &mut think, b"hello");
+        assert!(!stopped, "ordinary emit should return false");
+        vl_finish_think_routing(&mut out, "t-id", &mut filter, &mut think);
+        let out_s = String::from_utf8_lossy(&out);
+        assert!(out_s.contains("hello"), "payload should emit: {out_s:?}");
+    }
+
+    #[test]
+    fn stop_marker_returns_true_and_emits_preceding_text_without_leakage() {
+        let mut filter = EosFilter::new(crate::ar::qwen_ar_eos_filter_config());
+        let mut think = ThinkOutputRouter::new(false);
+        let mut out = Vec::new();
+        let payload = b"visible answer<|im_end|>";
+        let stopped = vl_route_decode_text(&mut out, "t-id", &mut filter, &mut think, payload);
+        assert!(stopped, "EOT marker should signal stop");
+        vl_finish_think_routing(&mut out, "t-id", &mut filter, &mut think);
+        let out_s = String::from_utf8_lossy(&out);
+        assert!(
+            out_s.contains("visible answer"),
+            "preceding text should emit: {out_s:?}"
+        );
+        assert!(
+            !out_s.contains("<|im_end|>"),
+            "marker must not leak: {out_s:?}"
+        );
+    }
+
+    #[test]
+    fn trailing_held_prefix_flushed_at_finish() {
+        // ` <` is a partial prefix of `<|im_end|>`; EosFilter holds it mid-stream
+        // and only at finish should it be treated as ordinary prose and routed
+        // through ThinkOutputRouter.
+        let mut filter = EosFilter::new(crate::ar::qwen_ar_eos_filter_config());
+        let mut think = ThinkOutputRouter::new(false);
+        let mut out = Vec::new();
+        let stopped = vl_route_decode_text(&mut out, "t-id", &mut filter, &mut think, b"hello <");
+        assert!(!stopped);
+        // Before finish, the held `<` should not yet be emitted.
+        let mid = String::from_utf8_lossy(&out).to_string();
+        let mid_events: Vec<(String, String)> = mid
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .map(|v| {
+                (
+                    v.get("type")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    v.get("text")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                )
+            })
+            .collect();
+        let mid_text = joined(&mid_events, "token");
+        assert_eq!(
+            mid_text, "hello ",
+            "partial prefix should be held, not emitted yet: {mid_text:?}"
+        );
+        vl_finish_think_routing(&mut out, "t-id", &mut filter, &mut think);
+        let out_s = String::from_utf8_lossy(&out);
+        let events: Vec<(String, String)> = out_s
+            .lines()
+            .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+            .map(|v| {
+                (
+                    v.get("type")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                    v.get("text")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("")
+                        .to_string(),
+                )
+            })
+            .collect();
+        assert_eq!(
+            joined(&events, "token"),
+            "hello <",
+            "held prefix should flush at finish"
+        );
+    }
+}
+
+// ── LFM2-VL (arch 11) ────────────────────────────────────────────────────────
+//
+// SigLIP2-NaFlex tower + projector executed by `hipfire_arch_lfm2_vl`; the
+// text loop, stream contract, sampling, and terminal handshake are copied
+// from `dense::generate_lfm2moe` so an image turn behaves exactly like a
+// long-prompted text turn once the visual features are spliced. See
+// docs/specs/2026-08-27-lfm2-vl-vision-runtime.md.
+
+use hipfire_arch_lfm2_vl as lfm2vl;
+
+/// Expand the single `<image>` id in `prompt_ids` into the marker structure
+/// HF's processor produces (narrow spec §1.5): `<|image_start|>`,
+/// per-tile `<|img_row_R_col_C|>` + 256 placeholders, `<|img_thumbnail|>` +
+/// thumbnail placeholders, `<|image_end|>` (markers only when present in
+/// this tokenizer; multi-tile REQUIRES its markers and fails closed).
+fn expand_image_placeholders(
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+    prompt_ids: &[u32],
+    image_token_id: u32,
+    prepared: &lfm2vl::Prepared,
+    cfg: &lfm2vl::VisionConfig,
+) -> Result<Vec<u32>, String> {
+    let start_count = prompt_ids.iter().filter(|&&t| t == image_token_id).count();
+    if start_count != 1 {
+        return Err(format!(
+            "expected exactly one <image> token in rendered prompt, found {start_count} — \
+             the artifact tokenizer is missing the VL added-token; requantize or use a \
+             VL-capable tokenizer"
+        ));
+    }
+    let special = |s: &str| -> Option<u32> { tokenizer.special_token_id(s) };
+    let multi_tile = prepared.grid_rows > 1 || prepared.grid_cols > 1;
+
+    let mut body: Vec<u32> = Vec::new();
+    let start_id = special("<|image_start|>");
+    let end_id = special("<|image_end|>");
+
+    let tiles: Vec<(usize, usize, usize)> = if multi_tile {
+        // row-major tile list aligned with Prepared.sub_images ordering.
+        prepared
+            .sub_images
+            .iter()
+            .take(prepared.grid_rows * prepared.grid_cols)
+            .enumerate()
+            .map(|(i, s)| {
+                (
+                    i / prepared.grid_cols + 1,
+                    i % prepared.grid_cols + 1,
+                    cfg.tokens_for_grid(s.gh(cfg), s.gw(cfg)),
+                )
+            })
+            .collect()
+    } else {
+        Vec::new()
+    };
+
+    // HF's processor ALWAYS wraps the placeholder run in <|image_start|> …
+    // <|image_end|> (single-tile included — pinned source §1.5), so both
+    // markers are unconditionally required from the tokenizer.
+    body.push(start_id.ok_or("tokenizer missing <|image_start|>")?);
+
+    if multi_tile {
+        for &(row, col, ntok) in &tiles {
+            let marker = special(&format!("<|img_row_{row}_col_{col}|>"))
+                .ok_or_else(|| format!("tokenizer missing <|img_row_{row}_col_{col}|>"))?;
+            body.push(marker);
+            for _ in 0..ntok {
+                body.push(image_token_id);
+            }
+        }
+        if cfg.use_thumbnail {
+            let thumb_marker = special("<|img_thumbnail|>")
+                .ok_or("multi-tile image requires <|img_thumbnail|> but tokenizer lacks it")?;
+            body.push(thumb_marker);
+            for _ in 0..cfg.tokens_for_grid(
+                prepared.sub_images.last().unwrap().gh(cfg),
+                prepared.sub_images.last().unwrap().gw(cfg),
+            ) {
+                body.push(image_token_id);
+            }
+        }
+    } else {
+        for _ in 0..cfg.tokens_for_grid(
+            prepared.sub_images[0].gh(cfg),
+            prepared.sub_images[0].gw(cfg),
+        ) {
+            body.push(image_token_id);
+        }
+    }
+    body.push(end_id.ok_or("tokenizer missing <|image_end|>")?);
+
+    // splice over the single <image>
+    let idx = prompt_ids
+        .iter()
+        .position(|&t| t == image_token_id)
+        .expect("position checked above");
+    let mut out = Vec::with_capacity(prompt_ids.len() + body.len() - 1);
+    out.extend_from_slice(&prompt_ids[..idx]);
+    out.extend_from_slice(&body);
+    out.extend_from_slice(&prompt_ids[idx + 1..]);
+
+    let total = out.iter().filter(|&&t| t == image_token_id).count();
+    if total != prepared.total_tokens(cfg) {
+        return Err(format!(
+            "placeholder/feature mismatch after expansion: {total} placeholders vs {} projected tokens",
+            prepared.total_tokens(cfg)
+        ));
+    }
+    Ok(out)
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn generate_lfm2_vl(
+    m: &mut LoadedModel,
+    gpu: &mut rdna_compute::Gpu,
+    stdout: &mut std::io::Stdout,
+    params: &GenerateVLParams,
+) {
+    let GenerateVLParams {
+        id,
+        prompt,
+        system_prompt,
+        ref image_source,
+        temp,
+        top_p,
+        max_tokens,
+        max_think_tokens,
+        seed,
+        ..
+    } = *params;
+    if m.tokenizer.is_none() {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            "tokenizer not loaded",
+            "validation",
+            false,
+            false,
+        );
+        return;
+    }
+    let vision_cfg = match m.lfm2_vision() {
+        Some((vc, _)) => vc.clone(),
+        None => {
+            emit_active_attempt_error(
+                stdout,
+                Some(id),
+                "model has no vision encoder",
+                "validation",
+                false,
+                false,
+            );
+            return;
+        }
+    };
+
+    // Stream contract opener BEFORE any GPU work or event emission — the
+    // HTTP gate rejects a `token` that arrives without gen_start first.
+    let gen_contract = crate::common::gen_start_contract_version_for_arch(m.arch_id);
+    emit_gen_start(stdout, id, false, gen_contract);
+
+    // Full-turn clock: preprocess + tower encode + prefill + decode. The
+    // tower dominates image turns (~7–10 s of the ~22 s wall on gfx1101),
+    // so a total that excludes it would misreport the turn.
+    let t_turn = Instant::now();
+
+    // ── Preprocess (CPU decode + resize/split/thumbnail) ──
+    let prepared = match image_source {
+        ImageSource::Path(path) => {
+            lfm2vl::load_and_preprocess(std::path::Path::new(path), &vision_cfg)
+        }
+        ImageSource::Base64(b64) => {
+            let raw_b64 = if let Some(rest) = b64.strip_prefix("data:") {
+                match rest.split_once(',') {
+                    Some((_, after)) => after,
+                    None => {
+                        emit_active_attempt_error(
+                            stdout,
+                            Some(id),
+                            "malformed data URL: missing ',' separator",
+                            "validation",
+                            false,
+                            false,
+                        );
+                        return;
+                    }
+                }
+            } else {
+                b64
+            };
+            match Engine::decode(&base64::engine::general_purpose::STANDARD, raw_b64) {
+                Ok(bytes) => lfm2vl::load_and_preprocess_from_bytes(&bytes, &vision_cfg),
+                Err(e) => Err(format!("failed to decode base64 image data: {e}")),
+            }
+        }
+    };
+    let prepared = match prepared {
+        Ok(p) => p,
+        Err(e) => {
+            emit_active_attempt_error(stdout, Some(id), &e, "validation", false, false);
+            return;
+        }
+    };
+    let n_visual_tokens = prepared.total_tokens(&vision_cfg);
+    eprintln!(
+        "[daemon/vl-lfm2] image preprocessed: {} sub-image(s), {}x{} grid(s), {} visual tokens",
+        prepared.sub_images.len(),
+        prepared.grid_rows,
+        prepared.grid_cols,
+        n_visual_tokens
+    );
+
+    // ── Prompt build: normal ChatML jinja frame with a literal <image> ──
+    let image_token_id = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        match tokenizer.special_token_id("<image>") {
+            Some(t) => t,
+            None => {
+                emit_active_attempt_error(
+                    stdout,
+                    Some(id),
+                    "tokenizer has no <image> token — not a VL tokenizer",
+                    "validation",
+                    false,
+                    false,
+                );
+                return;
+            }
+        }
+    };
+    let prompt_ids: Vec<u32> = {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
+        let template = m.chat_template.as_ref();
+        let user_content = format!("<image>{prompt}");
+        let rendered = match template {
+            Some(template) => hipfire_runtime::prompt_frame::JinjaChatFrame {
+                tokenizer,
+                template,
+                system: system_prompt,
+                user: &user_content,
+                enable_thinking: max_think_tokens != 1,
+                bos_token: None,
+                reasoning_strength: None,
+                reasoning_effort: None,
+            }
+            .render(),
+            None => Err("no chat template embedded in artifact".to_string()),
+        };
+        match rendered {
+            Ok(text) => tokenizer.encode(&text),
+            Err(e) => {
+                emit_active_attempt_error(
+                    stdout,
+                    Some(id),
+                    &format!("vl prompt render failed: {e}"),
+                    "validation",
+                    false,
+                    false,
+                );
+                return;
+            }
+        }
+    };
+    let prompt_ids = match expand_image_placeholders(
+        m.tokenizer.as_ref().unwrap(),
+        &prompt_ids,
+        image_token_id,
+        &prepared,
+        &vision_cfg,
+    ) {
+        Ok(p) => p,
+        Err(e) => {
+            emit_active_attempt_error(stdout, Some(id), &e, "validation", false, false);
+            return;
+        }
+    };
+
+    // Capacity guard BEFORE GPU work. VL forces the cold-reset path (below),
+    // so seq_pos is always 0 here.
+    let cap = m.lfm2moe().unwrap().state.max_seq;
+    if prompt_ids.len().saturating_add(max_tokens) > cap {
+        emit_active_attempt_error(
+            stdout,
+            Some(id),
+            &format!(
+                "prompt exceeds context capacity: prompt={} (incl. {} visual) + max_tokens={} > capacity={}",
+                prompt_ids.len(),
+                n_visual_tokens,
+                max_tokens,
+                cap
+            ),
+            "context_length",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return;
+    }
+
+    // Cross-conversation cold reset (mirrors dense::generate_lfm2moe).
+    let _ = m.lfm2moe_mut().unwrap().state.reset(gpu);
+    m.seq_pos = 0;
+    m.conversation_tokens.clear();
+
+    // ── Vision encode → projected [n_visual, hidden] rows ──
+    let visual_tokens = match m.lfm2_vision() {
+        Some((_, vw)) => lfm2vl::vision_forward(gpu, vw, &vision_cfg, &prepared),
+        None => {
+            write_error(stdout, id, "model has no vision encoder");
+            return;
+        }
+    };
+    let visual_tokens = match visual_tokens {
+        Ok(v) => v,
+        Err(e) => {
+            write_error(stdout, id, &e);
+            return;
+        }
+    };
+    // Release-mode fail-closed length check (the narrow spec §2.3 claims
+    // "fails loud BEFORE splicing"): debug_assert compiles out in release,
+    // and a mismatch would otherwise panic the daemon on the emb slice below
+    // instead of erroring the request. Unreachable while the splitter and
+    // the tower share tokens_for_grid, but the splice must not trust that
+    // by accident.
+    if visual_tokens.len() != n_visual_tokens * vision_cfg.out_hidden_size {
+        write_error(
+            stdout,
+            id,
+            &format!(
+                "vision/projector row mismatch: {} floats for {} tokens × {} dims",
+                visual_tokens.len(),
+                n_visual_tokens,
+                vision_cfg.out_hidden_size
+            ),
+        );
+        return;
+    }
+
+    // EOS-class stop set (verbatim rationale lives at the text path copy).
+    let stop_toks: Vec<u32> = {
+        let tk = m.tokenizer.as_ref().unwrap();
+        let eos_tok = m.lfm2moe().unwrap().eos_tok;
+        let mut v = vec![eos_tok];
+        for s in ["<|endoftext|>", "</s>", "<|im_end|>"] {
+            let ids = tk.encode(s);
+            if ids.len() == 1 && !v.contains(&ids[0]) {
+                v.push(ids[0]);
+            }
+        }
+        v
+    };
+
+    // ── Prefill with visual embeddings spliced at placeholder positions ──
+    let mut last_logits: Vec<f32> = Vec::new();
+    let prefill_t0 = Instant::now();
+    {
+        let b = m.lfm2moe_mut().unwrap();
+        let cfg_t = &b.config;
+        let weights = &b.weights;
+        let state = &mut b.state;
+        let dim = vision_cfg.out_hidden_size;
+        let mut vis_idx = 0usize;
+        let mut position = state.n_tokens as u32;
+        for &tok in &prompt_ids {
+            if check_abort(id) {
+                // Client-cancel poll (mirrors the generate_vl hardening on
+                // feat/qwen35-vl): the vision-encode phase before this loop
+                // cannot be interrupted mid-kernel, so prefill is where an
+                // abort signalled during the tower takes effect. Emit the
+                // canonical cancelled pair and return — breaking out here
+                // would fall through to the decode loop relying on its
+                // top-of-loop abort check to avoid sampling empty logits,
+                // and would push the full prompt into conversation_tokens
+                // against a partially-filled KV.
+                emit_qwen_ar_cancelled(stdout, id, 0);
+                return;
+            }
+            let res = if tok == image_token_id && vis_idx < n_visual_tokens {
+                let emb = &visual_tokens[vis_idx * dim..(vis_idx + 1) * dim];
+                vis_idx += 1;
+                hipfire_arch_lfm2moe::forward::prefill_embed_step(
+                    cfg_t, weights, state, gpu, emb, position,
+                )
+            } else {
+                hipfire_arch_lfm2moe::forward::decode_step(
+                    cfg_t, weights, state, gpu, tok, position,
+                )
+            };
+            match res {
+                Ok(logits) => last_logits = logits,
+                Err(e) => {
+                    write_error(stdout, id, &format!("lfm2-vl prefill failed: {e:?}"));
+                    return;
+                }
+            }
+            position += 1;
+        }
+    }
+    for &tok in &prompt_ids {
+        m.conversation_tokens.push(tok);
+    }
+    let prefill_ms = prefill_t0.elapsed().as_millis().max(1);
+
+    // ── Decode loop (identical sampling/stop semantics to generate_lfm2moe) ──
+    // Per-request sampler seed from hipfire-engine::request_seed_for (wire
+    // `seed` wins, else attempt key + counter). Matches generate_vl / text
+    // paths — never wall-clock entropy.
+    let mut rng = hipfire_arch_deepseek4::sampling::Xorshift::new(seed as u64);
+
+    let mut generated_count: usize = 0;
+    let decode_t0 = Instant::now();
+    loop {
+        if check_abort(id) {
+            eprintln!("[daemon/vl-lfm2] aborted mid-decode");
+            break;
+        }
+        if generated_count >= max_tokens {
+            break;
+        }
+        let next_tok =
+            hipfire_arch_deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
+        if stop_toks.contains(&next_tok) {
+            break;
+        }
+        let frag = m.tokenizer.as_ref().unwrap().decode(&[next_tok]);
+        if matches!(
+            frag.trim(),
+            "<|endoftext|>" | "</s>" | "<|im_end|>" | "<|startoftext|>"
+        ) {
+            break;
+        }
+        let envelope = serde_json::json!({
+            "type": "token",
+            "id": id,
+            "text": frag,
+            "attempt_id": active_attempt_id(),
+        });
+        let _ = writeln!(stdout, "{}", envelope);
+        let _ = stdout.flush();
+        m.conversation_tokens.push(next_tok);
+        generated_count += 1;
+
+        if check_abort(id) {
+            break;
+        }
+        let step = {
+            let b = m.lfm2moe_mut().unwrap();
+            let position = b.state.n_tokens as u32;
+            hipfire_arch_lfm2moe::forward::decode_step(
+                &b.config,
+                &b.weights,
+                &mut b.state,
+                gpu,
+                next_tok,
+                position,
+            )
+        };
+        match step {
+            Ok(logits) => last_logits = logits,
+            Err(e) => {
+                write_error(stdout, id, &format!("lfm2-vl decode failed: {e:?}"));
+                return;
+            }
+        }
+    }
+    let decode_ms = decode_t0.elapsed().as_millis().max(1);
+
+    // Post-loop abort latch — MANDATORY before the two-phase commit
+    // handshake. If the client cancelled/disconnected mid-decode,
+    // `await_client_terminal_commit` would block forever waiting for a
+    // commit that can never arrive and wedge the single slot (the exact
+    // failure recorded in the 2026-08-27 serve ledger). Emits the CANONICAL
+    // cancelled-terminal pair via `emit_qwen_ar_cancelled` (wire `aborted` +
+    // `aborted_done`) — serve's stream reader only releases an HTTP handler
+    // on the recognized terminal dialect, so a raw custom event here would
+    // hold the admission guard forever.
+    if check_abort(id) {
+        emit_qwen_ar_cancelled(stdout, id, generated_count);
+        return;
+    }
+
+    m.seq_pos = m.lfm2moe().unwrap().state.n_tokens;
+
+    let tok_s: f64 = if generated_count > 0 {
+        (generated_count as f64 * 1000.0) / decode_ms as f64
+    } else {
+        0.0
+    };
+    let pending_done = serde_json::json!({
+        "type": "done",
+        "id": id,
+        "tokens": generated_count,
+        "tok_s": (tok_s * 100.0).round() / 100.0,
+        "prefill_ms": prefill_ms,
+        "total_ms": t_turn.elapsed().as_millis().max(1),
+        "attempt_id": active_attempt_id(),
+    });
+    match await_client_terminal_commit(stdout, id, &pending_done) {
+        ClientTerminalDecision::Commit => emit_staged_terminal_done(stdout, &pending_done),
+        ClientTerminalDecision::Abort => {
+            // Same release contract as the post-loop latch: the terminal pair
+            // must be the recognized wire dialect or serve holds its
+            // admission guard forever.
+            emit_qwen_ar_cancelled(stdout, id, generated_count);
+        }
+    }
+}

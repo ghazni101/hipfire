@@ -152,56 +152,46 @@ pub(crate) fn launch_maybe_blob(
     blob_builder: impl FnOnce() -> KernargBlob,
 ) -> HipResult<()> {
     let record = replay.as_ref().map_or(false, |r| r.is_recording());
-    if record || capture_mode || force_blob_path {
+    let result: HipResult<()> = if record || capture_mode || force_blob_path {
         let mut blob = blob_builder();
         blob.pad_to(16);
         if record {
             // Single decision point for how a launch is recorded: same
             // artifact lookup shape as `Gpu::launch_maybe_blob_bound`.
-            let artifact = compiler
-                .as_ref()
-                .and_then(|c| {
-                    c
-                .compiled_kernels()
-                .get(func_name)
-                .or_else(|| match func_name {
-                    "mq_rotate_x" => c.compiled_kernels().get("gemv_mq4g256"),
-                    "deinterleave_f32_batched" => {
-                        c.compiled_kernels().get("deinterleave_batched")
-                    }
-                    name if name.starts_with("gemv_hfq4g256_residual_sigmoid_scaled_gpu") => {
-                        c
+            let artifact = compiler.as_ref().and_then(|c| {
+                c.compiled_kernels()
+                    .get(func_name)
+                    .or_else(|| match func_name {
+                        "mq_rotate_x" => c.compiled_kernels().get("gemv_mq4g256"),
+                        "deinterleave_f32_batched" => {
+                            c.compiled_kernels().get("deinterleave_batched")
+                        }
+                        name if name.starts_with("gemv_hfq4g256_residual_sigmoid_scaled_gpu") => {
+                            c.compiled_kernels().get("gemv_hfq4g256_residual_scaled")
+                        }
+                        "gemv_hfq4g256_moe_gate_up_k8_indexed" => c
                             .compiled_kernels()
-                            .get("gemv_hfq4g256_residual_scaled")
-                    }
-                    "gemv_hfq4g256_moe_gate_up_k8_indexed" => c
-                        .compiled_kernels()
-                        .get("gemv_hfq4g256_moe_gate_up_indexed"),
-                    name if name.starts_with("gemv_hfq4g256_multirow_r") => c
-                        .compiled_kernels()
-                        .get("gemv_hfq4g256_multirow_default")
-                        .or_else(|| {
-                            c
-                                .compiled_kernels()
-                                .get("gemv_hfq4g256_multirow_rdna3")
-                        }),
-                    name if name.starts_with("gemv_hfq4g256_residual_multirow_r") => c
-                        .compiled_kernels()
-                        .get("gemv_hfq4g256_residual_multirow_default")
-                        .or_else(|| {
-                            c
-                                .compiled_kernels()
-                                .get("gemv_hfq4g256_residual_multirow_rdna3")
-                        }),
-                    _ => None,
-                })
-                .or_else(|| {
-                    func_name
-                        .strip_suffix("_f32")
-                        .and_then(|name| c.compiled_kernels().get(name))
-                })
-                        .cloned()
-                });
+                            .get("gemv_hfq4g256_moe_gate_up_indexed"),
+                        name if name.starts_with("gemv_hfq4g256_multirow_r") => c
+                            .compiled_kernels()
+                            .get("gemv_hfq4g256_multirow_default")
+                            .or_else(|| c.compiled_kernels().get("gemv_hfq4g256_multirow_rdna3")),
+                        name if name.starts_with("gemv_hfq4g256_residual_multirow_r") => c
+                            .compiled_kernels()
+                            .get("gemv_hfq4g256_residual_multirow_default")
+                            .or_else(|| {
+                                c.compiled_kernels()
+                                    .get("gemv_hfq4g256_residual_multirow_rdna3")
+                            }),
+                        _ => None,
+                    })
+                    .or_else(|| {
+                        func_name
+                            .strip_suffix("_f32")
+                            .and_then(|name| c.compiled_kernels().get(name))
+                    })
+                    .cloned()
+            });
             replay.as_mut().unwrap().record_hip_launch_typed_bound(
                 hip,
                 func_name,
@@ -217,16 +207,24 @@ pub(crate) fn launch_maybe_blob(
             capture_blobs.push(blob.into_vec());
             let buf = capture_blobs.last_mut().unwrap();
             let func = &functions[func_name];
-            unsafe { hip.launch_kernel_blob(func, grid, block, shared_mem, stream, buf.as_mut_slice()) }
+            unsafe {
+                hip.launch_kernel_blob(func, grid, block, shared_mem, stream, buf.as_mut_slice())
+            }
         } else {
             let mut bytes = blob.into_vec();
             let func = &functions[func_name];
-            unsafe { hip.launch_kernel_blob(func, grid, block, shared_mem, stream, bytes.as_mut_slice()) }
+            unsafe {
+                hip.launch_kernel_blob(func, grid, block, shared_mem, stream, bytes.as_mut_slice())
+            }
         }
     } else {
         let func = &functions[func_name];
         unsafe { hip.launch_kernel(func, grid, block, shared_mem, stream, params) }
-    }
+    };
+    // Scratch converts share the dispatch stream: a failure here names the
+    // kernel the same way the dispatch funnel does. Deliberately no
+    // last-kernel recording — this helper has no `Gpu` to record into.
+    result.map_err(|e| e.with_kernel(func_name))
 }
 
 /// Predicate for the FP16/FP8 scratch fast path. The convert kernel must run
@@ -582,7 +580,12 @@ impl ScratchState {
             self.fp16_x_source_ptr = std::ptr::null_mut(); // force reconversion after realloc
         }
 
-        let must_convert = scratch_must_convert(capture_mode, replay.is_recording(), self.fp16_x_source_ptr, src_ptr);
+        let must_convert = scratch_must_convert(
+            capture_mode,
+            replay.is_recording(),
+            self.fp16_x_source_ptr,
+            src_ptr,
+        );
         if must_convert {
             let in_ptr = src_ptr;
             let out_ptr = self.fp16_x_scratch.as_ref().unwrap().as_ptr();
@@ -678,14 +681,14 @@ impl ScratchState {
         ];
         let grid = ((n_elems + 255) / 256) as u32;
         launch_maybe_blob(
-                hip,
-                Some(&*compiler),
-                functions,
-                stream,
-                capture_blobs,
-                capture_mode,
-                force_blob_path,
-                Some(replay),
+            hip,
+            Some(&*compiler),
+            functions,
+            stream,
+            capture_blobs,
+            capture_mode,
+            force_blob_path,
+            Some(replay),
             "convert_f32_to_f16",
             [grid, 1, 1],
             [256, 1, 1],
@@ -745,7 +748,12 @@ impl ScratchState {
             self.fp8_x_source_ptr = std::ptr::null_mut();
         }
 
-        let must_convert = scratch_must_convert(capture_mode, replay.is_recording(), self.fp8_x_source_ptr, src_ptr);
+        let must_convert = scratch_must_convert(
+            capture_mode,
+            replay.is_recording(),
+            self.fp8_x_source_ptr,
+            src_ptr,
+        );
         if must_convert {
             let in_ptr = src_ptr;
             let out_ptr = self.fp8_x_scratch.as_ref().unwrap().as_ptr();
@@ -929,14 +937,14 @@ impl ScratchState {
         let bytes = crate::profile::mq_rotate_bytes(k);
         let timer = crate::profile::begin_timer(hip, "fwht", "mq_rotate_x", bytes);
         let result = launch_maybe_blob(
-                hip,
-                Some(compiler),
-                functions,
-                stream,
-                capture_blobs,
-                capture_mode,
-                force_blob_path,
-                Some(replay),
+            hip,
+            Some(compiler),
+            functions,
+            stream,
+            capture_blobs,
+            capture_mode,
+            force_blob_path,
+            Some(replay),
             "mq_rotate_x",
             [n_groups, 1, 1],
             [32, 1, 1],
@@ -997,14 +1005,14 @@ impl ScratchState {
         let bytes = crate::profile::mq_rotate_bytes(k) * batch_size;
         let timer = crate::profile::begin_timer(hip, "fwht", "mq_rotate_x_batched", bytes);
         let result = launch_maybe_blob(
-                hip,
-                Some(compiler),
-                functions,
-                stream,
-                capture_blobs,
-                capture_mode,
-                force_blob_path,
-                Some(replay),
+            hip,
+            Some(compiler),
+            functions,
+            stream,
+            capture_blobs,
+            capture_mode,
+            force_blob_path,
+            Some(replay),
             "mq_rotate_x",
             [n_groups * batch_size as u32, 1, 1],
             [32, 1, 1],
@@ -1062,14 +1070,14 @@ impl ScratchState {
         let bytes = crate::profile::mq_rotate_bytes(k);
         let timer = crate::profile::begin_timer(hip, "fwht", "mq_rotate_x_128", bytes);
         let result = launch_maybe_blob(
-                hip,
-                Some(compiler),
-                functions,
-                stream,
-                capture_blobs,
-                capture_mode,
-                force_blob_path,
-                Some(replay),
+            hip,
+            Some(compiler),
+            functions,
+            stream,
+            capture_blobs,
+            capture_mode,
+            force_blob_path,
+            Some(replay),
             "mq_rotate_x_128",
             [n_groups, 1, 1],
             [32, 1, 1],
@@ -1129,14 +1137,14 @@ impl ScratchState {
         let bytes = k * 4 * 3 + 2 * 256 * 4;
         let timer = crate::profile::begin_timer(hip, "fwht", "rotate_x_mq_awq", bytes);
         let result = launch_maybe_blob(
-                hip,
-                Some(compiler),
-                functions,
-                stream,
-                capture_blobs,
-                capture_mode,
-                force_blob_path,
-                Some(replay),
+            hip,
+            Some(compiler),
+            functions,
+            stream,
+            capture_blobs,
+            capture_mode,
+            force_blob_path,
+            Some(replay),
             "rotate_x_mq_awq",
             [n_groups, 1, 1],
             [32, 1, 1],
@@ -1202,14 +1210,14 @@ impl ScratchState {
         let bytes = (k * 4 * 3 + 2 * 256 * 4) * batch_size;
         let timer = crate::profile::begin_timer(hip, "fwht", "rotate_x_mq_awq_batched", bytes);
         let result = launch_maybe_blob(
-                hip,
-                Some(compiler),
-                functions,
-                stream,
-                capture_blobs,
-                capture_mode,
-                force_blob_path,
-                Some(replay),
+            hip,
+            Some(compiler),
+            functions,
+            stream,
+            capture_blobs,
+            capture_mode,
+            force_blob_path,
+            Some(replay),
             "rotate_x_mq_awq",
             [n_groups, batch_size as u32, 1],
             [32, 1, 1],
@@ -1285,14 +1293,14 @@ impl ScratchState {
         let bytes = crate::profile::mq_rotate_bytes(k) + k;
         let timer = crate::profile::begin_timer(hip, "fwht", "mq_rotate_x_dual_fp8", bytes);
         let result = launch_maybe_blob(
-                hip,
-                Some(compiler),
-                functions,
-                stream,
-                capture_blobs,
-                capture_mode,
-                force_blob_path,
-                Some(replay),
+            hip,
+            Some(compiler),
+            functions,
+            stream,
+            capture_blobs,
+            capture_mode,
+            force_blob_path,
+            Some(replay),
             "mq_rotate_x_dual_fp8_gfx12",
             [n_groups, 1, 1],
             [32, 1, 1],

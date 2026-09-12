@@ -152,7 +152,7 @@ fn dense_activation_dump() -> Result<Option<&'static std::sync::Mutex<DenseActiv
 
     static DUMP: OnceLock<Result<Option<Mutex<DenseActivationDump>>, String>> = OnceLock::new();
     match DUMP.get_or_init(|| {
-        let Some(path) = std::env::var_os("HIPFIRE_DS4_DENSE_ACT_DIR") else {
+        let Some(path) = hipfire_config::developer_var_os("HIPFIRE_DS4_DENSE_ACT_DIR") else {
             return Ok(None);
         };
         if path.is_empty() {
@@ -1481,7 +1481,9 @@ pub fn ensure_request_capacity(
     Ok(scratch_grew || cache_grew)
 }
 
-pub(crate) fn refresh_compressor_cache_shard_tables(states: &mut [DeepseekV4State]) -> Result<(), String> {
+pub(crate) fn refresh_compressor_cache_shard_tables(
+    states: &mut [DeepseekV4State],
+) -> Result<(), String> {
     let world = states.len();
     if !matches!(world, 3 | 4) {
         return Err(format!(
@@ -5857,7 +5859,7 @@ fn dump_moe_route_if_enabled(
 
     static DUMP: OnceLock<Option<Mutex<std::io::BufWriter<std::fs::File>>>> = OnceLock::new();
     let dump = DUMP.get_or_init(|| {
-        let path = std::env::var("HIPFIRE_DS4_ROUTE_DUMP").ok()?;
+        let path = hipfire_config::developer_var("HIPFIRE_DS4_ROUTE_DUMP").ok()?;
         let file = std::fs::File::create(&path)
             .unwrap_or_else(|e| panic!("create HIPFIRE_DS4_ROUTE_DUMP {path}: {e}"));
         let mut writer = std::io::BufWriter::new(file);

@@ -130,10 +130,12 @@ fn mixed_tier_table(tiers: Vec<DType>) -> Option<Vec<DType>> {
     }
 }
 /// Fallible per-expert tag mapping for the pinned graded MQ4R family.
-/// Admits exactly 13 ordered (gate, down) pairs; every other ordered pair,
-/// every GL dtype in either position, and every unknown dtype is `Err`.
-/// Single source of truth consumed by both projections via one stored tag;
-/// the uniform MQ4 gate optimisation is the only reason the mixed MQ4 set is valid.
+///
+/// Tags 0..6 retain exact V1 pair meaning. Tags 7..18 are the frozen MQV2
+/// mixed-layout identities from the kernel contract — V1/V2 never collapse.
+/// Every other ordered pair, every GL dtype in either position, and every
+/// unknown dtype is `Err`. Single source of truth consumed by both
+/// projections via one stored tag.
 pub fn mixed_expert_tag(gate_dtype: DType, down_dtype: DType) -> HipResult<u8> {
     // GL in either position is always rejected – the tag-branched decoder has
     // no GL branch and would silently mis-decode as MQ4.
@@ -146,34 +148,34 @@ pub fn mixed_expert_tag(gate_dtype: DType, down_dtype: DType) -> HipResult<u8> {
         ));
     }
     match (gate_dtype, down_dtype) {
-        // Mixed MQ4 gate family (7 pairs) — MQ4G256V2 is the same container family
-        // as MQ4G256 for the grouped dispatch, so every gate pair that admits
-        // MQ4 also admits V2 (including the cross V2↔MQ4 uniform gate which
-        // keeps mixed-shard models loadable). The kernel selection is container-aware
-        // via forward_slots::fused_*_key_for, so admitting here never misroutes.
+        // Tags 0..6 — V1 pair identities (unchanged).
         (DType::MQ4G256, DType::MQ6G256) => Ok(0),
-        (DType::MQ4G256V2, DType::MQ6G256) => Ok(0),
         (DType::MQ4G256, DType::MQ2G256Lloyd) => Ok(1),
-        (DType::MQ4G256V2, DType::MQ2G256Lloyd) => Ok(1),
         (DType::MQ4G256, DType::MQ4G256) => Ok(2),
-        (DType::MQ4G256V2, DType::MQ4G256V2) => Ok(2),
-        (DType::MQ4G256V2, DType::MQ4G256) => Ok(2),
-        (DType::MQ4G256, DType::MQ4G256V2) => Ok(2),
         (DType::MQ4G256, DType::MQ3G256Lloyd) => Ok(3),
-        (DType::MQ4G256V2, DType::MQ3G256Lloyd) => Ok(3),
         (DType::MQ4G256, DType::MFP4G32E8) => Ok(4),
-        (DType::MQ4G256V2, DType::MFP4G32E8) => Ok(4),
         (DType::MQ4G256, DType::MFP3G32E8) => Ok(5),
-        (DType::MQ4G256V2, DType::MFP3G32E8) => Ok(5),
         (DType::MQ4G256, DType::MFP2G32E8) => Ok(6),
-        (DType::MQ4G256V2, DType::MFP2G32E8) => Ok(6),
-        // Matching non-MQ4 pairs (6 pairs)
+        // Matching non-MQ4 V1 pairs reuse the same tag numbers.
         (DType::MQ6G256, DType::MQ6G256) => Ok(0),
         (DType::MQ2G256Lloyd, DType::MQ2G256Lloyd) => Ok(1),
         (DType::MQ3G256Lloyd, DType::MQ3G256Lloyd) => Ok(3),
         (DType::MFP4G32E8, DType::MFP4G32E8) => Ok(4),
         (DType::MFP3G32E8, DType::MFP3G32E8) => Ok(5),
         (DType::MFP2G32E8, DType::MFP2G32E8) => Ok(6),
+        // Tags 7..18 — frozen MQV2 mixed identities (never collapse to 0..6).
+        (DType::MQ4G256V2, DType::MQ4G256V2) => Ok(7),
+        (DType::MQ6G256V2, DType::MQ6G256V2) => Ok(8),
+        (DType::MQ4G256V2, DType::MQ6G256) => Ok(9),
+        (DType::MQ4G256V2, DType::MQ2G256Lloyd) => Ok(10),
+        (DType::MQ4G256V2, DType::MQ4G256) => Ok(11),
+        (DType::MQ4G256, DType::MQ4G256V2) => Ok(12),
+        (DType::MQ4G256V2, DType::MQ3G256Lloyd) => Ok(13),
+        (DType::MQ4G256V2, DType::MFP4G32E8) => Ok(14),
+        (DType::MQ4G256V2, DType::MFP3G32E8) => Ok(15),
+        (DType::MQ4G256V2, DType::MFP2G32E8) => Ok(16),
+        (DType::MQ4G256V2, DType::MQ6G256V2) => Ok(17),
+        (DType::MQ4G256, DType::MQ6G256V2) => Ok(18),
         _ => Err(HipError::new(
             0,
             &format!("graded EP: unsupported dtype pair gate={gate_dtype:?} down={down_dtype:?}"),
@@ -1830,5 +1832,140 @@ mod tests {
         // qt44/45 still map to their V2/C DTypes.
         assert_eq!(dtype_from_quant_type(44).unwrap(), DType::MQ4G256V2);
         assert_eq!(dtype_from_quant_type(45).unwrap(), DType::MQ4CG256);
+    }
+
+    // ── mixed_expert_tag — frozen V1 0..6 + MQV2 7..18 ────────────────────
+    // Exact ordered-pair → tag map; V1/V2 never collapse; unknown pairs Err.
+
+    #[test]
+    fn mixed_expert_tag_v1_pairs_retain_tags_0_through_6() {
+        use DType::*;
+        let accepted: &[(DType, DType, u8)] = &[
+            (MQ4G256, MQ6G256, 0),
+            (MQ4G256, MQ2G256Lloyd, 1),
+            (MQ4G256, MQ4G256, 2),
+            (MQ4G256, MQ3G256Lloyd, 3),
+            (MQ4G256, MFP4G32E8, 4),
+            (MQ4G256, MFP3G32E8, 5),
+            (MQ4G256, MFP2G32E8, 6),
+            (MQ6G256, MQ6G256, 0),
+            (MQ2G256Lloyd, MQ2G256Lloyd, 1),
+            (MQ3G256Lloyd, MQ3G256Lloyd, 3),
+            (MFP4G32E8, MFP4G32E8, 4),
+            (MFP3G32E8, MFP3G32E8, 5),
+            (MFP2G32E8, MFP2G32E8, 6),
+        ];
+        for &(g, d, tag) in accepted {
+            assert_eq!(
+                mixed_expert_tag(g, d).expect("V1 accepted pair"),
+                tag,
+                "V1 gate={g:?} down={d:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_expert_tag_mqv2_pairs_emit_exact_tags_7_through_18() {
+        use DType::*;
+        // Frozen contract: exact tags 7..18; no V2→V1 collapse.
+        let accepted: &[(DType, DType, u8)] = &[
+            (MQ4G256V2, MQ4G256V2, 7),
+            (MQ6G256V2, MQ6G256V2, 8),
+            (MQ4G256V2, MQ6G256, 9),
+            (MQ4G256V2, MQ2G256Lloyd, 10),
+            (MQ4G256V2, MQ4G256, 11),
+            (MQ4G256, MQ4G256V2, 12),
+            (MQ4G256V2, MQ3G256Lloyd, 13),
+            (MQ4G256V2, MFP4G32E8, 14),
+            (MQ4G256V2, MFP3G32E8, 15),
+            (MQ4G256V2, MFP2G32E8, 16),
+            (MQ4G256V2, MQ6G256V2, 17),
+            (MQ4G256, MQ6G256V2, 18),
+        ];
+        for &(g, d, tag) in accepted {
+            assert_eq!(
+                mixed_expert_tag(g, d).expect("MQV2 accepted pair"),
+                tag,
+                "MQV2 gate={g:?} down={d:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_expert_tag_v2_never_collapses_to_v1_tags() {
+        use DType::*;
+        // Former collapses that incorrectly reused tags 0..6 must now be distinct.
+        assert_ne!(
+            mixed_expert_tag(MQ4G256V2, MQ6G256).unwrap(),
+            mixed_expert_tag(MQ4G256, MQ6G256).unwrap()
+        );
+        assert_ne!(
+            mixed_expert_tag(MQ4G256V2, MQ4G256V2).unwrap(),
+            mixed_expert_tag(MQ4G256, MQ4G256).unwrap()
+        );
+        assert_ne!(
+            mixed_expert_tag(MQ4G256V2, MQ4G256).unwrap(),
+            mixed_expert_tag(MQ4G256, MQ4G256).unwrap()
+        );
+        assert_ne!(
+            mixed_expert_tag(MQ4G256, MQ4G256V2).unwrap(),
+            mixed_expert_tag(MQ4G256, MQ4G256).unwrap()
+        );
+        assert_eq!(mixed_expert_tag(MQ4G256V2, MQ6G256).unwrap(), 9);
+        assert_eq!(mixed_expert_tag(MQ4G256V2, MQ4G256V2).unwrap(), 7);
+        assert_eq!(mixed_expert_tag(MQ4G256V2, MQ4G256).unwrap(), 11);
+        assert_eq!(mixed_expert_tag(MQ4G256, MQ4G256V2).unwrap(), 12);
+    }
+
+    #[test]
+    fn mixed_expert_tag_unknown_pairs_err() {
+        use DType::*;
+        // Cross-direction and unsupported V2 combos stay Err.
+        let rejected: &[(DType, DType)] = &[
+            (MQ6G256, MQ4G256),
+            (MQ6G256V2, MQ4G256V2),
+            (MQ6G256V2, MQ4G256),
+            (MQ6G256, MQ6G256V2),
+            (MQ6G256V2, MQ6G256),
+            (MQ4G256V2, MQ5G256V2),
+            (MQ2G256V2, MQ2G256V2),
+            (MQ3G256V2, MQ3G256V2),
+            (MQ5G256V2, MQ5G256V2),
+            (MQ4G256Lloyd, MQ4G256Lloyd),
+            (Q8_0, Q8_0),
+            (F16, F16),
+            (ParoQ4G128, ParoQ4G128),
+            (MQ2G256Lloyd, MQ4G256),
+            (MQ3G256Lloyd, MQ4G256V2),
+            (MFP4G32E8, MQ4G256),
+        ];
+        for &(g, d) in rejected {
+            let err = mixed_expert_tag(g, d).expect_err(&format!("gate={g:?} down={d:?}"));
+            assert!(
+                err.message.contains("unsupported dtype pair"),
+                "gate={g:?} down={d:?}: {}",
+                err.message
+            );
+        }
+    }
+
+    #[test]
+    fn mixed_expert_tag_gl_either_side_err() {
+        use DType::*;
+        for gate in [MQ2G256GL, MQ3G256GL, MQ4G256, MQ4G256V2] {
+            for down in [MQ2G256GL, MQ3G256GL, MQ4G256, MQ4G256V2] {
+                let gl =
+                    matches!(gate, MQ2G256GL | MQ3G256GL) || matches!(down, MQ2G256GL | MQ3G256GL);
+                if !gl {
+                    continue;
+                }
+                let err = mixed_expert_tag(gate, down).expect_err("GL must reject");
+                assert!(
+                    err.message.contains("GL dtype not supported"),
+                    "gate={gate:?} down={down:?}: {}",
+                    err.message
+                );
+            }
+        }
     }
 }

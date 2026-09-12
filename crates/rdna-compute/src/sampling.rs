@@ -13,15 +13,9 @@ use hip_bridge::{HipError, HipResult};
 
 /// Whether the multi-workgroup parallel sampler is enabled (default ON).
 /// `HIPFIRE_SAMPLE_PARALLEL=0` forces the legacy single-block kernel (for
-/// byte-exact A/B and as a fallback). Read once, cached.
+/// byte-exact A/B and as a fallback). Snapshot-backed, no per-flag cache.
 fn sample_parallel_enabled() -> bool {
-    use std::sync::OnceLock;
-    static EN: OnceLock<bool> = OnceLock::new();
-    *EN.get_or_init(|| {
-        hipfire_config::developer_var("HIPFIRE_SAMPLE_PARALLEL")
-            .map(|v| v != "0")
-            .unwrap_or(true)
-    })
+    hipfire_config::developer_bool("HIPFIRE_SAMPLE_PARALLEL", true)
 }
 
 /// Whether the tie-safe fast reducer is enabled (default ON). This keeps the
@@ -29,13 +23,7 @@ fn sample_parallel_enabled() -> bool {
 /// performance control without falling all the way back to the single-block
 /// sampler.
 fn sample_fast_stable_enabled() -> bool {
-    use std::sync::OnceLock;
-    static EN: OnceLock<bool> = OnceLock::new();
-    *EN.get_or_init(|| {
-        hipfire_config::developer_var("HIPFIRE_SAMPLE_FAST")
-            .map(|v| v != "0")
-            .unwrap_or(true)
-    })
+    hipfire_config::developer_bool("HIPFIRE_SAMPLE_FAST", true)
 }
 
 /// HIP source for the default parallel sampler module (`sample_top_p_parallel`,
@@ -819,7 +807,9 @@ impl Gpu {
         k: usize,
         b: usize,
     ) -> HipResult<()> {
-        self.launch_topk_batched_f32(logits, top_idx, top_logp, vocab, k, b, /*raw_values=*/ false)
+        self.launch_topk_batched_f32(
+            logits, top_idx, top_logp, vocab, k, b, /*raw_values=*/ false,
+        )
     }
 
     /// Per-row top-K over `[B × vocab]` f32 logits, returning raw top logits
@@ -830,14 +820,16 @@ impl Gpu {
     /// Constraints: K ≤ 16 (kernel-enforced).
     pub fn topk_values_batched_f32(
         &mut self,
-        logits: &GpuTensor,    // [B × vocab] f32
-        top_idx: &GpuTensor,   // [B × K] i32 (f32 tensor storage — caller reinterprets)
+        logits: &GpuTensor,     // [B × vocab] f32
+        top_idx: &GpuTensor,    // [B × K] i32 (f32 tensor storage — caller reinterprets)
         top_values: &GpuTensor, // [B × K] f32 raw top logits
         vocab: usize,
         k: usize,
         b: usize,
     ) -> HipResult<()> {
-        self.launch_topk_batched_f32(logits, top_idx, top_values, vocab, k, b, /*raw_values=*/ true)
+        self.launch_topk_batched_f32(
+            logits, top_idx, top_values, vocab, k, b, /*raw_values=*/ true,
+        )
     }
 
     fn launch_topk_batched_f32(
@@ -851,11 +843,7 @@ impl Gpu {
         raw_values: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        assert!(
-            k >= 1 && k <= 16,
-            "topk_batched: K={} must be in [1,16]",
-            k
-        );
+        assert!(k >= 1 && k <= 16, "topk_batched: K={} must be in [1,16]", k);
         self.ensure_kernel(
             "topk_logsumexp_batched",
             kernels::TOPK_LOGSUMEXP_BATCHED_SRC,
@@ -1575,10 +1563,14 @@ impl Gpu {
     /// greedy; otherwise samples each slot with its own parameters. Per-slot
     /// dispatch is correct but not optimal — a fused kernel is a later
     /// optimisation, and SP2 is explicitly components-not-performance.
+    /// `params` is `&mut` because each sampling slot's RNG state advances with
+    /// the token it drew: reusing the entry seed every step redraws the same
+    /// uniform forever, which collapses a temperature slot onto one fixed
+    /// quantile of its own distribution.
     pub fn sample_per_slot(
         &mut self,
         logits: &GpuTensor,
-        params: &[SlotSampleParams],
+        params: &mut [SlotSampleParams],
         n_slots: usize,
         vocab: usize,
         out_tokens: &GpuTensor,
@@ -1596,8 +1588,10 @@ impl Gpu {
             // crates/hipfire-arch-deepseek4/src/forward.rs and others.
             return self.argmax_f32_batched(logits, out_tokens, vocab, n_slots);
         }
-        for (i, p) in params.iter().enumerate() {
-            self.sample_slot_row(logits, i, vocab, p, out_tokens)?;
+        for i in 0..n_slots {
+            let mut p = params[i];
+            self.sample_slot_row(logits, i, vocab, &mut p, out_tokens)?;
+            params[i] = p;
         }
         Ok(())
     }
@@ -1615,7 +1609,7 @@ impl Gpu {
         logits: &GpuTensor,
         i: usize,
         vocab: usize,
-        p: &SlotSampleParams,
+        p: &mut SlotSampleParams,
         out_tokens: &GpuTensor,
     ) -> HipResult<()> {
         let row = logits.sub_offset(i * vocab, vocab);
@@ -1642,7 +1636,7 @@ impl Gpu {
                 vocab,
                 p.temperature,
                 p.top_p,
-                p.seed,
+                p.rng_state(),
                 0,   // repeat_window: no cross-slot repetition history here
                 1.0, // repeat_penalty: 1.0 == disabled (kernel checks `> 1.0`)
                 0.0, // presence_penalty: disabled
@@ -1652,7 +1646,9 @@ impl Gpu {
             );
             self.free_tensor(result_buf)?;
             self.free_tensor(repeat_buf)?;
-            sample_result?.0
+            let (token_id, next_rng) = sample_result?;
+            p.seed = next_rng;
+            token_id
         };
 
         self.hip.memcpy_htod(&out_row.buf, &token_id.to_ne_bytes())
@@ -1672,7 +1668,20 @@ pub struct SlotSampleParams {
     pub top_p: f32,
     /// 0 disables top-k for this slot.
     pub top_k: i32,
+    /// RNG state, advanced by every non-greedy draw.
     pub seed: u32,
+}
+
+impl SlotSampleParams {
+    pub fn rng_state(&self) -> u32 {
+        // xorshift32 has an absorbing all-zero state. Preserve every caller
+        // supplied nonzero seed exactly, but map zero onto a fixed live state.
+        if self.seed == 0 {
+            0xA341_316C
+        } else {
+            self.seed
+        }
+    }
 }
 
 /// True when every slot is greedy, so the batch can take the argmax fast path.
@@ -1727,5 +1736,18 @@ mod slot_sample_tests {
             !all_greedy(&mixed),
             "one sampling slot must disable the greedy fast path"
         );
+    }
+
+    #[test]
+    fn a_zero_seed_never_reaches_the_xorshift_dead_state() {
+        let dead = SlotSampleParams {
+            temperature: 0.7,
+            top_p: 0.95,
+            top_k: 20,
+            seed: 0,
+        };
+        assert_ne!(dead.rng_state(), 0);
+        let live = SlotSampleParams { seed: 1234, ..dead };
+        assert_eq!(live.rng_state(), 1234, "a real seed passes through");
     }
 }

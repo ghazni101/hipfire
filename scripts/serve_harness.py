@@ -304,9 +304,18 @@ def build_config(args):
             selected_budget = "uncapped"
         else:
             selected_budget = "med"
-    think_cap = THINKING_BUDGET.get(selected_budget)
-    if think_cap is None:
+    named_think_cap = THINKING_BUDGET.get(selected_budget)
+    if named_think_cap is None:
         sys.exit(f"thinking_budget {selected_budget!r} not a key of {list(THINKING_BUDGET)}")
+    request_think_cap = getattr(args, "max_think_tokens", None)
+    if request_think_cap is not None and request_think_cap < 0:
+        sys.exit("--max-think-tokens must be >= 0")
+    think_cap = request_think_cap if request_think_cap is not None else named_think_cap
+    think_cap_source = (
+        "explicit(--max-think-tokens)"
+        if request_think_cap is not None
+        else f"named-budget({selected_budget})"
+    )
     draft = getattr(args, "draft", None)
     if draft:
         draft = os.path.abspath(os.path.expanduser(draft))
@@ -404,7 +413,10 @@ def build_config(args):
         "mtp_ngram_min": mtp_ngram_min,
         "mtp_ngram_max": mtp_ngram_max,
         "draft": draft,
-        "thinking_budget": selected_budget, "thinking_cap_tokens": think_cap,
+        "thinking_budget": selected_budget,
+        "thinking_cap_tokens": think_cap,
+        "thinking_cap_source": think_cap_source,
+        "request_max_think_tokens": request_think_cap,
         "max_tokens": max_tokens,
         "max_tokens_source": max_tokens_source,
         "sampling": samp, "sampling_source": samp_src,
@@ -491,11 +503,11 @@ def show_config(cfg):
     prompt_source = cfg.get("prompt_file") or cfg.get("prompts_file") or cfg.get("niah_file") or "(built-in battery)"
     print(f"  seed          : {cfg.get('seed')}   prompt_source: {prompt_source}")
     _cap = cfg['thinking_cap_tokens']
-    _thinking_off = cfg['thinking_budget'] == 'off'
+    _thinking_off = _cap == 1
     _resolved = ('thinking DISABLED (sentinel cap 1)' if _thinking_off
                  else 'uncapped' if _cap == 0
                  else f'{_cap} tok (CONCRETE cap)')
-    print(f"  thinking_budget: {cfg['thinking_budget']} -> {_resolved}")
+    print(f"  thinking_cap  : {_resolved} [{cfg['thinking_cap_source']}]")
     print(f"  reasoning_effort: {cfg['sampling'].get('reasoning_effort', 'auto')}"
           "  (parent prompt semantics; independent of cap)")
     _note = ('no think block emitted' if _thinking_off
@@ -1706,6 +1718,7 @@ def _self_test_thinking_effort():
             draft=None,
             thinking=None,
             thinking_effort=None,
+            max_think_tokens=None,
             max_tokens=None,
             max_seq=None,
             sampling="greedy",
@@ -1740,6 +1753,23 @@ def _self_test_thinking_effort():
     assert cfg["sampling"]["reasoning_effort"] == "medium"
     assert cfg["thinking_budget"] == "high"
     assert cfg["thinking_cap_tokens"] == THINKING_BUDGET["high"]
+
+    # The exact per-turn numeric cap is independent of semantic effort and
+    # overrides the named budget only on the request wire.
+    cfg = build_config(
+        _ns(
+            thinking_effort="medium",
+            thinking="low",
+            max_think_tokens=4096,
+        )
+    )
+    assert cfg["sampling"]["reasoning_effort"] == "medium"
+    assert cfg["thinking_budget"] == "low"
+    assert cfg["thinking_cap_tokens"] == 4096
+    assert cfg["thinking_cap_source"] == "explicit(--max-think-tokens)"
+    assert cfg["request_max_think_tokens"] == 4096
+    body = _request_body(cfg, [{"role": "user", "content": "test"}])
+    assert body["max_think_tokens"] == 4096
 
     print("serve_harness: thinking-effort self-test OK", flush=True)
 
@@ -2003,6 +2033,48 @@ def gram3(toks):
     g = [tuple(toks[i:i+3]) for i in range(len(toks)-2)]
     from collections import Counter
     c = Counter(g); return sum(v for v in c.values() if v > 1) / len(g)
+
+# An attractor is *repetition*: the frequency tests below are meaningless on a
+# window too short to repeat in. A one-"word" answer (`Paris`, compact JSON
+# `{"name":"Alice","age":34}`, a bare number) has maxfreq == 1.0 by
+# construction and used to fail every short-answer battery turn at random —
+# the gate hard-floors on it (hw-gate run 33862054891, qwen3.8 format turn,
+# recall 6/6). Runaway/empty cover the degenerate short cases.
+ATTRACTOR_MIN_WINDOW = 8
+
+def _token_attractor(toks):
+    first, last, half = toks[:128], toks[-128:], toks[len(toks)//2:]
+    short = len(toks) < ATTRACTOR_MIN_WINDOW
+    return (
+        (not short and (uniq(first) < 0.15 or maxfreq(first) > 0.50))
+        or (not short and (uniq(last) < 0.30 or maxfreq(last) > 0.50))
+        or gram3(half) > 0.50
+    )
+
+def _response_has_attractor(think_text, visible_text):
+    # A reasoning model commonly drafts its eventual answer near the end of
+    # reasoning, then emits that answer visibly. Concatenating both channels
+    # turns this normal cross-channel repetition into a false token attractor.
+    # Score each channel independently; genuine repetition in either still fails.
+    think_tokens = re.findall(r"\S+", think_text.strip())
+    visible_tokens = re.findall(r"\S+", visible_text.strip())
+    return _token_attractor(think_tokens) or _token_attractor(visible_tokens)
+
+def _self_test_attractor_channels():
+    draft = [f"answer-{i}" for i in range(60)]
+    reasoning = " ".join([f"plan-{i}" for i in range(70)] + draft)
+    visible = " ".join(draft)
+    combined = re.findall(r"\S+", f"{reasoning} {visible}")
+    assert _token_attractor(combined), "fixture must reproduce the old false positive"
+    assert not _response_has_attractor(reasoning, visible)
+    assert _response_has_attractor("loop " * 200, "")
+    # Short answers cannot repeat enough to be attractors: one token, a
+    # compact JSON object, a bare number, a two-word echo.
+    for short in ('{"name":"Alice","age":34,"city":"Lisbon"}', "Paris", "43", "yes yes"):
+        assert not _response_has_attractor("", short), f"false positive on short answer {short!r}"
+    # ...but a genuinely degenerate short window still trips once it can repeat.
+    assert _response_has_attractor("", " ".join(["the"] * ATTRACTOR_MIN_WINDOW))
+    print("serve_harness: attractor-channel self-test OK", flush=True)
 
 def _project_mtp_ngram_timings(timings):
     """Project MTP/ngram timing fields from a daemon timings object for report rows.
@@ -2366,14 +2438,26 @@ def _run_glimmer_cache_tool_session(cfg, args, scenario):
 
 
 
-def send(cfg, messages, tools=None):
-    body = {"model": cfg["model"], "messages": messages, "max_tokens": cfg["max_tokens"],
-            "stream": True, "stream_options": {"include_usage": True}}
+def _request_body(cfg, messages, tools=None):
+    body = {
+        "model": cfg["model"],
+        "messages": messages,
+        "max_tokens": cfg["max_tokens"],
+        "stream": True,
+        "stream_options": {"include_usage": True},
+    }
     body.update(cfg["sampling"])
+    if cfg.get("request_max_think_tokens") is not None:
+        body["max_think_tokens"] = cfg["request_max_think_tokens"]
     if cfg.get("seed") is not None:
         body["seed"] = cfg["seed"]
     if tools is not None:
         body["tools"] = tools
+    return body
+
+
+def send(cfg, messages, tools=None):
+    body = _request_body(cfg, messages, tools)
     # Exact bytes sent for md5 (AGENTS.md discipline: byte-identical prompts + request identity)
     body_bytes = json.dumps(body, ensure_ascii=False).encode("utf-8")
     request_md5 = hashlib.md5(body_bytes).hexdigest()
@@ -2425,10 +2509,7 @@ def send(cfg, messages, tools=None):
     # Legacy stringified preview for backwards compat
     tool_s = " ".join(json.dumps(tc) for tc in tool_calls) if tool_calls else ""
     visible = (ans_s + " " + tool_s).strip()
-    toks = re.findall(r"\S+", (think_s + " " + visible).strip())
-    first, last, half = toks[:128], toks[-128:], toks[len(toks)//2:]
-    bad = (bool(first) and (uniq(first) < 0.15 or maxfreq(first) > 0.50)) or \
-          (bool(last) and (uniq(last) < 0.30 or maxfreq(last) > 0.50)) or (gram3(half) > 0.50)
+    bad = _response_has_attractor(think_s, visible)
     # ATEM leak detection (visible content deltas must not contain raw ATEM markup)
     atem_leak = ("<atem:" in ans_s) or ("<atem:" in think_s) or any("<atem:" in (tc.get("function", {}).get("arguments") or "") for tc in tool_calls)
     return {
@@ -2772,6 +2853,14 @@ def main():
                     help="explicit reasoning cap policy. Default: registry thinking_budget; "
                          "otherwise uncapped for an explicit effort, med for legacy callers. "
                          "\"off\" disables thinking (cap sentinel 1).")
+    ap.add_argument(
+        "--max-think-tokens",
+        type=int,
+        default=None,
+        help="exact per-request reasoning cap sent as max_think_tokens; "
+             "independent of --thinking-effort and overrides the named --thinking cap "
+             "(0=uncapped, 1=disabled, >=2=force-close at that token count)",
+    )
     ap.add_argument("--max-tokens", type=int, default=None,
                     help="generation cap; omitted resolves canonical-tag policy then 2048")
     ap.add_argument("--max-seq", type=int, default=None,
@@ -2858,6 +2947,7 @@ def main():
         _self_test_glimmer_feedback_shape()
         _self_test_glimmer_tool_delta_merge()
         _self_test_glimmer_transcript_and_trace()
+        _self_test_attractor_channels()
         return
     if not args.model:
         ap.error("--model is required unless --self-test")
@@ -2868,15 +2958,15 @@ def main():
         return
     # `off` resolves to the sentinel cap 1, which is not a real think budget — no
     # think block is emitted at all, so the think-only-output guard does not apply.
-    if (cfg['thinking_budget'] != 'off'
+    if (cfg['thinking_cap_tokens'] != 1
             and cfg['thinking_cap_tokens']
             and cfg['max_tokens'] <= cfg['thinking_cap_tokens']):
         sys.exit(
-            f"serve_harness: max_tokens ({cfg['max_tokens']}) <= thinking budget "
-            f"'{cfg['thinking_budget']}' ({cfg['thinking_cap_tokens']} tok) guarantees "
+            f"serve_harness: max_tokens ({cfg['max_tokens']}) <= thinking cap "
+            f"({cfg['thinking_cap_tokens']} tok from {cfg['thinking_cap_source']}) guarantees "
             f"think-only output with zero visible answer. Raise --max-tokens above "
-            f"{cfg['thinking_cap_tokens']}, lower --thinking (low={THINKING_BUDGET['low']}), "
-            f"or use --thinking uncapped."
+            f"{cfg['thinking_cap_tokens']}, lower --max-think-tokens/--thinking, "
+            "or use --max-think-tokens 0."
         )
     log_offset = 0
     if not args.no_spawn:

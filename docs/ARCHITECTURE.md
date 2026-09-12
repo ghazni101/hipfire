@@ -249,7 +249,7 @@ kernels/src/<name>.gfx12.hip            # family override (e.g. gfx1200+gfx1201)
         │  scripts/compile-kernels.sh  (chip → family → base)
         ▼
 kernels/compiled/<arch>/…               # packaged / tree prebuild output
-./.hipfire_kernels/<arch>/…             # default JIT cache (or HIPFIRE_KERNEL_CACHE)
+~/.hipfire_kernels/<arch>/<name>.<hash>.hsaco  # default JIT cache (or HIPFIRE_KERNEL_CACHE)
 ```
 
 On startup the runtime prefers a hash-matching precompiled blob. Missing or

@@ -88,6 +88,12 @@ pub struct Lfm2MoeBundle {
     /// so `LoadedModel` can become arch-free. Previously
     /// `LoadedModel.lfm2_decode_batch`.
     pub lfm2_decode_batch: Option<crate::batch::Lfm2DecodeBatchState>,
+    /// Optional SigLIP2-NaFlex tower + multi-modal projector, present only
+    /// for `lfm2_vl` artifacts quantized with `--include-vision`. Text-only
+    /// checkpoints keep `None` on both fields; images fail closed at the
+    /// daemon gate via `LoadedModel::has_vision_encoder()`.
+    pub vision_config: Option<hipfire_arch_lfm2_vl::VisionConfig>,
+    pub vision_weights: Option<hipfire_arch_lfm2_vl::VisionWeights>,
 }
 
 /// LFM2.5-MoE verify scratch: the pre-verify conv-state snapshot.

@@ -7,7 +7,7 @@
 //!
 //! Uses the same model file as both drafter (for scoring) and target (for
 //! prefill+decode) so this runs without a matched-tokenizer Qwen3.5
-//! drafter; that pairing is escalated in MANUAL_REVIEW.md. Tests the
+//! drafter; that pairing is escalated in docs/investigations/pflash/2026-05-manual-review.md. Tests the
 //! pipeline correctness, not retrieval quality at heavy compression on a
 //! small model.
 //!
