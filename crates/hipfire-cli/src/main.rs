@@ -10131,6 +10131,10 @@ mod tests {
 
             let registry = hipfire_registry::bundled().unwrap();
             let shared = Arc::new(ServeShared {
+                capabilities: crate::serve::route_capabilities(
+                    false, 4, 8192, 1024, false, 0, false, false, 4096, 1, 64,
+                    268435456, 30000, 4 << 20, 30_000, 64 << 20,
+                ),
                 metrics: crate::serve::metrics::Metrics::default(),
                 runtime: Mutex::new(ServeRuntime {
                     engine,
