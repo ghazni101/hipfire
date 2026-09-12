@@ -91,18 +91,21 @@ impl SessionTable {
         adm: &mut AdmissionController,
         requested_ctx: usize,
     ) -> Result<SessionId, AdmitError> {
-        let granted_ctx = adm.admit(requested_ctx)?;
+        // Mint the id first so the admission grant is keyed by it — two
+        // sessions with identical context sizes must never release each
+        // other's budget.
+        let id = self.next_id;
+        let granted_ctx = adm.admit(id, requested_ctx)?;
         let slot = match pool.acquire() {
             Some(slot) => slot,
             None => {
-                adm.release(granted_ctx);
+                adm.release(id);
                 return Err(AdmitError::PoolFull);
             }
         };
         // Monotonically increasing, never reused: a stale id from a closed
         // session must resolve to `None`, never silently address whoever now
         // holds that slot.
-        let id = self.next_id;
         self.next_id += 1;
         self.sessions.insert(
             id,
@@ -129,7 +132,7 @@ impl SessionTable {
             if let Some(slot) = session.slot {
                 pool.release(slot);
             }
-            adm.release(session.granted_ctx);
+            adm.release(id.0);
         }
     }
 

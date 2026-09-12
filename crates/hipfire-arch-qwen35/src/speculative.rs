@@ -1370,6 +1370,26 @@ impl DeltaNetSnapshot {
         Ok(snap)
     }
 
+    /// Total device bytes a snapshot of `state` would occupy, computed
+    /// WITHOUT allocating — lets `capture_checkpoint` pre-check the pool
+    /// ceiling before paying for `hipMalloc` + device-to-device copy.
+    pub fn bytes_for(state: &DeltaNetState) -> u64 {
+        let mut total: u64 = 0;
+        for t in &state.s_matrices {
+            total += t.buf.size() as u64;
+        }
+        for t in &state.s_scales {
+            total += t.buf.size() as u64;
+        }
+        for t in &state.conv_states {
+            total += t.buf.size() as u64;
+        }
+        for t in &state.s_ef_residual {
+            total += t.buf.size() as u64;
+        }
+        total
+    }
+
     /// Number of EF residual backup buffers (0 when EF is off).
     #[inline]
     pub fn s_ef_len(&self) -> usize {

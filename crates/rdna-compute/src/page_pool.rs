@@ -184,9 +184,17 @@ pub struct CowCopy {
 /// the reserved pages on failure.  This ordering ensures a failed
 /// reservation leaves the original table and pool state intact (spec §4.3:
 /// "transactional failure releases only newly reserved resources").
-#[derive(Debug, Clone)]
+/// A plan's reserved pages are released by [`PagePool::commit_cow`] or
+/// [`PagePool::abort_cow`], both of which consume the plan. Dropping an
+/// armed plan leaks its reserved pages — the `Drop` impl logs loudly
+/// because the pool cannot be reached from here.
+#[derive(Debug)]
+#[must_use = "a CowPlan holds reserved pages; pass it to commit_cow or abort_cow"]
 pub struct CowPlan {
     copies: Vec<CowCopy>,
+    /// True while the reserved destination pages are still owned by this
+    /// plan. Disarmed by commit/abort; an armed drop is a leak.
+    armed: bool,
 }
 
 impl CowPlan {
@@ -199,6 +207,18 @@ impl CowPlan {
     /// Sealed/CacheOnly pages).
     pub fn is_empty(&self) -> bool {
         self.copies.is_empty()
+    }
+}
+
+impl Drop for CowPlan {
+    fn drop(&mut self) {
+        if self.armed {
+            eprintln!(
+                "[page-pool] CowPlan dropped while armed: {} reserved page(s) \
+                 leak (commit_cow/abort_cow consume the plan)",
+                self.copies.len()
+            );
+        }
     }
 }
 
@@ -422,6 +442,21 @@ impl PagePool {
         self.k_arena_bytes()
     }
 
+
+    /// Bounds-check a physical page index. Every public entry point that
+    /// takes a `phys` calls this first — a stale or fabricated index must
+    /// produce `Err`, never an out-of-bounds `page_meta` panic.
+    #[inline]
+    fn check_phys(&self, phys: u32) -> Result<(), String> {
+        if (phys as usize) < self.n_pages {
+            Ok(())
+        } else {
+            Err(format!(
+                "PagePool: phys {} out of bounds (n_pages={})",
+                phys, self.n_pages
+            ))
+        }
+    }
     /// Bytes of the K arena.
     pub fn k_arena_bytes(&self) -> usize {
         self.n_pages * self.k_page_bytes()
@@ -443,21 +478,102 @@ impl PagePool {
         self.n_pages * PAGE_TOKENS
     }
 
+    /// Debug-only structural invariant check (spec §9.2 observability).
+    ///
+    /// Asserts the page-accounting invariants that a leak or double-free
+    /// would break:
+    /// - every page is accounted exactly once: free list + per-state
+    ///   residency == `n_pages`;
+    /// - the free list contains only `Free` pages, no duplicates;
+    /// - `reclaim_pending` contains only `ReclaimPending` pages;
+    /// - `Free` pages carry zero refs; `ReclaimPending` pages carry no
+    ///   table/cache refs (in-flight reads may remain).
+    ///
+    /// O(n_pages) — call from a debug flag, never the hot path.
+    pub fn check_invariants(&self) {
+        let mut seen = vec![false; self.n_pages];
+        for &p in &self.free_pages {
+            let m = &self.page_meta[p as usize];
+            assert_eq!(
+                m.state,
+                PageState::Free,
+                "free list holds non-Free page {p} (state={:?})",
+                m.state
+            );
+            assert_eq!(
+                m.total_refs(),
+                0,
+                "free page {p} carries {} refs",
+                m.total_refs()
+            );
+            assert!(!seen[p as usize], "free list duplicates page {p}");
+            seen[p as usize] = true;
+        }
+        for &p in &self.reclaim_pending {
+            let m = &self.page_meta[p as usize];
+            assert_eq!(
+                m.state,
+                PageState::ReclaimPending,
+                "reclaim_pending holds page {p} in state {:?}",
+                m.state
+            );
+            assert_eq!(
+                m.table_refs + m.cache_refs,
+                0,
+                "reclaim-pending page {p} still has table/cache refs"
+            );
+            assert!(!seen[p as usize], "page {p} both free and reclaim-pending");
+            seen[p as usize] = true;
+        }
+        let mut accounted = self.free_pages.len() + self.reclaim_pending.len();
+        for (p, m) in self.page_meta.iter().enumerate() {
+            match m.state {
+                PageState::Private | PageState::Sealed | PageState::CacheOnly => {
+                    accounted += 1;
+                    assert!(
+                        m.table_refs + m.cache_refs > 0,
+                        "resident page {p} has no owner refs (state={:?})",
+                        m.state
+                    );
+                }
+                PageState::Free | PageState::ReclaimPending => {}
+            }
+        }
+        assert_eq!(
+            accounted, self.n_pages,
+            "page accounting drift: {accounted} accounted vs {} physical",
+            self.n_pages
+        );
+    }
+
     // ── Wave 2: per-page metadata accessors ───────────────────────────
 
     /// Total refcount (all lease classes) for physical page `phys`.
     pub(crate) fn refcount(&self, phys: u32) -> u32 {
+        if self.check_phys(phys).is_err() {
+            return 0;
+        }
         self.page_meta[phys as usize].total_refs()
     }
 
     /// Current [`PageState`] of physical page `phys`.
     pub fn page_state(&self, phys: u32) -> PageState {
+        if self.check_phys(phys).is_err() {
+            // Fail closed: an out-of-range page reports as Free so no
+            // caller treats it as a live allocation.
+            return PageState::Free;
+        }
         self.page_meta[phys as usize].state
     }
 
     /// Current generation of physical page `phys`.  A [`PageHandle`]
     /// carrying a mismatched generation is stale.
     pub fn page_generation(&self, phys: u32) -> u32 {
+        if self.check_phys(phys).is_err() {
+            // A generation no real page can match (real generations start
+            // at 0 and wrap upward); any handle compared against it fails.
+            return u32::MAX;
+        }
         self.page_meta[phys as usize].generation
     }
 
@@ -486,6 +602,7 @@ impl PagePool {
                 handle.epoch, self.epoch
             ));
         }
+        self.check_phys(handle.phys)?;
         let meta = &self.page_meta[handle.phys as usize];
         if meta.generation != handle.generation {
             return Err(format!(
@@ -509,6 +626,7 @@ impl PagePool {
     /// it reaches zero.  Returns `Err` on underflow (spec §4.3: checked
     /// arithmetic, no wraparound).
     fn dec_table_ref(&mut self, phys: u32) -> Result<(), String> {
+        self.check_phys(phys)?;
         let meta = &mut self.page_meta[phys as usize];
         if meta.table_refs == 0 {
             return Err(format!(
@@ -662,6 +780,7 @@ impl PagePool {
         }
         for lp in 0..n_pages {
             let phys = src.physical(lp).expect("src page exists");
+            self.check_phys(phys)?;
             let meta = &mut self.page_meta[phys as usize];
             meta.table_refs = meta
                 .table_refs
@@ -681,6 +800,7 @@ impl PagePool {
     /// Uses checked arithmetic — returns `Err` on overflow or if the page
     /// is Free.
     pub fn refcount_inc(&mut self, phys: u32) -> Result<(), String> {
+        self.check_phys(phys)?;
         let meta = &mut self.page_meta[phys as usize];
         if meta.state == PageState::Free {
             return Err(format!("refcount_inc: phys {} is Free", phys));
@@ -727,13 +847,30 @@ impl PagePool {
 
     /// Free the last `n_pages` pages from `table`, decrementing table
     /// refcounts with checked arithmetic.  Used when trimming a session's
-    /// KV (e.g. sliding window eviction).  Returns `Err` on underflow.
+    /// KV (e.g. sliding window eviction).
+    ///
+    /// All-or-nothing: every tail page's refcount is verified BEFORE the
+    /// table is truncated, so an underflow leaves the table and the pool
+    /// untouched instead of stranding pages that are no longer mapped.
+    /// Returns `Err` on underflow.
     pub fn free_pages_from_tail(
         &mut self,
         table: &mut BlockTable,
         n_pages: usize,
     ) -> Result<(), String> {
-        let freed = table.truncate(table.num_pages().saturating_sub(n_pages));
+        let keep = table.num_pages().saturating_sub(n_pages);
+        // Verify phase: every page about to be dropped must hold a table
+        // ref. dec_table_ref cannot fail after this.
+        for &phys in &table.pages[keep..] {
+            if self.page_meta[phys as usize].table_refs == 0 {
+                return Err(format!(
+                    "free_pages_from_tail: table_refs underflow for phys {} \
+                     (state={:?}) — table unchanged",
+                    phys, self.page_meta[phys as usize].state
+                ));
+            }
+        }
+        let freed = table.truncate(keep);
         for phys in freed {
             self.dec_table_ref(phys)?;
         }
@@ -819,6 +956,7 @@ impl PagePool {
         if write_end == write_start {
             return Ok(CowPlan {
                 copies: Vec::new(),
+                armed: false,
             });
         }
 
@@ -875,7 +1013,7 @@ impl PagePool {
             }
         }
 
-        Ok(CowPlan { copies })
+        Ok(CowPlan { copies, armed: true })
     }
 
     /// Rebind the block table entries per `plan` and adjust refcounts on
@@ -883,16 +1021,56 @@ impl PagePool {
     /// memcpys described by the plan have been issued (spec §4.3: "rebind
     /// table only after copy ordering established").
     ///
+    /// All-or-nothing: every copy's source mapping is verified against the
+    /// table BEFORE any rebind or refcount change. If the table was
+    /// truncated, reallocated, or already partially committed since
+    /// `plan_cow`, the commit fails and the plan's reserved pages are
+    /// released — the table is left untouched.
+    ///
     /// Old pages whose table refs reach zero transition to Free,
     /// CacheOnly, or ReclaimPending as appropriate.
-    pub fn commit_cow(&mut self, table: &mut BlockTable, plan: &CowPlan) -> Result<(), String> {
-        for c in plan.copies() {
-            // Rebind the table entry to the private copy.
+    pub fn commit_cow(&mut self, table: &mut BlockTable, mut plan: CowPlan) -> Result<(), String> {
+        // Verify phase: the table must still map each logical page to the
+        // plan's source, and every source must still hold a table ref.
+        // Anything else means the table changed under the plan — committing
+        // would dec a ref this table no longer holds (underflow/double-free)
+        // or leak the page being overwritten.
+        let mut failure: Option<String> = None;
+        for c in &plan.copies {
+            match table.physical(c.logical_page) {
+                Some(p) if p == c.src_phys => {}
+                other => {
+                    let got = other.map(|p| p.to_string()).unwrap_or_else(|| "none".into());
+                    failure = Some(format!(
+                        "commit_cow: logical page {} maps to {} not src {} — \
+                         table changed since plan_cow; aborted",
+                        c.logical_page, got, c.src_phys
+                    ));
+                    break;
+                }
+            }
+            if self.page_meta[c.src_phys as usize].table_refs == 0 {
+                failure = Some(format!(
+                    "commit_cow: src phys {} has table_refs=0 — aborted",
+                    c.src_phys
+                ));
+                break;
+            }
+        }
+        if let Some(msg) = failure {
+            // Release the plan's reserved pages; the table is untouched.
+            plan.armed = false;
+            for c in &plan.copies {
+                self.release_reserved(c.dst_phys);
+            }
+            return Err(msg);
+        }
+        // Apply phase: verified above, so dec_table_ref cannot fail.
+        for c in &plan.copies {
             table.set_page(c.logical_page, c.dst_phys);
-            // Decrement the old page's table ref (this table no longer
-            // references it).
             self.dec_table_ref(c.src_phys)?;
         }
+        plan.armed = false;
         Ok(())
     }
 
@@ -900,10 +1078,11 @@ impl PagePool {
     /// table.  Call this when the GPU memcpy failed or the step was
     /// cancelled (spec §4.3: "transactional failure releases only newly
     /// reserved resources").
-    pub fn abort_cow(&mut self, plan: &CowPlan) {
-        for c in plan.copies() {
+    pub fn abort_cow(&mut self, mut plan: CowPlan) {
+        for c in &plan.copies {
             self.release_reserved(c.dst_phys);
         }
+        plan.armed = false;
     }
 
     // ── Deferred reclaim (spec §4.4 C4) ───────────────────────────────
@@ -914,6 +1093,7 @@ impl PagePool {
     ///
     /// Returns `Err` if the page is Free or on overflow.
     pub fn add_inflight_ref(&mut self, phys: u32) -> Result<(), String> {
+        self.check_phys(phys)?;
         let meta = &mut self.page_meta[phys as usize];
         if meta.state == PageState::Free {
             return Err(format!("add_inflight_ref: phys {} is Free", phys));
@@ -943,6 +1123,7 @@ impl PagePool {
     ///
     /// [`drain_completed`]: PagePool::drain_completed
     pub fn release_inflight_ref(&mut self, phys: u32) -> Result<(), String> {
+        self.check_phys(phys)?;
         let meta = &mut self.page_meta[phys as usize];
         if meta.inflight_refs == 0 {
             return Err(format!(
@@ -1008,6 +1189,7 @@ impl PagePool {
     ///
     /// Returns `Err` if the page is Free or on overflow.
     pub fn add_cache_ref(&mut self, phys: u32) -> Result<(), String> {
+        self.check_phys(phys)?;
         let meta = &mut self.page_meta[phys as usize];
         if meta.state == PageState::Free {
             return Err(format!("add_cache_ref: phys {} is Free", phys));
@@ -1039,6 +1221,7 @@ impl PagePool {
     /// never see it).  Returns `Err` on underflow.
     pub fn release_cache_ref(&mut self, phys: u32) -> Result<(), String> {
         let disposition = {
+            self.check_phys(phys)?;
             let meta = &mut self.page_meta[phys as usize];
             if meta.cache_refs == 0 {
                 return Err(format!(
@@ -1080,11 +1263,14 @@ impl PagePool {
     /// `block_table_dev_addr` is the GPU address of the uploaded page
     /// index array (i32 per page). The descriptor is in paged mode.
     pub fn make_desc(&self, table: &BlockTable, block_table_dev_addr: u64) -> KvSlotDesc {
+        // seq_len is i32 on the wire; clamp rather than wrap — a wrapped
+        // negative reads as a huge positive length in the kernel.
+        let seq_len = table.live_tokens().min(i32::MAX as usize) as i32;
         KvSlotDesc {
             block_table: block_table_dev_addr,
             legacy_k_base: 0,
             legacy_v_base: 0,
-            seq_len: table.live_tokens() as i32,
+            seq_len,
             page_tokens: PAGE_TOKENS as i32,
         }
     }
@@ -1092,13 +1278,14 @@ impl PagePool {
     /// Build a legacy-mode KvSlotDesc (contiguous slab at `base`).
     /// Used for backward compatibility with non-paged code paths.
     pub fn make_legacy_desc(base: u64, seq_len: usize) -> KvSlotDesc {
+        let seq_len = seq_len.min(i32::MAX as usize) as i32;
         KvSlotDesc {
             block_table: 0,
             // Equal K/V bases: this constructor is for equal-stride legacy
             // arenas (Q8_0 / BF16), where one slab offset serves both.
             legacy_k_base: base,
             legacy_v_base: base,
-            seq_len: seq_len as i32,
+            seq_len,
             page_tokens: 0,
         }
     }
@@ -1130,6 +1317,163 @@ mod tests {
         pool.release_table(&mut table).unwrap();
         assert_eq!(table.num_pages(), 0);
         assert_eq!(pool.free_pages(), 16);
+    }
+
+    /// Deterministic xorshift PRNG — no external deps, reproducible seeds.
+    struct XorShift(u64);
+    impl XorShift {
+        fn next(&mut self) -> u64 {
+            let mut x = self.0;
+            x ^= x << 13;
+            x ^= x >> 7;
+            x ^= x << 17;
+            self.0 = x;
+            x
+        }
+        fn below(&mut self, n: u64) -> u64 {
+            self.next() % n.max(1)
+        }
+    }
+
+    /// Randomized COW/alloc/share/release fuzz against the invariant
+    /// checker. Every op is precondition-checked so failures are real
+    /// bugs, not bad inputs; `check_invariants` runs after every step so
+    /// a refcount drift or double-free is caught at the op that caused it.
+    /// Host-only — no GPU needed.
+    #[test]
+    fn cow_fuzz_invariants_hold_under_random_ops() {
+        let mut rng = XorShift(0x9E3779B97F4A7C15);
+        let mut pool = PagePool::new(32, 1088).unwrap();
+        let mut tables: Vec<BlockTable> = (0..4).map(|_| BlockTable::new()).collect();
+        let mut plans: Vec<Option<(usize, CowPlan)>> = (0..4).map(|_| None).collect();
+        // Cache refs the fuzz itself holds — a page can carry more than
+        // one across a free/realloc cycle, so count them.
+        let mut cache_held: std::collections::HashMap<u32, u32> =
+            std::collections::HashMap::new();
+        for step in 0..2000 {
+            let t = rng.below(4) as usize;
+            match rng.below(10) {
+                // Allocate 1-3 pages.
+                0 => {
+                    let want = 1 + rng.below(3) as usize;
+                    pool.alloc_pages(&mut tables[t], want);
+                }
+                // Share a prefix into another table.
+                1 => {
+                    let src = rng.below(4) as usize;
+                    if src != t && tables[src].num_pages() > 0 {
+                        let n = 1 + rng.below(tables[src].num_pages() as u64) as usize;
+                        let (lo, hi) = if src < t { (src, t) } else { (t, src) };
+                        let (a, b) = tables.split_at_mut(hi);
+                        let (src_t, dst_t) = if src < t {
+                            (&a[lo], &mut b[0])
+                        } else {
+                            (&b[0], &mut a[lo])
+                        };
+                        let _ = pool.share_prefix(src_t, dst_t, n);
+                    }
+                }
+                // Plan a COW over a random write range.
+                2 => {
+                    if tables[t].num_pages() > 0 && plans[t].is_none() {
+                        let end = tables[t].num_pages() * PAGE_TOKENS;
+                        let start = rng.below(end as u64 + 1) as usize;
+                        let stop = start + rng.below((end - start) as u64 + 1) as usize;
+                        if let Ok(plan) = pool.plan_cow(&tables[t], start, stop) {
+                            plans[t] = Some((t, plan));
+                        }
+                    }
+                }
+                // Commit a pending plan.
+                3 => {
+                    if let Some((ti, plan)) = plans[t].take() {
+                        let _ = pool.commit_cow(&mut tables[ti], plan);
+                    }
+                }
+                // Abort a pending plan.
+                4 => {
+                    if let Some((_, plan)) = plans[t].take() {
+                        pool.abort_cow(plan);
+                    }
+                }
+                // Free pages from a table's tail.
+                5 => {
+                    if tables[t].num_pages() > 0 {
+                        let n = 1 + rng.below(tables[t].num_pages() as u64) as usize;
+                        let _ = pool.free_pages_from_tail(&mut tables[t], n);
+                    }
+                }
+                // Release a whole table.
+                6 => {
+                    let _ = pool.release_table(&mut tables[t]);
+                    if let Some((_, plan)) = plans[t].take() {
+                        pool.abort_cow(plan);
+                    }
+                }
+                // Seal a random page of a table.
+                7 => {
+                    if tables[t].num_pages() > 0 {
+                        let lp = rng.below(tables[t].num_pages() as u64) as usize;
+                        if let Some(phys) = tables[t].physical(lp) {
+                            let _ = pool.seal(phys);
+                        }
+                    }
+                }
+                // Add/release a cache ref on a random page.
+                8 => {
+                    if tables[t].num_pages() > 0 {
+                        let lp = rng.below(tables[t].num_pages() as u64) as usize;
+                        if let Some(phys) = tables[t].physical(lp) {
+                            if rng.below(2) == 0 {
+                                if pool.add_cache_ref(phys).is_ok() {
+                                    *cache_held.entry(phys).or_insert(0) += 1;
+                                }
+                            } else if let Some(n) = cache_held.get_mut(&phys) {
+                                if pool.release_cache_ref(phys).is_ok() {
+                                    *n -= 1;
+                                    if *n == 0 {
+                                        cache_held.remove(&phys);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                // Drain reclaim-pending.
+                _ => {
+                    pool.drain_completed();
+                }
+            }
+            pool.check_invariants();
+        }
+
+        // Release the fuzz's own cache refs, then teardown must return
+        // every page.
+        for (phys, n) in cache_held.drain() {
+            for _ in 0..n {
+                let _ = pool.release_cache_ref(phys);
+            }
+        }
+        for entry in plans.iter_mut() {
+            if let Some((_, plan)) = entry.take() {
+                pool.abort_cow(plan);
+            }
+        }
+        for t in &mut tables {
+            let _ = pool.release_table(t);
+        }
+        pool.drain_completed();
+        pool.check_invariants();
+        for p in 0..pool.n_pages() as u32 {
+            let m = pool.page_meta[p as usize];
+            if m.state != PageState::Free {
+                eprintln!(
+                    "leaked page {p}: state={:?} table={} cache={} inflight={}",
+                    m.state, m.table_refs, m.cache_refs, m.inflight_refs
+                );
+            }
+        }
+        assert_eq!(pool.free_pages(), 32, "pages leaked after teardown");
     }
 
     #[test]
@@ -1468,7 +1812,7 @@ mod tests {
         assert_eq!(plan.copies()[0].valid_prefix_tokens, 0); // write from pos 0
 
         // Commit COW: rebind table B's page 0 to the private copy
-        pool.commit_cow(&mut table_b, &plan).unwrap();
+        pool.commit_cow(&mut table_b, plan).unwrap();
 
         // Branch B's page 0 is now private (different from A's)
         assert_ne!(table_b.physical(0), table_a.physical(0));
@@ -1535,11 +1879,65 @@ mod tests {
         assert_eq!(pool.free_pages(), free_before - 1); // one page reserved
 
         // Abort — reserved page released
-        pool.abort_cow(&plan);
+        pool.abort_cow(plan);
         assert_eq!(pool.free_pages(), free_before);
 
         // Table unchanged
         assert_eq!(table.num_pages(), 2);
+    }
+
+    #[test]
+    fn cow_commit_refuses_stale_plan_and_releases_reservations() {
+        // A plan whose table changed between plan_cow and commit_cow must
+        // fail all-or-nothing: no rebind, no refcount drift, and the
+        // reserved destination pages return to the free list.
+        let mut pool = PagePool::new(8, 1088).unwrap();
+        let mut table = BlockTable::new();
+        pool.alloc_pages(&mut table, 2);
+        table.set_live_tokens(2 * PAGE_TOKENS);
+        pool.seal(table.physical(0).unwrap()).unwrap();
+
+        let free_before = pool.free_pages();
+        let plan = pool.plan_cow(&table, 0, PAGE_TOKENS).unwrap();
+        assert_eq!(pool.free_pages(), free_before - 1);
+
+        // Table shrinks under the plan: logical page 0 no longer maps to
+        // the planned source.
+        pool.free_pages_from_tail(&mut table, 2).unwrap();
+        assert_eq!(table.num_pages(), 0);
+
+        let result = pool.commit_cow(&mut table, plan);
+        assert!(result.is_err(), "stale plan must be refused");
+        // Reserved dst page released; table untouched by the failed commit.
+        // Reserved dst page released; the two truncated pages also
+        // returned to the free list.
+        assert_eq!(pool.free_pages(), free_before + 2);
+        assert_eq!(table.num_pages(), 0);
+    }
+
+    #[test]
+    fn cow_commit_twice_is_impossible_by_value() {
+        // commit_cow consumes the plan — a second commit cannot be
+        // expressed. This test pins the companion invariant: after a
+        // successful commit the dst page is table-owned and the src page's
+        // table ref was decremented exactly once.
+        let mut pool = PagePool::new(8, 1088).unwrap();
+        let mut table_a = BlockTable::new();
+        pool.alloc_pages(&mut table_a, 1);
+        table_a.set_live_tokens(PAGE_TOKENS);
+        let mut table_b = BlockTable::new();
+        pool.share_prefix(&table_a, &mut table_b, 1).unwrap();
+        table_b.set_live_tokens(PAGE_TOKENS);
+
+        let src = table_b.physical(0).unwrap();
+        let plan = pool.plan_cow(&table_b, 0, PAGE_TOKENS).unwrap();
+        let dst = plan.copies()[0].dst_phys;
+        pool.commit_cow(&mut table_b, plan).unwrap();
+
+        assert_eq!(table_b.physical(0), Some(dst));
+        // src lost exactly one table ref (B's); A's ref keeps it sealed.
+        assert_eq!(pool.page_state(src), PageState::Sealed);
+        assert_eq!(pool.page_state(dst), PageState::Private);
     }
 
     #[test]
@@ -1584,7 +1982,7 @@ mod tests {
         assert_eq!(pool.free_pages(), 4);
 
         let plan = pool.plan_cow(&table_b, 0, PAGE_TOKENS).unwrap();
-        pool.commit_cow(&mut table_b, &plan).unwrap();
+        pool.commit_cow(&mut table_b, plan).unwrap();
         assert_ne!(table_b.physical(0), table_a.physical(0));
         assert_eq!(
             pool.page_state(table_b.physical(0).unwrap()),
@@ -1835,7 +2233,7 @@ mod tests {
         assert_eq!(plan.copies()[0].src_phys, phys0);
 
         // Commit COW
-        pool.commit_cow(&mut table, &plan).unwrap();
+        pool.commit_cow(&mut table, plan).unwrap();
         assert_ne!(table.physical(0).unwrap(), phys0);
     }
 
