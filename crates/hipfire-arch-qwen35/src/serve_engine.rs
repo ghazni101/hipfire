@@ -2739,13 +2739,11 @@ impl GrammarConstraint {
             // JSON instead of free-running to max_tokens mid-thought and
             // dying as unsatisfiable. Requires the tokenizer to carry the
             // special close id; a text-only close cannot be forced.
-            if self.think_tokens_used >= self.think_budget {
-                if let Some(close_id) = self.think_close_id {
-                    for id in 0..vocab_size as u32 {
-                        self.mask_buf[id as usize] = id == close_id;
-                    }
-                    return Ok(&self.mask_buf);
+            if let Some(close_id) = self.think_close_forced() {
+                for id in 0..vocab_size as u32 {
+                    self.mask_buf[id as usize] = id == close_id;
                 }
+                return Ok(&self.mask_buf);
             }
             for id in 0..vocab_size as u32 {
                 self.mask_buf[id as usize] = !tokenizer.is_terminator(id);
@@ -2817,6 +2815,21 @@ impl GrammarConstraint {
             return Err(GrammarMaskError::EmptyAllowedSet);
         }
         Ok(&self.mask_buf)
+    }
+
+    /// The forced think-close token when the budget is exhausted:
+    /// `Some(close_id)` makes `build_mask` allow ONLY that token — the
+    /// span is force-closed through the normal commit path (vLLM
+    /// `thinking_token_budget` parity). `None` = not exhausted, or no
+    /// special close id exists (a text-only close cannot be forced; the
+    /// span stays uncapped and the request is bounded by max_tokens
+    /// instead).
+    fn think_close_forced(&self) -> Option<u32> {
+        if self.in_think && self.think_tokens_used >= self.think_budget {
+            self.think_close_id
+        } else {
+            None
+        }
     }
 
     /// Advance the parser cursor with the lossless token bytes of an
@@ -5968,6 +5981,38 @@ mod tests {
         let sampled = false;
         let mtp_active = mtp_available && !penalized && !sampled && !grammar_constrained;
         assert!(!mtp_active, "grammar-constrained requests must use AR");
+    }
+
+    /// Think-budget enforcement (vLLM thinking_token_budget parity): at
+    /// exhaustion the forced-close token is the think close, and before
+    /// exhaustion nothing is forced. Without a special close id the span
+    /// stays uncapped (a text-only close cannot be forced).
+    #[test]
+    fn think_budget_forces_close_at_exhaustion() {
+        let schema = serde_json::json!({"type": "object"});
+        let compiled = grammar::json_schema::CompiledSchema::compile(&schema)
+            .expect("compile");
+        let mk = |close_id: Option<u32>, budget: usize, used: usize| {
+            GrammarConstraint {
+                matcher: grammar::json_schema::SchemaMatcher::from_compiled(&compiled),
+                mask_buf: Vec::new(),
+                in_think: true,
+                think_open_id: None,
+                think_close_id: close_id,
+                think_tail: Vec::new(),
+                think_budget: budget,
+                think_tokens_used: used,
+                mask_cache: std::collections::HashMap::new(),
+                mask_cache_order: std::collections::VecDeque::new(),
+            }
+        };
+        // Under budget: nothing forced.
+        assert_eq!(mk(Some(9), 10, 9).think_close_forced(), None);
+        // At budget with a close id: forced close.
+        assert_eq!(mk(Some(9), 10, 10).think_close_forced(), Some(9));
+        assert_eq!(mk(Some(9), 10, 500).think_close_forced(), Some(9));
+        // At budget without a special close id: uncapped fallback.
+        assert_eq!(mk(None, 10, 10).think_close_forced(), None);
     }
 
     /// The SchemaMatcher mask forbids a token whose bytes would break the
