@@ -1282,9 +1282,16 @@ impl StreamBackpressure {
                 continue;
             }
 
+            // Charge the bytes BEFORE the chunk enters the channel: the
+            // consumer dequeues-then-subtracts, so a chunk whose bytes were
+            // not yet charged could be dequeued in between (saturating_sub
+            // clamps to 0) and the subsequent add would leak phantom bytes
+            // FOREVER — a permanently rising counter that eventually trips
+            // the stall bound on a healthy stream. Over-charging (charge
+            // first, refund on Full) only ever delays production briefly.
+            self.pending_bytes.fetch_add(chunk_bytes, Ordering::Relaxed);
             match self.sender.try_send(chunk.take().expect("chunk present at loop top")) {
                 Ok(()) => {
-                    self.pending_bytes.fetch_add(chunk_bytes, Ordering::Relaxed);
                     self.forwarded_bytes = self.forwarded_bytes.saturating_add(chunk_bytes);
                     // Progress: leave the stall (the consumer drained).
                     self.stalled = false;
@@ -1296,7 +1303,9 @@ impl StreamBackpressure {
                     // ordinary backpressure. Wait for a slot within the same
                     // stall deadline — the old code blocked unboundedly here,
                     // which let a dead-but-connected consumer hold the
-                    // forwarder forever.
+                    // forwarder forever. Refund the pre-charged bytes: the
+                    // retry re-charges them.
+                    self.pending_bytes.fetch_sub(chunk_bytes, Ordering::Relaxed);
                     self.stalled = true;
                     if self.stall_started.is_none() {
                         self.stall_started = Some(Instant::now());
@@ -1314,7 +1323,9 @@ impl StreamBackpressure {
                     chunk = Some(returned);
                 }
                 Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
-                    // Receiver dropped: consumer is gone.
+                    // Receiver dropped: consumer is gone. Refund the
+                    // pre-charged bytes for accounting hygiene.
+                    self.pending_bytes.fetch_sub(chunk_bytes, Ordering::Relaxed);
                     self.stalled = true;
                     return Err(StreamStallError);
                 }
@@ -1670,9 +1681,11 @@ pub(crate) fn request_error_status(message: &str) -> u16 {
         || lower.contains("must contain at least one user message")
         || lower.contains("must be non-negative")
         || lower.contains("outside the supported subset")
+        || lower.contains("unsupported json schema type")
         || lower.contains("unsatisfiable")
         || lower.contains("contradictory schema")
         || lower.contains("exceeds the maximum")
+        || lower.contains("exceeding serve.multi_slot_ctx")
         || lower.contains("not supported on this serve route")
         || lower.contains("outside the strict subset")
         || lower.contains("does not allow this assertion")

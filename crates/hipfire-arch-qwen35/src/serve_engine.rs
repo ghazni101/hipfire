@@ -2724,6 +2724,22 @@ impl GrammarConstraint {
             self.mask_buf[id as usize] = self.matcher.is_token_allowed(bytes);
         }
         if !self.mask_buf.iter().any(|&allowed| allowed) {
+            if std::env::var("GRAMMAR_TRACE").is_ok() {
+                eprintln!(
+                    "[masktrace] EMPTY SET: in_think={} matcher_errored={} accepting={} probes: quote={} ws_quote={} brace_close={}",
+                    self.in_think,
+                    self.matcher.is_errored(),
+                    self.matcher.is_accepting(),
+                    self.matcher.is_token_allowed(b"\""),
+                    self.matcher.is_token_allowed(b" \""),
+                    self.matcher.is_token_allowed(b"}"),
+                );
+                eprintln!(
+                    "[masktrace] matcher byte_len={} tail={:?}",
+                    self.matcher.buffer_len(),
+                    String::from_utf8_lossy(&self.matcher.buffer_bytes()[std::cmp::min(40, self.matcher.buffer_len()).max(40) - 40..]),
+                );
+            }
             return Err(GrammarMaskError::EmptyAllowedSet);
         }
         Ok(&self.mask_buf)
@@ -3758,6 +3774,14 @@ fn run_loop(
                 pp.check_invariants();
             }
         }
+        // Retire pages whose GPU readers have drained (deferred reclaim,
+        // spec §4.4). Without a periodic drain the pending queue only
+        // cleared on Reset, so a failed multi-page allocation's freed
+        // pages sat unreachable between retries and free counts drifted.
+        // The walk is over a short pending list — cheap per step.
+        if let Some(pp) = rig.pool.page_pool_mut() {
+            pp.drain_completed();
+        }
         // Penalty windows: for each slot whose request carries non-neutral
         // token penalties, clamp the requested window to what the session
         // actually holds and upload that tail (most recent last). The kernel
@@ -3946,6 +3970,20 @@ fn run_loop(
                 ));
             }
         }
+        // Seed-determinism (spec §7.3 G3.4): sample_per_slot draws from the
+        // per-request RNG for every row it samples. A slot that contributed
+        // NO rows this step (FairQueue-ineligible, mid-prefill chunk boundary,
+        // VL-waiting) used to draw anyway, shifting its RNG stream by one per
+        // skipped step — the same seed + prompt then produced different
+        // output depending on concurrent load. Park inactive slots at
+        // temperature 0 for the call (argmax, no draw) and restore.
+        let mut sampled_parked: Vec<(usize, f32)> = Vec::new();
+        for (s, &m) in batch.m_per_slot.iter().enumerate() {
+            if m == 0 && rig.sample_params[s].temperature != 0.0 {
+                sampled_parked.push((s, rig.sample_params[s].temperature));
+                rig.sample_params[s].temperature = 0.0;
+            }
+        }
         if let Err(e) = rig.gpu.sample_per_slot(
             &rig.logits_out,
             &mut rig.sample_params,
@@ -3954,10 +3992,16 @@ fn run_loop(
             rig.config.vocab_size,
             &rig.out_tokens,
         ) {
+            for (s, t) in sampled_parked {
+                rig.sample_params[s].temperature = t;
+            }
             let reason = format!("sample failed: {e:?}");
             fail_all_active(&mut rig, &mut slots, &mut work, reason.clone());
             poison = Some(reason);
             break 'serve;
+        }
+        for (s, t) in sampled_parked {
+            rig.sample_params[s].temperature = t;
         }
         if let Err(e) = rig.gpu.hip.device_synchronize() {
             let reason = format!("device synchronize failed: {e:?}");
@@ -5084,13 +5128,31 @@ fn admit(
         .saturating_add(req.max_tokens.max(1))
         .min(rig.cap_tokens);
     let mut opened = rig.sessions.open(&mut rig.pool, &mut rig.adm, grant_tokens);
-    while opened.is_err() && rig.sessions.lru_idle_victim(&busy).is_some() {
+    // Two remedies, matched to the error shape:
+    // - Budget-shaped (WouldExceedBudget): a swapped-out session still
+    //   holds its admission grant, so the search must reach EVERY non-busy
+    //   session (lru_reclaimable_victim) — a resident-only search could
+    //   never reclaim a swapped grant and starved newer requests. The
+    //   remedy CLOSES the victim (Cold/Swapped entries have no slot to
+    //   park; closing drops the entry and releases the grant).
+    // - Slot/page-shaped: the remedy must free a SLOT, so only residents
+    //   qualify (lru_idle_victim) and the remedy is evict/park.
+    while opened.is_err() && rig.sessions.lru_reclaimable_victim(&busy).is_some() {
         let budget_shaped = matches!(
             opened,
             Err(AdmitError::WouldExceedBudget { .. })
         );
         // Re-derive the victim each pass: the previous remedy consumed it.
-        let victim = rig.sessions.lru_idle_victim(&busy).expect("checked above");
+        let victim = if budget_shaped {
+            rig.sessions
+                .lru_reclaimable_victim(&busy)
+                .expect("checked above")
+        } else {
+            let Some(v) = rig.sessions.lru_idle_victim(&busy) else {
+                break;
+            };
+            v
+        };
         if budget_shaped {
             rig.swap.forget(victim.0);
             rig.sessions.close(&mut rig.pool, &mut rig.adm, victim);
