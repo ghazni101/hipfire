@@ -1634,13 +1634,38 @@ pub(crate) fn project_request_contract(
     resolved: &hipfire_config::ResolvedConfig,
     include_reasoning: bool,
 ) -> Result<RequestContract> {
-    let max_tokens = body
+    // Strict typing: a PRESENT-but-malformed max_tokens (negative, float,
+    // string) must be a 400, never a silent fallback to the config default
+    // (the old `.and_then(as_u64).unwrap_or(default)` quietly re-typed it).
+    let max_tokens = match body
         .get("max_tokens")
         .or_else(|| body.get("max_completion_tokens"))
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(config_u64(resolved, "generation.max_tokens")?);
+    {
+        None => config_u64(resolved, "generation.max_tokens")?,
+        Some(v) => v.as_u64().ok_or_else(|| {
+            anyhow!("max_tokens must be an integer between 1 and 393216")
+        })?,
+    };
     if max_tokens == 0 || max_tokens > 393_216 {
         bail!("max_tokens must be between 1 and 393216");
+    }
+    // Unsupported OpenAI request fields must be refused, never silently
+    // dropped. The daemon's `validate_generate_caps` has typed refusals
+    // for exactly these, but this gateway builds the generate message
+    // from scratch and would strip the fields first — an `n: 2` that
+    // returns a single completion is the "silent semantic downgrade"
+    // the spec forbids (§7.1), so mirror the refusal set here.
+    if let Some(n) = body.get("n") {
+        if n.as_u64() != Some(1) {
+            bail!("n != 1 is not supported on this serve route (one completion per request)");
+        }
+    }
+    for field in ["best_of", "logit_bias", "echo", "suffix"] {
+        if let Some(v) = body.get(field) {
+            if !v.is_null() {
+                bail!("{field} is not supported on this serve route");
+            }
+        }
     }
     let mut messages = normalize_openai_messages(body.get("messages"), include_reasoning);
     let default_system = request_string(resolved, "prompt.system", None)?;
@@ -1724,6 +1749,13 @@ pub(crate) fn validate_response_format(
                 schema: schema.clone(),
                 name,
             }))
+        }
+        "text" => {
+            // OpenAI's DEFAULT response format: plain unconstrained text.
+            // An explicit `{"type": "text"}` is the same as omitting the
+            // field — accept it as "no constraint" instead of rejecting a
+            // payload shape the platform itself emits by default.
+            Ok(None)
         }
         other => {
             bail!("response_format.type '{other}' is not supported");

@@ -1508,6 +1508,7 @@ async fn handle_nonstreaming(
     let body_for_worker = body;
     let staged_tx_clone = Arc::clone(&staged_tx);
     let staged_tx_for_worker = Arc::clone(&staged_tx);
+    let stall_timeout = shared.stream_stall_timeout;
     tokio::task::spawn_blocking(move || {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             let staged_for_terminal = Arc::clone(&staged_tx_for_worker);
@@ -1534,9 +1535,24 @@ async fn handle_nonstreaming(
                         return Err(hipfire_client::ClientError::Cancelled);
                     }
                 }
-                match ack_rx.recv() {
+                // The ack fires only when the CLIENT actually reads the
+                // body (socket flush) or the connection tears down. A
+                // zero-window client that never reads would otherwise pin
+                // this thread AND its admission permit forever — bound
+                // the wait by the stall deadline (the same contract the
+                // streaming terminal has had since its fix; spec §5.4/S4
+                // "abort on configured deadline").
+                match ack_rx.recv_timeout(stall_timeout) {
                     Ok(Ok(())) => Ok(()),
-                    Ok(Err(_)) | Err(_) => Err(hipfire_client::ClientError::Cancelled),
+                    Ok(Err(_)) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        Err(hipfire_client::ClientError::Cancelled)
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        eprintln!(
+                            "[serve] nonstream terminal ack deadline exceeded — releasing admission permit"
+                        );
+                        Err(hipfire_client::ClientError::Cancelled)
+                    }
                 }
             };
             complete_request_cancellable(
@@ -1602,6 +1618,30 @@ async fn handle_nonstreaming(
 // ---------------------------------------------------------------------------
 
 pub(crate) fn request_error_status(message: &str) -> u16 {
+    // Typed daemon errors carry their class in the leading bracketed prefix
+    // (`TypedDaemonError`'s Display: "[class retryable=… rolled_back=…
+    // attempt=…] message", optionally wrapped by a transport layer as
+    // "daemon error: […"). Classify by that FIRST — the daemon already
+    // classifies its validation refusals (seed, penalties, messages,
+    // top_k, capability caps) and overload rejections correctly, and the
+    // substring ladder below mis-mapped several of them to 500. Only
+    // untyped/local errors fall to the ladder.
+    if let Some(class) = daemon_error_class(message) {
+        return match class {
+            // Capacity signals: bounded queue rejection / timeout /
+            // parked cancellation / page-demand rejection (spec §5.3 S3:
+            // 429, 503 reserved for a poisoned backend).
+            "overload" | "cancel" => 429,
+            // Client-fixable request errors → 400 (OpenAI uses 400 for
+            // context_length_exceeded too).
+            "validation" | "malformed" | "unsupported" | "context_length" => 400,
+            // Retryable backend condition.
+            "transient" => 503,
+            // internal / transport / adaptive_poison /
+            // deterministic_mismatch / anything unknown stays a fault.
+            _ => 500,
+        };
+    }
     let lower = message.to_ascii_lowercase();
     if lower.contains("model not found") {
         404
@@ -1611,6 +1651,7 @@ pub(crate) fn request_error_status(message: &str) -> u16 {
         || lower.contains("queue timeout:")
         || lower.contains("cancelled while queued")
         || lower.contains("overload")
+        || lower.contains("page demand exceeds pool")
     {
         // Bounded-queue rejection / queue timeout / parked cancellation are
         // capacity signals, not faults (spec §5.3 S3: 429 for bounded queue
@@ -1625,8 +1666,12 @@ pub(crate) fn request_error_status(message: &str) -> u16 {
         || lower.contains("malformed canonical tool call")
         || lower.contains("must be a")
         || lower.contains("must be an")
+        || lower.contains("must be within")
+        || lower.contains("must contain at least one user message")
+        || lower.contains("must be non-negative")
         || lower.contains("outside the supported subset")
         || lower.contains("unsatisfiable")
+        || lower.contains("contradictory schema")
         || lower.contains("exceeds the maximum")
         || lower.contains("not supported on this serve route")
         || lower.contains("outside the strict subset")
@@ -1638,6 +1683,28 @@ pub(crate) fn request_error_status(message: &str) -> u16 {
         400
     } else {
         500
+    }
+}
+
+/// Extract the daemon error class from a `TypedDaemonError`-shaped message
+/// (`"[class retryable=… ] msg"`, optionally prefixed `"daemon error: "`).
+/// `None` for local/untyped error strings.
+fn daemon_error_class(message: &str) -> Option<&str> {
+    let rest = message
+        .strip_prefix("daemon error: [")
+        .or_else(|| message.strip_prefix('['))?;
+    let end = rest.find(' ')?;
+    let class = &rest[..end];
+    // Guard against an arbitrary bracketed non-daemon string: the class
+    // vocabulary is closed (hipfire_client::error_class).
+    if class
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c == '_')
+        && !class.is_empty()
+    {
+        Some(class)
+    } else {
+        None
     }
 }
 

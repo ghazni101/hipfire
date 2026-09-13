@@ -138,6 +138,13 @@ pub struct Selection {
     /// stop admitting younger conflicting requests (bounded backfill, spec
     /// §5.3 S3.4).
     pub starved_oldest: bool,
+    /// The id of the fairness-best request that received NOTHING this step
+    /// (the request `starved_oldest` describes). The consumer's backfill
+    /// mask must target THIS request — masking to "the oldest active
+    /// session" instead starves the wrong request whenever the starved one
+    /// is not the absolute oldest in flight, and freezes every healthy
+    /// slot to zero rows in the meantime.
+    pub starved_id: Option<u64>,
 }
 
 // =========================================================================
@@ -661,11 +668,13 @@ impl FairQueue {
             }
         }
         starved_oldest = best_starved.is_some();
+        let starved_id = best_starved.map(|i| self.requests[i].id);
 
         self.tick += 1;
         Selection {
             grants,
             starved_oldest,
+            starved_id,
         }
     }
 }

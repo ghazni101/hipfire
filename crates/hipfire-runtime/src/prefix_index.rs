@@ -745,14 +745,16 @@ impl PrefixIndex {
                 self.total_nodes,
             );
             match result {
-                Ok(delta) => {
+                Ok((delta, pages_adopted)) => {
                     self.total_nodes = (self.total_nodes as i32 + delta) as usize;
-                    // Each created node holds exactly one page handle, so
-                    // retained bytes track node creation; eviction and chain
-                    // rollback subtract the same arithmetic (see the
-                    // cache-ref ownership doc on the struct).
+                    // Charge retained bytes by PAGES ADOPTED (one cache
+                    // ref each), the exact basis eviction subtracts. The
+                    // old node-count basis over-charged one page per
+                    // mid-page split marker (a node holding zero pages),
+                    // permanently inflating the retained total until the
+                    // byte ceiling wedged (see the ownership doc).
                     self.retained_bytes = self.retained_bytes.saturating_add(
-                        delta.unsigned_abs() as usize
+                        pages_adopted
                             * (pool.k_page_bytes() + pool.v_page_bytes()),
                     );
                     return Ok(());
@@ -1040,7 +1042,9 @@ impl PrefixIndex {
 /// Takes one `PagePool` cache ref for every page handle recorded in a newly
 /// created node (released again if the chain rolls back — see the
 /// cache-ref ownership doc on [`PrefixIndex`]). Returns the net change in
-/// node count (positive = nodes added).
+/// node count (positive = nodes added) AND the number of pages adopted
+/// (cache refs taken) — the retained-bytes basis. Split markers add a
+/// node but adopt no page.
 fn insert_into_tree(
     tree: &mut DomainTree,
     tokens: &[u32],
@@ -1049,10 +1053,11 @@ fn insert_into_tree(
     pool: &mut PagePool,
     max_cpu_nodes: usize,
     current_total: usize,
-) -> Result<i32, InsertError> {
+) -> Result<(i32, usize), InsertError> {
     let mut current = tree.root;
     let mut query_pos: usize = 0;
     let mut delta: i32 = 0;
+    let mut pages_adopted: usize = 0;
 
     loop {
         if query_pos >= tokens.len() {
@@ -1073,12 +1078,12 @@ fn insert_into_tree(
                     }
                 }
             }
-            return Ok(delta);
+            return Ok((delta, pages_adopted));
         }
 
         let node = match tree.nodes.get(&current) {
             Some(n) => n,
-            None => return Ok(delta),
+            None => return Ok((delta, pages_adopted)),
         };
 
             let next_token = tokens[query_pos];
@@ -1090,7 +1095,7 @@ fn insert_into_tree(
                     // the cursor inside the new key's current page): the
                     // branch's first node claims only the tail of that page.
                     let remaining_handles = &handles[query_pos / PAGE_TOKENS..];
-                    delta += create_chain(
+                    let (d, p) = create_chain(
                         tree,
                         current,
                         remaining_tokens,
@@ -1101,13 +1106,15 @@ fn insert_into_tree(
                         max_cpu_nodes,
                         current_total + delta as usize,
                     )?;
-                    return Ok(delta);
+                    delta += d;
+                    pages_adopted += p;
+                    return Ok((delta, pages_adopted));
                 }
             };
 
         let child = match tree.nodes.get(&child_id) {
             Some(c) => c,
-            None => return Ok(delta),
+            None => return Ok((delta, pages_adopted)),
         };
 
         let edge = &child.edge_tokens;
@@ -1127,6 +1134,8 @@ fn insert_into_tree(
             // Split at the divergence token — page-aligned or not. A
             // mid-page split produces a zero-page marker plus children
             // whose first_page_skip reaches back into the divergent page.
+            // The marker adopts NO page (it holds zero handles), so it
+            // adds a node but zero retained bytes.
             let split_pos = edge_match;
             let divergence = query_pos + edge_match;
 
@@ -1160,7 +1169,7 @@ fn insert_into_tree(
                 // decouple pages-consumed from tokens-consumed.)
                 let remaining_handles = &handles[divergence / PAGE_TOKENS..];
                 let first_skip = divergence % PAGE_TOKENS;
-                delta += create_chain(
+                let (d, p) = create_chain(
                     tree,
                     split_node_id,
                     remaining_tokens,
@@ -1171,9 +1180,11 @@ fn insert_into_tree(
                     max_cpu_nodes,
                     current_total + delta as usize,
                 )?;
+                delta += d;
+                pages_adopted += p;
             }
 
-            return Ok(delta);
+            return Ok((delta, pages_adopted));
         }
     }
 }
@@ -1196,7 +1207,7 @@ fn create_chain(
     pool: &mut PagePool,
     max_cpu_nodes: usize,
     current_total: usize,
-) -> Result<i32, InsertError> {
+) -> Result<(i32, usize), InsertError> {
     let mut current_parent = parent;
     let mut token_pos = 0usize;
     let mut handle_idx = 0usize;
@@ -1289,7 +1300,9 @@ fn create_chain(
             handle_idx += 1;
     }
 
-    Ok(added)
+    // Every created node adopted exactly one page (one cache ref each) —
+    // the byte-accounting basis that eviction subtracts.
+    Ok((added, added.max(0) as usize))
 }
 
 /// Split an edge at `split_pos` tokens. Metadata-only (spec §4.2).
@@ -2387,6 +2400,58 @@ mod tests {
     // ── Mid-page divergence and per-lookup pins ──────────────────────
 
     #[test]
+    /// Retained bytes are charged by PAGES ADOPTED, not by nodes created:
+    /// a mid-page fork's split marker is a node holding ZERO pages, and
+    /// the old node-count basis permanently inflated `retained_bytes` by
+    /// one page per fork until the byte ceiling could never be satisfied
+    /// (every publish refused `CacheByteBoundExceeded` until Reset).
+    #[test]
+    fn retained_bytes_exclude_zero_page_split_markers() {
+        let (mut pool, handles) = setup_big_pool(4);
+        let page_bytes = pool.k_page_bytes() + pool.v_page_bytes();
+        let mut index = PrefixIndex::new(1000);
+        let domain = sample_domain(7);
+
+        // Key A: 2 adopted pages.
+        let tokens_a = make_tokens(PAGE_TOKENS * 2);
+        index
+            .insert(&domain, &tokens_a, &handles[..2], Some(CheckpointId(1)), &mut pool)
+            .unwrap();
+        assert_eq!(index.retained_bytes(), 2 * page_bytes);
+
+        // Key B forks A mid-page: one zero-page split marker plus a 2-page
+        // chain. Bytes must grow by exactly the 2 adopted pages — the
+        // marker contributes none.
+        let mut tokens_b = tokens_a[..60].to_vec();
+        tokens_b.extend(make_tokens_from(5000, PAGE_TOKENS * 2 - 60));
+        index
+            .insert(&domain, &tokens_b, &handles[2..4], Some(CheckpointId(2)), &mut pool)
+            .expect("mid-page fork must insert");
+        assert_eq!(
+            index.retained_bytes(),
+            4 * page_bytes,
+            "split marker must not be charged as a page"
+        );
+
+        // Repeated forks at the same divergence keep the invariant: each
+        // new fork adds its adopted pages only.
+        let mut tokens_c = tokens_a[..60].to_vec();
+        tokens_c.extend(make_tokens_from(7000, PAGE_TOKENS - 60));
+        let (mut pool2, handles2) = setup_big_pool(4);
+        let page_bytes2 = pool2.k_page_bytes() + pool2.v_page_bytes();
+        let mut index2 = PrefixIndex::new(1000);
+        index2
+            .insert(&domain, &tokens_a, &handles2[..2], None, &mut pool2)
+            .unwrap();
+        index2
+            .insert(&domain, &tokens_b, &handles2[2..4], None, &mut pool2)
+            .unwrap();
+        index2
+            .insert(&domain, &tokens_c, &handles2[..1], None, &mut pool2)
+            .unwrap();
+        assert_eq!(index2.retained_bytes(), 5 * page_bytes2);
+    }
+
     fn mid_page_divergence_forks_and_caches_tail() {
         // A published key that shares a non-page-aligned prefix with a
         // cached key forks mid-page: the split produces a zero-page marker
