@@ -1811,6 +1811,36 @@ pub(crate) fn finish_sse_stream(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Class-first error mapping: the typed daemon class drives the HTTP
+    /// status; several daemon validation refusals (negative seed, penalty
+    /// ranges, empty messages, top_k) carry no recognizable substring and
+    /// were mis-mapped to 500 by the old ladder-only logic.
+    #[test]
+    fn request_error_status_maps_typed_classes() {
+        let cases: &[(&str, u16)] = &[
+            // Typed daemon errors (TypedDaemonError Display, optionally
+            // wrapped by the transport layer).
+            ("daemon error: [validation retryable=false rolled_back=false attempt=3] seed must be non-negative, got -1", 400),
+            ("daemon error: [validation retryable=false rolled_back=false attempt=4] repeat_penalty must be within [1.0, 2.0]", 400),
+            ("daemon error: [validation retryable=false rolled_back=false attempt=5] messages must contain at least one user message", 400),
+            ("daemon error: [unsupported retryable=false rolled_back=false attempt=6] top_k must fit a non-negative 32-bit integer", 400),
+            ("daemon error: [overload retryable=false rolled_back=false attempt=7] multi_slot rejected: serve queue full: waiter cap", 429),
+            ("daemon error: [cancel retryable=false rolled_back=false attempt=8] cancelled while queued", 429),
+            ("daemon error: [internal retryable=false rolled_back=false attempt=9] engine fault", 500),
+            ("[transient retryable=true rolled_back=false attempt=10] hiccup", 503),
+            // Untyped/local errors keep the substring ladder.
+            ("model not found: nope", 404),
+            ("grammar constraint reached an unsatisfiable state", 400),
+            ("minItems (3) > maxItems (2) at $: contradictory schema", 400),
+            ("page demand exceeds pool: need 9 pages, 0 free after reclaim", 429),
+            ("generation worker panicked: boom", 500),
+        ];
+        for (msg, want) in cases {
+            assert_eq!(&request_error_status(msg), want, "message: {msg}");
+        }
+    }
+
     use hyper::body::Body;
     use std::future::poll_fn;
     use std::task::Waker;
