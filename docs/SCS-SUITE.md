@@ -71,51 +71,66 @@ Design invariants enforced across cells:
 
 ## Results on qwen35-4b-mq4v1-multislot (2026-09-13)
 
-Five full runs on freshly restarted engines (run2 `16:05`, run3 `16:28`,
-run4 `16:40`, run5 `16:54`), plus one aborted run against a degraded engine.
-Container image `local/hipfire-serve:serving-cache-scheduler`; binary md5s in
-each JSON report (`.codeinsight+research/scs_suite_report*.json`).
-Run-to-run stable results are separated from flaky ones; flaky ≠ less
-important — several flaky failures are the most serious findings.
+Seven full runs. Runs 1–5 were executed while a second agent ran concurrent
+workload on the same GPU and endpoint; runs 6–7 are the clean re-verification
+(quiet endpoint, hipfire the only GPU client, fresh engine each run). The
+container runs binary `dd5faaeaf87c68532c8f57876b4f4b16` (image built
+14:23 +04) for ALL runs — the branch's post-17:00 fix commits
+(`e80f3e110`…`13f9a27fc`) are NOT in this image, so these runs do not verify
+those fixes; rebuilding the container is the follow-up.
 
-**Environment caveat discovered during the campaign:** this container's GPU
-(12.87 GB) sits at **99% VRAM use on a freshly restarted, idle engine** — the
-4×50000-ctx slot pool + weights fill the card by config. Any extra allocation
-(vision tower activations, generation bursts) hits `hipMalloc: out of
-memory`, the daemon poisons, and the container exits cleanly (code 0). Two of
-five runs ended this way (run3 during the schema area, run5 at the vision
-request). This is a deployment-sizing issue (the branch's own wave-9 notes
-flag the same class) but the daemon's failure mode — poison + exit rather
-than degrade/reject — is engine behavior worth fixing.
+### Poisoning forensics
 
-### Stable failures (reproduce every run)
+* VRAM attribution via amdgpu sysfs: hipfire stopped → **174 MiB used**;
+  hipfire idle-resident → **9181 MiB / 12272 MiB (75%)**. The 99% readings
+  taken earlier (12.76/12.87 GB) carried ~3.5 GiB of a foreign workload.
+  `/usr/bin/rocm-smi`, present early in the campaign, later disappeared from
+  the host.
+* The clean runs (6–7) had zero daemon deaths, zero OOM, and a passing vision
+  cell — the run3/run5 crashes, the run5 vision OOM, and the run1 admission
+  parking do **not** reproduce without the co-tenant and are attributed to
+  it. Keep them in mind as a deployment-shaped risk (the engine's hipMalloc
+  failure mode is poison-and-exit), but they are not branch bugs on the
+  evidence available.
+* The "phantom `cached_tokens`" (cold prompts reporting 640–768 reused) was
+  observed only in run2 under co-tenant conditions and not in runs 3, 4, 6,
+  7 — unconfirmed; treat with suspicion.
+* The determinism findings below are the opposite case: the second agent
+  reclassified B8/C5 as a "kernel batch-invariance limitation" and softened
+  the cells to warnings; on the clean engine the divergences still occur, so
+  this suite keeps them as hard failures (the contracts they enforce are the
+  branch's own: SERVE.md seed determinism, oracle warm-replay identity).
+
+### Clean verdict (runs 6–7, quiet engine, old binary)
+
+### Confirmed real on the clean engine (every clean run)
 
 | Cell | Symptom | Severity / class |
 |---|---|---|
-| E2 | Streaming strict-schema generation emits **all content tokens, then no terminal chunk, no `finish_reason`, no `data: [DONE]`** — the stream stalls and the server closes it 30-120 s later. Non-schema streams (B2/B3) are fine. OpenAI clients will hang until their own timeout. | **P1** — SSE contract break on the schema path |
-| E3 | Valid schema + default thinking → typed **400 `grammar constraint reached an unsatisfiable state`** (fail-closed, no corruption). The framing-aware cursor (W10-2) is not effective for this model/route. | **P1** — advertised feature fails closed |
-| E4 | Valid enum/const schema → same 400 after a 30-137 s generation burn. | **P1** — grammar dead-end on satisfiable schemas |
+| E2 | Streaming strict-schema generation emits **all content tokens, then no terminal chunk, no `finish_reason`, no `data: [DONE]`** — the stream stalls and the server closes it ~30 s later. In run7 the streamed content itself was grammar-corrupt (`"leg\": "` mangled key + tab run). Non-schema streams (B2/B3) are fine. | **P1** — SSE contract break + content corruption on the schema stream path |
+| E3 | Valid schema + default thinking → typed 400 `grammar constraint reached an unsatisfiable state` (fail-closed), or — in runs 6/7, immediately after E2's stalled stream — a **150 s admission park** (post-stall wedge signature). | **P1** — framing cursor (W10-2) ineffective + stall-follow-on wedge |
+| E4 | Valid enum/const schema → same 400 after a 30-137 s generation burn | **P1** — grammar dead-end on satisfiable schemas |
+| B8 | Same seed + identical request → **different outputs** across cold/warm replay (4 of 5 verifiable runs) | **P1** — SERVE.md seed-determinism contract |
+| C5 | Multi-turn final-turn replay differs from the original in-context answer (4 of 5 runs) — cached-resume is not bit-faithful | **P1** — same class, checkpoint-resume path |
+| D1 | WARN: batched concurrent outputs differ from solo baselines (coherence + topical isolation held) — same batch-shape sensitivity as B8/C5 | P3 — observational |
 | E12 | `minItems > maxItems` → **500** (server_error), message proves the CLI validator detected it ("contradictory schema") | P2 — error-status mapping |
-| E15 | `response_format {"type":"text"}` → **500**. `text` is the OpenAI *default* type; clients that send it explicitly get a 5xx | P2 — compat + status mapping |
-| F8 | `n: 2` → **200** (silently accepted, single choice). `validate_generate_caps` (slots.rs) documents `n` as refused | P2 — refusal gate not reached on the serve path |
+| E15 | `response_format {"type":"text"}` → **500**. `text` is the OpenAI *default* type | P2 — compat + status mapping |
+| F8 | `n: 2` → **200** (silently accepted, single choice) — `validate_generate_caps` documents `n` as refused | P2 — refusal gate not reached on the serve path |
 | F9 | `logit_bias` → **200**, silently ignored | P2 — same class |
 | G3 | `max_tokens: -5` → **200** (silently treated as absent → uncapped); `0` and `400000` correctly 400 | P2 — validation gap |
-| G5 | `seed: -1` → **500**; SERVE.md documents "400-style error" for negative seeds (fractional seeds correctly 400) | P2 — contract drift |
+| G5 | `seed: -1` → **500**; SERVE.md documents "400-style error" (fractional seeds correctly 400) | P2 — contract drift |
 | G6 | `messages: []` → **500** server_error | P2 — client-input error as 5xx |
-| G7 | ctx overshoot (`prompt + max_tokens > 50000`) → **500**; request-specific, server stays healthy; should be 4xx | P2 — status mapping |
+| G7 | WARN: ctx overshoot → **500**; server stays healthy; should be 4xx | P2 — status mapping |
+| H2 | Post-flood warm miss: identical prompt re-run gets `cached_tokens 0` after the D3 overload (runs 4, 6, 7) | P2 — reuse reliability after admission pressure; needs `pool_free_pages` visibility to distinguish eviction from publication failure |
 
-### Flaky / recurring failures
+### Poisoned / not reproducible clean
 
-| Cell | Symptom | Runs | Severity / class |
-|---|---|---|---|
-| B8 | Same seed + identical request → **different outputs** (sampled determinism is not reliable) | failed run3+run4+run5, passed run2 | **P1** — determinism contract |
-| C5 | Multi-turn final-turn replay differs from the original in-context answer — hybrid-state resume is not bit-faithful | failed run3+run4+run5, passed run2 | **P1** — same class, checkpoint-resume path |
-| C2 | Warm long-gen replay (A10) differs from cold — candidate rows or MTP retire decisions leak into the visible output | failed run4, passed run2/run3/run5 | **P1** — "reuse never changes output" |
-| V1 | Vision request → `hipMalloc: out of memory` → daemon poisoned (all later requests 500) — VRAM overcommit (see env caveat) | run5; passed run2-4 | **P1** on this deployment — vision + full KV pool does not fit |
-| C2/C6/H2 phantom reuse | Cold, never-seen prompts report `cached_tokens 640-768` (full pages of *another* same-shape passage's chain). Outputs stay keyword-correct ⇒ count/accounting lie rather than foreign-KV use, but it defeats `cached_tokens` semantics | run2 (C2, C6, H2); run1 C1 | **P1** — radix walk / reused accounting; could not be isolated to a single trigger (15 isolated probes came back clean; reproduces only mid-suite) |
-| D1 | WARN: batched concurrent outputs differ from solo baselines (coherence + topical isolation held) | run4 | P3 — reduction-order sensitivity, observational |
-| H2 | Post-flood warm miss: identical prompt re-run gets `cached_tokens 0` after the D3 overload | run4 | P2 — reuse reliability after admission pressure; needs `pool_free_pages` visibility to distinguish eviction from publication failure |
-| serve exit | **Serve/daemon dies mid-traffic under VRAM exhaustion** — observed twice: run3 (clean exit 0 during schema area, after E2's stalled-stream abort, during E4's enum burn) and run5 (hipMalloc OOM at vision forward → daemon poison → exit 0). Neither trigger reproduces alone on a fresh engine (verified) — it needs the VRAM-pressure environment above. | run3, run5 | **P0** on this deployment — availability |
+| Symptom | Runs | Verdict |
+|---|---|---|
+| Serve/daemon death (clean exit 0 mid-schema-area; `hipMalloc: out of memory` at vision forward poisoning the daemon) | run3, run5 only | **Co-tenant VRAM pressure** — clean runs never die; VRAM attribution above. Re-test only if a real co-tenant returns. |
+| Vision request OOM | run5 only | same |
+| Admission parking (700-token requests park in the daemon wait queue until the 300 s timeout; widens to all long prompts) | run1 only, on an engine with hours of foreign traffic | **Attributed to the co-tenant** holding slots/VRAM. The signature to watch for: `queue_depth` frozen ≥1 with no admission and no rejection log line. H1's long-prompt canary guards this. |
+| Phantom `cached_tokens` (cold prompts reporting 640–768 reused from another passage's chain) | run2 (C2, C6, H2); run1 C1 | **Unconfirmed** — never reproduced clean (runs 3, 4, 6, 7). Keep the C1/C6/H2 guards; if it ever reproduces on a quiet engine, capture the JSON evidence immediately. |
 
 ### The run1 degradation episode (first run, aborted)
 
@@ -132,18 +147,36 @@ state-corruption class in the admission/radix path that several hours of
 traffic (including vision + schema requests from before the suite) can
 trigger. The H1 long-prompt liveness canary exists to catch this class.
 
-### What passed everywhere (stable green, worth knowing)
+### What passed on the clean engine (stable green)
 
 Capability advertisement and telemetry (A1-A6), non-stream/stream shapes and
-usage chunks (B1-B3, B5), coherence battery (B6), greedy determinism on
-short/medium generations (B7), sampling-param acceptance (B9), finish=length
-(B10), the entire cold/warm/branch/fork/COW/soak cache block in 3 of 4 runs
-(C1, C3, C4, C6-C9), strict-schema valid output + streaming-assembly +
-min/maxItems + nested + all typed schema rejections (E1, E5-E11, E13, E14,
-E16), the multi-slot refusal set (F1-F7), HTTP limits (G1, G2, G4), vision
-skips the radix (V1), the whole scheduler block (D2-D6: flood 429s with
-Retry-After, drain after burst, cancel storm, progressive service), and the
-post-gauntlet canaries (H1, H2 cold-side).
+usage chunks (B1-B3, B5), coherence battery (B6), greedy determinism (B7),
+sampling-param acceptance (B9), finish=length (B10), the entire
+cold/warm/branch/fork/COW/soak cache block (C1-C4, C6-C9), strict-schema
+valid output + streaming-assembly + min/maxItems + nested + all typed schema
+rejections (E1, E5-E11, E13, E14, E16 — schema prompts DO compose with the
+prefix cache), the multi-slot refusal set (F1-F7), HTTP limits (G1, G2, G4),
+vision skips the radix with no OOM (V1), the whole scheduler block (D2-D6:
+flood 429s with Retry-After, drain after burst, cancel storm, progressive
+service), and the post-gauntlet canaries (H1, H2 cold-side).
+
+## Relationship to the parallel fix campaign
+
+While this suite ran, a second agent landed `e80f3e110`…`13f9a27fc` on the
+same branch (grammar soundness, cache GPU leaks, scheduler wedges, serve
+error contract, seed determinism, stream accounting) and committed this
+suite with the B8/C5 determinism checks softened to warnings. As of the
+clean re-verification the container still runs the pre-fix binary
+(`dd5faaea…`, image 14:23 +04), so:
+
+* the failures above are verified against the PRE-fix build;
+* the container must be rebuilt from the current branch tip and the suite
+  re-run before any of these findings can be considered fixed — the commit
+  messages claim fixes for E2/E3-class (stream accounting, grammar),
+  B8-class (seed determinism), and the G5/G6/E12/E15-class (error contract),
+  none of which is yet evidenced on a running container;
+* this suite's B8/C5 cells intentionally keep hard assertions (the softened
+  versions were reverted) — the enforced contracts are the branch's own.
 
 ## Notes for triage
 
@@ -157,13 +190,12 @@ post-gauntlet canaries (H1, H2 cold-side).
   exposed over HTTP — adding a stats surface would let black-box runs
   distinguish eviction from publication failure (H2) and honest reuse from
   accounting lies (phantom).
-- The run3/run5 daemon deaths are VRAM-exhaustion events on an overcommitted
-  GPU (see env caveat): `rocm-smi --showmeminfo vram` shows 12.76/12.87 GB
-  used on a freshly restarted idle engine. Shrinking `multi_slot_slots` ×
-  `multi_slot_ctx`, disabling the vision sidecar, or enabling the OOM guard
-  for this discrete-GPU deployment are the deployment-side mitigations; the
-  engine-side gap is that hipMalloc failure poisons the daemon and exits
-  instead of failing the offending request and continuing.
+- The run3/run5 daemon deaths are attributed to the second agent's GPU
+  workload (see poisoning forensics): with the endpoint quiet they do not
+  reproduce across two full clean runs. If the engine's hipMalloc
+  failure mode (poison the daemon, exit 0) is ever hit again under a real
+  co-tenant, treat it as an engine robustness gap, not just deployment
+  sizing.
 - The run1 degradation episode (admission parking) was only observed on an
   engine that had served hours of foreign traffic first; if it recurs,
   capture `/stats` (`queue_depth` frozen at 1) plus `docker logs` — the

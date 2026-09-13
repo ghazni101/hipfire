@@ -736,18 +736,12 @@ impl SlotBackend {
                     .and_then(|v| v.as_u64())
             });
 
-        if max_think_tokens.is_some_and(|n| n >= 2) {
-            hipfire_engine::emit::emit_active_attempt_error(
-                stdout,
-                Some(id),
-                "finite reasoning caps not supported in experimental multi-slot (max_think_tokens >=2)",
-                "unsupported",
-                false,
-                false,
-            );
-            let _ = stdout.flush();
-            return Ok(());
-        }
+        // Finite caps (max_think_tokens >= 2) are ENFORCED on this route:
+        // once the cursor consumes the budget inside a think span, the
+        // grammar mask allows only the think close, forcing the span to end
+        // through the normal commit path (vLLM thinking_token_budget
+        // parity). Enforcement requires the tokenizer's special close id;
+        // engines without one fall back to uncapped thinking (documented).
 
         // --- Projected reasoning authority ---
         let has_think = self.tokenizer.special_token_id("<think>").is_some();
@@ -1216,6 +1210,12 @@ impl SlotBackend {
             visual_data,
             json_schema,
             started_in_think,
+            // Enforced thinking budget: absent/0 = uncapped; the 1-sentinel
+            // never enters a think span so the budget cannot engage.
+            think_budget: max_think_tokens
+                .filter(|&n| n >= 2)
+                .map(|n| n as usize)
+                .unwrap_or(usize::MAX),
             // Canonical pending-input bytes (spec §5.3): the engine's wait
             // queue charges its byte cap against this, so daemon-side
             // waiters must carry the real prompt weight — a hardcoded 0
