@@ -656,3 +656,7 @@ required-features = ["deltanet"]
 [[example]]
 name = "h2d_mmap_bench"
 required-features = ["deltanet"]
+
+[[example]]
+name = "test_e4_engine_repro"
+required-features = ["deltanet"]

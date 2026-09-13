@@ -1848,6 +1848,63 @@ fn validate_json_schema_subset(schema: &serde_json::Value, path: &str) -> Result
         }
     }
 
+    // DEFAULT-DENY, matching the saddle-core compiler's keyword policy:
+    // the compiler refuses any keyword outside its allowlist, so the CLI
+    // pre-flight must refuse the same set — a schema the CLI passes but
+    // the compiler rejects surfaces as a late 400 at admit instead of an
+    // up-front validation error (the drift hid `deprecated`-style keys).
+    // Annotations are permitted exactly where the compiler permits them.
+    const KNOWN_KEYWORDS: &[&str] = &[
+        "type",
+        "properties",
+        "required",
+        "additionalProperties",
+        "items",
+        "minItems",
+        "maxItems",
+        "enum",
+        "const",
+        "description",
+        "title",
+        "default",
+        "examples",
+        "$comment",
+    ];
+    for key in obj.keys() {
+        if !KNOWN_KEYWORDS.contains(&key.as_str()) {
+            bail!(
+                "unsupported JSON Schema keyword '{key}' at {path} \
+                 (strict subset default-deny: not in the compiler's allowlist)"
+            );
+        }
+    }
+
+    // Present-but-malformed keyword values are compiler typed errors
+    // (`.and_then(as_array)` here used to skip them silently, letting a
+    // pre-flighted schema die at admit). Match the compiler's refusals.
+    if let Some(v) = obj.get("enum") {
+        if !v.is_array() {
+            bail!("enum at {path} must be an array");
+        }
+    }
+    if let Some(v) = obj.get("properties") {
+        if !v.is_object() {
+            bail!("properties at {path} must be an object");
+        }
+    }
+    if let Some(v) = obj.get("required") {
+        if !v.is_array() {
+            bail!("required at {path} must be an array of strings");
+        }
+    }
+    for kw in ["minItems", "maxItems"] {
+        if let Some(v) = obj.get(kw) {
+            if v.as_u64().is_none() {
+                bail!("{kw} at {path} must be a non-negative integer");
+            }
+        }
+    }
+
     // Validate `type` if present. A non-string, non-null `type` (the union
     // form `["integer","null"]`) is outside the strict subset — it must be
     // rejected, not silently skipped into the inference path (the compiler
