@@ -1417,11 +1417,22 @@ impl SlotBackend {
             // are CAPACITY signals, not engine faults — surface them with
             // the overload kind so the front end maps them to 429 instead
             // of 500 (spec §5.3 S3: "HTTP 429 for bounded queue rejection").
+            // Engine rejections split the same way at the source: page /
+            // admission-demand refusals are capacity (overload → 429),
+            // schema-compile and grammar failures are client-fixable
+            // (validation → 400); everything else stays internal.
             let kind = if reason.starts_with("serve queue full")
                 || reason.starts_with("serve queue timeout")
                 || reason.starts_with("cancelled while queued")
+                || reason.starts_with("page demand exceeds pool")
+                || reason.starts_with("admission grant for the extended turn")
             {
                 "overload"
+            } else if reason.starts_with("grammar constraint")
+                || reason.starts_with("json_schema compile failed on admit")
+                || reason.contains("contradictory schema")
+            {
+                "validation"
             } else {
                 "internal"
             };

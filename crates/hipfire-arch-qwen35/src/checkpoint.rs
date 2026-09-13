@@ -184,9 +184,18 @@ impl<B: CheckpointBlob> QwenCheckpointPool<B> {
     ///
     /// Returns the minted [`CheckpointId`] for the radix index to store, or
     /// [`CheckpointId::NONE`] when the capture was refused.
-    pub fn insert(&mut self, domain: CacheDomain, p: u64, blob: B) -> CheckpointId {
+    ///
+    /// GPU memory discipline: every blob this call displaces (the replaced
+    /// entry at the same key, LRU evictions, and a refused capture itself)
+    /// is RETURNED to the caller. `DeviceBuffer` has no freeing `Drop`, so
+    /// a blob dropped here would leak its device memory permanently while
+    /// `total_bytes` is decremented as if freed. The caller routes each
+    /// returned blob through `free_gpu`.
+    pub fn insert(&mut self, domain: CacheDomain, p: u64, blob: B) -> (CheckpointId, Vec<B>) {
+        let mut displaced: Vec<B> = Vec::new();
         if !Self::is_aligned(p) {
-            return CheckpointId::NONE;
+            displaced.push(blob);
+            return (CheckpointId::NONE, displaced);
         }
 
         let bytes = blob.bytes_len();
@@ -199,6 +208,7 @@ impl<B: CheckpointBlob> QwenCheckpointPool<B> {
         if let Some(old) = self.entries.remove(&key) {
             self.total_bytes = self.total_bytes.saturating_sub(old.blob.bytes_len());
             reuse_id = Some(old.id);
+            displaced.push(old.blob);
         }
 
         // Clear any prior eviction record for this key.
@@ -208,13 +218,16 @@ impl<B: CheckpointBlob> QwenCheckpointPool<B> {
         while self.total_bytes + bytes > self.max_bytes {
             match self.find_oldest_unpinned_key() {
                 Some(evict_key) => {
-                    self.evict_internal(evict_key);
+                    if let Some(blob) = self.evict_internal(evict_key) {
+                        displaced.push(blob);
+                    }
                 }
                 None => {
                     // Everything left is pinned and the ceiling cannot be
-                    // honored. Refuse the capture (dropping the blob) rather
-                    // than exceeding the ceiling.
-                    return CheckpointId::NONE;
+                    // honored. Refuse the capture (handing the blob back for
+                    // the caller to free) rather than exceeding the ceiling.
+                    displaced.push(blob);
+                    return (CheckpointId::NONE, displaced);
                 }
             }
         }
@@ -236,7 +249,7 @@ impl<B: CheckpointBlob> QwenCheckpointPool<B> {
             },
         );
 
-        id
+        (id, displaced)
     }
 
     /// Find the key of the oldest (smallest `lru_stamp`) unpinned entry.
@@ -249,24 +262,23 @@ impl<B: CheckpointBlob> QwenCheckpointPool<B> {
     }
 
     /// Remove an entry by key, accounting bytes and recording eviction.
-    fn evict_internal(&mut self, key: CheckpointKey) {
-        if let Some(entry) = self.entries.remove(&key) {
+    /// Returns the removed blob for the caller to free on the GPU — never
+    /// dropped here (see [`Self::insert`] for the no-`Drop` rationale).
+    fn evict_internal(&mut self, key: CheckpointKey) -> Option<B> {
+        self.entries.remove(&key).map(|entry| {
             self.total_bytes = self.total_bytes.saturating_sub(entry.blob.bytes_len());
             self.evicted.insert(key);
-        }
+            entry.blob
+        })
     }
 
     /// Explicitly evict the checkpoint at `(domain, p)`.
     ///
-    /// Returns `true` if an entry was removed.
-    pub fn evict(&mut self, domain: &CacheDomain, p: u64) -> bool {
+    /// Returns the removed blob (for the caller to `free_gpu`), or `None`
+    /// when no entry existed.
+    pub fn evict(&mut self, domain: &CacheDomain, p: u64) -> Option<B> {
         let key = (domain.clone(), p);
-        if self.entries.contains_key(&key) {
-            self.evict_internal(key);
-            true
-        } else {
-            false
-        }
+        self.evict_internal(key)
     }
 
     /// Check whether a checkpoint exists at `(domain, p)`.
@@ -568,7 +580,14 @@ pub fn capture_checkpoint(
     let mut snap = DeltaNetSnapshot::new_for(gpu, state)?;
     snap.save_from(state, gpu)?;
 
-    Ok(pool.insert(domain.clone(), p, snap))
+    let (id, displaced) = pool.insert(domain.clone(), p, snap);
+    // Displaced blobs (LRU evictions / same-key replacement / a ceiling
+    // refusal of this very capture) own device memory with no freeing
+    // `Drop` — free them here or they leak for the process lifetime.
+    for blob in displaced {
+        blob.free_gpu(gpu);
+    }
+    Ok(id)
 }
 
 /// Restore an immutable cached checkpoint into a caller-owned **private**
@@ -673,7 +692,7 @@ mod tests {
         let dom = test_domain("a7");
 
         // Capture at p=128 (page-aligned).
-        let id = pool.insert(dom.clone(), 128, HostBlob { bytes: 4096 });
+        let (id, _) = pool.insert(dom.clone(), 128, HostBlob { bytes: 4096 });
         assert_ne!(id, CheckpointId::NONE, "insert should mint a nonzero id");
 
         // Plan for a 200-token prompt: p=128 < 200 → SuffixRecompute.
@@ -799,7 +818,7 @@ mod tests {
 
         // Insert at p=128, then evict it.
         pool.insert(dom.clone(), 128, HostBlob { bytes: 4096 });
-        assert!(pool.evict(&dom, 128));
+        assert!(pool.evict(&dom, 128).is_some());
 
         // Lookup still claims 128 resumable, but checkpoint was evicted.
         let err = plan_resume(
@@ -898,13 +917,13 @@ mod tests {
         let mut pool = QwenCheckpointPool::<HostBlob>::new(8192);
         let dom = test_domain("lru");
 
-        let id0 = pool.insert(dom.clone(), 0, HostBlob { bytes: 4096 });
-        let id128 = pool.insert(dom.clone(), 128, HostBlob { bytes: 4096 });
+        let (id0, _) = pool.insert(dom.clone(), 0, HostBlob { bytes: 4096 });
+        let (id128, _) = pool.insert(dom.clone(), 128, HostBlob { bytes: 4096 });
         assert_eq!(pool.len(), 2);
         assert_eq!(pool.total_bytes(), 8192);
 
         // Insert a third — should evict the oldest (p=0).
-        let id256 = pool.insert(dom.clone(), 256, HostBlob { bytes: 4096 });
+        let (id256, _) = pool.insert(dom.clone(), 256, HostBlob { bytes: 4096 });
         assert_eq!(pool.len(), 2, "should still have 2 entries after eviction");
         assert!(!pool.contains(&dom, 0), "oldest (p=0) should be evicted");
         assert!(pool.contains(&dom, 128));
@@ -912,6 +931,47 @@ mod tests {
         assert_ne!(id0, CheckpointId::NONE);
         assert_ne!(id128, CheckpointId::NONE);
         assert_ne!(id256, CheckpointId::NONE);
+    }
+
+    /// GPU-memory discipline: every blob displaced by an insert (LRU
+    /// eviction, same-key replacement, ceiling refusal) is RETURNED to the
+    /// caller — nothing is dropped inside the pool, because a dropped
+    /// `DeltaNetSnapshot` leaks its device buffers (no freeing `Drop`).
+    #[test]
+    fn displaced_blobs_are_returned_never_dropped() {
+        let mut pool = QwenCheckpointPool::<HostBlob>::new(8192);
+        let dom = test_domain("displaced");
+
+        // LRU eviction returns the evicted blob.
+        let _ = pool.insert(dom.clone(), 0, HostBlob { bytes: 4096 });
+        let _ = pool.insert(dom.clone(), 128, HostBlob { bytes: 4096 });
+        let (_, displaced) = pool.insert(dom.clone(), 256, HostBlob { bytes: 4096 });
+        assert_eq!(displaced.len(), 1, "evicted blob must be handed back");
+        assert_eq!(displaced[0].bytes, 4096);
+        assert!(!pool.contains(&dom, 0), "p=0 was the one evicted");
+
+        // Same-key replacement returns the replaced blob.
+        let (_, displaced) = pool.insert(dom.clone(), 256, HostBlob { bytes: 2048 });
+        assert_eq!(displaced.len(), 1, "replaced blob must be handed back");
+        assert_eq!(displaced[0].bytes, 4096);
+        assert_eq!(pool.total_bytes(), 4096 + 2048);
+
+        // Ceiling refusal with everything pinned returns the refused blob.
+        pool.pin(&dom, 128);
+        pool.pin(&dom, 256);
+        let (id, displaced) = pool.insert(dom.clone(), 384, HostBlob { bytes: 8192 });
+        assert_eq!(id, CheckpointId::NONE, "refused capture reports NONE");
+        assert_eq!(
+            displaced.len(),
+            1,
+            "the refused capture's blob must be handed back for freeing"
+        );
+        assert_eq!(displaced[0].bytes, 8192);
+
+        // Unaligned boundary: same contract.
+        let (id, displaced) = pool.insert(dom.clone(), 100, HostBlob { bytes: 4096 });
+        assert_eq!(id, CheckpointId::NONE);
+        assert_eq!(displaced.len(), 1);
     }
 
     // ── LRU byte bound: pinned checkpoints survive eviction ─────────────
@@ -1021,7 +1081,7 @@ mod tests {
         let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
         let dom = test_domain("align");
 
-        let id = pool.insert(dom.clone(), 100, HostBlob { bytes: 4096 });
+        let (id, _) = pool.insert(dom.clone(), 100, HostBlob { bytes: 4096 });
         assert_eq!(id, CheckpointId::NONE, "non-page-aligned boundary must be rejected");
         assert!(!pool.contains(&dom, 100));
         assert_eq!(pool.total_bytes(), 0);
@@ -1034,7 +1094,7 @@ mod tests {
         let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
         let dom = test_domain("p0");
 
-        let id = pool.insert(dom.clone(), 0, HostBlob { bytes: 0 });
+        let (id, _) = pool.insert(dom.clone(), 0, HostBlob { bytes: 0 });
         assert_ne!(id, CheckpointId::NONE);
         assert!(pool.contains(&dom, 0));
     }
@@ -1046,9 +1106,9 @@ mod tests {
         let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
         let dom = test_domain("monotonic");
 
-        let id1 = pool.insert(dom.clone(), 0, HostBlob { bytes: 100 });
-        let id2 = pool.insert(dom.clone(), 128, HostBlob { bytes: 100 });
-        let id3 = pool.insert(dom.clone(), 256, HostBlob { bytes: 100 });
+        let (id1, _) = pool.insert(dom.clone(), 0, HostBlob { bytes: 100 });
+        let (id2, _) = pool.insert(dom.clone(), 128, HostBlob { bytes: 100 });
+        let (id3, _) = pool.insert(dom.clone(), 256, HostBlob { bytes: 100 });
 
         assert!(id1 < id2);
         assert!(id2 < id3);
@@ -1068,7 +1128,7 @@ mod tests {
         pool.insert(dom.clone(), 128, HostBlob { bytes: 2000 });
         assert_eq!(pool.total_bytes(), 3000);
 
-        pool.evict(&dom, 0);
+        let _ = pool.evict(&dom, 0);
         assert_eq!(pool.total_bytes(), 2000);
     }
 
