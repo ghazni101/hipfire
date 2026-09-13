@@ -2627,12 +2627,14 @@ pub(crate) fn multi_slot_request_supported(body: &serde_json::Value) -> Result<(
     {
         return Err("reasoning_effort is not supported".to_owned());
     }
-    // `1` is the no-thinking sentinel and `0` is uncapped; neither needs a
-    // force-close. Any other finite cap does.
+    // Finite caps (>= 2) are now ENFORCED end-to-end on the multi-slot
+    // route (the grammar cursor force-closes the span at the budget —
+    // vLLM thinking_token_budget parity), so they are forwarded, not
+    // refused. `1` stays the no-thinking sentinel and `0` uncapped.
     for pointer in ["/max_think_tokens", "/reasoning/max_tokens"] {
         if let Some(cap) = body.pointer(pointer).and_then(serde_json::Value::as_u64) {
-            if cap >= 2 {
-                return Err("finite reasoning cap is not supported".to_owned());
+            if cap == 0 {
+                return Err("finite reasoning cap must be at least 1".to_owned());
             }
         }
     }

@@ -784,17 +784,13 @@ def b8(t):
     p = prompt_cold("corvane", "Write two sentences about the tidal records.")
     r1 = chat(t.cfg, user(p), temperature=0.7, seed=1234, max_tokens=96)
     r2 = chat(t.cfg, user(p), temperature=0.7, seed=1234, max_tokens=96)
-    if r1.content != r2.content:
-        # Kernel batch-invariance: the cold run prefills the full prompt,
-        # the warm run resumes from cache — different batch shapes, last-ulp
-        # logit differences, and a sampled pick flips. Same-shape replay is
-        # byte-identical (C1/C8); cross-shape determinism requires
-        # batch-invariant kernels (tracked limitation, cf. D1's warn).
-        t.warn("seeded outputs differ across cold/warm shapes "
-               "(kernel batch-invariance limitation):\n  A=%r\n  B=%r"
-               % (r1.content[:150], r2.content[:150]))
-    else:
-        t.ev("seeded replay identical across cold/warm")
+    # Hard check on purpose: SERVE.md's documented contract is "same seed +
+    # same request -> same output". A cold prefill vs a warm cached replay
+    # are the same request to the client; cross-shape last-ulp flips are an
+    # engine limitation to report, not to warn away. (cf. D1's WARN.)
+    t.check(r1.content == r2.content,
+            "same seed gave different outputs across cold/warm replay:\n  A=%r\n  B=%r"
+            % (r1.content[:150], r2.content[:150]))
     r3 = chat(t.cfg, user(p), temperature=0.7, seed=1235, max_tokens=96)
     if r3.content == r1.content:
         t.warn("different seed produced identical output (possible but unlikely at %d chars)"
@@ -922,29 +918,19 @@ def c5(t):
         t.check(r.finish in ("stop", "length"), "turn %d finish %s" % (turn + 1, r.finish))
     t.ev("cached=%s prompt=%s" % (cached_seq, ptoks))
     t.check(cached_seq[0] == 0, "turn 1 cached=%s != 0" % cached_seq[0])
-    # Turn 1 cold is only assertable on a fresh engine: the suite shares a
-    # long-lived serve whose radix may legitimately hold this fixture's
-    # prefix from an earlier run (the topics are deterministic). The
-    # CONTRACT is monotonic growth + bounded-by-prompt, asserted below;
-    # cold-turn-0 coverage lives in H2 on fresh topics.
-    if cached_seq[0] != 0:
-        t.warn("turn 1 cached=%s on a shared engine (fixture warmth, not "
-               "cross-prompt contamination — see C6)" % cached_seq[0])
     t.check(cached_seq[-1] >= 128, "final turn reuse %s < 1 page" % cached_seq[-1])
     for i in range(5):
         t.check(cached_seq[i] <= ptoks[i], "turn %d cached %s > prompt %s" % (i + 1, cached_seq[i], ptoks[i]))
     last_user = conv[-2]["content"]
     r_again = chat(t.cfg, list(conv[:-1]), temperature=0, max_tokens=64)
-    if r_again.content != conv[-1]["content"]:
-        # Kernel batch-invariance (see B8): the original turn and this
-        # replay ran different batch shapes (fresh continuation prefill vs
-        # cached resume), so a greedy pick can flip on a last-ulp logit
-        # difference. Same-shape replay is byte-identical (C1/C8).
-        t.warn("final-turn replay differs across shapes "
-               "(kernel batch-invariance limitation):\n  A=%r\n  B=%r"
-               % (conv[-1]["content"][:100], r_again.content[:100]))
-    else:
-        t.ev("final-turn replay identical")
+    # Hard check on purpose: same conversation, same question, greedy — the
+    # branch's own oracle asserts warm replay is byte-identical. A different
+    # batch shape (cached resume vs fresh prefill) flipping a greedy pick is
+    # an engine limitation to report, not to warn away. (cf. B8, D1.)
+    t.check(r_again.content == conv[-1]["content"],
+            "final-turn replay differs:\n  A=%r\n  B=%r"
+            % (conv[-1]["content"][:100], r_again.content[:100]))
+    t.ev("final-turn replay identical")
 
 
 @cell("C", "C6", "false-reuse guard: unrelated prompts must not reuse")
@@ -1327,9 +1313,22 @@ def f5(t):
 
 @cell("F", "F6", "finite think cap + named think budget refused")
 def f6(t):
-    r = chat(t.cfg, user("hi"), expect_error=True, max_tokens=16, max_think_tokens=512)
-    expect_refusal(t, "max_think_tokens", r)
-    r2 = chat(t.cfg, user("hi"), expect_error=True, max_tokens=16, thinking_budget="medium")
+    # Finite think caps are now ENFORCED (vLLM thinking_token_budget
+    # parity): the cursor force-closes the span at the budget, so a tiny
+    # budget yields a short reasoning phase and a normal terminal instead
+    # of the old typed refusal.
+    r = chat(t.cfg, user("Count from 1 to 5, then say done."),
+             max_tokens=400, max_think_tokens=24)
+    t.check(r.status == 200,
+            "max_think_tokens=24: expected 200 (enforced), got %s (%s)"
+            % (r.status, r.error_message[:140]))
+    t.check(r.finish in ("stop", "length"),
+            "budgeted request finish=%s" % r.finish)
+    t.ev("budgeted: reasoning=%d chars, content=%d chars, completion=%s tokens"
+         % (len(r.reasoning or ""), len(r.content or ""),
+            (r.json.get("usage") or {}).get("completion_tokens")))
+    r2 = chat(t.cfg, user("hi"), expect_error=True, max_tokens=16,
+              thinking_budget="medium")
     t.check(r2.status == 400, "thinking_budget: got %s (%s)" % (r2.status, r2.error_message[:140]))
 
 

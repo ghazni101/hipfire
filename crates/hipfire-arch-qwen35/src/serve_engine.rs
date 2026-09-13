@@ -2650,7 +2650,31 @@ struct GrammarConstraint {
     /// then free-runs to its cap and dies as unsatisfiable at terminal).
     /// Capped: only the last `THINK_TAIL_CAP` bytes are kept.
     think_tail: Vec<u8>,
+    /// Enforced thinking budget (spec §7.2, vLLM `thinking_token_budget`
+    /// parity): `usize::MAX` = uncapped. While `in_think`, every ordinary
+    /// committed token consumes one unit; at exhaustion `build_mask` allows
+    /// ONLY the think-close token — the model is forced to close the span
+    /// through the normal commit path (KV row, events, cursor) instead of
+    /// free-running to max_tokens and dying as unsatisfiable.
+    think_budget: usize,
+    /// Think tokens committed so far against `think_budget`.
+    think_tokens_used: usize,
+    /// XGrammar-style per-state token-mask cache (spec §9.2): the allowed
+    /// token set is a pure function of `mask_state_signature`, and states
+    /// recur constantly during structured generation (every `{`, `,`,
+    /// `:`, key/value boundary revisits the same signature). Caching the
+    /// packed bitset per signature turns the per-step O(vocab × buffer)
+    /// matcher sweep into a bitset copy on hits; misses pay once per state.
+    /// Per-request (per-constraint) storage keeps the key space scoped to
+    /// one schema. Bounded: oldest signature evicted at `MASK_CACHE_CAP`.
+    mask_cache: std::collections::HashMap<u64, Vec<u64>>,
+    mask_cache_order: std::collections::VecDeque<u64>,
 }
+
+/// Mask-cache bound: structural states per document are typically <100;
+/// 256 packed bitsets (248k vocab ≈ 31 KiB each) bound memory at ~8 MiB
+/// per grammar slot in the worst case.
+const MASK_CACHE_CAP: usize = 256;
 
 /// Error from grammar mask construction or application (spec §7.2 G2, A17).
 #[derive(Debug, Clone)]
@@ -2708,8 +2732,43 @@ impl GrammarConstraint {
         // the model cannot end the turn without closing the think span and
         // producing the schema-conforming answer (spec §7.2).
         if self.in_think {
+            // Budget exhausted: the only legal next token is the think
+            // close. Forcing it through the normal commit path (KV row,
+            // Token/reasoning events, cursor transition) ends the span
+            // cleanly — the model continues straight into schema-masked
+            // JSON instead of free-running to max_tokens mid-thought and
+            // dying as unsatisfiable. Requires the tokenizer to carry the
+            // special close id; a text-only close cannot be forced.
+            if self.think_tokens_used >= self.think_budget {
+                if let Some(close_id) = self.think_close_id {
+                    for id in 0..vocab_size as u32 {
+                        self.mask_buf[id as usize] = id == close_id;
+                    }
+                    return Ok(&self.mask_buf);
+                }
+            }
             for id in 0..vocab_size as u32 {
                 self.mask_buf[id as usize] = !tokenizer.is_terminator(id);
+            }
+            return Ok(&self.mask_buf);
+        }
+        // Cache hit (XGrammar per-state token masks): the allowed set is a
+        // pure function of the state signature within one schema, so a
+        // recurring state replays its packed bitset instead of re-running
+        // 248k matcher calls (the O(vocab × buffer) sweep — spec §9.2).
+        let sig = self.matcher.mask_state_signature();
+        if let Some(bits) = self.mask_cache.get(&sig) {
+            self.mask_buf.clear();
+            self.mask_buf.resize(vocab_size, false);
+            for (word, &w) in bits.iter().enumerate() {
+                let mut w = w;
+                while w != 0 {
+                    let id = word * 64 + w.trailing_zeros() as usize;
+                    if id < vocab_size {
+                        self.mask_buf[id] = true;
+                    }
+                    w &= w - 1;
+                }
             }
             return Ok(&self.mask_buf);
         }
@@ -2782,6 +2841,10 @@ impl GrammarConstraint {
             return;
         }
         if self.in_think {
+            // Budget accounting: every ordinary think token consumes one
+            // unit (the close token itself returns earlier and never gets
+            // here — closing must stay possible at exactly the budget).
+            self.think_tokens_used = self.think_tokens_used.saturating_add(1);
             // Accumulate raw bytes and watch for the close tag spelled by
             // ordinary tokens (possibly split across several tokens, and
             // possibly when `think_close_id` is None entirely).
@@ -4930,6 +4993,10 @@ fn admit(
                                     .tokenizer
                                     .special_token_id("</think>"),
                                 think_tail: Vec::new(),
+                                think_budget: req.think_budget,
+                                think_tokens_used: 0,
+                                mask_cache: std::collections::HashMap::new(),
+                                mask_cache_order: std::collections::VecDeque::new(),
                             }),
                             Err(e) => {
                                 let _ = send_event(
@@ -5015,15 +5082,22 @@ fn admit(
                     // since its last turn keeps a head KV that matches its
                     // committed prefix, so the suffix's head-fill extends it
                     // in place.
+                    // Head-KV validity gates drafting: after a swap-restore
+                    // the head's private KV is reset to zeros, and the
+                    // suffix head-fill only covers NEW rows — drafting over
+                    // a zeroed prefix span collapses acceptance to ~1
+                    // (pure drafting overhead), so the turn retires to AR
+                    // instead. A session resident on this slot keeps a head
+                    // KV matching its committed prefix and drafts fine.
                     work[slot.0].mtp_active = rig.mtp_head.is_some()
                         && rig.mtp_k > 0
                         && req.visual_data.is_none()
                         && !request_penalized(&req)
                         && !request_sampled(&req)
-                        && req.json_schema.is_none();
-                    if work[slot.0].mtp_active
-                        && !(mtp_head_kv_valid && rig.mtp_states[slot.0].is_some())
-                    {
+                        && req.json_schema.is_none()
+                        && mtp_head_kv_valid
+                        && rig.mtp_states[slot.0].is_some();
+                    if !work[slot.0].mtp_active {
                         if let Some(state) = rig.mtp_states[slot.0].as_mut() {
                             let _ = state.reset(&mut rig.gpu);
                         }
@@ -5589,6 +5663,10 @@ fn admit(
                 think_open_id: rig.tokenizer.special_token_id("<think>"),
                 think_tail: Vec::new(),
                 think_close_id: rig.tokenizer.special_token_id("</think>"),
+                think_budget: req.think_budget,
+                think_tokens_used: 0,
+                mask_cache: std::collections::HashMap::new(),
+                mask_cache_order: std::collections::VecDeque::new(),
             }),
             Err(e) => {
                 // Should not happen (validated at submit), but fail closed.
@@ -5652,11 +5730,17 @@ fn admit(
         // advanced state), which does not yet exist (spec §6 X2: "MTP +
         // grammar → AR selected before execution until exact joint
         // acceptance is implemented and validated").
+        // Radix-reuse retires drafting: the head's private KV is zero for
+        // the reused span (shared pages carry only trunk KV), and drafting
+        // over a zeroed prefix collapses acceptance to ~1 — pure overhead
+        // on exactly the turns reuse was meant to accelerate. AR produces
+        // identical output without the overhead.
         work[slot.0].mtp_active = rig.mtp_head.is_some()
             && rig.mtp_k > 0
             && !penalized
             && !request_sampled(&req)
-            && !grammar_constrained;
+            && !grammar_constrained
+            && reused == 0;
     }
     rig.sample_params[slot.0] = sample_params;
     // A prefix-cache hit's shared pages are already radix-owned up to
