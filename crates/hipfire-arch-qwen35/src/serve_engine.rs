@@ -2916,7 +2916,7 @@ fn run_loop(
         // (spec §5.3: "until it fits or its existing queue deadline
         // expires").
         while slots.iter().any(|s| s.is_none()) {
-            let waiter = match rig.wait_queue.pop_ready(u64::MAX) {
+            let waiter = match rig.wait_queue.pop_ready(rig.tick) {
                 Some(w) => w,
                 None => break,
             };
@@ -4296,7 +4296,7 @@ fn run_loop(
     let shutdown_reason = poison
         .clone()
         .unwrap_or_else(|| "engine shutdown".to_string());
-    while let Some(waiter) = rig.wait_queue.pop_ready(u64::MAX) {
+    for waiter in rig.wait_queue.expire(u64::MAX) {
         if let Some(parked) = rig.parked_requests.remove(&waiter.id) {
             let _ = send_event(
                 &parked.req.reply,

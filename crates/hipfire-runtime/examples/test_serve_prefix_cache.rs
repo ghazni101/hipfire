@@ -192,6 +192,7 @@ fn main() {
                 json_schema: spec.json_schema.clone(),
                 started_in_think: false,
         queue_bytes: 0,
+        request_tag: 1,
                 reply: tx,
             })
             .expect("submit");
@@ -274,6 +275,7 @@ fn main() {
                 json_schema: None,
                 started_in_think: false,
         queue_bytes: 0,
+        request_tag: 2,
                 reply: tx,
             })
             .expect("faulted submit");
@@ -387,6 +389,7 @@ fn main() {
                     json_schema: None,
                     started_in_think: false,
                     queue_bytes: 0,
+                    request_tag: 3,
                     reply: tx,
                 })
                 .expect("a20 submit");
@@ -691,6 +694,7 @@ fn main() {
             json_schema: None,
             started_in_think: false,
         queue_bytes: 0,
+        request_tag: 4,
             reply: tx_long,
         })
         .expect("submit long");
@@ -781,7 +785,8 @@ fn main() {
     let t0 = std::time::Instant::now();
     let rxs: Vec<std::sync::mpsc::Receiver<Event>> = specs
         .iter()
-        .map(|s| {
+        .enumerate()
+        .map(|(i, s)| {
             let (tx, rx) = channel::<Event>();
             engine
                 .submit(SubmitRequest {
@@ -802,6 +807,7 @@ fn main() {
                     json_schema: None,
                     started_in_think: false,
                     queue_bytes: 0,
+                    request_tag: 0xA13_000 + i as u64,
                     reply: tx,
                 })
                 .expect("concurrent submit");
