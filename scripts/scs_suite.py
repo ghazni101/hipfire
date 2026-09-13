@@ -1313,20 +1313,34 @@ def f5(t):
 
 @cell("F", "F6", "finite think cap + named think budget refused")
 def f6(t):
-    # Finite think caps are now ENFORCED (vLLM thinking_token_budget
-    # parity): the cursor force-closes the span at the budget, so a tiny
-    # budget yields a short reasoning phase and a normal terminal instead
-    # of the old typed refusal.
-    r = chat(t.cfg, user("Count from 1 to 5, then say done."),
-             max_tokens=400, max_think_tokens=24)
+    # Finite think caps are now ENFORCED via the grammar cursor (vLLM
+    # thinking_token_budget parity): with a schema present, the mask allows
+    # ONLY the think close at the budget, so the span force-closes and the
+    # request completes with valid JSON — instead of burning to max_tokens
+    # mid-think and dying as unsatisfiable.
+    schema = {"type": "object",
+              "properties": {"done": {"type": "boolean"}},
+              "required": ["done"], "additionalProperties": False}
+    r = chat(t.cfg, user("Count from 1 to 5, then confirm with JSON."),
+             max_tokens=400, max_think_tokens=24,
+             response_format={"type": "json_schema",
+                              "json_schema": {"name": "out", "schema": schema}})
     t.check(r.status == 200,
             "max_think_tokens=24: expected 200 (enforced), got %s (%s)"
             % (r.status, r.error_message[:140]))
-    t.check(r.finish in ("stop", "length"),
-            "budgeted request finish=%s" % r.finish)
-    t.ev("budgeted: reasoning=%d chars, content=%d chars, completion=%s tokens"
-         % (len(r.reasoning or ""), len(r.content or ""),
-            (r.json.get("usage") or {}).get("completion_tokens")))
+    if r.status == 200:
+        t.check(r.finish in ("stop", "length"),
+                "budgeted request finish=%s" % r.finish)
+        try:
+            v = json.loads(r.content)
+            t.check(isinstance(v.get("done"), bool),
+                    "budgeted output schema-conforming: %r" % (v,))
+        except Exception as e:
+            t.check(False, "budgeted output not JSON: %s: %r" % (e, r.content[:120]))
+        comp = (r.json.get("usage") or {}).get("completion_tokens") or 0
+        t.ev("budgeted: completion=%s tokens (budget 24 + JSON)" % comp)
+        t.check(comp < 200,
+                "enforcement should bound the span: completion=%s" % comp)
     r2 = chat(t.cfg, user("hi"), expect_error=True, max_tokens=16,
               thinking_budget="medium")
     t.check(r2.status == 400, "thinking_budget: got %s (%s)" % (r2.status, r2.error_message[:140]))
