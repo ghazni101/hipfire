@@ -1522,6 +1522,7 @@ fn vl_forward_remaining(
     slot: SlotId,
     work: &mut PendingWork,
     image_pad_id: u32,
+    mut grammar: Option<&mut GrammarConstraint>,
 ) -> Result<u32, String> {
     let mut vl = work
         .vl_prefill
@@ -1610,6 +1611,20 @@ fn vl_forward_remaining(
         .gpu
         .download_f32(&rig.scratch.logits)
         .map_err(|e| format!("VL download logits: {e}"))?;
+    // Hard grammar mask BEFORE the host sampler (spec §7.2 G2 — the same
+    // contract the batched path enforces on logits_out). This sequential
+    // path used to sample unconstrained: a schema-violating first token
+    // could leave the matcher accepting and sail through as a success.
+    if let Some(constraint) = grammar.as_deref_mut() {
+        let mask = constraint
+            .build_mask(&rig.tokenizer, rig.config.vocab_size)
+            .map_err(|e| format!("VL grammar mask: {e}"))?;
+        for (i, &allowed) in mask.iter().enumerate() {
+            if !allowed && i < logits.len() {
+                logits[i] = f32::NEG_INFINITY;
+            }
+        }
+    }
     let sp = &rig.sample_params[slot.0];
     let cfg = hipfire_runtime::sampler::SamplerConfig {
         temperature: sp.temperature,
@@ -2988,7 +3003,8 @@ fn run_loop(
                 continue;
             }
             let pad = image_pad_id.unwrap_or(u32::MAX);
-            match vl_forward_remaining(&mut rig, SlotId(s), &mut work[s], pad) {
+            let grammar = slots[s].as_mut().and_then(|f| f.grammar.as_mut());
+            match vl_forward_remaining(&mut rig, SlotId(s), &mut work[s], pad, grammar) {
                 Ok(tok) => commit_sampled_token(&mut rig, &mut slots, &mut work, s, tok),
                 Err(reason) => {
                     if let Some(mut f) = slots[s].take() {
