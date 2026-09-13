@@ -1640,6 +1640,7 @@ pub(crate) fn project_request_contract(
     let max_tokens = match body
         .get("max_tokens")
         .or_else(|| body.get("max_completion_tokens"))
+        .filter(|v| !v.is_null())
     {
         None => config_u64(resolved, "generation.max_tokens")?,
         Some(v) => v.as_u64().ok_or_else(|| {
@@ -7022,6 +7023,72 @@ mod tests {
         }
     }
 
+    /// A PRESENT-but-malformed max_tokens must be a typed 400, never a
+    /// silent fallback to the config default (the gateway used to
+    /// `.and_then(as_u64).unwrap_or(default)`, quietly re-typing -5 / 1.5 /
+    /// "100" into the default budget).
+    #[test]
+    fn project_request_contract_rejects_malformed_max_tokens() {
+        let resolved = contract_resolved_with_system("");
+        for bad in [serde_json::json!(-5), serde_json::json!(1.5), serde_json::json!("100")] {
+            let body = serde_json::json!({
+                "max_tokens": bad,
+                "messages": [{ "role": "user", "content": "hi" }]
+            });
+            let err = project_request_contract(&body, &resolved, false)
+                .expect_err("malformed max_tokens must be rejected");
+            assert!(
+                err.to_string().contains("max_tokens must be an integer"),
+                "unexpected error for {bad}: {err}"
+            );
+        }
+    }
+
+    /// Unsupported OpenAI request fields must be refused here — the daemon
+    /// has typed refusals for them, but this gateway builds the generate
+    /// message from scratch and would strip the fields first (silent
+    /// semantic downgrade: `n: 2` returning one completion).
+    #[test]
+    fn project_request_contract_refuses_unsupported_fields() {
+        let resolved = contract_resolved_with_system("");
+        let cases = [
+            serde_json::json!({"n": 2}),
+            serde_json::json!({"best_of": 2}),
+            serde_json::json!({"logit_bias": {"5": 10}}),
+            serde_json::json!({"echo": true}),
+            serde_json::json!({"suffix": "tail"}),
+        ];
+        for extra in cases {
+            let mut body = serde_json::json!({
+                "max_tokens": 16,
+                "messages": [{ "role": "user", "content": "hi" }]
+            });
+            let (k, v) = extra.as_object().unwrap().iter().next().unwrap();
+            body[k] = v.clone();
+            let err = project_request_contract(&body, &resolved, false)
+                .expect_err("unsupported field must be refused");
+            assert!(
+                err.to_string().contains("not supported on this serve route"),
+                "unexpected error for {k}: {err}"
+            );
+        }
+        // n=1 is the only legal arity and must pass.
+        let body = serde_json::json!({
+            "max_tokens": 16, "n": 1,
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        assert!(project_request_contract(&body, &resolved, false).is_ok());
+    }
+
+    /// `response_format: {"type": "text"}` is OpenAI's DEFAULT format —
+    /// accept it as unconstrained instead of erroring.
+    #[test]
+    fn response_format_text_is_accepted_as_unconstrained() {
+        let value = serde_json::json!({"type": "text"});
+        let got = validate_response_format(Some(&value)).unwrap();
+        assert!(got.is_none(), "text must be accepted as unconstrained");
+    }
+
     #[test]
     fn project_request_contract_injects_default_system() {
         let resolved = contract_resolved_with_system("injected default system");
@@ -7255,9 +7322,17 @@ mod tests {
         .expect("valid array schema");
         assert!(rf.name.is_none());
 
-        // Rejected: unknown type.
-        let err = validate_response_format(Some(&serde_json::json!({
+        // Accepted: `text` is OpenAI's DEFAULT response format — plain
+        // unconstrained output, same as omitting the field.
+        let rf = validate_response_format(Some(&serde_json::json!({
             "type": "text"
+        })))
+        .unwrap();
+        assert!(rf.is_none(), "text is the platform default: no constraint");
+
+        // Rejected: genuinely unknown type.
+        let err = validate_response_format(Some(&serde_json::json!({
+            "type": "yaml"
         })))
         .unwrap_err();
         assert!(err.to_string().contains("not supported"));
