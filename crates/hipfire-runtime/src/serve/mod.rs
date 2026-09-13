@@ -90,6 +90,12 @@ pub struct SubmitRequest {
     /// `thinking_token_budget` parity): once the cursor consumes this many
     /// think tokens, the mask allows ONLY the think close, forcing the span
     /// to end through the normal commit path. `usize::MAX` = uncapped.
+    ///
+    /// Scope: enforcement rides the grammar cursor, so it engages on
+    /// grammar-constrained requests (the case where an over-long think
+    /// span was fatal — burn-to-max then unsatisfiable). Unconstrained
+    /// requests keep OpenAI-style semantics: an over-long think span ends
+    /// at max_tokens with finish=length.
     pub think_budget: usize,
     /// (spec §5.3). The unified permit carries this from HTTP through daemon
     /// to slots so bytes are charged once and released exactly once. Zero
