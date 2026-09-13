@@ -379,6 +379,11 @@ struct Rig {
     cache_domain: Option<hipfire_runtime::serve_contract::CacheDomain>,
     /// True when cross-session prefix reuse is enabled.
     prefix_cache: bool,
+    /// The configured `serve.prefix_cache_max_bytes` ceiling. Retained on
+    /// the Rig so the Reset path can re-apply it to the replacement index
+    /// (`PrefixIndex::new` starts with no ceiling; losing it on reset
+    /// silently unbounded retention).
+    prefix_cache_max_bytes: Option<usize>,
     /// Debug counter: total prefix cache lookups (for test assertions that
     /// vision requests never call lookup).
     lookup_count: u64,
@@ -1317,6 +1322,11 @@ impl Rig {
             checkpoint_pool,
             cache_domain,
             prefix_cache,
+            prefix_cache_max_bytes: if prefix_cache {
+                Some(cfg.prefix_cache_max_bytes as usize)
+            } else {
+                None
+            },
             lookup_count: 0,
             cow_plan_count: 0,
             fair_queue,
@@ -2322,10 +2332,19 @@ fn publish_generated_prefix(
         return;
     }
     let total_tokens = sess.tokens.len();
+    // The token count can exceed the materialized frontier (`state_boundary`)
+    // by one retained-but-never-forwarded terminal token (MaxTokens keeps
+    // the final sampled token in the stream without a KV row; the next
+    // turn's begin_turn prefills it). Sealing a page above the frontier
+    // would publish a row that was never written — stale bytes from the
+    // page's previous tenant, served to every future resumer. Clamp to the
+    // processed-row frontier (the mid-step prefill publish path already
+    // floors `next_pos` the same way).
+    let frontier = done_publish_frontier(total_tokens, state_boundary);
     // Only publish full page-aligned boundaries beyond what was already
     // published. Pages strictly below the committed materialized frontier —
-    // speculative candidate rows never cross into them (spec §4.6.2).
-    let new_boundary = (total_tokens / PAGE_TOKENS) * PAGE_TOKENS;
+    // speculative candidate rows never cross into them (spec §4.6 C2).
+    let new_boundary = (frontier / PAGE_TOKENS) * PAGE_TOKENS;
     if new_boundary <= last_pub || new_boundary == 0 {
         return;
     }
@@ -3028,8 +3047,21 @@ fn run_loop(
                 }
                 if !draft_set.contains(&s) {
                     // Verify rows for this slot cannot fit the global budget
-                    // alongside the other drafted slots: keep the seed and
-                    // run ordinary decode this step (no drop, no wedge).
+                    // alongside the other drafted slots. The candidate order
+                    // (admission age) is stable across steps, so the same
+                    // slots are excluded every step — and a decoding MTP
+                    // slot contributes ZERO rows otherwise: the scheduler
+                    // skips `mtp_active && decoding` slots entirely (no
+                    // ordinary decode fallback), leaving the request
+                    // stalled with no timeout. Retire MTP for this slot
+                    // (mirroring the cap guard below) so it runs ordinary
+                    // decode — no drop, no wedge, just no spec-decode for
+                    // the rest of the request.
+                    work[s].mtp_active = false;
+                    if let Some(last) = work[s].remaining_prompt.last().copied() {
+                        work[s].remaining_prompt.clear();
+                        work[s].remaining_prompt.push(last);
+                    }
                     continue;
                 }
                 if !mtp_verify_fits_cap(work[s].next_pos, rig.mtp_k, rig.cap_tokens) {
@@ -3176,12 +3208,15 @@ fn run_loop(
         // skip_round_complete sets the round boundary so the next select
         // prefers aged (starved) requests before cache-locality tie-breaks.
         rig.fair_queue.skip_round_complete();
-        let granted_ids = if sel.starved_oldest {
-            oldest_active_session(&rig.fair_queue, &slots)
-                .map(|oid| apply_starved_backfill(&sel, oid))
-                .unwrap_or_else(|| eligible_ids_from_selection(&sel))
-        } else {
-            eligible_ids_from_selection(&sel)
+        let granted_ids = match sel.starved_id {
+            // Bounded backfill masks to the STARVED REQUEST's id — the id
+            // Selection carries. Masking to "the oldest active session"
+            // (the old guess, made because Selection lacked the id)
+            // starved the wrong request whenever the starved one was not
+            // the absolute oldest in flight, and froze every healthy slot
+            // to zero rows for the duration.
+            Some(sid) if sel.starved_oldest => apply_starved_backfill(&sel, sid),
+            _ => eligible_ids_from_selection(&sel),
         };
         let mut eligible = vec![false; n];
         for s in 0..n {
@@ -4321,6 +4356,16 @@ fn should_retain_terminal_tok(reason: DoneReason) -> bool {
     matches!(reason, DoneReason::MaxTokens)
 }
 
+/// The materialized-row frontier a Done-time publication may seal up to.
+///
+/// `sess.tokens.len()` is the authoritative token stream, which can run one
+/// token AHEAD of the KV rows: a MaxTokens-terminated request retains its
+/// final sampled token without forwarding it (no row exists for it yet).
+/// Publication must never seal a page covering that unmaterialized row.
+fn done_publish_frontier(total_tokens: usize, state_boundary: usize) -> usize {
+    state_boundary.min(total_tokens)
+}
+
 fn handle_command(
     rig: &mut Rig,
     slots: &mut [Option<InFlight>],
@@ -4443,9 +4488,17 @@ fn handle_command(
                             );
                         }
                     }
-                    // Fresh empty index: every subsequent lookup misses.
-                    rig.prefix_index =
-                        Some(hipfire_runtime::prefix_index::PrefixIndex::new(1 << 16));
+                    // Fresh empty index: every subsequent lookup misses. The
+                    // retained-byte ceiling must be re-applied — a bare
+                    // `PrefixIndex::new` has no ceiling, and losing it here
+                    // silently unbounded cache retention for the rest of
+                    // the process lifetime.
+                    let mut idx =
+                        hipfire_runtime::prefix_index::PrefixIndex::new(1 << 16);
+                    idx.set_max_retained_bytes(
+                        rig.prefix_cache_max_bytes.unwrap_or(usize::MAX),
+                    );
+                    rig.prefix_index = Some(idx);
                 }
                 // Drain and free GPU blobs from the checkpoint pool.
                 if let Some(pool) = rig.checkpoint_pool.as_mut() {
@@ -4507,42 +4560,20 @@ fn eligible_ids_from_selection(sel: &Selection) -> HashSet<u64> {
     sel.grants.iter().map(|g| g.id()).collect()
 }
 
-/// Bounded backfill (spec §5.3 S3.4): when the oldest request is starved,
-/// drop younger grants so the oldest receives the budget it needs. Returns
-/// a set containing only `oldest_id` when `starved_oldest` is set; otherwise
-/// returns every granted id. The oldest is force-included even if it
-/// received no grant this tick — the backfill exists precisely to give a
-/// starved oldest request the next step's budget.
-fn apply_starved_backfill(sel: &Selection, oldest_id: u64) -> HashSet<u64> {
+/// Bounded backfill (spec §5.3 S3.4): when a request is starved, drop
+/// younger grants so the starved one receives the budget it needs. Returns
+/// a set containing only `starved_id` when `starved_oldest` is set;
+/// otherwise returns every granted id. The starved request is force-included
+/// even if it received no grant this tick — the backfill exists precisely to
+/// give it the next step's budget.
+fn apply_starved_backfill(sel: &Selection, starved_id: u64) -> HashSet<u64> {
     if sel.starved_oldest {
         let mut set = HashSet::new();
-        set.insert(oldest_id);
+        set.insert(starved_id);
         set
     } else {
         eligible_ids_from_selection(sel)
     }
-}
-
-/// Find the session id of the oldest admitted request currently in flight,
-/// by lowest `admission_tick` (ties broken by lowest id). Returns `None`
-/// when no active slot is tracked by the FairQueue.
-fn oldest_active_session(
-    q: &FairQueue,
-    slots: &[Option<InFlight>],
-) -> Option<u64> {
-    let mut best: Option<(u64, u64)> = None; // (admission_tick, session_id)
-    for f in slots.iter().flatten() {
-        let Some(req) = q.get(f.session.0) else { continue };
-        match best {
-            None => best = Some((req.admission_tick, f.session.0)),
-            Some((bt, bid)) => {
-                if (req.admission_tick, f.session.0) < (bt, bid) {
-                    best = Some((req.admission_tick, f.session.0));
-                }
-            }
-        }
-    }
-    best.map(|(_, id)| id)
 }
 
 /// Sync a request's per-step needs into the FairQueue from slot state.
@@ -5949,6 +5980,7 @@ mod tests {
                 Grant::Verify { id: 9, rows: 4 },
             ],
             starved_oldest: false,
+            starved_id: None,
         };
         let ids = eligible_ids_from_selection(&sel);
         assert_eq!(ids.len(), 3, "one entry per granted id");
@@ -5972,6 +6004,7 @@ mod tests {
                 Grant::Verify { id: 9, rows: 4 },
             ],
             starved_oldest: true,
+            starved_id: Some(7),
         };
         let ids = apply_starved_backfill(&sel, 7);
         assert_eq!(ids.len(), 1, "backfill keeps only the oldest");
@@ -6070,6 +6103,25 @@ mod tests {
             WaitQueue::new(4, 0, 100),
             Err(WaitError::QueueBytes { .. })
         ));
+    }
+
+    /// Done-time publication boundary is clamped to the materialized row
+    /// frontier: a MaxTokens request whose retained terminal token pushes
+    /// `tokens.len()` to a page boundary must NOT seal the page whose last
+    /// row was never forwarded (stale-tenant KV poison).
+    #[test]
+    fn done_publish_frontier_clamps_unforwarded_terminal_token() {
+        // tokens.len()==256 but only 255 rows exist (terminal retained):
+        // the 128-255 page must stay unpublished until its row is written.
+        assert_eq!(done_publish_frontier(256, 255), 255);
+        // Tokens behind the frontier (normal continuing decode): frontier.
+        assert_eq!(done_publish_frontier(100, 128), 100);
+        // Frontier below tokens, mid-page: no clamping past rows written.
+        assert_eq!(done_publish_frontier(129, 128), 128);
+        // Aligned case: full pages, publish up to the boundary.
+        assert_eq!(done_publish_frontier(256, 256), 256);
+        // Defensive: frontier cannot exceed the token stream.
+        assert_eq!(done_publish_frontier(10, 999), 10);
     }
 
     /// WaitQueue enqueue/pop_ready/expire round-trip (spec §5.3 S3).
