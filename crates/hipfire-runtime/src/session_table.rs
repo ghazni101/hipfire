@@ -274,6 +274,23 @@ impl SessionTable {
             .map(|(id, _)| SessionId(*id))
     }
 
+    /// The LRU non-busy session REGARDLESS of residency — including Cold and
+    /// Swapped entries that hold no slot. The caller must CLOSE (not park)
+    /// such victims: a Cold/Swapped entry has no slot to free, and parking
+    /// it again would loop forever. This is the admission-budget recovery
+    /// path: a swapped-out session still holds its admission grant, and a
+    /// grant only a resident-only victim search can never reach starves
+    /// every newer request until the process restarts. Cold/Swapped
+    /// transcripts were also the unbounded host-memory growth: nothing but
+    /// an explicit client Close removed them.
+    pub fn lru_reclaimable_victim(&self, busy: &[SessionId]) -> Option<SessionId> {
+        self.sessions
+            .iter()
+            .filter(|(id, s)| !busy.iter().any(|b| b.0 == **id))
+            .min_by_key(|(_, s)| s.last_used)
+            .map(|(id, _)| SessionId(*id))
+    }
+
     /// Give up the slot, keeping the session restorable from its snapshot.
     pub fn mark_swapped(&mut self, pool: &mut SlotPool, id: SessionId) {
         if let Some(s) = self.sessions.get_mut(&id.0) {

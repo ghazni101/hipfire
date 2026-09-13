@@ -3536,6 +3536,28 @@ pub mod json_schema {
         /// The decoded-so-far text of the value string the buffer ends
         /// inside (empty when not in a value string).
         value_prefix_decoded: String,
+        /// At a structural VALUE position whose expected node is a string
+        /// `Const`/`Enum`: the member strings. A token OPENING the string
+        /// (`"` alone or a quote-bearing multi-char token) must decode its
+        /// post-quote remainder against this list — the in-string filter
+        /// below only sees later tokens, and the simulation is value-blind
+        /// inside strings (a `"{` opening would otherwise commit garbage).
+        value_start_filter: Option<Vec<String>>,
+        /// At a structural KEY position of a CLOSED object: the unused
+        /// property names — the opening-quote mirror of `key_filter` (a
+        /// `"city`-style token must decode its remainder against the
+        /// unused keys or the quote rides unknown chars into the key).
+        key_start_filter: Option<Vec<String>>,
+        /// The value position is the ROOT value (no enclosing frame): a
+        /// completed root value may only be followed by whitespace.
+        value_at_root: bool,
+        /// The buffer ends inside a KEY or VALUE string of a CLOSED object
+        /// whose every known property is already used (`sated`). The next
+        /// structural continuation after the string closes can only be
+        /// `}` — a `,` would demand a property the schema forbids, and the
+        /// simulation cannot judge that (it accepts `,` blindly), so the
+        /// in-string fast path must close-judge locally.
+        in_string_sated_closed: bool,
     }
 
     /// Value-start bytes for an unconstrained JSON value position.
@@ -3761,6 +3783,31 @@ pub mod json_schema {
                                         .unwrap_or(SchemaNode::Any),
                                     _ => SchemaNode::Any,
                                 };
+                                // A key that COMPLETES outside the closed
+                                // object's property set proves the document
+                                // can never validate — the closing quote of
+                                // such a key is a typed error at this
+                                // advance (the char filter above only
+                                // constrains extensions; `"f"` under
+                                // properties {fixed} must die HERE, or the
+                                // model is steered into an unvalidatable
+                                // document that burns to max_tokens).
+                                if std::env::var("GRAMMAR_TRACE").is_ok() {
+                                    eprintln!("[scan] key completed: {:?} (is_key branch)", s);
+                                }
+                                if let SchemaNode::Object {
+                                    properties,
+                                    additional_properties: false,
+                                    ..
+                                } = schema
+                                {
+                                    if !properties.iter().any(|(k, _)| k == &s) {
+                                        if std::env::var("GRAMMAR_TRACE").is_ok() {
+                                            eprintln!("[scan] UNKNOWN KEY FLAG SET: {:?}", s);
+                                        }
+                                        unknown_key = true;
+                                    }
+                                }
                                 if !keys.insert(s) {
                                     duplicate_keys = true;
                                 }
@@ -4109,6 +4156,23 @@ pub mod json_schema {
             None
         };
 
+        // Sated-closed-object flag: inside a key or value string of a
+        // closed object with every known property used (see the field doc).
+        let in_string_sated_closed = in_string
+            && matches!(
+                frames.last(),
+                Some(Frame::Object {
+                    schema:
+                        SchemaNode::Object {
+                            properties,
+                            additional_properties: false,
+                            ..
+                        },
+                    keys,
+                    ..
+                }) if properties.iter().all(|(k, _)| keys.contains(k))
+            );
+
         // Value-string filter (spec §7.1 soundness): while the buffer ends
         // inside a VALUE string whose expected node is a string
         // `Const`/`Enum`, only the member strings can complete the value —
@@ -4139,6 +4203,53 @@ pub mod json_schema {
             None
         };
 
+        // Opening-quote filters (see the field docs): a token that OPENS
+        // a key/value string carries content the in-string filters never
+        // see, and the simulation cannot judge string interiors against
+        // Const/Enum members or closed-object key sets.
+        let value_start_filter = if !in_string {
+            match value_schema(&frames, root) {
+                Some(SchemaNode::Const(v)) if v.is_string() => {
+                    Some(vec![v.as_str().unwrap_or_default().to_string()])
+                }
+                Some(SchemaNode::Enum(values)) => {
+                    let members: Vec<String> = values
+                        .iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect();
+                    if members.is_empty() { None } else { Some(members) }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+        let key_start_filter = if !in_string {
+            match frames.last() {
+                Some(Frame::Object {
+                    schema:
+                        SchemaNode::Object {
+                            properties,
+                            additional_properties: false,
+                            ..
+                        },
+                    keys,
+                    phase: Phase::Key,
+                    ..
+                }) => {
+                    let unused: Vec<String> = properties
+                        .iter()
+                        .map(|(k, _)| k.clone())
+                        .filter(|k| !keys.contains(k))
+                        .collect();
+                    if unused.is_empty() { None } else { Some(unused) }
+                }
+                _ => None,
+            }
+        } else {
+            None
+        };
+
         RawScan {
             duplicate_keys,
             in_string,
@@ -4159,6 +4270,10 @@ pub mod json_schema {
             number_text,
             value_filter,
             value_prefix_decoded,
+            value_start_filter,
+            key_start_filter,
+            value_at_root: frames.is_empty(),
+            in_string_sated_closed: in_string_sated_closed,
         }
     }
 
@@ -4423,6 +4538,90 @@ pub mod json_schema {
         false
     }
 
+    /// Decode a raw candidate-token fragment against an in-string state,
+    /// honouring a pending escape from the scan. Returns the decoded text
+    /// and whether the fragment contains an UNESCAPED closing quote (the
+    /// string completes — the caller must fall to the simulation, which
+    /// judges the completed string). `None` when the fragment cannot be
+    /// decided byte-locally (truncated \\u escape, raw control byte,
+    /// invalid escape) — under an active filter the caller REFUSES, since
+    /// an undecodable fragment can never be proven to extend a member.
+    fn decode_string_fragment<'a>(
+        mut escape_pending: bool,
+        bytes: &'a [u8],
+    ) -> Option<(String, bool, &'a [u8])> {
+        let mut out = String::new();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            let b = bytes[i];
+            if escape_pending {
+                escape_pending = false;
+                match b {
+                    b'"' => out.push('"'),
+                    b'\\' => out.push('\\'),
+                    b'/' => out.push('/'),
+                    b'b' => out.push('\u{0008}'),
+                    b'f' => out.push('\u{000C}'),
+                    b'n' => out.push('\n'),
+                    b'r' => out.push('\r'),
+                    b't' => out.push('\t'),
+                    b'u' => {
+                        // Need 4 hex digits within this fragment; a
+                        // truncated \\u must fall to the simulation.
+                        if i + 4 >= bytes.len() {
+                            return None;
+                        }
+                        let hex = std::str::from_utf8(&bytes[i + 1..i + 5]).ok()?;
+                        let ch = u32::from_str_radix(hex, 16).ok()?;
+                        // Surrogate pairs: a lone high surrogate needs 6
+                        // more bytes — fall to the simulation.
+                        if (0xD800..0xDC00).contains(&ch) {
+                            return None;
+                        }
+                        out.push(char::from_u32(ch).unwrap_or('\u{FFFD}'));
+                        i += 4;
+                    }
+                    _ => return None, // invalid escape — sim judges
+                }
+                i += 1;
+                continue;
+            }
+            match b {
+                b'"' => return Some((out, true, &bytes[i + 1..])), // string completes
+                b'\\' => {
+                    if i + 1 >= bytes.len() {
+                        // Fragment ends on the backslash: the escape char
+                        // is unknown, so the decoded prefix is undecidable
+                        // (a \\u spelling of a member char cannot be
+                        // ruled IN locally, and the continuation tokens
+                        // rarely exist) — undecidable under an active
+                        // filter means refuse.
+                        return None;
+                    }
+                    escape_pending = true;
+                    i += 1;
+                }
+                c if c < 0x20 => return None, // raw control — sim judges
+                c => {
+                    let len = match c {
+                        c if c & 0xE0 == 0xC0 => 2,
+                        c if c & 0xF0 == 0xE0 => 3,
+                        c if c & 0xF8 == 0xF0 => 4,
+                        _ => 1,
+                    };
+                    let end = (i + len).min(bytes.len());
+                    if end - i < len {
+                        // Truncated multi-byte sequence: leave to sim.
+                        return None;
+                    }
+                    out.push_str(std::str::from_utf8(&bytes[i..end]).ok()?);
+                    i = end;
+                }
+            }
+        }
+        Some((out, false, &[]))
+    }
+
     impl SchemaMatcher {
         /// Create a fresh matcher for the given root schema node.
         pub fn new(root: SchemaNode) -> Self {
@@ -4489,25 +4688,34 @@ pub mod json_schema {
                 // pruned at the mask instead of a burn-to-max_tokens
                 // wedge). Escapes fall through to the simulation.
                 if let Some(filters) = &self.scan.key_filter {
-                    if !self.scan.escape_pending {
-                        if let Ok(tok) = std::str::from_utf8(bytes) {
-                            // The closing quote (or any token containing
-                            // one) is NOT a key-character extension — it
-                            // completes the key and must reach the
-                            // simulation, which judges the completed key
-                            // against the schema.
-                            if !bytes.contains(&b'"')
-                                && !bytes.contains(&b'\\')
-                                && bytes.iter().all(|&b| b >= 0x20)
-                            {
-                                let mut cand = self.scan.key_prefix_decoded.clone();
-                                cand.push_str(tok);
-                                return filters.iter().any(|k| {
-                                    let kb = k.as_bytes();
-                                    kb.len() >= cand.len() && kb.starts_with(cand.as_bytes())
-                                });
-                            }
+                    // Decode the fragment (escapes included) and prefix-
+                    // check the decoded candidate. Escape-bearing tokens
+                    // used to SKIP the filter entirely — an escaped-quote
+                    // key (`"f\"` under properties {fixed}) could then
+                    // extend forever: the simulation cannot refuse an open
+                    // string, so the model burned to max_tokens on a key
+                    // that could never complete to anything valid.
+                    match decode_string_fragment(
+                        self.scan.escape_pending,
+                        bytes,
+                    ) {
+                        Some((decoded, false, _rest)) => {
+                            let mut cand = self.scan.key_prefix_decoded.clone();
+                            cand.push_str(&decoded);
+                            return filters.iter().any(|k| {
+                                let kb = k.as_bytes();
+                                kb.len() >= cand.len()
+                                    && kb.starts_with(cand.as_bytes())
+                            });
                         }
+                        // closes: the completed key must reach the
+                        // simulation (unknown-key / duplicate checks).
+                        Some((_, true, _rest)) => {}
+                        // Undecodable (byte-fallback garbage, truncated
+                        // \u): can never be PROVEN to extend a known key,
+                        // and the simulation cannot judge string interiors
+                        // — refuse rather than open an unprunable burn.
+                        None => return false,
                     }
                 }
                 // Value-string prune (string Const/Enum, spec §7.1): only
@@ -4522,21 +4730,74 @@ pub mod json_schema {
                 // the completed value against the schema. Escapes fall
                 // through to the simulation.
                 if let Some(members) = &self.scan.value_filter {
-                    if !self.scan.escape_pending {
-                        if let Ok(tok) = std::str::from_utf8(bytes) {
-                            if !bytes.contains(&b'"')
-                                && !bytes.contains(&b'\\')
-                                && bytes.iter().all(|&b| b >= 0x20)
-                            {
-                                let mut cand = self.scan.value_prefix_decoded.clone();
-                                cand.push_str(tok);
-                                return members.iter().any(|m| {
-                                    let mb = m.as_bytes();
-                                    mb.len() >= cand.len()
-                                        && mb.starts_with(cand.as_bytes())
-                                });
-                            }
+                    // Same escape-decoding discipline as the key filter:
+                    // escape-bearing fragments used to bypass the prune,
+                    // leaving an unprunable burn via `\"` spam.
+                    match decode_string_fragment(
+                        self.scan.escape_pending,
+                        bytes,
+                    ) {
+                        Some((decoded, false, _rest)) => {
+                            let mut cand = self.scan.value_prefix_decoded.clone();
+                            cand.push_str(&decoded);
+                            return members.iter().any(|m| {
+                                let mb = m.as_bytes();
+                                mb.len() >= cand.len()
+                                    && mb.starts_with(cand.as_bytes())
+                            });
                         }
+                        // closes: the string COMPLETED, so prefix +
+                        // fragment must be exactly a member (prefix alone
+                        // is not enough — `"Z",` under const "ZZQ7" would
+                        // otherwise commit — and the fragment alone is not
+                        // the whole content). The simulation is value-blind
+                        // inside strings; judge the content HERE. The
+                        // trailing bytes (if any) must start a legal
+                        // structural continuation — the sim tolerates some
+                        // trailing junk at commit (`":"` after a complete
+                        // root value) that dead-ends on the NEXT step.
+                        Some((decoded, true, rest)) => {
+                            let mut full = self.scan.value_prefix_decoded.clone();
+                            full.push_str(&decoded);
+                            let content_ok = members
+                                .iter()
+                                .any(|m| m.as_bytes() == full.as_bytes());
+                            if !content_ok {
+                                return false;
+                            }
+                            return match rest.iter().find(|&&b| {
+                                !matches!(b, b' ' | b'\n' | b'\t' | b'\r')
+                            }) {
+                                None => true, // trailing whitespace only
+                                Some(&first) => {
+                                    !self.scan.value_at_root
+                                        && matches!(first, b',' | b'}' | b']')
+                                }
+                            };
+                        }
+                        // Undecodable fragment under a const/enum string:
+                        // refuse (see the key-filter twin above).
+                        None => return false,
+                    }
+                }
+                // Sated-closed object (see the scan field doc): if this
+                // token CLOSES the string, the only legal structural
+                // continuation is `}` — a `,` would demand a property the
+                // schema forbids and the simulation would accept it
+                // blindly, committing an impossible key that then burns.
+                if self.scan.in_string_sated_closed {
+                    match decode_string_fragment(self.scan.escape_pending, bytes) {
+                        Some((_, true, rest)) => {
+                            return match rest.iter().find(|&&b| {
+                                !matches!(b, b' ' | b'\n' | b'\t' | b'\r')
+                            }) {
+                                None => true,
+                                Some(&first) => first == b'}',
+                            };
+                        }
+                        // Continues the string (no unescaped quote in the
+                        // fragment): falls through to the inert allowance.
+                        _ => {}
                     }
                 }
                 // Plain string content: inert UTF-8 without quotes,
@@ -4573,6 +4834,62 @@ pub mod json_schema {
                     {
                         if !value_next.contains(first) {
                             return false;
+                        }
+                    }
+                }
+                // Opening-quote filters: a token that OPENS a constrained
+                // string carries interior content the in-string filters
+                // never see and the simulation cannot judge. Decode the
+                // post-quote remainder against the member/key list.
+                let first_non_ws = bytes
+                    .iter()
+                    .find(|&&b| !matches!(b, b' ' | b'\n' | b'\t' | b'\r'));
+                if first_non_ws == Some(&b'"') {
+                    if let Some(members) = &self.scan.value_start_filter {
+                        match decode_string_fragment(false, &bytes[1..]) {
+                            Some((decoded, false, _rest)) => {
+                                return members.iter().any(|m| {
+                                    let mb = m.as_bytes();
+                                    mb.len() >= decoded.len()
+                                        && mb.starts_with(decoded.as_bytes())
+                                });
+                            }
+                            // Closing quote in the remainder: the string
+                            // completed, so the content must be exactly a
+                            // member, and any trailing bytes must start a
+                            // legal structural continuation (the sim
+                            // cannot judge interiors).
+                            Some((decoded, true, rest)) => {
+                                let content_ok = members
+                                    .iter()
+                                    .any(|m| m.as_bytes() == decoded.as_bytes());
+                                if !content_ok {
+                                    return false;
+                                }
+                                return match rest.iter().find(|&&b| {
+                                    !matches!(b, b' ' | b'\n' | b'\t' | b'\r')
+                                }) {
+                                    None => true,
+                                    Some(&first) => {
+                                        !self.scan.value_at_root
+                                            && matches!(first, b',' | b'}' | b']')
+                                    }
+                                };
+                            }
+                            None => return false,
+                        }
+                    }
+                    if let Some(known) = &self.scan.key_start_filter {
+                        match decode_string_fragment(false, &bytes[1..]) {
+                            Some((decoded, false, _rest)) => {
+                                return known.iter().any(|k| {
+                                    let kb = k.as_bytes();
+                                    kb.len() >= decoded.len()
+                                        && kb.starts_with(decoded.as_bytes())
+                                });
+                            }
+                            Some((_, true, _rest)) => {}
+                            None => return false,
                         }
                     }
                 }
@@ -4653,6 +4970,18 @@ pub mod json_schema {
             self.parse();
         }
 
+        /// Debug: the number of raw bytes the matcher has consumed.
+        #[doc(hidden)]
+        pub fn buffer_len(&self) -> usize {
+            self.bytes.len()
+        }
+
+        /// Debug: the raw buffer contents.
+        #[doc(hidden)]
+        pub fn buffer_bytes(&self) -> &[u8] {
+            &self.bytes
+        }
+
         /// True when the full JSON value has been parsed and conforms
         /// to the schema. After acceptance, only whitespace is allowed —
         /// except while `number_open`, when digits may still extend the
@@ -4695,6 +5024,25 @@ pub mod json_schema {
 
             if start >= slice.len() {
                 return; // Only whitespace so far.
+            }
+
+            // Scan-proven dead ends fire BEFORE serde classification
+            // (spec §7.1/A17: a typed error at the token that proves it).
+            // The old placement — inside the serde EOF-error arm only —
+            // was bypassed whenever the truncated document ended in a
+            // number (the Ok-arm number-growth logic): `{"bad": 1` burned
+            // to max_tokens while `{"bad": "` died instantly. These flags
+            // are proven by the raw scan alone; serde's classification of
+            // the truncation point is irrelevant.
+            if self.scan.duplicate_keys
+                || self.scan.unknown_key
+                || self.scan.required_missing_on_close
+                || self.scan.min_items_unmet_on_close
+                || self.scan.array_over_max
+                || self.scan.number_dead_end
+            {
+                self.errored = true;
+                return;
             }
 
             // Try parsing as a complete JSON value from `start`.
@@ -6590,6 +6938,77 @@ pub mod json_schema {
                 m.is_token_allowed(b"zxq"),
                 "non-enum string content must stay unconstrained"
             );
+        }
+
+        /// A key that completes OUTSIDE a closed object's property set is
+        /// a typed error at its closing quote. The char filter only prunes
+        /// extensions (`"f` survives as a prefix of `fixed`), so without
+        /// this the model could commit `"f": ...` — an unvalidatable
+        /// document that burned to max_tokens (the live E4 failure mode).
+        #[test]
+        fn completed_unknown_key_is_typed_error_under_closed_object() {
+            let schema = json!({
+                "type": "object",
+                "properties": {"fixed": {"type": "string"}},
+                "required": ["fixed"],
+                "additionalProperties": false
+            });
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            // The partial key chars survive the filter (prefix of fixed).
+            let mut m = compiled.matcher();
+            m.advance(b"{\"f");
+            assert!(m.is_token_allowed(b"i"), "prefix chars of a known key stay legal");
+            // Closing the key as "f" (not "fixed") must be refused at the
+            // closing quote.
+            assert!(!m.is_token_allowed(b"\""), "closing an unknown key must error");
+            m.advance(b"\"");
+            assert!(m.is_errored(), "committing the unknown key errors the matcher");
+            // Completing the full known key still works end to end.
+            let mut m = compiled.matcher();
+            m.advance(b"{\"fixed\": \"kappa\", \"fixed\": \"kappa\"}");
+            assert!(m.is_errored(), "duplicate known keys still error");
+            let mut m = compiled.matcher();
+            m.advance(b"{\"fixed\": \"kappa\"}");
+            assert!(m.is_accepting());
+            // Open objects (additionalProperties true) keep inert keys legal.
+            let open_schema = json!({
+                "type": "object",
+                "properties": {"fixed": {"type": "string"}}
+            });
+            let compiled = CompiledSchema::compile(&open_schema).expect("valid");
+            let mut m = compiled.matcher();
+            m.advance(b"{\"whatever\": 1}");
+            assert!(m.is_accepting(), "unknown keys stay legal under an open object");
+        }
+
+        /// Escape-bearing tokens must decode INTO the key filter, not
+        /// bypass it. The live E4 failure: under properties {fixed}, the
+        /// model emitted `"f` then `\":` — a backslash token skipped the
+        /// filter, the simulation cannot refuse an open string, and the
+        /// key grew forever as `f": \"\\"…` (burn to max_tokens).
+        #[test]
+        fn escaped_key_extension_is_pruned_by_key_filter() {
+            let schema = json!({
+                "type": "object",
+                "properties": {"fixed": {"type": "string"}},
+                "required": ["fixed"],
+                "additionalProperties": false
+            });
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let mut m = compiled.matcher();
+            m.advance(b"{\"f");
+            assert!(m.is_token_allowed(b"i"), "prefix extension stays legal");
+            // A backslash-escape extension of the key decodes to `f\"` —
+            // no member prefixes it — and must be refused NOW, not after
+            // an unbounded burn.
+            assert!(
+                !m.is_token_allowed(b"\\\""),
+                "escape-bearing key extension must be filter-pruned"
+            );
+            // Byte-wise equivalence: the same decoded content refused.
+            let mut m2 = compiled.matcher();
+            m2.advance(b"{\"f\\");
+            assert!(!m2.is_token_allowed(b"\""));
         }
 
         #[test]
