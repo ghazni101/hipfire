@@ -86,6 +86,11 @@ pub struct SubmitRequest {
     /// the grammar mask is deferred until `</think>` is emitted — the think
     /// preamble is not JSON and must not be masked by the schema.
     pub started_in_think: bool,
+    /// Enforced thinking budget in think tokens (vLLM
+    /// `thinking_token_budget` parity): once the cursor consumes this many
+    /// think tokens, the mask allows ONLY the think close, forcing the span
+    /// to end through the normal commit path. `usize::MAX` = uncapped.
+    pub think_budget: usize,
     /// (spec §5.3). The unified permit carries this from HTTP through daemon
     /// to slots so bytes are charged once and released exactly once. Zero
     /// when the request did not pass through the byte-bounded queue.

@@ -4982,6 +4982,99 @@ pub mod json_schema {
             &self.bytes
         }
 
+        /// A hash signature of EVERY matcher state the token mask depends
+        /// on: the accepted/errored/number-open bits plus the whole raw
+        /// scan (structural sets, filters, prefixes, dead-end flags).
+        ///
+        /// This is the cache key for the XGrammar-style per-state token
+        /// mask: two matchers with equal signatures return the SAME verdict
+        /// for every candidate token, because every `is_token_allowed` path
+        /// — fast paths and simulation fallthrough alike — reads only these
+        /// fields. Committed sibling VALUES are deliberately excluded: this
+        /// subset has no cross-key constraints, so committed values never
+        /// re-enter the mask (they matter only at final validation, which
+        /// is monotone per position). A mask cache keyed by this signature
+        /// is therefore sound within one schema.
+        #[doc(hidden)]
+        pub fn mask_state_signature(&self) -> u64 {
+            use std::hash::{Hash, Hasher};
+            let mut h = std::collections::hash_map::DefaultHasher::new();
+            self.accepted.hash(&mut h);
+            self.errored.hash(&mut h);
+            self.number_open.hash(&mut h);
+            let sc = &self.scan;
+            sc.duplicate_keys.hash(&mut h);
+            sc.in_string.hash(&mut h);
+            sc.escape_pending.hash(&mut h);
+            sc.literal_tail.hash(&mut h);
+            sc.unknown_key.hash(&mut h);
+            sc.required_missing_on_close.hash(&mut h);
+            sc.min_items_unmet_on_close.hash(&mut h);
+            sc.array_over_max.hash(&mut h);
+            sc.number_tail.hash(&mut h);
+            sc.number_tail_free.hash(&mut h);
+            sc.number_tail_integer.hash(&mut h);
+            sc.number_dead_end.hash(&mut h);
+            sc.value_at_root.hash(&mut h);
+            sc.in_string_sated_closed.hash(&mut h);
+            for &b in &sc.structural_next {
+                b.hash(&mut h);
+            }
+            0xFFu8.hash(&mut h);
+            match &sc.value_next {
+                Some(v) => {
+                    1u8.hash(&mut h);
+                    for &b in v {
+                        b.hash(&mut h);
+                    }
+                }
+                None => 0u8.hash(&mut h),
+            }
+            0xFEu8.hash(&mut h);
+            match &sc.key_filter {
+                Some(v) => {
+                    1u8.hash(&mut h);
+                    for k in v {
+                        k.hash(&mut h);
+                    }
+                }
+                None => 0u8.hash(&mut h),
+            }
+            sc.key_prefix_decoded.hash(&mut h);
+            match &sc.value_filter {
+                Some(v) => {
+                    1u8.hash(&mut h);
+                    for k in v {
+                        k.hash(&mut h);
+                    }
+                }
+                None => 0u8.hash(&mut h),
+            }
+            sc.value_prefix_decoded.hash(&mut h);
+            match &sc.value_start_filter {
+                Some(v) => {
+                    1u8.hash(&mut h);
+                    for k in v {
+                        k.hash(&mut h);
+                    }
+                }
+                None => 0u8.hash(&mut h),
+            }
+            match &sc.key_start_filter {
+                Some(v) => {
+                    1u8.hash(&mut h);
+                    for k in v {
+                        k.hash(&mut h);
+                    }
+                }
+                None => 0u8.hash(&mut h),
+            }
+            for &b in &sc.number_text {
+                b.hash(&mut h);
+            }
+            h.finish()
+        }
+
         /// True when the full JSON value has been parsed and conforms
         /// to the schema. After acceptance, only whitespace is allowed —
         /// except while `number_open`, when digits may still extend the
@@ -6979,6 +7072,54 @@ pub mod json_schema {
             let mut m = compiled.matcher();
             m.advance(b"{\"whatever\": 1}");
             assert!(m.is_accepting(), "unknown keys stay legal under an open object");
+        }
+
+        /// The mask-state signature must be buffer-blind: two matchers
+        /// whose committed buffers differ only in sibling VALUES (never in
+        /// schema-relevant structure) share a signature and return the same
+        /// verdicts — the soundness basis for the per-state mask cache.
+        #[test]
+        fn mask_state_signature_ignores_committed_sibling_values() {
+            let schema = serde_json::json!({
+                "type": "object",
+                "properties": {"a": {"type": "integer"}, "b": {"type": "integer"}},
+                "required": ["a", "b"],
+                "additionalProperties": false
+            });
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let mut m1 = compiled.matcher();
+            let mut m2 = compiled.matcher();
+            let p1 = b"{\"a\": 1, ";
+            let p2 = b"{\"a\": 987654321, ";
+            for by in p1 {
+                m1.advance(&[*by]);
+            }
+            for by in p2 {
+                m2.advance(&[*by]);
+            }
+            assert_eq!(
+                m1.mask_state_signature(),
+                m2.mask_state_signature(),
+                "sibling value length/digits must not change the state"
+            );
+            for t in [b"\"".as_slice(), b"b".as_slice(), b"}".as_slice(), b" ".as_slice()] {
+                assert_eq!(
+                    m1.is_token_allowed(t),
+                    m2.is_token_allowed(t),
+                    "verdicts must agree for {:?}",
+                    String::from_utf8_lossy(t)
+                );
+            }
+            // Genuinely different states (different keys seen) must differ.
+            let mut m3 = compiled.matcher();
+            for by in b"{\"a\": 1, \"b\": 2, " {
+                m3.advance(&[*by]);
+            }
+            assert_ne!(
+                m1.mask_state_signature(),
+                m3.mask_state_signature(),
+                "a used second key is a different state"
+            );
         }
 
         /// Escape-bearing tokens must decode INTO the key filter, not
