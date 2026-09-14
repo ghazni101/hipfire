@@ -1321,8 +1321,11 @@ def f6(t):
     schema = {"type": "object",
               "properties": {"done": {"type": "boolean"}},
               "required": ["done"], "additionalProperties": False}
+    # enable_thinking=True: the budget only engages when a think span
+    # exists (the suite's chat helper defaults it off).
     r = chat(t.cfg, user("Count from 1 to 5, then confirm with JSON."),
              max_tokens=400, max_think_tokens=24,
+             chat_template_kwargs={"enable_thinking": True},
              response_format={"type": "json_schema",
                               "json_schema": {"name": "out", "schema": schema}})
     t.check(r.status == 200,
