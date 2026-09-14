@@ -146,6 +146,15 @@ pub struct EngineConfig {
     /// false (read from `serve.structured_jump_forward`): no behavior change
     /// on the constrained-decode path.
     pub structured_jump_forward: bool,
+    /// DFlash2 draft path (registry sidecar / `params.draft` /
+    /// `HIPFIRE_DFLASH_DRAFT`). `Some` arms the DFlash2 selector chain on
+    /// the slots path; `None` = DFlash off. Mutually exclusive with `mtp_k`
+    /// in practice — when both are armed, DFlash wins at admit (deeper
+    /// speculation, same verify-exact contract).
+    pub dflash_draft: Option<PathBuf>,
+    /// `dflash_mode=on`: a draft load failure fails the engine load.
+    /// `auto`: warn and serve AR.
+    pub dflash_required: bool,
 }
 
 pub struct SlotEngine {
@@ -315,15 +324,26 @@ struct Rig {
         crate::mtp_head::Qwen35MtpHeadBatchedScratch,
         GpuTensor,
     )>,
-    /// Per-layer (qkv, alpha, beta) tape of MTP verify rows, captured during
+    /// Per-layer (qkv, alpha, beta) tape of spec verify rows, captured during
     /// the verify forward and replayed by the partial-accept DN repair.
-    /// Row stride per slot = mtp_k + 1.
-    mtp_verify_tape: Option<crate::speculative::GdnTape>,
+    /// Row stride per slot = `spec_rows` (mtp_k + 1 for MTP, B for DFlash2).
+    spec_verify_tape: Option<crate::speculative::GdnTape>,
     /// Staging for the POST-output-norm hidden rows fed to the MTP head
     /// during prompt prefill (x_batch holds the pre-norm residual).
     mtp_prefill_hidden: GpuTensor,
     /// MTP chain depth (K candidates per cycle). 0 = MTP off.
     mtp_k: usize,
+    /// Verify rows per spec slot: `mtp_k + 1` when only MTP is armed, the
+    /// DFlash2 block size B when a DFlash draft is loaded (the larger when
+    /// both exist — the tape stride and graph-shape check use this uniform
+    /// width).
+    spec_rows: usize,
+    /// Shared DFlash2 draft state (weights + hidden staging). None when
+    /// DFlash is off.
+    dflash: Option<crate::dflash_slot::DflashShared>,
+    /// Per-slot DFlash2 draft context. Allocated lazily on the slot's first
+    /// prefill chunk under `spec == Dflash`; reset per request.
+    dflash_states: Vec<Option<crate::dflash_slot::DflashSlotState>>,
     vision_config: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionConfig>,
     logits_out: GpuTensor,
     out_tokens: GpuTensor,
@@ -542,13 +562,33 @@ impl Rig {
         let per_pos_bytes = kv_plan.k_bytes_per_pos;
         let per_pos_v_bytes = kv_plan.v_bytes_per_pos;
         let prefill_chunk = cfg.prefill_chunk.max(1).min(cfg.cap_tokens.max(1));
-        // A step carries at most max(prefill_chunk, mtp_k + 1) rows per slot:
-        // prefilling slots contribute up to `prefill_chunk` rows, and a
-        // decoding MTP slot injects `mtp_k + 1` verify rows. Sizing without
-        // the mtp term let a small `prefill_chunk` (operator knob) overflow
-        // `pbs.max_batch` on the first verify step — an engine-thread panic,
-        // the serve-hang failure class.
-        let max_batch = (prefill_chunk.max(cfg.mtp_k + 1) * cfg.n_slots).max(cfg.n_slots);
+        // DFlash2 draft config pre-parse: the runtime block size B sets
+        // `spec_rows` (verify rows per spec slot), which `max_batch` and the
+        // verify tape are sized by — both allocated before the GPU-side
+        // draft load below. A parse failure here is non-fatal unless
+        // `dflash_required` (the load itself re-parses and reports).
+        let dflash_block = cfg.dflash_draft.as_ref().and_then(|p| {
+            hipfire_runtime::hfq::HfqFile::open(p)
+                .ok()
+                .and_then(|h| hipfire_runtime::dflash::DflashConfig::from_hfq(&h))
+                .map(|c| c.runtime_block_size())
+        });
+        if cfg.dflash_required && cfg.dflash_draft.is_some() && dflash_block.is_none() {
+            return Err(format!(
+                "dflash_mode=on: failed to parse DflashConfig from {}",
+                cfg.dflash_draft.as_ref().unwrap().display()
+            ));
+        }
+        // Verify rows per spec slot: MTP k+1, DFlash2 B — the larger wins so
+        // the tape stride and batch sizing cover either mechanism.
+        let spec_rows = (cfg.mtp_k + 1).max(dflash_block.unwrap_or(0));
+        // A step carries at most max(prefill_chunk, spec_rows) rows per
+        // slot: prefilling slots contribute up to `prefill_chunk` rows, and
+        // a decoding spec slot injects `spec_rows` verify rows. Sizing
+        // without the spec term let a small `prefill_chunk` (operator knob)
+        // overflow `pbs.max_batch` on the first verify step — an
+        // engine-thread panic, the serve-hang failure class.
+        let max_batch = prefill_chunk.max(spec_rows) * cfg.n_slots;
 
         // ── Paged KV opt-in ────────────────────────────────────────────────
         // Default OFF: the pool stays legacy (fixed per-slot slabs). With
@@ -781,6 +821,54 @@ impl Rig {
             );
         }
 
+        // ── DFlash2 draft loading ─────────────────────────────────────────
+        // Shared draft state (weights + extract-layer hidden staging). The
+        // slot path runs the DFlash2 selector chain only — legacy DFlash
+        // drafts are refused inside `load_dflash_shared`. `dflash_required`
+        // (dflash_mode=on) fails the load; auto warns and serves AR.
+        let dflash = match &cfg.dflash_draft {
+            Some(path) => match crate::dflash_slot::load_dflash_shared(
+                &mut gpu,
+                &path.to_string_lossy(),
+                &config,
+                cfg.cap_tokens,
+                max_batch,
+            ) {
+                Ok(d) => {
+                    eprintln!(
+                        "  DFlash2 draft loaded (slots): {} (B={}, ctx_cap={})",
+                        path.display(),
+                        d.block_size,
+                        d.ctx_capacity
+                    );
+                    Some(d)
+                }
+                Err(e) => {
+                    if cfg.dflash_required {
+                        // No transactional guard yet — free the stages this
+                        // build already owns before returning.
+                        if let Some(h) = mtp_head {
+                            h.free_gpu(&mut gpu);
+                        }
+                        if let Some(vw) = vision_weights {
+                            vw.free_gpu(&mut gpu);
+                        }
+                        weights.free_gpu(&mut gpu);
+                        return Err(format!(
+                            "dflash_mode=on: draft load failed for {}: {e}",
+                            path.display()
+                        ));
+                    }
+                    eprintln!(
+                        "  DFlash draft {} load failed: {e} — serving without DFlash",
+                        path.display()
+                    );
+                    None
+                }
+            },
+            None => None,
+        };
+
         // ── Transactional post-weight guard ────────────────────────────────
         // Every allocation after weights is owned here. On any error, Drop
         // frees all completed stages in reverse construction order
@@ -793,6 +881,7 @@ impl Rig {
             weights: Option<Qwen35Weights>,
             vision_weights: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionWeights>,
             mtp_head: Option<crate::mtp_head::Qwen35MtpHead>,
+            dflash: Option<crate::dflash_slot::DflashShared>,
             k_arenas: Vec<GpuTensor>,
             v_arenas: Vec<GpuTensor>,
             kv_tier: Option<crate::forward_slots::SlotKvTier>,
@@ -843,6 +932,9 @@ impl Rig {
                     if let Some(h) = self.mtp_head.take() {
                         h.free_gpu(&mut gpu);
                     }
+                    if let Some(d) = self.dflash.take() {
+                        d.free_gpu(&mut gpu);
+                    }
                     if let Some(vw) = self.vision_weights.take() {
                         vw.free_gpu(&mut gpu);
                     }
@@ -857,6 +949,7 @@ impl Rig {
             weights: Some(weights),
             vision_weights,
             mtp_head,
+            dflash,
             k_arenas: Vec::with_capacity(n_fa_layers),
             v_arenas: Vec::with_capacity(n_fa_layers),
             kv_tier: None,
@@ -1094,6 +1187,7 @@ impl Rig {
         let weights = g.weights.take().unwrap();
         let vision_weights = g.vision_weights.take();
         let mtp_head = g.mtp_head.take();
+        let dflash = g.dflash.take();
         let k_arenas = std::mem::take(&mut g.k_arenas);
         let v_arenas = std::mem::take(&mut g.v_arenas);
         let kv_tier = g.kv_tier.take().expect("kv tier built");
@@ -1125,14 +1219,14 @@ impl Rig {
                 Ok((scratch, rot))
             })
             .transpose()?;
-        let mtp_verify_tape = if mtp_head.is_some() && mtp_k > 0 {
+        let spec_verify_tape = if (mtp_head.is_some() && mtp_k > 0) || dflash.is_some() {
             Some(
                 crate::speculative::GdnTape::new_for_config(
                     &mut gpu,
                     &config,
-                    cfg.n_slots * (mtp_k + 1),
+                    cfg.n_slots * spec_rows,
                 )
-                .map_err(|e| format!("mtp verify tape: {e}"))?,
+                .map_err(|e| format!("spec verify tape: {e}"))?,
             )
         } else {
             None
@@ -1298,9 +1392,12 @@ impl Rig {
             mtp_head,
             mtp_states: (0..cfg.n_slots).map(|_| None).collect(),
             mtp_prefill_batched,
-            mtp_verify_tape,
+            spec_verify_tape,
             mtp_prefill_hidden,
             mtp_k,
+            spec_rows,
+            dflash,
+            dflash_states: (0..cfg.n_slots).map(|_| None).collect(),
             logits_out,
             out_tokens,
             sample_params,
@@ -1354,8 +1451,10 @@ impl Rig {
             mtp_head,
             mtp_states,
             mtp_prefill_batched,
-            mtp_verify_tape,
+            spec_verify_tape,
             mtp_prefill_hidden,
+            dflash,
+            dflash_states,
             kv_tier,
             k_arenas,
             v_arenas,
@@ -1415,8 +1514,14 @@ impl Rig {
             scratch.free_gpu(&mut gpu);
             note_hip(gpu.free_tensor(rot));
         }
-        if let Some(tape) = mtp_verify_tape {
+        if let Some(tape) = spec_verify_tape {
             tape.free_gpu(&mut gpu);
+        }
+        if let Some(d) = dflash {
+            d.free_gpu(&mut gpu);
+        }
+        for st in dflash_states.into_iter().flatten() {
+            st.free_gpu(&mut gpu);
         }
         note_hip(gpu.free_tensor(mtp_prefill_hidden));
         if let Some(vw) = vision_weights {
@@ -2003,10 +2108,10 @@ fn mtp_verify_accept_step(
             &mut state,
             &draft,
             hidden_row_offset,
-            rig.mtp_verify_tape
+            rig.spec_verify_tape
                 .as_ref()
                 .expect("MTP drafts require the verify tape"),
-            rig.mtp_k + 1,
+            rig.spec_rows,
             slot.0,
             rig.tokenizer.eos_id,
             rig.tokenizer.eot_id,
@@ -2030,8 +2135,178 @@ fn mtp_verify_accept_step(
     outcome
 }
 
-/// Rebuild a `SlotBatch` to include MTP verify tokens for slots that have
-/// draft outputs. Non-MTP slots keep their scheduler-provided rows.
+/// DFlash2 draft phase for one slot: run the draft forward over the slot's
+/// committed context and save the DN snapshot for the verify rollback.
+///
+/// Called when `work.decoding` (subsequent spec steps). Takes the seed from
+/// `work.remaining_prompt.last()` — same protocol as `mtp_draft_step`.
+fn dflash_draft_step(
+    rig: &mut Rig,
+    slot: SlotId,
+    work: &mut PendingWork,
+) -> Result<crate::dflash_slot::DflashSlotDraft, String> {
+    let shared = rig
+        .dflash
+        .as_ref()
+        .ok_or_else(|| "dflash_draft_step: DFlash not loaded".to_string())?;
+    let mut st = rig.dflash_states[slot.0]
+        .take()
+        .ok_or_else(|| "dflash_draft_step: slot state missing (admit bug)".to_string())?;
+
+    let prompt_tokens = std::mem::take(&mut work.remaining_prompt);
+    let pos = work.next_pos;
+    let outcome: Result<crate::dflash_slot::DflashSlotDraft, String> = (|| {
+        let seed = *prompt_tokens
+            .last()
+            .ok_or_else(|| "dflash_draft_step: no seed token".to_string())?;
+        // Save DN snapshot for rollback during verify phase.
+        st.trunk_snap
+            .save_from(&mut rig.dn_states[slot.0], &mut rig.gpu)
+            .map_err(|e| format!("dflash dn snapshot: {e}"))?;
+        crate::dflash_slot::dflash_slot_draft_step(
+            &mut rig.gpu,
+            shared,
+            &rig.weights,
+            &rig.config,
+            &mut st,
+            seed,
+            pos,
+        )
+    })();
+
+    rig.dflash_states[slot.0] = Some(st);
+    outcome
+}
+
+/// DFlash2 verify/accept phase: norm the slot's verify rows out of
+/// `pbs.x_batch`, run the trunk lm_head, greedy-accept, repair DN state on
+/// partial accept, and commit the kept rows' extract-layer hiddens into the
+/// slot's `target_hidden` ring. Mirrors `mtp_verify_accept_step`.
+#[allow(clippy::too_many_arguments)]
+fn dflash_verify_accept_step(
+    rig: &mut Rig,
+    slot: SlotId,
+    work: &mut PendingWork,
+    mut draft: crate::dflash_slot::DflashSlotDraft,
+    hidden_row_offset: usize,
+    produced: usize,
+    max_tokens: usize,
+    sess_len: usize,
+) -> Result<Vec<u32>, String> {
+    let mut st = rig.dflash_states[slot.0]
+        .take()
+        .expect("dflash state must exist from draft phase");
+    let pos = work.next_pos;
+    let commit_budget = max_tokens
+        .saturating_sub(produced)
+        .min(rig.cap_tokens.saturating_sub(sess_len))
+        .max(1);
+
+    let outcome: Result<Vec<u32>, String> = (|| {
+        let committed = crate::dflash_slot::dflash_slot_verify_accept(
+            &mut rig.gpu,
+            rig.dflash
+                .as_ref()
+                .expect("dflash draft requires shared state"),
+            &rig.weights,
+            &rig.config,
+            &mut rig.dn_states[slot.0],
+            &rig.pbs,
+            &mut st,
+            &mut draft,
+            pos,
+            hidden_row_offset,
+            rig.spec_verify_tape
+                .as_ref()
+                .expect("DFlash drafts require the verify tape"),
+            rig.spec_rows,
+            slot,
+            rig.tokenizer.eos_id,
+            rig.tokenizer.eot_id,
+            commit_budget,
+        )
+        .map_err(|e| format!("dflash verify: {e}"))?;
+
+        let new_pos = pos + committed.len();
+        work.next_pos = new_pos;
+        rig.pool
+            .set_seq_len(slot, new_pos)
+            .map_err(|e| format!("dflash set_seq_len: {e}"))?;
+        Ok(committed)
+    })();
+
+    // Keep the draft's device buffers for the next cycle's reuse.
+    st.draft = Some(draft);
+    rig.dflash_states[slot.0] = Some(st);
+    outcome
+}
+
+/// DFlash2 prefill chunk: lazily allocate the slot's draft state, scatter
+/// this chunk's extract-layer hidden rows (captured into the shared
+/// staging during the forward) into the slot's `target_hidden` ring, and
+/// advance the thlog watermark. `chunk_pos` is the chunk's first absolute
+/// position (`batch.positions[row_off]`).
+fn dflash_prefill_chunk(
+    rig: &mut Rig,
+    slot: SlotId,
+    row_off: usize,
+    m: usize,
+    chunk_pos: usize,
+) -> Result<(), String> {
+    if rig.dflash_states[slot.0].is_none() {
+        let st = crate::dflash_slot::new_dflash_slot_state(
+            &mut rig.gpu,
+            rig.dflash
+                .as_ref()
+                .ok_or_else(|| "dflash prefill: shared state missing".to_string())?,
+            &rig.config,
+            &rig.dn_states[slot.0],
+        )
+        .map_err(|e| format!("dflash state alloc: {e}"))?;
+        rig.dflash_states[slot.0] = Some(st);
+    }
+    let st = rig.dflash_states[slot.0].as_mut().unwrap();
+    let shared = rig.dflash.as_ref().unwrap();
+    crate::dflash_slot::scatter_staging_rows_to_interleaved(
+        &mut rig.gpu,
+        shared,
+        st,
+        row_off,
+        chunk_pos,
+        m,
+    )
+    .map_err(|e| format!("dflash prefill scatter: {e}"))?;
+    st.scratch.thlog.append_committed(chunk_pos, m, 0);
+    st.seeded_through = chunk_pos + m;
+    Ok(())
+}
+
+/// One slot's in-flight spec draft between the draft phase and the
+/// post-forward accept. `Mtp` carries the head's K-step chain output;
+/// `Dflash` carries the DFlash2 selector block. Both expose the verify-row
+/// tokens `[seed, drafts…]` and the row-0 position the batch injects.
+enum SpecDraftRows {
+    Mtp(crate::mtp_spec::MtpDraftOutput),
+    Dflash(crate::dflash_slot::DflashSlotDraft),
+}
+
+impl SpecDraftRows {
+    fn verify_tokens(&self) -> Vec<u32> {
+        match self {
+            SpecDraftRows::Mtp(d) => d.verify_tokens(),
+            SpecDraftRows::Dflash(d) => d.verify_tokens.clone(),
+        }
+    }
+    fn cur_pos(&self) -> usize {
+        match self {
+            SpecDraftRows::Mtp(d) => d.cur_pos,
+            SpecDraftRows::Dflash(d) => d.cur_pos,
+        }
+    }
+}
+
+/// Rebuild a `SlotBatch` to include spec verify tokens for slots that have
+/// draft outputs. Non-spec slots keep their scheduler-provided rows.
 ///
 /// `pos3_deltas[s]` is the slot's continuation rope offset (0 for pure-text
 /// conversations): verify rows are text rows of the slot they belong to, so
@@ -2041,15 +2316,15 @@ fn mtp_verify_accept_step(
 /// `force_pos3` is the scheduler's work-level "this step needs M-RoPE" flag
 /// (`(vl_prefill && !vl_sequential) || pos3_delta != 0` over ALL work, not
 /// just the rows the scheduler emitted). It MUST be passed in by the caller:
-/// an MTP-decoding slot contributes zero scheduler rows, so a verify-only
-/// step — the steady state whenever the only active request is an MTP slot —
+/// a spec-decoding slot contributes zero scheduler rows, so a verify-only
+/// step — the steady state whenever the only active request is a spec slot —
 /// has an empty `batch.pos3` even though the slot's rows need the shifted
 /// phases. Deriving the flag from `batch.pos3` emptiness here would silently
 /// drop pos3 for exactly those steps and phase-shift every verify query
 /// against the image turn's stored keys.
-fn inject_mtp_verify_tokens(
+fn inject_spec_verify_tokens(
     batch: &SlotBatch,
-    mtp_drafts: &[Option<crate::mtp_spec::MtpDraftOutput>],
+    spec_drafts: &[Option<SpecDraftRows>],
     n_slots: usize,
     pos3_deltas: &[i32],
     force_pos3: bool,
@@ -2063,12 +2338,12 @@ fn inject_mtp_verify_tokens(
     let mut new_batch = SlotBatch::default();
     let mut old_row_off = 0usize;
     for s in 0..n_slots {
-        if let Some(draft) = &mtp_drafts[s] {
+        if let Some(draft) = &spec_drafts[s] {
             let delta = pos3_deltas.get(s).copied().unwrap_or(0);
             let verify_tokens = draft.verify_tokens();
             new_batch.m_per_slot.push(verify_tokens.len());
             for (i, t) in verify_tokens.iter().enumerate() {
-                let pos = draft.cur_pos + i;
+                let pos = draft.cur_pos() + i;
                 new_batch.tokens.push(*t);
                 new_batch.positions.push(pos as i32);
                 new_batch.row_slot.push(s as i32);
@@ -2110,15 +2385,15 @@ fn clear_work_slot(work: &mut PendingWork) {
     work.decoding = false;
     work.next_pos = 0;
     work.vl_prefill = None;
-    work.mtp_active = false;
+    work.spec = crate::scheduler::SpecKind::None;
     work.pos3_delta = 0;
     // Adaptive-retire counters are per-REQUEST state: a request that ends
     // mid-window must not leave its failures behind for the slot's next
     // occupant (one bad window would sit one failure from retirement, and
     // the next request's window mean would mix both requests' advances).
-    work.mtp_cycles = 0;
-    work.mtp_committed = 0;
-    work.mtp_retire_fails = 0;
+    work.spec_cycles = 0;
+    work.spec_committed = 0;
+    work.spec_retire_fails = 0;
 }
 
 /// Release a request's prefix-cache pin on every terminal path (spec §4.4
@@ -2256,8 +2531,8 @@ pub const MTP_RETIRE_MIN_ADVANCE: f64 = 2.2;
 /// opening); two in a row means the head genuinely cannot pay for the cycle.
 pub const MTP_RETIRE_WINDOWS: usize = 2;
 
-fn mtp_verify_fits_cap(next_pos: usize, mtp_k: usize, cap_tokens: usize) -> bool {
-    mtp_k + 1 <= cap_tokens.saturating_sub(next_pos)
+fn spec_verify_fits_cap(next_pos: usize, verify_rows: usize, cap_tokens: usize) -> bool {
+    verify_rows <= cap_tokens.saturating_sub(next_pos)
 }
 
 /// True when the request carries a non-neutral token penalty. Such requests
@@ -2809,7 +3084,7 @@ impl GrammarConstraint {
                 eprintln!(
                     "[masktrace] matcher byte_len={} tail={:?}",
                     self.matcher.buffer_len(),
-                    String::from_utf8_lossy(&self.matcher.buffer_bytes()[std::cmp::min(40, self.matcher.buffer_len()).max(40) - 40..]),
+                    String::from_utf8_lossy(&self.matcher.buffer_bytes()[self.matcher.buffer_len().saturating_sub(40)..]),
                 );
             }
             return Err(GrammarMaskError::EmptyAllowedSet);
@@ -2919,10 +3194,10 @@ fn run_loop(
             next_pos: 0,
             decoding: false,
             vl_prefill: None,
-            mtp_active: false,
-            mtp_cycles: 0,
-            mtp_committed: 0,
-            mtp_retire_fails: 0,
+            spec: crate::scheduler::SpecKind::None,
+            spec_cycles: 0,
+            spec_committed: 0,
+            spec_retire_fails: 0,
             pos3_delta: 0,
         })
         .collect();
@@ -3101,37 +3376,38 @@ fn run_loop(
             }
         }
 
-        // ── MTP phase 1: draft ────────────────────────────────────────────
-        // MTP slots prefill through the scheduler's batched chunk path like
-        // any other slot (their head-KV fill runs post-forward from x_batch,
-        // below). This phase only drafts: K serial head-forward steps per
-        // decoding MTP slot. The trunk verify is batched with regular decode
-        // in the forward_batch_slots_graphed_opts call below — the vLLM-style
-        // batched-verify design, now graph-captured like pure decode.
-        let mut mtp_drafts: Vec<Option<crate::mtp_spec::MtpDraftOutput>> = (0..n).map(|_| None).collect();
-        // The seed token each draft consumed from `remaining_prompt`
-        // (`mtp_draft_step` takes the prompt vector to satisfy borrows, so
-        // the seed is GONE from the slot while the draft lives). Any path
-        // that drops a draft without terminating the request must re-push
-        // this seed and retire `mtp_active`, or the slot is left
-        // decoding/MTP-active with an empty prompt: `skip_entirely` holds,
-        // every readiness predicate is false, and the slot contributes zero
-        // rows forever — a permanent wedge.
-        let mut mtp_seeds: Vec<Option<u32>> = (0..n).map(|_| None).collect();
-        if rig.mtp_head.is_some() && rig.mtp_k > 0 {
-            // Pre-draft budget gate (spec §5.2 S2: "MTP decoding must not
+        // ── Spec phase 1: draft ─────────────────────────────────────────
+        // Spec slots prefill through the scheduler's batched chunk path
+        // like any other slot (their private state fills post-forward from
+        // x_batch / hidden staging, below). This phase only drafts: K
+        // serial head-forward steps per MTP slot, one DFlash2 block forward
+        // per DFlash slot. The trunk verify is batched with regular decode
+        // in the forward_batch_slots_graphed_opts call below — the
+        // vLLM-style batched-verify design, graph-captured like pure decode.
+        let mut spec_drafts: Vec<Option<SpecDraftRows>> = (0..n).map(|_| None).collect();
+        // The seed token each draft consumed from `remaining_prompt` (the
+        // draft step takes the prompt vector to satisfy borrows, so the
+        // seed is GONE from the slot while the draft lives). Any path that
+        // drops a draft without terminating the request must re-push this
+        // seed and retire `spec`, or the slot is left decoding/spec-active
+        // with an empty prompt: `skip_entirely` holds, every readiness
+        // predicate is false, and the slot contributes zero rows forever —
+        // a permanent wedge.
+        let mut spec_seeds: Vec<Option<u32>> = (0..n).map(|_| None).collect();
+        if (rig.mtp_head.is_some() && rig.mtp_k > 0) || rig.dflash.is_some() {
+            // Pre-draft budget gate (spec §5.2 S2: "spec decoding must not
             // also receive an ordinary decode row ... reduce supported draft
             // depth or run AR"): only as many slots may draft as fit their
-            // verify rows (k+1 each) inside max_batch_tokens. Candidates are
-            // taken in FairQueue age order so the oldest decodes keep MTP
-            // under pressure; the rest stay on ordinary AR decode this step
-            // (their seed is still in `remaining_prompt`, so nothing else is
-            // needed).
-            let verify_rows_per_slot = (rig.mtp_k + 1) as usize;
-            let max_draft_slots = (rig.max_batch_tokens / verify_rows_per_slot.max(1)).max(1);
+            // verify rows (spec_rows each) inside max_batch_tokens.
+            // Candidates are taken in FairQueue age order so the oldest
+            // decodes keep spec under pressure; the rest stay on ordinary
+            // AR decode this step (their seed is still in
+            // `remaining_prompt`, so nothing else is needed).
+            let verify_rows_per_slot = rig.spec_rows.max(1);
+            let max_draft_slots = (rig.max_batch_tokens / verify_rows_per_slot).max(1);
             let mut draft_candidates: Vec<usize> = Vec::new();
             for s in 0..n {
-                if work[s].mtp_active && slots[s].is_some() && work[s].decoding
+                if work[s].spec.active() && slots[s].is_some() && work[s].decoding
                     && !work[s].remaining_prompt.is_empty()
                 {
                     draft_candidates.push(s);
@@ -3147,7 +3423,7 @@ fn run_loop(
             let draft_set: std::collections::HashSet<usize> =
                 draft_candidates.into_iter().collect();
             for s in 0..n {
-                if !work[s].mtp_active || slots[s].is_none() || !work[s].decoding {
+                if !work[s].spec.active() || slots[s].is_none() || !work[s].decoding {
                     continue;
                 }
                 if work[s].remaining_prompt.is_empty() {
@@ -3157,43 +3433,61 @@ fn run_loop(
                     // Verify rows for this slot cannot fit the global budget
                     // alongside the other drafted slots. The candidate order
                     // (admission age) is stable across steps, so the same
-                    // slots are excluded every step — and a decoding MTP
+                    // slots are excluded every step — and a decoding spec
                     // slot contributes ZERO rows otherwise: the scheduler
-                    // skips `mtp_active && decoding` slots entirely (no
+                    // skips `spec.active() && decoding` slots entirely (no
                     // ordinary decode fallback), leaving the request
-                    // stalled with no timeout. Retire MTP for this slot
+                    // stalled with no timeout. Retire spec for this slot
                     // (mirroring the cap guard below) so it runs ordinary
                     // decode — no drop, no wedge, just no spec-decode for
                     // the rest of the request.
-                    work[s].mtp_active = false;
+                    work[s].spec = crate::scheduler::SpecKind::None;
                     if let Some(last) = work[s].remaining_prompt.last().copied() {
                         work[s].remaining_prompt.clear();
                         work[s].remaining_prompt.push(last);
                     }
                     continue;
                 }
-                if !mtp_verify_fits_cap(work[s].next_pos, rig.mtp_k, rig.cap_tokens) {
-                    // Context-cap guard: the batched verify writes mtp_k+1 rows
-                    // at next_pos..next_pos+mtp_k; a frontier past the cap
-                    // fails the forward's provision CLOSED, which rejects every
-                    // active slot, not just this one. Retire MTP for this slot
-                    // and let regular decode finish under its per-token guard.
-                    // Of the committed tokens only the newest is not yet in
-                    // KV — the rest are dead seed copies — so keep just it.
-                    work[s].mtp_active = false;
+                if !spec_verify_fits_cap(work[s].next_pos, rig.spec_rows, rig.cap_tokens) {
+                    // Context-cap guard: the batched verify writes spec_rows
+                    // rows at next_pos..next_pos+spec_rows-1; a frontier
+                    // past the cap fails the forward's provision CLOSED,
+                    // which rejects every active slot, not just this one.
+                    // Retire spec for this slot and let regular decode
+                    // finish under its per-token guard. Of the committed
+                    // tokens only the newest is not yet in KV — the rest
+                    // are dead seed copies — so keep just it.
+                    work[s].spec = crate::scheduler::SpecKind::None;
                     if let Some(last) = work[s].remaining_prompt.last().copied() {
                         work[s].remaining_prompt.clear();
                         work[s].remaining_prompt.push(last);
                     }
                 } else {
-                    // Draft phase: K serial head-forward steps. The seed this
-                    // call takes out of `remaining_prompt` is stashed so a
-                    // later draft drop can restore it.
+                    // Draft phase. The seed this call takes out of
+                    // `remaining_prompt` is stashed so a later draft drop
+                    // can restore it.
                     let seed = work[s].remaining_prompt.last().copied();
-                    match mtp_draft_step(&mut rig, SlotId(s), &mut work[s]) {
+                    let outcome = match work[s].spec {
+                        crate::scheduler::SpecKind::Mtp => mtp_draft_step(
+                            &mut rig,
+                            SlotId(s),
+                            &mut work[s],
+                        )
+                        .map(SpecDraftRows::Mtp),
+                        crate::scheduler::SpecKind::Dflash => dflash_draft_step(
+                            &mut rig,
+                            SlotId(s),
+                            &mut work[s],
+                        )
+                        .map(SpecDraftRows::Dflash),
+                        crate::scheduler::SpecKind::None => unreachable!(
+                            "spec.active() gate above"
+                        ),
+                    };
+                    match outcome {
                         Ok(draft) => {
-                            mtp_seeds[s] = seed;
-                            mtp_drafts[s] = Some(draft);
+                            spec_seeds[s] = seed;
+                            spec_drafts[s] = Some(draft);
                         }
                         Err(reason) => {
                             if let Some(mut f) = slots[s].take() {
@@ -3270,11 +3564,11 @@ fn run_loop(
         // seed stays in `remaining_prompt` for a regular decode row next
         // step) rather than overflowing the budget.
         let mut verify_rows: u64 = 0;
-        if mtp_drafts.iter().any(|d| d.is_some()) {
+        if spec_drafts.iter().any(|d| d.is_some()) {
             for s in 0..n {
-                if mtp_drafts[s].is_some() {
+                if spec_drafts[s].is_some() {
                     verify_rows = verify_rows
-                        .checked_add((rig.mtp_k + 1) as u64)
+                        .checked_add(rig.spec_rows as u64)
                         .unwrap_or(u64::MAX);
                 }
             }
@@ -3293,12 +3587,12 @@ fn run_loop(
         // backfill (only the oldest stays eligible so younger prefill/decode
         // is skipped this tick, giving the starved oldest the next budget).
         let vl_sequential = rig.vl_sequential;
-        let mtp_k = rig.mtp_k;
+        let spec_rows = rig.spec_rows;
         for s in 0..n {
             let Some(f) = slots[s].as_ref() else { continue };
             let id = f.session.0;
             let wants_decode = is_runnable_decode(&work[s], vl_sequential);
-            let verify = if mtp_drafts[s].is_some() { (mtp_k + 1) as u64 } else { 0 };
+            let verify = if spec_drafts[s].is_some() { spec_rows as u64 } else { 0 };
             let uncached = if is_runnable_prefill(&work[s], vl_sequential) {
                 work[s].remaining_prompt.len() as u64
             } else {
@@ -3347,7 +3641,7 @@ fn run_loop(
         let decode_rows: u64 = (0..n)
             .filter(|&s| {
                 work[s].decoding
-                    && !work[s].mtp_active
+                    && !work[s].spec.active()
                     && sched_batch.m_per_slot.get(s).copied().unwrap_or(0) > 0
             })
             .map(|s| sched_batch.m_per_slot[s] as u64)
@@ -3379,11 +3673,11 @@ fn run_loop(
                 // (= budget − verify_rows), so after draft dropping the
                 // reservation MUST fit — verify_rows was over-counted.
                 while reservation.fits(max_batch_tokens as u64) != Ok(true) {
-                    let slot = mtp_drafts.iter().position(|x| x.is_some());
+                    let slot = spec_drafts.iter().position(|x| x.is_some());
                     match slot {
                         Some(s) => {
-                            mtp_drafts[s] = None;
-                            let vk = (rig.mtp_k + 1) as u64;
+                            spec_drafts[s] = None;
+                            let vk = rig.spec_rows as u64;
                             reservation.verify_rows = reservation.verify_rows.saturating_sub(vk);
                             // The draft consumed the seed OUT of
                             // `remaining_prompt` (`mtp_draft_step` takes it).
@@ -3393,8 +3687,8 @@ fn run_loop(
                             // `skip_entirely` hold and every readiness
                             // predicate false: the slot would contribute zero
                             // rows forever (a wedge).
-                            work[s].mtp_active = false;
-                            if let Some(seed) = mtp_seeds[s].take() {
+                            work[s].spec = crate::scheduler::SpecKind::None;
+                            if let Some(seed) = spec_seeds[s].take() {
                                 work[s].remaining_prompt.clear();
                                 work[s].remaining_prompt.push(seed);
                             }
@@ -3420,20 +3714,20 @@ fn run_loop(
             }
         }
 
-        // Re-inject MTP verify tokens for the surviving drafts. A slot whose
+        // Re-inject spec verify tokens for the surviving drafts. A slot whose
         // draft was dropped above has been retired to ordinary decode (seed
-        // restored into `remaining_prompt`, `mtp_active` cleared) and simply
+        // restored into `remaining_prompt`, `spec` cleared) and simply
         // contributes no rows this step.
-        let mut batch = if mtp_drafts.iter().any(|d| d.is_some()) {
+        let mut batch = if spec_drafts.iter().any(|d| d.is_some()) {
             let pos3_deltas: Vec<i32> = work.iter().map(|w| w.pos3_delta).collect();
             // Work-level M-RoPE need — the same predicate the scheduler's
             // `any_pos3` uses — NOT derived from `sched_batch.pos3`, which is
             // empty whenever the scheduler emitted no rows (verify-only
-            // steps; see `inject_mtp_verify_tokens`).
+            // steps; see `inject_spec_verify_tokens`).
             let force_pos3 = work.iter().any(|w| {
                 (w.vl_prefill.is_some() && !rig.vl_sequential) || w.pos3_delta != 0
             });
-            inject_mtp_verify_tokens(&sched_batch, &mtp_drafts, n, &pos3_deltas, force_pos3)
+            inject_spec_verify_tokens(&sched_batch, &spec_drafts, n, &pos3_deltas, force_pos3)
         } else {
             sched_batch
         };
@@ -3582,10 +3876,10 @@ fn run_loop(
             // arrays packed by m_per_slot, so zeroing m_per_slot without
             // removing the flat rows would misalign every subsequent slot.
             rebuild_batch_excluding_failed(&mut batch, &failed_slots);
-            // Also drop MTP drafts for failed slots so the verify path
+            // Also drop spec drafts for failed slots so the verify path
             // does not try to read their hidden rows.
             for &s in &failed_slots {
-                mtp_drafts[s] = None;
+                spec_drafts[s] = None;
             }
             if batch.is_empty() {
                 continue;
@@ -3596,7 +3890,7 @@ fn run_loop(
         // lm_head over all k+1 rows instead, so the single-row GEMV (a full
         // vocab projection) is redundant for them. Computed after COW failure
         // isolation so a dropped draft is not counted as a verify slot.
-        let lm_head_skip: Vec<bool> = (0..n).map(|s| mtp_drafts[s].is_some()).collect();
+        let lm_head_skip: Vec<bool> = (0..n).map(|s| spec_drafts[s].is_some()).collect();
         let any_verify = lm_head_skip.iter().any(|&b| b);
 
         // Commit the surviving COW plans — the copies already ran at plan
@@ -3628,7 +3922,7 @@ fn run_loop(
                 }
                 clear_work_slot(&mut work[s]);
                 clear_slot_vl_state(&mut rig, s);
-                mtp_drafts[s] = None;
+                spec_drafts[s] = None;
             }
             rebuild_batch_excluding_failed(&mut batch, &failed_commits);
             if batch.is_empty() {
@@ -3636,16 +3930,30 @@ fn run_loop(
             }
         }
 
+        // DFlash slots need the extract-layer hidden capture whenever they
+        // contribute rows this step — prefill chunks (draft-context seed)
+        // and verify rows (post-accept commit) alike.
+        let any_dflash_rows = (0..n).any(|s| {
+            work[s].spec == crate::scheduler::SpecKind::Dflash
+                && batch.m_per_slot.get(s).copied().unwrap_or(0) > 0
+        });
         let fwd = (|| {
-            let mut capture = any_verify.then(|| {
+            let mut capture = (any_verify || any_dflash_rows).then(|| {
                 let tape = rig
-                    .mtp_verify_tape
+                    .spec_verify_tape
                     .as_mut()
-                    .expect("MTP drafts require the verify tape");
-                crate::forward_slots::MtpVerifyCapture {
+                    .expect("spec drafts require the verify tape");
+                crate::forward_slots::SpecVerifyCapture {
                     tape,
                     verify_slots: &lm_head_skip,
-                    stride: rig.mtp_k + 1,
+                    stride: rig.spec_rows,
+                    hidden: if any_dflash_rows {
+                        rig.dflash
+                            .as_ref()
+                            .map(|d| d.hidden_capture(rig.config.dim))
+                    } else {
+                        None
+                    },
                 }
             });
             forward_batch_slots_graphed_opts(
@@ -3663,7 +3971,7 @@ fn run_loop(
                 &rig.scratch,
                 &rig.logits_out,
                 &mut graph,
-                rig.mtp_k,
+                rig.spec_rows,
                 &lm_head_skip,
                 capture.as_mut(),
             )
@@ -3850,7 +4158,7 @@ fn run_loop(
                     work[s].remaining_prompt.clear();
                     work[s].decoding = false;
                     work[s].next_pos = 0;
-                    work[s].mtp_active = false;
+                    work[s].spec = crate::scheduler::SpecKind::None;
                 }
             }
             continue;
@@ -4036,7 +4344,7 @@ fn run_loop(
                 }
                 // MTP is disabled for grammar-constrained requests at
                 // admit, but be defensive.
-                if work[s].mtp_active {
+                if work[s].spec.active() {
                     continue;
                 }
                 let remaining_max = f.max_tokens.saturating_sub(f.produced);
@@ -4114,8 +4422,8 @@ fn run_loop(
         }
 
         for s in 0..n {
-            // MTP verify/accept: process slots that produced draft outputs.
-            if let Some(draft) = mtp_drafts[s].take() {
+            // Spec verify/accept: process slots that produced draft outputs.
+            if let Some(draft) = spec_drafts[s].take() {
                 if slots[s].is_none() {
                     continue;
                 }
@@ -4136,16 +4444,29 @@ fn run_loop(
                     ),
                     None => (0, usize::MAX, 0),
                 };
-                match mtp_verify_accept_step(
-                    &mut rig,
-                    SlotId(s),
-                    &mut work[s],
-                    draft,
-                    hidden_row_offset,
-                    produced,
-                    max_tokens,
-                    sess_len,
-                ) {
+                let accept_outcome = match draft {
+                    SpecDraftRows::Mtp(d) => mtp_verify_accept_step(
+                        &mut rig,
+                        SlotId(s),
+                        &mut work[s],
+                        d,
+                        hidden_row_offset,
+                        produced,
+                        max_tokens,
+                        sess_len,
+                    ),
+                    SpecDraftRows::Dflash(d) => dflash_verify_accept_step(
+                        &mut rig,
+                        SlotId(s),
+                        &mut work[s],
+                        d,
+                        hidden_row_offset,
+                        produced,
+                        max_tokens,
+                        sess_len,
+                    ),
+                };
+                match accept_outcome {
                     Ok(tokens) => {
                         for tok in &tokens {
                             commit_sampled_token(&mut rig, &mut slots, &mut work, s, *tok);
@@ -4159,30 +4480,30 @@ fn run_loop(
                         // the rest of this request. The last committed token
                         // is already in remaining_prompt; the scheduler picks
                         // the slot up as a regular decode row next step.
-                        if slots[s].is_some() && work[s].mtp_active {
-                            work[s].mtp_cycles += 1;
-                            work[s].mtp_committed += tokens.len();
-                            if work[s].mtp_cycles >= MTP_RETIRE_WINDOW {
-                                let mean = work[s].mtp_committed as f64
-                                    / work[s].mtp_cycles as f64;
+                        if slots[s].is_some() && work[s].spec.active() {
+                            work[s].spec_cycles += 1;
+                            work[s].spec_committed += tokens.len();
+                            if work[s].spec_cycles >= MTP_RETIRE_WINDOW {
+                                let mean = work[s].spec_committed as f64
+                                    / work[s].spec_cycles as f64;
                                 // Reset the window each time it fills; only a
                                 // SECOND consecutive failure retires.
-                                work[s].mtp_cycles = 0;
-                                work[s].mtp_committed = 0;
+                                work[s].spec_cycles = 0;
+                                work[s].spec_committed = 0;
                                 if mean < MTP_RETIRE_MIN_ADVANCE {
-                                    work[s].mtp_retire_fails += 1;
+                                    work[s].spec_retire_fails += 1;
                                 } else {
-                                    work[s].mtp_retire_fails = 0;
+                                    work[s].spec_retire_fails = 0;
                                 }
-                                if work[s].mtp_retire_fails >= MTP_RETIRE_WINDOWS {
+                                if work[s].spec_retire_fails >= MTP_RETIRE_WINDOWS {
                                     if rig.gpu.slot_trace() {
                                         eprintln!(
                                             "[slot-trace] MTP retired for slot {s}: mean advance {mean:.2} over {} consecutive windows",
                                             MTP_RETIRE_WINDOWS
                                         );
                                     }
-                                    work[s].mtp_active = false;
-                                    work[s].mtp_retire_fails = 0;
+                                    work[s].spec = crate::scheduler::SpecKind::None;
+                                    work[s].spec_retire_fails = 0;
                                     // Of the committed tokens only the newest
                                     // lacks a KV row (the rest were written by
                                     // verify) — keep just it, like the cap
@@ -4217,10 +4538,10 @@ fn run_loop(
                 }
                 continue;
             }
-            // MTP prefill: fill the head's private KV from this chunk's
-            // x_batch rows; when the prompt has drained, the sampled
-            // out_token becomes the draft seed and decode begins.
-            if work[s].mtp_active
+            // Spec prefill: fill the speculator's private state from this
+            // chunk's forward outputs; when the prompt has drained, the
+            // sampled out_token becomes the draft seed and decode begins.
+            if work[s].spec.active()
                 && !work[s].decoding
                 && slots[s].is_some()
                 && batch.m_per_slot.get(s).copied().unwrap_or(0) > 0
@@ -4229,22 +4550,35 @@ fn run_loop(
                 let row_off: usize = (0..s)
                     .map(|i| batch.m_per_slot.get(i).copied().unwrap_or(0))
                     .sum();
-                let chunk_tokens: Vec<u32> =
-                    batch.tokens[row_off..row_off + m].to_vec();
-                let chunk_positions: Vec<i32> =
-                    batch.positions[row_off..row_off + m].to_vec();
-                match mtp_head_prefill_chunk(
-                    &mut rig,
-                    SlotId(s),
-                    &chunk_tokens,
-                    &chunk_positions,
-                    row_off,
-                    m,
-                ) {
+                let prefill_outcome: Result<(), String> = match work[s].spec {
+                    crate::scheduler::SpecKind::Mtp => {
+                        let chunk_tokens: Vec<u32> =
+                            batch.tokens[row_off..row_off + m].to_vec();
+                        let chunk_positions: Vec<i32> =
+                            batch.positions[row_off..row_off + m].to_vec();
+                        mtp_head_prefill_chunk(
+                            &mut rig,
+                            SlotId(s),
+                            &chunk_tokens,
+                            &chunk_positions,
+                            row_off,
+                            m,
+                        )
+                    }
+                    crate::scheduler::SpecKind::Dflash => dflash_prefill_chunk(
+                        &mut rig,
+                        SlotId(s),
+                        row_off,
+                        m,
+                        batch.positions[row_off] as usize,
+                    ),
+                    crate::scheduler::SpecKind::None => Ok(()),
+                };
+                match prefill_outcome {
                     Ok(()) => {
                         if work[s].remaining_prompt.is_empty() && slots[s].is_some() {
                             // Prompt fully prefilled (trunk KV by the
-                            // scheduler path, head KV above): the sampled
+                            // scheduler path, spec state above): the sampled
                             // token is the first draft seed.
                             let seed = ids[s] as u32;
                             work[s].decoding = true;
@@ -4276,7 +4610,7 @@ fn run_loop(
             // Batched VL slots sample and commit like any regular slot (the
             // last prompt row's logits seed the first token); only
             // MTP-decoding slots skip — their tokens come from the verify.
-            if work[s].mtp_active {
+            if work[s].spec.active() {
                 continue;
             }
             // Still prefilling: these logits belong to a mid-prompt token.
@@ -5102,7 +5436,7 @@ fn admit(
                     // (pure drafting overhead), so the turn retires to AR
                     // instead. A session resident on this slot keeps a head
                     // KV matching its committed prefix and drafts fine.
-                    work[slot.0].mtp_active = rig.mtp_head.is_some()
+                    let mtp_ok = rig.mtp_head.is_some()
                         && rig.mtp_k > 0
                         && req.visual_data.is_none()
                         && !request_penalized(&req)
@@ -5110,7 +5444,38 @@ fn admit(
                         && req.json_schema.is_none()
                         && mtp_head_kv_valid
                         && rig.mtp_states[slot.0].is_some();
-                    if !work[slot.0].mtp_active {
+                    // DFlash2 admit: same request-shape gates as MTP (text
+                    // only, greedy, no grammar). The draft's private state
+                    // survives on this slot across turns, so a continuation
+                    // whose reuse point equals the ring's watermark
+                    // (`seeded_through`) drafts over a fully-seeded
+                    // target_hidden — including radix-reused prefixes,
+                    // which MTP cannot do. An edit that truncates below the
+                    // watermark leaves stale ring rows: drop the state and
+                    // run AR (a partial ring would poison the draft's
+                    // context with the pre-edit suffix's hiddens).
+                    let dflash_ring_valid = rig.dflash_states[slot.0]
+                        .as_ref()
+                        .is_some_and(|st| st.seeded_through == plan.reused);
+                    let dflash_ok = rig.dflash.is_some()
+                        && req.visual_data.is_none()
+                        && !request_penalized(&req)
+                        && !request_sampled(&req)
+                        && req.json_schema.is_none()
+                        && (plan.reused == 0 || dflash_ring_valid);
+                    if !dflash_ring_valid {
+                        if let Some(st) = rig.dflash_states[slot.0].take() {
+                            st.free_gpu(&mut rig.gpu);
+                        }
+                    }
+                    work[slot.0].spec = if mtp_ok {
+                        crate::scheduler::SpecKind::Mtp
+                    } else if dflash_ok {
+                        crate::scheduler::SpecKind::Dflash
+                    } else {
+                        crate::scheduler::SpecKind::None
+                    };
+                    if !work[slot.0].spec.active() {
                         if let Some(state) = rig.mtp_states[slot.0].as_mut() {
                             let _ = state.reset(&mut rig.gpu);
                         }
@@ -5374,6 +5739,13 @@ fn admit(
     // previous occupant would poison the first draft step).
     if let Some(state) = rig.mtp_states[slot.0].as_mut() {
         let _ = state.reset(&mut rig.gpu);
+    }
+
+    // Drop the previous occupant's DFlash2 draft state: its target_hidden
+    // ring and draft KV are conversation-scoped, and the next request
+    // re-allocates lazily on its first prefill chunk.
+    if let Some(st) = rig.dflash_states[slot.0].take() {
+        st.free_gpu(&mut rig.gpu);
     }
 
     // ── Prefix cache lookup (spec §4.5–4.6) ──────────────────────────────
@@ -5727,7 +6099,7 @@ fn admit(
             rope_delta: vd.rope_delta,
             base: 0,
         });
-        work[slot.0].mtp_active = false;
+        work[slot.0].spec = crate::scheduler::SpecKind::None;
     } else {
         work[slot.0].remaining_prompt = req.prompt_tokens[reused..].to_vec();
         work[slot.0].next_pos = reused;
@@ -5748,12 +6120,31 @@ fn admit(
         // over a zeroed prefix collapses acceptance to ~1 — pure overhead
         // on exactly the turns reuse was meant to accelerate. AR produces
         // identical output without the overhead.
-        work[slot.0].mtp_active = rig.mtp_head.is_some()
+        let mtp_ok = rig.mtp_head.is_some()
             && rig.mtp_k > 0
             && !penalized
             && !request_sampled(&req)
             && !grammar_constrained
             && reused == 0;
+        // DFlash2 admit on the new-session arm: same request-shape gates as
+        // MTP, including the reused==0 rule — a radix hit's reused span was
+        // never forwarded this turn, so its extract-layer hiddens are not
+        // captured and the ring would carry uninitialized rows for
+        // 0..reused (the append_committed gap guard). Continuations are the
+        // exception: their ring survives on the slot and the continuation
+        // arm checks its watermark.
+        let dflash_ok = rig.dflash.is_some()
+            && !penalized
+            && !request_sampled(&req)
+            && !grammar_constrained
+            && reused == 0;
+        work[slot.0].spec = if mtp_ok {
+            crate::scheduler::SpecKind::Mtp
+        } else if dflash_ok {
+            crate::scheduler::SpecKind::Dflash
+        } else {
+            crate::scheduler::SpecKind::None
+        };
     }
     rig.sample_params[slot.0] = sample_params;
     // A prefix-cache hit's shared pages are already radix-owned up to
@@ -5858,6 +6249,11 @@ fn restore(rig: &mut Rig, id: SessionId, slot: SlotId) -> bool {
             if let Some(state) = rig.mtp_states[slot.0].as_mut() {
                 let _ = state.reset(&mut rig.gpu);
             }
+            // DFlash2 draft state is likewise per-generation: the restored
+            // session re-seeds target_hidden from its suffix forward.
+            if let Some(st) = rig.dflash_states[slot.0].take() {
+                st.free_gpu(&mut rig.gpu);
+            }
             match r {
                 Ok(()) => {
                     rig.sessions.mark_resident(id, slot, snap.seq_len);
@@ -5904,19 +6300,20 @@ mod tests {
     }
 
     #[test]
-    fn mtp_verify_frontier_must_land_inside_the_cap() {
-        // cap 100, k 3: verify writes rows at next_pos..next_pos+3, frontier
-        // next_pos+4. next_pos 96 is the last position that fits (frontier 100).
-        assert!(mtp_verify_fits_cap(96, 3, 100));
-        assert!(!mtp_verify_fits_cap(97, 3, 100));
-        // A full verify batch is exactly k+1 rows.
-        assert!(mtp_verify_fits_cap(0, 3, 4));
-        assert!(!mtp_verify_fits_cap(0, 3, 3));
-        // k = 0 degenerates to plain decode: one row, frontier next_pos+1.
-        assert!(mtp_verify_fits_cap(99, 0, 100));
-        assert!(!mtp_verify_fits_cap(100, 0, 100));
-        // next_pos at or past the cap never fits, whatever k is.
-        assert!(!mtp_verify_fits_cap(100, 3, 100));
+    fn spec_verify_frontier_must_land_inside_the_cap() {
+        // cap 100, verify_rows 4 (MTP k=3): verify writes rows at
+        // next_pos..next_pos+3, frontier next_pos+4. next_pos 96 is the
+        // last position that fits (frontier 100).
+        assert!(spec_verify_fits_cap(96, 4, 100));
+        assert!(!spec_verify_fits_cap(97, 4, 100));
+        // A full verify batch is exactly verify_rows rows.
+        assert!(spec_verify_fits_cap(0, 4, 4));
+        assert!(!spec_verify_fits_cap(0, 4, 3));
+        // verify_rows = 1 degenerates to plain decode: frontier next_pos+1.
+        assert!(spec_verify_fits_cap(99, 1, 100));
+        assert!(!spec_verify_fits_cap(100, 1, 100));
+        // next_pos at or past the cap never fits, whatever the width.
+        assert!(!spec_verify_fits_cap(100, 4, 100));
     }
 
     /// Grammar mask ordering: the mask is applied BEFORE the sampler's

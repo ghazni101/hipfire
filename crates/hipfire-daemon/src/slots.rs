@@ -112,6 +112,12 @@ struct EngineSpawnParams {
     /// Structured-output jump-forward (spec §7.3 G3). Read from
     /// `serve.structured_jump_forward`; default false.
     structured_jump_forward: bool,
+    /// DFlash2 draft path (resolved daemon-side: HIPFIRE_DFLASH_DRAFT >
+    /// params.draft, suppressed by dflash_mode=off). None = no DFlash.
+    dflash_draft: Option<PathBuf>,
+    /// dflash_mode=on: a missing/failed draft load fails the engine load
+    /// instead of degrading to AR.
+    dflash_required: bool,
 }
 
 /// The per-arch multi-slot engine behind the four-method surface
@@ -174,6 +180,11 @@ impl AnySlotEngine {
                         // false — no behavior change on the constrained-
                         // decode path.
                         structured_jump_forward: p.structured_jump_forward,
+                        // DFlash2 spec-decode sidecar (resolved daemon-side:
+                        // HIPFIRE_DFLASH_DRAFT > params.draft, suppressed by
+                        // dflash_mode=off). dflash_required = mode "on".
+                        dflash_draft: p.dflash_draft,
+                        dflash_required: p.dflash_required,
                     },
                 )
                 .map_err(|e| format!("SlotEngine spawn: {e}"))?,
@@ -365,6 +376,8 @@ impl SlotBackend {
         prefill_chunk: usize,
         mtp_k: usize,
         kv_mode_raw: &str,
+        dflash_draft: Option<PathBuf>,
+        dflash_required: bool,
     ) -> Result<Self, String> {
         // CPU preflight: open HFQ, arch, VL, config, tokenizer.
         let preflight = cpu_preflight(model_path)?;
@@ -471,6 +484,8 @@ impl SlotBackend {
                 wait_max_bytes,
                 queue_timeout_ms,
                 structured_jump_forward,
+                dflash_draft,
+                dflash_required,
             },
         )?;
 
@@ -1764,17 +1779,11 @@ pub fn validate_load_caps(msg: &serde_json::Value) -> Option<String> {
     if tp != 1 || pp != 1 {
         return Some("experimental multi-slot requires pp=tp=1".to_string());
     }
-    // The slot kernels currently own a fixed Q8 KV/state path and no
-    // speculative or eviction sidecars. Refuse instead of silently ignoring
-    // an ordinary serve configuration that the alternate backend cannot honor.
+    // The slot kernels own a fixed Q8 KV/state path plus the DFlash2
+    // spec-decode sidecar (`params.draft` + `dflash_mode`). Other
+    // speculative/eviction sidecars stay refused rather than silently
+    // ignored.
     let params = msg.get("params");
-    if params
-        .and_then(|p| p.get("draft"))
-        .and_then(|v| v.as_str())
-        .is_some_and(|s| !s.is_empty())
-    {
-        return Some("draft not supported in experimental multi-slot".to_string());
-    }
     if params
         .and_then(|p| p.get("drafter"))
         .and_then(|v| v.as_str())
@@ -1782,10 +1791,7 @@ pub fn validate_load_caps(msg: &serde_json::Value) -> Option<String> {
     {
         return Some("spec/drafter not supported in experimental multi-slot".to_string());
     }
-    for (key, label) in [
-        ("dflash_mode", "DFlash"),
-        ("prefill_compression", "PFlash"),
-    ] {
+    for (key, label) in [("prefill_compression", "PFlash")] {
         if params
             .and_then(|p| p.get(key))
             .and_then(|v| v.as_str())
@@ -2711,7 +2717,7 @@ mod tests {
         assert!(validate_load_caps(&m2).is_some());
         let m3 = json!({"params": {"pp": 2}});
         assert!(validate_load_caps(&m3).is_some());
-        let m4 = json!({"params": {"draft": "some.hfq"}});
+        let m4 = json!({"params": {"drafter": "some.hfq"}});
         assert!(validate_load_caps(&m4).is_some());
         let m5 = json!({"params": {"prefill_compression": "on"}});
         assert!(validate_load_caps(&m5).is_some());
@@ -2937,9 +2943,10 @@ mod tests {
             json!({"kv_mode": "bf16"}),
             json!({"kv_mode": "garbage"}),
             json!({"kv_backend": "vmm"}),
-            json!({"dflash_mode": "auto"}),
             json!({"ngram_draft": true}),
             json!({"cask": true}),
+            json!({"drafter": "some-drafter"}),
+            json!({"prefill_compression": "on"}),
         ] {
             assert!(
                 validate_load_caps(&json!({"params": params})).is_some(),
@@ -2952,6 +2959,21 @@ mod tests {
             None,
             "mtp_mode on should be accepted in multi-slot"
         );
+        // DFlash2 is accepted: params.draft + dflash_mode auto/on route to
+        // the slot engine's spec-decode path.
+        for params in [
+            json!({"dflash_mode": "auto"}),
+            json!({"dflash_mode": "on"}),
+            json!({"dflash_mode": "off"}),
+            json!({"draft": "/path/to/draft.hfq"}),
+            json!({"draft": "/path/to/draft.hfq", "dflash_mode": "on"}),
+        ] {
+            assert_eq!(
+                validate_load_caps(&json!({"params": params})),
+                None,
+                "dflash params must be accepted: {params}"
+            );
+        }
     }
 
     #[test]
