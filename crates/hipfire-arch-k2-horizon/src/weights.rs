@@ -37,10 +37,16 @@ pub struct DenseLayerWeights {
     pub wv: WeightTensor,        // [n_kv_heads * head_dim, dim] = [1024, 2560]
     pub wo: WeightTensor,        // [dim, n_heads * head_dim] = [2560, 4096]
     pub attn_gate: WeightTensor, // [n_heads * head_dim, dim] = [4096, 2560]
-    pub ffn_norm: GpuTensor,     // [dim]
-    pub w_gate: WeightTensor,    // [intermediate_size, dim] = [6144, 2560]
-    pub w_up: WeightTensor,      // [intermediate_size, dim] = [6144, 2560]
-    pub w_down: WeightTensor,    // [dim, intermediate_size] = [2560, 6144]
+    /// Fused [wq‖wk‖wv‖attn_gate] = [10240, 2560] single-GEMV weight +
+    /// owning blob. When Some, wq/wk/wv/attn_gate are views into the owner.
+    pub attn_fused: Option<(WeightTensor, GpuTensor)>,
+    pub ffn_norm: GpuTensor,  // [dim]
+    pub w_gate: WeightTensor, // [intermediate_size, dim] = [6144, 2560]
+    pub w_up: WeightTensor,   // [intermediate_size, dim] = [6144, 2560]
+    /// Fused [w_gate‖w_up] = [12288, 2560] single-GEMV weight + owner.
+    /// When Some, w_gate/w_up are views into the owner.
+    pub ffn_fused: Option<(WeightTensor, GpuTensor)>,
+    pub w_down: WeightTensor, // [dim, intermediate_size] = [2560, 6144]
 }
 
 // ─── MoVA attention (layers 3–47) ───────────────────────────────────────
@@ -66,7 +72,7 @@ pub struct MovaAttnWeights {
     pub wq: WeightTensor,                 // [4096, 2560]
     pub wk: WeightTensor,                 // [1024, 2560]
     pub v_router: WeightTensor,           // [64, 2560] — routes to value experts
-    pub v_router_bias: Option<GpuTensor>, // [64] — present when moe_gate_bias=true
+    pub v_router_bias: Option<GpuTensor>, // [64] — loaded iff the HFQ carries the tensor
     pub v_experts: Vec<WeightTensor>,     // 64 × [1024, 2560] (kv_dim, not q_dim)
     /// Owning blob when v_experts were packed into one allocation. The
     /// `v_experts` WeightTensors are non-owning views into it — keep this
@@ -75,6 +81,9 @@ pub struct MovaAttnWeights {
     pub v_expert_ptrs: GpuTensor, // [2*64] F32 = 64 u64 device ptrs
     pub wo: WeightTensor,         // [2560, 4096]
     pub attn_gate: WeightTensor,  // [4096, 2560] — softplus post-attn gate
+    /// Fused [wq‖wk‖v_router‖attn_gate] = [9280, 2560] single-GEMV weight +
+    /// owning blob. When Some, wq/wk/v_router/attn_gate are views into it.
+    pub attn_fused: Option<(WeightTensor, GpuTensor)>,
 }
 
 // ─── Sigmoid-routed MoE FFN (layers 3–47) ───────────────────────────────
@@ -109,13 +118,13 @@ pub struct SharedExpertWeights {
 /// MoE FFN weights for one MoE layer.
 ///
 /// Tensor names:
-/// - `model.layers.{L}.mlp.router.weight` → `router` [100, 2560]
-/// - `model.layers.{L}.mlp.router.bias` → `router_bias` [100] (if moe_gate_bias)
+/// - `model.layers.{L}.mlp.gate.weight` → `router` [100, 2560]
+/// - `model.layers.{L}.mlp.gate.bias` → `router_bias` [100] (loaded iff present)
 /// - `model.layers.{L}.mlp.experts.{E}.*` → `experts[E]`
 /// - `model.layers.{L}.mlp.shared_experts.*` → `shared`
 pub struct MoeFfnWeights {
     pub router: WeightTensor,           // [100, 2560]
-    pub router_bias: Option<GpuTensor>, // [100] — present when moe_gate_bias=true
+    pub router_bias: Option<GpuTensor>, // [100] — loaded iff the HFQ carries the tensor
     pub experts: Vec<MoeExpertWeights>, // 100 experts (fused gate_up + down)
     /// Owning blobs when experts were packed (gate_up blob + down blob).
     /// The per-expert WeightTensors are non-owning views — keep alive for
@@ -125,6 +134,10 @@ pub struct MoeFfnWeights {
     pub expert_gate_up_ptrs: GpuTensor, // [2*100] F32 = 100 u64 device ptrs
     pub expert_down_ptrs: GpuTensor,    // [2*100] F32 = 100 u64 device ptrs
     pub shared: SharedExpertWeights,    // 1 shared expert
+    /// Fused [router‖shared.gate‖shared.up] = [1636, 2560] single-GEMV
+    /// weight + owning blob. When Some, router/shared.gate/shared.up are
+    /// views into it (shared.down stays separate — different K).
+    pub ffn_fused: Option<(WeightTensor, GpuTensor)>,
 }
 
 // ─── Full MoE layer (MoVA attention + MoE FFN) ──────────────────────────
@@ -177,13 +190,28 @@ impl K2HorizonWeights {
         for layer in self.dense_layers {
             let _ = gpu.free_tensor(layer.attn_norm);
             let _ = gpu.free_tensor(layer.ffn_norm);
-            layer.wq.free_all(gpu);
-            layer.wk.free_all(gpu);
-            layer.wv.free_all(gpu);
+            if let Some((_fused, owner)) = layer.attn_fused {
+                // wq/wk/wv/attn_gate are views into owner — drop, free once.
+                drop(layer.wq);
+                drop(layer.wk);
+                drop(layer.wv);
+                drop(layer.attn_gate);
+                let _ = gpu.free_tensor(owner);
+            } else {
+                layer.wq.free_all(gpu);
+                layer.wk.free_all(gpu);
+                layer.wv.free_all(gpu);
+                layer.attn_gate.free_all(gpu);
+            }
             layer.wo.free_all(gpu);
-            layer.attn_gate.free_all(gpu);
-            layer.w_gate.free_all(gpu);
-            layer.w_up.free_all(gpu);
+            if let Some((_fused, owner)) = layer.ffn_fused {
+                drop(layer.w_gate);
+                drop(layer.w_up);
+                let _ = gpu.free_tensor(owner);
+            } else {
+                layer.w_gate.free_all(gpu);
+                layer.w_up.free_all(gpu);
+            }
             layer.w_down.free_all(gpu);
         }
 
@@ -192,11 +220,19 @@ impl K2HorizonWeights {
             let _ = gpu.free_tensor(layer.ffn_norm);
 
             let attn = layer.attn;
-            attn.wq.free_all(gpu);
-            attn.wk.free_all(gpu);
+            if let Some((_fused, owner)) = attn.attn_fused {
+                drop(attn.wq);
+                drop(attn.wk);
+                drop(attn.v_router);
+                drop(attn.attn_gate);
+                let _ = gpu.free_tensor(owner);
+            } else {
+                attn.wq.free_all(gpu);
+                attn.wk.free_all(gpu);
+                attn.v_router.free_all(gpu);
+                attn.attn_gate.free_all(gpu);
+            }
             attn.wo.free_all(gpu);
-            attn.attn_gate.free_all(gpu);
-            attn.v_router.free_all(gpu);
             if let Some(b) = attn.v_router_bias {
                 let _ = gpu.free_tensor(b);
             }
@@ -212,7 +248,17 @@ impl K2HorizonWeights {
             }
 
             let ffn = layer.ffn;
-            ffn.router.free_all(gpu);
+            if let Some((_fused, owner)) = ffn.ffn_fused {
+                // router/shared.gate/shared.up are views into owner.
+                drop(ffn.router);
+                drop(ffn.shared.gate);
+                drop(ffn.shared.up);
+                let _ = gpu.free_tensor(owner);
+            } else {
+                ffn.router.free_all(gpu);
+                ffn.shared.gate.free_all(gpu);
+                ffn.shared.up.free_all(gpu);
+            }
             if let Some(b) = ffn.router_bias {
                 let _ = gpu.free_tensor(b);
             }
@@ -232,8 +278,6 @@ impl K2HorizonWeights {
                     e.down.free_all(gpu);
                 }
             }
-            ffn.shared.gate.free_all(gpu);
-            ffn.shared.up.free_all(gpu);
             ffn.shared.down.free_all(gpu);
         }
     }

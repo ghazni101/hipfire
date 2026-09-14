@@ -213,12 +213,14 @@ pub fn retry_candidate_reset_inventory() -> &'static [ResetCoreCoverage] {
     };
     const K2_HORIZON: ResetCoreCoverage = ResetCoreCoverage {
         arch: "k2_horizon",
-        recurrent_or_conv: true,
-        s_ef_residual: true,
-        kv_or_aux_caches: true,
-        graphs: false,
-        drafter: true,
-        adaptive: false,
+        recurrent_or_conv: true, // n/a — pure attention, no recurrent residual
+        s_ef_residual: true,     // n/a
+        kv_or_aux_caches: true,  // K2HorizonState::reset clears the q8 KV cache
+        // reset() drops retained_warmed_up → the PM4 tape re-warms on the
+        // next decode, so captured-graph state is invalidated.
+        graphs: true,
+        drafter: true,  // n/a — no spec decode
+        adaptive: true, // n/a — no adaptive KV controller
         host_position_and_conversation: true,
         eligibility: RetryResetEligibility::Ineligible {
             reason: "k2_horizon not a serve-hardening retry candidate yet",

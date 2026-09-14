@@ -368,7 +368,12 @@ fn dispatch_kv_write(
         }
         KernelKey::KvWriteQ8_0 => {
             debug_assert_eq!(plan.batch_size, 1);
-            if io.output_gate.is_some() {
+            // The paired writer is byte-exact with two kv_cache_write_q8_0
+            // calls (same 32-lane quantizer, concatenated grids) but one
+            // launch — use it wherever the gfx1100 kernel is available.
+            // The output_gate gate was incidental to the arch that first
+            // adopted it, not a semantic requirement.
+            if io.output_gate.is_some() || gpu.arch_caps.is_gfx1100() {
                 hip!(gpu.kv_cache_write_q8_0_pair(
                     io.k_cache,
                     io.v_cache,

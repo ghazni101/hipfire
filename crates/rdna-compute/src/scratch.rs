@@ -60,6 +60,9 @@ pub struct ScratchState {
     /// in one allocation; grows-never-shrinks.
     pub sample_partials: Option<DeviceBuffer>,
     pub sample_partials_bytes: usize,
+    /// Persistent 4-byte result buffer for `argmax_f32` — avoids a
+    /// hipMalloc/hipFree pair per sampled token on the decode hot path.
+    pub argmax_result: Option<DeviceBuffer>,
 }
 
 // ── Shared kernel dispatch helpers ──────────────────────────────────────

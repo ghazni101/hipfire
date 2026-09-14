@@ -31,6 +31,8 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Maximum tokens per prefill chunk. Larger = faster but more VRAM.
 /// At hidden=2560, batch=256 uses ~2.6 MB per buffer × ~20 buffers ≈ 52 MB.
+/// 128 halves scratch but doubles chunk overhead — measured -32% prefill
+/// tok/s on gfx1100, not worth ~110 MB with 1.4 GB headroom at 32k ctx.
 const PREFILL_MAX_BATCH: usize = 256;
 
 /// Batched scratch buffers for prefill. All are [MAX_BATCH × dim] shaped.
@@ -77,7 +79,15 @@ pub struct PrefillScratch {
 }
 
 impl PrefillScratch {
-    pub fn new(gpu: &mut Gpu, cfg: &K2HorizonConfig, max_seq: usize) -> Result<Self, String> {
+    /// `decode_logits` is the decode state's `[vocab]` logits buffer —
+    /// prefill borrows it (never live simultaneously) instead of
+    /// allocating a duplicate 1 MB tensor.
+    pub fn new(
+        gpu: &mut Gpu,
+        cfg: &K2HorizonConfig,
+        max_seq: usize,
+        decode_logits: &GpuTensor,
+    ) -> Result<Self, String> {
         let mb = PREFILL_MAX_BATCH;
         let hidden = cfg.dim;
         let q_dim = cfg.n_heads * cfg.head_dim;
@@ -131,11 +141,16 @@ impl PrefillScratch {
             shared_up: alloc(gpu, mb * moe_inter, "shared_up")?,
             shared_act: alloc(gpu, mb * moe_inter, "shared_act")?,
             final_norm_buf: alloc(gpu, mb * hidden, "final_norm_buf")?,
-            logits: alloc(gpu, vocab, "logits")?,
+            // Borrow the decode logits buffer — prefill and decode never
+            // hold logits simultaneously. Borrowed view: free is a no-op.
+            logits: decode_logits.sub_offset(0, vocab),
+            // Tile count must track the kernel's resolver (HIPFIRE_ATTN_TILE_SIZE),
+            // not a literal 128 — a lowered env tile inflates max_tiles and the
+            // capacity-derived sub_batch silently collapses to 1.
             flash_partials: alloc(
                 gpu,
                 cfg.n_heads
-                    * ((max_seq + 127) / 128)
+                    * max_seq.div_ceil(gpu.attn_tile_size())
                     * (2 + cfg.head_dim)
                     * crate::forward::FLASH_PREFILL_SUBBATCH,
                 "prefill_flash_partials",
@@ -658,7 +673,9 @@ fn forward_moe_layer_batch(
     Ok(())
 }
 
-/// Process a chunk of tokens through all layers. Returns the last token's logits.
+/// Process a chunk of tokens through all layers. Returns the last token's
+/// logits when `need_logits` is set (final chunk); intermediate chunks skip
+/// the lm_head GEMV + [vocab] D2H download entirely.
 pub fn forward_prefill_chunk(
     cfg: &K2HorizonConfig,
     weights: &K2HorizonWeights,
@@ -667,6 +684,7 @@ pub fn forward_prefill_chunk(
     gpu: &mut Gpu,
     tokens: &[u32],
     start_pos: usize,
+    need_logits: bool,
 ) -> Result<Vec<f32>, String> {
     let n = tokens.len();
     if n > PREFILL_MAX_BATCH {
@@ -706,6 +724,9 @@ pub fn forward_prefill_chunk(
     for (l, layer) in weights.moe_layers.iter().enumerate() {
         let global_l = weights.dense_layers.len() + l;
         forward_moe_layer_batch(cfg, layer, ps, kv, gpu, global_l, n, start_pos)?;
+    }
+    if !need_logits {
+        return Ok(Vec::new());
     }
 
     // Final norm (batched) + lm_head (last token only)
@@ -749,6 +770,12 @@ pub fn forward_prefill_chunk(
 
 /// Full prefill: process all prompt tokens in chunks.
 /// Returns the last token's logits for sampling the first decode token.
+///
+/// Bounds-checked: `kv.n_tokens + prompt_ids.len()` must fit `kv.max_seq` —
+/// the q8 KV write kernels index by position with no bounds check, and
+/// non-daemon callers (bench_decode_prime, redline fixtures) reach this
+/// without the daemon's prompt-length gate. `should_abort`, when provided,
+/// is polled between chunks so a client cancel can interrupt a long prefill.
 pub fn forward_prefill_batch(
     cfg: &K2HorizonConfig,
     weights: &K2HorizonWeights,
@@ -756,12 +783,28 @@ pub fn forward_prefill_batch(
     kv: &mut crate::forward::K2HorizonState,
     gpu: &mut Gpu,
     prompt_ids: &[u32],
+    should_abort: Option<&dyn Fn() -> bool>,
 ) -> Result<Vec<f32>, String> {
+    if kv.n_tokens + prompt_ids.len() > kv.max_seq {
+        return Err(format!(
+            "k2_horizon prefill: {} tokens at pos {} exceed max_seq {}",
+            prompt_ids.len(),
+            kv.n_tokens,
+            kv.max_seq
+        ));
+    }
     let mut last_logits: Vec<f32> = Vec::new();
     let mut start_pos = kv.n_tokens;
+    let n_chunks = prompt_ids.len().div_ceil(PREFILL_MAX_BATCH);
 
-    for chunk in prompt_ids.chunks(PREFILL_MAX_BATCH) {
-        last_logits = forward_prefill_chunk(cfg, weights, ps, kv, gpu, chunk, start_pos)?;
+    for (ci, chunk) in prompt_ids.chunks(PREFILL_MAX_BATCH).enumerate() {
+        if let Some(abort) = should_abort {
+            if abort() {
+                return Err("k2_horizon prefill aborted".to_string());
+            }
+        }
+        let last = ci + 1 == n_chunks;
+        last_logits = forward_prefill_chunk(cfg, weights, ps, kv, gpu, chunk, start_pos, last)?;
         start_pos += chunk.len();
         kv.n_tokens = start_pos;
     }

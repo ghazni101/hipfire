@@ -164,8 +164,12 @@ impl Gpu {
         self.ensure_kernel("argmax_f32", kernels::ARGMAX_SRC, "argmax_f32")?;
         let func = &self.functions["argmax_f32"];
 
-        let result_buf = self.hip.malloc(4)?; // single int
-        self.hip.memset(&result_buf, 0, 4)?;
+        // Persistent result buffer — the kernel writes all 4 bytes, so no
+        // memset is needed and the alloc happens once per Gpu, not per token.
+        if self.scratch.argmax_result.is_none() {
+            self.scratch.argmax_result = Some(self.hip.malloc(4)?);
+        }
+        let result_buf = self.scratch.argmax_result.as_ref().unwrap();
 
         let mut dp = data.buf.as_ptr();
         let mut rp = result_buf.as_ptr();
@@ -193,8 +197,7 @@ impl Gpu {
         let mut result = [0i32];
         let result_bytes: &mut [u8] =
             unsafe { std::slice::from_raw_parts_mut(result.as_mut_ptr() as *mut u8, 4) };
-        self.hip.memcpy_dtoh(result_bytes, &result_buf)?;
-        self.hip.free(result_buf)?;
+        self.hip.memcpy_dtoh(result_bytes, result_buf)?;
         Ok(result[0] as u32)
     }
 

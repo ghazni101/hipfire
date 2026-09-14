@@ -1,6 +1,6 @@
 # K2-Horizon serving container — pre-built binaries on ROCm base.
 #
-# 50k Q8 KV context: 19 GB model + ~5 GB KV ≈ 24 GB on 24.5 GB usable
+# 40k Q8 KV context: 19 GB model + ~5 GB KV ≈ 24 GB on 24.5 GB usable
 # gfx1100. 64k OOM'd (hipMalloc out of memory, 26 MB free at KV alloc).
 # Reasoning is uncapped (budget="uncapped") — no think-token cap.
 #
@@ -30,10 +30,13 @@ ENV HIP_PATH=/opt/rocm \
 RUN mkdir -p /var/cache/hipfire /root/.hipfire && chmod 1777 /var/cache/hipfire
 
 # Pre-built binaries from the host (dlopen'd ROCm, no hard link).
+# .docker-bin/ is gitignored — populate it before building:
+#   cargo build --release && mkdir -p .docker-bin && \
+#     cp target/release/daemon target/release/hipfire .docker-bin/
 COPY .docker-bin/daemon /opt/hipfire/bin/daemon
 COPY .docker-bin/hipfire /usr/local/bin/hipfire
 
-# Config: Q8 KV, 32k context (VRAM-safe for 24.5 GB), port 9001.
+# Config: Q8 KV, 40k context (VRAM-safe for 24.5 GB), port 9001.
 RUN mkdir -p /root/.hipfire
 COPY <<'EOF' /root/.hipfire/config.toml
 schema_version = 1
@@ -46,7 +49,9 @@ budget = "uncapped"
 multi_slot = false
 
 [speculation]
-mtp = "on"
+# K2-Horizon is AR-only — spec decode is refused at load. "off" is
+# explicit; "on" would be silently ignored.
+mtp = "off"
 
 [memory]
 kv_cache = "q8"
@@ -62,6 +67,6 @@ VOLUME ["/var/cache/hipfire"]
 EXPOSE 9001
 
 ENTRYPOINT ["hipfire"]
-# --idle-timeout 300: unload the model after 5 min idle (frees ~24 GB VRAM).
-# Override at `docker run ... k2-horizon-serve serve <model> <addr> --idle-timeout N`.
-CMD ["serve", "K2-Horizon-MoVA-36B-A4B.mq4r", "0.0.0.0:9001", "--kv-mode", "q8", "--idle-timeout", "300"]
+# --idle-timeout 0: never unload the model (keep ~24 GB resident).
+# Override at `docker run ... hipfire:k2-horizon serve <model> <addr> --idle-timeout N`.
+CMD ["serve", "K2-Horizon-MoVA-36B-A4B.mq4r", "0.0.0.0:9001", "--kv-mode", "q8", "--idle-timeout", "0"]

@@ -184,3 +184,4 @@ dist_test/
 *.hipfb
 /*-hip-amdgcn-amd-amdhsa-*.s
 /*-host-x86_64-unknown-linux-gnu.s
+.docker-bin/

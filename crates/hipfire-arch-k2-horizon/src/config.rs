@@ -126,6 +126,10 @@ struct RawK2HorizonConfig {
     attention_gate_func: String,
     #[serde(default)]
     mlp_only_layers: Option<Vec<usize>>,
+    #[serde(default)]
+    layernorm_num_groups: Option<usize>,
+    #[serde(default)]
+    decoder_sparse_step: Option<usize>,
     #[serde(default = "default_max_pos")]
     max_position_embeddings: usize,
     #[serde(default)]
@@ -153,7 +157,9 @@ fn default_norm_topk() -> bool {
     true
 }
 fn default_router_score() -> String {
-    "softmax".to_string()
+    // K2-Horizon is sigmoid-routed; a config that omits the field gets the
+    // arch default, not a value the validator then rejects.
+    "sigmoid".to_string()
 }
 fn default_router_scaling() -> f32 {
     1.0
@@ -202,16 +208,133 @@ fn config_from_raw(raw: RawK2HorizonConfig) -> Result<K2HorizonConfig, String> {
     let dim = raw.hidden_size;
     let n_heads = raw.num_attention_heads;
     let n_kv_heads = raw.num_key_value_heads.unwrap_or(n_heads);
-    let head_dim = raw.head_dim.unwrap_or(dim / n_heads);
+    let head_dim = raw.head_dim.unwrap_or(dim / n_heads.max(1));
     let rope_head_dim = raw.rope_head_dim.unwrap_or(head_dim);
+
+    // ── Fail-closed validation ──
+    // Every check below guards a silent-corruption or panic path: kernel
+    // contracts (topk shared arrays, indexed-GEMV group strides), the
+    // contiguous-dense-prefix assumption in the layer dispatch, and config
+    // fields the forward path does not honor. A variant checkpoint that
+    // deviates must fail at load, not serve wrong output.
+    if n_heads == 0 {
+        return Err("k2_horizon: num_attention_heads must be > 0".into());
+    }
+    if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
+        return Err(format!(
+            "k2_horizon: num_attention_heads {n_heads} not divisible by num_key_value_heads {n_kv_heads}"
+        ));
+    }
+    if head_dim == 0 || rope_head_dim != head_dim {
+        return Err(format!(
+            "k2_horizon: rope_head_dim {rope_head_dim} != head_dim {head_dim} — partial rotary unsupported"
+        ));
+    }
+    let n_groups = raw.layernorm_num_groups.unwrap_or(2);
+    if n_groups == 0 || dim % n_groups != 0 {
+        return Err(format!(
+            "k2_horizon: hidden_size {dim} not divisible by layernorm_num_groups {n_groups}"
+        ));
+    }
+    // grouped_rmsnorm_f32 launches block = min(256, chunk_len) into a
+    // power-of-two LDS tree — a non-pow2 chunk_len < 256 silently drops
+    // tail partials. The launcher rounds down to pow2, so any chunk_len
+    // works, but keep the divisibility check above as the real contract.
+    if raw.attention_bias {
+        return Err("k2_horizon: attention_bias=true unsupported (no bias on q/k/o)".into());
+    }
+    if raw.router_score_func != "sigmoid" {
+        return Err(format!(
+            "k2_horizon: router_score_func {:?} unsupported — forward is sigmoid-only",
+            raw.router_score_func
+        ));
+    }
+    if !raw.norm_topk_prob {
+        return Err(
+            "k2_horizon: norm_topk_prob=false unsupported — topk kernel always normalizes".into(),
+        );
+    }
+    if raw.attention_gate_func != "softplus" {
+        return Err(format!(
+            "k2_horizon: attention_gate_func {:?} unsupported — softplus gate only",
+            raw.attention_gate_func
+        ));
+    }
+    if raw.num_experts > 0 && raw.num_shared_experts != 1 {
+        return Err(format!(
+            "k2_horizon: num_shared_experts {} unsupported — exactly 1 shared expert",
+            raw.num_shared_experts
+        ));
+    }
+    if raw.tie_word_embeddings {
+        return Err("k2_horizon: tie_word_embeddings=true unsupported (lm_head required)".into());
+    }
+    if let Some(step) = raw.decoder_sparse_step {
+        if step != 1 {
+            return Err(format!(
+                "k2_horizon: decoder_sparse_step {step} unsupported — every post-prefix layer must be MoE"
+            ));
+        }
+    }
+    // Kernel contracts: the bias-aware topk kernel uses static
+    // __shared__[1024] and a 32-lane argmax; the indexed GEMVs stride by
+    // 256-wide groups.
+    if raw.num_experts > 1024 || raw.mova_num_experts > 1024 {
+        return Err(format!(
+            "k2_horizon: expert count exceeds kernel limit 1024 (moe={}, mova={})",
+            raw.num_experts, raw.mova_num_experts
+        ));
+    }
+    // topk bounds only apply when the corresponding expert set exists —
+    // a config with num_experts=0 has no MoE layers to route.
+    if raw.num_experts > 0
+        && (raw.num_experts_per_tok == 0
+            || raw.num_experts_per_tok > raw.num_experts
+            || raw.num_experts_per_tok > 32)
+    {
+        return Err(format!(
+            "k2_horizon: num_experts_per_tok {} out of range (1..=min(32, num_experts))",
+            raw.num_experts_per_tok
+        ));
+    }
+    if raw.mova_num_experts > 0
+        && (raw.mova_num_experts_per_tok == 0
+            || raw.mova_num_experts_per_tok > raw.mova_num_experts
+            || raw.mova_num_experts_per_tok > 32)
+    {
+        return Err(format!(
+            "k2_horizon: mova_num_experts_per_tok {} out of range (1..=min(32, mova_num_experts))",
+            raw.mova_num_experts_per_tok
+        ));
+    }
+    if dim % 256 != 0 || raw.moe_intermediate_size % 256 != 0 {
+        return Err(format!(
+            "k2_horizon: hidden {dim} and moe_intermediate {} must be multiples of 256 (indexed GEMV group stride)",
+            raw.moe_intermediate_size
+        ));
+    }
+
+    let mlp_only_layers = raw.mlp_only_layers.unwrap_or_default();
+    // The layer dispatch assumes dense layers form a contiguous prefix
+    // (run_decode_body computes global_layer = dense_layers.len() + l).
+    // A non-prefix mlp_only_layers would silently bind wrong weights and
+    // wrong KV slots — reject it rather than misroute.
+    for (i, &l) in mlp_only_layers.iter().enumerate() {
+        if l != i {
+            return Err(format!(
+                "k2_horizon: mlp_only_layers {mlp_only_layers:?} is not a contiguous prefix — unsupported topology"
+            ));
+        }
+    }
+    if mlp_only_layers.len() > raw.num_hidden_layers {
+        return Err("k2_horizon: mlp_only_layers longer than num_hidden_layers".into());
+    }
 
     let rope_theta = raw
         .rope_parameters
         .as_ref()
         .and_then(|r| r.rope_theta)
         .unwrap_or(10_000_000.0);
-
-    let mlp_only_layers = raw.mlp_only_layers.unwrap_or_default();
 
     // Derive per-layer kind: layers in mlp_only_layers are Dense, rest are Moe.
     let layer_kinds: Vec<LayerKind> = (0..raw.num_hidden_layers)
@@ -236,7 +359,7 @@ fn config_from_raw(raw: RawK2HorizonConfig) -> Result<K2HorizonConfig, String> {
         rope_theta,
         rope_head_dim,
         attention_bias: raw.attention_bias,
-        layernorm_num_groups: 2, // K2-Horizon always uses n_groups=2
+        layernorm_num_groups: n_groups,
         intermediate_size: raw.intermediate_size,
         num_experts: raw.num_experts,
         num_experts_per_tok: raw.num_experts_per_tok,

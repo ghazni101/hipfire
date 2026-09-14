@@ -2493,10 +2493,9 @@ impl Carrier for MuseGlimmerCarrier {
 
 // ─── K2HorizonCarrier ──────────────────────────────────────────────────
 //
-// Stub carrier for K2-Horizon (MoVA-36B-A4B, arch_id=16). Claims the arch_id
-// so the loader fails with a clean "not yet implemented" error instead of
-// "no carrier". The full load path (config parse, weight upload, forward)
-// lands in Phase 6 of the k2-horizon-arch-spec.
+// K2-Horizon (MoVA-36B-A4B, arch_id=16): MoVA attention (64 value experts,
+// top-4, sigmoid-routed) + sigmoid MoE FFN (100 experts, top-8 + 1 shared).
+// AR decode only — spec decode and continuous batch are refused.
 
 pub struct K2HorizonCarrier;
 impl Carrier for K2HorizonCarrier {
@@ -2530,6 +2529,7 @@ impl Carrier for K2HorizonCarrier {
             gpu,
             &b.config,
             b.state.max_seq,
+            &b.state.logits,
         ) {
             Ok(ps) => ps,
             Err(e) => return Some(Some(format!("prefill scratch: {e}"))),
@@ -2541,6 +2541,7 @@ impl Carrier for K2HorizonCarrier {
             &mut b.state,
             gpu,
             synthetic,
+            None,
         )
         .err();
         ps.free_gpu(gpu);

@@ -12,7 +12,7 @@ gfx1100: q8 KV @ 32k ctx, PM4 retained replay, ~121 tok/s decode.
 End-to-end support for the K2-Horizon model family in hipfire, starting
 with `K2-Horizon-MoVA-36B-A4B` (36B params, 4B active, MoVA attention +
 sigmoid-routed MoE FFN). The deliverable is a new arch crate
-(`hipfire-arch-k2-horizon`, `arch_id = 15`), a quantizer pipeline arm,
+(`hipfire-arch-k2-horizon`, `arch_id = 16`), a quantizer pipeline arm,
 and a forward path — enabling an MQ4R quant via the existing
 `--format mq4 --no-q8-router` recipe.
 
@@ -248,9 +248,16 @@ Result: ~4.25 bpw across the whole model. The "R" = reduced fixed tier.
 For K2-Horizon, the MQ4R recipe applies identically once the arch is
 registered — the `--no-q8-router` flag is arch-agnostic. The fixed tier
 for K2-Horizon includes: q_proj, k_proj, o_proj, v_router, gate_proj
-(attention), v_experts (attention value experts), mlp.gate (FFN router),
-shared_experts, lm_head, embed_tokens. All of these would drop from Q8
-to MQ4 under `--no-q8-router`.
+(attention), mlp.gate (FFN router), shared_experts, lm_head, embed_tokens.
+All of these would drop from Q8 to MQ4 under `--no-q8-router`.
+
+**Deviation (as implemented):** `v_experts` are excluded from the fixed
+tier unconditionally — `q8_class_of` returns `None` for any name
+containing `v_experts`, so they always follow `--format` (MQ4) regardless
+of `--no-q8-router`. Rationale: 64 experts × [1024, 2560] at Q8 ≈ 420 MB
+of VRAM for a routing-quality benefit not yet measured. If a future
+variant wants Q8 value experts, `q8_class_of` needs a `Some("attn")` arm
+for `v_experts` gated on an explicit flag.
 
 ## 3. Implementation plan
 
@@ -259,8 +266,8 @@ to MQ4 under `--no-q8-router`.
 **Goal:** `hipfire quantize` recognizes `k2_horizon` and fails with a
 clean "no carrier" error instead of "unknown model_type".
 
-1. **`arch_mapping.rs`** — add `("k2_horizon", 15)` to
-   `MODEL_TYPE_TO_ARCH_ID`. arch_id 15 is the next free ID (14 =
+1. **`arch_mapping.rs`** — add `("k2_horizon", 16)` to
+   `MODEL_TYPE_TO_ARCH_ID`. arch_id 16 is the next free ID (15 = maple, 14 =
    muse_glimmer, 22 = gemma4 drafter; 15–21 are free).
 
 2. **`safetensors_source.rs`** — `derive_arch_id` already calls
@@ -269,14 +276,14 @@ clean "no carrier" error instead of "unknown model_type".
    its own ID.
 
 3. **`carriers.rs`** — add a `K2HorizonCarrier` stub that claims
-   `arch_id == 15` and returns a clean "not yet implemented" error from
+   `arch_id == 16` and returns a clean "not yet implemented" error from
    `load()`. Register it in `REGISTRY`.
 
-4. **`reset_core.rs`** — add arch_key mapping for id 15 to the
+4. **`reset_core.rs`** — add arch_key mapping for id 16 to the
    `arch_key_for_id` function and `ResetCoreCoverage` inventory.
 
 **Acceptance:** `hipfire quantize --input <dir> --format mq4` fails with
-"unknown carrier for arch_id 15" instead of "unknown model_type
+"unknown carrier for arch_id 16" instead of "unknown model_type
 'k2_horizon'". `cargo test carriers_are_disjoint` passes.
 
 ### Phase 1: Config parser + weight structs
@@ -361,7 +368,7 @@ pub struct K2HorizonWeights {
 }
 ```
 
-4. **`Architecture` trait impl** — `arch_id() = 15`, `name() =
+4. **`Architecture` trait impl** — `arch_id() = 16`, `name() =
    "k2_horizon"`, `config_from_hfq`, `load_weights`, `new_state`.
 
 **Acceptance:** `cargo test` in the new crate passes config parsing unit
@@ -459,7 +466,7 @@ generation continues to match HF token IDs.
 **Goal:** `hipfire quantize` produces a valid `.mq4r` (or `.mq4`) HFQ
 file from the safetensors source.
 
-1. **`pipeline.rs`** — add `is_k2_horizon = arch_id == 15` and include
+1. **`pipeline.rs`** — add `is_k2_horizon = arch_id == 16` and include
    it in `is_moe_like`. This activates the MoE expert quant paths and
    the `--no-q8-router` fixed-tier logic.
 
@@ -489,13 +496,13 @@ file from the safetensors source.
    once `is_k2_horizon` is in `is_moe_like`. No K2-Horizon-specific
    recipe code needed.
 
-5. **Metadata** — stamp `arch_id = 15` into the HFQ header. The
+5. **Metadata** — stamp `arch_id = 16` into the HFQ header. The
    `metadata_json` carries the full `config.json` (including
    `model_type: "k2_horizon"`) so the loader can parse it at serve time.
 
 **Acceptance:** `hipfire quantize --input <safetensors-dir> --format mq4
 --no-q8-router --output k2-horizon-36b-a4b.mq4r` completes without error.
-The output `.mq4r` file has `arch_id = 15` in its header and loads via
+The output `.mq4r` file has `arch_id = 16` in its header and loads via
 the K2HorizonCarrier.
 
 ### Phase 6: Loader + carrier
@@ -560,7 +567,7 @@ static-dispatch (not on the trait).
 
 ### 4.2. Carrier (`hipfire-loader/src/carriers.rs`)
 
-`K2HorizonCarrier` claims `arch_id == 15`. The carrier registry
+`K2HorizonCarrier` claims `arch_id == 16`. The carrier registry
 auto-detects overlaps via `carriers_are_disjoint` test.
 
 ### 4.3. Quantizer pipeline (`hipfire-quantize/src/pipeline.rs`)
@@ -641,11 +648,11 @@ kernels/src/                              shared kernel tree (no per-arch dir)
   gemv_mq4g256v2_moe_gate_up_k8_indexed_batched.hip
   gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded.hip
 
-crates/hipfire-runtime/src/arch_mapping.rs    add ("k2_horizon", 15)
+crates/hipfire-runtime/src/arch_mapping.rs    add ("k2_horizon", 16)
 crates/hipfire-loader/src/carriers.rs         add K2HorizonCarrier
 crates/hipfire-quantize/src/pipeline.rs       add is_k2_horizon to is_moe_like
 crates/hipfire-quantize/src/model_filter.rs   tensor name matching for K2-Horizon
-crates/hipfire-runtime/src/reset_core.rs      arch_key + inventory for id 15
+crates/hipfire-runtime/src/reset_core.rs      arch_key + inventory for id 16
 crates/hipfire-generate/src/dense.rs          generate_k2_horizon (AR path)
 Containerfile.k2-horizon                      serving container
 docs/plans/k2-horizon-arch-spec.md            this file
@@ -661,7 +668,7 @@ hipfire quantize \
   --format mq4 \
   --no-q8-router \
   --output ~/models/hipfire/IFM/K2-Horizon-MoVA-36B-A4B-MQ4R/k2-horizon-36b-a4b.mq4r \
-  --arch-id 15
+  --arch-id 16
 ```
 
 Per the model store layout convention (`~/models/AGENTS.md`):
@@ -820,3 +827,24 @@ Ordered by impact. Items marked [FIXED] were closed during the
     `new_with_max_seq` via `load_k2_horizon_bundle`; the Containerfile's
     `max_seq=32768` config is honored. Measured 24.35 GB used of 25.75 GB
     at 32k ctx — tight but stable.
+
+14. **[VERIFIED] Concat-GEMV weight fusion** — all K2-Horizon 2D
+    weights are MQ4G256V2 (qt=44, same K=2560), so same-K projections
+    byte-concatenate into one GPU allocation and one GEMV launch.
+    `load_fused_wts` (arch.rs) uploads `[wq‖wk‖wv‖gate]` (dense),
+    `[wq‖wk‖v_router‖gate]` (MoVA), `[w_gate‖w_up]` (dense FFN), and
+    `[router‖shared_gate‖shared_up]` (MoE FFN) as fused weights; the
+    per-tensor `WeightTensor`s are `sub_offset` views into the owner
+    blob (freed once in `free_gpu`). Forward paths slice views into
+    `state.attn_fused_out` / `state.ffn_fused_out`; the MoVA router
+    logits are read in place from the fused output. Falls back to
+    per-tensor loads on any dtype/K mismatch.
+    **Verified on gfx1100** (K2-Horizon-MoVA-36B-A4B.mq4r, q8 KV):
+    PM4 tape 1737→1080 launches (−38%), `bench_k2_horizon` decode
+    90.1→115.4 tok/s (+28%), prefill 241.5→734.6 tok/s (3.0×),
+    `redline_daemon_harness --pm4` pass=True (exact=True,
+    gdn_frame_exact=True, median 117.6 tok/s), `serve_harness battery`
+    5/5 turns coherent (avg decode 111.6 tok/s). `PrefillScratch`
+    logits buffer aliased to `state.logits` via borrowed view (−1 MB).
+    `PREFILL_MAX_BATCH` 256→128 was tried and reverted: −32% prefill
+    for ~110 MB scratch, not worth it at 1.4 GB headroom.

@@ -96,16 +96,35 @@ fn dense_attention_block(
     // normed = grouped_rmsnorm(h, attn_norm); normed_rot = FWHT(normed) once.
     norm_and_rotate(cfg, &layer.attn_norm, state, gpu, l)?;
 
-    gemv_normed(gpu, &layer.wq, state, &state.fa_q)
-        .map_err(|e| format!("k2_horizon L{l}: q_proj: {e}"))?;
-    gemv_normed(gpu, &layer.wk, state, &state.fa_k)
-        .map_err(|e| format!("k2_horizon L{l}: k_proj: {e}"))?;
-    gemv_normed(gpu, &layer.wv, state, &state.fa_v)
-        .map_err(|e| format!("k2_horizon L{l}: v_proj: {e}"))?;
+    // Fused [wq‖wk‖wv‖gate] single GEMV when packed; per-projection else.
+    let q_dim = cfg.n_heads * cfg.head_dim;
+    let kv_dim = cfg.n_kv_heads * cfg.head_dim;
+    let (q_t, k_t, v_t, gate_t);
+    if let Some((fused, _owner)) = &layer.attn_fused {
+        gemv_normed(gpu, fused, state, &state.attn_fused_out)
+            .map_err(|e| format!("k2_horizon L{l}: fused qkv+gate: {e}"))?;
+        q_t = state.attn_fused_out.sub_offset(0, q_dim);
+        k_t = state.attn_fused_out.sub_offset(q_dim, kv_dim);
+        v_t = state.attn_fused_out.sub_offset(q_dim + kv_dim, kv_dim);
+        gate_t = state.attn_fused_out.sub_offset(q_dim + 2 * kv_dim, q_dim);
+    } else {
+        gemv_normed(gpu, &layer.wq, state, &state.fa_q)
+            .map_err(|e| format!("k2_horizon L{l}: q_proj: {e}"))?;
+        gemv_normed(gpu, &layer.wk, state, &state.fa_k)
+            .map_err(|e| format!("k2_horizon L{l}: k_proj: {e}"))?;
+        gemv_normed(gpu, &layer.wv, state, &state.fa_v)
+            .map_err(|e| format!("k2_horizon L{l}: v_proj: {e}"))?;
+        gemv_normed(gpu, &layer.attn_gate, state, &state.attn_gate_out)
+            .map_err(|e| format!("k2_horizon L{l}: attn gate: {e}"))?;
+        q_t = state.fa_q.sub_offset(0, q_dim);
+        k_t = state.fa_k.sub_offset(0, kv_dim);
+        v_t = state.fa_v.sub_offset(0, kv_dim);
+        gate_t = state.attn_gate_out.sub_offset(0, q_dim);
+    }
 
     gpu.rope_f32(
-        &state.fa_q,
-        &state.fa_k,
+        &q_t,
+        &k_t,
         &state.pos_buf,
         cfg.n_heads,
         cfg.n_kv_heads,
@@ -115,11 +134,9 @@ fn dense_attention_block(
     .map_err(|e| format!("k2_horizon L{l}: rope: {e:?}"))?;
 
     let seq_len = position as usize + 1;
-    attend(cfg, state, gpu, l, seq_len)?;
+    attend(cfg, state, gpu, l, seq_len, &q_t, &k_t, &v_t)?;
 
-    gemv_normed(gpu, &layer.attn_gate, state, &state.attn_gate_out)
-        .map_err(|e| format!("k2_horizon L{l}: attn gate: {e}"))?;
-    gpu.softplus_gate_f32(&state.attn_gate_out, &state.fa_attn_out)
+    gpu.softplus_gate_f32(&gate_t, &state.fa_attn_out)
         .map_err(|e| format!("k2_horizon L{l}: softplus gate: {e:?}"))?;
 
     // o_proj reads fa_attn_out (q_dim), rotated into proj_rot.
@@ -150,14 +167,20 @@ fn dense_gate_up_block(
 ) -> Result<(), String> {
     norm_and_rotate(cfg, &layer.ffn_norm, state, gpu, l)?;
 
-    gemv_normed(gpu, &layer.w_gate, state, &state.dense_gate)
-        .map_err(|e| format!("k2_horizon L{l}: dense gate: {e}"))?;
-    gemv_normed(gpu, &layer.w_up, state, &state.dense_up)
-        .map_err(|e| format!("k2_horizon L{l}: dense up: {e}"))?;
+    // Fused [w_gate‖w_up] single GEMV when packed; per-projection else.
+    // dense_down_block slices the ffn_fused_out views itself.
+    if let Some((fused, _owner)) = &layer.ffn_fused {
+        gemv_normed(gpu, fused, state, &state.ffn_fused_out)
+            .map_err(|e| format!("k2_horizon L{l}: fused gate_up: {e}"))?;
+    } else {
+        gemv_normed(gpu, &layer.w_gate, state, &state.dense_gate)
+            .map_err(|e| format!("k2_horizon L{l}: dense gate: {e}"))?;
+        gemv_normed(gpu, &layer.w_up, state, &state.dense_up)
+            .map_err(|e| format!("k2_horizon L{l}: dense up: {e}"))?;
+    }
 
     Ok(())
 }
-
 /// Dense FFN down block: silu_mul + down_proj + residual add. w_down reads
 /// dense_act (not normed) — rotated into proj_rot, matching the hand path.
 fn dense_down_block(
@@ -167,7 +190,20 @@ fn dense_down_block(
     gpu: &mut Gpu,
     l: usize,
 ) -> Result<(), String> {
-    gpu.silu_mul_f32(&state.dense_gate, &state.dense_up, &state.dense_act)
+    // With ffn_fused, gate/up sit in ffn_fused_out views; else state bufs.
+    let dense_inter = cfg.intermediate_size;
+    let (dg, du) = if layer.ffn_fused.is_some() {
+        (
+            state.ffn_fused_out.sub_offset(0, dense_inter),
+            state.ffn_fused_out.sub_offset(dense_inter, dense_inter),
+        )
+    } else {
+        (
+            state.dense_gate.sub_offset(0, dense_inter),
+            state.dense_up.sub_offset(0, dense_inter),
+        )
+    };
+    gpu.silu_mul_f32(&dg, &du, &state.dense_act)
         .map_err(|e| format!("k2_horizon L{l}: dense silu_mul: {e:?}"))?;
     gpu.rotate_x_mq(&state.dense_act, &state.proj_rot, cfg.intermediate_size)
         .map_err(|e| format!("k2_horizon L{l}: down rotate: {e:?}"))?;
@@ -201,16 +237,38 @@ fn moe_attention_block(
     // normed = grouped_rmsnorm(h, attn_norm); normed_rot = FWHT(normed) once.
     norm_and_rotate(cfg, &layer.attn_norm, state, gpu, l)?;
 
-    gemv_normed(gpu, &attn.wq, state, &state.fa_q)
-        .map_err(|e| format!("k2_horizon L{l}: q_proj: {e}"))?;
-    gemv_normed(gpu, &attn.wk, state, &state.fa_k)
-        .map_err(|e| format!("k2_horizon L{l}: k_proj: {e}"))?;
+    // Fused [wq‖wk‖v_router‖gate] single GEMV when packed; per-projection
+    // else. v_router logits land inside attn_fused_out — the routing helper
+    // views them in place when attn_fused is set.
+    let q_dim = cfg.n_heads * cfg.head_dim;
+    let kv_dim = cfg.n_kv_heads * cfg.head_dim;
+    let mova_n = cfg.mova_num_experts;
+    let (q_t, k_t, gate_t);
+    if let Some((fused, _owner)) = &attn.attn_fused {
+        gemv_normed(gpu, fused, state, &state.attn_fused_out)
+            .map_err(|e| format!("k2_horizon L{l}: fused qk+router+gate: {e}"))?;
+        q_t = state.attn_fused_out.sub_offset(0, q_dim);
+        k_t = state.attn_fused_out.sub_offset(q_dim, kv_dim);
+        gate_t = state
+            .attn_fused_out
+            .sub_offset(q_dim + kv_dim + mova_n, q_dim);
+    } else {
+        gemv_normed(gpu, &attn.wq, state, &state.fa_q)
+            .map_err(|e| format!("k2_horizon L{l}: q_proj: {e}"))?;
+        gemv_normed(gpu, &attn.wk, state, &state.fa_k)
+            .map_err(|e| format!("k2_horizon L{l}: k_proj: {e}"))?;
+        gemv_normed(gpu, &attn.attn_gate, state, &state.attn_gate_out)
+            .map_err(|e| format!("k2_horizon L{l}: attn gate: {e}"))?;
+        q_t = state.fa_q.sub_offset(0, q_dim);
+        k_t = state.fa_k.sub_offset(0, kv_dim);
+        gate_t = state.attn_gate_out.sub_offset(0, q_dim);
+    }
 
     forward_mova_value_routing(cfg, attn, state, gpu, l)?;
 
     gpu.rope_f32(
-        &state.fa_q,
-        &state.fa_k,
+        &q_t,
+        &k_t,
         &state.pos_buf,
         cfg.n_heads,
         cfg.n_kv_heads,
@@ -220,11 +278,10 @@ fn moe_attention_block(
     .map_err(|e| format!("k2_horizon L{l}: rope: {e:?}"))?;
 
     let seq_len = position as usize + 1;
-    attend(cfg, state, gpu, l, seq_len)?;
+    let v_t = state.fa_v.sub_offset(0, kv_dim);
+    attend(cfg, state, gpu, l, seq_len, &q_t, &k_t, &v_t)?;
 
-    gemv_normed(gpu, &attn.attn_gate, state, &state.attn_gate_out)
-        .map_err(|e| format!("k2_horizon L{l}: attn gate: {e}"))?;
-    gpu.softplus_gate_f32(&state.attn_gate_out, &state.fa_attn_out)
+    gpu.softplus_gate_f32(&gate_t, &state.fa_attn_out)
         .map_err(|e| format!("k2_horizon L{l}: softplus gate: {e:?}"))?;
 
     // o_proj reads fa_attn_out (q_dim), rotated into proj_rot.

@@ -1678,6 +1678,16 @@ pub const GEMV_MQ4G256V2_RESIDUAL_R1_K4096_GFX1100_NOSCRATCH_SRC: &str = concat!
     "#define HIPFIRE_MQ4G256V2_RESIDUAL_EPILOGUE 1\n",
     include_str!("../../../kernels/src/gemv_mq4g256v2.hip")
 );
+/// Generic-K one-row residual variant of the plain V2 body: residual store
+/// (`y[row] += acc`), unique symbol, no private scratch — retained-PM4
+/// qualified. For K2-Horizon o_proj (K=4096), shared down (K=768), and
+/// dense down (K=6144) where the fixed-K4096 variant does not apply.
+/// Launcher-gated to gfx1100 + MQ4G256V2.
+pub const GEMV_MQ4G256V2_RESIDUAL_R1_GENERIC_NOSCRATCH_SRC: &str = concat!(
+    "#define HIPFIRE_MQ4G256V2_KERNEL gemv_mq4g256v2_residual_r1_generic_noscratch\n",
+    "#define HIPFIRE_MQ4G256V2_RESIDUAL_EPILOGUE 1\n",
+    include_str!("../../../kernels/src/gemv_mq4g256v2.hip")
+);
 /// Ornith qt44 shared-expert down fuse: fixed K=512 dual-half MQ4G256V2 body with
 /// lane-0 `sigmoid(c_buf[0]) * acc` residual store. ABI is 40 B (A/x/y/c_buf/M/K).
 /// Launcher-gated to exact gfx1100|gfx1201 / M=2048 / K=512; default shared-down
@@ -4864,6 +4874,11 @@ pub const GEMV_Q6K_SRC: &str = include_str!("../../../kernels/src/gemv_q6k.hip")
 
 /// RMSNorm: y[i] = x[i] * weight[i] / sqrt(mean(x^2) + eps)
 pub const RMSNORM_SRC: &str = include_str!("../../../kernels/src/rmsnorm.hip");
+
+/// Fused grouped RMSNorm + FWHT rotation (K2-Horizon): per-chunk variance
+/// (n/n_groups) then per-256-group FWHT. Writes normed `out` and `x_rot`.
+pub const GROUPED_RMSNORM_MQ_ROTATE_SRC: &str =
+    include_str!("../../../kernels/src/grouped_rmsnorm_mq_rotate.hip");
 
 /// Fused sandwich post-norm + residual-add: out = residual + rmsnorm(x, weight).
 /// Collapses (rmsnorm + memcpy + add_inplace) 3 launches into 1 (gemma4 L4).

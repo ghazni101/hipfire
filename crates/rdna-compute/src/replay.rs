@@ -1040,6 +1040,11 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         "mul_f32" => Some(vec![read(0), read(8), write(16)]),
         "grouped_rmsnorm_f32" => Some(vec![read(0), read(8), write(16)]),
         "rope_f32" => Some(vec![write(0), write(8), read(16)]),
+        "softplus_gate_f32" => Some(vec![read(0), write(8)]),
+        "replicate_batched_f32" => Some(vec![read(0), write(8)]),
+        "deepseek4_moe_topk_bias_aware_batched_f32" => {
+            Some(vec![read(0), read(8), write(16), write(24)])
+        }
         "rotate_with_rms_gfx1100" => Some(vec![
             read(0),
             read(8),
@@ -1259,6 +1264,9 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "rmsnorm_f32_at_slot_buf"
             | "state_overlap_shift_f32_buf"
             | "add_inplace_f32"
+            | "state_ring_write_f32_buf"
+            | "softplus_gate_f32"
+            | "replicate_batched_f32"
             | "silu_f32"
             | "silu_mul_f32"
             | "mul_f32"
@@ -1284,7 +1292,9 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "indexer_top_k_buf"
             | "indexer_top_k_buf_parallel"
             | "swa_ring_write_f32_buf"
+            | "rope_tail_interleaved_f32"
             | "grouped_rmsnorm_f32"
+            | "deepseek4_moe_topk_bias_aware_batched_f32"
             | "rope_f32"
     ) {
         return Some(48);

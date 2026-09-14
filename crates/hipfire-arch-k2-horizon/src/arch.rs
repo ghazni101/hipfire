@@ -41,16 +41,43 @@ fn load_f32(
     shape: &[usize],
 ) -> Result<GpuTensor, String> {
     let (qt, data) = read_tensor(hfq, name)?;
+    let numel: usize = shape.iter().product();
     let f32_data: Vec<f32> = match qt {
-        1 => data
-            .chunks_exact(2)
-            .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect(),
-        2 => data
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect(),
-        3 => dequant_q8_0(&data),
+        1 => {
+            if data.len() != numel * 2 {
+                return Err(format!(
+                    "k2_horizon: {name} F16 payload {}B != {} elems",
+                    data.len(),
+                    numel
+                ));
+            }
+            data.chunks_exact(2)
+                .map(|c| f16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect()
+        }
+        2 => {
+            if data.len() != numel * 4 {
+                return Err(format!(
+                    "k2_horizon: {name} F32 payload {}B != {} elems",
+                    data.len(),
+                    numel
+                ));
+            }
+            data.chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect()
+        }
+        3 => {
+            if data.len() != numel.div_ceil(32) * 34 {
+                return Err(format!(
+                    "k2_horizon: {name} Q8_0 payload {}B != {} elems ({} blocks)",
+                    data.len(),
+                    numel,
+                    numel.div_ceil(32)
+                ));
+            }
+            dequant_q8_0(&data)
+        }
         _ => {
             return Err(format!(
                 "k2_horizon: expected F16/F32/Q8 for {name}, got qt={qt}"
@@ -116,6 +143,27 @@ fn wt_from_raw(
         50 => DType::MQ2G256V2,
         other => return Err(format!("unsupported quant_type {other}")),
     };
+    // Exact-size check for layouts whose byte math is fixed: catches
+    // truncated/corrupt HFQ payloads before they reach the GPU (a short
+    // upload would leave the tail of the tensor as stale/uninit memory).
+    // Layouts not listed (HFQ*, MQ2/3/5/6, MFP/BQ1) pass through unchecked.
+    let expected: Option<usize> = match dtype {
+        DType::F16 | DType::BF16 => m.checked_mul(k).and_then(|e| e.checked_mul(2)),
+        DType::F32 => m.checked_mul(k).and_then(|e| e.checked_mul(4)),
+        DType::Q8_0 if k % 32 == 0 => m.checked_mul(k / 32).and_then(|e| e.checked_mul(34)),
+        DType::MQ4G256 | DType::MQ4G256V2 | DType::MQ4CG256 if k % 256 == 0 => {
+            m.checked_mul(k / 256).and_then(|e| e.checked_mul(136))
+        }
+        _ => None,
+    };
+    if let Some(want) = expected {
+        if data.len() != want {
+            return Err(format!(
+                "{dtype:?} tensor [m={m}, k={k}] expects {want} bytes, got {}",
+                data.len()
+            ));
+        }
+    }
     let buf = gpu
         .upload_raw(data, &[data.len()])
         .map_err(|e| format!("upload_raw: {e:?}"))?;
@@ -143,6 +191,78 @@ fn packable_mq4_dtype(qt: u8) -> Option<DType> {
         45 => Some(DType::MQ4CG256),
         _ => None,
     }
+}
+
+/// Load several same-dtype, same-K 2D weights byte-concatenated into ONE
+/// GPU allocation, returning a fused `WeightTensor` ([Σm, k]) plus the
+/// owning `GpuTensor` and per-tensor views (same pattern as
+/// `load_packed_experts`). Returns `Ok(None)` when any tensor is missing,
+/// has a different dtype, or a different K — callers fall back to
+/// per-tensor `load_wt`.
+///
+/// Row-major concat is valid for every 136 B/group MQ4 layout: each row is
+/// `k/256` groups, so stacking tensors along M is just more rows.
+fn load_fused_wts(
+    hfq: &HfqFile,
+    gpu: &mut Gpu,
+    specs: &[(String, usize, usize)],
+) -> Result<Option<(WeightTensor, GpuTensor, Vec<WeightTensor>)>, String> {
+    if specs.is_empty() {
+        return Ok(None);
+    }
+    let k0 = specs[0].2;
+    let mut dtype: Option<DType> = None;
+    let mut blob: Vec<u8> = Vec::new();
+    let mut strides: Vec<usize> = Vec::with_capacity(specs.len());
+    for (name, _m, k) in specs {
+        if *k != k0 {
+            return Ok(None);
+        }
+        let Some((info, data)) = hfq.tensor_data_vec(name) else {
+            return Ok(None);
+        };
+        let Some(dt) = packable_mq4_dtype(info.quant_type) else {
+            return Ok(None);
+        };
+        match dtype {
+            None => dtype = Some(dt),
+            Some(d) if d == dt => {}
+            Some(_) => return Ok(None), // mixed dtypes — can't fuse
+        }
+        strides.push(data.len());
+        blob.extend_from_slice(&data);
+    }
+    let dtype = dtype.unwrap();
+    let owner = gpu
+        .upload_raw(&blob, &[blob.len()])
+        .map_err(|e| format!("k2_horizon: fused weight upload: {e:?}"))?;
+    let mut views = Vec::with_capacity(specs.len());
+    let mut off = 0usize;
+    let mut m_total = 0usize;
+    for ((_, m, _), stride) in specs.iter().zip(strides.iter()) {
+        let view = owner.sub_offset(off, *stride);
+        views.push(WeightTensor {
+            buf: view,
+            gpu_dtype: dtype,
+            m: *m,
+            k: k0,
+            row_stride: 0,
+            paro: None,
+            awq_scale: None,
+        });
+        off += stride;
+        m_total += m;
+    }
+    let fused = WeightTensor {
+        buf: owner.sub_offset(0, blob.len()),
+        gpu_dtype: dtype,
+        m: m_total,
+        k: k0,
+        row_stride: 0,
+        paro: None,
+        awq_scale: None,
+    };
+    Ok(Some((fused, owner, views)))
 }
 
 /// Restrict expert packing to the gfx11 family where the packed-blob layout
@@ -279,7 +399,14 @@ impl Architecture for K2Horizon {
         // Upload embedding as raw Q8_0 bytes (681 MB) instead of dequantizing
         // to F32 (2.57 GB). embedding_lookup_q8 dequantizes one row on-GPU
         // at lookup time. Matches minimax/deepseek4/cohere2moe pattern.
-        let (_qt, embed_bytes) = read_tensor(hfq, "model.embed_tokens.weight")?;
+        // Fail-fast on any other quant type — a non-Q8 embed would silently
+        // misdecode every token (same class require_v2_expert_dtype guards).
+        let (embed_qt, embed_bytes) = read_tensor(hfq, "model.embed_tokens.weight")?;
+        if embed_qt != 3 {
+            return Err(format!(
+                "k2_horizon: embed_tokens qt={embed_qt} — embedding_lookup_q8 requires Q8_0 (qt=3); re-quantize with embed in the Q8 tier"
+            ));
+        }
         let token_embd = gpu
             .upload_raw(&embed_bytes, &[embed_bytes.len()])
             .map_err(|e| format!("k2_horizon: upload embed: {e:?}"))?;
@@ -306,27 +433,35 @@ impl Architecture for K2Horizon {
 
             if dense_set.contains(&l) {
                 // ── Dense layer (0–2): standard MHA + dense SwiGLU MLP ──
-                let wq = load_wt(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.q_proj.weight"),
-                    q_dim,
-                    hidden,
-                )?;
-                let wk = load_wt(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.k_proj.weight"),
-                    kv_dim,
-                    hidden,
-                )?;
-                let wv = load_wt(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.v_proj.weight"),
-                    kv_dim,
-                    hidden,
-                )?;
+                // Fused [wq‖wk‖wv‖attn_gate] and [w_gate‖w_up] single-GEMV
+                // weights when all members share a packable dtype; falls
+                // back to per-tensor loads otherwise.
+                let attn_specs = [
+                    (format!("{p}.self_attn.q_proj.weight"), q_dim, hidden),
+                    (format!("{p}.self_attn.k_proj.weight"), kv_dim, hidden),
+                    (format!("{p}.self_attn.v_proj.weight"), kv_dim, hidden),
+                    (format!("{p}.self_attn.gate_proj.weight"), q_dim, hidden),
+                ];
+                let (wq, wk, wv, attn_gate, attn_fused) =
+                    match load_fused_wts(hfq, gpu, &attn_specs)? {
+                        Some((fused, owner, views)) => {
+                            let mut it = views.into_iter();
+                            (
+                                it.next().unwrap(),
+                                it.next().unwrap(),
+                                it.next().unwrap(),
+                                it.next().unwrap(),
+                                Some((fused, owner)),
+                            )
+                        }
+                        None => (
+                            load_wt(hfq, gpu, &attn_specs[0].0, q_dim, hidden)?,
+                            load_wt(hfq, gpu, &attn_specs[1].0, kv_dim, hidden)?,
+                            load_wt(hfq, gpu, &attn_specs[2].0, kv_dim, hidden)?,
+                            load_wt(hfq, gpu, &attn_specs[3].0, q_dim, hidden)?,
+                            None,
+                        ),
+                    };
                 let wo = load_wt(
                     hfq,
                     gpu,
@@ -334,27 +469,21 @@ impl Architecture for K2Horizon {
                     hidden,
                     q_dim,
                 )?;
-                let attn_gate = load_wt(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.gate_proj.weight"),
-                    q_dim, // [num_attention_heads * head_dim, dim] = [4096, 2560]
-                    hidden,
-                )?;
-                let w_gate = load_wt(
-                    hfq,
-                    gpu,
-                    &format!("{p}.mlp.gate_proj.weight"),
-                    dense_inter,
-                    hidden,
-                )?;
-                let w_up = load_wt(
-                    hfq,
-                    gpu,
-                    &format!("{p}.mlp.up_proj.weight"),
-                    dense_inter,
-                    hidden,
-                )?;
+                let ffn_specs = [
+                    (format!("{p}.mlp.gate_proj.weight"), dense_inter, hidden),
+                    (format!("{p}.mlp.up_proj.weight"), dense_inter, hidden),
+                ];
+                let (w_gate, w_up, ffn_fused) = match load_fused_wts(hfq, gpu, &ffn_specs)? {
+                    Some((fused, owner, views)) => {
+                        let mut it = views.into_iter();
+                        (it.next().unwrap(), it.next().unwrap(), Some((fused, owner)))
+                    }
+                    None => (
+                        load_wt(hfq, gpu, &ffn_specs[0].0, dense_inter, hidden)?,
+                        load_wt(hfq, gpu, &ffn_specs[1].0, dense_inter, hidden)?,
+                        None,
+                    ),
+                };
                 let w_down = load_wt(
                     hfq,
                     gpu,
@@ -369,27 +498,43 @@ impl Architecture for K2Horizon {
                     wv,
                     wo,
                     attn_gate,
+                    attn_fused,
                     ffn_norm,
                     w_gate,
                     w_up,
+                    ffn_fused,
                     w_down,
                 });
             } else {
                 // ── MoE layer (3–47): MoVA attention + sigmoid MoE FFN ──
-                let wq = load_wt(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.q_proj.weight"),
-                    q_dim,
-                    hidden,
-                )?;
-                let wk = load_wt(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.k_proj.weight"),
-                    kv_dim,
-                    hidden,
-                )?;
+                // Fused [wq‖wk‖v_router‖attn_gate] single-GEMV weight when
+                // all four share a packable dtype; per-tensor fallback.
+                let attn_specs = [
+                    (format!("{p}.self_attn.q_proj.weight"), q_dim, hidden),
+                    (format!("{p}.self_attn.k_proj.weight"), kv_dim, hidden),
+                    (format!("{p}.self_attn.v_router.weight"), mova_n_exp, hidden),
+                    (format!("{p}.self_attn.gate_proj.weight"), q_dim, hidden),
+                ];
+                let (wq, wk, v_router, attn_gate, attn_fused) =
+                    match load_fused_wts(hfq, gpu, &attn_specs)? {
+                        Some((fused, owner, views)) => {
+                            let mut it = views.into_iter();
+                            (
+                                it.next().unwrap(),
+                                it.next().unwrap(),
+                                it.next().unwrap(),
+                                it.next().unwrap(),
+                                Some((fused, owner)),
+                            )
+                        }
+                        None => (
+                            load_wt(hfq, gpu, &attn_specs[0].0, q_dim, hidden)?,
+                            load_wt(hfq, gpu, &attn_specs[1].0, kv_dim, hidden)?,
+                            load_wt(hfq, gpu, &attn_specs[2].0, mova_n_exp, hidden)?,
+                            load_wt(hfq, gpu, &attn_specs[3].0, q_dim, hidden)?,
+                            None,
+                        ),
+                    };
                 let wo = load_wt(
                     hfq,
                     gpu,
@@ -397,17 +542,14 @@ impl Architecture for K2Horizon {
                     hidden,
                     q_dim,
                 )?;
-
-                // MoVA: v_router [64, 2560] + v_router.bias [64],
-                // v_experts[64] [kv_dim=1024, 2560], attn_gate [2560, 2560].
-                let v_router = load_wt(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.v_router.weight"),
-                    mova_n_exp,
-                    hidden,
-                )?;
-                let v_router_bias = if cfg.moe_gate_bias {
+                // MoVA selection bias is an independent tensor — load it iff
+                // present in the HFQ, not gated on moe_gate_bias (which
+                // describes the FFN router). A variant with one bias but not
+                // the other must not silently drop the MoVA selection bias.
+                let v_router_bias = if hfq
+                    .find_tensor_info(&format!("{p}.self_attn.v_router.bias"))
+                    .is_some()
+                {
                     Some(load_f32(
                         hfq,
                         gpu,
@@ -462,18 +604,45 @@ impl Architecture for K2Horizon {
                     .memcpy_htod(&v_expert_ptrs.buf, &ve_ptrs)
                     .map_err(|e| format!("k2_horizon: htod v_expert_ptrs: {e:?}"))?;
 
-                let attn_gate = load_wt(
-                    hfq,
-                    gpu,
-                    &format!("{p}.self_attn.gate_proj.weight"),
-                    q_dim, // [num_attention_heads * head_dim, dim] = [4096, 2560]
-                    hidden,
-                )?;
-
                 // MoE FFN: router [100, 2560], router_bias [100],
                 // experts[100] (fused gate_up + down), shared expert.
-                let router = load_wt(hfq, gpu, &format!("{p}.mlp.gate.weight"), n_exp, hidden)?;
-                let router_bias = if cfg.moe_gate_bias {
+                // Fused [router‖shared.gate‖shared.up] single-GEMV weight
+                // when all three share a packable dtype; per-tensor fallback.
+                let ffn_specs = [
+                    (format!("{p}.mlp.gate.weight"), n_exp, hidden),
+                    (
+                        format!("{p}.mlp.shared_experts.gate_proj.weight"),
+                        moe_inter,
+                        hidden,
+                    ),
+                    (
+                        format!("{p}.mlp.shared_experts.up_proj.weight"),
+                        moe_inter,
+                        hidden,
+                    ),
+                ];
+                let (router, shared_gate, shared_up, ffn_fused) =
+                    match load_fused_wts(hfq, gpu, &ffn_specs)? {
+                        Some((fused, owner, views)) => {
+                            let mut it = views.into_iter();
+                            (
+                                it.next().unwrap(),
+                                it.next().unwrap(),
+                                it.next().unwrap(),
+                                Some((fused, owner)),
+                            )
+                        }
+                        None => (
+                            load_wt(hfq, gpu, &ffn_specs[0].0, n_exp, hidden)?,
+                            load_wt(hfq, gpu, &ffn_specs[1].0, moe_inter, hidden)?,
+                            load_wt(hfq, gpu, &ffn_specs[2].0, moe_inter, hidden)?,
+                            None,
+                        ),
+                    };
+                let router_bias = if hfq
+                    .find_tensor_info(&format!("{p}.mlp.gate.bias"))
+                    .is_some()
+                {
                     Some(load_f32(hfq, gpu, &format!("{p}.mlp.gate.bias"), &[n_exp])?)
                 } else {
                     None
@@ -679,22 +848,11 @@ impl Architecture for K2Horizon {
                     .memcpy_htod(&expert_down_ptrs.buf, &dn_ptrs)
                     .map_err(|e| format!("k2_horizon: htod dn_ptrs: {e:?}"))?;
 
-                // Shared expert (always-on).
+                // Shared expert (always-on). gate/up may be views into the
+                // fused [router‖gate‖up] blob; down stays separate (K=moe_inter).
                 let shared = SharedExpertWeights {
-                    gate: load_wt(
-                        hfq,
-                        gpu,
-                        &format!("{p}.mlp.shared_experts.gate_proj.weight"),
-                        moe_inter,
-                        hidden,
-                    )?,
-                    up: load_wt(
-                        hfq,
-                        gpu,
-                        &format!("{p}.mlp.shared_experts.up_proj.weight"),
-                        moe_inter,
-                        hidden,
-                    )?,
+                    gate: shared_gate,
+                    up: shared_up,
                     down: load_wt(
                         hfq,
                         gpu,
@@ -716,6 +874,7 @@ impl Architecture for K2Horizon {
                         v_expert_ptrs,
                         wo,
                         attn_gate,
+                        attn_fused,
                     },
                     ffn_norm,
                     ffn: MoeFfnWeights {
@@ -727,6 +886,7 @@ impl Architecture for K2Horizon {
                         expert_gate_up_ptrs,
                         expert_down_ptrs,
                         shared,
+                        ffn_fused,
                     },
                 });
             }

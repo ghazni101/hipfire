@@ -8528,6 +8528,20 @@ pub fn generate_k2_horizon(
     // opened (high→<ifm|think>, medium→<ifm|think_fast>, low→<ifm|think_faster>)
     // so the force-close feeds the MATCHING close tag, not a mismatched one.
     reasoning_effort: Option<&str>,
+    // HTTP-resolved reasoning contract: false = client asked for no thinking
+    // (reasoning_effort:"none" / thinking disabled). Mapped to the lowest
+    // effort tag + an immediate force-close.
+    enable_thinking: bool,
+    // Wire sampling controls this path does not implement. Non-default values
+    // are rejected loudly rather than silently dropped.
+    stop: &[String],
+    top_k: Option<u32>,
+    min_p: Option<f32>,
+    repeat_penalty: f32,
+    repeat_window: usize,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+    logprobs_top_k: Option<usize>,
     _tools: Option<&[serde_json::Value]>,
     _messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
 ) {
@@ -8546,15 +8560,95 @@ pub fn generate_k2_horizon(
         return;
     }
 
-    let gen_contract = crate::common::gen_start_contract_version_for_arch(m.arch_id);
-    emit_gen_start(stdout, id, false, gen_contract);
+    // Reject wire controls this path cannot honor rather than silently
+    // dropping them (stop sequences, top_k/min_p, penalties, logprobs).
+    {
+        let mut unsupported: Vec<&str> = Vec::new();
+        if !stop.is_empty() {
+            unsupported.push("stop");
+        }
+        if top_k.map(|k| k > 0).unwrap_or(false) {
+            unsupported.push("top_k");
+        }
+        if min_p.map(|p| p > 0.0).unwrap_or(false) {
+            unsupported.push("min_p");
+        }
+        // repeat_window defaults to 128 in the daemon even when the client
+        // omits it — only a non-neutral penalty is a real request. The
+        // window alone (penalty=1.0) is a no-op.
+        if (repeat_penalty - 1.0).abs() > f32::EPSILON {
+            unsupported.push("repeat_penalty");
+        }
+        if presence_penalty.abs() > f32::EPSILON {
+            unsupported.push("presence_penalty");
+        }
+        if frequency_penalty.abs() > f32::EPSILON {
+            unsupported.push("frequency_penalty");
+        }
+        if logprobs_top_k.is_some() {
+            unsupported.push("logprobs");
+        }
+        if !unsupported.is_empty() {
+            emit_error_with_id(
+                stdout,
+                id,
+                format!(
+                    "k2_horizon: unsupported request parameter(s): {}",
+                    unsupported.join(", ")
+                ),
+            );
+            let _ = stdout.flush();
+            return;
+        }
+    }
 
     let t0 = Instant::now();
 
+    // Resolve the reasoning effort ONCE — it selects which think tag the
+    // Jinja generation prompt opens AND which close tag the think-cap feeds.
+    // Deriving the two from different inputs (effort param vs the
+    // max_think_tokens ladder) re-opens the mismatched-close-tag bug.
+    // Precedence: explicit wire reasoning_effort wins; "none" means no
+    // thinking; otherwise the max_think_tokens ladder picks the tag.
+    // enable_thinking=false forces the no-think sentinel (cap=1 → low).
+    let effort: &str = if !enable_thinking {
+        "low"
+    } else {
+        match reasoning_effort {
+            Some("low") => "low",
+            Some("medium") | Some("med") => "medium",
+            Some("high") => "high",
+            Some("none") => "low",
+            _ => match max_think_tokens {
+                1 => "low",
+                0 => "high",
+                n if n <= 512 => "low",
+                n if n <= 2048 => "medium",
+                _ => "high",
+            },
+        }
+    };
+    // Effective think cap: enable_thinking=false or reasoning_effort="none"
+    // collapse to the no-think sentinel (immediate force-close).
+    let think_cap: usize =
+        if !enable_thinking || reasoning_effort.map(|e| e == "none").unwrap_or(false) {
+            1
+        } else {
+            max_think_tokens
+        };
+
     // ── Prompt build ──
+    // `primed_think` records whether the rendered prompt left the model
+    // inside an open think span — the Jinja template always opens one
+    // (`reasoning_effort | default('high')`), the raw-encode fallback does
+    // not. `in_think` and gen_start's started_in_think both read this.
+    let mut primed_think = false;
     let prompt_ids: Vec<u32> = {
         let tokenizer = m.tokenizer.as_ref().unwrap();
-        let jinja_enabled = std::env::var("HIPFIRE_JINJA_CHAT").ok().as_deref() != Some("0");
+        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+            .ok()
+            .as_deref()
+            != Some("0");
         let try_jinja = jinja_enabled && m.chat_template.is_some();
         if try_jinja {
             let template = m.chat_template.as_ref().unwrap();
@@ -8565,24 +8659,21 @@ pub fn generate_k2_horizon(
                 user: prompt,
                 // K2-Horizon's template opens a think block whenever
                 // `add_generation_prompt` is set — `enable_thinking` is not
-                // consulted; `reasoning_effort | default('high')` picks the
-                // tag (high→<ifm|think>, medium→<ifm|think_fast>,
-                // low→<ifm|think_faster>). Map the caller's think budget onto
-                // the effort ladder (mirrors glimmer_reasoning_strength):
-                // 1 = no-think → lowest effort, 0 = uncapped → high.
-                enable_thinking: max_think_tokens != 1,
+                // consulted; `reasoning_effort` picks the tag. We pass the
+                // resolved effort so the open tag always matches the close
+                // tag the think-cap arm feeds below.
+                enable_thinking,
                 bos_token: None,
                 reasoning_strength: None,
-                reasoning_effort: Some(match max_think_tokens {
-                    1 => "low",
-                    0 => "high",
-                    n if n <= 512 => "low",
-                    n if n <= 2048 => "medium",
-                    _ => "high",
-                }),
+                reasoning_effort: Some(effort),
             };
             match frame.render() {
-                Ok(rendered) => tokenizer.encode(&rendered),
+                Ok(rendered) => {
+                    primed_think = rendered.trim_end().ends_with("<ifm|think>")
+                        || rendered.trim_end().ends_with("<ifm|think_fast>")
+                        || rendered.trim_end().ends_with("<ifm|think_faster>");
+                    tokenizer.encode(&rendered)
+                }
                 Err(e) => {
                     emit_error_with_id(stdout, id, format!("k2_horizon jinja render failed: {e}"));
                     let _ = stdout.flush();
@@ -8590,7 +8681,8 @@ pub fn generate_k2_horizon(
                 }
             }
         } else {
-            // Fallback: BOS-prepended raw encode.
+            // Fallback: raw encode, system prompt prepended. No think block
+            // is opened — primed_think stays false.
             let mut ids = tokenizer.encode(prompt);
             if let Some(sys) = system_prompt {
                 let sys_ids = tokenizer.encode(sys);
@@ -8605,6 +8697,31 @@ pub fn generate_k2_horizon(
         let _ = stdout.flush();
         return;
     }
+
+    // Bound the turn against the KV allocation before any GPU work — the
+    // q8 KV write kernels index by position with no bounds check, so an
+    // over-capacity turn would write out of bounds (gemma4 does the same
+    // check at its prompt-build site).
+    {
+        let b = m.k2_horizon().unwrap();
+        if prompt_ids.len() + max_tokens > b.state.max_seq {
+            emit_error_with_id(
+                stdout,
+                id,
+                format!(
+                    "k2_horizon prompt is {} tokens + max_tokens {} but max_seq is {} — reload with a larger max_seq",
+                    prompt_ids.len(),
+                    max_tokens,
+                    b.state.max_seq
+                ),
+            );
+            let _ = stdout.flush();
+            return;
+        }
+    }
+
+    let gen_contract = crate::common::gen_start_contract_version_for_arch(m.arch_id);
+    emit_gen_start(stdout, id, primed_think, gen_contract);
 
     let eos_tok = m.k2_horizon().map(|b| b.eos_tok).unwrap_or(1);
     // K2-Horizon uses two EOS tokens: <|ifm|endoftext|> (id 1) and
@@ -8622,25 +8739,36 @@ pub fn generate_k2_horizon(
     const THINK_FAST_CLOSE: u32 = 250051;
     const THINK_FASTER_OPEN: u32 = 250052;
     const THINK_FASTER_CLOSE: u32 = 250053;
-    // ── Prefill (sequential decode_step) ──
+    // ── Prefill ──
     let prefill_t0 = Instant::now();
     {
         let b = m.k2_horizon_mut().unwrap();
-        let _ = b.state.reset(gpu);
+        if let Err(e) = b.state.reset(gpu) {
+            emit_error_with_id(stdout, id, format!("k2_horizon state reset failed: {e}"));
+            let _ = stdout.flush();
+            return;
+        }
     }
-
     let mut last_logits: Vec<f32> = Vec::new();
     {
         let b = m.k2_horizon_mut().unwrap();
         // Batched prefill (PREFILL_MAX_BATCH=256 tokens/chunk). The prior
         // IMA (hipMemcpy D2H 700) traced to the partial-warp topk hazard,
-        // fixed in deepseek4_moe_topk_bias_aware{,_batched}. Sequential
-        // decode_step prefill remains the fallback on error.
+        // fixed in deepseek4_moe_topk_bias_aware{,_batched}. A batched
+        // prefill error is fatal to the turn (no silent sequential retry —
+        // a mid-prefill failure leaves n_tokens/KV in an indeterminate
+        // state). Sequential decode_step prefill is the explicit opt-in via
+        // HIPFIRE_K2_PREFILL_SEQ=1.
         let use_batched = hipfire_config::developer_var("HIPFIRE_K2_PREFILL_SEQ")
             .map(|v| v != "1")
             .unwrap_or(true);
         let batched = if use_batched {
-            match k2_horizon::prefill::PrefillScratch::new(gpu, &b.config, b.state.max_seq) {
+            match k2_horizon::prefill::PrefillScratch::new(
+                gpu,
+                &b.config,
+                b.state.max_seq,
+                &b.state.logits,
+            ) {
                 Ok(ps) => {
                     let r = k2_horizon::prefill::forward_prefill_batch(
                         &b.config,
@@ -8649,6 +8777,7 @@ pub fn generate_k2_horizon(
                         &mut b.state,
                         gpu,
                         &prompt_ids,
+                        Some(&|| check_abort(id)),
                     );
                     ps.free_gpu(gpu);
                     Some(r)
@@ -8667,6 +8796,11 @@ pub fn generate_k2_horizon(
             }
             None => {
                 for (i, &tok) in prompt_ids.iter().enumerate() {
+                    if check_abort(id) {
+                        let ep = production_fail_closed_rollback(m, gpu, None, None);
+                        emit_spec_cancel_after_rollback(stdout, id, 0, &ep);
+                        return;
+                    }
                     match k2_horizon::decode_step(
                         &b.config,
                         &b.weights,
@@ -8700,30 +8834,27 @@ pub fn generate_k2_horizon(
     let decode_t0 = Instant::now();
     let mut generated_count = 0usize;
     let mut emitted_visible = false;
-    // The Jinja template ALWAYS opens a think block in the generation
-    // prompt (`reasoning_effort | default('high')` — enable_thinking is not
-    // consulted), so generation always starts inside a think block
-    // regardless of the caller's think budget. `max_think_tokens` is a CAP:
-    // 1 = minimum effort (think_faster), N = force-close after N reasoning
-    // tokens, 0 = uncapped. Track state at the token level: think-marker
+    // `in_think` follows the rendered prompt tail, not a constant: the Jinja
+    // template always opens a think block (`reasoning_effort` picks which
+    // tag), the raw-encode fallback opens none. `think_cap` is the effective
+    // reasoning budget: 1 = no-think sentinel (immediate force-close),
+    // N = force-close after N reasoning tokens, 0 = uncapped. Think-marker
     // tokens are single-token added tokens that decode as complete strings,
     // so no byte-level streaming router is needed.
-    let mut in_think = true;
+    let mut in_think = primed_think;
     let mut reasoning_tokens = 0usize;
     // Latched once the think cap fires — see the force-close arm in the loop.
     let mut think_capped = false;
     // Open-think tokens blocked at the sampler once the cap latches (the
     // `blocked_tokens` mechanism from hipfire_runtime::sampler::sample).
     const THINK_OPEN_TOKENS: [u32; 3] = [THINK_OPEN, THINK_FAST_OPEN, THINK_FASTER_OPEN];
-    // Close tag must MATCH the open tag the generation prompt emitted, which
-    // is selected by reasoning_effort (high→<ifm|think>, medium→<ifm|think_fast>,
-    // low→<ifm|think_faster>) — NOT by the token budget. Feeding a mismatched
+    // Close tag must MATCH the open tag the generation prompt emitted. Both
+    // derive from the single resolved `effort` above — feeding a mismatched
     // close (e.g. </ifm|think_faster> into an <ifm|think> block) leaves the
     // model's block unclosed, so it keeps reasoning into the content channel.
-    let think_close_tok: u32 = match reasoning_effort {
-        Some("low") => THINK_FASTER_CLOSE,
-        Some("medium") | Some("med") => THINK_FAST_CLOSE,
-        // high / uncapped / absent all open <ifm|think>.
+    let think_close_tok: u32 = match effort {
+        "low" => THINK_FASTER_CLOSE,
+        "medium" => THINK_FAST_CLOSE,
         _ => THINK_CLOSE,
     };
 
@@ -8733,6 +8864,9 @@ pub fn generate_k2_horizon(
     let mut next_tok = deepseek4::sampling::sample_token(&last_logits, temp, 0, top_p, &mut rng);
 
     let mut rng_state: u32 = request_seed;
+    // Track why the loop exited so `finish_reason` is honest: "length" on
+    // max_tokens truncation or the think-cap hard bound, "stop" on EOS.
+    let mut hit_length_cap = false;
     loop {
         // Abort check at the top of every iteration so a mid-decode client
         // cancel stops the loop immediately and emits `aborted`+`done`.
@@ -8744,12 +8878,16 @@ pub fn generate_k2_horizon(
             return;
         }
         if generated_count >= max_tokens {
+            hit_length_cap = true;
             break;
         }
         // Force-close the think block once the reasoning budget is spent.
-        // The close tag is fed through the normal marker arm below, so it
+        // `think_cap == 1` is the no-think sentinel: reasoning_tokens starts
+        // at 0 so saturating_sub(1) makes the cap fire before the first
+        // decode step — the close tag is the first token fed to the model.
+        // The close tag goes through the normal marker arm below, so it
         // reaches the model's KV cache and flips in_think off.
-        if in_think && max_think_tokens > 1 && reasoning_tokens >= max_think_tokens {
+        if in_think && think_cap >= 1 && reasoning_tokens >= think_cap.saturating_sub(1) {
             next_tok = think_close_tok;
             // Latch: K2-Horizon re-opens a think block after a forced close
             // and would otherwise ping-pong open/close for the rest of the
@@ -8761,11 +8899,12 @@ pub fn generate_k2_horizon(
         // Hard bound: if the model still hasn't produced a visible answer a
         // margin past the cap (persistent re-open loop), force EOS so the
         // turn can't run out to max_tokens on pure think churn.
-        if think_capped && !emitted_visible && generated_count >= max_think_tokens + 64 {
+        if think_capped && !emitted_visible && generated_count >= think_cap + 64 {
             eprintln!(
                 "[k2-think-cap] id={} — no answer {} tokens past think cap {}; forcing EOS",
-                id, generated_count, max_think_tokens
+                id, generated_count, think_cap
             );
+            hit_length_cap = true;
             break;
         }
 
@@ -8942,9 +9081,8 @@ pub fn generate_k2_horizon(
         "prefill_ms": prefill_ms,
         "prefill_tok_s": (prefill_tok_s * 10.0).round() / 10.0,
         "decode_tok_s": (tok_s * 100.0).round() / 100.0,
-        "ttft_ms": prefill_ms,
+        "finish_reason": if hit_length_cap { "length" } else { "stop" },
         "total_ms": total_ms,
-        "finish_reason": "stop",
         "attempt_id": active_attempt_id(),
     });
     match await_client_terminal_commit(stdout, id, &pending_done) {

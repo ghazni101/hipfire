@@ -7499,6 +7499,64 @@ impl Gpu {
         result
     }
 
+    /// PM4-safe MQ4G256V2 residual GEMV for arbitrary (m, k): single-row
+    /// plain-V2 body with `y[row] += acc` epilogue — no private scratch, so
+    /// it is admissible inside a retained-PM4 tape where the dual-row
+    /// `gemv_mq4g256v2_residual` (private=32) is rejected.
+    ///
+    /// Gated to gfx1100 (the only validated PM4 target for this variant).
+    /// Bit-identical to `gemv` + `add_inplace` on nonzero `y`.
+    pub fn gemv_mq4g256v2_residual_noscratch(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if !self.arch_caps.is_gfx1100() {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "gemv_mq4g256v2_residual_noscratch: gfx1100 only",
+            ));
+        }
+        const FUNC: &str = "gemv_mq4g256v2_residual_r1_generic_noscratch";
+        self.ensure_kernel(
+            FUNC,
+            kernels::GEMV_MQ4G256V2_RESIDUAL_R1_GENERIC_NOSCRATCH_SRC,
+            FUNC,
+        )?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+        ];
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + m * 4;
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", FUNC, bytes);
+        let result =
+            self.launch_maybe_blob(FUNC, [m as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(a_ptr);
+                b.push_ptr(x_ptr);
+                b.push_ptr(y_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b
+            });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Ornith qt44 shared-expert down fuse: MQ4G256V2 dual-half decode with
     /// lane-0 `y[row] += sigmoid(c_buf[0]) * acc`. Fail-closed to exact
     /// gfx1100|gfx1201, M=2048, K=512. 40-byte ABI (A/x/y/c_buf/M/K); grid M,

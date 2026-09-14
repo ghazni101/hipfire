@@ -1681,7 +1681,6 @@ pub fn generate(
                 pflash_cfg,
                 think_mode,
             );
-            let _ = (repeat_penalty, repeat_window);
             crate::dense::generate_k2_horizon(
                 m,
                 gpu,
@@ -1695,6 +1694,15 @@ pub fn generate(
                 max_think_tokens,
                 request_seed,
                 reasoning_effort,
+                enable_thinking,
+                stop,
+                top_k,
+                min_p,
+                repeat_penalty,
+                repeat_window,
+                presence_penalty,
+                frequency_penalty,
+                logprobs_top_k,
                 tools,
                 messages_history,
             );

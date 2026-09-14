@@ -3813,18 +3813,18 @@ fn main() {
                     }
                     _ => {}
                 }
-                // arch 5/6 = Qwen3.5, arch 14 = Muse Glimmer, arch 15 =
+                // arch 5/6 = Qwen3.5, arch 14 = Muse Glimmer, arch 16 =
                 // K2-Horizon. All prime with a batched prefill and then step
                 // tokens one at a time, so the same bench shape applies; the
                 // carrier's bench_decode_prime/run picks the right forward.
                 if m.pp > 1
                     || m.ep.is_some()
-                    || (m.arch_id != 5 && m.arch_id != 6 && m.arch_id != 14 && m.arch_id != 15)
+                    || (m.arch_id != 5 && m.arch_id != 6 && m.arch_id != 14 && m.arch_id != 16)
                 {
                     emit_uncorrelated_error(
                         &mut stdout,
                         None,
-                        "bench_decode requires a single-GPU Qwen3.5 or Muse Glimmer model",
+                        "bench_decode requires a single-GPU Qwen3.5, Muse Glimmer, or K2-Horizon model",
                         "unsupported",
                         false,
                         false,

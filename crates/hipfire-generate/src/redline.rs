@@ -347,8 +347,13 @@ pub fn redline_prime_k2_horizon(
     bundle: &mut k2_horizon::K2HorizonBundle,
     context: usize,
 ) -> Result<(), String> {
-    let ps = k2_horizon::prefill::PrefillScratch::new(gpu, &bundle.config, bundle.state.max_seq)
-        .map_err(|e| format!("k2_horizon prime scratch: {e}"))?;
+    let ps = k2_horizon::prefill::PrefillScratch::new(
+        gpu,
+        &bundle.config,
+        bundle.state.max_seq,
+        &bundle.state.logits,
+    )
+    .map_err(|e| format!("k2_horizon prime scratch: {e}"))?;
     let synthetic: Vec<u32> = (0..context as u32).map(|i| 10 + (i % 1000)).collect();
     let result = k2_horizon::prefill::forward_prefill_batch(
         &bundle.config,
@@ -357,6 +362,7 @@ pub fn redline_prime_k2_horizon(
         &mut bundle.state,
         gpu,
         &synthetic,
+        None,
     );
     ps.free_gpu(gpu);
     result?;
@@ -1048,6 +1054,7 @@ pub fn redline_run_direct_fixture(
             )?;
         }
         loaded.seq_pos = context + iterations;
+        bundle.state.n_tokens = context + iterations;
         Ok(())
     } else {
         Err("retained fixture requires Qwen3.5, DeepSeek4, dense LFM or K2-Horizon".to_string())
@@ -3369,13 +3376,15 @@ pub fn handle_redline_shadow(
             .and_then(|value| value.as_bool())
             .unwrap_or(false);
     if model.as_ref().is_some_and(|loaded| {
-        loaded.state.as_ref().is_some_and(|s| {
-            (s.as_ref() as &dyn Any).is::<hipfire_arch_deepseek4::Deepseek4Bundle>()
-        }) || redline_is_dense_lfm(loaded)
-            || loaded
-                .state
-                .as_ref()
-                .is_some_and(|s| (s.as_ref() as &dyn Any).is::<k2_horizon::K2HorizonBundle>())
+        loaded.pp == 1
+            && loaded.ep.is_none()
+            && (loaded.state.as_ref().is_some_and(|s| {
+                (s.as_ref() as &dyn Any).is::<hipfire_arch_deepseek4::Deepseek4Bundle>()
+            }) || redline_is_dense_lfm(loaded)
+                || loaded
+                    .state
+                    .as_ref()
+                    .is_some_and(|s| (s.as_ref() as &dyn Any).is::<k2_horizon::K2HorizonBundle>()))
     }) {
         let loaded = model.as_mut().expect("retained route checked");
         match redline_shadow_deepseek4(gpu, loaded, pm4, context, iterations) {

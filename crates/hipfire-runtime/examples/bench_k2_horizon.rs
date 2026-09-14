@@ -80,11 +80,13 @@ fn main() {
 
     // Prefill with a fixed token id (BOS-ish); content doesn't matter for perf.
     let prompt: Vec<u32> = vec![1u32; prefill_len];
-    let ps = k2::prefill::PrefillScratch::new(&mut gpu, &config, max_seq).expect("prefill scratch");
+    let ps = k2::prefill::PrefillScratch::new(&mut gpu, &config, max_seq, &state.logits)
+        .expect("prefill scratch");
     let t_prefill = Instant::now();
-    let logits =
-        k2::prefill::forward_prefill_batch(&config, &weights, &ps, &mut state, &mut gpu, &prompt)
-            .expect("prefill");
+    let logits = k2::prefill::forward_prefill_batch(
+        &config, &weights, &ps, &mut state, &mut gpu, &prompt, None,
+    )
+    .expect("prefill");
     eprintln!(
         "prefill: {} tokens in {:.1}ms ({:.1} tok/s)",
         prefill_len,
@@ -98,7 +100,16 @@ fn main() {
     for _ in 0..warmup_len {
         let pos = state.n_tokens as u32;
         let (tok, _rng) = k2::forward::decode_step_sampled(
-            &config, &weights, &mut state, &mut gpu, next_tok, pos, 0.0, 1.0, 0x1234,
+            &config,
+            &weights,
+            &mut state,
+            &mut gpu,
+            next_tok,
+            pos,
+            0.0,
+            1.0,
+            0x1234,
+            &[],
         )
         .expect("warmup decode");
         next_tok = tok;
@@ -112,6 +123,14 @@ fn main() {
         }
     }
 
+    // HIPFIRE_PROFILE=1: per-kernel event timing around the timed decode
+    // loop. rocprofv3 is unreliable on this host (ring-buffer mmap crash);
+    // this is the fallback per-kernel ranking.
+    let do_profile = std::env::var("HIPFIRE_PROFILE").ok().as_deref() == Some("1");
+    if do_profile {
+        rdna_compute::profile::start();
+    }
+
     // Timed decode. Collect token ids so the sequence can be diffed across
     // forward paths (hand vs HIPFIRE_FORWARD_LOWERED) for a correctness A/B.
     let mut per_token_ms = Vec::with_capacity(gen_len);
@@ -121,7 +140,16 @@ fn main() {
         let pos = state.n_tokens as u32;
         let t = Instant::now();
         let (tok, _rng) = k2::forward::decode_step_sampled(
-            &config, &weights, &mut state, &mut gpu, next_tok, pos, 0.0, 1.0, 0x1234,
+            &config,
+            &weights,
+            &mut state,
+            &mut gpu,
+            next_tok,
+            pos,
+            0.0,
+            1.0,
+            0x1234,
+            &[],
         )
         .expect("gen decode");
         per_token_ms.push(t.elapsed().as_secs_f64() * 1000.0);
@@ -145,6 +173,28 @@ fn main() {
         max,
         1000.0 / avg
     );
+
+    if do_profile {
+        if let Some(entries) = rdna_compute::profile::stop() {
+            let mut by_kernel: std::collections::HashMap<&str, (usize, f64)> =
+                std::collections::HashMap::new();
+            for e in &entries {
+                let ent = by_kernel.entry(e.kernel).or_default();
+                ent.0 += 1;
+                ent.1 += e.time_us;
+            }
+            let mut ranked: Vec<_> = by_kernel.into_iter().collect();
+            ranked.sort_by(|a, b| b.1 .1.partial_cmp(&a.1 .1).unwrap());
+            eprintln!(
+                "\n=== per-kernel decode profile ({} launches) ===",
+                entries.len()
+            );
+            for (name, (count, us)) in ranked.iter().take(25) {
+                eprintln!("  {us:>10.1} us  x{count:<5} {name}");
+            }
+        }
+    }
+
     // Token sequence on stdout so two runs can be diffed for a correctness
     // A/B (hand vs HIPFIRE_FORWARD_LOWERED). Greedy argmax → deterministic.
     println!("TOKENS {:?}", gen_tokens);
