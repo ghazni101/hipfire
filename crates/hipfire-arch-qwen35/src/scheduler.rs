@@ -62,6 +62,26 @@ pub struct Scheduler {
     pub prefill_cursor: usize,
 }
 
+/// Which speculative mechanism owns a slot's decode loop. `None` = plain AR.
+/// MTP and DFlash2 are mutually exclusive per load (the engine loads at most
+/// one drafter), so a slot never carries both.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum SpecKind {
+    #[default]
+    None,
+    /// In-trunk MTP head (K+1 verify rows per cycle).
+    Mtp,
+    /// DFlash2 candidate-selector draft (B verify rows per cycle).
+    Dflash,
+}
+
+impl SpecKind {
+    /// True while this slot's decode is owned by a spec draft/verify cycle.
+    pub fn active(self) -> bool {
+        !matches!(self, SpecKind::None)
+    }
+}
+
 /// One slot's outstanding work as seen by the scheduler.
 pub struct PendingWork {
     pub slot: SlotId,
@@ -76,20 +96,22 @@ pub struct PendingWork {
     /// M-RoPE path (vision_forward + per-token prefill/decode) and MUST
     /// be skipped by the batched 1D-RoPE scheduler.
     pub vl_prefill: Option<VlPrefill>,
-    /// MTP state. When true and still prefilling, this slot's prompt chunks
-    /// flow through the batched scheduler (the MTP head's KV is filled
-    /// post-forward). Once decoding, the slot is owned by the MTP
-    /// draft/verify cycle and MUST be skipped by the batched scheduler.
-    pub mtp_active: bool,
-    /// Rolling adaptive-retire window: decode cycles spent under MTP and
-    /// tokens committed across them. When the window's mean advance stays
+
+    /// Speculative-decode ownership. `Mtp`/`Dflash` while prefilling mean the
+    /// slot's prompt chunks still flow through the batched scheduler (the
+    /// speculator's private state is filled post-forward); once `decoding`,
+    /// the slot is owned by the spec draft/verify cycle and MUST be skipped
+    /// by the batched scheduler — its verify rows are injected separately.
+    pub spec: SpecKind,
+    /// Rolling adaptive-retire window: decode cycles spent under speculation
+    /// and tokens committed across them. When the window's mean advance stays
     /// below `MTP_RETIRE_MIN_ADVANCE`, the engine retires the slot to plain
-    /// AR decode (a spec cycle costs ~2x an AR step, so a head that cannot
+    /// AR decode (a spec cycle costs ~2x an AR step, so a drafter that cannot
     /// beat that loses wall-clock — the genre-conditional trap).
-    pub mtp_cycles: usize,
-    pub mtp_committed: usize,
+    pub spec_cycles: usize,
+    pub spec_committed: usize,
     /// Consecutive retire-windows whose mean advance fell below the line.
-    pub mtp_retire_fails: usize,
+    pub spec_retire_fails: usize,
     /// M-RoPE phase offset for a TEXT continuation whose conversation
     /// carries image-turn KV (the session's `rope_delta`; 0 = pure text).
     ///
@@ -343,10 +365,9 @@ impl Scheduler {
 // rows (image pads would embed as the raw pad token). Decode slots carry one
 // seed token in `remaining_prompt`; prefill slots carry the un-prefilled
 // prompt suffix.
-
-/// Sequential VL or decoding MTP: owned elsewhere, never batched here.
+/// Sequential VL or a decoding spec slot: owned elsewhere, never batched here.
 pub(crate) fn skip_entirely(w: &PendingWork, vl_sequential: bool) -> bool {
-    (w.vl_prefill.is_some() && vl_sequential) || (w.mtp_active && w.decoding)
+    (w.vl_prefill.is_some() && vl_sequential) || (w.spec.active() && w.decoding)
 }
 
 /// Batched VL slot whose vision-tower embeddings have not landed yet.
@@ -389,7 +410,7 @@ mod tests {
             remaining_prompt: prompt(1000),
             next_pos: 0,
             decoding: false,
-            vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0, pos3_delta: 0,
+            vl_prefill: None, spec: SpecKind::None, spec_cycles: 0, spec_committed: 0, spec_retire_fails: 0, pos3_delta: 0,
         }];
         let b = s.next_batch(&mut work, 4096, 1);
         assert_eq!(
@@ -410,14 +431,14 @@ mod tests {
                 remaining_prompt: prompt(300),
                 next_pos: 0,
                 decoding: false,
-                vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0, pos3_delta: 0,
+                vl_prefill: None, spec: SpecKind::None, spec_cycles: 0, spec_committed: 0, spec_retire_fails: 0, pos3_delta: 0,
             },
             PendingWork {
                 slot: SlotId(1),
                 remaining_prompt: vec![42],
                 next_pos: 10,
                 decoding: true,
-                vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0, pos3_delta: 0,
+                vl_prefill: None, spec: SpecKind::None, spec_cycles: 0, spec_committed: 0, spec_retire_fails: 0, pos3_delta: 0,
             },
         ];
         let b = s.next_batch(&mut work, 4096, 1);
@@ -436,7 +457,7 @@ mod tests {
             remaining_prompt: prompt(10),
             next_pos: 0,
             decoding: false,
-            vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0, pos3_delta: 0,
+            vl_prefill: None, spec: SpecKind::None, spec_cycles: 0, spec_committed: 0, spec_retire_fails: 0, pos3_delta: 0,
         }];
         let b = s.next_batch(&mut work, 4096, 1);
         assert_eq!(b.total_rows(), 10);
@@ -451,7 +472,7 @@ mod tests {
             remaining_prompt: vec![],
             next_pos: 0,
             decoding: false,
-            vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0, pos3_delta: 0,
+            vl_prefill: None, spec: SpecKind::None, spec_cycles: 0, spec_committed: 0, spec_retire_fails: 0, pos3_delta: 0,
         }];
         let b = s.next_batch(&mut work, 4096, 1);
         assert!(b.is_empty());
@@ -470,7 +491,7 @@ mod tests {
             remaining_prompt: prompt(283),
             next_pos: 0,
             decoding: false,
-            vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0, pos3_delta: 0,
+            vl_prefill: None, spec: SpecKind::None, spec_cycles: 0, spec_committed: 0, spec_retire_fails: 0, pos3_delta: 0,
         }];
         let b = s.next_batch(&mut work, 4096, 1);
         assert_eq!(b.total_rows(), 256, "completing round must end at the page boundary");
@@ -490,7 +511,7 @@ mod tests {
             remaining_prompt: prompt(256),
             next_pos: 0,
             decoding: false,
-            vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0, pos3_delta: 0,
+            vl_prefill: None, spec: SpecKind::None, spec_cycles: 0, spec_committed: 0, spec_retire_fails: 0, pos3_delta: 0,
         }];
         let b = s.next_batch(&mut work, 4096, 1);
         assert_eq!(b.total_rows(), 256);
@@ -508,7 +529,7 @@ mod tests {
             remaining_prompt: prompt(283),
             next_pos: 0,
             decoding: false,
-            vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0, pos3_delta: 0,
+            vl_prefill: None, spec: SpecKind::None, spec_cycles: 0, spec_committed: 0, spec_retire_fails: 0, pos3_delta: 0,
         }];
         let b = s.next_batch(&mut work, 4096, 200);
         assert_eq!(b.total_rows(), 283, "quantum above a page: no alignment trim");
@@ -558,14 +579,14 @@ mod tests {
                     embeddings: vec![],
                     ..vl_state(1, 10)
                 }),
-                mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0, pos3_delta: 0,
+                spec: SpecKind::None, spec_cycles: 0, spec_committed: 0, spec_retire_fails: 0, pos3_delta: 0,
             },
             PendingWork {
                 slot: SlotId(1),
                 remaining_prompt: vec![7],
                 next_pos: 3,
                 decoding: true,
-                vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0, pos3_delta: 0,
+                vl_prefill: None, spec: SpecKind::None, spec_cycles: 0, spec_committed: 0, spec_retire_fails: 0, pos3_delta: 0,
             },
         ];
         let b = s.next_batch(&mut work, 4096, 1);
@@ -587,7 +608,7 @@ mod tests {
             next_pos: 0,
             decoding: false,
             vl_prefill: Some(vl_state(1, 10)),
-            mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0, pos3_delta: 0,
+            spec: SpecKind::None, spec_cycles: 0, spec_committed: 0, spec_retire_fails: 0, pos3_delta: 0,
         }];
         let b = s.next_batch(&mut work, 4096, 1);
         assert_eq!(b.total_rows(), 10);
@@ -607,7 +628,7 @@ mod tests {
             next_pos: 12,
             decoding: true,
             vl_prefill: Some(vl_state(2, 4)),
-            mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0, pos3_delta: 0,
+            spec: SpecKind::None, spec_cycles: 0, spec_committed: 0, spec_retire_fails: 0, pos3_delta: 0,
         }];
         let b = s.next_batch(&mut work, 4096, 1);
         assert_eq!(b.total_rows(), 1);
@@ -625,7 +646,7 @@ mod tests {
             next_pos: 0,
             decoding: false,
             vl_prefill: Some(vl_state(1, 10)),
-            mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0, pos3_delta: 0,
+            spec: SpecKind::None, spec_cycles: 0, spec_committed: 0, spec_retire_fails: 0, pos3_delta: 0,
         }];
         let b = s.next_batch(&mut work, 4096, 1);
         assert!(b.is_empty(), "sequential mode owns the slot");
@@ -644,10 +665,10 @@ mod tests {
                 next_pos: 0,
                 decoding: false,
                 vl_prefill: None,
-                mtp_active: true,
-                mtp_cycles: 0,
-                mtp_committed: 0,
-                mtp_retire_fails: 0, pos3_delta: 0,
+                spec: SpecKind::Mtp,
+                spec_cycles: 0,
+                spec_committed: 0,
+                spec_retire_fails: 0, pos3_delta: 0,
             },
             PendingWork {
                 // MTP slot decoding: owned by the draft/verify cycle; its
@@ -657,10 +678,10 @@ mod tests {
                 next_pos: 3,
                 decoding: true,
                 vl_prefill: None,
-                mtp_active: true,
-                mtp_cycles: 0,
-                mtp_committed: 0,
-                mtp_retire_fails: 0, pos3_delta: 0,
+                spec: SpecKind::Mtp,
+                spec_cycles: 0,
+                spec_committed: 0,
+                spec_retire_fails: 0, pos3_delta: 0,
             },
         ];
         let b = s.next_batch(&mut work, 4096, 1);
@@ -689,10 +710,10 @@ mod tests {
                 next_pos: 300,
                 decoding: false,
                 vl_prefill: None,
-                mtp_active: false,
-                mtp_cycles: 0,
-                mtp_committed: 0,
-                mtp_retire_fails: 0,
+                spec: SpecKind::None,
+                spec_cycles: 0,
+                spec_committed: 0,
+                spec_retire_fails: 0,
                 pos3_delta: -240,
             },
             PendingWork {
@@ -701,10 +722,10 @@ mod tests {
                 next_pos: 5,
                 decoding: true,
                 vl_prefill: None,
-                mtp_active: false,
-                mtp_cycles: 0,
-                mtp_committed: 0,
-                mtp_retire_fails: 0,
+                spec: SpecKind::None,
+                spec_cycles: 0,
+                spec_committed: 0,
+                spec_retire_fails: 0,
                 pos3_delta: 0,
             },
         ];
@@ -726,10 +747,10 @@ mod tests {
             next_pos: 0,
             decoding: false,
             vl_prefill: None,
-            mtp_active: true,
-            mtp_cycles: 0,
-            mtp_committed: 0,
-            mtp_retire_fails: 0,
+            spec: SpecKind::Mtp,
+            spec_cycles: 0,
+            spec_committed: 0,
+            spec_retire_fails: 0,
             pos3_delta: 0,
         }];
         let b = s.next_batch(&mut work, 4096, 1);
@@ -745,10 +766,10 @@ mod tests {
             next_pos,
             decoding: false,
             vl_prefill: None,
-            mtp_active: false,
-            mtp_cycles: 0,
-            mtp_committed: 0,
-            mtp_retire_fails: 0,
+            spec: SpecKind::None,
+            spec_cycles: 0,
+            spec_committed: 0,
+            spec_retire_fails: 0,
             pos3_delta: 0,
         }
     }
@@ -760,10 +781,10 @@ mod tests {
             next_pos,
             decoding: true,
             vl_prefill: None,
-            mtp_active: false,
-            mtp_cycles: 0,
-            mtp_committed: 0,
-            mtp_retire_fails: 0,
+            spec: SpecKind::None,
+            spec_cycles: 0,
+            spec_committed: 0,
+            spec_retire_fails: 0,
             pos3_delta: 0,
         }
     }
@@ -898,14 +919,14 @@ mod tests {
                 remaining_prompt: prompt(100),
                 next_pos: 0,
                 decoding: false,
-                vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0, pos3_delta: 0,
+                vl_prefill: None, spec: SpecKind::None, spec_cycles: 0, spec_committed: 0, spec_retire_fails: 0, pos3_delta: 0,
             },
             PendingWork {
                 slot: SlotId(1),
                 remaining_prompt: prompt(100),
                 next_pos: 0,
                 decoding: false,
-                vl_prefill: None, mtp_active: false, mtp_cycles: 0, mtp_committed: 0, mtp_retire_fails: 0, pos3_delta: 0,
+                vl_prefill: None, spec: SpecKind::None, spec_cycles: 0, spec_committed: 0, spec_retire_fails: 0, pos3_delta: 0,
             },
         ];
         // Only slot 0 is eligible (FairQueue granted it); slot 1 is not.

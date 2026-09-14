@@ -1149,6 +1149,37 @@ fn main() {
                         .and_then(|v| v.as_str())
                         .unwrap_or("")
                         .to_string();
+                    // DFlash2 draft resolution for the slot engine — same
+                    // ladder as the sequential path below:
+                    // HIPFIRE_DFLASH_DRAFT (non-empty wins, empty opts out)
+                    // > params.draft; dflash_mode=off suppresses either way.
+                    let slot_dflash_mode = msg
+                        .get("params")
+                        .and_then(|p| p.get("dflash_mode"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("auto");
+                    let slot_env_draft = developer_var("HIPFIRE_DFLASH_DRAFT").ok();
+                    let slot_raw_draft: Option<String> = match slot_env_draft.as_deref() {
+                        Some("") => None,
+                        Some(p) => Some(p.to_string()),
+                        None => msg
+                            .get("params")
+                            .and_then(|p| p.get("draft"))
+                            .and_then(|v| v.as_str())
+                            .filter(|s| !s.is_empty())
+                            .map(|s| s.to_string()),
+                    };
+                    let slot_draft_path = if slot_dflash_mode == "off" {
+                        if let Some(d) = slot_raw_draft {
+                            eprintln!(
+                                "[hipfire-daemon] dflash_mode=off — skipping draft load ({d})"
+                            );
+                        }
+                        None
+                    } else {
+                        slot_raw_draft
+                    };
+                    let slot_dflash_required = slot_dflash_mode == "on";
                     match slots::SlotBackend::load(
                         path,
                         n_slots,
@@ -1156,6 +1187,8 @@ fn main() {
                         prefill_chunk,
                         mtp_k,
                         &slot_kv_mode_raw,
+                        slot_draft_path.map(std::path::PathBuf::from),
+                        slot_dflash_required,
                     ) {
                         Ok(backend) => {
                             let arch = backend.arch_str().to_string();
