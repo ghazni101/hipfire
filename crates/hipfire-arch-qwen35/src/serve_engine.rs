@@ -541,7 +541,6 @@ impl Rig {
             hipfire_runtime::kv_mode::resolve(
                 &kv_mode_raw,
                 &hipfire_runtime::kv_mode::QWEN35_SLOTS_POLICY,
-                config.head_dim,
             );
         if let Some(w) = kv_warning {
             eprintln!(

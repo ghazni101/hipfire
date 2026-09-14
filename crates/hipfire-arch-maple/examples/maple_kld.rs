@@ -195,13 +195,8 @@ fn main() {
 
     eprintln!("Loading weights from {}...", args.model);
     let t_load = Instant::now();
-<<<<<<< HEAD
     let mut b =
         load_maple_from_hfq(&mut hfq, &mut gpu, n, &args.kv_mode).expect("load maple bundle");
-=======
-    let mut b =
-        load_maple_from_hfq(&mut hfq, &mut gpu, n, &args.kv_mode).expect("load maple bundle");
->>>>>>> 97356ee4c (feat(maple): default the KV cache to bf16; q8 costs 39% of the divergence)
     eprintln!("Loaded in {:.1}s", t_load.elapsed().as_secs_f64());
     eprintln!(
         "maple: hidden={} layers={} experts={}/{} vocab={}",

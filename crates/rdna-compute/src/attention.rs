@@ -7182,6 +7182,8 @@ impl Gpu {
                 n_kv_heads,
                 head_dim,
                 batch_size,
+                slot_descs,
+                row_slot,
             )?;
             return self.kv_cache_write_q8_0_batched(
                 v_dst, v_src, positions, n_kv_heads, head_dim, batch_size,
