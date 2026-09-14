@@ -4111,13 +4111,13 @@ pub fn download_hidden_block(
 /// per-element math as the scalar loop, so the plane is bit-identical.
 pub fn build_dflash_noise_embeddings(
     gpu: &mut Gpu,
-    target: &ModelSlot,
+    weights: &Qwen35Weights,
     block: &[u32],
     h: usize,
     draft_scratch: &mut DflashScratch,
 ) -> HipResult<bool> {
     if !matches!(
-        target.weights.embd_format,
+        weights.embd_format,
         hipfire_runtime::llama::EmbeddingFormat::Q8_0
     ) {
         return Ok(false);
@@ -4135,7 +4135,7 @@ pub fn build_dflash_noise_embeddings(
         unsafe { std::slice::from_raw_parts(ids.as_ptr() as *const u8, ids.len() * 4) };
     gpu.hip.memcpy_htod(&id_view.buf, id_bytes)?;
     let out_view = draft_scratch.x.sub_offset(0, b * h);
-    gpu.embedding_lookup_q8_batched(&target.weights.token_embd, &out_view, &id_view, b, h)?;
+    gpu.embedding_lookup_q8_batched(&weights.token_embd, &out_view, &id_view, b, h)?;
     Ok(true)
 }
 
@@ -4416,7 +4416,7 @@ pub fn spec_step_dflash(
         // collapse into one batched embedding (token IDs uploaded once into
         // the persistent noise plane). Every other format/arch/switch keeps
         // the loop below byte-for-byte.
-        if !build_dflash_noise_embeddings(gpu, target, &block, h, draft_scratch)? {
+        if !build_dflash_noise_embeddings(gpu, &target.weights, &block, h, draft_scratch)? {
             for (i, &tok) in block.iter().enumerate() {
                 let dst = draft_scratch.x.sub_offset(i * h, h);
                 match target.weights.embd_format {

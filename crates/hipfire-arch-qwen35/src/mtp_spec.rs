@@ -1346,7 +1346,7 @@ fn mtp_takeover_kv_repair_forwards(mtp_already_retired: bool, accept_count: usiz
 /// fall through to `n_verify` sequential GEMVs now that the validated gfx11 /
 /// gfx12 batched lm_head family exists.
 #[allow(clippy::too_many_arguments)]
-fn mtp_trunk_verify_lm_head(
+pub(crate) fn mtp_trunk_verify_lm_head(
     gpu: &mut Gpu,
     w_out: &llama::WeightTensor,
     verify_hidden: &GpuTensor,

@@ -869,7 +869,7 @@ fn dense_ffn_body_slots(
 }
 
 /// Per-layer `(qkv, alpha, beta)` capture of a step's DeltaNet activations
-/// for a slot's MTP verify rows — the tape the post-accept DN repair
+/// for a slot's spec verify rows — the tape the post-accept DN repair
 /// (`mtp_dn_repair_from_tape`) replays conv+GDN from.
 ///
 /// The `pbs.dn_*` batch buffers are per-LAYER scratch: each DeltaNet layer
@@ -877,20 +877,65 @@ fn dense_ffn_body_slots(
 /// layer's activations. A partial accept needs per-layer activations to
 /// rewind the recurrent state over the accepted prefix, so verify steps tape
 /// their rows as the layers compute. The tape is indexed per slot at
-/// `slot * stride` rows (stride = mtp_k + 1), independent of the batch row
-/// layout, so at most `n_slots * stride` rows are ever taped — a few MB.
-pub struct MtpVerifyCapture<'a> {
+/// `slot * stride` rows (stride = verify rows per slot: `mtp_k + 1` for MTP,
+/// `B` for DFlash2), independent of the batch row layout, so at most
+/// `n_slots * stride` rows are ever taped — a few MB.
+pub struct SpecVerifyCapture<'a> {
     pub tape: &'a mut crate::speculative::GdnTape,
-    /// `verify_slots[s]`: slot s's rows this step are MTP verify rows.
+    /// `verify_slots[s]`: slot s's rows this step are spec verify rows.
     pub verify_slots: &'a [bool],
-    /// Rows taped per flagged slot (= mtp_k + 1).
+    /// Rows taped per flagged slot (verify rows per slot).
     pub stride: usize,
+    /// DFlash2 extract-layer hidden capture. When `Some`, every layer whose
+    /// index is in `extract_layers` copies the step's post-layer `x_batch`
+    /// rows into `staging[extract_idx]` at offset 0 (fixed offsets — safe
+    /// inside graph capture). The engine scatters staging into each DFlash
+    /// slot's `target_hidden` ring after the forward returns. `None` on
+    /// steps with no DFlash rows (zero cost).
+    pub hidden: Option<SpecHiddenCapture<'a>>,
 }
 
-impl MtpVerifyCapture<'_> {
+/// Extract-layer hidden capture for DFlash2 slots: `staging[i]` receives
+/// `n` rows of `x_batch` whenever the layer index equals `extract_layers[i]`.
+/// One shared staging set covers the whole step (rows are slot-contiguous in
+/// `x_batch`); the engine maps each slot's row range onto its own ring.
+pub struct SpecHiddenCapture<'a> {
+    pub staging: &'a [GpuTensor],
+    pub extract_layers: &'a [usize],
+    /// Row stride of `x_batch` (= model dim).
+    pub dim: usize,
+}
+
+impl SpecVerifyCapture<'_> {
     #[inline]
     pub fn is_verify_slot(&self, slot: usize) -> bool {
         self.verify_slots.get(slot).copied().unwrap_or(false)
+    }
+
+    /// Copy this step's post-layer hidden rows into the DFlash2 staging
+    /// buffer when `layer_idx` is an extract layer. Called once per layer
+    /// from the main dispatch loop — the copy is a single contiguous D2D
+    /// (all rows of the step), so it is capture-safe under hipGraph.
+    #[inline]
+    fn capture_hidden_rows(
+        &self,
+        gpu: &mut Gpu,
+        pbs: &PrefillBatchScratch,
+        layer_idx: usize,
+        n: usize,
+    ) -> HipResult<()> {
+        let Some(h) = &self.hidden else { return Ok(()) };
+        let Some(ext) = h.extract_layers.iter().position(|&l| l == layer_idx) else {
+            return Ok(());
+        };
+        let row_bytes = h.dim * 4;
+        gpu.hip.memcpy_dtod_at(
+            &h.staging[ext].buf,
+            0,
+            &pbs.x_batch.buf,
+            0,
+            n * row_bytes,
+        )
     }
 }
 
@@ -899,9 +944,9 @@ impl MtpVerifyCapture<'_> {
 /// values are exactly what `replay_gdn`-style repair needs to re-run
 /// conv1d + qk-norm + GDN for those rows.
 #[allow(clippy::too_many_arguments)]
-fn mtp_tape_layer_rows(
+fn spec_tape_layer_rows(
     gpu: &mut Gpu,
-    cap: &mut MtpVerifyCapture,
+    cap: &mut SpecVerifyCapture,
     pbs: &PrefillBatchScratch,
     delta_layer_idx: usize,
     row_off: usize,
@@ -954,7 +999,7 @@ fn run_deltanet_layer_slots(
     q8_wmma_arch: bool,
     n: usize,
     delta_layer_idx: usize,
-    mut mtp_capture: Option<&mut MtpVerifyCapture>,
+    mut spec_capture: Option<&mut SpecVerifyCapture>,
 ) -> HipResult<()> {
     let attn_dtype = require_batchable_deltanet_layer(layer, gpu.arch.as_str())?;
 
@@ -1091,9 +1136,9 @@ fn run_deltanet_layer_slots(
     let mut row_off = 0usize;
     for (s, &m) in batch.m_per_slot.iter().enumerate() {
         if m > 0 {
-            if let Some(cap) = mtp_capture.as_deref_mut() {
+            if let Some(cap) = spec_capture.as_deref_mut() {
                 if cap.is_verify_slot(s) {
-                    mtp_tape_layer_rows(
+                    spec_tape_layer_rows(
                         gpu,
                         cap,
                         pbs,
@@ -1273,7 +1318,7 @@ fn run_deltanet_moe_layer_slots(
     q8_wmma_arch: bool,
     n: usize,
     delta_layer_idx: usize,
-    mut mtp_capture: Option<&mut MtpVerifyCapture>,
+    mut spec_capture: Option<&mut SpecVerifyCapture>,
     // Whole-MODEL flag (not per-layer): true when ANY MoE layer anywhere in
     // the model has an MQ6 FFN projection. Threaded straight through to
     // `prefill_moe_ffn_body_batched`'s `model_has_mq6_moe` — see that
@@ -1423,9 +1468,9 @@ fn run_deltanet_moe_layer_slots(
     let mut row_off = 0usize;
     for (s, &m) in batch.m_per_slot.iter().enumerate() {
         if m > 0 {
-            if let Some(cap) = mtp_capture.as_deref_mut() {
+            if let Some(cap) = spec_capture.as_deref_mut() {
                 if cap.is_verify_slot(s) {
-                    mtp_tape_layer_rows(
+                    spec_tape_layer_rows(
                         gpu,
                         cap,
                         pbs,
@@ -3101,13 +3146,14 @@ fn decode_graph_m_hash(
     h
 }
 
-/// Pure predicate: is this per-slot row-count pattern a capturable MTP verify
-/// step at the given `mtp_k`? Every slot must be idle (0), a regular decode
-/// row (1), or exactly one verify window (`mtp_k + 1`). Prefill chunks (any
-/// other m) keep the plain path — their shapes vary step to step and would
-/// thrash the capture cache.
-pub fn mtp_verify_graph_shape(m_per_slot: &[usize], mtp_k: usize) -> bool {
-    mtp_k > 0 && m_per_slot.iter().all(|&m| m == 0 || m == 1 || m == mtp_k + 1)
+/// Pure predicate: is this per-slot row-count pattern a capturable spec
+/// verify step at the given `verify_rows` (verify rows per spec slot:
+/// `mtp_k + 1` for MTP, `B` for DFlash2)? Every slot must be idle (0), a
+/// regular decode row (1), or exactly one verify window (`verify_rows`).
+/// Prefill chunks (any other m) keep the plain path — their shapes vary
+/// step to step and would thrash the capture cache.
+pub fn spec_verify_graph_shape(m_per_slot: &[usize], verify_rows: usize) -> bool {
+    verify_rows > 0 && m_per_slot.iter().all(|&m| m == 0 || m == 1 || m == verify_rows)
 }
 
 /// A hipGraph of one pure-decode step, reused across steps.
@@ -3194,7 +3240,7 @@ pub fn forward_batch_slots_graphed(
         cache,
         /* mtp_k */ 0,
         /* lm_head_skip */ &[],
-        /* mtp_capture */ None,
+        /* spec_capture */ None,
     )
 }
 
@@ -3229,9 +3275,9 @@ pub fn forward_batch_slots_graphed_opts(
     s: &Qwen35Scratch,
     logits_out: &GpuTensor,
     cache: &mut SlotDecodeGraph,
-    mtp_k: usize,
+    verify_rows: usize,
     lm_head_skip: &[bool],
-    mut mtp_capture: Option<&mut MtpVerifyCapture>,
+    mut spec_capture: Option<&mut SpecVerifyCapture>,
 ) -> HipResult<()> {
     let pure_decode = !batch.is_empty() && batch.m_per_slot.iter().all(|&m| m == 1);
     // An MTP verify step is graphable when every slot's row count is a decode
@@ -3239,7 +3285,7 @@ pub fn forward_batch_slots_graphed_opts(
     // scheduler prefill chunk mixed in — keeps the plain path: prefill shapes
     // vary step to step and would thrash the capture cache.
     let mtp_verify_shape =
-        !batch.is_empty() && mtp_verify_graph_shape(&batch.m_per_slot, mtp_k);
+        !batch.is_empty() && spec_verify_graph_shape(&batch.m_per_slot, verify_rows);
     if !gpu.slots_decode_graph() || !(pure_decode || mtp_verify_shape) || pool.is_paged() {
         return forward_batch_slots_opts(
             gpu,
@@ -3258,7 +3304,7 @@ pub fn forward_batch_slots_graphed_opts(
             None,
             SlotStepOpts::default(),
             lm_head_skip,
-            mtp_capture,
+            spec_capture,
         );
     }
 
@@ -3317,7 +3363,7 @@ pub fn forward_batch_slots_graphed_opts(
                 ctx_override: Some(ctx_bucket),
             },
             lm_head_skip,
-            mtp_capture.as_deref_mut(),
+            spec_capture.as_deref_mut(),
         )?;
         // The warm-up step above already advanced the slot lengths; re-running
         // the capture body would advance them a second time, so roll back to
@@ -3345,7 +3391,7 @@ pub fn forward_batch_slots_graphed_opts(
                 ctx_override: Some(ctx_bucket),
             },
             lm_head_skip,
-            mtp_capture,
+            spec_capture,
         );
         let graph = gpu.end_stream_capture()?;
         captured?;
@@ -3601,7 +3647,7 @@ pub fn forward_batch_slots_opts(
     max_layer: Option<usize>,
     opts: SlotStepOpts,
     lm_head_skip: &[bool],
-    mut mtp_capture: Option<&mut MtpVerifyCapture>,
+    mut spec_capture: Option<&mut SpecVerifyCapture>,
 ) -> HipResult<()> {
     if batch.is_empty() {
         return Ok(());
@@ -3890,7 +3936,7 @@ pub fn forward_batch_slots_opts(
                     q8_wmma_arch,
                     n,
                     delta_layer_idx,
-                    mtp_capture.as_deref_mut(),
+                    spec_capture.as_deref_mut(),
                 )?;
                 delta_layer_idx += 1;
             }
@@ -3926,7 +3972,7 @@ pub fn forward_batch_slots_opts(
                     q8_wmma_arch,
                     n,
                     delta_layer_idx,
-                    mtp_capture.as_deref_mut(),
+                    spec_capture.as_deref_mut(),
                     weights.moe_has_mq6,
                 )?;
                 delta_layer_idx += 1;
@@ -3963,6 +4009,15 @@ pub fn forward_batch_slots_opts(
                 ));
             }
         }
+            // DFlash2 extract-layer hidden capture: copy this step's
+            // post-layer hidden rows into the shared staging buffer. Runs
+            // for every layer kind (extract layers can be DeltaNet or
+            // FullAttention); `capture_hidden_rows` is a no-op when the
+            // capture is unset or this layer is not an extract layer.
+            if let Some(cap) = spec_capture.as_deref() {
+                cap.capture_hidden_rows(gpu, pbs, layer_idx, n)?;
+            }
+
     }
 
     if max_layer.is_some() {
@@ -4103,19 +4158,19 @@ mod tests {
     }
 
     #[test]
-    fn mtp_verify_graph_shape_admits_only_verify_patterns() {
-        // Pure decode / mixed verify+decode+idle: graphable at k=3 (verify
-        // rows are exactly k+1).
-        assert!(mtp_verify_graph_shape(&[1, 1, 1, 1], 3));
-        assert!(mtp_verify_graph_shape(&[4, 1, 0, 4], 3));
-        assert!(mtp_verify_graph_shape(&[4, 0], 3));
-        // A prefill chunk (any m not in {0,1,k+1}) must keep the plain path.
-        assert!(!mtp_verify_graph_shape(&[4, 1, 7, 4], 3));
-        assert!(!mtp_verify_graph_shape(&[256], 3));
-        // Verify rows that don't match mtp_k (k drift / partial window).
-        assert!(!mtp_verify_graph_shape(&[4, 1], 2));
-        // MTP off: nothing but pure decode (handled separately) graph captures.
-        assert!(!mtp_verify_graph_shape(&[4, 1], 0));
+    fn spec_verify_graph_shape_admits_only_verify_patterns() {
+        // Pure decode / mixed verify+decode+idle: graphable at verify_rows=4
+        // (MTP k=3 → k+1 rows; DFlash2 B=16 → 16 rows).
+        assert!(spec_verify_graph_shape(&[1, 1, 1, 1], 4));
+        assert!(spec_verify_graph_shape(&[4, 1, 0, 4], 4));
+        assert!(spec_verify_graph_shape(&[4, 0], 4));
+        // A prefill chunk (any m not in {0,1,verify_rows}) must keep the plain path.
+        assert!(!spec_verify_graph_shape(&[4, 1, 7, 4], 4));
+        assert!(!spec_verify_graph_shape(&[256], 4));
+        // Verify rows that don't match the configured width (drift / partial window).
+        assert!(!spec_verify_graph_shape(&[4, 1], 3));
+        // Spec off: nothing but pure decode (handled separately) graph captures.
+        assert!(!spec_verify_graph_shape(&[4, 1], 0));
     }
 
     #[test]
