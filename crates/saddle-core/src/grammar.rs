@@ -3454,6 +3454,16 @@ pub mod json_schema {
         number_open: bool,
         /// Whether the matcher has errored (invalid JSON or schema violation).
         errored: bool,
+        /// Consecutive WHITESPACE-ONLY tokens committed at a structural
+        /// (outside-string) position. JSON allows unlimited leading
+        /// whitespace, so the mask alone can never force progress: a model
+        /// steered away from its preferred continuation (e.g. right after
+        /// a forced think close) can pour out tabs forever — a document
+        /// valid at every prefix that never finishes. `is_token_allowed`
+        /// refuses whitespace-only tokens past WS_RUN_CAP; a value byte
+        /// resets the run. Sound: JSON is whitespace-insensitive, so the
+        /// cap cannot make any valid document unreachable.
+        ws_run: usize,
         /// Raw byte-scan state refreshed by [`SchemaMatcher::advance`]:
         /// duplicate-key detection plus the cheap first-byte/string context
         /// used by `is_token_allowed` to avoid a full clone+reparse per
@@ -3562,6 +3572,12 @@ pub mod json_schema {
 
     /// Value-start bytes for an unconstrained JSON value position.
     const VALUE_START: &[u8] = b"\"-{0123456789tfn[";
+
+    /// Consecutive structural-whitespace tokens allowed before the mask
+    /// refuses further whitespace (progress bound — see `ws_run`).
+    /// Sane pretty-printing never approaches this; 32 whitespace TOKENS at
+    /// 96 tokens of budget would otherwise be an unbounded burn.
+    const WS_RUN_CAP: usize = 32;
 
     /// Scan raw JSON bytes once for duplicate keys, string state, the
     /// legal next structural bytes, and — at a value-start position —
@@ -4635,6 +4651,7 @@ pub mod json_schema {
                 accepted: false,
                 number_open: false,
                 errored: false,
+                ws_run: 0,
                 scan,
             }
         }
@@ -4670,14 +4687,32 @@ pub mod json_schema {
             }
             if self.accepted {
                 if !self.number_open {
-                    // After a closed acceptance, only whitespace is allowed.
-                    return bytes
-                        .iter()
-                        .all(|&b| b == b' ' || b == b'\n' || b == b'\t' || b == b'\r');
+                    // After a closed acceptance, only whitespace is allowed
+                    // — bounded by WS_RUN_CAP (the tab-spam burn class:
+                    // valid JSON followed by unlimited tabs never errors,
+                    // so the run must be capped to let EOS win the argmax).
+                    return bytes.iter().all(|&b| {
+                        matches!(b, b' ' | b'\n' | b'\t' | b'\r')
+                    }) && self.ws_run < WS_RUN_CAP;
                 }
                 // Accepted but the trailing number could still grow: fall
                 // through to the simulation so digits stay legal and a
                 // non-continuing byte is judged by the parser.
+            }
+            // Whitespace-run cap (spec §9.2 progress bound): past WS_RUN_CAP
+            // consecutive structural whitespace tokens, refuse further
+            // whitespace-only tokens. JSON is whitespace-insensitive, so no
+            // valid document is cut off; the loop class (a steered model
+            // pouring tabs after a forced think close) is broken because a
+            // value byte remains legal and the whitespace escape is gone.
+            if !self.scan.in_string
+                && self.ws_run >= WS_RUN_CAP
+                && !bytes.is_empty()
+                && bytes
+                    .iter()
+                    .all(|&b| matches!(b, b' ' | b'\n' | b'\t' | b'\r'))
+            {
+                return false;
             }
             if self.scan.in_string {
                 // Key-string prune (closed objects, spec §7.1): only the
@@ -4960,6 +4995,20 @@ pub mod json_schema {
         /// handles JSON tokens: structural characters, strings (with
         /// escape handling), numbers, booleans, null.
         pub fn advance(&mut self, bytes: &[u8]) {
+            // Whitespace-run tracking: whitespace counts only at a
+            // structural position; inside a string it is inert content.
+            // Tracked BEFORE the accepted/errored early return so the run
+            // also grows for post-acceptance whitespace (the burn class:
+            // a valid document followed by unlimited tabs).
+            let all_ws = !bytes.is_empty()
+                && bytes
+                    .iter()
+                    .all(|&b| matches!(b, b' ' | b'\n' | b'\t' | b'\r'));
+            self.ws_run = if all_ws {
+                self.ws_run.saturating_add(1)
+            } else {
+                0
+            };
             if self.errored || (self.accepted && !self.number_open) {
                 return;
             }
@@ -4968,6 +5017,11 @@ pub mod json_schema {
             // detection (strict mode, spec §7.1) sees the current buffer.
             self.scan = scan_raw(&self.bytes, &self.root);
             self.parse();
+            // Whitespace appended inside a string is inert content, not a
+            // structural run.
+            if self.scan.in_string {
+                self.ws_run = 0;
+            }
         }
 
         /// Debug: the number of raw bytes the matcher has consumed.
@@ -7072,6 +7126,36 @@ pub mod json_schema {
             let mut m = compiled.matcher();
             m.advance(b"{\"whatever\": 1}");
             assert!(m.is_accepting(), "unknown keys stay legal under an open object");
+        }
+
+        /// The whitespace-run cap: past WS_RUN_CAP consecutive
+        /// whitespace-only tokens at a structural position, further
+        /// whitespace is refused but a value byte stays legal — breaking
+        /// the tabs-forever burn a steered model produces after a forced
+        /// think close, without cutting off any valid document.
+        #[test]
+        fn whitespace_run_cap_breaks_the_tab_loop() {
+            let schema = serde_json::json!({
+                "type": "object",
+                "properties": {"done": {"type": "boolean"}},
+                "required": ["done"]
+            });
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let mut m = compiled.matcher();
+            for _ in 0..32 {
+                assert!(m.is_token_allowed(b"\t"), "under the cap whitespace is legal");
+                m.advance(b"\t");
+            }
+            assert!(
+                !m.is_token_allowed(b"\t"),
+                "the 33rd consecutive whitespace token must be refused"
+            );
+            assert!(
+                m.is_token_allowed(b"{"),
+                "a value byte stays legal — no dead end"
+            );
+            m.advance(b"{");
+            assert!(m.is_token_allowed(b"\"done\""), "document continues");
         }
 
         /// The mask-state signature must be buffer-blind: two matchers
