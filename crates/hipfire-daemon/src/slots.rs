@@ -1975,16 +1975,10 @@ pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
     {
         return Some("reasoning_effort is not supported in experimental multi-slot".to_string());
     }
-    if msg
-        .get("max_think_tokens")
-        .and_then(|v| v.as_u64())
-        .is_some_and(|n| n >= 2)
-    {
-        return Some(
-            "finite reasoning caps not supported in experimental multi-slot (max_think_tokens >=2)"
-                .to_string(),
-        );
-    }
+    // max_think_tokens >= 2 is ACCEPTED here (was refused): the engine now
+    // enforces finite think budgets — the grammar cursor force-closes the
+    // span at the budget (vLLM thinking_token_budget parity). Enforced
+    // behavior must never be refused at the door.
     // Fields the wire accepts but the engine never reads must be refused,
     // not silently dropped: `n: 2` returning one completion is a silent
     // semantic downgrade (spec §7.1).
