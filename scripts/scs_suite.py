@@ -729,21 +729,32 @@ def b3(t):
 
 @cell("B", "B4", "thinking separation: reasoning_content vs content")
 def b4(t):
+    # Budget must let the think span close: upstream's fail-closed terminal
+    # (unsafe multi_slot terminal: open_think) turns a truncated think into a
+    # 500, so a too-small max_tokens is a server error by contract.
     r = chat(t.cfg, user("Name three primary colors, one per line."),
-             max_tokens=800, chat_template_kwargs={"enable_thinking": True})
+             max_tokens=3000, temperature=0, expect_error=True,
+             chat_template_kwargs={"enable_thinking": True})
+    t.check(r.status == 200,
+            "thinking request failed: %s (%s)" % (r.status, r.error_message[:140]))
+    if r.status != 200:
+        return
     t.check(len(r.reasoning) > 0, "reasoning_content empty with default thinking")
-    if not r.content:
-        t.warn("content empty (finish=%s): think span consumed max_tokens. The "
-               "multi-slot route refuses finite think caps, so clients cannot bound "
-               "this except through max_tokens" % r.finish)
-    else:
-        t.check("<think>" not in r.content and "</think>" not in r.content,
-                "think tags leaked into content")
-        low = r.content.lower()
-        t.check(any(c in low for c in ("red", "blue", "yellow")),
-                "content does not answer the prompt: %r" % r.content[:120])
+    t.check("<think>" not in r.content and "</think>" not in r.content,
+            "think tags leaked into content")
+    low = r.content.lower()
+    t.check(any(c in low for c in ("red", "blue", "yellow")),
+            "content does not answer the prompt: %r" % r.content[:120])
     bad, stats = is_attractor(r.content)
     t.check(not bad, "attractor in content: %s" % stats)
+    # The fail-closed contract itself: a think span truncated by max_tokens
+    # must surface as a typed server error, not silent empty content.
+    r2 = chat(t.cfg, user("Name three primary colors, one per line."),
+              max_tokens=16, expect_error=True,
+              chat_template_kwargs={"enable_thinking": True})
+    t.check(r2.status == 500 and "open_think" in r2.error_message,
+            "truncated think: expected 500 open_think, got %s (%s)"
+            % (r2.status, r2.error_message[:140]))
 
 
 @cell("B", "B5", "enable_thinking=false disables the think span")
@@ -1272,13 +1283,26 @@ def expect_refusal(t, label, r, prefix="experimental multi-slot does not support
             "%s: message %r lacks refusal prefix" % (label, r.error_message[:140]))
 
 
-@cell("F", "F1", "tools refused")
+@cell("F", "F1", "tools supported: emits tool_calls")
 def f1(t):
-    r = chat(t.cfg, user("hi"), expect_error=True, max_tokens=16,
+    # Upstream restored tool turns on the daemon slot path (ad6004ac0):
+    # tools are accepted and the model's call is parsed into a structured
+    # tool_calls finish.
+    r = chat(t.cfg, user("What is the weather in Paris? Use the get_weather tool."),
+             max_tokens=400, expect_error=True,
              tools=[{"type": "function",
-                     "function": {"name": "get_weather", "description": "d",
-                                  "parameters": {"type": "object", "properties": {}}}}])
-    expect_refusal(t, "tools", r)
+                     "function": {"name": "get_weather",
+                                  "description": "Get weather for a city",
+                                  "parameters": {"type": "object",
+                                                 "properties": {"city": {"type": "string"}},
+                                                 "required": ["city"]}}}],
+             chat_template_kwargs={"enable_thinking": False})
+    t.check(r.status == 200, "tools request rejected: %s (%s)" % (r.status, r.error_message[:140]))
+    if r.status == 200:
+        t.check(r.finish == "tool_calls", "finish=%s, expected tool_calls" % r.finish)
+        calls = (r.json.get("choices") or [{}])[0].get("message", {}).get("tool_calls") or []
+        t.check(any(c.get("function", {}).get("name") == "get_weather" for c in calls),
+                "no get_weather call in %r" % (calls,))
 
 
 @cell("F", "F2", "stop sequences refused")
@@ -1295,11 +1319,27 @@ def f3(t):
     expect_refusal(t, "top_logprobs", r2)
 
 
-@cell("F", "F4", "tool-result role message refused")
+@cell("F", "F4", "tool-result role accepted; malformed tool message refused")
 def f4(t):
+    # Tool turns are supported: a well-formed tool-result continuation is
+    # accepted; a tool message without tool_call_id is a typed 400.
     r = chat(t.cfg, [{"role": "user", "content": "hi"},
                      {"role": "tool", "content": "result"}], expect_error=True, max_tokens=16)
-    expect_refusal(t, "tool role", r)
+    t.check(r.status == 400,
+            "tool message without tool_call_id: expected 400, got %s" % r.status)
+    t.check("tool_call_id" in r.error_message,
+            "rejection should name tool_call_id: %s" % r.error_message[:140])
+    ok = chat(t.cfg, [{"role": "user", "content": "What is the weather in Paris?"},
+                      {"role": "assistant", "content": None,
+                       "tool_calls": [{"id": "call_1", "type": "function",
+                                       "function": {"name": "get_weather",
+                                                    "arguments": "{\"city\":\"Paris\"}"}}]},
+                      {"role": "tool", "tool_call_id": "call_1",
+                       "content": "{\"temp_c\": 18}"},
+                      {"role": "user", "content": "Summarize in one word."}],
+              max_tokens=32, expect_error=True)
+    t.check(ok.status == 200,
+            "tool-result continuation rejected: %s (%s)" % (ok.status, ok.error_message[:140]))
 
 
 @cell("F", "F5", "reasoning_effort high refused; 'none' accepted with warning")

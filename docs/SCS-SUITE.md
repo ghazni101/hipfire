@@ -178,6 +178,36 @@ clean re-verification the container still runs the pre-fix binary
 * this suite's B8/C5 cells intentionally keep hard assertions (the softened
   versions were reverted) — the enforced contracts are the branch's own.
 
+## Post-merge re-verification (2026-09-14, upstream v0.3.1 merged)
+
+Container rebuilt from merge commit `de1455476` (upstream/master @ v0.3.1
+merged into the branch). Clean single run on a fresh engine:
+**63 pass / 2 fail / 1 warn / 3 skip** (report:
+`.codeinsight+research/scs-post-merge-2026-09-14-r3.json`).
+
+Fixed by the post-17:00 commits + upstream merge (all verified green):
+E2/E3/E4 (grammar stream + framing cursor + dead-end), E12, E15, F8, F9,
+G3, G5, G6, G7, H2.
+
+Still failing (unchanged, the known determinism cluster): **B8** (seeded
+sampling cold/warm divergence) and **C5** (multi-turn final-turn replay).
+
+Contract updates from the merge (cells updated, now green):
+
+* **F1/F4** — upstream `ad6004ac0` restored tool turns on the daemon slot
+  path: tools are accepted, `tool_calls` finish is emitted, tool-result
+  continuations work; a tool message without `tool_call_id` is a typed 400.
+  The old refusal assertions were replaced with support assertions.
+* **B4** — upstream's fail-closed terminal turns a think span truncated by
+  `max_tokens` into a 500 `unsafe multi_slot terminal: open_think`. The cell
+  now uses `max_tokens=3000` (span closes, separation verified) and asserts
+  the truncated-think 500 contract explicitly.
+
+Note: a second back-to-back suite run on the same engine hit a host OOM
+(daemon 16.4 GB anon RSS after ~480 cumulative requests) — consistent with
+the long-lived-engine degradation class noted above; keep one suite run per
+engine lifetime.
+
 ## Notes for triage
 
 - The JSON reports contain full per-cell evidence, all fixture prompt md5s,
