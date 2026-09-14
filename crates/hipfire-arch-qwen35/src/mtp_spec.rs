@@ -1793,6 +1793,7 @@ fn mtp_shared_verify_accept_rollback_inner(
         None,
         None,
         false,
+        qwen35::DflashFusionCtx::Off,
     )?;
 
     mtp_accept_and_rollback(

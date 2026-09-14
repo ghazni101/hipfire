@@ -25,6 +25,10 @@ pub enum KvMode {
     Fwht2,
     Fwht3,
     Fwht4,
+    /// Sentinel: auto-select the asym3 tier. Must be resolved to a concrete
+    /// mode before reaching the slot KV plan — `SlotKvTierPlan::resolve`
+    /// rejects it.
+    Asym3Auto,
 }
 
 /// KV storage backend selection.
@@ -591,6 +595,12 @@ impl KvCache {
                 .checked_div(2)
                 .and_then(|n| n.checked_add(4))
                 .ok_or_else(|| hip_bridge::HipError::new(0, "VMM 4-bit K head stride overflowed")),
+            KvMode::Asym3Auto => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "KV mode Asym3Auto must be resolved before the slot KV plan",
+                ));
+            }
         }
     }
 
@@ -720,6 +730,12 @@ impl KvCache {
                     }
                 }
             },
+            KvMode::Asym3Auto => {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "KV mode Asym3Auto must be resolved before the slot KV plan",
+                ));
+            }
         }
         Ok(())
     }
@@ -753,6 +769,9 @@ impl KvCache {
             // rejects bf16 for VMM before this runs — but 0 is the honest
             // answer for a tier with no rotation table.
             KvMode::Bf16 => 0,
+            // Sentinel: unreachable — resolve() rejects Asym3Auto before any
+            // VMM constructor runs.
+            KvMode::Asym3Auto => 0,
             KvMode::Asym2 | KvMode::Asym3 | KvMode::Asym4 => head_dim / 2,
             KvMode::Fwht3 => 256,
             KvMode::Fwht2 | KvMode::Fwht4 => {
@@ -914,6 +933,11 @@ impl KvCache {
         match mode {
             KvMode::Q8 => (true, false, false, false, false),
             KvMode::Asym2 => (false, false, false, true, false),
+            // Sentinel: unreachable — resolve() rejects Asym3Auto before any
+            // VMM constructor runs.
+            KvMode::Asym3Auto => panic!(
+                "vmm_mode_flags: Asym3Auto is a sentinel, not a VMM layout mode"
+            ),
             KvMode::Asym3 => (false, false, true, false, false),
             KvMode::Asym4 => (false, true, false, false, false),
             KvMode::Fwht2 => (false, false, false, true, true),
@@ -4349,6 +4373,7 @@ mod vmm_layout_tests {
             KvMode::Asym4 | KvMode::Fwht4 => 4 + head_dim / 2,
 
             KvMode::Bf16 => panic!("bf16 is not a VMM layout mode"),
+            KvMode::Asym3Auto => panic!("Asym3Auto is not a VMM layout mode"),
         }
     }
 

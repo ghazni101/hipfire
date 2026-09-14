@@ -14,12 +14,8 @@
 //! Usage:
 //!   maple_coherence --model <model.hfq> [--prompt "..."] [--max-tokens N]
 //!                   [--raw] [--kv-mode q8|bf16]
-<<<<<<< HEAD
 //!                   [--temp T] [--top-p P] [--seed N]
 //!                   [--head <head-only.hfq>]
-=======
-//!                   [--temp T] [--top-p P] [--seed N]
->>>>>>> 9bb15c745 (fix(maple): use the vendor chat template and sampling defaults)
 //!
 //! `--kv-mode bf16` swaps the Q8_0 KV cache for the flat BF16 tier. Both run
 //! the same sliding-window kernels with the same dim mapping and FMA order, so
@@ -44,7 +40,6 @@ struct Args {
     max_tokens: usize,
     raw: bool,
     kv_mode: String,
-<<<<<<< HEAD
     /// Optional head-overlay `.hfq` (hipfire-quantize --head-only).
     head: Option<String>,
     /// 0.0 = greedy (default, unchanged behaviour). > 0 = sample.
@@ -122,9 +117,6 @@ fn sample_top_p(logits: &[f32], temp: f32, top_p: f32, rng: &mut SplitMix64) -> 
         }
     }
     nucleus[nucleus.len() - 1]
-
-=======
->>>>>>> 9bb15c745 (fix(maple): use the vendor chat template and sampling defaults)
 }
 
 fn parse_args() -> Args {
@@ -133,20 +125,12 @@ fn parse_args() -> Args {
     let mut prompt = "The capital of France is".to_string();
     let mut max_tokens = 64usize;
     let mut raw = false;
-<<<<<<< HEAD
     // "" = MAPLE_POLICY's default (bf16). "q8" selects the block-quantized tier.
     let mut kv_mode = String::new();
     let mut temp = 0.0f32;
     let mut top_p = 0.95f32;
     let mut seed = 0u64;
     let mut head: Option<String> = None;
-=======
-    // "" = MAPLE_POLICY's default (bf16). "q8" selects the block-quantized tier.
-    let mut kv_mode = String::new();
-    let mut temp = 0.0f32;
-    let mut top_p = 0.95f32;
-    let mut seed = 0u64;
->>>>>>> 9bb15c745 (fix(maple): use the vendor chat template and sampling defaults)
     let mut i = 1;
     while i < argv.len() {
         match argv[i].as_str() {
@@ -174,7 +158,6 @@ fn parse_args() -> Args {
                 kv_mode = argv[i + 1].clone();
                 i += 2;
             }
-<<<<<<< HEAD
 
             "--temp" => {
                 temp = argv[i + 1].parse().expect("--temp");
@@ -194,8 +177,6 @@ fn parse_args() -> Args {
                 head = Some(argv[i + 1].clone());
                 i += 2;
             }
-=======
->>>>>>> 9bb15c745 (fix(maple): use the vendor chat template and sampling defaults)
             other => panic!("unknown arg {other}"),
         }
     }
@@ -205,16 +186,10 @@ fn parse_args() -> Args {
         max_tokens,
         raw,
         kv_mode,
-<<<<<<< HEAD
         temp,
         top_p,
         seed,
         head,
-=======
-        temp,
-        top_p,
-        seed,
->>>>>>> 9bb15c745 (fix(maple): use the vendor chat template and sampling defaults)
     }
 }
 
