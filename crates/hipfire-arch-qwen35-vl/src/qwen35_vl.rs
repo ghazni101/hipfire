@@ -1139,6 +1139,127 @@ impl VisionTowerJob {
         })
     }
 
+    /// Like [`Self::new`] but takes device-resident patches (the VCN JPEG
+    /// decode path in `image`). Skips the host→device upload — `x_patches`
+    /// is consumed by the patch embedding and freed immediately after.
+    pub fn new_patches(
+        gpu: &mut Gpu,
+        weights: &VisionWeights,
+        config: &VisionConfig,
+        x_patches: GpuTensor,
+        grid_h: usize,
+        grid_w: usize,
+    ) -> HipResult<Self> {
+        let h = config.hidden_size;
+        let n = grid_h * grid_w;
+        let patch_dim = 3 * config.temporal_patch_size * config.patch_size * config.patch_size;
+        let t0 = std::time::Instant::now();
+
+        let dump_dir: Option<std::path::PathBuf> =
+            std::env::var("HIPFIRE_VL_DUMP_DIR").ok().map(Into::into);
+        let dd = dump_dir.as_deref();
+        if dd.is_some() {
+            eprintln!(
+                "  [VL-DUMP] stage dumps enabled ({} patches, {grid_h}x{grid_w})",
+                n
+            );
+        }
+        eprintln!(
+            "  vision forward (GPU): {} patches, {}x{} grid",
+            n, grid_h, grid_w
+        );
+
+        if let Some(d) = dd {
+            // Env-gated debug dump: a download failure must still release the
+            // owned input before propagating.
+            match gpu.download_f32(&x_patches) {
+                Ok(host) => vl_dump_slice(d, "pixel_values", &host, &[n, patch_dim]),
+                Err(e) => {
+                    let _ = gpu.free_tensor(x_patches);
+                    return Err(e);
+                }
+            }
+        }
+
+        // Patch embedding: linear_f16 → [n, h]. Last use of the owned input:
+        // release it here — not at tower end — on both success and failure.
+        let x = match linear_f16(
+            gpu,
+            &weights.patch_embed_w,
+            &x_patches,
+            &weights.patch_embed_b,
+            h,
+            patch_dim,
+            n,
+        ) {
+            Ok(x) => {
+                gpu.free_tensor(x_patches)?;
+                x
+            }
+            Err(e) => {
+                let _ = gpu.free_tensor(x_patches);
+                return Err(e);
+            }
+        };
+        vl_dump_tensor(gpu, dd, "patch_embed", &x, &[n, h])?;
+
+        // Bilinear-interpolate the learned (K×K, h) pos_embed table down to the
+        // actual (grid_h, grid_w) and reorder into 2x2-grouped patch sequence,
+        // then add. HF's `fast_pos_embed_interpolate`.
+        let num_grid_per_side = (config.num_position_embeddings as f64).sqrt().round() as usize;
+        assert_eq!(
+            num_grid_per_side * num_grid_per_side,
+            config.num_position_embeddings,
+            "num_position_embeddings ({}) must be a perfect square",
+            config.num_position_embeddings,
+        );
+        let pos_embed_interp = fast_pos_embed_interpolate(
+            &weights.pos_embed,
+            h,
+            grid_h,
+            grid_w,
+            num_grid_per_side,
+            config.spatial_merge_size,
+        );
+        let pos_embed_gpu = gpu.upload_f32(&pos_embed_interp, &[n * h])?;
+        gpu.add_inplace_f32(&x, &pos_embed_gpu)?;
+        gpu.free_tensor(pos_embed_gpu)?;
+        vl_dump_tensor(gpu, dd, "post_pos_embed", &x, &[n, h])?;
+        if let Some(d) = dd {
+            vl_dump_slice(d, "pos_embed_interp", &pos_embed_interp, &[n, h]);
+        }
+
+        let rot_dim_half = config.head_dim / 2;
+        let (rope_cos, rope_sin) = compute_vision_rope_cos_sin(
+            grid_h,
+            grid_w,
+            config.head_dim,
+            config.spatial_merge_size,
+            config.rope_theta,
+        );
+        let rope_cos_gpu = gpu.upload_f32(&rope_cos, &[n * rot_dim_half])?;
+        let rope_sin_gpu = gpu.upload_f32(&rope_sin, &[n * rot_dim_half])?;
+
+        let attn_naive = matches!(
+            hipfire_config::developer_var("HIPFIRE_VIT_ATTN").as_deref(),
+            Ok("naive")
+        ) || config.head_dim % 16 != 0
+            || config.head_dim > 128;
+
+        Ok(Self {
+            x,
+            rope_cos_gpu,
+            rope_sin_gpu,
+            n,
+            grid_h,
+            grid_w,
+            next_layer: 0,
+            attn_naive,
+            dump_dir,
+            t0,
+        })
+    }
+
     /// Run the NEXT single tower layer. Returns `true` when the last layer
     /// has just run — the job is then ready for [`Self::finish`]; calling
     /// `step_layer` again after that panics (contract violation).
@@ -1158,9 +1279,6 @@ impl VisionTowerJob {
         let dd = self.dump_dir.as_deref();
         let lw = &weights.layers[li];
 
-    // Transformer layers
-    let qkv_dim = 3 * h;
-    for (li, lw) in weights.layers.iter().enumerate() {
         // LayerNorm1 → tmp
         let tmp = gpu.alloc_tensor(&[n * h], DType::F32)?;
         gpu.layernorm_batched(&self.x, &lw.norm1_w, &lw.norm1_b, &tmp, n, h, config.norm_eps)?;
@@ -1382,6 +1500,29 @@ pub fn vision_forward(
     grid_w: usize,
 ) -> HipResult<Vec<f32>> {
     let mut job = VisionTowerJob::new(gpu, weights, config, patches, grid_h, grid_w)?;
+    let mut done = false;
+    while !done {
+        done = job.step_layer(gpu, weights, config)?;
+    }
+    job.finish(gpu, weights, config)
+}
+
+/// `vision_forward` without the host→device patch upload: encode patches
+/// already resident on the device (the VCN product path in `image`). Takes
+/// `x_patches` BY VALUE and frees it immediately after patch embedding —
+/// its last use — so the peak drops by the full image tensor instead of
+/// holding it through the whole tower, and no later (or embedding-error)
+/// path can strand it. Same contract for CPU-uploaded and VCN-produced
+/// input: the caller owns nothing after the call.
+pub fn vision_forward_patches(
+    gpu: &mut Gpu,
+    weights: &VisionWeights,
+    config: &VisionConfig,
+    x_patches: GpuTensor,
+    grid_h: usize,
+    grid_w: usize,
+) -> HipResult<Vec<f32>> {
+    let mut job = VisionTowerJob::new_patches(gpu, weights, config, x_patches, grid_h, grid_w)?;
     let mut done = false;
     while !done {
         done = job.step_layer(gpu, weights, config)?;

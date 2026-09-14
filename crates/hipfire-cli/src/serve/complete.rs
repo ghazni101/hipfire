@@ -2547,36 +2547,37 @@ pub(crate) fn complete_request_attempt(
 
 /// Whether the experimental multi-slot daemon path can honour this request.
 ///
-<<<<<<< HEAD
-/// Pure pre-send gate. Temperature / top_p / top_k remain supported. Images
-/// are supported when the loaded model has a vision encoder (the daemon slot
-/// backend gates on is_vl). Images and tools are each supported but not
-/// together — the VL prompt path cannot render a tool contract. Rejects
-/// non-null stop, logprobs, non-neutral repeat/frequency/presence penalties,
-/// min_p, reasoning caps >= 2, and named thinking budgets other than `"off"`.
-/// Callers with `serve.multi_slot` enabled must surface the error — there is
-/// no ordinary-model fallback in that mode.
-=======
 /// Pure pre-send gate. Temperature / top_p / top_k remain supported, and
 /// token penalties (repeat/frequency/presence, min_p) are FORWARDED — the
 /// slot engine honours them via its penalize-then-argmax prepass (penalized
 /// requests decode AR; MTP stays off). Images are supported when the loaded
 /// model has a vision encoder (the daemon slot backend gates on is_vl).
-<<<<<<< HEAD
-/// Rejects tools, non-null stop, logprobs, reasoning caps >= 2, and named
-/// thinking budgets other than `"off"`. Callers with `serve.multi_slot`
-/// enabled must surface the error — there is no ordinary-model fallback in
-/// that mode.
->>>>>>> 528b658ec (fix(slots): full-branch hardening — MTP verify norm, DN burst clamp, rope_delta verify-only steps, fail-loud paths)
-=======
 /// `response_format` (json_schema) is forwarded — the daemon slot backend
 /// validates grammar-compiler availability and refuses with a typed error
 /// when the compiled artifact or lossless token-byte table is unavailable
-/// (spec §7 G1/G2). Rejects tools, non-null stop, logprobs, reasoning caps
-/// >= 2, and named thinking budgets other than `"off"`. Callers with
-/// `serve.multi_slot` enabled must surface the error — there is no
-/// ordinary-model fallback in that mode.
->>>>>>> 3f024ec4c (feat(slots): response_format contract, lossless token bytes, pre-sample mask seam)
+/// (spec §7 G1/G2). Images and tools are each supported but not together —
+/// the VL prompt path cannot render a tool contract. Rejects non-null stop,
+/// logprobs, reasoning caps >= 2, and named thinking budgets other than
+/// `"off"`. Callers with `serve.multi_slot` enabled must surface the error —
+/// there is no ordinary-model fallback in that mode.
+fn multi_slot_request_has_image(body: &serde_json::Value) -> bool {
+    let Some(messages) = body.get("messages").and_then(serde_json::Value::as_array) else {
+        return false;
+    };
+    for message in messages {
+        let Some(parts) = message.get("content").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        if parts
+            .iter()
+            .any(|part| part.get("type").and_then(serde_json::Value::as_str) == Some("image_url"))
+        {
+            return true;
+        }
+    }
+    false
+}
+
 pub(crate) fn multi_slot_request_supported(body: &serde_json::Value) -> Result<(), String> {
     let has_image = multi_slot_request_has_image(body)
         || body.get("image").is_some_and(|value| !value.is_null())

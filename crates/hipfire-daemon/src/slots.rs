@@ -1453,7 +1453,7 @@ impl SlotBackend {
             };
             hipfire_engine::emit::emit_active_attempt_error(
                 stdout,
-                id,
+                Some(id),
                 &format!("multi_slot rejected: {reason}"),
                 kind,
                 false,
@@ -1834,7 +1834,6 @@ pub fn validate_load_caps(msg: &serde_json::Value) -> Option<String> {
         let resolved = hipfire_runtime::kv_mode::resolve(
             raw,
             &hipfire_runtime::kv_mode::QWEN35_SLOTS_POLICY,
-            256, // head_dim gate runs later in Rig::build with the real value
         );
         if resolved.warning.is_some() {
             return Some(format!(
@@ -1946,7 +1945,7 @@ pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
                 }
             };
             if let Err(e) =
-                saddle_core::grammar::json::json_schema::CompiledSchema::compile(schema)
+                hipfire_arch_qwen35::grammar::json_schema::CompiledSchema::compile(schema)
             {
                 return Some(format!("response_format json_schema: {e}"));
             }
