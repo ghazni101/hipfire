@@ -64,6 +64,8 @@ fn main() {
         wait_max_bytes: 256 * 1024 * 1024,
         queue_timeout_ms: 30_000,
         structured_jump_forward: false,
+        dflash_draft: None,
+        dflash_required: false,
     })
     .expect("engine");
 
@@ -112,7 +114,12 @@ fn main() {
                 visual_data: None,
                 json_schema: None,
                 started_in_think: false,
-        queue_bytes: 0,
+                // Unconstrained request: OpenAI-style think semantics (an
+                // over-long think span ends at max_tokens), no canceller tag
+                // (this example never cancels a queued request).
+                think_budget: 0,
+                request_tag: 0,
+                queue_bytes: 0,
                 reply: tx,
             })
             .expect("submit");

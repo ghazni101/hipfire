@@ -44,35 +44,13 @@ struct SourceMeta {
 }
 
 /// Discover a `.vl` sidecar file for the given trunk model path.
-/// Mirrors the daemon's `discover_vl_sidecar`: `HIPFIRE_VL_FILE` env,
-/// then `<stem>.vl` sibling.
+///
+/// Same resolution the daemon uses (they are one implementation now, in
+/// [`hipfire_runtime::sidecar`]): `HIPFIRE_VL_FILE` env, then the
+/// `<stem>.vl` sibling candidates (`<stem>` also strips `.hfq` and a quant
+/// suffix, so `model.mq4v2.hfq` finds `model.vl`).
 fn discover_vl_path(model_path: &str) -> Option<std::path::PathBuf> {
-    if let Ok(v) = std::env::var("HIPFIRE_VL_FILE") {
-        let p = std::path::PathBuf::from(&v);
-        if p.exists() {
-            return Some(p);
-        }
-        // Same rationale as the daemon's discover_vl_sidecar: an explicit
-        // override that doesn't exist deserves a warning, not silence.
-        if !v.trim().is_empty() {
-            eprintln!(
-                "HIPFIRE_VL_FILE is set to {v:?} but the file does not exist; \
-                 falling back to <stem>.vl sibling discovery"
-            );
-        }
-    }
-    let base = std::path::Path::new(model_path);
-    match (base.parent(), base.file_stem()) {
-        (Some(parent), Some(stem)) => {
-            let vl = parent.join(format!("{}.vl", stem.to_string_lossy()));
-            if vl.exists() {
-                Some(vl)
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
+    hipfire_runtime::sidecar::resolve_vl_sidecar(model_path)
 }
 
 fn resolve_source_meta(src: &ModelSource, path: &str) -> Result<SourceMeta, String> {

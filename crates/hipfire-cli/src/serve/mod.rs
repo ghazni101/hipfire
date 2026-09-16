@@ -134,49 +134,25 @@ pub(crate) struct ServeShared {
     pub(crate) capabilities: serde_json::Value,
 }
 
-/// Mirror of the MTP sidecar probe in
-/// `hipfire_arch_qwen35::mtp_head::mtp_sidecar_candidates` (hipfire-cli
-/// does not depend on the arch crate — keep the two in sync). Candidates:
-/// `<name-with-last-ext-replaced>.mtp`, `<stem-without-.hfq-or-quant>.mtp`.
+/// MTP sidecar probe for the capability advertisement — the same candidate
+/// list the loader/daemon use ([`hipfire_runtime::sidecar`]), so this
+/// cannot advertise `mtp_sidecar: false` for a head the load path finds.
 pub(crate) fn mtp_sidecar_exists(trunk: &std::path::Path) -> bool {
-    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
-    let mut push = |p: std::path::PathBuf| {
-        if !candidates.iter().any(|e| e == &p) {
-            candidates.push(p);
-        }
-    };
-    push(trunk.with_extension("mtp"));
-    let name = trunk.file_name().and_then(|s| s.to_str()).unwrap_or("");
-    let parent = trunk.parent().unwrap_or_else(|| std::path::Path::new("."));
-    let stem = name.strip_suffix(".hfq").unwrap_or(name);
-    const QUANTS: &[&str] = &[
-        ".mq4v2", ".mq6v2", ".mq5v2", ".mq3v2", ".mq2v2", ".mq4cg256", ".mq4",
-        ".mq6", ".mq8", ".q8", ".q4", ".bf16",
-    ];
-    for q in QUANTS {
-        if let Some(base) = stem.strip_suffix(q) {
-            push(parent.join(format!("{base}.mtp")));
-        }
-    }
-    if let Some((base, rest)) = stem.rsplit_once('.') {
-        if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphanumeric()) {
-            push(parent.join(format!("{base}.mtp")));
-        }
-    }
-    candidates.into_iter().any(|p| p.exists())
+    hipfire_runtime::sidecar::sidecar_candidates(trunk, "mtp")
+        .into_iter()
+        .any(|p| p.exists())
 }
 
-/// Vision sidecar probe — mirrors the daemon's `discover_vl_sidecar`
-/// sibling convention (`<stem>.vl`; the HIPFIRE_VL_FILE override is
-/// daemon-env state the serve cannot see, so this probe is the sibling
-/// convention only).
+/// Vision sidecar probe for the capability advertisement.
+///
+/// Uses the SAME resolution the daemon's load path uses
+/// ([`hipfire_runtime::sidecar::resolve_vl_sidecar`]): `HIPFIRE_VL_FILE`
+/// then the `<stem>.vl` sibling candidates, with `.hfq`/quant suffixes
+/// stripped. A probe with its own narrower rule advertised
+/// `vision_sidecar: false` for a trunk whose tower the daemon would have
+/// loaded (`model.mq4v2.hfq` + `model.vl`).
 pub(crate) fn vision_sidecar_exists(trunk: &std::path::Path) -> bool {
-    match (trunk.parent(), trunk.file_stem()) {
-        (Some(parent), Some(stem)) => {
-            parent.join(format!("{}.vl", stem.to_string_lossy())).exists()
-        }
-        _ => false,
-    }
+    hipfire_runtime::sidecar::resolve_vl_sidecar(&trunk.to_string_lossy()).is_some()
 }
 
 /// Build the route capability advertisement from the resolved serve
@@ -233,10 +209,26 @@ pub(crate) fn route_capabilities(
         "stream_stall_timeout_ms": stream_stall_timeout_ms,
         "max_request_bytes": max_request_bytes,
         // Honest refusal list: fields this route rejects BEFORE generation
-        // (typed 400s). Mirrors `multi_slot_request_supported` + the
-        // response_format gate.
+        // (typed 400s). Mirrors `multi_slot_request_supported` (gateway) +
+        // `validate_generate_caps` (daemon), which together refuse every
+        // entry below — a client that only reads the advertisement must not
+        // be surprised by a 400 for a field it was never told about.
+        // `images+tools` is a rejected COMBINATION, not a field, so it is
+        // spelled out separately.
         "refused_request_fields": if multi_slot {
-            serde_json::json!(["stop", "logprobs", "response_format:json_object"])
+            serde_json::json!([
+                "stop",
+                "logprobs",
+                "top_logprobs",
+                "n",
+                "best_of",
+                "logit_bias",
+                "echo",
+                "suffix",
+                "reasoning_effort",
+                "response_format:json_object",
+                "tools+image",
+            ])
         } else {
             serde_json::json!(["response_format"])
         },

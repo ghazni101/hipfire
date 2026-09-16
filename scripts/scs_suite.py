@@ -604,14 +604,28 @@ def a2(t):
     t.check(st == 200, "status %s" % st)
     d = json.loads(text)
     ids = [m.get("id") for m in d.get("data", [])]
-    t.check(t.cfg.model in ids, "model %r not listed (%s)" % (t.cfg.model, ids))
-    m = [x for x in d["data"] if x.get("id") == t.cfg.model][0]
+    # The catalog lists a model by its NAME; a request may also name it by an
+    # absolute path inside the model store (the daemon accepts both, verified
+    # against the live route). Compare identities, not spellings: the listed id
+    # must be the requested model (same basename), or be requestable as-is.
+    want = t.cfg.model.rstrip("/").split("/")[-1]
+    match = [m for m in d.get("data", [])
+             if m.get("id") == t.cfg.model or m.get("id") == want
+             or (m.get("id") or "").rstrip("/").split("/")[-1] == want]
+    t.check(bool(match), "model %r not listed by name or path (%s)" % (t.cfg.model, ids))
+    if not match:
+        return
+    m = match[0]
     caps = m.get("capabilities") or {}
     t.ev("model caps=%s" % json.dumps(caps, sort_keys=True))
     for k in ("multi_slot", "structured_output", "prefix_cache", "mtp_sidecar", "vision_sidecar"):
         t.check(k in caps, "model capability %s missing" % k)
     t.check(caps.get("multi_slot") is True and caps.get("prefix_cache") is True,
             "model route facts not projected")
+    # The advertised id must be usable as a request model id.
+    r = chat(t.cfg, user("Say ok."), max_tokens=4, model=m["id"])
+    t.check(r.status == 200, "advertised id %r is not requestable: %s (%s)"
+            % (m["id"], r.status, r.error_message[:120]))
 
 
 @cell("A", "A3", "/stats contract + counters move")
@@ -1287,9 +1301,19 @@ def e15(t):
 # --------------------------------------------------------------------------
 
 
+# Gateway-side request validation prefixes its refusals with a typed tag so
+# the HTTP layer maps them to 400 by CLASS, not by message wording
+# (`REQUEST_VALIDATION_TAG` in hipfire-cli/src/serve/mod.rs). The contract a
+# client observes is "HTTP 400 naming the refused field/knob"; the exact
+# sentence is an implementation detail, so accept either spelling.
+REFUSAL_TAG = "[request validation] "
+
+
 def expect_refusal(t, label, r, prefix="experimental multi-slot does not support this request"):
     t.check(r.status == 400, "%s: expected 400, got %s (%s)" % (label, r.status, r.error_message[:140]))
-    t.check(r.error_message.startswith(prefix),
+    body = r.error_message[len(REFUSAL_TAG):] if r.error_message.startswith(REFUSAL_TAG) \
+        else r.error_message
+    t.check(body.startswith(prefix),
             "%s: message %r lacks refusal prefix" % (label, r.error_message[:140]))
 
 

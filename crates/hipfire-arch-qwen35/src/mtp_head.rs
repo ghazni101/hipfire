@@ -813,38 +813,19 @@ pub fn load_mtp_head_bundled(
     Ok(Some(head))
 }
 
-/// Candidate `.mtp` sidecar paths for a trunk weight file.
+/// Candidate `.mtp` sidecar paths for a trunk weight file, most specific
+/// first.
 ///
 /// `Path::with_extension("mtp")` only replaces the last extension, so
 /// `qwen3.5-4b.mq4v2.hfq` becomes `qwen3.5-4b.mq4v2.mtp`. Product extracts
-/// sit next to the trunk as `qwen3.5-4b.mtp`. Probe both, plus the no-`.hfq`
-/// sibling (`qwen3.5-4b.mq4` → `qwen3.5-4b.mtp`).
+/// sit next to the trunk as `qwen3.5-4b.mtp`. Both are probed, plus the
+/// no-`.hfq`/no-quant sibling (`qwen3.5-4b.mq4` → `qwen3.5-4b.mtp`).
+///
+/// The list itself lives in [`hipfire_runtime::sidecar`], shared with the
+/// `.vl` probe and the CLI's capability advertisement so the three cannot
+/// drift apart.
 pub fn mtp_sidecar_candidates(trunk: &Path) -> Vec<PathBuf> {
-    let mut out = Vec::new();
-    let mut push = |p: PathBuf| {
-        if !out.iter().any(|e| e == &p) {
-            out.push(p);
-        }
-    };
-    push(trunk.with_extension("mtp"));
-    let name = trunk.file_name().and_then(|s| s.to_str()).unwrap_or("");
-    let parent = trunk.parent().unwrap_or_else(|| Path::new("."));
-    let stem = name.strip_suffix(".hfq").unwrap_or(name);
-    const QUANTS: &[&str] = &[
-        ".mq4v2", ".mq6v2", ".mq5v2", ".mq3v2", ".mq2v2", ".mq4cg256", ".mq4",
-        ".mq6", ".mq8", ".q8", ".q4", ".bf16",
-    ];
-    for q in QUANTS {
-        if let Some(base) = stem.strip_suffix(*q) {
-            push(parent.join(format!("{base}.mtp")));
-        }
-    }
-    if let Some((base, rest)) = stem.rsplit_once('.') {
-        if !rest.is_empty() && rest.chars().all(|c| c.is_ascii_alphanumeric()) {
-            push(parent.join(format!("{base}.mtp")));
-        }
-    }
-    out
+    hipfire_runtime::sidecar::sidecar_candidates(trunk, "mtp")
 }
 
 /// First candidate that exists on disk, if any.

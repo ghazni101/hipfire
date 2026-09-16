@@ -56,7 +56,11 @@ Perf hardening: `is_token_allowed` gained bounded fast paths (structural first-b
 ### Remaining gaps (unchanged or newly precise)
 
 - **Vision + prefix reuse (X2/A18)** — still off; needs the pixel/embedding/position oracle.
-- **Slots tools / stop / logprobs** — refusals stay (spec: remove only with complete behavior).
+- **Slots tools / stop / logprobs** — upstream `ad6004ac0` restored tool turns on
+  the daemon slot path: `tools` are now **supported** (a tool call finishes with
+  `tool_calls`; a tool message without `tool_call_id` is a typed 400). `stop`
+  and `logprobs`/`top_logprobs` refusals stay (spec: remove only with complete
+  behavior).
 - **`admissions.yml` / ARCHITECTURE.md / default-on** — still gated on the full §12 evidence tuple.
 - **P6 overlap** — flag only, stays off until a measured host gap exceeds fixture noise.
 
@@ -285,9 +289,10 @@ The subsequent generate fails with an open-think-span validator (too few tokens 
 ### Slots tools / stop / logprobs
 
 - `validate_generate_caps` in `crates/hipfire-daemon/src/slots.rs` still refuses:
-  - `tools` (non-empty array) → rejected
   - `stop` (non-null) → rejected
   - `logprobs` / `top_logprobs` → rejected
+  - (`tools` was removed from this list by upstream `ad6004ac0`: tool turns are
+    supported on the slot path now — a tool-call finish emits `tool_calls`.)
 - Spec: remove refusals only when complete behavior lands in the same change.
 
 ### A19 — HIP fault injection / fail-closed reuse

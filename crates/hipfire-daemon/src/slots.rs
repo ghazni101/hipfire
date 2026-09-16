@@ -369,6 +369,14 @@ impl PendingToolBroker {
 
 impl SlotBackend {
     /// CPU preflight then GPU load. Called only when experimental_multi_slot load is requested.
+    ///
+    /// `vision_mode` / `vision` are the load's resolved vision-tower ladder
+    /// (`params.vision_mode` + `params.vision`/`HIPFIRE_VISION_SIDECAR`,
+    /// already gated by the caller). They exist because the multi-slot route
+    /// used to resolve the `.vl` sibling on its own, ignoring both — so a VL
+    /// trunk paid the tower's ~1 GB under the documented text-only default,
+    /// and an explicit `serve --vision` was dropped here.
+    #[allow(clippy::too_many_arguments)]
     pub fn load(
         model_path: &str,
         n_slots: usize,
@@ -378,9 +386,11 @@ impl SlotBackend {
         kv_mode_raw: &str,
         dflash_draft: Option<PathBuf>,
         dflash_required: bool,
+        vision_mode: &str,
+        vision: Option<String>,
     ) -> Result<Self, String> {
         // CPU preflight: open HFQ, arch, VL, config, tokenizer.
-        let preflight = cpu_preflight(model_path)?;
+        let preflight = cpu_preflight(model_path, vision_mode, vision.as_deref())?;
         let arch_id = preflight.arch_id;
         let arch_str = preflight.arch_str.clone();
         let dim = preflight.dim;
@@ -1616,7 +1626,11 @@ struct Preflight {
     vl_path: Option<PathBuf>,
 }
 
-fn cpu_preflight(model_path: &str) -> Result<Preflight, String> {
+fn cpu_preflight(
+    model_path: &str,
+    vision_mode: &str,
+    vision: Option<&str>,
+) -> Result<Preflight, String> {
     let hfq =
         HfqFile::open(std::path::Path::new(model_path)).map_err(|e| format!("open model: {e}"))?;
     validate_arch_id(hfq.arch_id)?;
@@ -1624,12 +1638,33 @@ fn cpu_preflight(model_path: &str) -> Result<Preflight, String> {
     // ── .vl sidecar discovery ──────────────────────────────────────────
     // A .vl file is a standalone HFQM container with only vision tower
     // tensors + config.vision_config metadata. Discovery order:
-    //   1. HIPFIRE_VL_FILE env var (explicit override)
-    //   2. <stem>.vl sibling next to the trunk model
+    //   1. the caller's explicit sidecar (`params.vision` /
+    //      `HIPFIRE_VISION_SIDECAR`), already filtered by `vision_mode`
+    //   2. `<stem>.vl` sibling next to the trunk model
     // When a .vl file is found, it takes precedence over inline vision
     // tensors. If no .vl file exists, fall back to inline (backward compat).
-    let vl_path = discover_vl_sidecar(model_path);
+    //
+    // `vision_mode` is the SAME documented ladder the sequential load arm
+    // applies (`apply_vision_mode_gate`): `off` (the default) never wires a
+    // sidecar — not even an explicit one — so a text load pays no tower
+    // VRAM; `on` requires a tower to resolve. The multi-slot arm used to
+    // discover the sibling unconditionally, so a VL trunk paid the tower's
+    // ~1 GB even under the documented text-only default, and `serve --vision`
+    // was dropped on this route entirely.
     let has_inline_vision = is_vision_hfq(&hfq);
+    let vl_path: Option<PathBuf> = if vision_mode == "off" {
+        None
+    } else {
+        vision
+            .map(PathBuf::from)
+            .or_else(|| discover_vl_sidecar(model_path))
+    };
+    if vision_mode == "on" && vl_path.is_none() && !has_inline_vision {
+        return Err(format!(
+            "vision_mode=on: no vision tower resolved for {model_path} \
+             (no explicit sidecar and no <stem>.vl sibling found)"
+        ));
+    }
     let is_vl = vl_path.is_some() || has_inline_vision;
 
     // Read vision_config from the .vl file when present, else from the trunk.
@@ -1708,37 +1743,18 @@ pub fn is_vision_hfq(hfq: &HfqFile) -> bool {
 ///
 /// Discovery order:
 /// 1. `HIPFIRE_VL_FILE` env var — explicit override (any path)
-/// 2. `<stem>.vl` sibling next to the trunk model
+/// 2. `<stem>.vl` sibling next to the trunk model, where `<stem>` also
+///    strips `.hfq` and a quant suffix (`model.mq4v2.hfq` → `model.vl`)
 ///
 /// Returns `None` when no .vl file is found (caller falls back to inline
 /// vision tensors in the trunk for backward compat).
+///
+/// The probe list lives in [`hipfire_runtime::sidecar`] so the daemon, the
+/// loader and the CLI capability advertisement cannot drift apart — they
+/// already had three copies, and the `.vl` copies had lost the quant-suffix
+/// stripping the `.mtp` probe has.
 fn discover_vl_sidecar(model_path: &str) -> Option<PathBuf> {
-    if let Ok(v) = std::env::var("HIPFIRE_VL_FILE") {
-        let p = PathBuf::from(&v);
-        if p.exists() {
-            return Some(p);
-        }
-        // An explicitly-set override that doesn't exist is almost certainly a
-        // typo — silently falling through to sibling discovery hides it.
-        if !v.trim().is_empty() {
-            eprintln!(
-                "[daemon/vl] HIPFIRE_VL_FILE is set to {v:?} but the file does \
-                 not exist; falling back to <stem>.vl sibling discovery"
-            );
-        }
-    }
-    let base = std::path::Path::new(model_path);
-    match (base.parent(), base.file_stem()) {
-        (Some(parent), Some(stem)) => {
-            let vl = parent.join(format!("{}.vl", stem.to_string_lossy()));
-            if vl.exists() {
-                Some(vl)
-            } else {
-                None
-            }
-        }
-        _ => None,
-    }
+    hipfire_runtime::sidecar::resolve_vl_sidecar(model_path)
 }
 
 pub fn validate_load_caps(msg: &serde_json::Value) -> Option<String> {
@@ -1983,9 +1999,16 @@ pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
     // behavior must never be refused at the door.
     // Fields the wire accepts but the engine never reads must be refused,
     // not silently dropped: `n: 2` returning one completion is a silent
-    // semantic downgrade (spec §7.1).
-    if msg.get("n").and_then(|v| v.as_u64()).is_some_and(|n| n != 1) {
-        return Some("n != 1 not supported in experimental multi-slot".to_string());
+    // semantic downgrade (spec §7.1). The check reads the value as a NUMBER,
+    // not as a u64: `n: 2.5` / `n: -1` deserialise as f64, and an `as_u64`
+    // gate let both through as a silent single completion — the same
+    // downgrade, spelled differently. Anything present that is not exactly
+    // numeric 1 is refused (a string `n` cannot be honoured either).
+    match msg.get("n") {
+        None => {}
+        Some(v) if v.is_null() => {}
+        Some(v) if v.as_f64() == Some(1.0) => {}
+        Some(_) => return Some("n != 1 not supported in experimental multi-slot".to_string()),
     }
     if msg.get("best_of").is_some_and(|v| !v.is_null()) {
         return Some("best_of not supported in experimental multi-slot".to_string());
@@ -1993,8 +2016,14 @@ pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
     if msg.get("logit_bias").is_some_and(|v| !v.is_null()) {
         return Some("logit_bias not supported in experimental multi-slot".to_string());
     }
-    if msg.get("echo").and_then(|v| v.as_bool()) == Some(true) {
-        return Some("echo not supported in experimental multi-slot".to_string());
+    // `echo: false` (the OpenAI default, which this route honours by simply
+    // not echoing) passes; `echo: true` and any non-boolean spelling (whose
+    // intent cannot be read) are refused rather than silently ignored.
+    match msg.get("echo") {
+        None => {}
+        Some(v) if v.is_null() => {}
+        Some(v) if v.as_bool() == Some(false) => {}
+        Some(_) => return Some("echo not supported in experimental multi-slot".to_string()),
     }
     if msg.get("suffix").is_some_and(|v| !v.is_null()) {
         return Some("suffix not supported in experimental multi-slot".to_string());
@@ -2567,11 +2596,29 @@ mod tests {
     }
 
     #[test]
-    fn generate_caps_rejects_tool_results() {
-        let m = json!({"messages": [{"role": "tool", "content": "result"}], "experimental_multi_slot": true});
-        assert!(validate_generate_caps(&m).is_some());
-        let m2 = json!({"messages": [{"role": "assistant", "tool_calls": [{"id": "1", "type": "function", "function": {"name": "f"}}]}], "experimental_multi_slot": true});
-        assert!(validate_generate_caps(&m2).is_some());
+    fn generate_caps_accepts_tool_turns_and_refuses_tools_with_images() {
+        // Tool turns are SUPPORTED on the slot route (upstream ad6004ac0:
+        // the daemon projects role=tool into the Jinja message list and the
+        // tool-call parser emits `tool_calls`). The gate that used to refuse
+        // a bare tool message is gone; the surviving refusal is the
+        // images+tools COMBINATION (the VL prompt path splices image pads
+        // into a user body and cannot render a tool contract).
+        let tool_turn = json!({"messages": [{"role": "tool", "content": "result",
+                                             "tool_call_id": "call_1"}],
+                               "experimental_multi_slot": true});
+        assert!(
+            validate_generate_caps(&tool_turn).is_none(),
+            "tool-result turns are supported and must not be refused here"
+        );
+        let assistant_call = json!({"messages": [{"role": "assistant", "tool_calls": [
+                                        {"id": "1", "function": {"name": "f"}}]}],
+                                    "experimental_multi_slot": true});
+        assert!(validate_generate_caps(&assistant_call).is_none());
+        let both = json!({"image_base64": "abcd", "tools": [{"type": "function"}],
+                          "experimental_multi_slot": true});
+        let reason = validate_generate_caps(&both)
+            .expect("images+tools must stay refused (no VL tool contract)");
+        assert!(reason.contains("images and tools"), "unexpected: {reason}");
     }
 
     #[test]
@@ -2659,11 +2706,45 @@ mod tests {
         assert!(validate_generate_caps(&m2).is_some());
         let m3 = json!({"logprobs": true, "experimental_multi_slot": true});
         assert!(validate_generate_caps(&m3).is_some());
-        let m4 = json!({"max_think_tokens": 5, "experimental_multi_slot": true});
-        assert!(validate_generate_caps(&m4).is_some());
-        let m5 = json!({"max_think_tokens": 1, "experimental_multi_slot": true});
-        assert!(validate_generate_caps(&m5).is_none());
+        // Finite think caps are ENFORCED (the grammar cursor force-closes the
+        // span at the budget) and are therefore never refused at the door —
+        // including the `1` no-thinking sentinel, whose contradiction with an
+        // open-think framing is raised later, in `handle_generate`'s projected
+        // reasoning authority, not by this wire-cap gate.
+        for cap in [json!(1), json!(5)] {
+            let m = json!({"max_think_tokens": cap, "experimental_multi_slot": true});
+            assert!(
+                validate_generate_caps(&m).is_none(),
+                "max_think_tokens={cap} is enforced, not refused"
+            );
+        }
     }
+    #[test]
+    fn generate_caps_rejects_every_non_unit_spelling_of_n_and_echo() {
+        // `n` is refused unless it is exactly the number 1: an `as_u64` gate
+        // silently accepted `2.5`/`-1`/"2" as a single completion (the
+        // semantic downgrade the refusal exists to prevent).
+        for bad in [json!(2), json!(2.5), json!(-1), json!(0), json!("2")] {
+            let m = json!({"n": bad, "experimental_multi_slot": true});
+            assert!(
+                validate_generate_caps(&m).is_some(),
+                "n={bad} must be refused, not silently downgraded to one completion"
+            );
+        }
+        assert!(validate_generate_caps(&json!({"n": 1, "experimental_multi_slot": true})).is_none());
+        assert!(validate_generate_caps(&json!({"n": null, "experimental_multi_slot": true})).is_none());
+        // `echo: false` is the OpenAI default this route honours by not
+        // echoing; `true` and non-boolean spellings are refused.
+        assert!(
+            validate_generate_caps(&json!({"echo": false, "experimental_multi_slot": true}))
+                .is_none()
+        );
+        for bad in [json!(true), json!(1)] {
+            let m = json!({"echo": bad, "experimental_multi_slot": true});
+            assert!(validate_generate_caps(&m).is_some(), "echo={bad} must be refused");
+        }
+    }
+
     #[test]
     fn generate_caps_accepts_valid_json_schema_rejects_unsupported() {
         // A valid subset schema (object with typed properties) is accepted at
@@ -2677,12 +2758,21 @@ mod tests {
             validate_generate_caps(&m).is_none(),
             "valid json_schema response_format should be accepted"
         );
-        // Non-json_schema response_format (text) is not rejected by this guard.
+        // `response_format: {"type":"text"}` is OpenAI's DEFAULT type and
+        // means "unconstrained". The gateway maps it to "no response_format"
+        // before the wire (verified: E15 accepts it with HTTP 200), so a
+        // `text` type arriving at the DAEMON door is a second, ambiguous
+        // meaning and is refused rather than silently reinterpreted.
         let m2 = json!({
             "response_format": {"type": "text"},
             "experimental_multi_slot": true
         });
-        assert!(validate_generate_caps(&m2).is_none(), "text response_format should not be rejected here");
+        let reason = validate_generate_caps(&m2)
+            .expect("a text response_format must be refused at the daemon door");
+        assert!(
+            reason.contains("is not supported"),
+            "unexpected: {reason}"
+        );
         // Unsupported $ref is rejected before submit (spec §7 G1, §5.4 S4).
         let m3 = json!({
             "response_format": {"type": "json_schema", "json_schema": {"name": "test", "schema": {"$ref": "#/$defs/foo"}}},

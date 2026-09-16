@@ -32,7 +32,7 @@ fn main() {
     use hipfire_arch_qwen35::qwen35::{
         self, DeltaNetState, LayerType, PrefillBatchScratch, Qwen35Scratch, Qwen35Weights,
     };
-    use hipfire_arch_qwen35::scheduler::{PendingWork, Scheduler};
+    use hipfire_arch_qwen35::scheduler::{PendingWork, Scheduler, SpecKind};
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::swap::snapshot::{
         capture_slot, restore_slot, SlotSnapshot, SnapshotStamp,
@@ -127,19 +127,20 @@ fn main() {
         next_pos: 0,
         decoding: false,
         vl_prefill: None,
-        mtp_active: false,
-        mtp_committed: 0,
-        mtp_cycles: 0,
-        mtp_retire_fails: 0,
+        spec: SpecKind::None,
+        spec_cycles: 0,
+        spec_committed: 0,
+        spec_retire_fails: 0,
         pos3_delta: 0,
     }];
     let mut sched = Scheduler {
         chunk_size: prompt.len(),
         vl_sequential: false,
+        prefill_cursor: 0,
     };
     let kv_tier = hipfire_arch_qwen35::forward_slots::SlotKvTier::q8();
     let mut graph = SlotDecodeGraph::new();
-    let batch = sched.next_batch(&mut work);
+    let batch = sched.next_batch(&mut work, usize::MAX, 1);
     forward_batch_slots_graphed(
         &mut gpu,
         &weights,

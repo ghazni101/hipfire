@@ -47,6 +47,8 @@ fn main() {
         wait_max_bytes: 256 * 1024 * 1024,
         queue_timeout_ms: 30_000,
         structured_jump_forward: false,
+        dflash_draft: None,
+        dflash_required: false,
     })
     .expect("spawn");
     println!("engine up: 2 slots, submitting {n} concurrent requests");
@@ -74,6 +76,7 @@ fn main() {
                     visual_data: None,
                     json_schema: None,
                     started_in_think: false,
+                    think_budget: 0,
                     queue_bytes: 0,
                     request_tag: 0xA13_000 + i as u64,
                     reply: tx,

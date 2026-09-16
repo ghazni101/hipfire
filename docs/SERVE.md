@@ -395,7 +395,7 @@ hipfire clients (and deployment tooling) use them for discovery:
     "prefix_cache": true,
     "structured_output": true,
     "structured_output_subset": "json-schema-strict-v1",
-    "refused_request_fields": ["tools", "stop", "logprobs", "response_format:json_object"]
+    "refused_request_fields": ["stop", "logprobs", "response_format:json_object"]
   }
 }
 ```

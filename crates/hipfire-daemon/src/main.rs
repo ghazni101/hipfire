@@ -525,6 +525,51 @@ fn apply_vision_mode_gate(vision_mode: &str, raw_vision: Option<String>) -> Opti
     }
 }
 
+/// Resolve the vision-tower ladder for a load request.
+///
+/// Returns `(vision_mode, gated_sidecar, suppressed_sidecar)`:
+/// `vision_mode` is `params.vision_mode` (default `off`); `gated_sidecar` is
+/// the `HIPFIRE_VISION_SIDECAR` (non-empty wins, empty opts out) →
+/// `params.vision` ladder result with `apply_vision_mode_gate` applied; and
+/// `suppressed_sidecar` is the explicit sidecar that `off` dropped, so the
+/// caller can name it in a later "no vision encoder" error.
+///
+/// Both load arms (ordinary and multi-slot) MUST use this — the multi-slot
+/// arm used to discover a `.vl` sibling of its own accord and never read
+/// either knob, so `vision_mode=off` still paid the tower's ~1 GB and
+/// `serve --vision` was silently ignored on that route.
+fn resolve_vision_ladder(msg: &serde_json::Value) -> (String, Option<String>, Option<String>) {
+    let vision_mode = msg
+        .get("params")
+        .and_then(|p| p.get("vision_mode"))
+        .and_then(|v| v.as_str())
+        .unwrap_or("off")
+        .to_string();
+    let env_vision = developer_var("HIPFIRE_VISION_SIDECAR").ok();
+    let raw_vision: Option<String> = match env_vision.as_deref() {
+        Some("") => None,
+        Some(p) => Some(p.to_string()),
+        None => msg
+            .get("params")
+            .and_then(|p| p.get("vision"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string()),
+    };
+    let suppressed = if vision_mode == "off" {
+        if let Some(v) = raw_vision.as_deref() {
+            eprintln!("[hipfire-daemon] vision_mode=off — skipping tower sidecar load ({v})");
+            Some(v.to_string())
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    let gated = apply_vision_mode_gate(&vision_mode, raw_vision);
+    (vision_mode, gated, suppressed)
+}
+
 /// Print a friendly, user-actionable message when Gpu::init fails. Matches
 /// the panic shape we used to emit (which dumped a Rust backtrace and the
 /// raw HipError debug-format) but turns it into a concrete next-step list.
@@ -1180,6 +1225,12 @@ fn main() {
                         slot_raw_draft
                     };
                     let slot_dflash_required = slot_dflash_mode == "on";
+                    // Vision tower: the SAME ladder the ordinary arm applies
+                    // (`vision_mode=off` is a hard override). The slot engine
+                    // discovers the `.vl` sibling itself, so it has to be told
+                    // the mode — otherwise the documented text-only default
+                    // still pays the tower's ~1 GB on this route.
+                    let (slot_vision_mode, slot_vision, _) = resolve_vision_ladder(&msg);
                     match slots::SlotBackend::load(
                         path,
                         n_slots,
@@ -1189,6 +1240,8 @@ fn main() {
                         &slot_kv_mode_raw,
                         slot_draft_path.map(std::path::PathBuf::from),
                         slot_dflash_required,
+                        &slot_vision_mode,
+                        slot_vision,
                     ) {
                         Ok(backend) => {
                             let arch = backend.arch_str().to_string();
@@ -1348,32 +1401,11 @@ fn main() {
                 // sidecar is skipped, so a default load never pays the +~1 GB
                 // tower VRAM. CLI-side gating is the primary path; this guard
                 // makes the flag durable for non-hipfire-CLI clients.
-                let vision_mode = msg
-                    .get("params")
-                    .and_then(|p| p.get("vision_mode"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("off");
-                let env_vision = developer_var("HIPFIRE_VISION_SIDECAR").ok();
-                let raw_vision: Option<String> = match env_vision.as_deref() {
-                    Some("") => None,
-                    Some(p) => Some(p.to_string()),
-                    None => msg
-                        .get("params")
-                        .and_then(|p| p.get("vision"))
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string()),
-                };
-                vision_gated_off = None;
-                if vision_mode == "off" {
-                    if let Some(v) = raw_vision.as_deref() {
-                        eprintln!(
-                            "[hipfire-daemon] vision_mode=off — skipping tower sidecar load ({v})"
-                        );
-                        vision_gated_off = Some(v.to_string());
-                    }
-                }
-                let vision_path: Option<String> = apply_vision_mode_gate(vision_mode, raw_vision);
+                //
+                // One implementation for both load arms: `resolve_vision_ladder`
+                // (next to `apply_vision_mode_gate`).
+                let (vision_mode, vision_path, gated_off) = resolve_vision_ladder(&msg);
+                vision_gated_off = gated_off;
                 // Gemma 4 EAGLE drafter (arch-22 `gemma4_unified_assistant`).
                 // Deliberately a SEPARATE param from `params.draft` (the
                 // qwen3.5 DFlash knob) so a DFlash .hfq can never be routed

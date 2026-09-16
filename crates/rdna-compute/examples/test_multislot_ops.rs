@@ -560,6 +560,7 @@ mod dn {
                 positions.len(),
                 Some(&descs_dev),
                 Some(&row_slot_dev),
+                false,
             )
             .expect("isolation write");
             gpu.hip.device_synchronize().expect("sync");
@@ -631,6 +632,7 @@ mod dn {
                 positions.len(),
                 Some(&descs_dev),
                 Some(&row_slot_dev),
+            false,
             )
             .expect("positive control write");
             gpu.hip.device_synchronize().expect("sync");
@@ -724,6 +726,7 @@ mod dn {
             positions.len(),
             Some(&descs_dev),
             Some(&row_slot_dev),
+        false,
         )
         .expect("negative-control write");
         gpu.hip.device_synchronize().expect("sync");
@@ -912,6 +915,7 @@ mod dn {
             positions_flat.len(),
             Some(&descs_dev),
             Some(&row_slot_dev),
+        false,
         )
         .expect("paged multi-slot kv write");
         gpu.hip.device_synchronize().expect("sync");
@@ -1015,6 +1019,7 @@ mod dn {
             positions.len(),
             Some(&descs_dev),
             Some(&row_slot_dev),
+        false,
         )
         .expect("paged isolation write");
         gpu.hip.device_synchronize().expect("sync");
@@ -1114,6 +1119,7 @@ mod dn {
             positions_flat.len(),
             Some(&descs_dev),
             Some(&row_slot_dev),
+        false,
         )
         .expect("paged kv write (attn setup)");
         gpu.hip.device_synchronize().expect("sync");

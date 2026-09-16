@@ -1052,7 +1052,7 @@ impl VisionTowerJob {
 
         // Diagnostic stage dumps (env-gated; see `vl_dump_slice`).
         let dump_dir: Option<std::path::PathBuf> =
-            std::env::var("HIPFIRE_VL_DUMP_DIR").ok().map(Into::into);
+            hipfire_config::developer_var("HIPFIRE_VL_DUMP_DIR").ok().map(Into::into);
         let dd = dump_dir.as_deref();
         if dd.is_some() {
             eprintln!(
@@ -1177,7 +1177,7 @@ impl VisionTowerJob {
         let t0 = std::time::Instant::now();
 
         let dump_dir: Option<std::path::PathBuf> =
-            std::env::var("HIPFIRE_VL_DUMP_DIR").ok().map(Into::into);
+            hipfire_config::developer_var("HIPFIRE_VL_DUMP_DIR").ok().map(Into::into);
         let dd = dump_dir.as_deref();
         if dd.is_some() {
             eprintln!(

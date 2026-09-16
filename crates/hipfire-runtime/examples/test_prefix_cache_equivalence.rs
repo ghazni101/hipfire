@@ -32,7 +32,7 @@ fn main() {
     use hipfire_arch_qwen35::qwen35::{
         self, DeltaNetState, LayerType, PrefillBatchScratch, Qwen35Scratch, Qwen35Weights,
     };
-    use hipfire_arch_qwen35::scheduler::{PendingWork, Scheduler};
+    use hipfire_arch_qwen35::scheduler::{PendingWork, Scheduler, SpecKind};
     use hipfire_runtime::admission::{AdmissionController, ModelFootprint};
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::session_table::SessionTable;
@@ -214,6 +214,7 @@ fn main() {
         let mut sched = Scheduler {
             chunk_size: chunk.max(1),
             vl_sequential: false,
+            prefill_cursor: 0,
         };
 
         // Prefill + decode driver shared by the warm turn and the real turn.
@@ -232,10 +233,10 @@ fn main() {
                 next_pos: start_pos,
                 decoding: false,
                 vl_prefill: None,
-                mtp_active: false,
-                mtp_committed: 0,
-                mtp_cycles: 0,
-                mtp_retire_fails: 0,
+                spec: SpecKind::None,
+                spec_cycles: 0,
+                spec_committed: 0,
+                spec_retire_fails: 0,
                 pos3_delta: 0,
             }];
             let mut produced = Vec::new();
@@ -245,7 +246,7 @@ fn main() {
             // MIDDLE of the prompt, which silently corrupts the sequence.
             let steps = feed.len().div_ceil(sched.chunk_size.max(1)) + n_decode + 1;
             for _ in 0..steps {
-                let batch = sched.next_batch(&mut work);
+                let batch = sched.next_batch(&mut work, usize::MAX, 1);
                 if batch.is_empty() {
                     break;
                 }

@@ -159,6 +159,37 @@ fn flash_rows_per_block(batch_size: usize) -> usize {
         .unwrap_or(0)
 }
 
+/// `head_dim` envelope of a batched flash-tile kernel, inclusive.
+///
+/// The launcher-level check (`positive multiple of 32, <= 512`) describes the
+/// q8/bf16 tile kernels only: they carry `float mq[16]` with
+/// `dpt = head_dim / 32` dims per lane. The rotated tiers are narrower, and
+/// routing a wider head through them is a silent-wrong-attention class:
+///
+/// * `asym2`/`asym4`/`fwht2`/`fwht4` index `mq[8]` / `out_vec[8]` as
+///   `half * 4 + i` with `n_halves = head_dim / 128`, so head_dim must be
+///   128 or 256 (head_dim 384/512 writes past the arrays — device stack
+///   corruption).
+/// * `asym3`/`fwht3` hardwire 8 dims per lane (`d0 = tid * 8`) over a 3-bit
+///   packing, i.e. head_dim == 256.
+/// * `asym3_tile_hd512` early-returns unless `head_dim == 512`; a mismatch
+///   leaves the reduce folding stale partials, so 512 is the only sound value.
+/// * the asym4 WMMA variants document "supports {128, 256}".
+/// * everything else keeps the generic `[32, 512]` bound.
+fn batched_tile_head_dim_envelope(tile_func_name: &str) -> (usize, usize) {
+    match tile_func_name {
+        "attention_flash_asym3_tile_batched" | "attention_flash_fwht3_tile_batched" => (256, 256),
+        "attention_flash_asym3_tile_hd512_batched" => (512, 512),
+        "attention_flash_asym2_tile_batched"
+        | "attention_flash_asym4_tile_batched"
+        | "attention_flash_fwht2_tile_batched"
+        | "attention_flash_fwht4_tile_batched"
+        | "attention_flash_asym4_wmma_tile_batched"
+        | "attention_flash_asym4_wmma_tile_batched_gfx12" => (128, 256),
+        _ => (32, 512),
+    }
+}
+
 impl Gpu {
     /// DSpark bidirectional staging assembly (on-GPU; replaces a host
     /// d2h+assemble+h2d that forced ~2 stream syncs per stage).
@@ -6675,14 +6706,25 @@ impl Gpu {
         // The batched tile kernels hold per-lane register accumulators sized
         // for head_dim <= 512 (float mq[16] at 32 dims per lane) and compute
         // `dpt = head_dim / 32`, which silently truncates non-multiples of 32
-        // (dims past the truncation would never be accumulated). Inherited
-        // contract from the q8 batched kernel; every rotated tier routed
-        // through this launcher shares it.
+        // (dims past the truncation would never be accumulated). That bound
+        // describes the q8/bf16 tile kernels ONLY; the rotated tiers are
+        // narrower (see `batched_tile_head_dim_envelope`), so the envelope
+        // check below is the authority and this one stays as the shared
+        // multiple-of-32 floor.
         assert!(
             head_dim > 0 && head_dim % 32 == 0 && head_dim <= 512,
             "launch_asym_flash_batched ({tile_func_name}): batched tile \
              kernels require head_dim to be a positive multiple of 32 and \
              <= 512 (got {head_dim})"
+        );
+        let (hd_min, hd_max) = batched_tile_head_dim_envelope(tile_func_name);
+        assert!(
+            head_dim >= hd_min && head_dim <= hd_max,
+            "launch_asym_flash_batched ({tile_func_name}): head_dim {head_dim} \
+             is outside this kernel's envelope [{hd_min}, {hd_max}]. Routing a \
+             larger head through it writes past its per-lane register arrays \
+             (or early-returns, leaving the reduce to fold stale partials) — \
+             both are silent-wrong-attention classes, so refuse here instead."
         );
         // gfx1151 is the dev box; gfx1201 is the target. Never bake a tuned
         // constant into a `const` — see spec §11. Resolution lives in

@@ -29,7 +29,7 @@ fn main() {
     use hipfire_arch_qwen35::qwen35::{
         self, DeltaNetState, LayerType, PrefillBatchScratch, Qwen35Scratch, Qwen35Weights,
     };
-    use hipfire_arch_qwen35::scheduler::{PendingWork, Scheduler};
+    use hipfire_arch_qwen35::scheduler::{PendingWork, Scheduler, SpecKind};
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::swap::snapshot::{capture_slot, restore_slot, SnapshotStamp};
     use hipfire_runtime::swap::SwapManager;
@@ -166,20 +166,24 @@ fn main() {
             next_pos: start_pos,
             decoding: false,
             vl_prefill: None,
-            mtp_active: false,
-            mtp_committed: 0,
-            mtp_cycles: 0,
-            mtp_retire_fails: 0,
+            spec: SpecKind::None,
+            spec_cycles: 0,
+            spec_committed: 0,
+            spec_retire_fails: 0,
             pos3_delta: 0,
         }];
         let mut sched = Scheduler {
             chunk_size: feed.len().max(1),
             vl_sequential: false,
+            prefill_cursor: 0,
         };
         let mut graph = SlotDecodeGraph::new();
         let mut produced = Vec::new();
         for _ in 0..(1 + n_decode) {
-            let batch = sched.next_batch(&mut work);
+            // Row budget: this example runs a single slot, so give the
+            // scheduler an unbounded budget and the default prefill quantum —
+            // the take is still capped at `chunk_size`.
+            let batch = sched.next_batch(&mut work, usize::MAX, 1);
             if batch.is_empty() {
                 break;
             }

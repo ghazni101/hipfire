@@ -80,6 +80,9 @@ fn main() {
         wait_max_bytes: 256 * 1024 * 1024,
         queue_timeout_ms: 30_000,
         structured_jump_forward: false,
+        // No DFlash draft on this route (the oracle pins slot concurrency).
+        dflash_draft: None,
+        dflash_required: false,
     })
     .expect("SlotEngine::spawn");
     println!("engine up: {N_SLOTS} slots, {n_clients} clients, {MAX_TOKENS} tokens each");
@@ -110,7 +113,9 @@ fn main() {
                 visual_data: None,
                 json_schema: None,
                 started_in_think: false,
-        queue_bytes: 0,
+                think_budget: 0,
+                request_tag: 0,
+                queue_bytes: 0,
                 reply: tx,
             })
             .expect("submit");
