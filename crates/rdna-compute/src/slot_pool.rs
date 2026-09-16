@@ -313,6 +313,61 @@ impl SlotPool {
         Ok(())
     }
 
+    /// Grow `id`'s block table so it can hold `seq_len` tokens WITHOUT
+    /// publishing that length (the descriptor still reports its previous
+    /// `seq_len`, i32-validated the same way `set_seq_len` is). Split out of
+    /// [`Self::set_seq_len`] for the snapshot-restore path: pages must exist
+    /// before the payload is scattered into them, but no reader may observe a
+    /// raised length over rows that have not been restored yet.
+    ///
+    /// Pair with [`Self::publish_seq_len`] once the bytes are in place.
+    pub fn provision_pages_for(&mut self, id: SlotId, seq_len: usize) -> Result<(), String> {
+        if seq_len > self.cap_tokens {
+            return Err(format!(
+                "SlotPool: slot {} seq_len {} exceeds cap {}",
+                id.0, seq_len, self.cap_tokens
+            ));
+        }
+        if seq_len > i32::MAX as usize {
+            return Err(format!(
+                "SlotPool: slot {} seq_len {} exceeds the i32 descriptor ABI",
+                id.0, seq_len
+            ));
+        }
+        if let Some(pool) = self.page_pool.as_mut() {
+            let bt = self
+                .block_tables[id.0]
+                .as_mut()
+                .ok_or_else(|| format!("SlotPool: slot {} has no block table", id.0))?;
+            pool.ensure_capacity(bt, seq_len)?;
+            self.block_tables_dirty[id.0] = true;
+        }
+        Ok(())
+    }
+
+    /// Publish a slot's descriptor `seq_len` (the length readers/kernels see)
+    /// after [`Self::provision_pages_for`] and the data copy have both
+    /// completed. No allocation happens here.
+    pub fn publish_seq_len(&mut self, id: SlotId, seq_len: usize) -> Result<(), String> {
+        if seq_len > self.cap_tokens {
+            return Err(format!(
+                "SlotPool: slot {} seq_len {} exceeds cap {}",
+                id.0, seq_len, self.cap_tokens
+            ));
+        }
+        if seq_len > i32::MAX as usize {
+            return Err(format!(
+                "SlotPool: slot {} seq_len {} exceeds the i32 descriptor ABI",
+                id.0, seq_len
+            ));
+        }
+        if self.descs[id.0].seq_len != seq_len as i32 {
+            self.descs[id.0].seq_len = seq_len as i32;
+            self.dirty = true;
+        }
+        Ok(())
+    }
+
     pub fn descriptors(&self) -> &[KvSlotDesc] {
         &self.descs
     }
@@ -434,6 +489,17 @@ impl SlotPool {
         dst: SlotId,
         n_pages: usize,
     ) -> Result<(), String> {
+        // Every final validation runs BEFORE any mutation. The pool's own
+        // refusal arms are contractually non-mutating; this wrapper's cap arm
+        // used to run AFTER the pages were already shared into dst, so a
+        // refused share left dst holding shared sealed pages.
+        let live = n_pages * PAGE_TOKENS;
+        if live > self.cap_tokens {
+            return Err(format!(
+                "share_prefix: {n_pages} pages ({live} tokens) exceed dst cap {}",
+                self.cap_tokens
+            ));
+        }
         // Snapshot src's table (a small Vec<u32>) so the PagePool call sees a
         // stable copy instead of fighting the field borrows.
         let src_snap = self
@@ -456,13 +522,6 @@ impl SlotPool {
         // table with shared pages but live_tokens == 0 would upload fine and
         // then silently attend to nothing until the next write-frontier
         // provision happened to fix it.
-        let live = n_pages * PAGE_TOKENS;
-        if live > self.cap_tokens {
-            return Err(format!(
-                "share_prefix: {n_pages} pages ({live} tokens) exceed dst cap {}",
-                self.cap_tokens
-            ));
-        }
         dst_bt.set_live_tokens(live);
         self.descs[dst.0].seq_len = live as i32;
         self.block_tables_dirty[dst.0] = true;
@@ -493,6 +552,16 @@ impl SlotPool {
         dst: SlotId,
         phys_pages: &[u32],
     ) -> Result<(), String> {
+        // Validate everything that can refuse BEFORE the first mutation: a
+        // refused share must leave dst holding no pages and no refs.
+        let live = phys_pages.len() * PAGE_TOKENS;
+        if live > self.cap_tokens {
+            return Err(format!(
+                "share_published_pages: {} pages ({live} tokens) exceed dst cap {}",
+                phys_pages.len(),
+                self.cap_tokens
+            ));
+        }
         let pool = self
             .page_pool
             .as_mut()
@@ -510,16 +579,11 @@ impl SlotPool {
             ));
         }
         for &phys in phys_pages {
+            pool.check_attachable(phys)?;
+        }
+        for &phys in phys_pages {
             pool.refcount_inc(phys)?;
             bt.push_page(phys);
-        }
-        let live = phys_pages.len() * PAGE_TOKENS;
-        if live > self.cap_tokens {
-            return Err(format!(
-                "share_published_pages: {} pages ({live} tokens) exceed dst cap {}",
-                phys_pages.len(),
-                self.cap_tokens
-            ));
         }
         bt.set_live_tokens(live);
         self.descs[dst.0].seq_len = live as i32;

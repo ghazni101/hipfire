@@ -376,7 +376,13 @@ pub fn restore_slot(
         // Paged mode: ensure the slot has enough pages, then scatter the
         // contiguous payload back into the physical pages (K and V pages
         // sized by their own arena's stride).
-        pool.set_seq_len(slot, snap.seq_len)
+        //
+        // Ordering matters: provisioning grows the block table, but the
+        // descriptor's `seq_len` (what readers and kernels see) is published
+        // ONLY after every byte has landed. Publishing it here — before the
+        // copies — left a window where a concurrent reader observed a length
+        // over rows that had not been restored.
+        pool.provision_pages_for(slot, snap.seq_len)
             .map_err(|e| SwapError::Gpu(e))?;
         let bt = pool
             .block_table(slot)
@@ -449,10 +455,10 @@ pub fn restore_slot(
             .map_err(|e| SwapError::Gpu(e.to_string()))?;
         off += n;
     }
-    if !pool.is_paged() {
-        pool.set_seq_len(slot, snap.seq_len)
-            .map_err(|e| SwapError::Gpu(e))?;
-    }
+    // Both modes publish the new length LAST, after the KV payload and the
+    // recurrent-state buffers (`extra`) are in place.
+    pool.set_seq_len(slot, snap.seq_len)
+        .map_err(|e| SwapError::Gpu(e))?;
     Ok(())
 }
 

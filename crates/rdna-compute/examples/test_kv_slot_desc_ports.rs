@@ -581,6 +581,275 @@ fn q8_v_base_check(gpu: &mut Gpu, rng: &mut Rng) {
     let _ = (src, pos, rs_one, cand_dev, ref_dev, neg_dev);
 }
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Paged (block-table) arm
+//
+// The checks above all run LEGACY (page_tokens = 0) descriptors, so nothing
+// here proved that the rotated tiers' paged indirection works: the batched K
+// writers and the tile-batched attention kernels resolve their destination
+// through `kv_offset_for_k/v(desc, pos, stride)`, which switches to a block
+// table lookup the moment `page_tokens != 0`. This arm drives that path for
+// real: scattered, non-monotonic physical page tables, a write through the
+// paged descriptors, a gather of the referenced pages into an equivalent
+// contiguous arena, and a comparison of the paged attention output against
+// the legacy output over those identical logical bytes. It also asserts that
+// pages NO table references stay byte-for-byte untouched.
+// ─────────────────────────────────────────────────────────────────────────────
+
+/// Tokens per physical page for the paged arm (the production page size).
+const PAGE_TOKENS: usize = 128;
+/// Physical pages per arena; slots reference 4 of them, 2 stay bystanders.
+const PAGED_PAGES: usize = 6;
+/// Non-monotonic page tables: logical page 0 maps AWAY from physical 0, so a
+/// kernel that ignored the table (pos * stride) lands in the wrong bytes.
+const SLOT_TABLES: [[i32; 2]; SLOTS] = [[4, 1], [3, 0]];
+
+fn paged_descs(gpu: &Gpu, tables: &[GpuTensor; SLOTS]) -> GpuTensor {
+    let descs: Vec<KvSlotDesc> = (0..SLOTS)
+        .map(|s| KvSlotDesc {
+            block_table: tables[s].buf.as_ptr() as u64,
+            legacy_k_base: 0,
+            legacy_v_base: 0,
+            seq_len: (2 * PAGE_TOKENS) as i32,
+            page_tokens: PAGE_TOKENS as i32,
+        })
+        .collect();
+    let mut bytes = pack_descs(&descs);
+    while bytes.len() % 4 != 0 {
+        bytes.push(0);
+    }
+    upload_raw(gpu, &bytes)
+}
+
+/// Gather the physical pages a table references into logical page order.
+fn gather_logical(raw: &[u8], table: &[i32; 2], page_bytes: usize) -> Vec<u8> {
+    let mut out = Vec::with_capacity(2 * page_bytes);
+    for &phys in table.iter() {
+        let start = phys as usize * page_bytes;
+        out.extend_from_slice(&raw[start..start + page_bytes]);
+    }
+    out
+}
+
+/// One page's worth of poison for a tier (NaN norm header / NaN Q8 scale), so
+/// any stray write into an unreferenced page is observable.
+fn poison_page_k(tier: &str, rng: &mut Rng) -> Vec<u8> {
+    let page_bytes = PAGE_TOKENS * k_bytes_per_pos(tier);
+    let slab = k_slab(tier, rng, true);
+    let mut out = Vec::with_capacity(page_bytes);
+    for t in 0..PAGE_TOKENS {
+        let row = &slab[t * k_bytes_per_pos(tier)..(t + 1) * k_bytes_per_pos(tier)];
+        out.extend_from_slice(row);
+    }
+    out
+}
+
+fn poison_page_v(rng: &mut Rng) -> Vec<u8> {
+    let page_bytes = PAGE_TOKENS * v_bytes_per_pos();
+    let slab = v_slab(rng, true);
+    let mut out = Vec::with_capacity(page_bytes);
+    for t in 0..PAGE_TOKENS {
+        let row = &slab[t * v_bytes_per_pos()..(t + 1) * v_bytes_per_pos()];
+        out.extend_from_slice(row);
+    }
+    out
+}
+
+/// Write the step's rows through the tier's composite slots writer with a
+/// PAGED descriptor (block table, page_tokens > 0).
+#[allow(clippy::too_many_arguments)]
+fn paged_write(
+    gpu: &mut Gpu,
+    tier: &str,
+    t: &Tables,
+    k_dst: &GpuTensor,
+    v_dst: &GpuTensor,
+    k_src: &GpuTensor,
+    v_src: &GpuTensor,
+    pos: &GpuTensor,
+    row_slot: &GpuTensor,
+    descs: &GpuTensor,
+) {
+    match tier {
+        "asym2" => gpu.kv_cache_write_asym2_batched_slots(
+            k_dst, v_dst, k_src, v_src, pos, &t.cos, &t.sin, N_KV_HEADS, HEAD_DIM, BATCH,
+            Some(descs), Some(row_slot),
+        ),
+        "asym3" => gpu.kv_cache_write_asym3_batched_slots(
+            k_dst, v_dst, k_src, v_src, pos, &t.cos, &t.sin, N_KV_HEADS, HEAD_DIM, BATCH,
+            Some(descs), Some(row_slot),
+        ),
+        "asym4" => gpu.kv_cache_write_asym4_batched_slots(
+            k_dst, v_dst, k_src, v_src, pos, &t.cos, &t.sin, N_KV_HEADS, HEAD_DIM, BATCH,
+            Some(descs), Some(row_slot),
+        ),
+        "fwht2" => gpu.kv_cache_write_fwht2_batched_slots(
+            k_dst, v_dst, k_src, v_src, pos, &t.signs1, &t.signs2, N_KV_HEADS, HEAD_DIM, BATCH,
+            Some(descs), Some(row_slot),
+        ),
+        "fwht3" => gpu.kv_cache_write_fwht3_batched_slots(
+            k_dst, v_dst, k_src, v_src, pos, &t.signs1, &t.signs2, N_KV_HEADS, HEAD_DIM, BATCH,
+            Some(descs), Some(row_slot),
+        ),
+        "fwht4" => gpu.kv_cache_write_fwht4_batched_slots(
+            k_dst, v_dst, k_src, v_src, pos, &t.signs1, &t.signs2, N_KV_HEADS, HEAD_DIM, BATCH,
+            Some(descs), Some(row_slot),
+        ),
+        other => panic!("unknown tier {other}"),
+    }
+    .expect("paged composite write");
+    gpu.hip.device_synchronize().expect("sync");
+}
+
+/// Attention over the given (paged or legacy) descriptors for one tier.
+#[allow(clippy::too_many_arguments)]
+fn attend(
+    gpu: &mut Gpu,
+    tier: &str,
+    t: &Tables,
+    q: &GpuTensor,
+    k: &GpuTensor,
+    v: &GpuTensor,
+    out: &GpuTensor,
+    pos: &GpuTensor,
+    partials: &GpuTensor,
+    seq: usize,
+    descs: &GpuTensor,
+    row_slot: &GpuTensor,
+) {
+    match tier {
+        "asym2" => gpu.attention_flash_asym2_batched_slots(
+            q, k, v, out, pos, &t.cos, &t.sin, N_HEADS, N_KV_HEADS, HEAD_DIM, seq, seq, BATCH,
+            partials, Some(descs), Some(row_slot),
+        ),
+        "asym3" => gpu.attention_flash_asym3_batched_masked_slots(
+            q, k, v, out, pos, &t.cos, &t.sin, N_HEADS, N_KV_HEADS, HEAD_DIM, seq, seq, BATCH,
+            partials, None, 0, 0, Some(descs), Some(row_slot),
+        ),
+        "asym4" => gpu.attention_flash_asym4_batched_masked_slots(
+            q, k, v, out, pos, &t.cos, &t.sin, N_HEADS, N_KV_HEADS, HEAD_DIM, seq, seq, BATCH,
+            partials, None, 0, 0, Some(descs), Some(row_slot),
+        ),
+        "fwht2" => gpu.attention_flash_fwht2_batched_slots(
+            q, k, v, out, pos, &t.signs1, &t.signs2, N_HEADS, N_KV_HEADS, HEAD_DIM, seq, seq,
+            BATCH, partials, Some(descs), Some(row_slot),
+        ),
+        "fwht3" => gpu.attention_flash_fwht3_batched_masked_slots(
+            q, k, v, out, pos, &t.signs1, &t.signs2, N_HEADS, N_KV_HEADS, HEAD_DIM, seq, seq,
+            BATCH, partials, None, 0, 0, 8, Some(descs), Some(row_slot),
+        ),
+        "fwht4" => gpu.attention_flash_fwht4_batched_masked_slots(
+            q, k, v, out, pos, &t.signs1, &t.signs2, N_HEADS, N_KV_HEADS, HEAD_DIM, seq, seq,
+            BATCH, partials, None, 0, 0, Some(descs), Some(row_slot),
+        ),
+        other => panic!("unknown tier {other}"),
+    }
+    .expect("paged attention");
+    gpu.hip.device_synchronize().expect("sync");
+}
+
+/// Returns (attention parity, stray-write free, gather parity).
+fn paged_rotated_check(gpu: &mut Gpu, tier: &str, t: &Tables, rng: &mut Rng) -> (f32, bool, bool) {
+    let page_k = PAGE_TOKENS * k_bytes_per_pos(tier);
+    let page_v = PAGE_TOKENS * v_bytes_per_pos();
+
+    // Poison every physical page; the write must only touch pages a table
+    // references, and only at the offsets the table maps.
+    let k_page = poison_page_k(tier, rng);
+    let v_page = poison_page_v(rng);
+    let mut k_arena: Vec<u8> = Vec::with_capacity(PAGED_PAGES * page_k);
+    let mut v_arena: Vec<u8> = Vec::with_capacity(PAGED_PAGES * page_v);
+    for _ in 0..PAGED_PAGES {
+        k_arena.extend_from_slice(&k_page);
+        v_arena.extend_from_slice(&v_page);
+    }
+    let k_poison_snapshot = k_arena.clone();
+    let v_poison_snapshot = v_arena.clone();
+
+    let k_paged = upload_raw(gpu, &k_arena);
+    let v_paged = upload_raw(gpu, &v_arena);
+
+    // One device block table per slot.
+    let tables: [GpuTensor; SLOTS] = std::array::from_fn(|s| {
+        upload_raw(gpu, &i32_bytes(&SLOT_TABLES[s]))
+    });
+    let descs_paged = paged_descs(gpu, &tables);
+    // Rows alternate slots; positions span both logical pages.
+    let row_slot = upload_raw(gpu, &i32_bytes(&[0, 0, 1, 1]));
+    let pos = positions_dev(gpu);
+
+    let k_src = upload_f32(gpu, &rand_f32_vec(BATCH * N_KV_HEADS * HEAD_DIM, rng));
+    let v_src = upload_f32(gpu, &rand_f32_vec(BATCH * N_KV_HEADS * HEAD_DIM, rng));
+
+    paged_write(gpu, tier, t, &k_paged, &v_paged, &k_src, &v_src, &pos, &row_slot, &descs_paged);
+
+    let k_after = download_raw(gpu, &k_paged);
+    let v_after = download_raw(gpu, &v_paged);
+
+    // Bystander pages (2, 5) are referenced by no table: any change is a
+    // stray write through unmapped addressing.
+    let mut stray = false;
+    for bystander in [2usize, 5] {
+        let ks = bystander * page_k;
+        let vs = bystander * page_v;
+        if k_after[ks..ks + page_k] != k_poison_snapshot[ks..ks + page_k]
+            || v_after[vs..vs + page_v] != v_poison_snapshot[vs..vs + page_v]
+        {
+            stray = true;
+        }
+    }
+
+    // Gather the referenced pages into logical order: the same logical bytes
+    // a legacy contiguous arena would hold.
+    let mut legacy_k: Vec<u8> = Vec::with_capacity(SLOTS * 2 * page_k);
+    let mut legacy_v: Vec<u8> = Vec::with_capacity(SLOTS * 2 * page_v);
+    for s in 0..SLOTS {
+        legacy_k.extend_from_slice(&gather_logical(&k_after, &SLOT_TABLES[s], page_k));
+        legacy_v.extend_from_slice(&gather_logical(&v_after, &SLOT_TABLES[s], page_v));
+    }
+    let k_legacy = upload_raw(gpu, &legacy_k);
+    let v_legacy = upload_raw(gpu, &legacy_v);
+    let descs_legacy = slab_descs(
+        gpu,
+        [0, (2 * page_k) as u64],
+        [0, (2 * page_v) as u64],
+    );
+
+    // Parity: paged read over the scattered arena vs legacy read over the
+    // gathered copy of exactly those bytes.
+    let q = upload_f32(gpu, &rand_f32_vec(BATCH * N_HEADS * HEAD_DIM, rng));
+    let partials = partials_dev(gpu);
+    let out_paged = out_dev(gpu);
+    let out_legacy = out_dev(gpu);
+    let seq = 2 * PAGE_TOKENS;
+    attend(gpu, tier, t, &q, &k_paged, &v_paged, &out_paged, &pos, &partials, seq, &descs_paged, &row_slot);
+    attend(gpu, tier, t, &q, &k_legacy, &v_legacy, &out_legacy, &pos, &partials, seq, &descs_legacy, &row_slot);
+    let parity = max_abs_diff(gpu, &out_paged, &out_legacy);
+
+    // Gather parity: the logical bytes really are where the table says. A
+    // writer that ignored the table would have put the rows at their logical
+    // offsets instead, so re-deriving each written row through the table's
+    // own mapping is the check that the indirection was honored.
+    let mut gather_ok = true;
+    let slot_of_row = [0usize, 0, 1, 1];
+    let row_bytes = k_bytes_per_pos(tier);
+    for (row, &p_raw) in POSITIONS.iter().enumerate() {
+        let p = p_raw as usize;
+        let s = slot_of_row[row];
+        let gathered = gather_logical(&k_after, &SLOT_TABLES[s], page_k);
+        let off = p * row_bytes;
+        let written = &gathered[off..off + row_bytes];
+        let poison_row =
+            &k_page[(p % PAGE_TOKENS) * row_bytes..(p % PAGE_TOKENS + 1) * row_bytes];
+        if written == poison_row {
+            gather_ok = false;
+        }
+    }
+
+    (parity, !stray, gather_ok)
+}
+
 fn main() {
     let mut gpu = Gpu::init().expect("gpu init");
     let mut rng = Rng(0xC0FFEE);
@@ -591,13 +860,21 @@ fn main() {
         let t = upload_tables(&mut gpu, &mut rng);
         let (parity, understudy) = attn_checks(&mut gpu, tier, &t, &mut rng);
         let (mm, intact) = write_check(&mut gpu, tier, &t, &mut rng);
-        let ok = parity <= TOL && understudy <= TOL && mm == 0 && intact;
+        let (paged_parity, no_stray, gather_ok) = paged_rotated_check(&mut gpu, tier, &t, &mut rng);
+        let ok = parity <= TOL
+            && understudy <= TOL
+            && mm == 0
+            && intact
+            && paged_parity <= TOL
+            && no_stray
+            && gather_ok;
         if !ok {
             failures += 1;
         }
         println!(
             "  {tier:6} attn parity {parity:.3e} | understudy {understudy:.3e} | \
-             write mismatches {mm} | slot0 intact {intact}  {}",
+             write mismatches {mm} | slot0 intact {intact} | \
+             paged parity {paged_parity:.3e} | no stray {no_stray} | gather {gather_ok}  {}",
             if ok { "OK" } else { "FAIL" }
         );
         drop(t);

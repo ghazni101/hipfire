@@ -51,6 +51,10 @@ pub enum FairnessError {
         decode_lanes: u64,
         prefill_min_tokens: u64,
     },
+    /// `prefill_min_tokens == 0` — a zero minimum quantum admits zero-row
+    /// prefill grants and disables the sliver guard, livelocking the queue.
+    /// The minimum must be at least 1.
+    ZeroMinTokens,
     /// A request with the given id is already admitted.
     DuplicateId(u64),
     /// No request with the given id is currently admitted.
@@ -71,6 +75,7 @@ impl fmt::Display for FairnessError {
                 "fairness config invalid: max_batch_tokens ({max_batch_tokens}) \
                  < decode_lanes ({decode_lanes}) + prefill_min_tokens ({prefill_min_tokens})"
             ),
+            Self::ZeroMinTokens => write!(f, "prefill_min_tokens must be at least 1"),
             Self::DuplicateId(id) => write!(f, "request {id} already admitted"),
             Self::NotFound(id) => write!(f, "request {id} not found"),
             Self::RowOverflow => write!(f, "fairness row count overflow"),
@@ -228,6 +233,9 @@ impl FairQueue {
         decode_lanes: u64,
         prefill_min_tokens: u64,
     ) -> Result<Self, FairnessError> {
+        if prefill_min_tokens == 0 {
+            return Err(FairnessError::ZeroMinTokens);
+        }
         let min_budget = decode_lanes
             .checked_add(prefill_min_tokens)
             .ok_or(FairnessError::RowOverflow)?;
@@ -492,12 +500,9 @@ impl FairQueue {
                     break; // every prefilling request had a chance
                 }
                 let avail = match remaining_rows.checked_sub(used) {
-                    Some(a) => a,
-                    None => break,
+                    Some(a) if a > 0 => a,
+                    _ => break,
                 };
-                if avail < self.prefill_min_tokens {
-                    break; // cannot fit minimum prefill quantum
-                }
                 // Scan from cursor, find best prefilling candidate by
                 // fairness order. Cursor proximity is the implicit tie-break
                 // (earlier in scan = closer to cursor = preferred on ties).
@@ -507,6 +512,9 @@ impl FairQueue {
                     let idx = (start + i) % n;
                     let r = &self.requests[idx];
                     if r.uncached_prefill_tokens == 0 || served_ids.contains(&r.id) {
+                        continue;
+                    }
+                    if avail < self.prefill_min_tokens && r.uncached_prefill_tokens > avail {
                         continue;
                     }
                     match best {
@@ -951,6 +959,14 @@ mod tests {
         assert!(matches!(err, FairnessError::InvalidConfig { .. }));
     }
 
+    #[test]
+    fn constructor_rejects_zero_prefill_minimum() {
+        assert!(matches!(
+            FairQueue::new(4096, 4, 0),
+            Err(FairnessError::ZeroMinTokens)
+        ));
+    }
+
     /// Duplicate admit is rejected.
     #[test]
     fn duplicate_admit_rejected() {
@@ -1079,6 +1095,18 @@ mod tests {
         q.set_needs(1, false, 0, 0).unwrap();
         let sel = q.select(0, 512, 2);
         assert!(sel.grants.is_empty(), "2-row non-completing sliver stays refused");
+    }
+
+    #[test]
+    fn final_sub_minimum_prefill_fits_tight_remaining_budget() {
+        let mut q = queue(4096, 0, 512);
+        q.admit(1, "s1", 3).unwrap();
+        let sel = q.select(0, 512, 3);
+        assert_eq!(
+            sel.grants,
+            vec![Grant::Prefill { id: 1, rows: 3 }],
+            "a final prompt tail must progress even when the caller reserved the rest for verify rows"
+        );
     }
 
     /// Age is recomputed per round: a served request leaves the aged band

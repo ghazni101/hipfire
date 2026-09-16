@@ -152,6 +152,14 @@ pub enum DoneReason {
     ClientGone,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectClass {
+    Overload,
+    Validation,
+    Internal,
+    Cancel,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     /// `reused` — prompt tokens served from the session's existing KV;
@@ -172,6 +180,7 @@ pub enum Event {
         generated: usize,
     },
     Rejected {
+        class: RejectClass,
         reason: String,
     },
 }

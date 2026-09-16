@@ -22,7 +22,7 @@ use std::thread::JoinHandle;
 
 use hipfire_runtime::admission::{AdmissionController, AdmitError, ModelFootprint};
 use hipfire_runtime::serve::{
-    send_event, Continuation, DoneReason, EngineStats, Event, SubmitRequest,
+    send_event, Continuation, DoneReason, EngineStats, Event, RejectClass, SubmitRequest,
 };
 use hipfire_runtime::session_table::{SessionId, SessionTable};
 use hipfire_runtime::swap::snapshot::{capture_slot, restore_slot, SnapshotStamp};
@@ -607,11 +607,16 @@ impl Rig {
         let prefix_cache = cfg.prefix_cache;
         let paged_pages = if prefix_cache {
             let legacy_equivalent = cfg.n_slots * cfg.cap_tokens.div_ceil(PAGE_TOKENS);
+            // Cache-retained pages share the same physical pool as active slots.
+            // Keep one prefill chunk plus one page per slot available beyond
+            // the legacy active-session capacity so publication cannot consume
+            // the last page needed by an admitted request.
+            let cache_headroom = cfg.prefill_chunk.div_ceil(PAGE_TOKENS) + cfg.n_slots;
             Some(
                 hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED_PAGES")
                     .ok()
                     .and_then(|v| v.trim().parse::<usize>().ok())
-                    .unwrap_or(legacy_equivalent),
+                    .unwrap_or_else(|| legacy_equivalent.saturating_add(cache_headroom)),
             )
         } else {
             match hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED")
@@ -1828,6 +1833,9 @@ fn vision_tower_step(
         return Ok(false);
     }
     let j = job.take().expect("vision tower job present");
+    // `finish` consumes the job and frees its own device buffers on every
+    // error path (the tower's working set is neither pooled nor released by
+    // Drop, so a failed merger epilogue must not leak it).
     let emb = j
         .finish(gpu, weights, vconfig)
         .map_err(|e| format!("vision_forward: {e}"))?;
@@ -1837,9 +1845,10 @@ fn vision_tower_step(
     let bytes: &[u8] = unsafe {
         std::slice::from_raw_parts(emb.as_ptr() as *const u8, emb.len() * 4)
     };
-    gpu.hip
-        .memcpy_htod(&dev.buf, bytes)
-        .map_err(|e| format!("vl ext upload: {e}"))?;
+    if let Err(e) = gpu.hip.memcpy_htod(&dev.buf, bytes) {
+        let _ = gpu.free_tensor(dev);
+        return Err(format!("vl ext upload: {e}"));
+    }
     *vl_ext_devs.get_mut(s).expect("vl_ext_devs slot") = Some(dev);
     vl.embeddings = emb;
     vl.dim = config.dim;
@@ -2787,8 +2796,7 @@ fn commit_sampled_token(
         if grammar_incomplete && !matches!(reason, DoneReason::ClientGone) {
             let _ = send_event(
                 &f.reply,
-                Event::Rejected {
-                    reason: GrammarMaskError::Unsatisfiable.to_string(),
+                Event::Rejected { class: RejectClass::Validation, reason: GrammarMaskError::Unsatisfiable.to_string(),
                 },
             );
         } else {
@@ -2860,10 +2868,6 @@ struct InFlight {
     /// "requested" value — freezing the window at the first step's session
     /// length for the whole generation.
     repeat_window_req: usize,
-    /// Tokens reused from the cross-session prefix cache (spec §4.5).
-    /// 0 when prefix_cache is off or the lookup missed. Reported to
-    /// EngineStats.reused_tokens when the request completes.
-    reused_tokens: usize,
     /// Last page-aligned boundary published to the prefix cache for this
     /// request (spec §4.6 C6). Initialized to `reused` at admit time so
     /// that shared pages from a prefix cache hit are not re-published.
@@ -3218,8 +3222,7 @@ fn run_loop(
             if let Some(mut f) = f.take() {
                 let _ = send_event(
                     &f.reply,
-                    Event::Rejected {
-                        reason: reason.clone(),
+                    Event::Rejected { class: RejectClass::Internal, reason: reason.clone(),
                     },
                 );
                 release_pin_ticket(rig, &mut f.pin_ticket);
@@ -3298,8 +3301,7 @@ fn run_loop(
                 rig.wait_queue.remove(waiter_id);
                 let _ = send_event(
                     &parked.req.reply,
-                    Event::Rejected {
-                        reason: "serve queue timeout: request waited beyond \
+                    Event::Rejected { class: RejectClass::Overload, reason: "serve queue timeout: request waited beyond \
                                  the configured deadline"
                             .to_string(),
                     },
@@ -3360,8 +3362,7 @@ fn run_loop(
                     if let Some(mut f) = slots[s].take() {
                         let _ = send_event(
                             &f.reply,
-                            Event::Rejected {
-                                reason: reason.clone(),
+                            Event::Rejected { class: RejectClass::Internal, reason: reason.clone(),
                             },
                         );
                         release_pin_ticket(&mut rig, &mut f.pin_ticket);
@@ -3447,6 +3448,22 @@ fn run_loop(
                     }
                     continue;
                 }
+                if work[s].spec == crate::scheduler::SpecKind::Dflash
+                    && rig
+                        .dflash
+                        .as_ref()
+                        .is_some_and(|d| d.window.is_none() && work[s].next_pos >= d.ctx_capacity)
+                {
+                    // Legacy DFlash owns context-indexed draft buffers capped by
+                    // HIPFIRE_DFLASH_CTX_CAP. Past the cap the documented policy
+                    // is plain AR fallback, not an out-of-bounds scatter/assert.
+                    work[s].spec = crate::scheduler::SpecKind::None;
+                    if let Some(last) = work[s].remaining_prompt.last().copied() {
+                        work[s].remaining_prompt.clear();
+                        work[s].remaining_prompt.push(last);
+                    }
+                    continue;
+                }
                 if !spec_verify_fits_cap(work[s].next_pos, rig.spec_rows, rig.cap_tokens) {
                     // Context-cap guard: the batched verify writes spec_rows
                     // rows at next_pos..next_pos+spec_rows-1; a frontier
@@ -3492,8 +3509,7 @@ fn run_loop(
                             if let Some(mut f) = slots[s].take() {
                                 let _ = send_event(
                                     &f.reply,
-                                    Event::Rejected {
-                                        reason: reason.clone(),
+                                    Event::Rejected { class: RejectClass::Internal, reason: reason.clone(),
                                     },
                                 );
                                 release_pin_ticket(&mut rig, &mut f.pin_ticket);
@@ -3533,8 +3549,7 @@ fn run_loop(
                 rig.vl_tower_jobs[s] = job;
                 if let Err(reason) = outcome {
                     if let Some(mut f) = slots[s].take() {
-                        let _ = send_event(&f.reply, Event::Rejected {
-                            reason: reason.clone(),
+                        let _ = send_event(&f.reply, Event::Rejected { class: RejectClass::Internal, reason: reason.clone(),
                         });
                         release_pin_ticket(&mut rig, &mut f.pin_ticket);
                         rig.swap.forget(f.session.0);
@@ -3574,8 +3589,8 @@ fn run_loop(
         }
 
         let remaining_for_sched = max_batch_tokens
-            .saturating_sub(verify_rows as usize)
-            .max(0);
+            .min(rig.pbs.max_batch)
+            .saturating_sub(verify_rows as usize);
         // ── FairQueue select (spec §5.3 S3) ─────────────────────────────
         // The FairQueue decides WHO is eligible this tick (aged-first,
         // backfill, prefill cursor); the scheduler still decides HOW MANY
@@ -3777,6 +3792,57 @@ fn run_loop(
                 break 'serve;
             }
         }
+        // Provision every slot's write frontier before any COW or kernel work.
+        // If retained cache-only pages consumed the free list, evict unpinned
+        // radix leaves and retry once. `forward_batch_slots` repeats this call
+        // idempotently; doing it here turns capacity pressure into a per-request
+        // refusal instead of an engine-thread failure.
+        let mut provision_failed = Vec::new();
+        let mut row = 0usize;
+        for s in 0..n {
+            let m = batch.m_per_slot[s];
+            if m == 0 {
+                continue;
+            }
+            let frontier = batch.positions[row + m - 1] as usize + 1;
+            row += m;
+            let first = rig.pool.set_seq_len(SlotId(s), frontier);
+            if first.is_ok() {
+                continue;
+            }
+            if let (Some(idx), Some(pp)) =
+                (rig.prefix_index.as_mut(), rig.pool.page_pool_mut())
+            {
+                idx.evict_unpinned_leaves(pp, usize::MAX);
+                pp.drain_completed();
+            }
+            if let Err(error) = rig.pool.set_seq_len(SlotId(s), frontier) {
+                eprintln!("[serve] page provisioning refused slot {s}: {error}");
+                provision_failed.push(s);
+            }
+        }
+        if !provision_failed.is_empty() {
+            for &s in &provision_failed {
+                if let Some(mut f) = slots[s].take() {
+                    let _ = send_event(
+                        &f.reply,
+                        Event::Rejected { class: RejectClass::Overload, reason: "server capacity exhausted while reserving KV pages; retry later".to_owned(),
+                        },
+                    );
+                    release_pin_ticket(&mut rig, &mut f.pin_ticket);
+                    rig.swap.forget(f.session.0);
+                    let _ = rig.fair_queue.remove(f.session.0);
+                    rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
+                    clear_work_slot(&mut work[s]);
+                    clear_slot_vl_state(&mut rig, s);
+                }
+            }
+            rebuild_batch_excluding_failed(&mut batch, &provision_failed);
+            if batch.is_empty() {
+                continue;
+            }
+        }
+
         // ── COW write barrier (spec §4.3) ────────────────────────────────
         // Before KV write kernels: plan copy-on-write for each active slot's
         // block table over the write interval, execute the copies, and
@@ -3861,7 +3927,7 @@ fn run_loop(
                 let _ = m; // rows are dropped from the flat arrays below
                 if let Some(mut f) = slots[s].take() {
                     let reason = "COW reservation failed for this slot".to_string();
-                    let _ = send_event(&f.reply, Event::Rejected { reason });
+                    let _ = send_event(&f.reply, Event::Rejected { class: RejectClass::Internal, reason });
                     release_pin_ticket(&mut rig, &mut f.pin_ticket);
                     rig.swap.forget(f.session.0);
                     let _ = rig.fair_queue.remove(f.session.0);
@@ -3913,7 +3979,7 @@ fn run_loop(
                 if let Some(mut f) = slots[s].take() {
                     let reason =
                         "COW commit failed: table changed under the plan".to_string();
-                    let _ = send_event(&f.reply, Event::Rejected { reason });
+                    let _ = send_event(&f.reply, Event::Rejected { class: RejectClass::Internal, reason });
                     release_pin_ticket(&mut rig, &mut f.pin_ticket);
                     rig.swap.forget(f.session.0);
                     let _ = rig.fair_queue.remove(f.session.0);
@@ -4146,8 +4212,7 @@ fn run_loop(
                 if let Some(mut f) = f.take() {
                     let _ = send_event(
                         &f.reply,
-                        Event::Rejected {
-                            reason: reason.clone(),
+                        Event::Rejected { class: RejectClass::Internal, reason: reason.clone(),
                         },
                     );
                     release_pin_ticket(&mut rig, &mut f.pin_ticket);
@@ -4294,7 +4359,7 @@ fn run_loop(
         // resources at a safe boundary").
         for (s, reason) in grammar_failures {
             if let Some(mut f) = slots[s].take() {
-                let _ = send_event(&f.reply, Event::Rejected { reason: reason.clone() });
+                let _ = send_event(&f.reply, Event::Rejected { class: RejectClass::Internal, reason: reason.clone() });
                 release_pin_ticket(&mut rig, &mut f.pin_ticket);
                 rig.swap.forget(f.session.0);
                 let _ = rig.fair_queue.remove(f.session.0);
@@ -4522,8 +4587,7 @@ fn run_loop(
                         if let Some(mut f) = slots[s].take() {
                             let _ = send_event(
                                 &f.reply,
-                                Event::Rejected {
-                                    reason: reason.clone(),
+                                Event::Rejected { class: RejectClass::Internal, reason: reason.clone(),
                                 },
                             );
                             release_pin_ticket(&mut rig, &mut f.pin_ticket);
@@ -4591,8 +4655,7 @@ fn run_loop(
                         if let Some(mut f) = slots[s].take() {
                             let _ = send_event(
                                 &f.reply,
-                                Event::Rejected {
-                                    reason: reason.clone(),
+                                Event::Rejected { class: RejectClass::Internal, reason: reason.clone(),
                                 },
                             );
                             release_pin_ticket(&mut rig, &mut f.pin_ticket);
@@ -4704,8 +4767,7 @@ fn run_loop(
                 if grammar_incomplete && !matches!(reason, DoneReason::ClientGone) {
                     let _ = send_event(
                         &f.reply,
-                        Event::Rejected {
-                            reason: GrammarMaskError::Unsatisfiable.to_string(),
+                        Event::Rejected { class: RejectClass::Validation, reason: GrammarMaskError::Unsatisfiable.to_string(),
                         },
                     );
                 } else {
@@ -4804,8 +4866,7 @@ fn run_loop(
         if let Some(parked) = rig.parked_requests.remove(&waiter.id) {
             let _ = send_event(
                 &parked.req.reply,
-                Event::Rejected {
-                    reason: shutdown_reason.clone(),
+                Event::Rejected { class: RejectClass::Internal, reason: shutdown_reason.clone(),
                 },
             );
             lock_stats(&stats).note_rejected();
@@ -4867,8 +4928,7 @@ fn handle_command(
                     Err(we) => {
                         let _ = send_event(
                             &req.reply,
-                            Event::Rejected {
-                                reason: format!("serve queue full: {we}"),
+                            Event::Rejected { class: RejectClass::Overload, reason: format!("serve queue full: {we}"),
                             },
                         );
                         lock_stats(stats).note_rejected();
@@ -4894,8 +4954,7 @@ fn handle_command(
                     rig.wait_queue.remove(waiter_id);
                     let _ = send_event(
                         &parked.req.reply,
-                        Event::Rejected {
-                            reason: "cancelled while queued".to_string(),
+                        Event::Rejected { class: RejectClass::Cancel, reason: "cancelled while queued".to_string(),
                         },
                     );
                     lock_stats(stats).note_rejected();
@@ -5074,7 +5133,7 @@ fn admit(
 
     if let Some(vd) = req.visual_data.as_ref() {
         let reject = |reason: String| {
-            let _ = send_event(&req.reply, Event::Rejected { reason });
+            let _ = send_event(&req.reply, Event::Rejected { class: RejectClass::Validation, reason });
             lock_stats(stats).note_rejected();
         };
         if rig.vision_weights.is_none() {
@@ -5209,7 +5268,7 @@ fn admit(
                         extended.len(),
                         rig.cap_tokens
                     );
-                    let _ = send_event(&req.reply, Event::Rejected { reason });
+                    let _ = send_event(&req.reply, Event::Rejected { class: RejectClass::Validation, reason });
                     rig.swap.forget(existing.0);
                     rig.sessions.close(&mut rig.pool, &mut rig.adm, existing);
                     return;
@@ -5232,7 +5291,7 @@ fn admit(
                         req.max_tokens.max(1),
                         rig.cap_tokens
                     );
-                    let _ = send_event(&req.reply, Event::Rejected { reason });
+                    let _ = send_event(&req.reply, Event::Rejected { class: RejectClass::Validation, reason });
                     return;
                 }
                 // Page-demand reclaim (spec §5.4 S4 row 3), mirroring the
@@ -5304,8 +5363,7 @@ fn admit(
                         // still continue it; only this request is refused.
                         let _ = send_event(
                             &req.reply,
-                            Event::Rejected {
-                                reason: format!(
+                            Event::Rejected { class: RejectClass::Overload, reason: format!(
                                     "page demand exceeds pool: need \
                                      {needed_pages} pages, {free} free \
                                      after reclaim"
@@ -5347,8 +5405,7 @@ fn admit(
                             Err(e) => {
                                 let _ = send_event(
                                     &req.reply,
-                                    Event::Rejected {
-                                        reason: format!(
+                                    Event::Rejected { class: RejectClass::Validation, reason: format!(
                                             "json_schema compile failed on admit: {e}"
                                         ),
                                     },
@@ -5373,8 +5430,7 @@ fn admit(
                 if let Err(e) = rig.adm.resize(existing.0, turn_grant) {
                     let _ = send_event(
                         &req.reply,
-                        Event::Rejected {
-                            reason: format!(
+                        Event::Rejected { class: RejectClass::Internal, reason: format!(
                                 "admission grant for the extended turn does not fit: {e}"
                             ),
                         },
@@ -5504,7 +5560,6 @@ fn admit(
                         produced: 0,
                         max_tokens: req.max_tokens.max(1),
                         repeat_window_req: req.repeat_window.min(REPEAT_WINDOW_MAX),
-                        reused_tokens: plan.reused,
                         last_published_boundary: session_pub,
                         grammar: grammar_constraint,
                         // Continuation reuse is session-local (convo hash),
@@ -5538,8 +5593,7 @@ fn admit(
                         // double-occupy the slot. Reject and close instead.
                         let _ = send_event(
                             &req.reply,
-                            Event::Rejected {
-                                reason: format!("continuation begin_turn failed: {e}"),
+                            Event::Rejected { class: RejectClass::Internal, reason: format!("continuation begin_turn failed: {e}"),
                             },
                         );
                         rig.swap.forget(existing.0);
@@ -5564,7 +5618,7 @@ fn admit(
             req.prompt_tokens.len(),
             rig.cap_tokens
         );
-        let _ = send_event(&req.reply, Event::Rejected { reason });
+        let _ = send_event(&req.reply, Event::Rejected { class: RejectClass::Validation, reason });
         lock_stats(stats).note_rejected();
         return;
     }
@@ -5633,7 +5687,7 @@ fn admit(
             if !evict(rig, victim) {
                 let _ = send_event(
                     &req.reply,
-                    Event::Rejected { reason: "eviction failed".to_string() },
+                    Event::Rejected { class: RejectClass::Internal, reason: "eviction failed".to_string() },
                 );
                 lock_stats(stats).note_rejected();
                 return;
@@ -5683,8 +5737,7 @@ fn admit(
                         // end). The request is not parked.
                         let _ = send_event(
                             &req.reply,
-                            Event::Rejected {
-                                reason: format!("serve queue full: {we}"),
+                            Event::Rejected { class: RejectClass::Overload, reason: format!("serve queue full: {we}"),
                             },
                         );
                         lock_stats(stats).note_rejected();
@@ -5696,7 +5749,7 @@ fn admit(
             // zero caps): fall back to the original immediate reject.
             let _ = send_event(
                 &req.reply,
-                Event::Rejected { reason: format!("{e:?}") },
+                Event::Rejected { class: RejectClass::Internal, reason: format!("{e:?}") },
             );
             lock_stats(stats).note_rejected();
             return;
@@ -5708,8 +5761,7 @@ fn admit(
         None => {
             let _ = send_event(
                 &req.reply,
-                Event::Rejected {
-                    reason: "admitted session holds no slot".to_string(),
+                Event::Rejected { class: RejectClass::Internal, reason: "admitted session holds no slot".to_string(),
                 },
             );
             lock_stats(stats).note_rejected();
@@ -5725,8 +5777,7 @@ fn admit(
     if let Err(e) = rig.dn_states[slot.0].reset(&mut rig.gpu) {
         let _ = send_event(
             &req.reply,
-            Event::Rejected {
-                reason: format!("state reset failed: {e}"),
+            Event::Rejected { class: RejectClass::Internal, reason: format!("state reset failed: {e}"),
             },
         );
         rig.sessions.close(&mut rig.pool, &mut rig.adm, id);
@@ -5951,8 +6002,7 @@ fn admit(
         if free < needed_pages {
             let _ = send_event(
                 &req.reply,
-                Event::Rejected {
-                    reason: format!(
+                Event::Rejected { class: RejectClass::Overload, reason: format!(
                         "page demand exceeds pool: need {needed_pages} pages, \
                          {free} free after reclaim"
                     ),
@@ -5983,7 +6033,7 @@ fn admit(
         {
             Ok(p) => p,
             Err(e) => {
-                let _ = send_event(&req.reply, Event::Rejected { reason: e });
+                let _ = send_event(&req.reply, Event::Rejected { class: RejectClass::Internal, reason: e });
                 rig.sessions.close(&mut rig.pool, &mut rig.adm, id);
                 lock_stats(stats).note_rejected();
                 return;
@@ -6056,8 +6106,7 @@ fn admit(
                 // Should not happen (validated at submit), but fail closed.
                 let _ = send_event(
                     &req.reply,
-                    Event::Rejected {
-                        reason: format!("json_schema compile failed on admit: {e}"),
+                    Event::Rejected { class: RejectClass::Validation, reason: format!("json_schema compile failed on admit: {e}"),
                     },
                 );
                 release_pin_ticket(rig, &mut pin_ticket);
@@ -6161,7 +6210,6 @@ fn admit(
         produced: 0,
         max_tokens: req.max_tokens.max(1),
         repeat_window_req: req.repeat_window.min(REPEAT_WINDOW_MAX),
-        reused_tokens: if prefix_hit { prefix_reused } else { 0 },
         last_published_boundary: reused,
         grammar: grammar_constraint,
         pin_ticket,

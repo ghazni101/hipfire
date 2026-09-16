@@ -35,7 +35,7 @@ fn main() {
     use hipfire_arch_qwen35::mtp_head::find_mtp_sidecar;
     use hipfire_arch_qwen35::serve_engine::{EngineConfig, SlotEngine};
     use hipfire_runtime::hfq::HfqFile;
-    use hipfire_runtime::serve::{Continuation, Event, SubmitRequest};
+    use hipfire_runtime::serve::{Continuation, Event, RejectClass, SubmitRequest};
     use hipfire_runtime::tokenizer::Tokenizer;
     use std::path::{Path, PathBuf};
     use std::sync::mpsc::channel;
@@ -142,6 +142,8 @@ fn main() {
         wait_max_bytes: 256 * 1024 * 1024,
         queue_timeout_ms: 30_000,
         structured_jump_forward: false,
+        dflash_draft: None,
+        dflash_required: false,
     })
     .expect("SlotEngine::spawn");
     println!(
@@ -191,6 +193,7 @@ fn main() {
                 visual_data: None,
                 json_schema: spec.json_schema.clone(),
                 started_in_think: false,
+                think_budget: usize::MAX,
         queue_bytes: 0,
         request_tag: 1,
                 reply: tx,
@@ -202,7 +205,7 @@ fn main() {
             match ev {
                 Event::Accepted { reused: r, .. } => reused = r,
                 Event::Token { id } => tokens.push(id),
-                Event::Rejected { reason } => panic!("rejected: {reason}"),
+                Event::Rejected { reason, .. } => panic!("rejected: {reason}"),
                 Event::Done { .. } => break,
             }
         }
@@ -247,14 +250,16 @@ fn main() {
     // reuse, no same-forward fallback execution).
     if let Some(class) = fault_hip_class {
         println!("--- A19 fault-hip mode (class={class}) ---");
-        // Reference BEFORE arming, so the fault lands mid-request.
+        // Reference BEFORE arming, so the fault lands mid-request. Arming
+        // writes the bridge's atomics directly — mutating the process
+        // environment from a running engine is UB against concurrent readers.
         let (reused_ref, toks_ref) = run(&engine, italy.clone(), &greedy);
         println!(
             "  reference: reused={reused_ref} generated={}",
             toks_ref.len()
         );
         assert!(!toks_ref.is_empty());
-        std::env::set_var("HIPFIRE_FAULT_HIP", &class);
+        hip_bridge::arm_hip_fault(&class, 1);
         let (tx, rx) = channel::<Event>();
         engine
             .submit(SubmitRequest {
@@ -274,6 +279,7 @@ fn main() {
                 visual_data: None,
                 json_schema: None,
                 started_in_think: false,
+                think_budget: usize::MAX,
         queue_bytes: 0,
         request_tag: 2,
                 reply: tx,
@@ -284,7 +290,7 @@ fn main() {
         let mut emitted = 0usize;
         while let Ok(ev) = rx.recv() {
             match ev {
-                Event::Rejected { reason } => {
+                Event::Rejected { reason, .. } => {
                     println!("  faulted request rejected: {reason}");
                     saw_rejection = true;
                 }
@@ -293,7 +299,7 @@ fn main() {
                 Event::Accepted { .. } => {}
             }
         }
-        std::env::remove_var("HIPFIRE_FAULT_HIP");
+        hip_bridge::arm_hip_fault(&class, 0);
         assert!(saw_rejection, "the faulted request must be typed-rejected");
         assert!(
             !saw_done,
@@ -333,6 +339,8 @@ fn main() {
                     wait_max_bytes: 256 * 1024 * 1024,
                     queue_timeout_ms: 30_000,
                     structured_jump_forward: false,
+                    dflash_draft: None,
+                    dflash_required: false,
                 })
                 .expect("fresh engine after poison");
                 let out = run(&fresh, italy.clone(), &greedy);
@@ -388,6 +396,7 @@ fn main() {
                     visual_data: None,
                     json_schema: None,
                     started_in_think: false,
+                    think_budget: usize::MAX,
                     queue_bytes: 0,
                     request_tag: 3,
                     reply: tx,
@@ -407,7 +416,7 @@ fn main() {
                     }
                     Event::Token { id } => tokens.push(id),
                     Event::Done { .. } => break,
-                    Event::Rejected { reason } => panic!("a20 rejected: {reason}"),
+                    Event::Rejected { reason, .. } => panic!("a20 rejected: {reason}"),
                 }
             }
             assert_ne!(session, u64::MAX, "engine never accepted");
@@ -479,6 +488,8 @@ fn main() {
             wait_max_bytes: 256 * 1024 * 1024,
             queue_timeout_ms: 30_000,
             structured_jump_forward: false,
+            dflash_draft: None,
+            dflash_required: false,
         };
         engine.shutdown().expect("a20 shutdown");
         for cycle in 0..2 {
@@ -693,6 +704,7 @@ fn main() {
             visual_data: None,
             json_schema: None,
             started_in_think: false,
+            think_budget: usize::MAX,
         queue_bytes: 0,
         request_tag: 4,
             reply: tx_long,
@@ -706,7 +718,7 @@ fn main() {
         match ev {
             Event::Accepted { reused: r, .. } => reused_long = r,
             Event::Token { id } => toks_long.push(id),
-            Event::Rejected { reason } => panic!("long request rejected: {reason}"),
+            Event::Rejected { reason, .. } => panic!("long request rejected: {reason}"),
             Event::Done { .. } => break,
         }
     }
@@ -806,6 +818,7 @@ fn main() {
                     visual_data: None,
                     json_schema: None,
                     started_in_think: false,
+                    think_budget: usize::MAX,
                     queue_bytes: 0,
                     request_tag: 0xA13_000 + i as u64,
                     reply: tx,
@@ -826,7 +839,7 @@ fn main() {
                     match ev {
                         Event::Accepted { reused: r, .. } => reused = r,
                         Event::Token { id } => tokens.push(id),
-                        Event::Rejected { reason } => {
+                        Event::Rejected { reason, .. } => {
                             panic!("concurrent request rejected: {reason}")
                         }
                         Event::Done { .. } => break,

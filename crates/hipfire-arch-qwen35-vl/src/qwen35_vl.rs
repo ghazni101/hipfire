@@ -329,6 +329,22 @@ pub fn load_vision_weights(
     config: &VisionConfig,
     gpu: &mut Gpu,
 ) -> HipResult<VisionWeights> {
+    // Load-time geometry validation: the learned position table is a square
+    // grid indexed by `sqrt(num_position_embeddings)`. A non-square value
+    // makes `fast_pos_embed_interpolate` index the wrong rows — the tower then
+    // produces garbage tokens. This is a model-config malformation, so it is
+    // refused HERE (model load) rather than per image request, where it used
+    // to be an engine-thread assert that poisoned every slot.
+    let side = (config.num_position_embeddings as f64).sqrt().round() as usize;
+    if side == 0 || side * side != config.num_position_embeddings {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "qwen35-vl: num_position_embeddings ({}) must be a perfect square",
+                config.num_position_embeddings
+            ),
+        ));
+    }
     let h = config.hidden_size;
 
     // Arch advisory. The vision tower kernels (gemm_f16, layernorm_batched,
@@ -1073,16 +1089,21 @@ impl VisionTowerJob {
         // actual (grid_h, grid_w) and reorder into 2x2-grouped patch sequence,
         // then add. HF's `fast_pos_embed_interpolate`.
         let num_grid_per_side = (config.num_position_embeddings as f64).sqrt().round() as usize;
-        // Hard assertion (not debug_assert): a non-square pos_embed table is a
-        // model-config malformation that silently produces wrong indexing in
-        // `fast_pos_embed_interpolate` if we round to the nearest int. Fail loud
-        // at tower start instead of producing garbage tokens.
-        assert_eq!(
-            num_grid_per_side * num_grid_per_side,
-            config.num_position_embeddings,
-            "num_position_embeddings ({}) must be a perfect square",
-            config.num_position_embeddings,
-        );
+        // Defensive re-check (never a panic): `load_vision_weights` already
+        // refused a non-square table at model load, so reaching here with one
+        // means the weights bypassed that loader. A typed error keeps the
+        // engine thread alive instead of poisoning every slot.
+        if num_grid_per_side == 0
+            || num_grid_per_side * num_grid_per_side != config.num_position_embeddings
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "num_position_embeddings ({}) must be a perfect square",
+                    config.num_position_embeddings
+                ),
+            ));
+        }
         let pos_embed_interp = fast_pos_embed_interpolate(
             &weights.pos_embed,
             h,
@@ -1207,12 +1228,17 @@ impl VisionTowerJob {
         // actual (grid_h, grid_w) and reorder into 2x2-grouped patch sequence,
         // then add. HF's `fast_pos_embed_interpolate`.
         let num_grid_per_side = (config.num_position_embeddings as f64).sqrt().round() as usize;
-        assert_eq!(
-            num_grid_per_side * num_grid_per_side,
-            config.num_position_embeddings,
-            "num_position_embeddings ({}) must be a perfect square",
-            config.num_position_embeddings,
-        );
+        if num_grid_per_side == 0
+            || num_grid_per_side * num_grid_per_side != config.num_position_embeddings
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "num_position_embeddings ({}) must be a perfect square",
+                    config.num_position_embeddings
+                ),
+            ));
+        }
         let pos_embed_interp = fast_pos_embed_interpolate(
             &weights.pos_embed,
             h,
@@ -1367,8 +1393,16 @@ impl VisionTowerJob {
         } = self;
         let h = config.hidden_size;
 
-        // Single sync at end of all layers (avoids per-layer sync overhead)
-        gpu.hip.device_synchronize()?;
+        // Single sync at end of all layers (avoids per-layer sync overhead).
+        // Every error arm below releases the tensors this epilogue owns: the
+        // tower's device buffers are neither pooled nor released by Drop, so a
+        // failure partway through the merger must not strand them.
+        if let Err(e) = gpu.hip.device_synchronize() {
+            let _ = gpu.free_tensor(x);
+            let _ = gpu.free_tensor(rope_cos_gpu);
+            let _ = gpu.free_tensor(rope_sin_gpu);
+            return Err(e);
+        }
         gpu.free_tensor(rope_cos_gpu)?;
         gpu.free_tensor(rope_sin_gpu)?;
         eprintln!(
@@ -1385,7 +1419,7 @@ impl VisionTowerJob {
 
         // LayerNorm all patches
         let normed = gpu.alloc_tensor(&[n * h], DType::F32)?;
-        gpu.layernorm_batched(
+        if let Err(e) = gpu.layernorm_batched(
             &x,
             &weights.merger_norm_w,
             &weights.merger_norm_b,
@@ -1393,11 +1427,21 @@ impl VisionTowerJob {
             n,
             h,
             config.norm_eps,
-        )?;
+        ) {
+            let _ = gpu.free_tensor(normed);
+            let _ = gpu.free_tensor(x);
+            return Err(e);
+        }
         gpu.free_tensor(x)?;
 
         // Download for 2x2 rearrange (only ~3.6MB, one-time cost)
-        let normed_data = gpu.download_f32(&normed)?;
+        let normed_data = match gpu.download_f32(&normed) {
+            Ok(data) => data,
+            Err(e) => {
+                let _ = gpu.free_tensor(normed);
+                return Err(e);
+            }
+        };
         gpu.free_tensor(normed)?;
 
         // Patches in `normed_data` are stored in 2x2-block-grouped order (see
@@ -1417,7 +1461,7 @@ impl VisionTowerJob {
 
         // Merger MLP on GPU
         let merged_gpu = gpu.upload_f32(&merged, &[n_merged * merge_dim])?;
-        let m1 = linear_f16(
+        let m1 = match linear_f16(
             gpu,
             &weights.merger_fc1_w,
             &merged_gpu,
@@ -1425,11 +1469,20 @@ impl VisionTowerJob {
             merge_dim,
             merge_dim,
             n_merged,
-        )?;
+        ) {
+            Ok(m1) => m1,
+            Err(e) => {
+                let _ = gpu.free_tensor(merged_gpu);
+                return Err(e);
+            }
+        };
         gpu.free_tensor(merged_gpu)?;
-        gpu.gelu_tanh_f32(&m1, &m1, n_merged * merge_dim)?;
+        if let Err(e) = gpu.gelu_tanh_f32(&m1, &m1, n_merged * merge_dim) {
+            let _ = gpu.free_tensor(m1);
+            return Err(e);
+        }
 
-        let m2 = linear_f16(
+        let m2 = match linear_f16(
             gpu,
             &weights.merger_fc2_w,
             &m1,
@@ -1437,10 +1490,22 @@ impl VisionTowerJob {
             config.out_hidden_size,
             merge_dim,
             n_merged,
-        )?;
+        ) {
+            Ok(m2) => m2,
+            Err(e) => {
+                let _ = gpu.free_tensor(m1);
+                return Err(e);
+            }
+        };
         gpu.free_tensor(m1)?;
 
-        let result = gpu.download_f32(&m2)?;
+        let result = match gpu.download_f32(&m2) {
+            Ok(result) => result,
+            Err(e) => {
+                let _ = gpu.free_tensor(m2);
+                return Err(e);
+            }
+        };
         gpu.free_tensor(m2)?;
 
         if let Some(d) = dump_dir.as_deref() {

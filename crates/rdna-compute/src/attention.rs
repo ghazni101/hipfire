@@ -8081,6 +8081,27 @@ impl Gpu {
         );
         self.bind_thread()?;
         if head_dim == 512 {
+            // Fail-closed: the hd512 batched K-write kernel
+            // (`kv_cache_write_asym_k_givens3_hd512_batched`) does NOT declare
+            // `slot_descs`/`row_slot` parameters and writes through a raw
+            // `pos * stride` offset — always slab 0. The V write below also
+            // goes through the non-slots `kv_cache_write_q8_0_batched` (null
+            // descriptors), so V lands in slab 0 too. Launching this path with
+            // descriptors would silently route every slot's K and V into
+            // slot 0's slab. Until the hd512 K-write kernel is ported to
+            // descriptor addressing (and the V write routed through
+            // `kv_cache_write_q8_0_batched_slots`), refuse multi-slot hd512
+            // rather than corrupt silently.
+            if slot_descs.is_some() {
+                return Err(hip_bridge::HipError::new(
+                    0,
+                    "kv_cache_write_asym3_batched_slots: head_dim=512 multi-slot \
+                     (descriptor/paged) KV writes are not supported — the hd512 \
+                     K-write kernel lacks descriptor addressing and would \
+                     silently route every slot's K and V into slab 0. Use \
+                     single-arena mode (null slot_descs/row_slot) instead.",
+                ));
+            }
             self.launch_asym_k_batched(
                 "kv_cache_write_asym_k_givens3_hd512_batched",
                 kernels::KV_CACHE_WRITE_ASYM_K_GIVENS3_HD512_BATCHED_SRC,

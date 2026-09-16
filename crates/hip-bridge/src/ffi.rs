@@ -127,27 +127,54 @@ static HIP_FAULT_UPLOAD: AtomicUsize = AtomicUsize::new(HIP_FAULT_UNSET);
 static HIP_FAULT_LAUNCH: AtomicUsize = AtomicUsize::new(HIP_FAULT_UNSET);
 static HIP_FAULT_SYNC: AtomicUsize = AtomicUsize::new(HIP_FAULT_UNSET);
 
+/// The process environment is read EXACTLY ONCE (POSIX forbids mutating it
+/// under concurrent readers, and the decode-hot path must not pay a getenv
+/// per memcpy/launch/sync). Tests arm the seam through
+/// [`arm_hip_fault`] instead of `set_var`.
+fn fault_spec() -> &'static Option<String> {
+    static SPEC: std::sync::LazyLock<Option<String>> =
+        std::sync::LazyLock::new(|| std::env::var("HIPFIRE_FAULT_HIP").ok());
+    &SPEC
+}
+
+/// Arm `count` injected failures for one fault class (`upload`, `launch`,
+/// `sync`), or disarm with `count == 0`. This is the test-facing arming API:
+/// it writes the atomics directly, so no process-global environment state is
+/// mutated from a running engine.
+pub fn arm_hip_fault(class: &str, count: usize) {
+    let cell = match class {
+        "upload" => &HIP_FAULT_UPLOAD,
+        "launch" => &HIP_FAULT_LAUNCH,
+        "sync" => &HIP_FAULT_SYNC,
+        other => {
+            eprintln!("[hip-bridge] arm_hip_fault: unknown fault class '{other}'");
+            return;
+        }
+    };
+    cell.store(count, Ordering::Release);
+}
+
 fn hip_fault_consume(class_idx: usize, class: &'static str) -> bool {
     let cells = [&HIP_FAULT_UPLOAD, &HIP_FAULT_LAUNCH, &HIP_FAULT_SYNC];
     let cell = cells[class_idx];
     let mut cur = cell.load(Ordering::Acquire);
     if cur == HIP_FAULT_UNSET {
-        // Arm-after-load semantics: model load issues hundreds of fault-
-        // class calls before the oracle can arm, so an ABSENT variable must
-        // not latch the class inert — stay unset and re-read. Once the
-        // variable is present, the class count latches (0 = inert forever).
-        let Ok(spec) = std::env::var("HIPFIRE_FAULT_HIP") else {
-            return false;
-        };
-        let n = spec
-            .split(',')
-            .find_map(|part| {
-                let mut it = part.splitn(2, ':');
-                let name = it.next()?.trim();
-                if name != class {
-                    return None;
-                }
-                Some(it.next().and_then(|v| v.parse().ok()).unwrap_or(1))
+        // First use: latch the class from the (single) environment read.
+        // Absent or unmatched means inert forever — the hot path never
+        // consults the environment again.
+        let n = fault_spec()
+            .as_deref()
+            .map(|spec| {
+                spec.split(',')
+                    .find_map(|part| {
+                        let mut it = part.splitn(2, ':');
+                        let name = it.next()?.trim();
+                        if name != class {
+                            return None;
+                        }
+                        Some(it.next().and_then(|v| v.parse().ok()).unwrap_or(1))
+                    })
+                    .unwrap_or(0)
             })
             .unwrap_or(0);
         cell.store(n, Ordering::Release);

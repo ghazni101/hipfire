@@ -7,7 +7,7 @@ configuration ([CONFIG.md](CONFIG.md)); the HTTP surface is implemented by
 
 | Field | Default (source) |
 |---|---|
-| Bind host | `serve.host = "0.0.0.0"` |
+| Bind host | `serve.host = "127.0.0.1"` (loopback; see Security) |
 | Port | `serve.port = 11435` |
 | Pre-warm model | `serve.default_model = "qwen3.5:9b"` or a positional model arg |
 | Idle unload | `serve.idle_timeout_seconds = 300` (`0` = never) |
@@ -24,16 +24,25 @@ implied by this page — see [MODELS.md](MODELS.md) and [VALIDATION.md](VALIDATI
 
 The native handler implements **no authentication and no TLS**.
 Anyone who can reach the bind address can call every endpoint, including
-chat completions. Default bind is `0.0.0.0` (all interfaces).
+chat completions. **Default bind is `127.0.0.1` (loopback)** — the surface has
+no authentication, so exposing it is an explicit operator decision
+(`hipfire serve 0.0.0.0:11435`, `serve.host`, or a host positional).
 
-- Prefer loopback for local use: `hipfire serve 127.0.0.1:11435`
+Cross-origin browser access is refused by default: no response carries
+`Access-Control-Allow-Origin`, and `OPTIONS` preflights are rejected, so a web
+page cannot drive a LAN-exposed instance. `GET /health` does not disclose an
+ownership token (`hipfire stop` proves ownership through the pidfile's PID and
+its listening socket). The `model` field accepts a registry tag or local model
+name — filesystem paths are refused over HTTP.
+
+- Prefer loopback for local use (the default): `hipfire serve`
 - Expose beyond localhost only behind a trusted network or an authenticated
   TLS reverse proxy you control. Do not publish the raw port to the internet.
 
 ## Start and stop
 
 ```bash
-hipfire serve                         # foreground; Ctrl-C stops (default bind 0.0.0.0)
+hipfire serve                         # foreground; Ctrl-C stops (default bind 127.0.0.1)
 hipfire serve 127.0.0.1:11435         # loopback-only (preferred local bind)
 hipfire serve -d                      # background (setsid/nohup); polls /health up to 300s
 hipfire serve qwen3.5:9b -d           # pre-warm a specific tag this run
@@ -101,7 +110,7 @@ Implemented paths (anything else → `404`):
 
 | Method | Path | Role |
 |---|---|---|
-| `GET` | `/health` | Liveness JSON: `status`, `model`, `loading_model`, `pid`, `native` |
+| `GET` | `/health` | Liveness JSON: `status`, `model`, `loading_model`, `pid`, `native`, `capabilities` |
 | `GET` | `/v1/models` | `{ data: [{ id }, ...] }` from local model files |
 | `GET` | `/stats` | Serve telemetry: uptime, queue depth, requests served, recent decode tok/s |
 | `POST` | `/v1/chat/completions` | Chat completions (stream or non-stream) |
@@ -152,7 +161,7 @@ through to per-model / registry / daemon defaults when omitted):
 | `messages[].content[].image_url` | One base64 PNG/JPEG data URI for VL models; remote URLs and multiple images are rejected |
 | `stream`, `stream_options.include_usage` | Streaming + optional usage on stream end |
 | `temperature`, `top_p`, `top_k`, `min_p`, `repeat_penalty` | Sampling; explicit request values win, otherwise per-model TOML / registry-card values are applied |
-| `seed` | OpenAI-compatible deterministic-sampling seed: non-negative integer (≤ u64::MAX). Same seed + same request → same output; `null`/omitted = fresh entropy per request; negative/fractional/non-integer → 400-style error, never silently unseeded. Best-effort like OpenAI: other sampling params and prompt must also match |
+| `seed` | OpenAI-compatible sampling seed: non-negative integer (≤ u64::MAX). Same seed is reproducible only when prompt, sampling parameters, and execution shape match. Cold vs prefix-resumed and solo vs co-batched shapes may differ until `serve.batch_invariant` is implemented; `null`/omitted = fresh entropy. Negative/fractional/non-integer values are rejected. |
 | `presence_penalty`, `frequency_penalty` | Forwarded natively to the daemon (≥ 0); `presence_penalty` also inherits per-model / registry defaults |
 | `max_tokens` | Generation cap |
 | `stop` | Up to 4 strings, each ≤ 64 chars |
@@ -288,6 +297,13 @@ When `messages` contains no `system` or `developer` role, the serve layer insert
 
 `finish_reason` values emitted to clients: `stop`, `length`, `tool_calls`.
 
+Streaming error contract: a failure that happens BEFORE the first byte is a
+plain HTTP error status (no SSE body). A failure after the stream has started
+emits an OpenAI-shaped SSE `data: {"error": {...}}` frame followed by
+`data: [DONE]`, so a streaming client always sees a terminal event instead of
+a silently truncated `200`. Non-streaming failures keep the typed
+status mapping (`400` request/config, `429` overload, `500` internal).
+
 Prefix-cache capable arches (daemon `cache_capable`, or arch allowlist
 `deepseek4` / `qwen3_5` / `qwen3_5_moe`) skip per-request `reset` so multi-turn
 LCP can hit. Other arches reset every request (stateless OpenAI shape).
@@ -328,6 +344,13 @@ hipfire serve -d
 hipfire run qwen3.5:9b "..."                 # uses HTTP when /health is up
 HIPFIRE_LOCAL=1 hipfire run qwen3.5:9b "..." # force one-shot local daemon
 ```
+
+An HTTP request's `model` must be a registry tag, a local model name, or a
+path that resolves inside the model store (`~/.hipfire/models`); any other
+filesystem path is refused with 400 — otherwise the field is a file-existence
+oracle for anyone who can reach the port. A local `hipfire run <path>` against
+an out-of-store file needs `HIPFIRE_LOCAL=1` (or `--no-stream`/`--json`) so it
+spawns its own daemon instead of going through serve.
 
 `run` probes `http://<probe-host>:<port>/health` (500 ms). Probe host maps
 `0.0.0.0` / `::` → `127.0.0.1`. If serve is up, `run` POSTs

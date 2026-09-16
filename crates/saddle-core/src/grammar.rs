@@ -2946,6 +2946,15 @@ mod tests {
 /// stack-based tracking; a single state id cannot represent it.
 pub mod json_schema {
     use std::collections::HashSet;
+    use std::sync::LazyLock;
+
+    static GRAMMAR_TRACE_ENABLED: LazyLock<bool> =
+        LazyLock::new(|| std::env::var_os("GRAMMAR_TRACE").is_some());
+
+    #[inline]
+    fn grammar_trace_enabled() -> bool {
+        *GRAMMAR_TRACE_ENABLED
+    }
 
     /// Maximum nesting depth for objects/arrays.
     const MAX_NESTING: usize = 64;
@@ -3808,7 +3817,7 @@ pub mod json_schema {
                                 // properties {fixed} must die HERE, or the
                                 // model is steered into an unvalidatable
                                 // document that burns to max_tokens).
-                                if std::env::var("GRAMMAR_TRACE").is_ok() {
+                                if grammar_trace_enabled() {
                                     eprintln!("[scan] key completed: {:?} (is_key branch)", s);
                                 }
                                 if let SchemaNode::Object {
@@ -3818,7 +3827,7 @@ pub mod json_schema {
                                 } = schema
                                 {
                                     if !properties.iter().any(|(k, _)| k == &s) {
-                                        if std::env::var("GRAMMAR_TRACE").is_ok() {
+                                        if grammar_trace_enabled() {
                                             eprintln!("[scan] UNKNOWN KEY FLAG SET: {:?}", s);
                                         }
                                         unknown_key = true;
@@ -5015,6 +5024,17 @@ pub mod json_schema {
             self.bytes.extend_from_slice(bytes);
             // Refresh the raw scan BEFORE parsing so accept-time duplicate
             // detection (strict mode, spec §7.1) sees the current buffer.
+            //
+            // Cost note: this re-scans the whole buffer, so a generation of
+            // `n` tokens costs O(n²) byte steps. It is NOT made incremental
+            // because `scan_raw`'s output (`RawScan`) does not carry the
+            // object/array frame stack — the frames hold the per-frame
+            // pending property schema, so resuming a scan from `RawScan`
+            // alone would silently mis-constrain nested objects. At serve
+            // scale (a schema-constrained generation is bounded by
+            // `max_tokens`, i.e. a few KB) the measured cost is sub-millisecond
+            // per generation; an incremental rewrite must first make the frame
+            // stack part of the resumable state.
             self.scan = scan_raw(&self.bytes, &self.root);
             self.parse();
             // Whitespace appended inside a string is inert content, not a
@@ -5056,6 +5076,7 @@ pub mod json_schema {
             self.accepted.hash(&mut h);
             self.errored.hash(&mut h);
             self.number_open.hash(&mut h);
+            self.ws_run.min(WS_RUN_CAP).hash(&mut h);
             let sc = &self.scan;
             sc.duplicate_keys.hash(&mut h);
             sc.in_string.hash(&mut h);
@@ -7156,6 +7177,22 @@ pub mod json_schema {
             );
             m.advance(b"{");
             assert!(m.is_token_allowed(b"\"done\""), "document continues");
+        }
+
+        #[test]
+        fn mask_state_signature_tracks_whitespace_run_until_cap() {
+            let schema = serde_json::json!({"type": "boolean"});
+            let compiled = CompiledSchema::compile(&schema).expect("valid");
+            let mut m = compiled.matcher();
+            let initial = m.mask_state_signature();
+            m.advance(b"\t");
+            assert_ne!(initial, m.mask_state_signature());
+            for _ in 1..WS_RUN_CAP {
+                m.advance(b"\t");
+            }
+            let capped = m.mask_state_signature();
+            m.advance(b"\t");
+            assert_eq!(capped, m.mask_state_signature(), "states beyond the cap share the same deny mask");
         }
 
         /// The mask-state signature must be buffer-blind: two matchers

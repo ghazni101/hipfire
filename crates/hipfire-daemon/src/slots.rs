@@ -738,10 +738,23 @@ impl SlotBackend {
             .unwrap_or(0.0)
             .max(0.0) as f32;
 
-        let max_tokens = msg
-            .get("max_tokens")
-            .and_then(|v| v.as_u64())
-            .unwrap_or(512) as usize;
+        let max_tokens = match msg.get("max_tokens") {
+            None | Some(serde_json::Value::Null) => 512usize,
+            Some(value) => match value.as_u64().and_then(|v| usize::try_from(v).ok()) {
+                Some(v) if v > 0 => v,
+                _ => {
+                    hipfire_engine::emit::emit_active_attempt_error(
+                        stdout,
+                        Some(id),
+                        "max_tokens must be a positive integer",
+                        "validation",
+                        false,
+                        false,
+                    );
+                    return Ok(());
+                }
+            },
+        };
         let max_think_tokens = msg
             .get("max_think_tokens")
             .and_then(|v| v.as_u64())
@@ -1318,7 +1331,7 @@ impl SlotBackend {
         let mut first_token = true;
 
         let mut done_reason: Option<(DoneReason, usize)> = None;
-        let mut rejected: Option<String> = None;
+        let mut rejected: Option<(hipfire_runtime::serve::RejectClass, String)> = None;
         // Set when the engine channel dropped without a terminal event —
         // the engine thread died (panic/GPU fault). Must NOT be reported as
         // a normal stop: the client would see a clean-looking truncated
@@ -1353,10 +1366,11 @@ impl SlotBackend {
                         {
                             self.close_session(expected);
                             accepted_session = Some(session);
-                            rejected = Some(
+                            rejected = Some((
+                                hipfire_runtime::serve::RejectClass::Internal,
                                 "tool-result reentry was admitted on the wrong slot session"
                                     .to_string(),
-                            );
+                            ));
                             break;
                         }
                         accepted_session = Some(session);
@@ -1384,8 +1398,8 @@ impl SlotBackend {
                         done_reason = Some((reason, generated));
                         break;
                     }
-                    Event::Rejected { reason } => {
-                        rejected = Some(reason);
+                    Event::Rejected { class, reason } => {
+                        rejected = Some((class, reason));
                         break;
                     }
                 },
@@ -1421,35 +1435,18 @@ impl SlotBackend {
             return Ok(());
         }
 
-        if let Some(reason) = rejected {
+        if let Some((class, reason)) = rejected {
             drop(rx);
             if let Some(sess) = accepted_session.take() {
                 self.close_session(sess);
             } else if let Some(session) = claimed_session {
                 self.close_session(session);
             }
-            // Overload rejections (bounded wait queue full / queue timeout)
-            // are CAPACITY signals, not engine faults — surface them with
-            // the overload kind so the front end maps them to 429 instead
-            // of 500 (spec §5.3 S3: "HTTP 429 for bounded queue rejection").
-            // Engine rejections split the same way at the source: page /
-            // admission-demand refusals are capacity (overload → 429),
-            // schema-compile and grammar failures are client-fixable
-            // (validation → 400); everything else stays internal.
-            let kind = if reason.starts_with("serve queue full")
-                || reason.starts_with("serve queue timeout")
-                || reason.starts_with("cancelled while queued")
-                || reason.starts_with("page demand exceeds pool")
-                || reason.starts_with("admission grant for the extended turn")
-            {
-                "overload"
-            } else if reason.starts_with("grammar constraint")
-                || reason.starts_with("json_schema compile failed on admit")
-                || reason.contains("contradictory schema")
-            {
-                "validation"
-            } else {
-                "internal"
+            let kind = match class {
+                hipfire_runtime::serve::RejectClass::Overload => "overload",
+                hipfire_runtime::serve::RejectClass::Validation => "validation",
+                hipfire_runtime::serve::RejectClass::Internal => "internal",
+                hipfire_runtime::serve::RejectClass::Cancel => "cancel",
             };
             hipfire_engine::emit::emit_active_attempt_error(
                 stdout,

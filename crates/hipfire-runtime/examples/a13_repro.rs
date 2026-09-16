@@ -13,7 +13,7 @@ fn main() {
 #[cfg(feature = "lab")]
 fn main() {
     use hipfire_arch_qwen35::serve_engine::{EngineConfig, SlotEngine};
-    use hipfire_runtime::serve::{Continuation, Event, SubmitRequest};
+    use hipfire_runtime::serve::{Continuation, Event, RejectClass, SubmitRequest};
     use std::path::PathBuf;
     use std::sync::mpsc::channel;
     use std::time::{Duration, Instant};
@@ -96,7 +96,7 @@ fn main() {
                             log.push(format!("Accepted(reused={reused})"))
                         }
                         Ok(Event::Token { id }) => log.push(format!("Tok({id})")),
-                        Ok(Event::Rejected { reason }) => {
+                        Ok(Event::Rejected { reason, .. }) => {
                             log.push(format!("Rejected({reason})"));
                             break;
                         }

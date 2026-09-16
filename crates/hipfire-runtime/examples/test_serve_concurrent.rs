@@ -26,7 +26,7 @@ fn main() {
 fn main() {
     use hipfire_arch_qwen35::serve_engine::{EngineConfig, SlotEngine};
     use hipfire_runtime::hfq::HfqFile;
-    use hipfire_runtime::serve::{Continuation, Event, SubmitRequest};
+    use hipfire_runtime::serve::{Continuation, Event, RejectClass, SubmitRequest};
     use hipfire_runtime::tokenizer::Tokenizer;
     use std::collections::HashSet;
     use std::path::{Path, PathBuf};
@@ -122,7 +122,7 @@ fn main() {
                 match ev {
                     Event::Accepted { .. } => accepted = true,
                     Event::Token { id } => tokens.push(id),
-                    Event::Rejected { reason } => {
+                    Event::Rejected { reason, .. } => {
                         rejected = Some(reason);
                         break;
                     }

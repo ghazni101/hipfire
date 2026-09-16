@@ -76,8 +76,7 @@ fn json_response_result(
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "application/json")
-        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-        .body(boxed_full(bytes))
+                .body(boxed_full(bytes))
         .map_err(|err| format!("failed to build HTTP response: {err}"))
 }
 
@@ -87,8 +86,7 @@ fn static_server_error() -> Response<BoxBody> {
     Response::builder()
         .status(500)
         .header(header::CONTENT_TYPE, "application/json")
-        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-        .body(boxed_full(
+                .body(boxed_full(
             br#"{"error":{"message":"internal server error","type":"server_error"}}"#.to_vec(),
         ))
         // Static status, headers, and body: the builder cannot fail on these
@@ -532,13 +530,9 @@ async fn handle_request(
                 "model": meta.current_model,
                 "loading_model": meta.loading_model,
                 "pid": std::process::id(),
-                "token": meta.instance_token,
                 "native": true,
-                // Route capability advertisement (multi-slot, prefix cache,
-                // structured output, queue bounds): built once at startup
-                // from the same resolved config the daemon's slot engine
-                // reads. OpenAI-compatible clients ignore the extra field;
-                // hipfire clients discover the route with it.
+                // Route capability advertisement comes from the same resolved
+                // config the daemon slot engine reads.
                 "capabilities": shared.capabilities,
             });
             json_response(body, 200)
@@ -577,8 +571,7 @@ async fn handle_request(
                     header::CONTENT_TYPE,
                     "text/plain; version=0.0.4; charset=utf-8",
                 )
-                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                .body(boxed_full(body.into_bytes()))
+                                .body(boxed_full(body.into_bytes()))
                 .unwrap();
             resp
         }
@@ -610,19 +603,10 @@ async fn handle_request(
             });
             json_response(body, 200)
         }
-        (Method::OPTIONS, _) => {
-            let mut resp = Response::builder()
-                .status(204)
-                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                .header(
-                    header::ACCESS_CONTROL_ALLOW_HEADERS,
-                    "Content-Type, Authorization",
-                )
-                .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, OPTIONS")
-                .body(boxed_empty())
-                .unwrap();
-            resp
-        }
+        (Method::OPTIONS, _) => Response::builder()
+            .status(403)
+            .body(boxed_empty())
+            .unwrap(),
         (Method::POST, "/v1/chat/completions") => {
             let max_bytes = shared.max_request_bytes;
             if req
@@ -858,9 +842,15 @@ async fn handle_images_generations(
         .map(str::to_owned);
 
     // Serialize against chat traffic and cap queue depth the same way the
-    // chat path does; the daemon processes messages sequentially.
-    let guard = shared.admission.acquire().map_err(|e| e.to_string())?;
-    let _guard = guard;
+    // chat path does; the daemon processes messages sequentially. This is the
+    // ASYNC admission: the blocking condvar acquire would park the tokio
+    // reactor for up to the whole queue timeout, stalling every other request
+    // on the connection pool while one image waits.
+    let _guard = shared
+        .admission
+        .acquire_for_async_with_bytes(false, None, 0, CancellationToken::new())
+        .await
+        .map_err(|e| e.to_string())?;
 
     let (engine, loaded_model) = {
         let runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
@@ -1350,6 +1340,14 @@ impl StreamBackpressure {
     }
 }
 
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_owned())
+}
+
 async fn handle_streaming(
     shared: Arc<ServeShared>,
     body: serde_json::Value,
@@ -1386,25 +1384,16 @@ async fn handle_streaming(
     let stream_buffer_bytes = shared.stream_buffer_bytes;
     let stream_stall_timeout = shared.stream_stall_timeout;
     tokio::task::spawn_blocking(move || {
-        // Stream backpressure guard (spec §5.4/S4): the SSE forwarder stops
-        // producing for a stalled consumer at the byte bound and aborts after
-        // the timeout. Committed state is retained; the guard only pauses the
-        // forwarder. The engine-side scheduling skip is wired in Wave 4.
-        let backpressure = std::cell::RefCell::new(
-            StreamBackpressure::new(
-                tx_clone.clone(),
-                bp_pending,
-                stream_buffer_bytes,
-                stream_stall_timeout,
-            )
-            .with_cancelled(Arc::clone(&cancelled)),
-        );
-        // Leading role delta (OpenAI streaming shape). Sent through the same
-        // bounded backpressure path as every other chunk so its bytes are
-        // counted and a stalled consumer delays it too. (The chunk used to
-        // be constructed and dropped before the worker — a dead store; the
-        // role delta never reached clients.)
-        {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let backpressure = std::cell::RefCell::new(
+                StreamBackpressure::new(
+                    tx_clone.clone(),
+                    bp_pending,
+                    stream_buffer_bytes,
+                    stream_stall_timeout,
+                )
+                .with_cancelled(Arc::clone(&cancelled)),
+            );
             let first = serde_json::json!({
                 "id": id_clone,
                 "object": "chat.completion.chunk",
@@ -1412,81 +1401,48 @@ async fn handle_streaming(
                 "model": model_clone,
                 "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": null }],
             });
-            let mut bp = backpressure.borrow_mut();
-            let _ = bp.send(ResponseChunk::plain(sse_data(&first)));
-        }
-        let result = complete_request_cancellable(
-            &shared_clone,
-            &body,
-            guard,
-            Some((id_clone.clone(), created)),
-            &cancelled,
-            |event| {
-                let mut bp = backpressure.borrow_mut();
-                if bp.is_stalled() && bp.check_stall_timeout() {
-                    return Err(hipfire_client::ClientError::Cancelled);
-                }
-                if let Some(delta) = openai_stream_delta_for_event(event) {
-                    let chunk = serde_json::json!({
-                        "id": id_clone,
-                        "object": "chat.completion.chunk",
-                        "created": created,
-                        "model": model_clone,
-                        "choices": [{ "index": 0, "delta": delta, "finish_reason": null }],
-                    });
-                    match bp.send(ResponseChunk::plain(sse_data(&chunk))) {
-                        Ok(()) => Ok(()),
-                        Err(_) => Err(hipfire_client::ClientError::Cancelled),
+            let _ = backpressure.borrow_mut().send(ResponseChunk::plain(sse_data(&first)));
+            complete_request_cancellable(
+                &shared_clone,
+                &body,
+                guard,
+                Some((id_clone.clone(), created)),
+                &cancelled,
+                |event| {
+                    let mut bp = backpressure.borrow_mut();
+                    if bp.is_stalled() && bp.check_stall_timeout() {
+                        return Err(hipfire_client::ClientError::Cancelled);
                     }
-                } else {
-                    Ok(())
-                }
-            },
-            |completion| {
-                let mut bp = backpressure.borrow_mut();
-                if bp.is_stalled() && bp.check_stall_timeout() {
-                    return Err(hipfire_client::ClientError::Cancelled);
-                }
-                let mut bytes = Vec::new();
-                for chunk in openai_stream_terminal_chunks(completion, include_usage) {
-                    bytes.extend_from_slice(&sse_data(&chunk));
-                }
-                bytes.extend_from_slice(b"data: [DONE]\n\n");
-                if bytes.is_empty() {
-                    return Err(hipfire_client::ClientError::Protocol(
-                        "stream terminal payload must be non-empty".into(),
-                    ));
-                }
-                let (ack_tx, ack_rx) = std::sync::mpsc::channel();
-                match bp.send(ResponseChunk {
-                    bytes,
-                    ack: Some(ack_tx),
-                    fail: false,
-                }) {
-                    Ok(()) => {}
-                    Err(_) => return Err(hipfire_client::ClientError::Cancelled),
-                }
-                drop(bp);
-                // The terminal chunk is delivered only when the CLIENT
-                // actually reads it (poll_flush acks). A zero-window or
-                // silent client used to pin this thread AND its admission
-                // permit forever — bound the wait by the stall deadline and
-                // fail with Cancelled, which releases both (spec §5.4/S4:
-                // "abort on configured deadline").
-                match ack_rx.recv_timeout(stream_stall_timeout) {
-                    Ok(Ok(())) => Ok(()),
-                    Ok(Err(_)) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
-                        Err(hipfire_client::ClientError::Cancelled)
+                    if let Some(delta) = openai_stream_delta_for_event(event) {
+                        let chunk = serde_json::json!({
+                            "id": id_clone,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_clone,
+                            "choices": [{ "index": 0, "delta": delta, "finish_reason": null }],
+                        });
+                        bp.send(ResponseChunk::plain(sse_data(&chunk)))
+                            .map_err(|_| hipfire_client::ClientError::Cancelled)
+                    } else {
+                        Ok(())
                     }
-                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
-                        eprintln!(
-                            "[serve] terminal ack deadline exceeded — releasing admission permit"
-                        );
-                        Err(hipfire_client::ClientError::Cancelled)
+                },
+                |completion| {
+                    let mut bp = backpressure.borrow_mut();
+                    let mut bytes = Vec::new();
+                    for chunk in openai_stream_terminal_chunks(completion, include_usage) {
+                        bytes.extend_from_slice(&sse_data(&chunk));
                     }
-                }
-            },
-        );
+                    bytes.extend_from_slice(b"data: [DONE]\n\n");
+                    bp.send(ResponseChunk::plain(bytes))
+                        .map_err(|_| hipfire_client::ClientError::Cancelled)
+                },
+            )
+        }));
+        let result = match outcome {
+            Ok(result) => result,
+            Err(payload) => Err(anyhow::anyhow!("streaming worker panicked: {}", panic_message(payload))),
+        };
         finish_sse_stream(tx_clone, result);
     });
 
@@ -1495,8 +1451,7 @@ async fn handle_streaming(
         .status(200)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
-        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-        .body(boxed(body))
+                .body(boxed(body))
         .unwrap();
     // Ensure chunked; hyper sets it automatically for streaming bodies.
     resp
@@ -1614,8 +1569,7 @@ async fn handle_nonstreaming(
             let resp = Response::builder()
                 .status(200)
                 .header(header::CONTENT_TYPE, "application/json")
-                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                .body(boxed(body))
+                                .body(boxed(body))
                 .unwrap();
             resp
         }
@@ -1637,6 +1591,11 @@ pub(crate) fn request_error_status(message: &str) -> u16 {
     // top_k, capability caps) and overload rejections correctly, and the
     // substring ladder below mis-mapped several of them to 500. Only
     // untyped/local errors fall to the ladder.
+    // Gateway-side request validation carries an explicit class tag; check it
+    // FIRST so the wording never decides the status.
+    if message.contains(crate::serve::REQUEST_VALIDATION_TAG) {
+        return 400;
+    }
     if let Some(class) = daemon_error_class(message) {
         return match class {
             // Capacity signals: bounded queue rejection / timeout /
@@ -1795,30 +1754,31 @@ pub(crate) fn deliver_sse_terminal_ack(
 }
 
 /// Close an OpenAI SSE body after `complete_request_cancellable`.
-/// Success: terminal already delivered+acked at commit_ready — emit no post-commit bytes.
-/// Cancelled: no server_error/`[DONE]`. Post-terminal engine errors force an unclean
-/// reader failure rather than appending a success/error frame.
+/// Success already delivered its terminal chunk. A non-cancellation failure
+/// becomes an observable OpenAI-shaped error event followed by `[DONE]`.
 pub(crate) fn finish_sse_stream(
     sender: tokio::sync::mpsc::Sender<ResponseChunk>,
     result: Result<Completion>,
 ) {
-    match result {
-        Ok(_completion) => {
-            drop(sender);
-        }
-        Err(error) => {
-            let cancelled = error
-                .downcast_ref::<hipfire_client::ClientError>()
-                .is_some_and(|err| matches!(err, hipfire_client::ClientError::Cancelled));
-            if cancelled {
-                drop(sender);
-                return;
-            }
+    if let Err(error) = result {
+        let cancelled = error
+            .downcast_ref::<hipfire_client::ClientError>()
+            .is_some_and(|err| matches!(err, hipfire_client::ClientError::Cancelled));
+        if !cancelled {
             eprintln!("[hipfire] streaming completion failed: {error:#}");
-            let _ = sender.try_send(ResponseChunk::fail());
-            drop(sender);
+            let payload = serde_json::json!({
+                "error": {
+                    "message": format!("{error:#}"),
+                    "type": "server_error",
+                    "code": null
+                }
+            });
+            let mut bytes = sse_data(&payload);
+            bytes.extend_from_slice(b"data: [DONE]\n\n");
+            let _ = sender.blocking_send(ResponseChunk::plain(bytes));
         }
     }
+    drop(sender);
 }
 
 #[cfg(test)]

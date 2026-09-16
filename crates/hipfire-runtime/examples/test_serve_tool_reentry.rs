@@ -28,7 +28,7 @@ fn main() {
     use hipfire_runtime::prompt_frame::{
         continuation_suffix_tool_results, AssistantPrefix, ChatFrame,
     };
-    use hipfire_runtime::serve::{Continuation, Event, SubmitRequest};
+    use hipfire_runtime::serve::{Continuation, Event, RejectClass, SubmitRequest};
     use hipfire_runtime::tokenizer::Tokenizer;
     use std::path::{Path, PathBuf};
     use std::sync::mpsc::channel;
@@ -130,7 +130,7 @@ fn main() {
                 }
                 Event::Token { .. } => {}
                 Event::Done { .. } => break,
-                Event::Rejected { reason } => panic!("rejected: {reason}"),
+                Event::Rejected { reason, .. } => panic!("rejected: {reason}"),
             }
         }
         assert_ne!(session, u64::MAX, "engine never accepted the request");

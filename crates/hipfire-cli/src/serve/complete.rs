@@ -1308,6 +1308,22 @@ pub(crate) enum RetryDecision {
     Fail,
 }
 
+/// True when `candidate` resolves to a file inside the configured model store.
+///
+/// `canonicalize` resolves symlinks on both sides, so a link dropped in the
+/// store that points elsewhere is refused too. A path that does not exist
+/// resolves to `false` — the refusal is then indistinguishable from "not
+/// found locally", which is what keeps this from being a filesystem oracle.
+fn model_path_in_local_store(paths: &Paths, candidate: &std::path::Path) -> bool {
+    let Ok(store) = paths.models.canonicalize() else {
+        return false;
+    };
+    let Ok(real) = candidate.canonicalize() else {
+        return false;
+    };
+    real.starts_with(store)
+}
+
 /// Single enforced retry-eligibility decision for the serve retry driver.
 ///
 /// Retry iff ALL hold: gate enabled; first attempt; no visible token/reasoning
@@ -1634,6 +1650,17 @@ pub(crate) fn project_request_contract(
     resolved: &hipfire_config::ResolvedConfig,
     include_reasoning: bool,
 ) -> Result<RequestContract> {
+    // Tag every refusal from this projection as a client-fixable request
+    // validation error: the HTTP layer keys off the tag, not the wording.
+    project_request_contract_inner(body, resolved, include_reasoning)
+        .map_err(|e| anyhow!("{}{e}", crate::serve::REQUEST_VALIDATION_TAG))
+}
+
+fn project_request_contract_inner(
+    body: &serde_json::Value,
+    resolved: &hipfire_config::ResolvedConfig,
+    include_reasoning: bool,
+) -> Result<RequestContract> {
     // Strict typing: a PRESENT-but-malformed max_tokens (negative, float,
     // string) must be a 400, never a silent fallback to the config default
     // (the old `.and_then(as_u64).unwrap_or(default)` quietly re-typed it).
@@ -1665,6 +1692,34 @@ pub(crate) fn project_request_contract(
         if let Some(v) = body.get(field) {
             if !v.is_null() {
                 bail!("{field} is not supported on this serve route");
+            }
+        }
+    }
+    for (field, min, max) in [("temperature", 0.0, 2.0), ("top_p", 0.0, 1.0)] {
+        if let Some(value) = body.get(field).filter(|v| !v.is_null()) {
+            let number = value
+                .as_f64()
+                .filter(|v| v.is_finite())
+                .ok_or_else(|| anyhow!("{field} must be a finite number"))?;
+            if number < min || number > max || field == "top_p" && number == 0.0 {
+                bail!("{field} must be within {}", if field == "top_p" { "(0, 1]" } else { "[0, 2]" });
+            }
+        }
+    }
+    if let Some(value) = body.get("repeat_window").filter(|v| !v.is_null()) {
+        match value.as_u64() {
+            Some(v) if v <= 2048 => {}
+            _ => bail!("repeat_window must be an integer between 0 and 2048"),
+        }
+    }
+    if let Some(messages) = body.get("messages").and_then(serde_json::Value::as_array) {
+        for message in messages {
+            let role = message
+                .get("role")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("each message must have a string role"))?;
+            if !matches!(role, "developer" | "system" | "user" | "assistant" | "tool" | "toolResult" | "tool_result") {
+                bail!("unknown message role: {role}");
             }
         }
     }
@@ -2040,6 +2095,19 @@ pub(crate) fn complete_request_attempt(
         // Attempt id is allocated by the retry driver before any cold reset /
         // generate so reset ack, generate request, and the semantic fold share one
         // wire id.
+        // A remote client may name a registry tag, a local model name, or a
+        // path INSIDE the configured model store (the operator's own model
+        // directory). Any other filesystem path is refused: accepting one
+        // turned the `model` field into a file-existence oracle and an
+        // arbitrary-file-parse surface for anyone who could reach the port.
+        let candidate = std::path::Path::new(&model);
+        let pathish = candidate.is_absolute() || model.contains('/') || model.contains('\\');
+        if pathish && !model_path_in_local_store(&runtime.paths, candidate) {
+            bail!(
+                "HTTP model must be a registry tag, a local model name, or a path \
+                 inside the model store"
+            );
+        }
         let resolved = runtime.ensure_model(&model, &shared.meta, None)?;
         if force_reset || (!runtime.cache_capable && !runtime.continuous_batch_capable) {
             if let Err(error) = runtime.engine.reset(attempt_id) {
@@ -2213,7 +2281,10 @@ pub(crate) fn complete_request_attempt(
             // body: registry/config defaults may have inserted a
             // reasoning control the slot sampler cannot honor.
             if let Err(reason) = multi_slot_request_supported(&generate) {
-                bail!("experimental multi-slot does not support this request: {reason}");
+                bail!(
+                    "{}experimental multi-slot does not support this request: {reason}",
+                    crate::serve::REQUEST_VALIDATION_TAG
+                );
             }
         }
         let engine_clone = runtime.engine.clone();
@@ -2628,17 +2699,12 @@ pub(crate) fn multi_slot_request_supported(body: &serde_json::Value) -> Result<(
     {
         return Err("reasoning_effort is not supported".to_owned());
     }
-    // Finite caps (>= 2) are now ENFORCED end-to-end on the multi-slot
-    // route (the grammar cursor force-closes the span at the budget —
+    // Finite caps (>= 2) are ENFORCED end-to-end on the multi-slot route
+    // (the grammar cursor force-closes the span at the budget —
     // vLLM thinking_token_budget parity), so they are forwarded, not
-    // refused. `1` stays the no-thinking sentinel and `0` uncapped.
-    for pointer in ["/max_think_tokens", "/reasoning/max_tokens"] {
-        if let Some(cap) = body.pointer(pointer).and_then(serde_json::Value::as_u64) {
-            if cap == 0 {
-                return Err("finite reasoning cap must be at least 1".to_owned());
-            }
-        }
-    }
+    // refused. `0` means UNCAPPED and `1` is the no-thinking sentinel
+    // (SERVE.md), so neither is a refusal here — the daemon owns the
+    // interpretation of the forwarded value.
     if let Some(budget) = body
         .get("thinking_budget")
         .and_then(serde_json::Value::as_str)
@@ -2667,6 +2733,22 @@ pub(crate) fn complete_request_cancellable(
     mut terminal_callback: impl FnMut(&Completion) -> Result<(), hipfire_client::ClientError>,
 ) -> Result<Completion> {
     let identity = request_identity.unwrap_or_else(|| (request_id(), unix_timestamp()));
+    // Retry must re-enter admission with the SAME eligibility the original
+    // request used: re-acquiring ineligible would park the retry until every
+    // eligible slot drains, and a multi-slot engine reset under concurrency
+    // is refused — either one made the single allowed retry a 500.
+    let retry_eligible = guard.is_eligible();
+    let retry_model = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    let multi_slot_route = {
+        let runtime = shared
+            .runtime
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        runtime.multi_slot_enabled
+    };
 
     // Experimental multi-slot: fail closed on shapes the daemon slot engine
     // cannot honour. Do not fall through to ordinary LoadedModel generate.
@@ -2677,7 +2759,10 @@ pub(crate) fn complete_request_cancellable(
             .unwrap_or_else(|error| error.into_inner());
         if runtime.multi_slot_enabled {
             if let Err(reason) = multi_slot_request_supported(body) {
-                bail!("experimental multi-slot does not support this request: {reason}");
+                bail!(
+                    "{}experimental multi-slot does not support this request: {reason}",
+                    crate::serve::REQUEST_VALIDATION_TAG
+                );
             }
         }
     }
@@ -2696,7 +2781,7 @@ pub(crate) fn complete_request_cancellable(
             guard,
             &identity,
             attempt_id,
-            attempt_index > 1,
+            attempt_index > 1 && !multi_slot_route,
             &latches,
             Some(cancelled),
             &mut event_callback,
@@ -2765,7 +2850,11 @@ pub(crate) fn complete_request_cancellable(
                 if cancelled.load(Ordering::Relaxed) {
                     return Err(anyhow::Error::new(ClientError::Cancelled));
                 }
-                guard = match shared.admission.acquire() {
+                guard = match shared.admission.acquire_for_with_bytes(
+                    retry_eligible,
+                    retry_model.as_deref(),
+                    0,
+                ) {
                     Ok(guard) => guard,
                     Err(_) => {
                         return Err(error.context("retry aborted: admission re-acquire failed"));
@@ -7057,6 +7146,68 @@ mod tests {
     }
 
     #[test]
+    fn project_request_contract_rejects_malformed_sampling_and_roles() {
+        let resolved = contract_resolved_with_system("");
+        let user = serde_json::json!({ "role": "user", "content": "hi" });
+        let cases: &[(&str, serde_json::Value, &str)] = &[
+            (
+                "temperature type",
+                serde_json::json!({ "temperature": [] }),
+                "temperature must be a finite number",
+            ),
+            (
+                "temperature range",
+                serde_json::json!({ "temperature": 100.0 }),
+                "temperature must be within",
+            ),
+            (
+                "top_p range",
+                serde_json::json!({ "top_p": -5.0 }),
+                "top_p must be within",
+            ),
+            (
+                "top_p type",
+                serde_json::json!({ "top_p": "0.9" }),
+                "top_p must be a finite number",
+            ),
+            (
+                "repeat_window",
+                serde_json::json!({ "repeat_window": -1 }),
+                "repeat_window must be an integer between 0 and 2048",
+            ),
+        ];
+        for (label, extra, expected) in cases {
+            let mut body = serde_json::json!({
+                "max_tokens": 16,
+                "messages": [user],
+            });
+            for (key, value) in extra.as_object().unwrap() {
+                body[key] = value.clone();
+            }
+            let err = project_request_contract(&body, &resolved, false)
+                .expect_err(&format!("{label} must be refused"));
+            assert!(err.to_string().contains(expected), "{label}: {err}");
+        }
+        let body = serde_json::json!({
+            "max_tokens": 16,
+            "messages": [{ "role": "wizard", "content": "hi" }],
+        });
+        let err = project_request_contract(&body, &resolved, false)
+            .expect_err("unknown role must be refused");
+        assert!(err.to_string().contains("unknown message role"), "{err}");
+
+        // In-range values still pass.
+        let body = serde_json::json!({
+            "max_tokens": 16,
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "repeat_window": 64,
+            "messages": [user],
+        });
+        project_request_contract(&body, &resolved, false).expect("valid sampling accepted");
+    }
+
+    #[test]
     fn project_request_contract_rejects_max_tokens_bounds() {
         let resolved = contract_resolved_with_system("");
         for bad in [0u64, 393_217] {
@@ -7310,14 +7461,12 @@ mod tests {
         assert!(ok(serde_json::json!({ "repeat_penalty": 1.05 })));
         assert!(ok(serde_json::json!({ "min_p": 0.05 })));
         err_contains(serde_json::json!({ "min_p": 1.5 }), "min_p");
-        err_contains(
-            serde_json::json!({ "max_think_tokens": 2 }),
-            "reasoning cap",
-        );
-        err_contains(
-            serde_json::json!({ "reasoning": { "max_tokens": 2048 } }),
-            "reasoning cap",
-        );
+        // Finite caps are ACCEPTED and ENFORCED (the grammar cursor
+        // force-closes the span at the budget), so `max_think_tokens >= 2`
+        // and the nested `reasoning.max_tokens` alias are inputs, not
+        // refusals. `0` = uncapped and `1` = no-thinking sentinel.
+        assert!(ok(serde_json::json!({ "max_think_tokens": 2 })));
+        assert!(ok(serde_json::json!({ "reasoning": { "max_tokens": 2048 } })));
         err_contains(serde_json::json!({ "thinking_budget": "high" }), "budget");
     }
 

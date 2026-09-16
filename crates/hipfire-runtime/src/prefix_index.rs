@@ -704,13 +704,21 @@ impl PrefixIndex {
         // and §9.1: zero means no retained cache). The insert needs at most
         // `handles.len()` page slots; evict oldest unpinned leaves until the
         // ceiling can hold the insert, refusing if eviction cannot progress.
+        // Every refusal here must also drop a tree this call created: the
+        // caller charges nothing on Err, so a left-behind empty root would
+        // count against the CPU node bound forever.
         if let Some(max_bytes) = self.max_retained_bytes {
             let page_bytes = pool.k_page_bytes() + pool.v_page_bytes();
+            let refuse = |this: &mut Self, retained: usize, max: usize| {
+                if is_new_tree {
+                    if let Some(t) = this.trees.remove(domain) {
+                        this.total_nodes = this.total_nodes.saturating_sub(t.node_count());
+                    }
+                }
+                InsertError::CacheByteBoundExceeded { retained, max }
+            };
             if max_bytes < page_bytes {
-                return Err(InsertError::CacheByteBoundExceeded {
-                    retained: self.retained_bytes,
-                    max: max_bytes,
-                });
+                return Err(refuse(self, self.retained_bytes, max_bytes));
             }
             loop {
                 let projected = self
@@ -722,10 +730,7 @@ impl PrefixIndex {
                 let before = self.total_nodes;
                 self.evict_unpinned_leaves(pool, projected.saturating_sub(max_bytes));
                 if self.total_nodes == before {
-                    return Err(InsertError::CacheByteBoundExceeded {
-                        retained: self.retained_bytes,
-                        max: max_bytes,
-                    });
+                    return Err(refuse(self, self.retained_bytes, max_bytes));
                 }
             }
         }
@@ -1169,7 +1174,7 @@ fn insert_into_tree(
                 // decouple pages-consumed from tokens-consumed.)
                 let remaining_handles = &handles[divergence / PAGE_TOKENS..];
                 let first_skip = divergence % PAGE_TOKENS;
-                let (d, p) = create_chain(
+                let chained = create_chain(
                     tree,
                     split_node_id,
                     remaining_tokens,
@@ -1179,7 +1184,17 @@ fn insert_into_tree(
                     pool,
                     max_cpu_nodes,
                     current_total + delta as usize,
-                )?;
+                );
+                let (d, p) = match chained {
+                    Ok(v) => v,
+                    Err(e) => {
+                        // Undo the split installed above: the caller charges
+                        // `delta` only on Ok, so leaving the marker would make
+                        // total_nodes under-count forever.
+                        unsplit_edge(tree, current, split_node_id, child_id);
+                        return Err(e);
+                    }
+                };
                 delta += d;
                 pages_adopted += p;
             }
@@ -1303,6 +1318,51 @@ fn create_chain(
     // Every created node adopted exactly one page (one cache ref each) —
     // the byte-accounting basis that eviction subtracts.
     Ok((added, added.max(0) as usize))
+}
+
+/// Undo a [`split_edge`] — used when the insert fails AFTER the split was
+/// installed (a `create_chain` refusal further down the path). Without this
+/// the marker would stay in the tree while the caller never adds its node to
+/// `total_nodes` (the caller only charges on `Ok`), so the CPU node bound
+/// would under-count permanently and the bound would stop binding.
+///
+/// Restores the pre-split shape exactly: the marker's tokens/pages/checkpoints
+/// (and its `first_page_skip`) are prepended back onto the child, the child is
+/// re-linked under the original parent at the original first token, and the
+/// marker is removed. No cache refs move — the split moved handle slots
+/// between nodes without taking or releasing any.
+fn unsplit_edge(
+    tree: &mut DomainTree,
+    parent: NodeId,
+    split_node_id: NodeId,
+    child_id: NodeId,
+) {
+    let Some(marker) = tree.nodes.remove(&split_node_id) else {
+        return;
+    };
+    let split_len = marker.edge_tokens.len() as u64;
+    let first_token = marker.edge_tokens.first().copied();
+    let Some(child) = tree.nodes.get_mut(&child_id) else {
+        return;
+    };
+    let mut edge = marker.edge_tokens;
+    edge.extend(child.edge_tokens.iter().copied());
+    let mut pages = marker.pages;
+    pages.extend(child.pages.iter().copied());
+    let mut checkpoints = marker.checkpoints;
+    checkpoints.extend(child.checkpoints.iter().map(|cb| CheckpointBoundary {
+        token_offset: cb.token_offset + split_len,
+        checkpoint: cb.checkpoint,
+    }));
+    checkpoints.sort_by_key(|cb| cb.token_offset);
+    child.edge_tokens = edge;
+    child.pages = pages;
+    child.checkpoints = checkpoints;
+    child.first_page_skip = marker.first_page_skip;
+    child.parent = Some(parent);
+    if let (Some(parent_node), Some(ft)) = (tree.nodes.get_mut(&parent), first_token) {
+        parent_node.children.insert(ft, child_id);
+    }
 }
 
 /// Split an edge at `split_pos` tokens. Metadata-only (spec §4.2).
@@ -2397,9 +2457,166 @@ mod tests {
         assert!(matches!(r, PrefixLookupResult::Hit(_)));
     }
 
+    /// A refusal that lands AFTER the edge split must undo the split: the
+    /// marker is installed before the chain is built, and leaving it would
+    /// strand a node the caller never charges to `total_nodes` (the bound
+    /// stops binding) and a tree shape no key asked for.
+    #[test]
+    fn split_is_rolled_back_when_the_chain_hits_the_bound() {
+        let (mut pool, handles) = setup_big_pool(4);
+        // root + A's node + the split marker = 3; the chain node is the 4th.
+        let mut index = PrefixIndex::new(3);
+        let domain = sample_domain(11);
+
+        let tokens_a = make_tokens(PAGE_TOKENS);
+        index
+            .insert(&domain, &tokens_a, &handles[..1], Some(CheckpointId(1)), &mut pool)
+            .unwrap();
+        assert_eq!(index.total_nodes(), 2);
+
+        // Pin A's leaf so insert-time eviction cannot free the node the
+        // chain needs — the bound must genuinely refuse.
+        let _pin = index.lookup_with_pages(&domain, &tokens_a, &pool, None);
+
+        // B shares half of A's page then diverges: the split at 64 is
+        // affordable (3 nodes) but B's own chain node is not.
+        let mut tokens_b = tokens_a[..PAGE_TOKENS / 2].to_vec();
+        tokens_b.extend(make_tokens_from(7000, PAGE_TOKENS / 2));
+        let result = index.insert(
+            &domain,
+            &tokens_b,
+            &handles[1..2],
+            Some(CheckpointId(2)),
+            &mut pool,
+        );
+        assert!(
+            matches!(result, Err(InsertError::CpuNodeBoundExceeded { .. })),
+            "expected the chain to hit the node bound, got {result:?}"
+        );
+        assert_eq!(
+            index.total_nodes(),
+            2,
+            "a refused insert must undo its split marker"
+        );
+
+        // The tree is byte-for-byte the pre-insert shape: A still resolves to
+        // its own single full page and B's divergence is not visible.
+        let (r, h, _t) = index.lookup_with_pages(&domain, &tokens_a, &pool, None);
+        match r {
+            PrefixLookupResult::Hit(lk) => {
+                assert_eq!(lk.resumable_tokens, PAGE_TOKENS as u64)
+            }
+            other => panic!("A must be unchanged after the rollback, got {other:?}"),
+        }
+        assert_eq!(h.len(), 1);
+        let r = index.lookup(&domain, &tokens_b, &pool, None);
+        assert!(matches!(r, PrefixLookupResult::Miss(_)));
+
+        // And the bound still binds: exactly one more node fits.
+        let tokens_c = make_tokens_from(4000, PAGE_TOKENS);
+        index
+            .insert(&domain, &tokens_c, &handles[2..3], Some(CheckpointId(3)), &mut pool)
+            .unwrap();
+        assert_eq!(index.total_nodes(), 3);
+    }
+
+    /// A retained-byte refusal on a brand-new domain must not leave the empty
+    /// root behind: the caller charges nothing on Err, so the orphan would
+    /// count against the CPU node bound for the process lifetime.
+    #[test]
+    fn byte_ceiling_refusal_on_new_domain_leaves_no_root() {
+        let (mut pool, handles) = setup_big_pool(2);
+        let page_bytes = pool.k_page_bytes() + pool.v_page_bytes();
+        let mut index = PrefixIndex::new(1000);
+        index.set_max_retained_bytes(page_bytes / 2);
+        let domain = sample_domain(13);
+
+        let tokens_a = make_tokens(PAGE_TOKENS);
+        let result = index.insert(
+            &domain,
+            &tokens_a,
+            &handles[..1],
+            Some(CheckpointId(1)),
+            &mut pool,
+        );
+        assert!(
+            matches!(result, Err(InsertError::CacheByteBoundExceeded { .. })),
+            "expected the byte ceiling to refuse, got {result:?}"
+        );
+        assert_eq!(
+            index.total_nodes(),
+            0,
+            "a refused new-domain insert must not leak its root"
+        );
+
+        // The same domain is fully usable once the ceiling can hold a page.
+        index.set_max_retained_bytes(page_bytes * 2);
+        index
+            .insert(&domain, &tokens_a, &handles[..1], Some(CheckpointId(1)), &mut pool)
+            .unwrap();
+        assert_eq!(index.total_nodes(), 2, "root + one page node");
+        let r = index.lookup(&domain, &tokens_a, &pool, None);
+        assert!(matches!(r, PrefixLookupResult::Hit(_)));
+    }
+
     // ── Mid-page divergence and per-lookup pins ──────────────────────
 
+    /// Mid-page fork (W10-4): a key that shares a prefix and diverges INSIDE
+    /// a page must split the covering node with a zero-page marker — both
+    /// paths stay independently resumable, node accounting grows by exactly
+    /// the marker plus the new chain, and retained bytes charge only the
+    /// pages a node actually adopts.
     #[test]
+    fn mid_page_fork_keeps_both_paths_resumable() {
+        let (mut pool, handles) = setup_big_pool(4);
+        let page_bytes = pool.k_page_bytes() + pool.v_page_bytes();
+        let mut index = PrefixIndex::new(1000);
+        let domain = sample_domain(3);
+
+        // A: two full pages.
+        let tokens_a = make_tokens(PAGE_TOKENS * 2);
+        index
+            .insert(&domain, &tokens_a, &handles[..2], Some(CheckpointId(1)), &mut pool)
+            .unwrap();
+        let nodes_before = index.total_nodes();
+        assert_eq!(index.retained_bytes(), 2 * page_bytes);
+
+        // B shares 1.5 pages of A, then diverges mid-page and completes the
+        // second page with its own tokens.
+        let mut tokens_b = tokens_a[..PAGE_TOKENS + PAGE_TOKENS / 2].to_vec();
+        tokens_b.extend(make_tokens_from(9000, PAGE_TOKENS / 2));
+        assert_eq!(tokens_b.len(), PAGE_TOKENS * 2);
+        index
+            .insert(&domain, &tokens_b, &handles[2..4], Some(CheckpointId(2)), &mut pool)
+            .unwrap();
+
+        // The fork added the zero-page split marker plus B's one-page chain
+        // (B's first page is A's, reached through the marker).
+        assert_eq!(
+            index.total_nodes(),
+            nodes_before + 2,
+            "mid-page fork must add exactly a marker and B's chain node"
+        );
+        assert_eq!(
+            index.retained_bytes(),
+            3 * page_bytes,
+            "a zero-page split marker must not be charged retained bytes"
+        );
+
+        let (r, h, _t) = index.lookup_with_pages(&domain, &tokens_a, &pool, None);
+        assert!(matches!(r, PrefixLookupResult::Hit(_)), "A must stay resumable: {r:?}");
+        assert_eq!(h.len(), 2);
+
+        let (r, h, _t) = index.lookup_with_pages(&domain, &tokens_b, &pool, None);
+        match r {
+            PrefixLookupResult::Hit(lk) => {
+                assert_eq!(lk.resumable_tokens, (PAGE_TOKENS * 2) as u64)
+            }
+            other => panic!("B must stay resumable after the fork, got {other:?}"),
+        }
+        assert_eq!(h.len(), 2);
+    }
+
     /// Retained bytes are charged by PAGES ADOPTED, not by nodes created:
     /// a mid-page fork's split marker is a node holding ZERO pages, and
     /// the old node-count basis permanently inflated `retained_bytes` by

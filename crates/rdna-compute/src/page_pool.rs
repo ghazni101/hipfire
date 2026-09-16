@@ -794,6 +794,29 @@ impl PagePool {
         Ok(())
     }
 
+    /// Validate that `phys` can accept a table ref — the same preconditions
+    /// [`refcount_inc`](Self::refcount_inc) enforces — WITHOUT mutating the
+    /// pool. A caller attaching several pages uses this to refuse before the
+    /// first mutation, so a refused multi-page share cannot half-attach.
+    pub fn check_attachable(&self, phys: u32) -> Result<(), String> {
+        self.check_phys(phys)?;
+        let meta = &self.page_meta[phys as usize];
+        if meta.state == PageState::Free {
+            return Err(format!("refcount_inc: phys {} is Free", phys));
+        }
+        if meta.state == PageState::ReclaimPending {
+            return Err(format!(
+                "refcount_inc: phys {} is ReclaimPending — cannot attach a \
+                 table to a page queued for reclaim",
+                phys
+            ));
+        }
+        if meta.table_refs == u32::MAX {
+            return Err(format!("refcount_inc: overflow for phys {}", phys));
+        }
+        Ok(())
+    }
+
     /// Increment the table refcount for physical page `phys` and seal it
     /// if currently Private (spec §4.3: shared pages are immutable).
     ///

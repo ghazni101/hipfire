@@ -574,8 +574,16 @@ impl Carrier for Qwen35Carrier {
                     use hipfire_arch_qwen35_vl::Qwen35Vl;
                     use hipfire_runtime::arch::Architecture;
 
-                    // .vl sidecar discovery: HIPFIRE_VL_FILE env, then <stem>.vl sibling.
-                    let vl_path = discover_vl_path(ctx.path);
+                    // Vision tower sidecar resolution: an explicit
+                    // `--vision-path` (or HIPFIRE_VL_FILE) must never be
+                    // shadowed by a co-located `<stem>.vl` sibling — the
+                    // operator's tower wins, and sibling discovery is only
+                    // the fallback.
+                    let vl_path = ctx
+                        .vision_path
+                        .as_ref()
+                        .map(std::path::PathBuf::from)
+                        .or_else(|| discover_vl_path(ctx.path));
                     let has_inline_vision = hfq_file
                         .tensor_data("model.visual.patch_embed.proj.weight")
                         .is_some();
@@ -586,6 +594,29 @@ impl Carrier for Qwen35Carrier {
                             .map_err(|e| format!("open .vl file {}: {e}", vl.display()))?;
                         let vc = Qwen35Vl::config_from_hfq(&vl_hfq)
                             .map_err(|e| format!(".vl vision_config: {e}"))?;
+                        // Identity: the tower's projector writes the trunk's
+                        // text hidden width. A sidecar paired with a different
+                        // trunk (a sibling `foo.vl` next to `bar.mq4`) would
+                        // load "successfully" and then fail per request; the
+                        // shape of the trunk's output_norm is the text hidden
+                        // size, so refuse the mismatch at load time.
+                        if let Some(trunk_dim) = hfq_file
+                            .find_tensor_info("output_norm.weight")
+                            .and_then(|t| t.shape.first().copied())
+                            .map(|d| d as usize)
+                        {
+                            if vc.out_hidden_size != trunk_dim {
+                                return Err(format!(
+                                    "vision sidecar {} does not match trunk {}: projector \
+                                     output {} != trunk hidden {}",
+                                    vl.display(),
+                                    ctx.path,
+                                    vc.out_hidden_size,
+                                    trunk_dim
+                                ));
+                            }
+                        }
+
                         // Fail the load, loudly: swallowing the error here
                         // used to yield (Some(config), None) — a model whose
                         // daemon-side image gate stays open (has_vision keys

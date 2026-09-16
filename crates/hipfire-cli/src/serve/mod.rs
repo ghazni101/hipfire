@@ -236,7 +236,7 @@ pub(crate) fn route_capabilities(
         // (typed 400s). Mirrors `multi_slot_request_supported` + the
         // response_format gate.
         "refused_request_fields": if multi_slot {
-            serde_json::json!(["tools", "stop", "logprobs", "response_format:json_object"])
+            serde_json::json!(["stop", "logprobs", "response_format:json_object"])
         } else {
             serde_json::json!(["response_format"])
         },
@@ -1200,6 +1200,8 @@ pub(crate) fn serve_foreground(
         max_queue as u64,
         max_batch_tokens,
         prefill_min_tokens,
+        multi_slot_prefill_chunk,
+        multi_slot_slots,
     ) {
         bail!("{message}");
     }
@@ -1615,7 +1617,12 @@ pub(crate) fn validate_multi_slot_startup(
     max_queue: u64,
     max_batch_tokens: u64,
     prefill_min_tokens: u64,
+    prefill_chunk: u64,
+    n_slots: u64,
 ) -> Result<(), String> {
+    if prefill_min_tokens == 0 {
+        return Err("serve.prefill_min_tokens must be at least 1".to_owned());
+    }
     // The global trunk-row budget must be at least the minimum prefill quantum
     // so a nonzero prefill service quantum can always be allocated (spec §5.2,
     // §5.3). This holds regardless of multi-slot mode.
@@ -1625,6 +1632,21 @@ pub(crate) fn validate_multi_slot_startup(
              serve.prefill_min_tokens ({prefill_min_tokens}); the global trunk-row \
              budget cannot be smaller than the minimum prefill quantum"
         ));
+    }
+    if multi_slot_enabled && prefill_min_tokens > prefill_chunk {
+        return Err(format!(
+            "serve.prefill_min_tokens ({prefill_min_tokens}) must be <= serve.multi_slot_prefill_chunk ({prefill_chunk}); otherwise one decode row plus the minimum prefill quantum exceeds the slot scratch"
+        ));
+    }
+    if multi_slot_enabled {
+        let scratch_rows = prefill_chunk
+            .checked_mul(n_slots)
+            .ok_or_else(|| "multi-slot scratch row capacity overflow".to_owned())?;
+        if max_batch_tokens > scratch_rows {
+            return Err(format!(
+                "serve.max_batch_tokens ({max_batch_tokens}) must be <= multi-slot scratch capacity ({scratch_rows} = {n_slots} slots x {prefill_chunk} rows)"
+            ));
+        }
     }
     if multi_slot_enabled {
         if continuous_batch_size > 1 {
@@ -1649,6 +1671,15 @@ pub(crate) fn validate_multi_slot_startup(
     }
     Ok(())
 }
+
+/// Machine-readable prefix for gateway-side request-validation failures.
+///
+/// Mirrors the daemon's typed error prefix so the HTTP layer classifies by
+/// CLASS rather than by wording: any message carrying this tag is a
+/// client-fixable 400, whatever English it happens to contain. New
+/// validation text is therefore safe to reword without changing status
+/// semantics.
+pub(crate) const REQUEST_VALIDATION_TAG: &str = "[request validation] ";
 
 pub(crate) fn serve_instance_token() -> String {
     let now = std::time::SystemTime::now()
@@ -1741,19 +1772,10 @@ pub(crate) fn validate_serve_pid(
             record.pid
         );
     }
-    let health_matches = record.token.as_deref().is_some_and(|expected| {
-        http_get_json(host, port, "/health").is_some_and(|health| {
-            health.get("pid").and_then(serde_json::Value::as_u64) == Some(record.pid as u64)
-                && health.get("token").and_then(serde_json::Value::as_str) == Some(expected)
-        })
-    });
-    if owns_port == Some(true) || health_matches || record.legacy && owns_port.is_none() {
+    if owns_port == Some(true) || record.legacy && owns_port.is_none() {
         Ok(())
     } else {
-        bail!(
-            "could not prove ownership of PID {} with port or health token",
-            record.pid
-        )
+        bail!("could not prove PID {} owns the tracked serve port", record.pid)
     }
 }
 
@@ -2521,36 +2543,54 @@ mod tests {
     #[test]
     fn multi_slot_startup_rejects_continuous_batch_gt_one() {
         // Args: (multi_slot, continuous_batch_size, max_queue, max_batch_tokens, prefill_min_tokens)
-        assert!(validate_multi_slot_startup(false, 1, 64, 4096, 1).is_ok());
-        assert!(validate_multi_slot_startup(false, 8, 64, 4096, 1).is_ok());
-        assert!(validate_multi_slot_startup(true, 1, 64, 4096, 1).is_ok());
-        let err = validate_multi_slot_startup(true, 2, 64, 4096, 1).unwrap_err();
+        assert!(validate_multi_slot_startup(false, 1, 64, 4096, 1, 1024, 4).is_ok());
+        assert!(validate_multi_slot_startup(false, 8, 64, 4096, 1, 1024, 4).is_ok());
+        assert!(validate_multi_slot_startup(true, 1, 64, 4096, 1, 1024, 4).is_ok());
+        let err = validate_multi_slot_startup(true, 2, 64, 4096, 1, 1024, 4).unwrap_err();
         assert!(err.contains("continuous_batch_size > 1"), "{err}");
         assert!(err.contains("deferred"), "{err}");
-        let err = validate_multi_slot_startup(true, 16, 64, 4096, 1).unwrap_err();
+        let err = validate_multi_slot_startup(true, 16, 64, 4096, 1, 1024, 4).unwrap_err();
         assert!(err.contains("serve.multi_slot"), "{err}");
     }
 
     #[test]
     fn multi_slot_startup_rejects_uncapped_queue() {
         // serve.max_queue=0 is uncapped historically; robust multi-slot rejects it.
-        let err = validate_multi_slot_startup(true, 1, 0, 4096, 1).unwrap_err();
+        let err = validate_multi_slot_startup(true, 1, 0, 4096, 1, 1024, 4).unwrap_err();
         assert!(err.contains("serve.max_queue"), "{err}");
         assert!(err.contains("non-zero"), "{err}");
         // Off multi-slot, an uncapped queue is still accepted (old behavior preserved).
-        assert!(validate_multi_slot_startup(false, 1, 0, 4096, 1).is_ok());
+        assert!(validate_multi_slot_startup(false, 1, 0, 4096, 1, 1024, 4).is_ok());
     }
 
     #[test]
     fn multi_slot_startup_rejects_budget_below_prefill_min() {
         // max_batch_tokens < prefill_min_tokens is rejected regardless of multi-slot.
-        let err = validate_multi_slot_startup(false, 1, 64, 0, 1).unwrap_err();
+        let err = validate_multi_slot_startup(false, 1, 64, 0, 1, 1024, 4).unwrap_err();
         assert!(err.contains("serve.max_batch_tokens"), "{err}");
         assert!(err.contains("serve.prefill_min_tokens"), "{err}");
-        let err = validate_multi_slot_startup(true, 1, 64, 1, 2).unwrap_err();
+        let err = validate_multi_slot_startup(true, 1, 64, 1, 2, 1024, 4).unwrap_err();
         assert!(err.contains("serve.max_batch_tokens"), "{err}");
         // Equal values are accepted.
-        assert!(validate_multi_slot_startup(true, 1, 64, 4, 4).is_ok());
+        assert!(validate_multi_slot_startup(true, 1, 64, 4, 4, 1024, 4).is_ok());
+    }
+
+    #[test]
+    fn multi_slot_startup_rejects_prefill_min_above_chunk() {
+        let err = validate_multi_slot_startup(true, 1, 64, 2048, 2048, 1024, 2).unwrap_err();
+        assert!(err.contains("must be <= serve.multi_slot_prefill_chunk"), "{err}");
+    }
+
+    #[test]
+    fn multi_slot_startup_rejects_budget_above_scratch_rows() {
+        let err = validate_multi_slot_startup(true, 1, 64, 2049, 1, 1024, 2).unwrap_err();
+        assert!(err.contains("scratch capacity (2048"), "{err}");
+    }
+
+    #[test]
+    fn multi_slot_startup_rejects_zero_prefill_minimum() {
+        let err = validate_multi_slot_startup(true, 1, 64, 2048, 0, 1024, 2).unwrap_err();
+        assert!(err.contains("at least 1"), "{err}");
     }
 
     // ---- Queue byte budget (spec §5.3) ----
@@ -2824,11 +2864,9 @@ mod capabilities_tests {
         assert_eq!(caps["queue_timeout_ms"], 30000);
         assert_eq!(caps["openai_compatible"], true);
         let refused = caps["refused_request_fields"].as_array().unwrap();
-        for field in ["tools", "stop", "logprobs", "response_format:json_object"] {
-            assert!(
-                refused.iter().any(|v| v == field),
-                "refusal list must contain {field}"
-            );
+        assert!(!refused.iter().any(|v| v == "tools"), "tools are supported");
+        for field in ["stop", "logprobs", "response_format:json_object"] {
+            assert!(refused.iter().any(|v| v == field), "refusal list must contain {field}");
         }
     }
 

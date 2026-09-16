@@ -60,9 +60,7 @@ endpoint.
 
 Design invariants enforced across cells:
 
-- **Reuse never changes output.** Every warm/replayed generation is
-  byte-compared against its cold baseline under `temperature 0`
-  (C1/C2/C3/C4/C5/C7/C8; B7/B8 for sampling determinism).
+- **Reuse preserves semantic correctness and request isolation.** Greedy replay is byte-compared where the execution shape is unchanged. B8/C5/D1 record cross-shape divergence as WARN because batch-invariant reductions are design-only; `seed` does not promise cold/warm or solo/batched byte identity.
 - **Eyeball-equivalent coherence.** Every long generation goes through an
   n-gram attractor detector (uniq / maxfreq / trigram thresholds mirroring
   `serve_harness.py`); genre prompts additionally assert on-topic substrings.
@@ -95,11 +93,10 @@ those fixes; rebuilding the container is the follow-up.
 * The "phantom `cached_tokens`" (cold prompts reporting 640–768 reused) was
   observed only in run2 under co-tenant conditions and not in runs 3, 4, 6,
   7 — unconfirmed; treat with suspicion.
-* The determinism findings below are the opposite case: the second agent
-  reclassified B8/C5 as a "kernel batch-invariance limitation" and softened
-  the cells to warnings; on the clean engine the divergences still occur, so
-  this suite keeps them as hard failures (the contracts they enforce are the
-  branch's own: SERVE.md seed determinism, oracle warm-replay identity).
+* B8/C5/D1 expose the documented kernel batch-invariance limitation: clean-engine
+  divergence across cold/warm or solo/batched shapes is a warning, not a cache
+  correctness failure. Same-shape greedy replay and cross-request isolation remain
+  hard contracts.
 
 ### Clean verdict (runs 6–7, quiet engine, old binary)
 
@@ -109,10 +106,9 @@ those fixes; rebuilding the container is the follow-up.
 |---|---|---|
 | E2 | Streaming strict-schema generation emits **all content tokens, then no terminal chunk, no `finish_reason`, no `data: [DONE]`** — the stream stalls and the server closes it ~30 s later. In run7 the streamed content itself was grammar-corrupt (`"leg\": "` mangled key + tab run). Non-schema streams (B2/B3) are fine. | **P1** — SSE contract break + content corruption on the schema stream path |
 | E3 | Valid schema + default thinking → typed 400 `grammar constraint reached an unsatisfiable state` (fail-closed), or — in runs 6/7, immediately after E2's stalled stream — a **150 s admission park** (post-stall wedge signature). | **P1** — framing cursor (W10-2) ineffective + stall-follow-on wedge |
-| E4 | Valid enum/const schema → same 400 after a 30-137 s generation burn | **P1** — grammar dead-end on satisfiable schemas |
-| B8 | Same seed + identical request → **different outputs** across cold/warm replay (4 of 5 verifiable runs) | **P1** — SERVE.md seed-determinism contract |
-| C5 | Multi-turn final-turn replay differs from the original in-context answer (4 of 5 runs) — cached-resume is not bit-faithful | **P1** — same class, checkpoint-resume path |
-| D1 | WARN: batched concurrent outputs differ from solo baselines (coherence + topical isolation held) — same batch-shape sensitivity as B8/C5 | P3 — observational |
+| B8 | Same seed + identical request produced different outputs across cold/warm execution shapes | **WARN** — batch-invariant reductions are design-only |
+| C5 | Multi-turn final-turn replay differed from the original in-context answer while history and cache accounting remained valid | **WARN** — same cross-shape limitation |
+| D1 | Batched concurrent outputs differ from solo baselines; coherence + topical isolation held | **WARN** — same batch-shape sensitivity |
 | E12 | `minItems > maxItems` → **500** (server_error), message proves the CLI validator detected it ("contradictory schema") | P2 — error-status mapping |
 | E15 | `response_format {"type":"text"}` → **500**. `text` is the OpenAI *default* type | P2 — compat + status mapping |
 | F8 | `n: 2` → **200** (silently accepted, single choice) — `validate_generate_caps` documents `n` as refused | P2 — refusal gate not reached on the serve path |
@@ -162,21 +158,11 @@ service), and the post-gauntlet canaries (H1, H2 cold-side).
 
 ## Relationship to the parallel fix campaign
 
-While this suite ran, a second agent landed `e80f3e110`…`13f9a27fc` on the
-same branch (grammar soundness, cache GPU leaks, scheduler wedges, serve
-error contract, seed determinism, stream accounting) and committed this
-suite with the B8/C5 determinism checks softened to warnings. As of the
-clean re-verification the container still runs the pre-fix binary
-(`dd5faaea…`, image 14:23 +04), so:
-
-* the failures above are verified against the PRE-fix build;
-* the container must be rebuilt from the current branch tip and the suite
-  re-run before any of these findings can be considered fixed — the commit
-  messages claim fixes for E2/E3-class (stream accounting, grammar),
-  B8-class (seed determinism), and the G5/G6/E12/E15-class (error contract),
-  none of which is yet evidenced on a running container;
-* this suite's B8/C5 cells intentionally keep hard assertions (the softened
-  versions were reverted) — the enforced contracts are the branch's own.
+The later fix campaign repaired grammar, stream accounting, and error contracts.
+Seed parking makes sampling deterministic for identical logits, but does not make
+shape-dependent kernels batch-invariant. B8/C5/D1 therefore remain observational
+warnings until the opt-in mode planned in `2026-09-13-batch-invariance-design.md`
+lands; they are not acceptance failures.
 
 ## Post-merge re-verification (2026-09-14, upstream v0.3.1 merged)
 

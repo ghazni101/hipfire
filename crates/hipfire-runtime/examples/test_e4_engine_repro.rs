@@ -4,7 +4,7 @@
 
 fn main() {
     use hipfire_arch_qwen35::serve_engine::{EngineConfig, SlotEngine};
-    use hipfire_runtime::serve::{Continuation, Event, SubmitRequest};
+    use hipfire_runtime::serve::{Continuation, Event, RejectClass, SubmitRequest};
     use hipfire_runtime::tokenizer::Tokenizer;
     use hipfire_runtime::hfq::HfqFile;
     use std::path::{Path, PathBuf};
@@ -68,6 +68,8 @@ fn main() {
         wait_max_bytes: 256 * 1024 * 1024,
         queue_timeout_ms: 30_000,
         structured_jump_forward: false,
+        dflash_draft: None,
+        dflash_required: false,
     })
     .expect("SlotEngine::spawn");
 
@@ -89,6 +91,7 @@ fn main() {
         visual_data: None,
         json_schema: Some(schema),
         started_in_think: think,
+        think_budget: usize::MAX,
         queue_bytes: 0,
         request_tag: 1,
         reply: reply_tx,
@@ -112,7 +115,7 @@ fn main() {
                 println!("OUTPUT: {:?}", text);
                 break;
             }
-            Ok(Event::Rejected { reason }) => {
+            Ok(Event::Rejected { reason, .. }) => {
                 println!("Rejected: {reason}");
                 println!("OUTPUT-SO-FAR: {:?}", text);
                 break;
