@@ -67,6 +67,14 @@ pub struct DflashShared {
     /// Legacy mode: `min(requested_ctx, HIPFIRE_DFLASH_CTX_CAP | 8192)`.
     /// Windowed: `w`.
     pub ctx_capacity: usize,
+    /// The engine's per-slot token capacity (`cap_tokens`) — the draft's
+    /// hard context bound. In windowed mode this is `new_windowed`'s
+    /// `max_ctx`: the committed length `l` grows past the window `w` (the
+    /// rings wrap), so `max_ctx_len` must be the physical cap, NOT `w`.
+    /// Passing `w` here froze `l` at the window and tripped
+    /// `draft_forward_opts`'s `assert!(l <= max_ctx_len)` on any request
+    /// whose committed length crossed it.
+    pub physical_ctx: usize,
     /// Per-extract-layer staging buffers the batched forward fills via
     /// [`SpecHiddenCapture`]; sized `max_batch × dim` each. Shared across
     /// slots because staging holds the step's rows (slots scatter their own
@@ -308,6 +316,7 @@ pub fn load_dflash_shared(
         draft_config,
         draft_weights,
         block_size,
+        physical_ctx: requested_ctx,
         window,
         ctx_capacity,
         hidden_staging,
@@ -335,7 +344,12 @@ pub fn new_dflash_slot_state(
             w,
             // All-sliding drafts ignore w_full; pass the window for both.
             w,
-            shared.ctx_capacity,
+            // max_ctx is the draft's HARD context bound (the committed
+            // length `l` grows past the window `w` — the rings wrap), so it
+            // must be the physical per-slot cap, not `w`. Passing `w` here
+            // froze `l` at the window and tripped draft_forward_opts's
+            // `assert!(l <= max_ctx_len)` once a request crossed it.
+            shared.physical_ctx,
             shared.draft_weights.has_mq,
         ),
         None => DflashScratch::new_with_mq(
@@ -379,10 +393,6 @@ pub fn reset_dflash_slot(st: &mut DflashSlotState, session: u64) {
     st.draft = None;
 }
 
-/// Scatter `n` rows of the step's captured hidden staging into the slot's
-/// interleaved `target_hidden` at absolute position `pos`. `row_off` is the
-/// slot's first row within the step's `x_batch`/staging layout.
-///
 /// `target_hidden` is interleaved `[pos % modulus][layer][h]` — one
 /// `scatter_hidden_block_to_interleaved`-style copy per extract layer.
 pub fn scatter_staging_rows_to_interleaved(
@@ -396,6 +406,23 @@ pub fn scatter_staging_rows_to_interleaved(
     let h = shared.draft_config.hidden;
     let ne = shared.draft_config.num_extract();
     let modulus = st.scratch.ctx_modulus();
+    // Legacy (modulus == usize::MAX) writes at the ABSOLUTE position into a
+    // `ctx_capacity`-row target_hidden. Bound it here so an over-cap write is
+    // a typed Err (the caller retires spec / falls back to AR), not the
+    // release `assert!` panic `sub_offset` would raise — the serve-hang class.
+    if modulus == usize::MAX {
+        // target_hidden is a flat [rows * ne * h] f32 buffer.
+        let rows = st.scratch.target_hidden.numel() / (ne * h);
+        if pos + n > rows {
+            return Err(hip_bridge::HipError::new(
+                1,
+                &format!(
+                    "dflash legacy scatter: pos {pos} + n {n} exceeds target_hidden \
+                     rows {rows} (ctx_capacity)"
+                ),
+            ));
+        }
+    }
     for (i, staging) in shared.hidden_staging.iter().enumerate() {
         // Source: this extract layer's staging, rows row_off..row_off+n.
         let src = staging.sub_offset(row_off * h, n * h);
@@ -504,7 +531,23 @@ pub fn dflash_slot_draft_step(
     // compact_offset is always 0 on the slots path); K = committed abs
     // positions (contiguous — no CASK eviction on slots) + the same block
     // slots.
-    let effective_ctx_len = st.scratch.thlog.abs_positions().len().min(position);
+    //
+    // `effective_ctx_len` is capped at `scratch.max_ctx_len` (= the window
+    // `w` for all-sliding DFlash2, the ctx cap for Legacy). Without the cap
+    // the unbounded `abs_positions` log lets `l` cross `w` once a request's
+    // committed length exceeds the window, tripping `draft_forward_opts`'s
+    // `assert!(l <= max_ctx_len)` — a panic in the engine loop. The windowed
+    // contract is to DEGRADE τ past the window (the K span is the last `w`
+    // rows), never to assert. The sequential path gets the same cap from
+    // `ctx_slice = Some(window)`; the slot path has no ctx_slice, so the cap
+    // lives here.
+    let effective_ctx_len = st
+        .scratch
+        .thlog
+        .abs_positions()
+        .len()
+        .min(position)
+        .min(st.scratch.max_ctx_len);
     let positions_q: Vec<i32> =
         (position as i32..(position + b) as i32).collect();
     let mut positions_k: Vec<i32> = Vec::with_capacity(effective_ctx_len + b);

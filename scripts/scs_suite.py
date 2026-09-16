@@ -587,15 +587,17 @@ def a1(t):
     # Tools are SUPPORTED on this route (upstream restored tool turns); the
     # advertisement must not claim otherwise.
     t.check("tools" not in refused, "tools are supported but advertised as refused")
-    for f in ("stop", "logprobs", "response_format:json_object"):
+    for f in ("stop", "logprobs", "top_logprobs", "n", "best_of",
+              "logit_bias", "echo", "suffix", "reasoning_effort",
+              "response_format:json_object", "tools+image"):
         t.check(f in refused, "refused_request_fields missing %r (got %s)" % (f, refused))
     for k in ("max_batch_tokens", "prefill_min_tokens", "max_queue", "max_queue_bytes",
               "queue_timeout_ms", "stream_buffer_bytes", "stream_stall_timeout_ms",
               "max_request_bytes"):
         t.check(isinstance(caps.get(k), int) and caps.get(k) > 0,
                 "capability %s missing/zero" % k)
-    t.ev("structured_jump_forward=%s scheduler_overlap=%s"
-         % (caps.get("structured_jump_forward"), caps.get("scheduler_overlap")))
+    t.ev("structured_jump_forward=%s"
+         % caps.get("structured_jump_forward"))
 
 
 @cell("A", "A2", "per-model capability projection (sidecar probes)")

@@ -371,8 +371,7 @@ single-slot loader (`hipfire run --spec mtp`). Verified on gfx1101 /
 ROCm 10 (`test_serve_prefix_cache --mtp-k 4`): greedy MTP, sampled AR,
 and JSON-Schema AR all reuse ≥256 tokens; `reset` forces a cold miss.
 Vision+prefix reuse stays off. Tools/stop/logprobs stay refused on slots.
-`serve.scheduler_overlap` stays off (no overlap implementation, no
-host-gap to measure). This is not a registry admission.
+This is not a registry admission.
 
 ### Capability advertisement
 

@@ -1859,6 +1859,7 @@ fn main() {
                     draft_path.as_deref(),
                     gpu.arch.as_str(),
                     vision_path.as_deref(),
+                    &vision_mode,
                     head_path.as_deref(),
                     max_seq,
                 ) {
@@ -2463,8 +2464,10 @@ fn main() {
                             &mut stdout,
                             Some(id),
                             "too many concurrent slot requests (bounded worker limit hit)",
-                            "validation",
-                            false,
+                            // Overload, not validation: slot saturation is a
+                            // transient capacity condition → 429 + Retry-After.
+                            "overload",
+                            true,
                             false,
                         );
                         let _ = stdout.flush();

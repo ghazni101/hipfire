@@ -616,6 +616,11 @@ impl Rig {
                 hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED_PAGES")
                     .ok()
                     .and_then(|v| v.trim().parse::<usize>().ok())
+                    // Clamp to >= 1: a literal "0" reaches PagePool's
+                    // `assert!(n_pages > 0)` inside Rig::build, which runs on
+                    // the engine thread before ready_tx — the spawn then
+                    // reports the opaque "engine thread died during startup".
+                    .map(|p| p.max(1))
                     .unwrap_or_else(|| legacy_equivalent.saturating_add(cache_headroom)),
             )
         } else {
@@ -645,6 +650,9 @@ impl Rig {
                             hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED_PAGES")
                                 .ok()
                                 .and_then(|v| v.trim().parse::<usize>().ok())
+                                // Same >= 1 clamp as the prefix-cache arm: a
+                                // literal "0" would panic PagePool's build.
+                                .map(|p| p.max(1))
                                 .unwrap_or(legacy_equivalent),
                         )
                     }
@@ -704,6 +712,26 @@ impl Rig {
                     .map_err(|e| format!("open .vl file {}: {e}", vl.display()))?;
                 let vc = hipfire_arch_qwen35_vl::qwen35_vl::vision_config_from_hfq(&vl_hfq)
                     .ok_or_else(|| ".vl file missing vision_config in metadata".to_string())?;
+                // Identity: the tower's projector writes the trunk's text
+                // hidden width. A `.vl` sibling paired with a different
+                // trunk (a `foo.vl` next to `bar.mq4`) would load
+                // "successfully" and then misalign every image embedding —
+                // refuse the mismatch at load time. Compare against
+                // `config.dim` (the value the runtime actually uses for the
+                // ext-embedding row stride), NOT a tensor-name probe: the
+                // trunk's final norm lives under `norm.weight`/`model.norm.weight`
+                // on HFQ, so probing `output_norm.weight` (a GGUF-only name)
+                // would skip the check entirely.
+                if vc.out_hidden_size != config.dim {
+                    return Err(format!(
+                        "vision sidecar {} does not match trunk {}: projector \
+                         output {} != trunk hidden {}",
+                        vl.display(),
+                        cfg.model_path.display(),
+                        vc.out_hidden_size,
+                        config.dim
+                    ));
+                }
                 let vw = hipfire_arch_qwen35_vl::qwen35_vl::load_vision_weights(
                     &mut vl_hfq, &vc, &mut gpu,
                 )
@@ -2311,6 +2339,15 @@ impl SpecDraftRows {
             SpecDraftRows::Dflash(d) => d.cur_pos,
         }
     }
+    /// Release the draft's device buffers. `DflashSlotDraft` owns four
+    /// `GpuTensor`s (verify_hidden/logits/rot/argmax, ~batch×vocab each) and
+    /// `GpuTensor` has no `Drop` — dropping the enum without this leaks VRAM.
+    /// `MtpDraftOutput` is host-only, so this is a no-op for it.
+    fn free_gpu(self, gpu: &mut Gpu) {
+        if let SpecDraftRows::Dflash(d) = self {
+            d.free_gpu(gpu);
+        }
+    }
 }
 
 /// Rebuild a `SlotBatch` to include spec verify tokens for slots that have
@@ -2547,11 +2584,38 @@ fn spec_verify_fits_cap(next_pos: usize, verify_rows: usize, cap_tokens: usize) 
 /// decode as plain AR when MTP would otherwise be available: the verify accept
 /// compares draft tokens against a bare greedy argmax over unpenalized logits,
 /// which cannot reproduce penalize-then-argmax.
+///
+/// `repeat_window == 0` does NOT neutralize the penalties: OpenAI-style
+/// presence/frequency penalties are defined over the whole context, so a zero
+/// window means "uncapped" (clamped to REPEAT_WINDOW_MAX), never "off". The
+/// old `repeat_window > 0` gate silently dropped a request's penalties AND
+/// let it take the MTP path — a double contract violation.
 fn request_penalized(req: &SubmitRequest) -> bool {
-    req.repeat_window > 0
-        && (req.repeat_penalty > 1.0
-            || req.presence_penalty > 0.0
-            || req.frequency_penalty > 0.0)
+    req.repeat_penalty > 1.0
+        || req.presence_penalty > 0.0
+        || req.frequency_penalty > 0.0
+}
+
+/// The penalty window a request actually gets: the requested value clamped to
+/// REPEAT_WINDOW_MAX, with 0 promoted to REPEAT_WINDOW_MAX when any penalty is
+/// active (0 = uncapped, per request_penalized's contract). When no penalty is
+/// active the window is irrelevant and stays 0 — no upload, no kernel scan.
+/// Takes the raw fields (not &SubmitRequest) so it can run after req's
+/// non-Copy fields have been moved into the InFlight.
+fn effective_repeat_window(
+    repeat_window: usize,
+    repeat_penalty: f32,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+) -> usize {
+    let w = repeat_window.min(REPEAT_WINDOW_MAX);
+    let penalized =
+        repeat_penalty > 1.0 || presence_penalty > 0.0 || frequency_penalty > 0.0;
+    if w == 0 && penalized {
+        REPEAT_WINDOW_MAX
+    } else {
+        w
+    }
 }
 
 /// True when the request asks for real sampling. Sampled requests decode AR
@@ -2571,7 +2635,7 @@ fn install_sample_params(rig: &mut Rig, slot: SlotId, req: &SubmitRequest) {
         top_p: req.top_p,
         top_k: req.top_k,
         seed: req.seed,
-        repeat_window: req.repeat_window.min(REPEAT_WINDOW_MAX) as i32,
+        repeat_window: effective_repeat_window(req.repeat_window, req.repeat_penalty, req.presence_penalty, req.frequency_penalty) as i32,
         repeat_penalty: req.repeat_penalty,
         presence_penalty: req.presence_penalty,
         frequency_penalty: req.frequency_penalty,
@@ -2625,8 +2689,9 @@ fn publish_generated_prefix(
     // Vision + prefix reuse stays OFF (spec §6 X2): an image conversation's
     // KV carries M-RoPE compressed-grid phases that a text requester cannot
     // resume correctly, and no pixel/embedding identity oracle exists yet.
-    // rope_delta != 0 marks a conversation that carries an image turn.
-    if sess.rope_delta != 0 {
+    // `has_image` is the positive marker — `rope_delta` is 0 for a thin
+    // (single-row/col) image, so it cannot stand in for "carries an image".
+    if sess.has_image {
         return;
     }
     let total_tokens = sess.tokens.len();
@@ -2698,6 +2763,7 @@ fn publish_generated_prefix(
                 ckpt_pool,
                 domain,
                 new_boundary as u64,
+                &tokens,
                 &rig.dn_states[s],
             ) {
                 Ok(id) if id.is_some() => Some(id),
@@ -3126,11 +3192,14 @@ impl GrammarConstraint {
             self.think_tail.clear();
             return;
         }
-        if Some(token) == self.think_close_id {
+        if Some(token) == self.think_close_id && self.in_think {
             self.in_think = false;
             self.think_tail.clear();
             return;
         }
+        // When NOT in_think, a `</think>` token is ordinary content (the mask
+        // admits it as inert string bytes) — it MUST reach the matcher, or
+        // the validated buffer diverges from the emitted text.
         if self.in_think {
             // Budget accounting: every ordinary think token consumes one
             // unit (the close token itself returns earlier and never gets
@@ -3287,8 +3356,15 @@ fn run_loop(
         // iteration — absorbing whole prefill chunks, or not advancing at
         // all while the engine blocks on recv with an empty room — so a
         // tick-denominated deadline fired arbitrarily late or never.
-        let queue_timeout =
-            std::time::Duration::from_millis(rig.queue_timeout_ms);
+        // `serve.queue_timeout_ms == 0` is documented (docs/CONFIG.md) as "no
+        // wait timeout" — a parked request must never expire. Map it to
+        // Duration::MAX so `duration_since >= timeout` is never true; a plain
+        // `from_millis(0)` would expire every waiter on the next iteration.
+        let queue_timeout = if rig.queue_timeout_ms == 0 {
+            std::time::Duration::MAX
+        } else {
+            std::time::Duration::from_millis(rig.queue_timeout_ms)
+        };
         let now = std::time::Instant::now();
         let expired_waiters: Vec<u64> = rig
             .parked_requests
@@ -3338,6 +3414,30 @@ fn run_loop(
             }
         }
         if slots.iter().all(|s| s.is_none()) {
+            // All slots free but waiters remain queued: the drain loop above
+            // could not admit any of them (e.g. the grant cannot fit the
+            // VRAM budget with weights resident, and there is no reclaimable
+            // victim). A bare `continue` would re-run the whole iteration —
+            // try_recv, expire scan, pop, re-park — forever on one core until
+            // each waiter's wall-clock deadline. Block instead until the
+            // SOONEST queued deadline (or a new command arrives), so the
+            // expiry path still fires on time and the engine does not spin.
+            let now = std::time::Instant::now();
+            let sleep_for = rig
+                .parked_requests
+                .values()
+                .map(|p| {
+                    queue_timeout
+                        .checked_sub(now.duration_since(p.enqueued_at))
+                        .unwrap_or(std::time::Duration::ZERO)
+                })
+                .min()
+                .unwrap_or(std::time::Duration::from_millis(50));
+            match rx.recv_timeout(sleep_for) {
+                Ok(cmd) => handle_command(&mut rig, &mut slots, &mut work, &stats, cmd),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {}
+                Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break 'serve,
+            }
             continue;
         }
 
@@ -3614,10 +3714,20 @@ fn run_loop(
             };
             sync_fair_needs(&mut rig.fair_queue, id, wants_decode, verify, uncached);
         }
+        // Pass the FULL row budget, not `remaining_for_sched`: select's
+        // phase-3 verify pass already charges each spec slot's verify_rows
+        // against the budget it is given. Handing it the verify-subtracted
+        // budget double-charges verify — a spec slot's verify is denied
+        // whenever used > budget − 2·verify_rows even though used + verify
+        // fits, and the denied slot is then reported starved → backfill
+        // masks every other slot to 0 rows for the spec request's whole
+        // generation. The scheduler still gets `remaining_for_sched` for its
+        // decode+prefill allocation (it does not handle verify rows).
+        let full_budget = max_batch_tokens.min(rig.pbs.max_batch) as u64;
         let sel = rig.fair_queue.select(
             n as u64,
             prefill_min_tokens as u64,
-            remaining_for_sched as u64,
+            full_budget,
         );
         // After the admission round: mark requests not served since the last
         // round as aged (spec §5.3 S3.3). select already advanced the tick;
@@ -3690,7 +3800,11 @@ fn run_loop(
                     let slot = spec_drafts.iter().position(|x| x.is_some());
                     match slot {
                         Some(s) => {
-                            spec_drafts[s] = None;
+                            // Free the dropped draft's device buffers —
+                            // DflashSlotDraft owns GpuTensors with no Drop.
+                            if let Some(d) = spec_drafts[s].take() {
+                                d.free_gpu(&mut rig.gpu);
+                            }
                             let vk = rig.spec_rows as u64;
                             reservation.verify_rows = reservation.verify_rows.saturating_sub(vk);
                             // The draft consumed the seed OUT of
@@ -3748,50 +3862,6 @@ fn run_loop(
         if batch.is_empty() {
             continue;
         }
-        // VL rows: refresh the per-row vision-matrix base pointers the
-        // scatter kernel dereferences. Engine-side upload, every step
-        // (including graph replays), so the captured kernel always reads
-        // current pointers. Rows with a negative index never dereference.
-        if batch.ext_emb.len() == batch.positions.len()
-            && batch.ext_emb.iter().any(|&e| e >= 0)
-        {
-            let ptrs: Vec<u64> = batch
-                .row_slot
-                .iter()
-                .map(|&sl| {
-                    rig.vl_ext_devs[sl as usize]
-                        .as_ref()
-                        .map(|t| t.buf.as_ptr() as u64)
-                        .unwrap_or(0)
-                })
-                .collect();
-            let bytes: Vec<u8> = ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
-            // Bound-check here, not in memcpy_htod: its overflow path is an
-            // assert, and a panic in this thread kills the engine loop while
-            // the HTTP front end keeps accepting — the serve-hang failure
-            // mode. This upload runs before forward_batch_slots' own
-            // n <= pbs.max_batch assert, so an oversized batch would only
-            // surface here.
-            if bytes.len() > rig.pbs.ext_emb_row_ptr.buf.size() {
-                let reason = format!(
-                    "vl ext ptr upload of {} bytes exceeds staging capacity {} \
-                     (batch of {} rows vs max_batch {})",
-                    bytes.len(),
-                    rig.pbs.ext_emb_row_ptr.buf.size(),
-                    batch.total_rows(),
-                    rig.pbs.max_batch
-                );
-                fail_all_active(&mut rig, &mut slots, &mut work, reason.clone());
-                poison = Some(reason);
-                break 'serve;
-            }
-            if let Err(e) = rig.gpu.hip.memcpy_htod(&rig.pbs.ext_emb_row_ptr.buf, &bytes) {
-                let reason = format!("vl ext ptr upload failed: {e:?}");
-                fail_all_active(&mut rig, &mut slots, &mut work, reason.clone());
-                poison = Some(reason);
-                break 'serve;
-            }
-        }
         // Provision every slot's write frontier before any COW or kernel work.
         // If retained cache-only pages consumed the free list, evict unpinned
         // radix leaves and retry once. `forward_batch_slots` repeats this call
@@ -3835,6 +3905,11 @@ fn run_loop(
                     rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
                     clear_work_slot(&mut work[s]);
                     clear_slot_vl_state(&mut rig, s);
+                    // Free the dropped draft's device buffers — the slot is
+                    // gone but its DflashSlotDraft GpuTensors would leak.
+                    if let Some(d) = spec_drafts[s].take() {
+                        d.free_gpu(&mut rig.gpu);
+                    }
                 }
             }
             rebuild_batch_excluding_failed(&mut batch, &provision_failed);
@@ -3944,7 +4019,11 @@ fn run_loop(
             // Also drop spec drafts for failed slots so the verify path
             // does not try to read their hidden rows.
             for &s in &failed_slots {
-                spec_drafts[s] = None;
+                // Free the dropped draft's device buffers — DflashSlotDraft
+                // owns GpuTensors with no Drop.
+                if let Some(d) = spec_drafts[s].take() {
+                    d.free_gpu(&mut rig.gpu);
+                }
             }
             if batch.is_empty() {
                 continue;
@@ -3987,13 +4066,65 @@ fn run_loop(
                 }
                 clear_work_slot(&mut work[s]);
                 clear_slot_vl_state(&mut rig, s);
-                spec_drafts[s] = None;
+                if let Some(d) = spec_drafts[s].take() {
+                    d.free_gpu(&mut rig.gpu);
+                }
             }
             rebuild_batch_excluding_failed(&mut batch, &failed_commits);
             if batch.is_empty() {
                 continue;
             }
         }
+        // VL rows: refresh the per-row vision-matrix base pointers the
+        // scatter kernel dereferences. This MUST run AFTER every
+        // rebuild_batch_excluding_failed above — the upload reads the
+        // post-rebuild `row_slot`, and uploading before a rebuild would
+        // leave the pointer array misaligned with the surviving rows (a
+        // failed slot's rows are dropped, shifting every later row's slot
+        // index). Engine-side upload, every step (including graph replays),
+        // so the captured kernel always reads current pointers. Rows with a
+        // negative index never dereference.
+        if batch.ext_emb.len() == batch.positions.len()
+            && batch.ext_emb.iter().any(|&e| e >= 0)
+        {
+            let ptrs: Vec<u64> = batch
+                .row_slot
+                .iter()
+                .map(|&sl| {
+                    rig.vl_ext_devs[sl as usize]
+                        .as_ref()
+                        .map(|t| t.buf.as_ptr() as u64)
+                        .unwrap_or(0)
+                })
+                .collect();
+            let bytes: Vec<u8> = ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
+            // Bound-check here, not in memcpy_htod: its overflow path is an
+            // assert, and a panic in this thread kills the engine loop while
+            // the HTTP front end keeps accepting — the serve-hang failure
+            // mode. This upload runs before forward_batch_slots' own
+            // n <= pbs.max_batch assert, so an oversized batch would only
+            // surface here.
+            if bytes.len() > rig.pbs.ext_emb_row_ptr.buf.size() {
+                let reason = format!(
+                    "vl ext ptr upload of {} bytes exceeds staging capacity {} \
+                     (batch of {} rows vs max_batch {})",
+                    bytes.len(),
+                    rig.pbs.ext_emb_row_ptr.buf.size(),
+                    batch.total_rows(),
+                    rig.pbs.max_batch
+                );
+                fail_all_active(&mut rig, &mut slots, &mut work, reason.clone());
+                poison = Some(reason);
+                break 'serve;
+            }
+            if let Err(e) = rig.gpu.hip.memcpy_htod(&rig.pbs.ext_emb_row_ptr.buf, &bytes) {
+                let reason = format!("vl ext ptr upload failed: {e:?}");
+                fail_all_active(&mut rig, &mut slots, &mut work, reason.clone());
+                poison = Some(reason);
+                break 'serve;
+            }
+        }
+
 
         // DFlash slots need the extract-layer hidden capture whenever they
         // contribute rows this step — prefill chunks (draft-context seed)
@@ -4066,14 +4197,15 @@ fn run_loop(
                 }
                 // Vision requests skip the radix (spec X2) — including TEXT
                 // continuations of an image conversation: their context KV
-                // carries image-turn M-RoPE phases (rope_delta != 0).
+                // carries image-turn M-RoPE phases. `has_image` is the
+                // positive marker (`rope_delta` is 0 for a thin image).
                 if work[s].vl_prefill.is_some() {
                     continue;
                 }
                 if slots[s]
                     .as_ref()
                     .and_then(|f| rig.sessions.get(f.session))
-                    .map(|sess| sess.rope_delta != 0)
+                    .map(|sess| sess.has_image)
                     .unwrap_or(true)
                 {
                     continue;
@@ -4148,6 +4280,7 @@ fn run_loop(
                                 ckpt_pool,
                                 domain,
                                 new_boundary as u64,
+                                &tokens,
                                 &rig.dn_states[s],
                             ) {
                                 Ok(id) if id.is_some() => Some(id),
@@ -4208,23 +4341,20 @@ fn run_loop(
             // work cleared and swap forgotten, so no poisoned KV/DN survives.
             // If this invariant were broken, we would need to poison instead.
             let reason = e.to_string();
-            for (s, f) in slots.iter_mut().enumerate() {
-                if let Some(mut f) = f.take() {
-                    let _ = send_event(
-                        &f.reply,
-                        Event::Rejected { class: RejectClass::Internal, reason: reason.clone(),
-                        },
-                    );
-                    release_pin_ticket(&mut rig, &mut f.pin_ticket);
-                    rig.swap.forget(f.session.0);
-                    let _ = rig.fair_queue.remove(f.session.0);
-                    rig.sessions.close(&mut rig.pool, &mut rig.adm, f.session);
-                    work[s].remaining_prompt.clear();
-                    work[s].decoding = false;
-                    work[s].next_pos = 0;
-                    work[s].spec = crate::scheduler::SpecKind::None;
+            // Free every in-flight draft's device buffers first — the slots
+            // are about to be torn down and DflashSlotDraft owns GpuTensors
+            // with no Drop.
+            for d in spec_drafts.iter_mut() {
+                if let Some(d) = d.take() {
+                    d.free_gpu(&mut rig.gpu);
                 }
             }
+            // fail_all_active does the full per-slot teardown (clear_work_slot
+            // + clear_slot_vl_state + fair_queue.remove + session close) that
+            // this path previously open-coded but skipped — leaking VL device
+            // buffers (vl_ext_devs, vl_tower_jobs) and leaving stale
+            // work[s].vl_prefill/pos3_delta.
+            fail_all_active(&mut rig, &mut slots, &mut work, reason);
             continue;
         }
         if let Err(e) = rig.gpu.hip.device_synchronize() {
@@ -5301,11 +5431,23 @@ fn admit(
                 // pages". Evict radix leaves first, then LRU idle sessions;
                 // the matched session itself is never a victim.
                 if rig.pool.is_paged() {
+                    // `held` = tokens already materialized in this slot's KV.
+                    // For a RESIDENT session that is the descriptor's seq_len
+                    // (the real frontier), NOT sess.next_pos — next_pos is
+                    // only stamped at begin_turn/mark_resident and still holds
+                    // the PREVIOUS turn's reuse point, which over-counts the
+                    // suffix and evicts/rejects requests the pool could back.
                     let held = rig
-                        .sessions
-                        .get(existing)
-                        .map(|s| s.next_pos)
-                        .unwrap_or(0);
+                        .pool
+                        .descriptors()
+                        .get(slot.0)
+                        .map(|d| d.seq_len.max(0) as usize)
+                        .unwrap_or_else(|| {
+                            rig.sessions
+                                .get(existing)
+                                .map(|s| s.next_pos)
+                                .unwrap_or(0)
+                        });
                     let needed_pages = extended
                         .len()
                         .saturating_sub(held)
@@ -5428,9 +5570,19 @@ fn admit(
                     .saturating_add(req.max_tokens.max(1))
                     .min(rig.cap_tokens);
                 if let Err(e) = rig.adm.resize(existing.0, turn_grant) {
+                    // A real budget shortfall is a capacity signal (429
+                    // Overload — retryable), not an internal fault (500).
+                    // UnknownSession/PoolFull are engine inconsistencies and
+                    // stay Internal.
+                    let class = match e {
+                        hipfire_runtime::admission::AdmitError::WouldExceedBudget { .. } => {
+                            RejectClass::Overload
+                        }
+                        _ => RejectClass::Internal,
+                    };
                     let _ = send_event(
                         &req.reply,
-                        Event::Rejected { class: RejectClass::Internal, reason: format!(
+                        Event::Rejected { class, reason: format!(
                                 "admission grant for the extended turn does not fit: {e}"
                             ),
                         },
@@ -5512,11 +5664,30 @@ fn admit(
                     let dflash_ring_valid = rig.dflash_states[slot.0]
                         .as_ref()
                         .is_some_and(|st| st.seeded_through == plan.reused);
+                    // Legacy-mode ctx fit (sequential `spec_ctx_request_fits`
+                    // parity): the Legacy scatter writes target_hidden at the
+                    // ABSOLUTE position into a `ctx_capacity`-row buffer, so a
+                    // request that can grow past `ctx_capacity` would drive an
+                    // out-of-bounds scatter (a release `assert!` panic in
+                    // `sub_offset` — the serve-hang class). Windowed mode has
+                    // no such bound (its rings wrap), so the gate is Legacy-
+                    // only. `+ block_size` keeps the last verify window's
+                    // `advance` rows inside the buffer.
+                    let dflash_ctx_fits = rig.dflash.as_ref().map_or(false, |d| {
+                        d.window.is_some()
+                            || req
+                                .prompt_tokens
+                                .len()
+                                .saturating_add(req.max_tokens.max(1))
+                                .saturating_add(d.block_size)
+                                <= d.ctx_capacity
+                    });
                     let dflash_ok = rig.dflash.is_some()
                         && req.visual_data.is_none()
                         && !request_penalized(&req)
                         && !request_sampled(&req)
                         && req.json_schema.is_none()
+                        && dflash_ctx_fits
                         && (plan.reused == 0 || dflash_ring_valid);
                     if !dflash_ring_valid {
                         if let Some(st) = rig.dflash_states[slot.0].take() {
@@ -5554,12 +5725,13 @@ fn admit(
                     if let Some(sess) = rig.sessions.get_mut(existing) {
                         sess.published_boundary = session_pub;
                     }
+                    let repeat_window_req = effective_repeat_window(req.repeat_window, req.repeat_penalty, req.presence_penalty, req.frequency_penalty);
                     slots[slot.0] = Some(InFlight {
                         session: existing,
                         reply: req.reply,
                         produced: 0,
                         max_tokens: req.max_tokens.max(1),
-                        repeat_window_req: req.repeat_window.min(REPEAT_WINDOW_MAX),
+                        repeat_window_req,
                         last_published_boundary: session_pub,
                         grammar: grammar_constraint,
                         // Continuation reuse is session-local (convo hash),
@@ -5699,6 +5871,19 @@ fn admit(
     let id = match opened {
         Ok(id) => id,
         Err(e) => {
+            // A WouldExceedBudget failure is NOT slot-shaped: parking the
+            // request cannot release grant bytes (parking swaps where they
+            // live, it does not forgive them), so no slot-freeing event will
+            // ever admit it — it would burn the full queue timeout before a
+            // 429. Reject immediately as Overload instead of parking.
+            if matches!(e, AdmitError::WouldExceedBudget { .. }) {
+                let _ = send_event(
+                    &req.reply,
+                    Event::Rejected { class: RejectClass::Overload, reason: format!("admission budget exhausted: {e}") },
+                );
+                lock_stats(stats).note_rejected();
+                return;
+            }
             // R-A4 replacement (spec §5.3 S3): when every resident session
             // is generating and no idle victim can make room, enqueue the
             // request in the bounded WaitQueue instead of rejecting
@@ -5845,7 +6030,7 @@ fn admit(
             match plan_resume(
                 ckpt_pool,
                 domain,
-                req.prompt_tokens.len() as u64,
+                &req.prompt_tokens,
                 lookup,
                 drafter,
             ) {
@@ -5868,7 +6053,7 @@ fn admit(
                             // to the cold path below (begin_turn resets the
                             // table; the DN state is still the reset one).
                             let restore_ok = ckpt_pool
-                                .peek(domain, boundary as u64)
+                                .peek(domain, boundary as u64, crate::checkpoint::prefix_fingerprint(&req.prompt_tokens[..boundary]))
                                 .map(|snapshot| {
                                     snapshot
                                         .restore_to(
@@ -5912,7 +6097,7 @@ fn admit(
                     // restore attempt is over (or was skipped) either way,
                     // so release it on every Ok(plan) exit path.
                     if plan.boundary > 0 {
-                        ckpt_pool.unpin(domain, plan.boundary);
+                        ckpt_pool.unpin(domain, plan.boundary, crate::checkpoint::prefix_fingerprint(&req.prompt_tokens[..plan.boundary as usize]));
                     }
                 }
                 Err(_) => {} // No checkpoint at any boundary: cold prefill
@@ -6049,6 +6234,11 @@ fn admit(
         // (fresh sessions are, but this path also serves continuation-miss
         // re-prefills, which must not inherit anything stale).
         sess.rope_delta = req.visual_data.as_ref().map(|vd| vd.rope_delta).unwrap_or(0);
+        // Sticky image marker: `rope_delta` is 0 for a thin (single-row/col)
+        // image, so it cannot stand in for "this conversation carries an
+        // image turn". `has_image` is the publish/lookup gate for the prefix
+        // cache (spec §6 X2).
+        sess.has_image = sess.has_image || req.visual_data.is_some();
     }
 
     if send_event(
@@ -6077,7 +6267,7 @@ fn admit(
         top_p: req.top_p,
         top_k: req.top_k,
         seed: req.seed,
-        repeat_window: req.repeat_window.min(REPEAT_WINDOW_MAX) as i32,
+        repeat_window: effective_repeat_window(req.repeat_window, req.repeat_penalty, req.presence_penalty, req.frequency_penalty) as i32,
         repeat_penalty: req.repeat_penalty,
         presence_penalty: req.presence_penalty,
         frequency_penalty: req.frequency_penalty,
@@ -6181,10 +6371,26 @@ fn admit(
         // 0..reused (the append_committed gap guard). Continuations are the
         // exception: their ring survives on the slot and the continuation
         // arm checks its watermark.
+        // Legacy-mode ctx fit (sequential `spec_ctx_request_fits` parity):
+        // the Legacy scatter writes target_hidden at the ABSOLUTE position
+        // into a `ctx_capacity`-row buffer, so a request that can grow past
+        // `ctx_capacity` would drive an out-of-bounds scatter (a release
+        // `assert!` panic in `sub_offset` — the serve-hang class). Windowed
+        // mode has no such bound (its rings wrap), so the gate is Legacy-only.
+        let dflash_ctx_fits = rig.dflash.as_ref().map_or(false, |d| {
+            d.window.is_some()
+                || req
+                    .prompt_tokens
+                    .len()
+                    .saturating_add(req.max_tokens.max(1))
+                    .saturating_add(d.block_size)
+                    <= d.ctx_capacity
+        });
         let dflash_ok = rig.dflash.is_some()
             && !penalized
             && !request_sampled(&req)
             && !grammar_constrained
+            && dflash_ctx_fits
             && reused == 0;
         work[slot.0].spec = if mtp_ok {
             crate::scheduler::SpecKind::Mtp
@@ -6204,12 +6410,13 @@ fn admit(
             sess.published_boundary = reused;
         }
     }
+    let repeat_window_req = effective_repeat_window(req.repeat_window, req.repeat_penalty, req.presence_penalty, req.frequency_penalty);
     slots[slot.0] = Some(InFlight {
         session: id,
         reply: req.reply,
         produced: 0,
         max_tokens: req.max_tokens.max(1),
-        repeat_window_req: req.repeat_window.min(REPEAT_WINDOW_MAX),
+        repeat_window_req,
         last_published_boundary: reused,
         grammar: grammar_constraint,
         pin_ticket,

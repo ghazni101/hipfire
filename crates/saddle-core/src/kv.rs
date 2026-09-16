@@ -462,8 +462,17 @@ impl SlotKvTierPlan {
             v_bytes_per_pos,
             givens_len: matches!(mode, KvMode::Asym2 | KvMode::Asym3 | KvMode::Asym4)
                 .then_some(head_dim / 2),
-            fwht_len: matches!(mode, KvMode::Fwht2 | KvMode::Fwht3 | KvMode::Fwht4)
-                .then_some(128),
+            // fwht3's K-rotation kernel is `fwht_shfl_forward_256` — it reads
+            // signs[0..255] (d0 = tid*8 → lane 31 touches index 255). The
+            // sequential path already allocates 256 for Fwht3 (kv.rs:776);
+            // the slot path must match or the sign table is 512 B short →
+            // OOB read + a wrong rotation → silently corrupted KV.
+            // fwht2/fwht4 use the 128-wide `fwht_shfl_forward_128`.
+            fwht_len: match mode {
+                KvMode::Fwht3 => Some(256),
+                KvMode::Fwht2 | KvMode::Fwht4 => Some(128),
+                _ => None,
+            },
         })
     }
 
@@ -5156,11 +5165,15 @@ mod slot_kv_plan_tests {
             assert_eq!(p.givens_len, Some(128), "{m:?}: head_dim/2 givens angles");
             assert!(p.fwht_len.is_none(), "{m:?} must not carry fwht signs");
         }
-        for m in [KvMode::Fwht2, KvMode::Fwht3, KvMode::Fwht4] {
+        for m in [KvMode::Fwht2, KvMode::Fwht4] {
             let p = SlotKvTierPlan::resolve(m, 2, 256).unwrap();
             assert_eq!(p.fwht_len, Some(128), "{m:?}: 128-wide sign vectors");
             assert!(p.givens_len.is_none(), "{m:?} must not carry givens angles");
         }
+        // fwht3's K-rotation kernel reads signs[0..255] — 256-wide, not 128.
+        let p = SlotKvTierPlan::resolve(KvMode::Fwht3, 2, 256).unwrap();
+        assert_eq!(p.fwht_len, Some(256), "Fwht3: 256-wide sign vectors");
+        assert!(p.givens_len.is_none(), "Fwht3 must not carry givens angles");
     }
 
     #[test]

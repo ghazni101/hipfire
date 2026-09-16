@@ -589,6 +589,7 @@ fn admit_and_load(
         None,
         gpu.arch.as_str(),
         vision,
+        "auto",
         None,
         max_seq,
     )

@@ -232,7 +232,7 @@ impl CacheDomain {
         }
         let model_content_digest = take_bytes(&mut cur)?;
         let model_load_epoch = take_u64(&mut cur)?;
-        let sidecar_count = take_u64(&mut cur)? as usize;
+        let sidecar_count = take_count(&mut cur, 8)?;
         let mut sidecar_digests = Vec::with_capacity(sidecar_count);
         for _ in 0..sidecar_count {
             sidecar_digests.push(take_bytes(&mut cur)?);
@@ -244,12 +244,12 @@ impl CacheDomain {
         let arch_tag = take_str(&mut cur)?;
         let state_abi_tag = take_str(&mut cur)?;
         let position_attention_tag = take_str(&mut cur)?;
-        let k_len = take_u64(&mut cur)? as usize;
+        let k_len = take_count(&mut cur, 8)?;
         let mut k_stride_bytes = Vec::with_capacity(k_len);
         for _ in 0..k_len {
             k_stride_bytes.push(take_u64(&mut cur)?);
         }
-        let v_len = take_u64(&mut cur)? as usize;
+        let v_len = take_count(&mut cur, 8)?;
         let mut v_stride_bytes = Vec::with_capacity(v_len);
         for _ in 0..v_len {
             v_stride_bytes.push(take_u64(&mut cur)?);
@@ -360,6 +360,19 @@ fn take_u64(cur: &mut &[u8]) -> Result<u64, CanonicalError> {
     buf.copy_from_slice(&cur[..8]);
     *cur = &cur[8..];
     Ok(u64::from_le_bytes(buf))
+}
+
+/// Read a collection count without allocating from an attacker-controlled
+/// u64. Every encoded member consumes at least `min_member_bytes` bytes, so a
+/// count larger than the remaining stream can never be valid.
+fn take_count(cur: &mut &[u8], min_member_bytes: usize) -> Result<usize, CanonicalError> {
+    let raw = take_u64(cur)?;
+    let count = usize::try_from(raw).map_err(|_| CanonicalError::Oversized)?;
+    let max_count = cur.len() / min_member_bytes.max(1);
+    if count > max_count {
+        return Err(CanonicalError::Oversized);
+    }
+    Ok(count)
 }
 
 fn take_bytes(cur: &mut &[u8]) -> Result<Vec<u8>, CanonicalError> {
@@ -836,6 +849,21 @@ mod tests {
             CanonicalError::Trailing(_) => {}
             other => panic!("expected Trailing, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn cache_domain_canonical_rejects_unbounded_collection_count() {
+        let mut bytes = sample_domain(1).to_canonical_bytes();
+        // version + model digest length + digest + model_load_epoch lands at
+        // the sidecar count. Replace it with u64::MAX; decoding must reject
+        // before Vec::with_capacity attempts an attacker-sized allocation.
+        let digest_len = u64::from_le_bytes(bytes[1..9].try_into().unwrap()) as usize;
+        let sidecar_count = 1 + 8 + digest_len + 8;
+        bytes[sidecar_count..sidecar_count + 8].copy_from_slice(&u64::MAX.to_le_bytes());
+        assert_eq!(
+            CacheDomain::from_canonical_bytes(&bytes).unwrap_err(),
+            CanonicalError::Oversized
+        );
     }
 
     #[test]

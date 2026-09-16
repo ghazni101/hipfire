@@ -478,7 +478,21 @@ pub(crate) async fn serve_listener_until(
         tokio::select! {
             _ = shutdown.cancelled() => return Ok(()),
             accepted = listener.accept() => {
-                let (stream, _) = accepted?;
+                // A transient accept() error (EMFILE/ENFILE under a
+                // connection flood, transient fd exhaustion) must NOT exit
+                // the loop — the process would stay alive but stop accepting
+                // connections forever. Log and keep accepting; only the
+                // shutdown token ends the listener.
+                let stream = match accepted {
+                    Ok((stream, _)) => stream,
+                    Err(err) => {
+                        eprintln!("[hipfire] accept error (listener stays up): {err:#}");
+                        // Brief yield so a hard fd-exhaustion spin does not
+                        // peg a core while the condition persists.
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        continue;
+                    }
+                };
                 let shared = Arc::clone(&shared);
                 tokio::spawn(async move {
                     // One tracker per connection so pipelined responses share FIFO
@@ -1573,7 +1587,21 @@ async fn handle_nonstreaming(
                 .unwrap();
             resp
         }
-        Ok(Err(message)) => openai_error(&message, request_error_status(&message)),
+        Ok(Err(message)) => {
+            let status = request_error_status(&message);
+            let mut resp = openai_error(&message, status);
+            // Engine-side overload (queue timeout / capacity-exhausted) maps
+            // to 429 through request_error_status, but unlike the CLI
+            // admission guard's 429 it carried no Retry-After — scs_suite D3
+            // asserts every 429 has one. Emit the queue timeout as the hint.
+            if status == 429 {
+                let ra = shared.admission.retry_after_seconds();
+                if let Ok(v) = header::HeaderValue::from_str(&ra.to_string()) {
+                    resp.headers_mut().insert(header::RETRY_AFTER, v);
+                }
+            }
+            resp
+        }
         Err(_) => openai_error("generation worker disconnected", 500),
     }
 }
@@ -1775,7 +1803,12 @@ pub(crate) fn finish_sse_stream(
             });
             let mut bytes = sse_data(&payload);
             bytes.extend_from_slice(b"data: [DONE]\n\n");
-            let _ = sender.blocking_send(ResponseChunk::plain(bytes));
+            // try_send, not blocking_send: a stalled client at zero window
+            // leaves the channel full, and an unbounded blocking_send here
+            // would pin this spawn_blocking thread forever — repeated stalls
+            // exhaust the blocking pool and hang every request. The error
+            // frame is best-effort; a full channel means the client is gone.
+            let _ = sender.try_send(ResponseChunk::plain(bytes));
         }
     }
     drop(sender);

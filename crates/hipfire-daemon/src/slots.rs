@@ -602,8 +602,11 @@ impl SlotBackend {
                 stdout,
                 Some(id),
                 "too many concurrent slot requests (bounded worker limit hit)",
-                "validation",
-                false,
+                // Overload, not validation: all slots busy is a transient
+                // capacity condition → HTTP 429 + Retry-After, not a
+                // client-fixable 400.
+                "overload",
+                true,
                 false,
             );
             let _ = stdout.flush();
@@ -936,6 +939,18 @@ impl SlotBackend {
             let _ = stdout.flush();
             return Ok(());
         }
+        if let Err(reason) = validate_tool_schema_bounds(tools) {
+            hipfire_engine::emit::emit_active_attempt_error(
+                stdout,
+                Some(id),
+                &reason,
+                "validation",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return Ok(());
+        }
         let messages = match project_jinja_messages(msg) {
             Ok(messages) => messages,
             Err(reason) => {
@@ -1142,7 +1157,10 @@ impl SlotBackend {
                 &format!(
                     "request requires context {prompt_len} prompt + {max_tokens} max_tokens = {}, \
                      exceeding the slot context cap of {} tokens — reduce max_tokens or shorten the prompt",
-                    prompt_len + max_tokens,
+                    // saturating: a direct-wire max_tokens = usize::MAX would
+                    // overflow a plain `prompt_len + max_tokens` and panic in
+                    // an overflow-checked build while the request is live.
+                    prompt_len.saturating_add(max_tokens),
                     self.cap_tokens
                 ),
                 "validation",
@@ -1885,6 +1903,36 @@ pub fn is_experimental_generate(msg: &serde_json::Value) -> bool {
 }
 
 pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
+    // Optional numeric controls must not silently fall back to defaults when
+    // present with the wrong JSON type. The parsing path uses as_f64/as_u64;
+    // validate the shape here before those Option chains erase intent.
+    for key in [
+        "temperature",
+        "top_p",
+        "repeat_penalty",
+        "repetition_penalty",
+        "presence_penalty",
+        "frequency_penalty",
+        "min_p",
+    ] {
+        if let Some(value) = msg.get(key) {
+            if !value.is_null() && value.as_f64().is_none() {
+                return Some(format!("{key} must be a number"));
+            }
+        }
+    }
+    for key in ["top_k", "repeat_window", "max_think_tokens"] {
+        if let Some(value) = msg.get(key) {
+            if !value.is_null() && value.as_u64().is_none() {
+                return Some(format!("{key} must be a non-negative integer"));
+            }
+        }
+    }
+    if let Some(value) = msg.get("params").and_then(|p| p.get("max_think_tokens")) {
+        if !value.is_null() && value.as_u64().is_none() {
+            return Some("params.max_think_tokens must be a non-negative integer".to_string());
+        }
+    }
     // Images and tools are each supported in experimental multi-slot, but
     // not together: the VL prompt path splices image pads into a ChatFrame
     // user body and cannot render a tool contract. Reject the combination
@@ -1917,7 +1965,16 @@ pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
             "images and tools together are not supported in experimental multi-slot".to_string(),
         );
     }
-    if msg.get("stop").is_some_and(|v| !v.is_null()) {
+    // `stop` is unsupported, but an EMPTY stop (`[]` or `""`) is
+    // semantically neutral — OpenAI-legal and a no-op. Refusing it 400s a
+    // request that asks for nothing. Only a non-empty stop is refused.
+    let stop_nonempty = match msg.get("stop") {
+        None | Some(serde_json::Value::Null) => false,
+        Some(serde_json::Value::Array(a)) => !a.is_empty(),
+        Some(serde_json::Value::String(s)) => !s.is_empty(),
+        Some(_) => true,
+    };
+    if stop_nonempty {
         return Some("custom stop not supported in experimental multi-slot".to_string());
     }
     if msg.get("logprobs").and_then(|v| v.as_bool()) == Some(true)
@@ -1976,14 +2033,29 @@ pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
     // out-of-range values are rejected here.
     for (key, lo, hi) in [
         ("repeat_penalty", 1.0, 2.0),
+        // `repetition_penalty` is the OpenAI alias the sampler read resolves
+        // (`.or_else(repetition_penalty)`); it must be range-checked too —
+        // otherwise `{"repetition_penalty": 0.5}` silently clamps to 1.0 and
+        // `{"repetition_penalty": 1e9}` reaches the sampler unclamped.
+        ("repetition_penalty", 1.0, 2.0),
         ("presence_penalty", 0.0, 2.0),
         ("frequency_penalty", 0.0, 2.0),
         ("min_p", 0.0, 1.0),
+        // temperature/top_p are consumed by the sampler with no daemon-side
+        // check; only the HTTP gateway validated them. Mirror the ranges so
+        // a direct-wire client cannot push -5 / 1e300 (f32::INFINITY) in.
+        ("temperature", 0.0, 2.0),
     ] {
         if let Some(v) = msg.get(key).and_then(|v| v.as_f64()) {
             if !(lo..=hi).contains(&v) {
                 return Some(format!("{key} must be within [{lo}, {hi}]"));
             }
+        }
+    }
+    // top_p is (0, 1] — open at 0, so it cannot ride the inclusive table.
+    if let Some(v) = msg.get("top_p").and_then(|v| v.as_f64()) {
+        if !(v > 0.0 && v <= 1.0) {
+            return Some("top_p must be within (0, 1]".to_string());
         }
     }
     if msg
@@ -2262,6 +2334,53 @@ fn validate_projected_tool_policy(
         }
         Some(_) => Err("invalid projected tool_choice policy".to_string()),
     }
+}
+
+/// Refuse a tools array that would exceed the grammar compiler's input
+/// bounds. `Matcher::with_config` builds the tool grammar with an internal
+/// `expect` on these same bounds, so an over-bound request that slipped
+/// through here would panic the per-request worker thread (and the whole
+/// process on a panic=abort build). Validating at the trust boundary turns
+/// it into a typed 400. Mirrors `saddle_core::grammar::json`'s accounting:
+/// tool count, plus the byte total of every tool name and `required` entry.
+fn validate_tool_schema_bounds(tools: Option<&[serde_json::Value]>) -> Result<(), String> {
+    use hipfire_arch_qwen35::grammar::{MAX_SCHEMA_BYTES, MAX_TOOL_SCHEMAS};
+    let Some(tools) = tools else { return Ok(()) };
+    if tools.len() > MAX_TOOL_SCHEMAS {
+        return Err(format!(
+            "tools: {} entries exceeds the grammar bound of {MAX_TOOL_SCHEMAS}",
+            tools.len()
+        ));
+    }
+    let mut total_bytes = 0usize;
+    for (i, tool) in tools.iter().enumerate() {
+        let func = tool.get("function").unwrap_or(tool);
+        let name = func.get("name").and_then(serde_json::Value::as_str);
+        if let Some(n) = name {
+            if n.is_empty() {
+                return Err(format!("tools[{i}]: empty tool name"));
+            }
+            total_bytes += n.len();
+        }
+        if let Some(required) = func
+            .get("parameters")
+            .and_then(|p| p.get("required"))
+            .and_then(serde_json::Value::as_array)
+        {
+            for r in required {
+                if let Some(s) = r.as_str() {
+                    total_bytes += s.len();
+                }
+            }
+        }
+    }
+    if total_bytes > MAX_SCHEMA_BYTES {
+        return Err(format!(
+            "tools: {total_bytes} bytes of names/required exceeds the grammar \
+             bound of {MAX_SCHEMA_BYTES}"
+        ));
+    }
+    Ok(())
 }
 
 fn trailing_tool_results(
@@ -3099,6 +3218,24 @@ mod tests {
             ]
         }))
         .is_none());
+    }
+
+    #[test]
+    fn generate_caps_rejects_malformed_numeric_controls() {
+        for request in [
+            json!({"temperature": "hot"}),
+            json!({"top_p": true}),
+            json!({"top_k": 1.5}),
+            json!({"repeat_window": -1}),
+            json!({"presence_penalty": []}),
+            json!({"max_think_tokens": "many"}),
+            json!({"params": {"max_think_tokens": -2}}),
+        ] {
+            assert!(
+                validate_generate_caps(&request).is_some(),
+                "malformed numeric control silently passed: {request}"
+            );
+        }
     }
 
     #[test]

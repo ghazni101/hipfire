@@ -1712,6 +1712,33 @@ fn project_request_contract_inner(
             _ => bail!("repeat_window must be an integer between 0 and 2048"),
         }
     }
+    // Token penalties + min_p + top_k: the daemon's slot sampler honors
+    // these, so a malformed value must be a typed 400 — not silently dropped
+    // to the config default (a string "abc" would otherwise forward as the
+    // default, and a non-finite number would reach the sampler).
+    for (field, min, max) in [
+        ("repeat_penalty", 1.0, 2.0),
+        ("repetition_penalty", 1.0, 2.0),
+        ("presence_penalty", 0.0, 2.0),
+        ("frequency_penalty", 0.0, 2.0),
+        ("min_p", 0.0, 1.0),
+    ] {
+        if let Some(value) = body.get(field).filter(|v| !v.is_null()) {
+            let number = value
+                .as_f64()
+                .filter(|v| v.is_finite())
+                .ok_or_else(|| anyhow!("{field} must be a finite number"))?;
+            if number < min || number > max {
+                bail!("{field} must be within [{min}, {max}]");
+            }
+        }
+    }
+    if let Some(value) = body.get("top_k").filter(|v| !v.is_null()) {
+        match value.as_u64() {
+            Some(v) if v >= 1 => {}
+            _ => bail!("top_k must be a positive integer"),
+        }
+    }
     if let Some(messages) = body.get("messages").and_then(serde_json::Value::as_array) {
         for message in messages {
             let role = message
@@ -2083,7 +2110,8 @@ pub(crate) fn complete_request_attempt(
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| anyhow!("model is required"))?
         .to_owned();
-    let image_base64 = request_image_base64(body.get("messages"))?;
+    let image_base64 = request_image_base64(body.get("messages"))
+        .map_err(|e| anyhow!("{}{e}", crate::serve::REQUEST_VALIDATION_TAG))?;
     // Acquire runtime, ensure model, and build the generate request while
     // holding the lock. Clone the engine handle before dropping the lock so
     // concurrent eligible requests can share the multiplexed transport.
@@ -2183,7 +2211,8 @@ pub(crate) fn complete_request_attempt(
         }
         // Validate OpenAI logprobs contract before forwarding; reject rather
         // than silently clamping so callers notice a mismatch.
-        validate_logprobs_request(body)?;
+        validate_logprobs_request(body)
+            .map_err(|e| anyhow!("{}{e}", crate::serve::REQUEST_VALIDATION_TAG))?;
         // Project tools under tool_choice; never forward raw tool_choice (daemon
         // ignores it). none drops tools so the template/parser stay inactive.
         if let Some(tools) = forwarded_tools {
@@ -2255,7 +2284,8 @@ pub(crate) fn complete_request_attempt(
             contract,
             effort_native,
             &supported_efforts,
-        )?;
+        )
+        .map_err(|e| anyhow!("{}{e}", crate::serve::REQUEST_VALIDATION_TAG))?;
         let (id, created) = identity.clone();
         generate["id"] = serde_json::Value::String(id.clone());
         generate["attempt_id"] = serde_json::json!(attempt_id);

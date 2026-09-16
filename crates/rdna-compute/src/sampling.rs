@@ -1695,6 +1695,17 @@ impl Gpu {
         presence_penalty: f32,
         frequency_penalty: f32,
     ) -> HipResult<()> {
+        // The kernel reads repeat_buf[0..window] as u32 token ids with no
+        // internal bound — a window larger than the buffer is an OOB device
+        // read. The engine clamps to REPEAT_WINDOW_MAX, but this is a public
+        // API: refuse an over-capacity window here rather than read past the
+        // allocation.
+        assert!(
+            window <= repeat_buf.numel(),
+            "apply_repeat_penalty_row: window {window} exceeds repeat_buf \
+             capacity {} tokens",
+            repeat_buf.numel()
+        );
         self.bind_thread()?;
         if !self.functions.contains_key("sample_apply_repeat_penalty") {
             let src = sample_top_p_parallel_src();

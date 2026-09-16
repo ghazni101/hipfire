@@ -168,7 +168,6 @@ pub(crate) fn route_capabilities(
     prefix_cache: bool,
     prefix_cache_max_bytes: u64,
     structured_jump_forward: bool,
-    scheduler_overlap: bool,
     max_batch_tokens: u64,
     prefill_min_tokens: u64,
     max_queue: u64,
@@ -199,7 +198,6 @@ pub(crate) fn route_capabilities(
             serde_json::Value::Null
         },
         "structured_jump_forward": structured_jump_forward,
-        "scheduler_overlap": scheduler_overlap,
         "max_batch_tokens": max_batch_tokens,
         "prefill_min_tokens": prefill_min_tokens,
         "max_queue": max_queue,
@@ -1180,7 +1178,6 @@ pub(crate) fn serve_foreground(
     let prefix_cache = config_bool(&global, "serve.prefix_cache")?;
     let prefix_cache_max_bytes = config_u64(&global, "serve.prefix_cache_max_bytes")?;
     let structured_jump_forward = config_bool(&global, "serve.structured_jump_forward")?;
-    let scheduler_overlap = config_bool(&global, "serve.scheduler_overlap")?;
     // Multi-slot is an alternate daemon-owned Qwen35 mode, not continuous batching.
     // Combining them is rejected until a future integration lands. The robust
     // multi-slot mode also rejects an uncapped queue (serve.max_queue=0) rather
@@ -1232,7 +1229,6 @@ pub(crate) fn serve_foreground(
         prefix_cache,
         prefix_cache_max_bytes,
         structured_jump_forward,
-        scheduler_overlap,
         max_batch_tokens,
         prefill_min_tokens,
         max_queue as u64,
@@ -2823,7 +2819,6 @@ mod capabilities_tests {
             /*prefix_cache*/ true,
             536870912,
             /*jump_forward*/ true,
-            /*overlap*/ false,
             8192,
             1,
             64,
@@ -2850,15 +2845,29 @@ mod capabilities_tests {
         assert_eq!(caps["structured_output"], true);
         assert_eq!(caps["structured_output_subset"], "json-schema-strict-v1");
         assert_eq!(caps["structured_jump_forward"], true);
-        assert_eq!(caps["scheduler_overlap"], false);
         assert_eq!(caps["max_batch_tokens"], 8192);
         assert_eq!(caps["max_queue"], 64);
         assert_eq!(caps["queue_timeout_ms"], 30000);
         assert_eq!(caps["openai_compatible"], true);
         let refused = caps["refused_request_fields"].as_array().unwrap();
         assert!(!refused.iter().any(|v| v == "tools"), "tools are supported");
-        for field in ["stop", "logprobs", "response_format:json_object"] {
-            assert!(refused.iter().any(|v| v == field), "refusal list must contain {field}");
+        for field in [
+            "stop",
+            "logprobs",
+            "top_logprobs",
+            "n",
+            "best_of",
+            "logit_bias",
+            "echo",
+            "suffix",
+            "reasoning_effort",
+            "response_format:json_object",
+            "tools+image",
+        ] {
+            assert!(
+                refused.iter().any(|v| v == field),
+                "refusal list must contain {field}"
+            );
         }
     }
 
@@ -2868,8 +2877,8 @@ mod capabilities_tests {
     #[test]
     fn standard_route_advertises_honest_absence() {
         let caps = route_capabilities(
-            false, 4, 8192, 1024, false, 0, false, false, 4096, 1, 64,
-            268435456, 30000, 4 << 20, 30_000, 64 << 20,
+            false, 4, 8192, 1024, false, 0, false, 4096, 1, 64, 268435456, 30000,
+            4 << 20, 30_000, 64 << 20,
         );
         assert_eq!(caps["mode"], "standard");
         assert_eq!(caps["multi_slot"], false);

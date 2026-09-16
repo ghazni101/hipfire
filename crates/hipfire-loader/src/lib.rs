@@ -2419,6 +2419,10 @@ pub fn load_model_with_kv_backend(
         deepseek4_experts_per_token,
         draft_path,
         vision_path: None,
+        // Pre-admission entry point: no per-request vision_mode is threaded,
+        // so preserve the sibling probe (auto). The daemon's admitted route
+        // carries the real resolved mode.
+        vision_mode: "auto".to_string(),
         kv_mode_override,
         kv_backend,
         kv_adaptive_override,
@@ -2519,6 +2523,9 @@ pub fn load_model_with_gemma4_drafter(
         draft_path,
         gpu.arch.as_str(),
         None,
+        // No per-request vision_mode on this entry point — preserve the
+        // sibling probe (auto).
+        "auto",
         head_path,
         max_seq,
     )?;
@@ -2568,6 +2575,7 @@ pub fn load_admitted_with_gemma4_drafter(
         kv_backend,
         carrier,
         vision_path,
+        vision_mode,
         ..
     } = admission;
     let carrier =
@@ -2584,6 +2592,7 @@ pub fn load_admitted_with_gemma4_drafter(
         deepseek4_experts_per_token,
         draft_path,
         vision_path,
+        vision_mode,
         kv_mode_override,
         kv_backend,
         kv_adaptive_override,
@@ -3181,7 +3190,7 @@ pub fn load_model_ep_with_kv_mode(
     // dispatches on arch_id, so the admission retains the arch_id decision and
     // the per-rank file re-open happens inside the EP load (unchanged).
     let admission =
-        crate::admission::admit_source(path, tp, 1, kv_backend, None, "", None, None, max_seq)?;
+        crate::admission::admit_source(path, tp, 1, kv_backend, None, "", None, "auto", None, max_seq)?;
     load_model_ep_admitted(
         admission,
         path,
@@ -4549,6 +4558,7 @@ mod ep_admission_tests {
             None,
             "gfx1201",
             None,
+            "auto",
             None,
             4096,
         )?;

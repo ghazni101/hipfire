@@ -67,6 +67,17 @@ pub struct Session {
     /// symptom). Lives on the session, not the slot: it must survive
     /// eviction/restore and apply wherever the session is resumed.
     pub rope_delta: i32,
+    /// True once any turn of this conversation carried an image
+    /// (`req.visual_data.is_some()`). Sticky: a text continuation of an
+    /// image conversation keeps it set.
+    ///
+    /// This is the publish/lookup gate for the cross-session prefix cache —
+    /// NOT `rope_delta != 0`. `rope_delta` is `max(lh,lw) − lh·lw` for the
+    /// merged grid, which is 0 for any single-row/single-column image
+    /// (min(lh,lw) == 1), so a thin-image turn would publish its image-row
+    /// KV to the radix and a later text request could restore it — silent
+    /// wrong output (spec §6 X2). `has_image` is the positive marker.
+    pub has_image: bool,
     /// Highest page-aligned token boundary of this session's KV that has
     /// been published to the cross-session prefix cache (spec §4.6 C6).
     ///
@@ -127,6 +138,7 @@ impl SessionTable {
                 residency: Residency::Resident,
                 convo: Vec::new(),
                 rope_delta: 0,
+                has_image: false,
                 published_boundary: 0,
                 last_used: {
                     self.clock += 1;

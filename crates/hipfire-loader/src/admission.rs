@@ -44,6 +44,11 @@ pub struct SourceAdmission {
     /// tower probe tensor; the single/pp route threads it into `LoadCtx`.
     /// `None` = trunk-only (or explicit opt-out via empty string).
     pub vision_path: Option<std::path::PathBuf>,
+    /// The resolved `vision.mode` ladder value (`off`/`auto`/`on`). The
+    /// carrier needs it to gate `<stem>.vl` sibling discovery: `vision_path`
+    /// alone cannot distinguish "off" (never probe a sibling) from "auto with
+    /// no explicit sidecar" (probe allowed). `off` suppresses discovery.
+    pub vision_mode: String,
 }
 
 /// Pure text-vs-VL decision. The vision tower tensor decides; configuration
@@ -458,6 +463,9 @@ pub fn admit_source(
     draft_path: Option<&str>,
     gpu_arch: &str,
     vision: Option<&str>,
+    // Resolved `vision.mode` (`off`/`auto`/`on`) — gates `.vl` sibling
+    // discovery in the carrier. `off` = never probe a sibling.
+    vision_mode: &str,
     head: Option<&str>,
     max_seq: usize,
 ) -> Result<SourceAdmission, String> {
@@ -616,6 +624,7 @@ pub fn admit_source(
         kv_backend,
         carrier,
         vision_path,
+        vision_mode: vision_mode.to_string(),
     })
 }
 
@@ -829,6 +838,7 @@ mod tests {
                 None,
                 "gfx1100",
                 Some(sidecar.to_str().unwrap()),
+                "auto",
                 None,
                 4096,
             )
@@ -856,6 +866,7 @@ mod tests {
                 None,
                 "gfx1100",
                 Some(sidecar.to_str().unwrap()),
+                "auto",
                 None,
                 4096,
             )
@@ -879,6 +890,7 @@ mod tests {
                 None,
                 "gfx1100",
                 Some(sidecar.to_str().unwrap()),
+                "auto",
                 None,
                 4096,
             )
@@ -968,6 +980,7 @@ mod tests {
                 None,
                 "gfx1151",
                 None,
+                "auto",
                 Some(head.to_str().unwrap()),
                 4096,
             )
@@ -996,6 +1009,7 @@ mod tests {
                 None,
                 "gfx1151",
                 None,
+                "auto",
                 Some(""),
                 4096,
             )
@@ -1028,6 +1042,7 @@ mod tests {
                 None,
                 "gfx1151",
                 None,
+                "auto",
                 Some(head.to_str().unwrap()),
                 4096,
             )
@@ -1105,6 +1120,7 @@ mod tests {
                 None,
                 "gfx1151",
                 None,
+                "auto",
                 Some(head.to_str().unwrap()),
                 4096,
             )
@@ -1131,6 +1147,7 @@ mod tests {
                 None,
                 "gfx1151",
                 None,
+                "auto",
                 Some(head.to_str().unwrap()),
                 4096,
             )
@@ -1160,6 +1177,7 @@ mod tests {
                 None,
                 "gfx1151",
                 None,
+                "auto",
                 Some(head.to_str().unwrap()),
                 4096,
             )

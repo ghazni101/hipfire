@@ -25,6 +25,11 @@ pub struct ModelFootprint {
 pub enum AdmitError {
     PoolFull,
     WouldExceedBudget { need: u64, available: u64 },
+    /// resize() named a session that holds no grant — an internal
+    /// inconsistency, NOT a budget shortfall. Reporting it as
+    /// WouldExceedBudget{0,0} both lied about the cause and let the engine
+    /// misclassify a real budget failure as Internal.
+    UnknownSession(u64),
 }
 
 impl std::fmt::Display for AdmitError {
@@ -38,6 +43,9 @@ impl std::fmt::Display for AdmitError {
                 gib(*need),
                 gib(*available)
             ),
+            AdmitError::UnknownSession(id) => {
+                write!(f, "session {id} holds no admission grant")
+            }
         }
     }
 }
@@ -164,10 +172,7 @@ impl AdmissionController {
             .admitted
             .iter()
             .position(|(id, _)| *id == session)
-            .ok_or(AdmitError::WouldExceedBudget {
-                need: 0,
-                available: 0,
-            })?;
+            .ok_or(AdmitError::UnknownSession(session))?;
         let old_ctx = self.admitted[pos].1;
         let bpt = self.footprint.kv_bytes_per_token;
         let old_kv = (old_ctx as u64).saturating_mul(bpt);

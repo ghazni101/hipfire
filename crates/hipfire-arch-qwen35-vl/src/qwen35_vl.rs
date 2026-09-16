@@ -345,6 +345,21 @@ pub fn load_vision_weights(
             ),
         ));
     }
+    // Same class as the num_position_embeddings check above: a `.vl` sidecar
+    // whose `depth`/`hidden`/`heads` is 0 loads "successfully" (the layer loop
+    // is empty) and then panics the engine thread on the FIRST image request
+    // (`step_layer`'s `next_layer < num_layers` assert) — the serve-hang class.
+    // Refuse at load, where the operator sees it.
+    if config.num_layers == 0 || config.hidden_size == 0 || config.num_heads == 0 {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "qwen35-vl: vision_config must have positive depth/hidden/heads \
+                 (got depth={} hidden={} heads={})",
+                config.num_layers, config.hidden_size, config.num_heads
+            ),
+        ));
+    }
     let h = config.hidden_size;
 
     // Arch advisory. The vision tower kernels (gemm_f16, layernorm_batched,

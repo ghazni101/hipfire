@@ -1165,18 +1165,6 @@ pub static FIELDS: &[ConfigField] = &[
         "Experimental: maximum stalled-consumer interval; the request is aborted after this deadline (spec §5.4, §9.1)."
     ),
     field!(
-        "serve.scheduler_overlap",
-        "scheduler_overlap",
-        Serve,
-        Process,
-        DefaultValue::Bool(false),
-        ValueRule::Bool,
-        true,
-        true,
-        Some("HIPFIRE_SERVE_SCHEDULER_OVERLAP"),
-        "Experimental: overlap independent CPU preparation with GPU execution; off until race/lifetime and profile evidence exist (spec §1, §9.1)."
-    ),
-    field!(
         "serve.structured_jump_forward",
         "structured_jump_forward",
         Serve,

@@ -561,7 +561,17 @@ impl Carrier for Qwen35Carrier {
                         .vision_path
                         .as_ref()
                         .map(std::path::PathBuf::from)
-                        .or_else(|| discover_vl_path(ctx.path));
+                        // `vision_mode=off` suppresses sibling discovery too —
+                        // a co-located `<stem>.vl` must not load the tower
+                        // under the documented text-only default (the daemon
+                        // gates the explicit sidecar; this gates the probe).
+                        .or_else(|| {
+                            if ctx.vision_mode == "off" {
+                                None
+                            } else {
+                                discover_vl_path(ctx.path)
+                            }
+                        });
                     let has_inline_vision = hfq_file
                         .tensor_data("model.visual.patch_embed.proj.weight")
                         .is_some();
@@ -575,14 +585,21 @@ impl Carrier for Qwen35Carrier {
                         // Identity: the tower's projector writes the trunk's
                         // text hidden width. A sidecar paired with a different
                         // trunk (a sibling `foo.vl` next to `bar.mq4`) would
-                        // load "successfully" and then fail per request; the
-                        // shape of the trunk's output_norm is the text hidden
-                        // size, so refuse the mismatch at load time.
-                        if let Some(trunk_dim) = hfq_file
-                            .find_tensor_info("output_norm.weight")
-                            .and_then(|t| t.shape.first().copied())
-                            .map(|d| d as usize)
-                        {
+                        // load "successfully" and then misalign every image
+                        // embedding — refuse the mismatch at load time.
+                        // Probe the trunk's final norm under its real HFQ
+                        // names (`output_norm.weight` is GGUF-only and never
+                        // resolves here, which would skip the check entirely).
+                        let trunk_dim = [
+                            "model.language_model.norm.weight",
+                            "model.norm.weight",
+                            "norm.weight",
+                        ]
+                        .iter()
+                        .find_map(|n| hfq_file.find_tensor_info(n))
+                        .and_then(|t| t.shape.first().copied())
+                        .map(|d| d as usize);
+                        if let Some(trunk_dim) = trunk_dim {
                             if vc.out_hidden_size != trunk_dim {
                                 return Err(format!(
                                     "vision sidecar {} does not match trunk {}: projector \

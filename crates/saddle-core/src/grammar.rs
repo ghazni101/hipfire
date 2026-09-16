@@ -180,12 +180,15 @@ use std::sync::Arc;
 
 /// Maximum number of tool schemas accepted by [`CompiledGrammar::new`].
 /// Bounds compilation input so a pathological tools array can't stall
-/// request admission.
-const MAX_TOOL_SCHEMAS: usize = 256;
+/// request admission. Public so the serving layer can refuse an over-bound
+/// request with a typed 400 instead of reaching `Matcher::with_config`'s
+/// panic.
+pub const MAX_TOOL_SCHEMAS: usize = 256;
 
 /// Maximum total bytes of all tool names + required field names combined.
-/// Prevents unbounded string allocation during compilation.
-const MAX_SCHEMA_BYTES: usize = 64 * 1024;
+/// Prevents unbounded string allocation during compilation. Public for the
+/// same request-validation reason as [`MAX_TOOL_SCHEMAS`].
+pub const MAX_SCHEMA_BYTES: usize = 64 * 1024;
 
 /// Typed error returned when compilation inputs exceed bounds or are
 /// otherwise invalid. Rejects before any GPU work (spec §7 G1, S4).
@@ -3201,8 +3204,52 @@ pub mod json_schema {
             }
         }
 
+        // Read `type` BEFORE const/enum so the declared type constrains the
+        // literal set. A non-string `type` (e.g. the union form
+        // `["integer","null"]`) is OUTSIDE the supported subset — falling
+        // through to the inference path would compile it to an unconstrained
+        // `Any` (spec §7.1: unions are rejected before generation).
+        if let Some(tv) = obj.get("type") {
+            if tv.as_str().is_none() {
+                return Err(SchemaError::UnsupportedKeyword {
+                    keyword: format!(
+                        "type (union/array forms are outside the supported subset: {})",
+                        tv
+                    ),
+                });
+            }
+        }
+        let ty = obj.get("type").and_then(|v| v.as_str());
+
+        // A `const`/`enum` member that contradicts the declared `type` is a
+        // silent constraint drop: {"type":"integer","enum":[1,"a"]} would
+        // compile to Enum([1,"a"]) and emit "a" as conforming. Intersect the
+        // literal set with `type`; an empty intersection is unsatisfiable.
+        let value_matches_type = |v: &serde_json::Value, ty: &str| -> bool {
+            match ty {
+                "string" => v.is_string(),
+                "integer" => v.as_i64().is_some()
+                    || v.as_f64().map(|f| f.fract() == 0.0).unwrap_or(false),
+                "number" => v.is_number(),
+                "boolean" => v.is_boolean(),
+                "null" => v.is_null(),
+                "object" => v.is_object(),
+                "array" => v.is_array(),
+                _ => true,
+            }
+        };
+
         // const takes priority.
         if let Some(c) = obj.get("const") {
+            if let Some(t) = ty {
+                if !value_matches_type(c, t) {
+                    return Err(SchemaError::InvalidSchema {
+                        reason: format!(
+                            "const value {c} contradicts declared type \"{t}\" (unsatisfiable)"
+                        ),
+                    });
+                }
+            }
             return Ok(SchemaNode::Const(c.clone()));
         }
 
@@ -3227,24 +3274,27 @@ pub mod json_schema {
                     max: MAX_ENUM_VALUES,
                 });
             }
-            return Ok(SchemaNode::Enum(arr.clone()));
-        }
-
-        // type-based compilation. A non-string `type` (e.g. the union form
-        // `["integer","null"]`) is OUTSIDE the supported subset — falling
-        // through to the inference path would compile it to an unconstrained
-        // `Any` (spec §7.1: unions are rejected before generation).
-        if let Some(tv) = obj.get("type") {
-            if tv.as_str().is_none() {
-                return Err(SchemaError::UnsupportedKeyword {
-                    keyword: format!(
-                        "type (union/array forms are outside the supported subset: {})",
-                        tv
+            // Intersect with the declared type: members that contradict it are
+            // dropped; if none remain the schema is unsatisfiable.
+            let filtered: Vec<serde_json::Value> = match ty {
+                Some(t) => arr
+                    .iter()
+                    .filter(|v| value_matches_type(v, t))
+                    .cloned()
+                    .collect(),
+                None => arr.clone(),
+            };
+            if filtered.is_empty() {
+                return Err(SchemaError::InvalidSchema {
+                    reason: format!(
+                        "no enum member matches declared type \"{}\" (unsatisfiable)",
+                        ty.unwrap_or("")
                     ),
                 });
             }
+            return Ok(SchemaNode::Enum(filtered));
         }
-        let ty = obj.get("type").and_then(|v| v.as_str());
+
         match ty {
             Some("string") => Ok(SchemaNode::String),
             Some("number") => Ok(SchemaNode::Number),
@@ -4031,6 +4081,12 @@ pub mod json_schema {
                                     NumCtx::Integer => {
                                         number_tail_integer = true;
                                         // "4." can never become an integer.
+                                        // Deliberate contract (see the
+                                        // number-tail fast path and
+                                        // integer_rejects_fractional_growth):
+                                        // Integer never grows a fraction, so
+                                        // "4.5e1" is refused even though
+                                        // validate() would accept fract==0.
                                         number_dead_end = text.contains(&b'.');
                                     }
                                     NumCtx::Targets(targets) => {
@@ -4885,12 +4941,16 @@ pub mod json_schema {
                 // string carries interior content the in-string filters
                 // never see and the simulation cannot judge. Decode the
                 // post-quote remainder against the member/key list.
-                let first_non_ws = bytes
+                let quote_idx = bytes
                     .iter()
-                    .find(|&&b| !matches!(b, b' ' | b'\n' | b'\t' | b'\r'));
-                if first_non_ws == Some(&b'"') {
+                    .position(|&b| !matches!(b, b' ' | b'\n' | b'\t' | b'\r'));
+                if quote_idx.map(|i| bytes[i]) == Some(b'"') {
+                    // Slice from AFTER the quote, not bytes[1..]: a token like
+                    // ` "x` (leading whitespace) has the quote at index >0, and
+                    // bytes[1..] would decode the quote itself as a CLOSE.
+                    let after_quote = &bytes[quote_idx.unwrap() + 1..];
                     if let Some(members) = &self.scan.value_start_filter {
-                        match decode_string_fragment(false, &bytes[1..]) {
+                        match decode_string_fragment(false, after_quote) {
                             Some((decoded, false, _rest)) => {
                                 return members.iter().any(|m| {
                                     let mb = m.as_bytes();
@@ -4924,7 +4984,7 @@ pub mod json_schema {
                         }
                     }
                     if let Some(known) = &self.scan.key_start_filter {
-                        match decode_string_fragment(false, &bytes[1..]) {
+                        match decode_string_fragment(false, after_quote) {
                             Some((decoded, false, _rest)) => {
                                 return known.iter().any(|k| {
                                     let kb = k.as_bytes();

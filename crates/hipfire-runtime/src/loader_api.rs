@@ -75,6 +75,11 @@ pub struct LoadCtx<'a> {
     /// loads against the trunk's `vision_config_from_hfq`. `None` = trunk-only
     /// (or text-only when the trunk has no tower either).
     pub vision_path: Option<PathBuf>,
+    /// Resolved `vision.mode` (`off`/`auto`/`on`). Gates `<stem>.vl` sibling
+    /// discovery in the carrier — `vision_path` alone cannot distinguish
+    /// "off" (never probe) from "auto with no explicit sidecar" (probe).
+    /// `off` suppresses discovery; `auto`/`on` allow it.
+    pub vision_mode: String,
     pub kv_mode_override: Option<&'a str>,
     // NOTE: head overlays (`--head`) deliberately have NO LoadCtx field. They
     // validate and attach in `admit_source` before teardown, so the admitted
