@@ -59,3 +59,36 @@ use hipfire_generate::common::*;
             hipfire_generate::common::asst_turn_fingerprint("visible answer", &[])
         );
     }
+
+#[test]
+fn ifm_thinking_channels_survive_every_chunk_boundary() {
+    use hipfire_runtime::emit_text::{ThinkOutputRouter, ThinkRouteEvent};
+    for (open, close) in [
+        ("<ifm|think>", "</ifm|think>"),
+        ("<ifm|think_fast>", "</ifm|think_fast>"),
+        ("<ifm|think_faster>", "</ifm|think_faster>"),
+    ] {
+        let prompt = format!("<|ifm|im_start|>assistant\n{open}\n");
+        assert!(render_tail_opens_think(&prompt));
+        assert!(!render_tail_opens_think(&format!("{prompt}{close}")));
+        let text = format!("reason{close}\n\nanswer{open}more{close}done");
+        for split in 0..=text.len() {
+            let mut router = ThinkOutputRouter::new(true);
+            let mut events = Vec::new();
+            router.push_into(&text[..split], &mut events);
+            router.push_into(&text[split..], &mut events);
+            router.finish_into(&mut events);
+            let mut reasoning = String::new();
+            let mut content = String::new();
+            for event in events {
+                match event {
+                    ThinkRouteEvent::Reasoning(s) => reasoning.push_str(&s),
+                    ThinkRouteEvent::Content(s) => content.push_str(&s),
+                }
+            }
+            assert_eq!(reasoning, "reasonmore", "split={split}");
+            assert_eq!(content, "answerdone", "split={split}");
+            assert!(!router.in_think());
+        }
+    }
+}

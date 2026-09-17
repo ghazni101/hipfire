@@ -79,7 +79,8 @@ fn qwen_dflash_eos_filter_config() -> EosFilterConfig {
     EosFilterConfig {
         strip_think: false,
         started_in_think: false,
-        stop_at: vec![b"<|im_end|>".to_vec(), b"<|endoftext|>".to_vec()],
+        stop_at: vec![b"<|im_end|>".to_vec(), b"<|endoftext|>".to_vec(),
+            b"<|ifm|im_end|>".to_vec(), b"<|ifm|endoftext|>".to_vec()],
         holdback_prefixes: Vec::new(),
     }
 }

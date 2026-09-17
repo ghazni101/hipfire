@@ -45,7 +45,9 @@ impl TerminalEmitOutcome {
 /// This is deliberately tail-only: a literal `<think>` in user content must
 /// not reclassify the assistant's visible answer as reasoning.
 pub fn render_tail_opens_think(rendered: &str) -> bool {
-    rendered.trim_end().ends_with("<think>")
+    let tail = rendered.trim_end();
+    ["<think>", "<ifm|think>", "<ifm|think_fast>", "<ifm|think_faster>"]
+        .iter().any(|marker| tail.ends_with(marker))
 }
 
 /// Reduce the authoritative rendered-prompt state to the signal consumed by
