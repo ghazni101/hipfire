@@ -1466,6 +1466,10 @@ struct RawLlamaConfig {
     max_position_embeddings: usize,
     #[serde(default = "default_llama_rope")]
     rope_theta: f32,
+    #[serde(default)]
+    layernorm_num_groups: Option<usize>,
+    #[serde(default)]
+    rope_parameters: Option<serde_json::Value>,
     // Real safetensors configs ship `bos_token_id`/`eos_token_id` as either a
     // scalar (most LLaMA/Mistral) or an array (Llama-3.1: `[128001, 128009]`).
     // Keep them as raw Values and resolve to the FIRST element in finalize
@@ -1514,6 +1518,15 @@ fn llama_config_from_value(
         "qwen3" | "qwen2" => ModelArch::Qwen3,
         _ => ModelArch::Llama,
     };
+    let norm_groups = raw.layernorm_num_groups.unwrap_or(1);
+    if norm_groups == 0 || raw.hidden_size % norm_groups != 0 {
+        return Err("llama: layernorm_num_groups must be positive and divide hidden_size".into());
+    }
+    let rope_theta = raw.rope_parameters.as_ref()
+        .and_then(|p| p.get("rope_theta"))
+        .and_then(|v| v.as_f64())
+        .map(|v| v as f32)
+        .unwrap_or(raw.rope_theta);
     let n_kv_heads = raw.num_key_value_heads.unwrap_or(raw.num_attention_heads);
     let head_dim = raw
         .head_dim
@@ -1529,10 +1542,11 @@ fn llama_config_from_value(
         head_dim,
         norm_eps: raw.rms_norm_eps,
         max_seq_len: raw.max_position_embeddings,
-        rope_freq_base: raw.rope_theta,
+        rope_freq_base: rope_theta,
         bos_token: first_token_or(raw.bos_token_id.as_ref(), 1),
         eos_token: first_token_or(raw.eos_token_id.as_ref(), 2),
         has_qk_norm,
+        norm_groups,
     })
 }
 

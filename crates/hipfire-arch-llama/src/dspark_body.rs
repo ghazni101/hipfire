@@ -414,22 +414,20 @@ fn config_from_sidecar_tensors(source: &HfqFile) -> Result<LlamaConfig, String> 
         return Err("qwen3_dspark: no body layers found (layers.0.* absent)".into());
     }
 
-    Ok(LlamaConfig {
-        arch: ModelArch::Qwen3,
-        dim,
-        hidden_dim,
-        n_layers,
-        n_heads,
-        n_kv_heads,
-        vocab_size,
-        head_dim,
-        norm_eps: 1e-6,              // qwen3 standard
-        max_seq_len: 1024,           // drafter; actual cap = block_size (set by KvCache)
-        rope_freq_base: 1_000_000.0, // qwen3 rope θ = 1e6
-        bos_token: 1,
-        eos_token: 2,
-        has_qk_norm,
-    })
+    Ok(LlamaConfig { norm_groups: 1, arch: ModelArch::Qwen3,
+    dim,
+    hidden_dim,
+    n_layers,
+    n_heads,
+    n_kv_heads,
+    vocab_size,
+    head_dim,
+    norm_eps: 1e-6,              // qwen3 standard
+    max_seq_len: 1024,           // drafter; actual cap = block_size (set by KvCache)
+    rope_freq_base: 1_000_000.0, // qwen3 rope θ = 1e6
+    bos_token: 1,
+    eos_token: 2,
+    has_qk_norm, })
 }
 
 // ── Block-attention body forward ──────────────────────────────────────────────

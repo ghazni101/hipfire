@@ -773,10 +773,8 @@ impl Carrier for LlamaCarrier {
         Ok(Qwen35Emit::from_ctx(ctx))
     }
     fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
-        // 0 = LLaMA/Mistral, 1 = plain Qwen3/Qwen2 (both namespaces).
-        // Explicit allowlist (was an open `< 5` range that would silently
-        // swallow any future HFQ id in 2..=4 into the llama path).
-        matches!(arch_id, 0 | 1)
+        // K2-Horizon uses the same weights with grouped residual-stream RMSNorm.
+        matches!(arch_id, 0 | 1 | 16)
     }
     fn caps(&self) -> saddle_core::caps::ArchCaps {
         saddle_core::caps::ArchCaps {

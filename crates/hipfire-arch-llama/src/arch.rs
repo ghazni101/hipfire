@@ -361,6 +361,9 @@ impl Llama {
         repeat_window: usize,
         repeat_penalty: f32,
     ) -> HipResult<(u32, u32)> {
+        if config.norm_groups > 1 {
+            return hipfire_runtime::llama::forward_scratch_layers(gpu, weights, config, pos, kv_cache, scratch, temperature, top_p, rng_state, repeat_window, repeat_penalty);
+        }
         let ctx = DispatchCtx::new(gpu);
 
         let n_heads = config.n_heads;
@@ -565,12 +568,7 @@ impl Llama {
         }
 
         // ── Final norm + logits + sampling ──────────────────────
-        gpu.rmsnorm_f32(
-            &scratch.x,
-            &weights.output_norm,
-            &scratch.tmp,
-            config.norm_eps,
-        )?;
+        config.rmsnorm(gpu, &scratch.x, &weights.output_norm, &scratch.tmp)?;
         let wr_out = weights.output.dispatch_ref();
         execute_steps(
             gpu,
