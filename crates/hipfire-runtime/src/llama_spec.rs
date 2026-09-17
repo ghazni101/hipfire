@@ -300,12 +300,7 @@ pub fn verify_tree_logits(
         let off_bytes = i * dim * 4;
         gpu.hip
             .memcpy_dtod_at(&scratch.x.buf, 0, &pbs.x_batch.buf, off_bytes, dim * 4)?;
-        gpu.rmsnorm_f32(
-            &scratch.x,
-            &weights.output_norm,
-            &scratch.tmp,
-            config.norm_eps,
-        )?;
+        config.rmsnorm(gpu, &scratch.x, &weights.output_norm, &scratch.tmp)?;
         weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
         logits_out.extend_from_slice(&gpu.download_f32(&scratch.logits)?);
     }
@@ -423,12 +418,7 @@ fn verify_block_logits_or_argmax(
             let off_bytes = i * dim * 4;
             gpu.hip
                 .memcpy_dtod_at(&scratch.x.buf, 0, &pbs.x_batch.buf, off_bytes, dim * 4)?;
-            gpu.rmsnorm_f32(
-                &scratch.x,
-                &weights.output_norm,
-                &scratch.tmp,
-                config.norm_eps,
-            )?;
+            config.rmsnorm(gpu, &scratch.x, &weights.output_norm, &scratch.tmp)?;
             weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
             if let Some(sc) = sample.as_mut() {
                 // temp>0: fused GPU sample (softmax+nucleus+draw) → 4-byte D2H.
@@ -576,12 +566,7 @@ pub fn lm_head_logits_n_rows(
         let off_bytes = i * dim * 4;
         gpu.hip
             .memcpy_dtod_at(&scratch.x.buf, 0, &hidden_rows.buf, off_bytes, dim * 4)?;
-        gpu.rmsnorm_f32(
-            &scratch.x,
-            &weights.output_norm,
-            &scratch.tmp,
-            config.norm_eps,
-        )?;
+        config.rmsnorm(gpu, &scratch.x, &weights.output_norm, &scratch.tmp)?;
         weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
         out.extend_from_slice(&gpu.download_f32(&scratch.logits)?);
     }

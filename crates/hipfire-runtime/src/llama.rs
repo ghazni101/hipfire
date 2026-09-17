@@ -40,9 +40,31 @@ pub struct LlamaConfig {
     pub bos_token: u32,
     pub eos_token: u32,
     pub has_qk_norm: bool, // Qwen3 feature
+    /// Independent contiguous RMSNorm groups, each with its own affine weights.
+    pub norm_groups: usize,
 }
 
 impl LlamaConfig {
+    pub fn rmsnorm(&self, gpu: &mut Gpu, x: &GpuTensor, weight: &GpuTensor, out: &GpuTensor) -> HipResult<()> {
+        if self.norm_groups == 1 {
+            return gpu.rmsnorm_f32(x, weight, out, self.norm_eps);
+        }
+        let width = self.dim / self.norm_groups;
+        for group in 0..self.norm_groups {
+            let offset = group * width;
+            gpu.rmsnorm_f32(&x.sub_offset(offset, width), &weight.sub_offset(offset, width), &out.sub_offset(offset, width), self.norm_eps)?;
+        }
+        Ok(())
+    }
+    pub fn rmsnorm_batch(&self, gpu: &mut Gpu, x: &GpuTensor, weight: &GpuTensor, out: &GpuTensor, rows: usize) -> HipResult<()> {
+        if self.norm_groups == 1 {
+            return gpu.rmsnorm_batched(x, weight, out, rows, self.dim, self.norm_eps);
+        }
+        for row in 0..rows {
+            self.rmsnorm(gpu, &x.sub_offset(row * self.dim, self.dim), weight, &out.sub_offset(row * self.dim, self.dim))?;
+        }
+        Ok(())
+    }
     pub fn from_gguf(gguf: &GgufFile) -> Option<Self> {
         let arch_str = gguf.meta_str("general.architecture")?;
 
@@ -101,6 +123,7 @@ impl LlamaConfig {
             bos_token,
             eos_token,
             has_qk_norm,
+            norm_groups: 1,
         })
     }
 }
@@ -1884,7 +1907,7 @@ pub fn prefill_forward(
         .memcpy_dtod_at(&x_last.buf, 0, &x_batch.buf, last_off, dim * 4)?;
 
     let tmp = gpu.alloc_tensor(&[dim], DType::F32)?;
-    gpu.rmsnorm_f32(&x_last, &weights.output_norm, &tmp, config.norm_eps)?;
+    config.rmsnorm(gpu, &x_last, &weights.output_norm, &tmp)?;
 
     let logits = gpu.alloc_tensor(&[config.vocab_size], DType::F32)?;
     weight_gemv(gpu, &weights.output, &tmp, &logits)?;
@@ -2346,12 +2369,7 @@ pub fn forward_prefill_batch_capture(
     let last_off_bytes = (last_n - 1) * dim * 4;
     gpu.hip
         .memcpy_dtod_at(&scratch.x.buf, 0, &pbs.x_batch.buf, last_off_bytes, dim * 4)?;
-    gpu.rmsnorm_f32(
-        &scratch.x,
-        &weights.output_norm,
-        &scratch.tmp,
-        config.norm_eps,
-    )?;
+    config.rmsnorm(gpu, &scratch.x, &weights.output_norm, &scratch.tmp)?;
     weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
 
     if let Some(p) = own_pbs {
@@ -2676,7 +2694,19 @@ fn forward_prefill_chunk(
 
         // attn_norm (+ FWHT for MQ — includes MFP4G32 since rotation is the
         // same FWHT pattern as MQ4).
-        if qkv_is_mq {
+        if config.norm_groups > 1 {
+            config.rmsnorm_batch(gpu, &pbs.x_batch, &layer.attn_norm, &pbs.x_rot_batch, n)?;
+            if qkv_is_mq {
+                for row in 0..n {
+                    let view = pbs.x_rot_batch.sub_offset(row * dim, dim);
+                    let rotation_scratch = pbs.fa_q_batch.sub_offset(0, dim);
+                    let rotated = rotate_x_for_mq(gpu, &layer.wq, &view, &rotation_scratch)?;
+                    if let Some(rotated) = rotated {
+                        gpu.hip.memcpy_dtod(&view.buf, &rotated.buf, dim * 4)?;
+                    }
+                }
+            }
+        } else if qkv_is_mq {
             gpu.fused_rmsnorm_rotate_mq_batched(
                 &pbs.x_batch,
                 &layer.attn_norm,
@@ -3222,7 +3252,19 @@ fn forward_prefill_chunk(
         let ffn_is_fp4 = matches!(layer.w_gate.gpu_dtype, DType::HFP4G32 | DType::MFP4G32);
         let ffn_is_q8 = matches!(layer.w_gate.gpu_dtype, DType::Q8_0);
         let ffn_is_hfq4g128 = matches!(layer.w_gate.gpu_dtype, DType::HFQ4G128);
-        if ffn_is_mq {
+        if config.norm_groups > 1 {
+            config.rmsnorm_batch(gpu, &pbs.x_batch, &layer.ffn_norm, &pbs.x_rot_batch, n)?;
+            if ffn_is_mq {
+                for row in 0..n {
+                    let view = pbs.x_rot_batch.sub_offset(row * dim, dim);
+                    let rotation_scratch = pbs.fa_q_batch.sub_offset(0, dim);
+                    let rotated = rotate_x_for_mq(gpu, &layer.w_gate, &view, &rotation_scratch)?;
+                    if let Some(rotated) = rotated {
+                        gpu.hip.memcpy_dtod(&view.buf, &rotated.buf, dim * 4)?;
+                    }
+                }
+            }
+        } else if ffn_is_mq {
             gpu.fused_rmsnorm_rotate_mq_batched(
                 &pbs.x_batch,
                 &layer.ffn_norm,
@@ -4217,12 +4259,7 @@ fn forward_scratch_layers_lowered(
     crate::arch_spec::dense_forward(gpu, &ctx, &arch)?;
 
     // ── Final norm + logits + sampling ──
-    gpu.rmsnorm_f32(
-        &scratch.x,
-        &weights.output_norm,
-        &scratch.tmp,
-        config.norm_eps,
-    )?;
+    config.rmsnorm(gpu, &scratch.x, &weights.output_norm, &scratch.tmp)?;
     let wr_out = weights.output.dispatch_ref();
     execute_steps(
         gpu,
@@ -4386,7 +4423,7 @@ pub fn forward_scratch_layers(
     repeat_window: usize,
     repeat_penalty: f32,
 ) -> HipResult<(u32, u32)> {
-    if llama_forward_lowered_enabled() {
+    if config.norm_groups == 1 && llama_forward_lowered_enabled() {
         return forward_scratch_layers_lowered(
             gpu,
             weights,
@@ -4410,7 +4447,7 @@ pub fn forward_scratch_layers(
     for layer_idx in 0..config.n_layers {
         let layer = &weights.layers[layer_idx];
 
-        gpu.rmsnorm_f32(&scratch.x, &layer.attn_norm, &scratch.tmp, config.norm_eps)?;
+        config.rmsnorm(gpu, &scratch.x, &layer.attn_norm, &scratch.tmp)?;
 
         if layer.wq.gpu_dtype == DType::Q4K && layer.wk.gpu_dtype == DType::Q4K {
             gpu.fused_qkv_q4k(
@@ -4682,7 +4719,7 @@ pub fn forward_scratch_layers(
         weight_gemv(gpu, &layer.wo, &scratch.attn_out, &scratch.o)?;
         gpu.add_inplace_f32(&scratch.x, &scratch.o)?;
 
-        gpu.rmsnorm_f32(&scratch.x, &layer.ffn_norm, &scratch.tmp, config.norm_eps)?;
+        config.rmsnorm(gpu, &scratch.x, &layer.ffn_norm, &scratch.tmp)?;
         if layer.w_gate.gpu_dtype == DType::Q4K && layer.w_up.gpu_dtype == DType::Q4K {
             gpu.fused_gate_up_q4k(
                 &layer.w_gate.buf,
@@ -4706,12 +4743,7 @@ pub fn forward_scratch_layers(
         gpu.add_inplace_f32(&scratch.x, &scratch.ffn_out)?;
     }
 
-    gpu.rmsnorm_f32(
-        &scratch.x,
-        &weights.output_norm,
-        &scratch.tmp,
-        config.norm_eps,
-    )?;
+    config.rmsnorm(gpu, &scratch.x, &weights.output_norm, &scratch.tmp)?;
     weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
 
     // GPU-side sampling (includes sync readback — can't be in graph capture)
@@ -4761,7 +4793,7 @@ pub fn forward_early_exit(
         let layer = &weights.layers[layer_idx];
 
         // Standard layer computation (same as forward_scratch_layers)
-        gpu.rmsnorm_f32(&scratch.x, &layer.attn_norm, &scratch.tmp, config.norm_eps)?;
+        config.rmsnorm(gpu, &scratch.x, &layer.attn_norm, &scratch.tmp)?;
 
         if layer.wq.gpu_dtype == DType::Q4K && layer.wk.gpu_dtype == DType::Q4K {
             gpu.fused_qkv_q4k(
@@ -4876,7 +4908,7 @@ pub fn forward_early_exit(
         weight_gemv(gpu, &layer.wo, &scratch.attn_out, &scratch.o)?;
         gpu.add_inplace_f32(&scratch.x, &scratch.o)?;
 
-        gpu.rmsnorm_f32(&scratch.x, &layer.ffn_norm, &scratch.tmp, config.norm_eps)?;
+        config.rmsnorm(gpu, &scratch.x, &layer.ffn_norm, &scratch.tmp)?;
         if layer.w_gate.gpu_dtype == DType::Q4K && layer.w_up.gpu_dtype == DType::Q4K {
             gpu.fused_gate_up_q4k(
                 &layer.w_gate.buf,
@@ -4902,12 +4934,7 @@ pub fn forward_early_exit(
         // Early exit check at checkpoint layers
         if checkpoint_layers.contains(&layer_idx) && exit_threshold > 0.0 {
             // Compute logits from intermediate hidden state
-            gpu.rmsnorm_f32(
-                &scratch.x,
-                &weights.output_norm,
-                &scratch.tmp,
-                config.norm_eps,
-            )?;
+            config.rmsnorm(gpu, &scratch.x, &weights.output_norm, &scratch.tmp)?;
             weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
 
             // GPU-side confidence check: compute max(softmax) on GPU, download 4 bytes
@@ -4937,12 +4964,7 @@ pub fn forward_early_exit(
     }
 
     // No early exit — run full final norm + logits + sampling
-    gpu.rmsnorm_f32(
-        &scratch.x,
-        &weights.output_norm,
-        &scratch.tmp,
-        config.norm_eps,
-    )?;
+    config.rmsnorm(gpu, &scratch.x, &weights.output_norm, &scratch.tmp)?;
     weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
     let (tok, rng) = gpu.sample_top_p(
         &scratch.logits,
@@ -5001,7 +5023,7 @@ pub fn forward_scratch_compute_capture(
 
     for layer_idx in 0..config.n_layers {
         let layer = &weights.layers[layer_idx];
-        gpu.rmsnorm_f32(&scratch.x, &layer.attn_norm, &scratch.tmp, config.norm_eps)?;
+        config.rmsnorm(gpu, &scratch.x, &layer.attn_norm, &scratch.tmp)?;
 
         if layer.wq.gpu_dtype == DType::Q4K && layer.wk.gpu_dtype == DType::Q4K {
             gpu.fused_qkv_q4k(
@@ -5273,7 +5295,7 @@ pub fn forward_scratch_compute_capture(
         weight_gemv(gpu, &layer.wo, &scratch.attn_out, &scratch.o)?;
         gpu.add_inplace_f32(&scratch.x, &scratch.o)?;
 
-        gpu.rmsnorm_f32(&scratch.x, &layer.ffn_norm, &scratch.tmp, config.norm_eps)?;
+        config.rmsnorm(gpu, &scratch.x, &layer.ffn_norm, &scratch.tmp)?;
         if layer.w_gate.gpu_dtype == DType::Q4K && layer.w_up.gpu_dtype == DType::Q4K {
             gpu.fused_gate_up_q4k(
                 &layer.w_gate.buf,
@@ -5320,12 +5342,7 @@ pub fn forward_scratch_compute_capture(
         }
     }
 
-    gpu.rmsnorm_f32(
-        &scratch.x,
-        &weights.output_norm,
-        &scratch.tmp,
-        config.norm_eps,
-    )?;
+    config.rmsnorm(gpu, &scratch.x, &weights.output_norm, &scratch.tmp)?;
     weight_gemv(gpu, &weights.output, &scratch.tmp, &scratch.logits)?;
     Ok(())
 }
@@ -5380,7 +5397,7 @@ pub fn forward(
         let layer = &weights.layers[layer_idx];
 
         // RMSNorm before attention
-        gpu.rmsnorm_f32(&x, &layer.attn_norm, &tmp, config.norm_eps)?;
+        config.rmsnorm(gpu, &x, &layer.attn_norm, &tmp)?;
 
         // Fused QKV: 3 GEMVs in 1 kernel launch (saves 2 launches per layer)
         if layer.wq.gpu_dtype == DType::Q4K
@@ -5450,7 +5467,7 @@ pub fn forward(
         gpu.add_inplace_f32(&x, &o)?;
 
         // FFN
-        gpu.rmsnorm_f32(&x, &layer.ffn_norm, &tmp, config.norm_eps)?;
+        config.rmsnorm(gpu, &x, &layer.ffn_norm, &tmp)?;
         // Fused Gate+Up: 2 GEMVs in 1 kernel launch
         if layer.w_gate.gpu_dtype == DType::Q4K && layer.w_up.gpu_dtype == DType::Q4K {
             gpu.fused_gate_up_q4k(
@@ -5479,7 +5496,7 @@ pub fn forward(
     }
 
     // Final norm
-    gpu.rmsnorm_f32(&x, &weights.output_norm, &tmp, config.norm_eps)?;
+    config.rmsnorm(gpu, &x, &weights.output_norm, &tmp)?;
 
     // Logits: output = output_weight * x
     let logits = gpu.alloc_tensor(&[config.vocab_size], DType::F32)?;
@@ -5578,7 +5595,7 @@ fn forward_logits_gpu(
 
     for layer_idx in 0..config.n_layers {
         let layer = &weights.layers[layer_idx];
-        gpu.rmsnorm_f32(&x, &layer.attn_norm, &tmp, config.norm_eps)?;
+        config.rmsnorm(gpu, &x, &layer.attn_norm, &tmp)?;
 
         if layer.wq.gpu_dtype == DType::Q4K && layer.wk.gpu_dtype == DType::Q4K {
             gpu.fused_qkv_q4k(
@@ -5638,7 +5655,7 @@ fn forward_logits_gpu(
         weight_gemv(gpu, &layer.wo, &attn_out, &o)?;
         gpu.add_inplace_f32(&x, &o)?;
 
-        gpu.rmsnorm_f32(&x, &layer.ffn_norm, &tmp, config.norm_eps)?;
+        config.rmsnorm(gpu, &x, &layer.ffn_norm, &tmp)?;
         if layer.w_gate.gpu_dtype == DType::Q4K && layer.w_up.gpu_dtype == DType::Q4K {
             gpu.fused_gate_up_q4k(
                 &layer.w_gate.buf,
@@ -5660,7 +5677,7 @@ fn forward_logits_gpu(
         gpu.add_inplace_f32(&x, &ffn_out)?;
     }
 
-    gpu.rmsnorm_f32(&x, &weights.output_norm, &tmp, config.norm_eps)?;
+    config.rmsnorm(gpu, &x, &weights.output_norm, &tmp)?;
 
     let logits = gpu.alloc_tensor(&[config.vocab_size], DType::F32)?;
     weight_gemv(gpu, &weights.output, &tmp, &logits)?;
