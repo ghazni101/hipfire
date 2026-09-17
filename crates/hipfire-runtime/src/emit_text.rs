@@ -27,7 +27,11 @@
 /// budget runs away to `max_tokens`. Centralises the scan used by every
 /// force-close / budget-alert site so they stay consistent.
 pub fn currently_in_think(raw_str: &str, started_in_think: bool) -> bool {
-    match (raw_str.rfind("<think>"), raw_str.rfind("</think>")) {
+    let open = THINK_MARKERS.iter().filter(|(_, open)| *open)
+        .filter_map(|(marker, _)| raw_str.rfind(marker)).max();
+    let close = THINK_MARKERS.iter().filter(|(_, open)| !*open)
+        .filter_map(|(marker, _)| raw_str.rfind(marker)).max();
+    match (open, close) {
         (Some(o), Some(c)) => o > c, // both present: in-think iff opener is latest
         (Some(_), None) => true,     // generated opener, not yet closed
         (None, Some(_)) => false,    // closed (e.g. a prompt-injected opener) → answering
@@ -35,8 +39,12 @@ pub fn currently_in_think(raw_str: &str, started_in_think: bool) -> bool {
     }
 }
 
-const THINK_OPEN: &str = "<think>";
-const THINK_CLOSE: &str = "</think>";
+const THINK_MARKERS: [(&str, bool); 8] = [
+    ("<think>", true), ("</think>", false),
+    ("<ifm|think>", true), ("</ifm|think>", false),
+    ("<ifm|think_fast>", true), ("</ifm|think_fast>", false),
+    ("<ifm|think_faster>", true), ("</ifm|think_faster>", false),
+];
 
 /// Ordered channel fragments produced by ThinkOutputRouter.
 ///
@@ -119,11 +127,11 @@ impl ThinkOutputRouter {
 
     fn drain(&mut self, finish: bool, out: &mut Vec<ThinkRouteEvent>) {
         loop {
-            if let Some((at, marker)) = next_think_marker(&self.pending) {
+            if let Some((at, marker, opens)) = next_think_marker(&self.pending) {
                 let before = self.pending[..at].to_owned();
                 self.emit(before, out);
                 self.pending.drain(..at + marker.len());
-                if marker == THINK_OPEN {
+                if opens {
                     self.in_think = true;
                 } else {
                     self.in_think = false;
@@ -167,17 +175,15 @@ impl ThinkOutputRouter {
     }
 }
 
-fn next_think_marker(text: &str) -> Option<(usize, &'static str)> {
-    [THINK_OPEN, THINK_CLOSE]
-        .into_iter()
-        .filter_map(|marker| text.find(marker).map(|at| (at, marker)))
-        .min_by_key(|(at, _)| *at)
+fn next_think_marker(text: &str) -> Option<(usize, &'static str, bool)> {
+    THINK_MARKERS.into_iter()
+        .filter_map(|(marker, opens)| text.find(marker).map(|at| (at, marker, opens)))
+        .min_by_key(|(at, _, _)| *at)
 }
 
 fn longest_think_prefix_suffix(text: &str) -> usize {
-    [THINK_OPEN, THINK_CLOSE]
-        .into_iter()
-        .map(|marker| {
+    THINK_MARKERS.into_iter()
+        .map(|(marker, _)| {
             let max = text.len().min(marker.len().saturating_sub(1));
             (1..=max)
                 .rev()
