@@ -53,6 +53,9 @@ pub mod carrier;
 /// DSpark qwen3-8B drafter sidecar loader.
 pub mod dspark_body;
 /// LLaMA-family implementation of the arch-generic speculative-decode seam.
+/// Uno two-pass diffusion decoding (conditional LoRA over the dense target).
+pub mod uno;
+pub mod uno_spec;
 pub mod spec_impl;
 
 /// Re-export the LLaMA-family model module so callers can write

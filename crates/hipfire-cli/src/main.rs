@@ -2120,8 +2120,10 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         }
     }
     if let Some(draft) = &args.model_draft {
-        if !draft.is_file() {
-            bail!("DFlash draft not found: {}", draft.display());
+        if !draft.is_file() && !(draft.is_dir()
+            && draft.join("adapter_config.json").is_file()
+            && draft.join("adapter_model.safetensors").is_file()) {
+            bail!("draft model or Uno adapter not found: {}", draft.display());
         }
     }
     if let Some(vision) = &args.vision {

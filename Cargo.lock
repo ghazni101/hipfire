@@ -1240,7 +1240,10 @@ dependencies = [
  "hipfire-dispatch",
  "hipfire-runtime",
  "md5",
+ "memmap2",
  "rdna-compute",
+ "safetensors",
+ "serde_json",
  "tempfile",
 ]
 

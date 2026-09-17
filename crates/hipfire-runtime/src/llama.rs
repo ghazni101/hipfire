@@ -3979,7 +3979,7 @@ fn llama_flash_partials_len(
 /// Asym and Q8 tiers use the paired `AttentionFamily` plan; legacy cache
 /// formats retain the hand ladder below. The hand body keeps its own inline
 /// copy as the byte-exact `HIPFIRE_FORWARD_LOWERED=0` reference.
-fn llama_kv_write_attend(
+pub fn llama_kv_write_attend(
     gpu: &mut Gpu,
     kv_cache: &KvCache,
     scratch: &ForwardScratch,

@@ -1022,6 +1022,19 @@ impl Carrier for LlamaCarrier {
                 0.5,
             ))
         } else if let Some(dp) = ctx.draft_path {
+            if meta.arch_id == 16 && std::path::Path::new(dp).is_dir() {
+                let spec = match hipfire_arch_llama::uno_spec::UnoSpeculator::load(
+                    ctx.gpu, &bundle, std::path::Path::new(dp), ctx.max_seq,
+                ) {
+                    Ok(spec) => spec,
+                    Err(error) => {
+                        hipfire_runtime::arch_model::ArchModel::free_gpu(Box::new(bundle), ctx.gpu);
+                        return Err(error);
+                    }
+                };
+                eprintln!("  Uno conditional-LoRA speculator loaded: {dp}");
+                Some(spec)
+            } else {
             // Peek at the draft's arch_id without consuming the path; the builder
             // opens it again internally.
             match hipfire_runtime::hfq::HfqFile::open(std::path::Path::new(dp)) {
@@ -1088,6 +1101,7 @@ impl Carrier for LlamaCarrier {
                         ctx.spec,
                     )
                 }
+            }
             }
         } else {
             // No draft configured: opt-in model-free n-gram (HIPFIRE_NGRAM_DRAFT=1) or None.

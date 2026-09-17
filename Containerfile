@@ -32,7 +32,7 @@
 # is all the JIT path needs for gfx1151. If a build ever reports hipcc/headers
 # missing, switch the tag to `7.2.4-complete` (adds rocBLAS/MIOpen, ~7.4 GB).
 # ─────────────────────────────────────────────────────────────────────────────
-FROM docker.io/rocm/dev-ubuntu-24.04:7.2.4 AS base-rocm
+FROM local/rocm-base:10.0.0 AS base-rocm
 
 ENV DEBIAN_FRONTEND=noninteractive
 RUN apt-get update && apt-get install -y --no-install-recommends \

@@ -14,6 +14,9 @@ hipfire-runtime = { path = "../hipfire-runtime" }
 hipfire-dispatch = { path = "../hipfire-dispatch", features = ["from-hip-error"] }
 hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
+memmap2.workspace = true
+safetensors.workspace = true
+serde_json.workspace = true
 
 [dev-dependencies]
 # Streaming MD5 of the pinned G3 fixture in tests: the tracker identity is an
