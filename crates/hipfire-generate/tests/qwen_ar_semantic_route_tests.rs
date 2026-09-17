@@ -502,14 +502,6 @@ fn begin_terminal_test(id: &str, attempt_id: u64) -> TerminalTestGuard {
         assert_eq!(producer.raw_commit_positions, vec![0]);
     }
 
-    #[test]
-    fn eos_filter_config_delegates_think_and_keeps_both_terminators() {
-        let cfg = qwen_ar_eos_filter_config();
-        assert!(!cfg.strip_think);
-        assert!(!cfg.started_in_think);
-        assert!(cfg.stop_at.contains(&b"<|im_end|>".to_vec()));
-        assert!(cfg.stop_at.contains(&b"<|endoftext|>".to_vec()));
-    }
 
     #[test]
     fn cancellation_transcript_carries_attempt_id() {

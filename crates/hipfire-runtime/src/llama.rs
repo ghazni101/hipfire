@@ -2359,6 +2359,7 @@ pub fn forward_prefill_batch_capture(
             capture.as_deref_mut(),
             false,
             None,
+            None,
         )?;
         offset += chunk_n;
     }
@@ -2473,6 +2474,7 @@ pub fn forward_prefill_batch_tree(
         capture,
         false,
         Some(&tm),
+        None,
     );
     let _ = gpu.free_tensor(rope_pos);
     r
@@ -2536,7 +2538,7 @@ pub fn forward_prefill_batch_chunk_captured(
     // per-position malloc/memcpy), so no cap-based gate is needed.
 
     forward_prefill_chunk(
-        gpu, weights, config, tokens, start_pos, kv_cache, scratch, pbs, None, true, None,
+        gpu, weights, config, tokens, start_pos, kv_cache, scratch, pbs, None, true, None, None,
     )
 }
 
@@ -2555,6 +2557,47 @@ fn q8_prefill_family_eligible(
         && batch_size > 1
 }
 
+/// Projection boundaries for conditional adapters. Inputs remain in the model's
+/// original basis; the adapter must not consume FWHT-rotated base-kernel inputs.
+pub enum PrefillProjectionStage { Qkv, AttentionOutput, GateUp, Down }
+
+pub type PrefillProjectionHook<'a> = dyn FnMut(
+    &mut Gpu, &LlamaConfig, &LlamaWeights, &PrefillBatchScratch, usize, usize,
+    PrefillProjectionStage,
+) -> HipResult<()> + 'a;
+
+/// One causal batch with optional conditional projection deltas, leaving every
+/// final residual row in `pbs.x_batch`. No output-head projection or capture.
+#[allow(clippy::too_many_arguments)]
+pub fn forward_prefill_adapter_batch(
+    gpu: &mut Gpu, weights: &LlamaWeights, config: &LlamaConfig,
+    tokens: &[u32], start_pos: usize, kv: &mut KvCache,
+    scratch: &ForwardScratch, pbs: &PrefillBatchScratch,
+    hook: Option<&mut PrefillProjectionHook<'_>>,
+) -> HipResult<()> {
+    if tokens.is_empty() || tokens.len() > pbs.max_batch {
+        return Err(hip_bridge::HipError::new(0, &format!("conditional adapter batch rows={} exceed workspace={} or are empty", tokens.len(), pbs.max_batch)));
+    }
+    if kv.compact_offset != 0 {
+        return Err(hip_bridge::HipError::new(0, &format!("conditional adapter batch requires uncompacted KV; offset={}", kv.compact_offset)));
+    }
+    if !start_pos.checked_add(tokens.len()).is_some_and(|end| end <= kv.physical_cap) {
+        return Err(hip_bridge::HipError::new(0, &format!("conditional adapter batch exceeds KV capacity: start={start_pos} rows={} capacity={}", tokens.len(), kv.physical_cap)));
+    }
+    if !(kv.quant_q8 || kv.quant_asym2 || kv.quant_asym3 || kv.quant_asym4) {
+        return Err(hip_bridge::HipError::new(0, "conditional adapter batch requires q8/asym2/asym3/asym4 KV"));
+    }
+    for (index, layer) in weights.layers.iter().enumerate() {
+        for (name, w) in [("q", &layer.wq), ("k", &layer.wk), ("v", &layer.wv), ("o", &layer.wo), ("gate", &layer.w_gate), ("up", &layer.w_up), ("down", &layer.w_down)] {
+            if !is_batchable_la(w.gpu_dtype, &gpu.arch) && !(w.gpu_dtype == DType::MQ4G256V2 && gpu.arch == "gfx1101") {
+                return Err(hip_bridge::HipError::new(0, &format!("conditional adapter batch unsupported projection: layer={index} projection={name} dtype={:?} arch={}", w.gpu_dtype, gpu.arch)));
+            }
+        }
+    }
+    forward_prefill_chunk(gpu, weights, config, tokens, start_pos, kv,
+        scratch, pbs, None, false, None, hook)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn forward_prefill_chunk(
     gpu: &mut Gpu,
@@ -2568,6 +2611,7 @@ fn forward_prefill_chunk(
     mut capture: Option<&mut HiddenCaptureSink>,
     pre_uploaded: bool,
     tree_mask: Option<&TreeMaskRef>,
+    mut projection_hook: Option<&mut PrefillProjectionHook<'_>>,
 ) -> HipResult<()> {
     let n = tokens.len();
     debug_assert!(n > 0);
@@ -2730,7 +2774,11 @@ fn forward_prefill_chunk(
         let qkv_is_hfq4g128 = matches!(layer.wq.gpu_dtype, DType::HFQ4G128);
 
         // 3-way fused QKV projection.
-        if qkv_is_hfq4g128 {
+        if layer.wq.gpu_dtype == DType::MQ4G256V2 {
+            weight_gemm(gpu, &layer.wq, &pbs.x_rot_batch, &pbs.fa_q_batch, n)?;
+            weight_gemm(gpu, &layer.wk, &pbs.x_rot_batch, &pbs.fa_k_batch, n)?;
+            weight_gemm(gpu, &layer.wv, &pbs.x_rot_batch, &pbs.fa_v_batch, n)?;
+        } else if qkv_is_hfq4g128 {
             debug_assert!(
                 matches!(layer.wk.gpu_dtype, DType::HFQ4G128)
                     && matches!(layer.wv.gpu_dtype, DType::HFQ4G128),
@@ -2865,6 +2913,9 @@ fn forward_prefill_chunk(
                 layer.wq.k,
                 n,
             )?;
+        }
+        if let Some(hook) = projection_hook.as_mut() {
+            hook(gpu, config, weights, pbs, layer_idx, n, PrefillProjectionStage::Qkv)?;
         }
 
         // Per-head Q/K rmsnorm (Qwen3 only — None on plain LLaMA).
@@ -3174,7 +3225,11 @@ fn forward_prefill_chunk(
         } else {
             &pbs.fa_attn_out_batch
         };
-        if wo_is_hfq4g128 {
+        if layer.wo.gpu_dtype == DType::MQ4G256V2 {
+            let projected = pbs.x_rot_batch.sub_offset(0, n * layer.wo.m);
+            weight_gemm(gpu, &layer.wo, &pbs.fa_attn_out_batch, &projected, n)?;
+            gpu.add_inplace_f32(&pbs.x_batch.sub_offset(0, n * dim), &projected)?;
+        } else if wo_is_hfq4g128 {
             // The generic G128 GEMM has overwrite semantics. Reuse x_rot_batch
             // as a dead-after-QKV temporary, then add into the residual stream.
             let projected = pbs.x_rot_batch.sub_offset(0, n * layer.wo.m);
@@ -3240,6 +3295,9 @@ fn forward_prefill_chunk(
                 n,
             )?;
         }
+        if let Some(hook) = projection_hook.as_mut() {
+            hook(gpu, config, weights, pbs, layer_idx, n, PrefillProjectionStage::AttentionOutput)?;
+        }
 
         // FFN: rmsnorm (+ FWHT for MQ — includes MFP4G32), gate+up, silu_mul,
         // w_down + residual.
@@ -3283,7 +3341,10 @@ fn forward_prefill_chunk(
                 config.norm_eps,
             )?;
         }
-        if ffn_is_hfq4g128 {
+        if layer.w_gate.gpu_dtype == DType::MQ4G256V2 {
+            weight_gemm(gpu, &layer.w_gate, &pbs.x_rot_batch, &pbs.gate_ffn_batch, n)?;
+            weight_gemm(gpu, &layer.w_up, &pbs.x_rot_batch, &pbs.up_batch, n)?;
+        } else if ffn_is_hfq4g128 {
             debug_assert!(
                 matches!(layer.w_up.gpu_dtype, DType::HFQ4G128),
                 "llama HFQ4G128 gate/up batch requires one uniform wire layout",
@@ -3386,6 +3447,14 @@ fn forward_prefill_chunk(
                 n,
             )?;
         }
+        if let Some(hook) = projection_hook.as_mut() {
+            hook(gpu, config, weights, pbs, layer_idx, n, PrefillProjectionStage::GateUp)?;
+        }
+        // Down's delta reads ordinary SiLU(gate)*up, before the base path
+        // rotates it. Adding to the residual here commutes with base down.
+        if let Some(hook) = projection_hook.as_mut() {
+            hook(gpu, config, weights, pbs, layer_idx, n, PrefillProjectionStage::Down)?;
+        }
         let w_down_is_mq = matches!(
             layer.w_down.gpu_dtype,
             DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256 | DType::MFP4G32
@@ -3409,7 +3478,11 @@ fn forward_prefill_chunk(
         } else {
             gpu.silu_mul_f32(&pbs.gate_ffn_batch, &pbs.up_batch, &pbs.ffn_hidden_batch)?;
         }
-        if w_down_is_hfq4g128 {
+        if layer.w_down.gpu_dtype == DType::MQ4G256V2 {
+            let projected = pbs.gate_ffn_batch.sub_offset(0, n * layer.w_down.m);
+            weight_gemm(gpu, &layer.w_down, &pbs.ffn_hidden_batch, &projected, n)?;
+            gpu.add_inplace_f32(&pbs.x_batch.sub_offset(0, n * dim), &projected)?;
+        } else if w_down_is_hfq4g128 {
             // gate_ffn_batch is dead after silu_mul and is larger than the
             // dim-wide down projection output, so it is a safe residual temp.
             let projected = pbs.gate_ffn_batch.sub_offset(0, n * layer.w_down.m);

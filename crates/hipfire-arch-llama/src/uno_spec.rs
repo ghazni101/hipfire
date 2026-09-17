@@ -3,15 +3,18 @@
 
 //! Conditional-LoRA Uno linear windows, using the base target as verifier.
 //! Reference: https://github.com/ifm-ai/uno (Apache-2.0).
-use crate::{uno::{uno_forward_row, UnoAdapter, UnoScratch}, LlamaBundle};
-use hipfire_runtime::{llama, spec::{accept_greedy_prefix, PrefillOutcome, SpecAdvance, SpecGrammar, SpecStep, SpecTarget, Speculator}};
+use crate::{uno::{uno_forward_row, uno_forward_batch, uno_forward_batch_device, UnoAdapter, UnoScratch, UnoBatchScratch}, LlamaBundle};
+use hipfire_runtime::{llama, spec::{request_rng_state, PrefillOutcome, SpecAdvance, SpecGrammar, SpecRequestConfig, SpecStep, SpecTarget, Speculator}};
 use rdna_compute::Gpu;
 
 pub struct UnoSpeculator {
     adapter: UnoAdapter,
     scratch: UnoScratch,
+    batch: Option<UnoBatchScratch>,
     capacity: usize,
     noise_state: u64,
+    request: SpecRequestConfig,
+    rng: u32,
 }
 
 impl UnoSpeculator {
@@ -25,66 +28,330 @@ impl UnoSpeculator {
             Ok(s) => s,
             Err(e) => { adapter.free_gpu(gpu); return Err(format!("Uno scratch: {e:?}")); }
         };
-        Ok(Box::new(Self { adapter, scratch, capacity, noise_state: 42 }))
+        let batch = if gpu.arch == "gfx1101" && target.kv.quant_q8 {
+            match UnoBatchScratch::new(gpu, c, adapter.rank, adapter.block_len, target.kv.physical_cap) {
+                Ok(batch) => Some(batch),
+                Err(e) => { scratch.free_gpu(gpu); adapter.free_gpu(gpu); return Err(format!("Uno batch scratch: {e:?}")); }
+            }
+        } else { None };
+        Ok(Box::new(Self { adapter, scratch, batch, capacity, noise_state: 42, request: SpecRequestConfig::default(), rng: 0x1357_9BDF }))
     }
 
-    fn row(&mut self, gpu: &mut Gpu, target: &mut LlamaBundle, token: u32, pos: usize, gated: bool) -> Result<u32, String> {
-        let logits = if gated {
-            uno_forward_row(gpu, &target.weights, &target.config, &self.adapter, token, pos, true, &mut target.kv, &target.scratch, &mut self.scratch).map_err(|e| format!("Uno draft: {e:?}"))?
-        } else {
-            llama::forward_scratch_embed(gpu, &target.weights, &target.config, token, pos, &target.scratch).map_err(|e| format!("Uno base embed: {e:?}"))?;
-            llama::forward_scratch_compute(gpu, &target.weights, &target.config, pos, &mut target.kv, &target.scratch).map_err(|e| format!("Uno base forward: {e:?}"))?;
-            gpu.download_f32(&target.scratch.logits).map_err(|e| format!("Uno logits: {e:?}"))?
-        };
-        if logits.iter().any(|v| !v.is_finite()) { return Err("Uno nonfinite logits".into()); }
-        Ok(llama::argmax(&logits))
+    fn forward(&mut self, gpu: &mut Gpu, target: &mut LlamaBundle, tokens: &[u32], pos: usize, gated: bool) -> Result<Vec<f32>, String> {
+        if let Some(batch) = &self.batch {
+            return uno_forward_batch(gpu, &target.weights, &target.config,
+                gated.then_some(&self.adapter), tokens, pos, &mut target.kv,
+                &target.scratch, batch).map_err(|e| format!("Uno batch: {e:?}"));
+        }
+        let mut logits = Vec::with_capacity(tokens.len() * target.config.vocab_size);
+        for (row, &token) in tokens.iter().enumerate() {
+            if gated && row > 0 {
+                logits.extend(uno_forward_row(gpu, &target.weights, &target.config,
+                    &self.adapter, token, pos + row, true, &mut target.kv,
+                    &target.scratch, &mut self.scratch).map_err(|e| format!("Uno draft: {e:?}"))?);
+            } else {
+                llama::forward_scratch_embed(gpu, &target.weights, &target.config, token, pos + row, &target.scratch).map_err(|e| format!("Uno embed: {e:?}"))?;
+                llama::forward_scratch_compute(gpu, &target.weights, &target.config, pos + row, &mut target.kv, &target.scratch).map_err(|e| format!("Uno forward: {e:?}"))?;
+                logits.extend(gpu.download_f32(&target.scratch.logits).map_err(|e| format!("Uno logits: {e:?}"))?);
+            }
+        }
+        Ok(logits)
+    }
+
+    fn sample_target(&mut self, gpu: &mut Gpu, target: &LlamaBundle) -> Result<u32, String> {
+        let logits = gpu.download_f32(&target.scratch.logits).map_err(|e| format!("Uno prefill logits: {e:?}"))?;
+        Ok(Distribution::from_logits(&logits, self.request)?.sample(&mut self.rng))
     }
 }
 
 impl Speculator for UnoSpeculator {
     fn name(&self) -> &'static str { "uno" }
+    fn requires_greedy(&self) -> bool { false }
+    fn supports_temp_verify(&self) -> bool { true }
+    fn supports_chain_nucleus_verify(&self) -> bool { true }
+    fn configure_request(&mut self, cfg: SpecRequestConfig) {
+        self.request = cfg;
+        self.rng = request_rng_state(cfg.rng_seed) as u32;
+        self.noise_state = u64::from(self.rng).max(1);
+    }
     fn prefill(&mut self, gpu: &mut Gpu, target: &mut dyn SpecTarget, _prompt_tokens: &[u32], tokens: &[u32], start: usize, cache_hit: bool, _resume: Option<usize>, abort: &dyn Fn() -> bool) -> Result<PrefillOutcome, String> {
         match target.spec_advance(gpu, tokens, start, !cache_hit, abort, None)? {
-            SpecAdvance::Ready { last_argmax, .. } => Ok(PrefillOutcome::Ready { first_token: last_argmax }),
+            SpecAdvance::Ready { .. } => {
+                let target = target.as_any_mut().downcast_mut::<LlamaBundle>().ok_or("Uno target is not LlamaBundle")?;
+                Ok(PrefillOutcome::Ready { first_token: self.sample_target(gpu, target)? })
+            }
             SpecAdvance::Aborted => Ok(PrefillOutcome::Aborted),
         }
     }
     fn step(&mut self, gpu: &mut Gpu, target: &mut dyn SpecTarget, position: usize, seed: u32, _emitted: &[u32], grammar: Option<&mut dyn SpecGrammar>, temp: f32, max_emit: usize) -> Result<SpecStep, String> {
-        if max_emit == 0 || temp > 1e-6 || grammar.is_some() { return Err("Uno requires a positive output budget, greedy sampling, and no grammar".into()); }
-        let target = target.as_any_mut().downcast_mut::<LlamaBundle>().ok_or("Uno target is not LlamaBundle")?;
-        if target.kv.compact_offset != 0 { return Err("Uno does not support compacted KV".into()); }
+        if max_emit == 0 || grammar.is_some() { return Err("Uno requires a positive output budget and no grammar".into()); }
         let budget = max_emit.min(self.capacity.saturating_sub(position)).min(self.adapter.block_len + 1);
         if budget == 0 { return Err("Uno context exhausted".into()); }
-        let clean = self.row(gpu, target, seed, position, false)?;
+        self.request.temp = temp;
+        let target = target.as_any_mut().downcast_mut::<LlamaBundle>().ok_or("Uno target is not LlamaBundle")?;
+        if target.kv.compact_offset != 0 { return Err("Uno does not support compacted KV".into()); }
+        let n = budget.saturating_sub(2);
+        let noise: Vec<u32> = std::iter::once(seed)
+            .chain(std::iter::repeat(self.adapter.noise_high).take(n))
+            .collect();
+        let vocab = target.config.vocab_size;
+        let fused = self.batch.is_some() && temp.is_finite() && temp > 1e-6
+            && (self.request.top_k == 0 || self.request.top_k >= vocab)
+            && !(self.request.top_p > 0.0 && self.request.top_p < 1.0)
+            && self.request.min_p <= 0.0;
+        let draft_logits = self.forward(gpu, target, &noise, position, true)?;
+        let clean = Distribution::from_logits(&draft_logits[..vocab], self.request)?.sample(&mut self.rng);
         if budget == 1 || is_stop(clean) { return Ok(SpecStep::new([clean], clean, 0, 0)); }
-        let n = budget - 2;
-        let mut drafts = Vec::with_capacity(n);
-        for row in 1..=n {
-            // Deterministic uniform noise in the reference checkpoint's [1, mask) range.
-            self.noise_state ^= self.noise_state << 13;
-            self.noise_state ^= self.noise_state >> 7;
-            self.noise_state ^= self.noise_state << 17;
-            let token = self.adapter.noise_low + (self.noise_state % u64::from(self.adapter.noise_high - self.adapter.noise_low)) as u32;
-            drafts.push(self.row(gpu, target, token, position + row, true)?);
+        let mut proposal = Vec::with_capacity(n + 1);
+        proposal.push(clean);
+        let mut distributions = Vec::with_capacity(n);
+        for row in draft_logits.chunks_exact(vocab).skip(1) {
+            let q = Distribution::from_logits(row, self.request)?;
+            proposal.push(q.sample(&mut self.rng));
+            if !fused { distributions.push(q); }
         }
-        let mut picks = Vec::with_capacity(n + 1);
-        for (row, token) in std::iter::once(clean).chain(drafts.iter().copied()).enumerate() {
-            picks.push(self.row(gpu, target, token, position + 1 + row, false)?);
+        if fused {
+            let batch = self.batch.as_ref().unwrap();
+            uno_forward_batch_device(gpu, &target.weights, &target.config, None,
+                &proposal, position + 1, &mut target.kv, &target.scratch, batch,
+                &batch.verify_logits).map_err(|e| format!("Uno verify forward: {e:?}"))?;
+            let mut emit = Vec::with_capacity(budget);
+            emit.push(clean);
+            let mut accepted = 0;
+            if n > 0 {
+                let bytes: Vec<u8> = proposal[1..].iter().flat_map(|t| t.to_ne_bytes()).collect();
+                gpu.hip.memcpy_htod(&batch.proposals.buf, &bytes).map_err(|e| format!("Uno proposals: {e:?}"))?;
+                // Reserve a fresh request-seeded stream for each verification window.
+                let _ = uniform(&mut self.rng);
+                gpu.uno_verify_logits(&batch.verify_logits, &batch.draft_logits.sub_offset(vocab, n * vocab),
+                    &batch.proposals, &batch.decisions, n, vocab, temp, self.rng)
+                    .map_err(|e| format!("Uno fused verify: {e:?}"))?;
+                let mut decisions = vec![0u8; n * 8];
+                gpu.hip.memcpy_dtoh(&mut decisions, &batch.decisions.buf).map_err(|e| format!("Uno decisions: {e:?}"))?;
+                for (row, pair) in decisions.chunks_exact(8).enumerate() {
+                    let status = u32::from_ne_bytes(pair[..4].try_into().unwrap());
+                    let correction = u32::from_ne_bytes(pair[4..].try_into().unwrap());
+                    match status {
+                        1 => { emit.push(proposal[row + 1]); accepted += 1; }
+                        0 if (correction as usize) < vocab => { emit.push(correction); break; }
+                        _ => return Err("Uno fused verifier rejected invalid logits or residual mass".into()),
+                    }
+                    if is_stop(*emit.last().unwrap()) { break; }
+                }
+            }
+            if accepted == n && !is_stop(*emit.last().unwrap()) {
+                let logits = gpu.download_f32(&batch.verify_logits.sub_offset(n * vocab, vocab))
+                    .map_err(|e| format!("Uno bonus logits: {e:?}"))?;
+                emit.push(Distribution::from_logits(&logits, self.request)?.sample(&mut self.rng));
+            }
+            let next = *emit.last().unwrap();
+            return Ok(SpecStep::new(emit, next, n, accepted));
         }
-        let verdict = accept_greedy_prefix(&drafts, &picks, None);
-        let mut emit: Vec<u32> = std::iter::once(clean).chain(verdict.committed).collect();
-        if let Some(stop) = emit.iter().position(|&t| is_stop(t)) { emit.truncate(stop + 1); }
-        let accepted = verdict.accepted.min(emit.len().saturating_sub(1));
+        // Base seed KV persists; verification overwrites the noise suffix.
+        let verify_logits = self.forward(gpu, target, &proposal, position + 1, false)?;
+        let mut emit = Vec::with_capacity(budget);
+        emit.push(clean);
+        let mut accepted = 0;
+        for (row, q) in distributions.iter().enumerate() {
+            let p = Distribution::from_logits(&verify_logits[row * vocab..(row + 1) * vocab], self.request)?;
+            let token = proposal[row + 1];
+            let (next, keep) = verify_proposal(&p, q, token, temp <= 1e-6, &mut self.rng)?;
+            emit.push(next);
+            if !keep { break; }
+            accepted += 1;
+            if is_stop(next) { break; }
+        }
+        if accepted == n && !is_stop(*emit.last().unwrap()) {
+            emit.push(Distribution::from_logits(&verify_logits[n * vocab..(n + 1) * vocab], self.request)?.sample(&mut self.rng));
+        }
         let next = *emit.last().unwrap();
-        // Pure attention: valid seed/accepted-prefix KV is already base-only.
-        // Rejected slots remain outside the next position's attention range.
         Ok(SpecStep::new(emit, next, n, accepted))
     }
     fn repair_terminal_prefix(&mut self, _gpu: &mut Gpu, _target: &mut dyn SpecTarget, _start: usize, _seed: u32, _consumed: &[u32]) -> Result<bool, String> { Ok(true) }
     fn reset(&mut self, _gpu: &mut Gpu) -> Result<(), String> { self.noise_state = 42; Ok(()) }
     fn block_size(&self) -> usize { self.adapter.block_len + 1 }
     fn ctx_capacity(&self) -> usize { self.capacity }
-    fn free(self: Box<Self>, gpu: &mut Gpu) { self.scratch.free_gpu(gpu); self.adapter.free_gpu(gpu); }
+    fn free(self: Box<Self>, gpu: &mut Gpu) {
+        if let Some(batch) = self.batch { batch.free_gpu(gpu); }
+        self.scratch.free_gpu(gpu);
+        self.adapter.free_gpu(gpu);
+    }
 }
 
 fn is_stop(token: u32) -> bool { matches!(token, 1 | 250019) }
+
+fn verify_proposal(p: &Distribution, q: &Distribution, token: u32, greedy: bool, rng: &mut u32) -> Result<(u32, bool), String> {
+    let keep = if greedy { p.probability(token) > 0.0 }
+        else { uniform(rng) * q.probability(token) < p.probability(token) };
+    if keep { Ok((token, true)) }
+    else { Ok((p.residual(q)?.sample(rng), false)) }
+}
+
+/// Normalized categorical distribution in token-ID order. Unfiltered softmax
+/// is linear; explicit top-k/nucleus requests rank before filtering.
+struct Distribution(Vec<(u32, f64)>);
+
+impl Distribution {
+    fn from_logits(logits: &[f32], cfg: SpecRequestConfig) -> Result<Self, String> {
+        if logits.is_empty() || logits.iter().any(|v| !v.is_finite()) {
+            return Err("Uno nonfinite or empty logits".into());
+        }
+        if !cfg.temp.is_finite() { return Err("Uno nonfinite temperature".into()); }
+        if cfg.temp <= 1e-6 { return Ok(Self(vec![(llama::argmax(logits), 1.0)])); }
+        let nucleus = if cfg.top_p > 0.0 { f64::from(cfg.top_p.min(1.0)) } else { 1.0 };
+        let ranked_filter = (cfg.top_k > 0 && cfg.top_k < logits.len()) || nucleus < 1.0;
+        let mut ranked: Vec<(u32, f64)> = logits.iter().enumerate().map(|(i, &v)| (i as u32, f64::from(v))).collect();
+        let max = f64::from(logits.iter().copied().fold(f32::NEG_INFINITY, f32::max));
+        if ranked_filter {
+            ranked.sort_unstable_by(|a,b| b.1.total_cmp(&a.1).then(a.0.cmp(&b.0)));
+            if cfg.top_k > 0 { ranked.truncate(cfg.top_k.min(ranked.len())); }
+        }
+        for (_, p) in &mut ranked { *p = ((*p - max) / f64::from(cfg.temp)).exp(); }
+        if cfg.min_p > 0.0 { ranked.retain(|&(_, p)| p >= f64::from(cfg.min_p)); }
+        if nucleus < 1.0 {
+            let total: f64 = ranked.iter().map(|x| x.1).sum();
+            let mut cumulative = 0.0;
+            ranked.retain(|(_, p)| {
+                let keep = cumulative <= nucleus * total;
+                cumulative += *p;
+                keep
+            });
+        }
+        let total: f64 = ranked.iter().map(|x| x.1).sum();
+        if total <= 0.0 || !total.is_finite() { return Err("Uno empty filtered distribution".into()); }
+        for (_, p) in &mut ranked { *p /= total; }
+        if ranked_filter { ranked.sort_unstable_by_key(|x| x.0); }
+        Ok(Self(ranked))
+    }
+
+    fn probability(&self, token: u32) -> f64 {
+        self.0.binary_search_by_key(&token, |x| x.0).map(|i| self.0[i].1).unwrap_or(0.0)
+    }
+
+    fn sample(&self, rng: &mut u32) -> u32 {
+        if self.0.len() == 1 { return self.0[0].0; }
+        self.sample_at(uniform(rng))
+    }
+
+    fn sample_at(&self, u: f64) -> u32 {
+        let total: f64 = self.0.iter().map(|x| x.1).sum();
+        let mut remainder = u * total;
+        for &(token, p) in &self.0 {
+            if remainder < p { return token; }
+            remainder -= p;
+        }
+        self.0.iter().rev().find(|x| x.1 > 0.0).expect("positive categorical mass").0
+    }
+
+    fn residual(&self, draft: &Self) -> Result<Self, String> {
+        let mut residual = Vec::with_capacity(self.0.len());
+        let mut j = 0;
+        for &(token, p) in &self.0 {
+            while j < draft.0.len() && draft.0[j].0 < token { j += 1; }
+            let q = draft.0.get(j).filter(|x| x.0 == token).map_or(0.0, |x| x.1);
+            if p > q { residual.push((token, p-q)); }
+        }
+        if residual.is_empty() { return Err("Uno rejected identical distributions".into()); }
+        Ok(Self(residual))
+    }
+}
+
+fn uniform(state: &mut u32) -> f64 {
+    *state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+    (f64::from(*state) + 0.5) / 4294967296.0
+}
+
+#[cfg(test)]
+mod uno_sampling_tests {
+    use super::*;
+
+    #[test]
+    fn production_decision_accepts_or_corrects_from_residual_support() {
+        let cfg = SpecRequestConfig { temp: 1.5, ..Default::default() };
+        let p = Distribution::from_logits(&[0.1f32.ln() * 1.5, 0.6f32.ln() * 1.5, 0.3f32.ln() * 1.5], cfg).unwrap();
+        let q = Distribution::from_logits(&[0.7f32.ln() * 1.5, 0.2f32.ln() * 1.5, 0.1f32.ln() * 1.5], cfg).unwrap();
+        // Seed 42: acceptance draw 0.2523 > 1/7; correction draw
+        // 0.0881 selects token 1 from residual probabilities [0, 2/3, 1/3].
+        assert_eq!(verify_proposal(&p, &q, 0, false, &mut 42).unwrap(), (1, false));
+        assert_eq!(verify_proposal(&p, &q, 1, false, &mut 42).unwrap(), (1, true));
+        // Seed 1972 accepts even when p<q: acceptance is not argmax matching.
+        assert_eq!(verify_proposal(&p, &q, 0, false, &mut 1972).unwrap(), (0, true));
+        let mut rng = 42;
+        let mut counts = [0usize; 3];
+        let mut rejected = 0;
+        for _ in 0..100_000 {
+            let proposal = q.sample(&mut rng);
+            let (emitted, accepted) = verify_proposal(&p, &q, proposal, false, &mut rng).unwrap();
+            counts[emitted as usize] += 1;
+            rejected += usize::from(!accepted);
+        }
+        for (count, expected) in counts.into_iter().zip([0.1, 0.6, 0.3]) {
+            assert!((count as f64 / 100_000.0 - expected).abs() < 0.005);
+        }
+        assert!((rejected as f64 / 100_000.0 - 0.6).abs() < 0.005);
+    }
+
+    #[test]
+    fn unfiltered_temperature_and_rejection_draws_match_target() {
+        let cfg = SpecRequestConfig { temp: 0.8, ..Default::default() };
+        let p = Distribution::from_logits(&[0.1f32.ln() * 0.8 + 5.0, 0.6f32.ln() * 0.8 + 5.0, 0.3f32.ln() * 0.8 + 5.0], cfg).unwrap();
+        let q = Distribution::from_logits(&[0.7f32.ln() * 0.8 - 3.0, 0.2f32.ln() * 0.8 - 3.0, 0.1f32.ln() * 0.8 - 3.0], cfg).unwrap();
+        for (token, expected) in [0.1, 0.6, 0.3].into_iter().enumerate() {
+            assert!((p.probability(token as u32) - expected).abs() < 1e-6);
+        }
+        let residual = p.residual(&q).unwrap();
+        let rejected: f64 = q.0.iter().map(|&(t, mass)| (mass - p.probability(t)).max(0.0)).sum();
+        let mut counts = [0usize; 3];
+        for i in 0..10000 {
+            counts[residual.sample_at((i as f64 + 0.5) / 10000.0) as usize] += 1;
+        }
+        assert_eq!(counts[0], 0);
+        for token in 0..3 {
+            let mass = p.probability(token as u32).min(q.probability(token as u32))
+                + rejected * counts[token] as f64 / 10000.0;
+            assert!((mass - p.probability(token as u32)).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn greedy_rejection_corrects_to_target_without_rng_draw() {
+        let cfg = SpecRequestConfig { temp: 0.0, ..Default::default() };
+        let p = Distribution::from_logits(&[0.0, 3.0, 1.0], cfg).unwrap();
+        let q = Distribution::from_logits(&[4.0, 0.0, 1.0], cfg).unwrap();
+        let mut rng = 42;
+        assert_eq!(q.sample(&mut rng), 0);
+        assert_eq!(p.probability(0), 0.0);
+        assert_eq!(p.residual(&q).unwrap().sample(&mut rng), 1);
+        assert_eq!(rng, 42);
+    }
+
+    #[test]
+    fn rejection_mass_recovers_target_including_disjoint_support() {
+        for (p, q) in [
+            (vec![(0, 0.1), (1, 0.6), (2, 0.3)], vec![(0, 0.7), (1, 0.2), (3, 0.1)]),
+            (vec![(2, 1.0)], vec![(0, 1.0)]),
+        ] {
+            let p = Distribution(p);
+            let q = Distribution(q);
+            let residual = p.residual(&q).unwrap();
+            let rejected: f64 = q.0.iter().map(|&(t, mass)| mass - mass.min(p.probability(t))).sum();
+            let residual_sum: f64 = residual.0.iter().map(|x| x.1).sum();
+            for token in 0..4 {
+                let emitted = q.probability(token).min(p.probability(token))
+                    + rejected * residual.probability(token) / residual_sum;
+                assert!((emitted - p.probability(token)).abs() < 1e-12);
+            }
+            assert!(residual.probability(residual.sample_at(0.0)) > 0.0);
+            assert!(residual.probability(residual.sample_at(1.0 - f64::EPSILON)) > 0.0);
+        }
+    }
+
+    #[test]
+    fn nucleus_includes_crossing_token_after_top_k() {
+        let cfg = SpecRequestConfig { temp: 1.0, top_k: 2, top_p: 0.7, ..Default::default() };
+        let p = Distribution::from_logits(&[0.5f32.ln(), 0.3f32.ln(), 0.2f32.ln()], cfg).unwrap();
+        assert!((p.probability(0) - 0.625).abs() < 1e-6);
+        assert!((p.probability(1) - 0.375).abs() < 1e-6);
+        assert_eq!(p.probability(2), 0.0);
+    }
+}

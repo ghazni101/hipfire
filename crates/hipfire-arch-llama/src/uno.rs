@@ -395,3 +395,121 @@ impl UnoScratch {
         }
     }
 }
+
+/// Persistent batch workspace; separate from the scalar reference workspace.
+pub struct UnoBatchScratch {
+    pub pbs: hipfire_runtime::llama::PrefillBatchScratch,
+    norm: GpuTensor,
+    ax: GpuTensor,
+    delta: GpuTensor,
+    hidden: GpuTensor,
+    pub(crate) draft_logits: GpuTensor,
+    pub(crate) verify_logits: GpuTensor,
+    pub(crate) proposals: GpuTensor,
+    pub(crate) decisions: GpuTensor,
+}
+
+impl UnoBatchScratch {
+    pub fn new(gpu: &mut Gpu, config: &LlamaConfig, rank: usize, rows: usize, capacity: usize) -> HipResult<Self> {
+        let pbs = hipfire_runtime::llama::PrefillBatchScratch::new(gpu, config, rows, capacity)?;
+        let mut tensors = Vec::with_capacity(8);
+        for size in [rows * config.dim, rows * rank, rows * config.hidden_dim.max(config.dim),
+            rows * config.hidden_dim, rows * config.vocab_size, rows * config.vocab_size, rows, rows * 2] {
+            match gpu.alloc_tensor(&[size], DType::F32) {
+                Ok(t) => tensors.push(t),
+                Err(e) => {
+                    for t in tensors { let _ = gpu.free_tensor(t); }
+                    pbs.free_gpu(gpu);
+                    return Err(e);
+                }
+            }
+        }
+        let mut tensors = tensors.into_iter();
+        Ok(Self {
+            pbs, norm: tensors.next().unwrap(), ax: tensors.next().unwrap(),
+            delta: tensors.next().unwrap(), hidden: tensors.next().unwrap(),
+            draft_logits: tensors.next().unwrap(), verify_logits: tensors.next().unwrap(),
+            proposals: tensors.next().unwrap(), decisions: tensors.next().unwrap(),
+        })
+    }
+
+    pub fn free_gpu(self, gpu: &mut Gpu) {
+        self.pbs.free_gpu(gpu);
+        for tensor in [self.norm, self.ax, self.delta, self.hidden, self.draft_logits, self.verify_logits, self.proposals, self.decisions] { let _ = gpu.free_tensor(tensor); }
+    }
+
+    fn delta(&self, gpu: &mut Gpu, p: &UnoProj, x: &GpuTensor, y: &GpuTensor, rows: usize) -> HipResult<()> {
+        // Gate row zero out by never launching or adding its delta.
+        let n = rows - 1;
+        if n == 0 { return Ok(()); }
+        let x = x.sub_offset(p.k, n * p.k);
+        let y = y.sub_offset(p.m, n * p.m);
+        let ax = self.ax.sub_offset(0, n * p.rank);
+        let delta = self.delta.sub_offset(0, n * p.m);
+        gpu.gemm_f32_batched(&p.a, &x, &ax, p.rank, p.k, n)?;
+        gpu.gemm_f32_batched(&p.b, &ax, &delta, p.m, p.rank, n)?;
+        gpu.add_inplace_f32(&y, &delta)
+    }
+}
+
+/// Causal conditional-LoRA batch. Row zero is base-only; subsequent rows use
+/// the adapter. `None` performs base verification. Returns token-major logits.
+#[allow(clippy::too_many_arguments)]
+pub fn uno_forward_batch(
+    gpu: &mut Gpu, weights: &LlamaWeights, config: &LlamaConfig,
+    uno: Option<&UnoAdapter>, tokens: &[u32], pos: usize,
+    kv: &mut KvCache, scratch: &ForwardScratch, batch: &UnoBatchScratch,
+) -> HipResult<Vec<f32>> {
+    let output = if uno.is_some() { &batch.draft_logits } else { &batch.verify_logits };
+    uno_forward_batch_device(gpu, weights, config, uno, tokens, pos, kv, scratch, batch, output)?;
+    gpu.download_f32(&output.sub_offset(0, tokens.len() * config.vocab_size))
+}
+
+/// Device-output variant for fused verification; does not download logits.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn uno_forward_batch_device(
+    gpu: &mut Gpu, weights: &LlamaWeights, config: &LlamaConfig,
+    uno: Option<&UnoAdapter>, tokens: &[u32], pos: usize,
+    kv: &mut KvCache, scratch: &ForwardScratch, batch: &UnoBatchScratch,
+    output: &GpuTensor,
+) -> HipResult<()> {
+    use hipfire_runtime::llama::{forward_prefill_adapter_batch, PrefillProjectionStage};
+    let mut hook = |gpu: &mut Gpu, c: &LlamaConfig, w: &LlamaWeights,
+        pbs: &hipfire_runtime::llama::PrefillBatchScratch, layer: usize, rows: usize,
+        stage: PrefillProjectionStage| -> HipResult<()> {
+        let adapter = uno.expect("hook only installed with adapter");
+        let ul = &adapter.layers[layer];
+        match stage {
+            PrefillProjectionStage::Qkv => {
+                c.rmsnorm_batch(gpu, &pbs.x_batch, &w.layers[layer].attn_norm, &batch.norm, rows)?;
+                batch.delta(gpu, &ul.q_proj, &batch.norm, &pbs.fa_q_batch, rows)?;
+                batch.delta(gpu, &ul.k_proj, &batch.norm, &pbs.fa_k_batch, rows)?;
+                batch.delta(gpu, &ul.v_proj, &batch.norm, &pbs.fa_v_batch, rows)?;
+            }
+            PrefillProjectionStage::AttentionOutput => {
+                batch.delta(gpu, &ul.o_proj, &pbs.fa_attn_out_batch, &pbs.x_batch, rows)?;
+            }
+            PrefillProjectionStage::GateUp => {
+                c.rmsnorm_batch(gpu, &pbs.x_batch, &w.layers[layer].ffn_norm, &batch.norm, rows)?;
+                batch.delta(gpu, &ul.gate_proj, &batch.norm, &pbs.gate_ffn_batch, rows)?;
+                batch.delta(gpu, &ul.up_proj, &batch.norm, &pbs.up_batch, rows)?;
+            }
+            PrefillProjectionStage::Down => {
+                let size = rows * c.hidden_dim;
+                gpu.silu_mul_f32(&pbs.gate_ffn_batch.sub_offset(0, size),
+                    &pbs.up_batch.sub_offset(0, size), &batch.hidden.sub_offset(0, size))?;
+                batch.delta(gpu, &ul.down_proj, &batch.hidden, &pbs.x_batch, rows)?;
+            }
+        }
+        Ok(())
+    };
+    forward_prefill_adapter_batch(gpu, weights, config, tokens, pos, kv,
+        scratch, &batch.pbs, if uno.is_some() { Some(&mut hook) } else { None })?;
+    for row in 0..tokens.len() {
+        let x = batch.pbs.x_batch.sub_offset(row * config.dim, config.dim);
+        config.rmsnorm(gpu, &x, &weights.output_norm, &scratch.tmp)?;
+        let logits = output.sub_offset(row * config.vocab_size, config.vocab_size);
+        weight_gemv(gpu, &weights.output, &scratch.tmp, &logits)?;
+    }
+    Ok(())
+}

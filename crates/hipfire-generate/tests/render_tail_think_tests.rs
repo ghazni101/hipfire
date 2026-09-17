@@ -92,3 +92,40 @@ fn ifm_thinking_channels_survive_every_chunk_boundary() {
         }
     }
 }
+
+#[test]
+fn ifm_ar_wire_routes_answer_and_stops_at_eot() {
+    use hipfire_runtime::emit_text::{ThinkOutputRouter, ToolOutputRouter};
+    use hipfire_runtime::eos_filter::EosFilter;
+    let text = b"reason</ifm|think>Red, blue, and green.<|ifm|im_end|><|ifm|endoftext|>";
+    for split in 0..=text.len() {
+        let mut config = qwen_ar_eos_filter_config();
+        config.stop_at.extend([b"<|ifm|im_end|>".to_vec(), b"<|ifm|endoftext|>".to_vec()]);
+        let mut filter = EosFilter::new(config);
+        let mut think = ThinkOutputRouter::new(true);
+        let mut tools = ToolOutputRouter::disabled();
+        let mut visible = String::new();
+        let mut wire = Vec::new();
+        let mut stopped = false;
+        for chunk in [&text[..split], &text[split..]] {
+            if qwen_ar_observe_and_route(&mut wire, "ifm", &mut filter, &mut think, &mut tools, chunk, &mut visible).unwrap() {
+                stopped = true;
+                break;
+            }
+        }
+        qwen_ar_drain_pending_into_router(&mut wire, "ifm", &mut filter, &mut think, &mut tools, &mut visible).unwrap();
+        let mut reasoning = String::new();
+        let mut answer = String::new();
+        for line in String::from_utf8(wire).unwrap().lines() {
+            let event: serde_json::Value = serde_json::from_str(line).unwrap();
+            match event["type"].as_str().unwrap() {
+                "reasoning" => reasoning.push_str(event["text"].as_str().unwrap()),
+                "token" => answer.push_str(event["text"].as_str().unwrap()),
+                other => panic!("unexpected event {other}"),
+            }
+        }
+        assert!(stopped, "split={split}");
+        assert_eq!(reasoning, "reason", "split={split}");
+        assert_eq!(answer, "Red, blue, and green.", "split={split}");
+    }
+}

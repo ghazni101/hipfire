@@ -81,6 +81,40 @@ pub(crate) fn sample_top_p_parallel_precompile_specs() -> [(&'static str, String
 }
 
 impl Gpu {
+    /// Unfiltered Uno rejection verification. Output contains U32 pairs
+    /// [accepted, correction]; accepted=2 is a fail-closed numeric error.
+    /// Integer buffers use F32 storage, interpreted as raw U32 bytes.
+    #[allow(clippy::too_many_arguments)]
+    pub fn uno_verify_logits(&mut self, p: &GpuTensor, q: &GpuTensor,
+        proposals: &GpuTensor, result: &GpuTensor, rows: usize, vocab: usize,
+        temperature: f32, seed: u32) -> HipResult<()> {
+        let elements = rows.checked_mul(vocab).and_then(|n| n.checked_mul(4));
+        if rows == 0 || rows > u32::MAX as usize || vocab == 0 || vocab > i32::MAX as usize
+            || !temperature.is_finite() || temperature <= 1e-6
+            || elements.is_none_or(|bytes| p.buf.size() < bytes || q.buf.size() < bytes)
+            || rows.checked_mul(8).is_none_or(|bytes| result.buf.size() < bytes)
+            || rows.checked_mul(4).is_none_or(|bytes| proposals.buf.size() < bytes)
+            || [p, q, proposals, result].iter().any(|t| t.dtype != DType::F32) {
+            return Err(HipError::new(0, "invalid Uno verifier tensor shape or temperature"));
+        }
+        self.bind_thread()?;
+        self.ensure_kernel("uno_verify_logits", include_str!("../../../kernels/src/uno_verify_logits.hip"), "uno_verify_logits")?;
+        let mut pp = p.buf.as_ptr(); let mut qp = q.buf.as_ptr();
+        let mut tp = proposals.buf.as_ptr(); let mut out = result.buf.as_ptr();
+        let mut v = vocab as i32; let mut temp = temperature; let mut rng = seed;
+        let mut params = [
+            &mut pp as *mut _ as *mut c_void, &mut qp as *mut _ as *mut c_void,
+            &mut tp as *mut _ as *mut c_void, &mut out as *mut _ as *mut c_void,
+            &mut v as *mut _ as *mut c_void, &mut temp as *mut _ as *mut c_void,
+            &mut rng as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob("uno_verify_logits", [rows as u32, 1, 1], [256, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(pp); b.push_ptr(qp); b.push_ptr(tp); b.push_ptr(out);
+            b.push_i32(v); b.push_f32(temp); b.push_u32(rng); b
+        })
+    }
+
     /// Compute max softmax probability on GPU. Downloads 4 bytes instead of vocab×4.
     pub fn max_prob(
         &mut self,
