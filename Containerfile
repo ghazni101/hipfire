@@ -80,8 +80,11 @@ COPY --from=builder /hipfire/target/release/hipfire /usr/local/bin/hipfire
 ENV HIPFIRE_DAEMON_BIN=/opt/hipfire/bin/daemon \
     HIPFIRE_DIR=/root/.hipfire
 
-# Models and the JIT kernel cache persist across runs via named volumes.
-VOLUME ["/root/.hipfire/models", "/var/cache/hipfire"]
+# The JIT kernel cache persists across runs via a named volume. Models are NOT
+# a VOLUME: an anonymous volume here shadows bind-mounted model dirs, making
+# pulled artifacts invisible (they're runtime-only downloads — mount or
+# HIPFIRE_DIR them in).
+VOLUME ["/var/cache/hipfire"]
 EXPOSE 11435
 
 ENTRYPOINT ["hipfire"]
