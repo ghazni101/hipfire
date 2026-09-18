@@ -17,8 +17,15 @@
 //!    Greedy: accept the prefix whose target argmax equals the proposal, then
 //!    a lookahead argmax from the last verify row. Stochastic (temp > 0):
 //!    dual-softmax rejection acceptance with residual correction, fused on
-//!    device for unfiltered requests (`uno_verify_logits.hip`, a HIP port of
-//!    the upstream `fused_verify_kernel.py`); filtered requests use the host
+//!    device. Unfiltered requests use the full-vocab fused verifier
+//!    (`uno_verify_logits.hip`, a HIP port of the upstream
+//!    `fused_verify_kernel.py`); filtered requests are device-resident too —
+//!    top-k rows are masked to their top-K support, and top-p (optionally
+//!    with top_k) goes through the candidate-gather verifier
+//!    (`uno_filter_verify.hip`), which replicates the fused AR sampler's
+//!    law (top-K gather → softmax → nucleus truncation → renormalize) so the
+//!    emitted distribution matches the daemon's non-speculative AR decode at
+//!    the same request config. min-p-only requests keep the host
 //!    `Distribution` law. Truncate at EOS.
 //! 3. KV: committed tokens keep base computations only — the linear path
 //!    overwrites the draft-noise slots during verify; the tree path walks the
@@ -432,17 +439,23 @@ pub struct UnoBatchScratch {
     pub(crate) lse: GpuTensor,
     pub(crate) topk: GpuTensor,
     pub(crate) bias: GpuTensor,
+    /// Filter-verify candidate gather scratch: 64 (idx, val) per row for the
+    /// target and draft rows (`uno_filter_gather` writes p then q into the
+    /// first/second half; `uno_filter_finalize` consumes both).
+    pub(crate) filter_vals: GpuTensor,
+    pub(crate) filter_idxs: GpuTensor,
 }
 
 impl UnoBatchScratch {
     pub fn new(gpu: &mut Gpu, config: &LlamaConfig, rank: usize, rows: usize, capacity: usize) -> HipResult<Self> {
         let pbs = hipfire_runtime::llama::PrefillBatchScratch::new(gpu, config, rows, capacity)?;
         let tree_cols = rows * rows;
-        let mut tensors = Vec::with_capacity(13);
+        let mut tensors = Vec::with_capacity(15);
         for size in [rows * config.dim, rows * rank,
             rows * config.hidden_dim, rows * config.vocab_size, rows * config.vocab_size, rows, rows * 2,
             rows, 2, 1,
-            rows, rows * 2 * 8, tree_cols.max(1)] {
+            rows, rows * 2 * 8, tree_cols.max(1),
+            rows * 64 * 2, rows * 64 * 2] {
             match gpu.alloc_tensor(&[size], DType::F32) {
                 Ok(t) => tensors.push(t),
                 Err(e) => {
@@ -462,12 +475,13 @@ impl UnoBatchScratch {
             sample_repeat: tensors.next().unwrap(),
             lse: tensors.next().unwrap(), topk: tensors.next().unwrap(),
             bias: tensors.next().unwrap(),
+            filter_vals: tensors.next().unwrap(), filter_idxs: tensors.next().unwrap(),
         })
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) {
         self.pbs.free_gpu(gpu);
-        for tensor in [self.norm, self.ax, self.hidden, self.draft_logits, self.verify_logits, self.proposals, self.decisions, self.picks, self.sample_result, self.sample_repeat, self.lse, self.topk, self.bias] { let _ = gpu.free_tensor(tensor); }
+        for tensor in [self.norm, self.ax, self.hidden, self.draft_logits, self.verify_logits, self.proposals, self.decisions, self.picks, self.sample_result, self.sample_repeat, self.lse, self.topk, self.bias, self.filter_vals, self.filter_idxs] { let _ = gpu.free_tensor(tensor); }
     }
 
     fn delta(&self, gpu: &mut Gpu, p: &UnoProj, x: &GpuTensor, y: &GpuTensor, rows: usize) -> HipResult<()> {
@@ -843,6 +857,8 @@ pub(crate) fn uno_tree_verify_picks(
                 &batch.verify_logits.sub_offset(row * vocab, vocab),
                 vocab,
                 temp,
+                1.0,
+                None,
                 &batch.sample_result,
                 &batch.sample_repeat,
                 rng,

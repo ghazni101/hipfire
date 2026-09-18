@@ -202,3 +202,202 @@ extern "C" __global__ void uno_apply_topk_mask(
         if (keep_idx[r]<vocab) p[keep_idx[r]]=keep_val[r];
     }
 }
+
+// Filtered Uno verification via candidate gather — the device-resident
+// nucleus (top-p) path. Two kernels mirror the fused AR sampler's exact law
+// (softmax probabilities are monotone in logit, so the top-K gather by logit
+// value is already in probability order):
+//
+//   `uno_filter_gather`  — per row, the row's top-64 logits by value (the
+//                          sampler's partial+merge selection), written to
+//                          global scratch for the target (p) and draft (q)
+//                          rows.
+//   `uno_filter_finalize` — per row, build the two sampling laws with the
+//                          sampler's arithmetic — softmax at `temperature`,
+//                          cap at `top_k_req` candidates (request top_k, else
+//                          the sampler's 20 when the request sets no top_k),
+//                          nucleus-truncate at `top_p` over the descending
+//                          list, renormalize over the truncated support (the
+//                          sampler's `trunc_sum`) — then decide accept/correct.
+//
+// The proposals were drawn by that same law (`sample_row` →
+// `sample_top_p_pf`), so the acceptance ratio p(t)/q(t) and the (p−q)+ residual
+// correction emit exactly the target's AR-sampler-law distribution. Emission
+// law therefore matches what the daemon's non-speculative AR decode produces
+// at the same request config (temp + top_p + top_k), replacing the old host
+// Distribution law (full-vocab nucleus) that forced a full logits download per
+// row per forward.
+//
+// `uno_filter_gather` grid: rows blocks, 128 threads; dynamic smem =
+// 128*64*8 bytes (64 KiB, the RDNA wave32 group-segment limit — same footprint
+// as the wide sampler partial; no static smem on top, so the launch fits).
+// `uno_filter_finalize` grid: rows blocks, 1 thread; no smem. Result pairs:
+// [accepted, correction]; accepted=2 is a fail-closed numeric error (mirrors
+// `uno_verify_logits`).
+#define UNO_FILTER_KW 64
+extern "C" __global__ void uno_filter_gather(
+    const float* __restrict__ logits, float* __restrict__ out_val,
+    int* __restrict__ out_idx, int vocab) {
+    extern __shared__ char smem[];
+    const int tid=threadIdx.x, nthreads=blockDim.x, row=blockIdx.x;
+    const float* p=logits+size_t(row)*vocab;
+    float* s_val=(float*)smem;                       // [nthreads*KW]
+    int*   s_idx=(int*)(s_val+(size_t)nthreads*UNO_FILTER_KW);
+    float my_val[UNO_FILTER_KW];
+    int   my_idx[UNO_FILTER_KW];
+    #pragma unroll
+    for (int k=0; k<UNO_FILTER_KW; ++k) { my_val[k]=-1e30f; my_idx[k]=0; }
+    int min_pos=0;
+    float min_val=-1e30f;
+    for (int i=tid; i<vocab; i+=nthreads) {
+        float v=p[i];
+        if (v>min_val) {
+            my_val[min_pos]=v;
+            my_idx[min_pos]=i;
+            min_val=my_val[0]; min_pos=0;
+            #pragma unroll
+            for (int k=1; k<UNO_FILTER_KW; ++k) {
+                if (my_val[k]<min_val) { min_val=my_val[k]; min_pos=k; }
+            }
+        }
+    }
+    // Block merge (the sampler's non-fast merge: nthreads x KW -> block top-KW).
+    #pragma unroll
+    for (int k=0; k<UNO_FILTER_KW; ++k) {
+        s_val[(size_t)tid*UNO_FILTER_KW+k]=my_val[k];
+        s_idx[(size_t)tid*UNO_FILTER_KW+k]=my_idx[k];
+    }
+    __syncthreads();
+    for (int stride=nthreads/2; stride; stride>>=1) {
+        if (tid<stride) {
+            float* a_val=s_val+(size_t)tid*UNO_FILTER_KW;
+            int*   a_idx=s_idx+(size_t)tid*UNO_FILTER_KW;
+            const float* b_val=s_val+(size_t)(tid+stride)*UNO_FILTER_KW;
+            const int*   b_idx=s_idx+(size_t)(tid+stride)*UNO_FILTER_KW;
+            for (int j=0; j<UNO_FILTER_KW; ++j) {
+                float bv=b_val[j]; int bi=b_idx[j];
+                float amin=a_val[0]; int amin_pos=0;
+                #pragma unroll
+                for (int k=1; k<UNO_FILTER_KW; ++k) {
+                    if (a_val[k]<amin) { amin=a_val[k]; amin_pos=k; }
+                }
+                if (bv>amin) { a_val[amin_pos]=bv; a_idx[amin_pos]=bi; }
+            }
+        }
+        __syncthreads();
+    }
+    if (tid==0) {
+        float* o_val=out_val+size_t(row)*UNO_FILTER_KW;
+        int*   o_idx=out_idx+size_t(row)*UNO_FILTER_KW;
+        #pragma unroll
+        for (int k=0; k<UNO_FILTER_KW; ++k) { o_val[k]=s_val[k]; o_idx[k]=s_idx[k]; }
+    }
+}
+
+extern "C" __global__ void uno_filter_finalize(
+    const float* __restrict__ p_val, const int* __restrict__ p_idx,
+    const float* __restrict__ q_val, const int* __restrict__ q_idx,
+    const uint32_t* __restrict__ proposals, uint32_t* __restrict__ result,
+    int vocab, float temperature, float top_p, int top_k_req, uint32_t seed) {
+    const int row=blockIdx.x;
+    const float* pv_all=p_val+size_t(row)*UNO_FILTER_KW;
+    const int*   pi_all=p_idx+size_t(row)*UNO_FILTER_KW;
+    const float* qv_all=q_val+size_t(row)*UNO_FILTER_KW;
+    const int*   qi_all=q_idx+size_t(row)*UNO_FILTER_KW;
+    int cap_lo=top_k_req; if (cap_lo<1) cap_lo=1;
+    if (cap_lo>UNO_FILTER_KW) cap_lo=UNO_FILTER_KW;
+    float inv_temp=1.0f/temperature;
+
+    // ── p law: descending logit order == descending probability order.
+    float pv[UNO_FILTER_KW]; int pi[UNO_FILTER_KW];
+    #pragma unroll
+    for (int k=0; k<UNO_FILTER_KW; ++k) { pv[k]=pv_all[k]; pi[k]=pi_all[k]; }
+    for (int i=1; i<UNO_FILTER_KW; ++i) {
+        float cv=pv[i]; int ci=pi[i];
+        int j=i;
+        while (j>0 && pv[j-1]<cv) { pv[j]=pv[j-1]; pi[j]=pi[j-1]; --j; }
+        pv[j]=cv; pi[j]=ci;
+    }
+    float pmax=pv[0];
+    float pprobs[UNO_FILTER_KW];
+    #pragma unroll
+    for (int k=0; k<UNO_FILTER_KW; ++k) {
+        pprobs[k]=(pv[k]<=-1e29f) ? 0.0f : expf((pv[k]-pmax)*inv_temp);
+    }
+    float psum=0.0f;
+    for (int i=0; i<cap_lo; ++i) psum+=pprobs[i];
+    float pthresh=top_p*psum;
+    float pcum=0.0f;
+    int ptrunc=cap_lo;
+    for (int i=0; i<cap_lo; ++i) {
+        pcum+=pprobs[i];
+        if (pcum>=pthresh) { ptrunc=i+1; break; }
+    }
+    float pnorm=0.0f;
+    for (int i=0; i<ptrunc; ++i) pnorm+=pprobs[i];
+
+    // ── q law: identical arithmetic over the draft row.
+    float qv[UNO_FILTER_KW]; int qi[UNO_FILTER_KW];
+    #pragma unroll
+    for (int k=0; k<UNO_FILTER_KW; ++k) { qv[k]=qv_all[k]; qi[k]=qi_all[k]; }
+    for (int i=1; i<UNO_FILTER_KW; ++i) {
+        float cv=qv[i]; int ci=qi[i];
+        int j=i;
+        while (j>0 && qv[j-1]<cv) { qv[j]=qv[j-1]; qi[j]=qi[j-1]; --j; }
+        qv[j]=cv; qi[j]=ci;
+    }
+    float qmax=qv[0];
+    float qprobs[UNO_FILTER_KW];
+    #pragma unroll
+    for (int k=0; k<UNO_FILTER_KW; ++k) {
+        qprobs[k]=(qv[k]<=-1e29f) ? 0.0f : expf((qv[k]-qmax)*inv_temp);
+    }
+    float qsum=0.0f;
+    for (int i=0; i<cap_lo; ++i) qsum+=qprobs[i];
+    float qthresh=top_p*qsum;
+    float qcum=0.0f;
+    int qtrunc=cap_lo;
+    for (int i=0; i<cap_lo; ++i) {
+        qcum+=qprobs[i];
+        if (qcum>=qthresh) { qtrunc=i+1; break; }
+    }
+    float qnorm=0.0f;
+    for (int i=0; i<qtrunc; ++i) qnorm+=qprobs[i];
+
+    const uint32_t t=proposals[row];
+    float pt=0.0f, qt=0.0f;
+    for (int i=0; i<ptrunc; ++i) {
+        if ((uint32_t)pi[i]==t) { pt=pprobs[i]/pnorm; break; }
+    }
+    for (int i=0; i<qtrunc; ++i) {
+        if ((uint32_t)qi[i]==t) { qt=qprobs[i]/qnorm; break; }
+    }
+    uint32_t status=2;
+    if (pmax>-1e29f && qmax>-1e29f && pnorm>0.0f && qnorm>0.0f
+        && isfinite(pnorm) && isfinite(qnorm) && t<(uint32_t)vocab) {
+        float ratio=(qt>0.0f) ? (pt/qt) : 0.0f;
+        status=(ratio>=1.0f || uno_uniform(seed,row,0,0)<ratio) ? 1 : 0;
+    }
+    result[2*row]=status; result[2*row+1]=0;
+    if (status!=0) return;
+    // Residual corrective draw: (p−q)+ is nonzero only on the p support
+    // (q-only tokens have p=0 <= q). Gumbel-max over the truncated p support
+    // with per-token q lookup — mirrors uno_verify_logits.
+    float best=-INFINITY;
+    uint32_t pick=(uint32_t)vocab;
+    for (int i=0; i<ptrunc; ++i) {
+        uint32_t id=(uint32_t)pi[i];
+        float qv_at=0.0f;
+        for (int j=0; j<qtrunc; ++j) {
+            if ((uint32_t)qi[j]==id) { qv_at=qprobs[j]/qnorm; break; }
+        }
+        float residual=fmaxf(pprobs[i]/pnorm-qv_at, 0.0f);
+        if (residual>1e-20f) {
+            float u=uno_uniform(seed,row,id,1);
+            float score=logf(residual)-logf(-logf(u));
+            if (score>best || (score==best && id<pick)) { best=score; pick=id; }
+        }
+    }
+    if (pick>=uint32_t(vocab)) result[2*row]=2;
+    else result[2*row+1]=pick;
+}

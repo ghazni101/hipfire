@@ -175,7 +175,7 @@ impl UnoSpeculator {
             gpu.hip.memcpy_dtoh(&mut raw, &batch.picks.buf).map_err(|e| format!("Uno tree picks: {e:?}"))?;
             u32::from_ne_bytes(raw)
         } else {
-            sample_row(gpu, &batch.draft_logits.sub_offset(0, vocab), vocab, temp,
+            sample_row(gpu, &batch.draft_logits.sub_offset(0, vocab), vocab, temp, 1.0, None,
                 &batch.sample_result, &batch.sample_repeat, &mut self.rng)?
         };
         if budget == 1 || is_stop(clean) {
@@ -243,15 +243,36 @@ impl UnoSpeculator {
         let n = budget.saturating_sub(2);
         let vocab = target.config.vocab_size;
         let rows = n + 1;
-        // Filtered (top-k-only) device path: mask draft + verify logits to
-        // their top-K support so the fused dual-softmax kernel computes the
-        // filtered p/q — the upstream `build_sparse_top_k_probs` support.
-        // Greedy ignores the filter (argmax); top-p/min-p-only stay host-side.
+        // Device-resident filters. Greedy ignores the filter (argmax).
+        // top-k-only requests mask draft + verify rows to their top-K support
+        // so the fused dual-softmax kernel computes the filtered p/q (upstream
+        // `build_sparse_top_k_probs` support). top-p requests (optionally with
+        // top_k, min_p=0) use the candidate-gather verifier (`uno_filter_verify`),
+        // which replicates the fused AR sampler's exact law: top-K logit gather
+        // (cap = request top_k else the sampler's 20), softmax at temp, nucleus
+        // truncation at top_p over the descending-order list, renormalization.
+        // min-p-only filtering keeps the host Distribution law (the gather
+        // kernel has no min-p selector).
         let dev_topk = if greedy { None } else {
             (self.request.top_k > 0 && self.request.top_k < vocab
                 && !(self.request.top_p > 0.0 && self.request.top_p < 1.0)
                 && self.request.min_p <= 0.0)
                 .then_some(self.request.top_k.min(1024))
+        };
+        let dev_nucleus = !greedy
+            && self.request.top_p > 0.0
+            && self.request.top_p < 1.0
+            && self.request.min_p <= 0.0;
+        // Sampling law for non-greedy rows: dev_nucleus passes the request
+        // top_p/top_k through to the fused AR sampler (identical law to what
+        // AR decode emits at this request config); every other non-greedy path
+        // keeps the unfiltered draw (`top_k` None → sampler cap 20, top_p 1.0 —
+        // the dev_topk mask already restricted the row's support).
+        let (sample_top_p, sample_top_k) = if dev_nucleus {
+            (self.request.top_p.min(1.0),
+             (self.request.top_k > 0).then_some(self.request.top_k.min(64) as u32))
+        } else {
+            (1.0, None)
         };
         let mut noise = self.draw_noise(n, seed);
         noise.insert(0, seed);
@@ -271,7 +292,8 @@ impl UnoSpeculator {
         } else {
             for row in 0..rows {
                 proposal.push(sample_row(gpu, &batch.draft_logits.sub_offset(row * vocab, vocab),
-                    vocab, temp, &batch.sample_result, &batch.sample_repeat, &mut self.rng)?);
+                    vocab, temp, sample_top_p, sample_top_k, &batch.sample_result,
+                    &batch.sample_repeat, &mut self.rng)?);
             }
         }
         let clean = proposal[0];
@@ -304,9 +326,25 @@ impl UnoSpeculator {
                 gpu.hip.memcpy_htod(&batch.proposals.buf, &bytes).map_err(|e| format!("Uno proposals: {e:?}"))?;
                 // Reserve a fresh request-seeded stream for each verification window.
                 let _ = uniform(&mut self.rng);
-                gpu.uno_verify_logits(&batch.verify_logits, &batch.draft_logits.sub_offset(vocab, n * vocab),
-                    &batch.proposals, &batch.decisions, n, vocab, temp, self.rng)
-                    .map_err(|e| format!("Uno fused verify: {e:?}"))?;
+                if dev_nucleus {
+                    // Candidate-gather verifier: per-row top-K +
+                    // softmax + nucleus truncation, matching the fused AR
+                    // sampler law the proposals were drawn with.
+                    let top_k_req = if self.request.top_k > 0 {
+                        self.request.top_k.min(64) as i32
+                    } else {
+                        20
+                    };
+                    gpu.uno_filter_verify(&batch.verify_logits, &batch.draft_logits.sub_offset(vocab, n * vocab),
+                        &batch.proposals, &batch.decisions, &batch.filter_vals,
+                        &batch.filter_idxs, n, vocab, temp,
+                        sample_top_p, top_k_req, self.rng)
+                        .map_err(|e| format!("Uno filter verify: {e:?}"))?;
+                } else {
+                    gpu.uno_verify_logits(&batch.verify_logits, &batch.draft_logits.sub_offset(vocab, n * vocab),
+                        &batch.proposals, &batch.decisions, n, vocab, temp, self.rng)
+                        .map_err(|e| format!("Uno fused verify: {e:?}"))?;
+                }
                 let mut decisions = vec![0u8; n * 8];
                 gpu.hip.memcpy_dtoh(&mut decisions, &batch.decisions.buf).map_err(|e| format!("Uno decisions: {e:?}"))?;
                 for (row, pair) in decisions.chunks_exact(8).enumerate() {
@@ -322,7 +360,8 @@ impl UnoSpeculator {
             }
             if accepted == n && !is_stop(*emit.last().unwrap()) {
                 emit.push(sample_row(gpu, &batch.verify_logits.sub_offset(n * vocab, vocab),
-                    vocab, temp, &batch.sample_result, &batch.sample_repeat, &mut self.rng)?);
+                    vocab, temp, sample_top_p, sample_top_k, &batch.sample_result,
+                    &batch.sample_repeat, &mut self.rng)?);
             }
         }
         let next = *emit.last().unwrap();
@@ -367,18 +406,20 @@ impl Speculator for UnoSpeculator {
         let filtered = (self.request.top_k > 0 && self.request.top_k < vocab)
             || (self.request.top_p > 0.0 && self.request.top_p < 1.0)
             || self.request.min_p > 0.0;
-        // top-k-only filters are device-resident: step_device masks the draft
-        // and verify logits to their top-K support so the fused kernel computes
-        // the filtered p/q. top-p/min-p-only filtering keeps the host
-        // Distribution law (the fused kernel's full-vocab softmax can't
-        // express a nucleus support without the top-K selection).
-        let dev_filterable = filtered
-            && !(self.request.top_p > 0.0 && self.request.top_p < 1.0)
-            && self.request.min_p <= 0.0;
+        // Filtered requests are device-resident when the filter is
+        // expressible on-device: top-k-only masks rows to their top-K support
+        // (fused dual-softmax over the masked row); top-p (optionally combined
+        // with top_k) uses the candidate-gather verifier that replicates the
+        // fused AR sampler's law. min-p-only filtering keeps the host
+        // Distribution law (the gather kernel has no min-p selector). Greedy
+        // ignores all filters (argmax).
+        let dev_filterable = filtered && self.request.min_p <= 0.0;
+        let dev_topk_only =
+            dev_filterable && !(self.request.top_p > 0.0 && self.request.top_p < 1.0);
+        if self.tree.is_some() && (greedy || !filtered || dev_topk_only) {
+            return self.step_tree(gpu, target, position, seed, budget, temp, greedy);
+        }
         if self.batch.is_some() && (greedy || !filtered || dev_filterable) {
-            if self.tree.is_some() {
-                return self.step_tree(gpu, target, position, seed, budget, temp, greedy);
-            }
             return self.step_device(gpu, target, position, seed, budget, temp, greedy);
         }
         let mut noise = self.draw_noise(n, seed);
@@ -442,11 +483,14 @@ fn argmax_rows(gpu: &mut Gpu, logits: &GpuTensor, picks: &GpuTensor, vocab: usiz
 }
 
 /// One fused GPU draw (softmax + categorical) via the AR decode sampler —
-/// unfiltered only (the caller routes filtered requests to the host law).
+/// the same kernel AR decode uses, so the drawn token matches the request
+/// sampling law exactly (temp + top_p + top_k). `top_p_eff` = 1.0 with
+/// `top_k` = None reproduces the unfiltered legacy draw byte-for-byte.
 pub(crate) fn sample_row(gpu: &mut Gpu, logits: &GpuTensor, vocab: usize, temp: f32,
-    result: &GpuTensor, repeat: &GpuTensor, rng: &mut u32) -> Result<u32, String> {
+    top_p_eff: f32, top_k: Option<u32>, result: &GpuTensor, repeat: &GpuTensor,
+    rng: &mut u32) -> Result<u32, String> {
     let (tok, next) = gpu
-        .sample_top_p_pf(logits, result, repeat, vocab, temp, 1.0, *rng, 0, 1.0, 0.0, 0.0, None, None)
+        .sample_top_p_pf(logits, result, repeat, vocab, temp, top_p_eff, *rng, 0, 1.0, 0.0, 0.0, top_k, None)
         .map_err(|e| format!("Uno sample: {e:?}"))?;
     *rng = next;
     Ok(tok)

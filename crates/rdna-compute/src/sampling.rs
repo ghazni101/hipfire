@@ -81,6 +81,98 @@ pub(crate) fn sample_top_p_parallel_precompile_specs() -> [(&'static str, String
 }
 
 impl Gpu {
+    /// Filtered Uno rejection verification via candidate gather (top-p /
+    /// top-k requests): `uno_filter_gather` per row writes the top-64 logits
+    /// by value for the target (p) and draft (q) rows into `filter_vals` /
+    /// `filter_idxs` (p in the first half, q in the second), then
+    /// `uno_filter_finalize` builds both sampling laws with the fused AR
+    /// sampler's exact arithmetic (softmax at temp, cap at `top_k_req`,
+    /// nucleus-truncate at `top_p`, renormalize) and decides accept/correct.
+    /// Proposals must have been drawn by `sample_top_p_pf` with the same law.
+    /// Output contains U32 pairs [accepted, correction]; accepted=2 is a
+    /// fail-closed numeric error.
+    #[allow(clippy::too_many_arguments)]
+    pub fn uno_filter_verify(&mut self, p: &GpuTensor, q: &GpuTensor,
+        proposals: &GpuTensor, result: &GpuTensor, filter_vals: &GpuTensor,
+        filter_idxs: &GpuTensor, rows: usize, vocab: usize,
+        temperature: f32, top_p: f32, top_k_req: i32, seed: u32) -> HipResult<()> {
+        let elements = rows.checked_mul(vocab).and_then(|n| n.checked_mul(4));
+        let cand_bytes = |n: usize| n.checked_mul(64).and_then(|c| c.checked_mul(4));
+        if rows == 0 || rows > u32::MAX as usize || vocab == 0 || vocab > i32::MAX as usize
+            || !temperature.is_finite() || temperature <= 1e-6
+            || !top_p.is_finite() || !(0.0..=1.0).contains(&top_p)
+            || !(1..=64).contains(&top_k_req)
+            || elements.is_none_or(|bytes| p.buf.size() < bytes || q.buf.size() < bytes)
+            || rows.checked_mul(8).is_none_or(|bytes| result.buf.size() < bytes)
+            || rows.checked_mul(4).is_none_or(|bytes| proposals.buf.size() < bytes)
+            || rows.checked_mul(128).is_none_or(|bytes| filter_vals.buf.size() < bytes)
+            || rows.checked_mul(128).is_none_or(|bytes| filter_idxs.buf.size() < bytes)
+            || cand_bytes(rows).is_none_or(|bytes| filter_vals.buf.size() < bytes)
+            || cand_bytes(rows).is_none_or(|bytes| filter_idxs.buf.size() < bytes)
+            || [p, q, proposals, result, filter_vals, filter_idxs].iter().any(|t| t.dtype != DType::F32) {
+            return Err(HipError::new(0, "invalid Uno filter verifier tensor shape or parameters"));
+        }
+        self.bind_thread()?;
+        self.ensure_kernel("uno_filter_gather", include_str!("../../../kernels/src/uno_verify_logits.hip"), "uno_filter_gather")?;
+        self.ensure_kernel("uno_filter_finalize", include_str!("../../../kernels/src/uno_verify_logits.hip"), "uno_filter_finalize")?;
+        // Gather target rows into the first half, draft rows into the second.
+        let half = rows.checked_mul(64).ok_or_else(|| HipError::new(0, "Uno filter scratch overflow"))?;
+        let pv = filter_vals.sub_offset(0, half);
+        let pi = filter_idxs.sub_offset(0, half);
+        let qv = filter_vals.sub_offset(half, half);
+        let qi = filter_idxs.sub_offset(half, half);
+        for (logits, out_v, out_i) in [(p, &pv, &pi), (q, &qv, &qi)] {
+            let mut lp = logits.buf.as_ptr();
+            let mut ov = out_v.buf.as_ptr();
+            let mut oi = out_i.buf.as_ptr();
+            let mut v = vocab as i32;
+            let mut params = [
+                &mut lp as *mut _ as *mut std::ffi::c_void,
+                &mut ov as *mut _ as *mut std::ffi::c_void,
+                &mut oi as *mut _ as *mut std::ffi::c_void,
+                &mut v as *mut _ as *mut std::ffi::c_void,
+            ];
+            // 128 threads x 64 candidates x (f32 val + i32 idx) = 64 KiB — the
+            // RDNA wave32 group-segment limit (same as the wide sampler
+            // partial); no static smem on top, so the launch fits.
+            const SMEM: u32 = 128 * 64 * 8;
+            self.launch_maybe_blob("uno_filter_gather", [rows as u32, 1, 1], [128, 1, 1], SMEM, &mut params, || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(lp); b.push_ptr(ov); b.push_ptr(oi); b.push_i32(v); b
+            })?;
+        }
+        {
+            let mut pvp = pv.buf.as_ptr(); let mut pip = pi.buf.as_ptr();
+            let mut qvp = qv.buf.as_ptr(); let mut qip = qi.buf.as_ptr();
+            let mut tp = proposals.buf.as_ptr(); let mut out = result.buf.as_ptr();
+            let mut v = vocab as i32;
+            let mut temp = temperature;
+            let mut tp_p = top_p;
+            let mut tk = top_k_req;
+            let mut rng = seed;
+            let mut params = [
+                &mut pvp as *mut _ as *mut std::ffi::c_void,
+                &mut pip as *mut _ as *mut std::ffi::c_void,
+                &mut qvp as *mut _ as *mut std::ffi::c_void,
+                &mut qip as *mut _ as *mut std::ffi::c_void,
+                &mut tp as *mut _ as *mut std::ffi::c_void,
+                &mut out as *mut _ as *mut std::ffi::c_void,
+                &mut v as *mut _ as *mut std::ffi::c_void,
+                &mut temp as *mut _ as *mut std::ffi::c_void,
+                &mut tp_p as *mut _ as *mut std::ffi::c_void,
+                &mut tk as *mut _ as *mut std::ffi::c_void,
+                &mut rng as *mut _ as *mut std::ffi::c_void,
+            ];
+            self.launch_maybe_blob("uno_filter_finalize", [rows as u32, 1, 1], [1, 1, 1], 0, &mut params, || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pvp); b.push_ptr(pip); b.push_ptr(qvp); b.push_ptr(qip);
+                b.push_ptr(tp); b.push_ptr(out);
+                b.push_i32(v); b.push_f32(temp); b.push_f32(tp_p); b.push_i32(tk); b.push_u32(rng); b
+            })?;
+        }
+        Ok(())
+    }
+
     /// Unfiltered Uno rejection verification. Output contains U32 pairs
     /// [accepted, correction]; accepted=2 is a fail-closed numeric error.
     /// Integer buffers use F32 storage, interpreted as raw U32 bytes.
