@@ -100,3 +100,64 @@ extern "C" __global__ void uno_verify_logits(
         else result[2*row+1]=ids[0];
     }
 }
+
+// Per-row logsumexp over temperature-scaled logits (Uno tree candidate
+// masses): out[row] = max/temp + log(sum exp((x-max)/temp)). One block per
+// row, 256 threads, online two-pass (max then sum) over the row.
+extern "C" __global__ void uno_row_lse(
+    const float* __restrict__ logits, float* __restrict__ out,
+    int vocab, float inv_temp) {
+    const int tid=threadIdx.x, row=blockIdx.x;
+    const float* p=logits+size_t(row)*vocab;
+    __shared__ float sm[256], ss[256];
+    float tmax=-INFINITY, tsum=0.0f;
+    for (int i=tid; i<vocab; i+=256) {
+        float v=p[i]*inv_temp;
+        float n=fmaxf(tmax, v);
+        tsum=tsum*expf(tmax-n)+expf(v-n);
+        tmax=n;
+    }
+    sm[tid]=tmax; ss[tid]=tsum;
+    __syncthreads();
+    for (int s=128; s; s>>=1) {
+        if (tid<s) {
+            float n=fmaxf(sm[tid], sm[tid+s]);
+            float a=ss[tid]>0 ? ss[tid]*expf(sm[tid]-n) : 0.0f;
+            float b=ss[tid+s]>0 ? ss[tid+s]*expf(sm[tid+s]-n) : 0.0f;
+            ss[tid]=a+b; sm[tid]=n;
+        }
+        __syncthreads();
+    }
+    if (tid==0) out[row]=sm[0]+logf(ss[0]);
+}
+
+// One masked-argmax round of an iterative top-k: each row block finds its
+// strict-> lowest-index maximum, writes [idx, f32bits(val)] to out[row*2..],
+// and knocks that lane down to -INF so the next round yields the runner-up.
+// Callers loop k rounds on host (k tiny: candidate width of the draft tree).
+extern "C" __global__ void uno_topk_round(
+    float* __restrict__ logits, float* __restrict__ out,
+    int vocab) {
+    const int tid=threadIdx.x, row=blockIdx.x;
+    float* p=logits+size_t(row)*vocab;
+    __shared__ float vm[256];
+    __shared__ int vi[256];
+    float best=-INFINITY; int idx=0;
+    for (int i=tid; i<vocab; i+=256) {
+        float v=p[i];
+        if (v>best) { best=v; idx=i; }
+    }
+    vm[tid]=best; vi[tid]=idx;
+    __syncthreads();
+    for (int s=128; s; s>>=1) {
+        if (tid<s && vm[tid+s]>vm[tid]) {
+            vm[tid]=vm[tid+s]; vi[tid]=vi[tid+s];
+        }
+        __syncthreads();
+    }
+    if (tid==0) {
+        out[2*row]=(float)vi[0];
+        out[2*row+1]=vm[0];
+        p[vi[0]]=-INFINITY;
+    }
+}

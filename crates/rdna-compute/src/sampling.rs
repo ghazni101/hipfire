@@ -115,6 +115,60 @@ impl Gpu {
         })
     }
 
+    /// Per-row logsumexp over temperature-scaled logits (`out[row]`).
+    /// `inv_temp` is the multiplier applied to the logits (1/temp, or 1 for
+    /// greedy tree-mass ordering).
+    pub fn uno_row_lse(&mut self, logits: &GpuTensor, out: &GpuTensor,
+        rows: usize, vocab: usize, inv_temp: f32) -> HipResult<()> {
+        let elements = rows.checked_mul(vocab).and_then(|n| n.checked_mul(4));
+        if rows == 0 || rows > u32::MAX as usize || vocab == 0 || vocab > i32::MAX as usize
+            || !inv_temp.is_finite()
+            || elements.is_none_or(|bytes| logits.buf.size() < bytes)
+            || rows.checked_mul(4).is_none_or(|bytes| out.buf.size() < bytes)
+            || logits.dtype != DType::F32 || out.dtype != DType::F32 {
+            return Err(HipError::new(0, "invalid uno_row_lse tensor shape"));
+        }
+        self.bind_thread()?;
+        self.ensure_kernel("uno_row_lse", include_str!("../../../kernels/src/uno_verify_logits.hip"), "uno_row_lse")?;
+        let mut lp = logits.buf.as_ptr(); let mut op = out.buf.as_ptr();
+        let mut v = vocab as i32; let mut it = inv_temp;
+        let mut params = [
+            &mut lp as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
+            &mut v as *mut _ as *mut c_void, &mut it as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob("uno_row_lse", [rows as u32, 1, 1], [256, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(lp); b.push_ptr(op); b.push_i32(v); b.push_f32(it); b
+        })
+    }
+
+    /// One masked-argmax top-k round over `rows` logits rows: writes
+    /// `[idx, f32bits(value)]` per row into `out` and sets the winning lane
+    /// to -INF in place. Host loops this k times for a k-wide candidate list.
+    /// NOTE: mutates `logits`.
+    pub fn uno_topk_round(&mut self, logits: &GpuTensor, out: &GpuTensor,
+        rows: usize, vocab: usize) -> HipResult<()> {
+        let elements = rows.checked_mul(vocab).and_then(|n| n.checked_mul(4));
+        if rows == 0 || rows > u32::MAX as usize || vocab == 0 || vocab > i32::MAX as usize
+            || elements.is_none_or(|bytes| logits.buf.size() < bytes)
+            || rows.checked_mul(8).is_none_or(|bytes| out.buf.size() < bytes)
+            || logits.dtype != DType::F32 || out.dtype != DType::F32 {
+            return Err(HipError::new(0, "invalid uno_topk_round tensor shape"));
+        }
+        self.bind_thread()?;
+        self.ensure_kernel("uno_topk_round", include_str!("../../../kernels/src/uno_verify_logits.hip"), "uno_topk_round")?;
+        let mut lp = logits.buf.as_ptr(); let mut op = out.buf.as_ptr();
+        let mut v = vocab as i32;
+        let mut params = [
+            &mut lp as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
+            &mut v as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob("uno_topk_round", [rows as u32, 1, 1], [256, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(lp); b.push_ptr(op); b.push_i32(v); b
+        })
+    }
+
     /// Compute max softmax probability on GPU. Downloads 4 bytes instead of vocab×4.
     pub fn max_prob(
         &mut self,

@@ -25,7 +25,8 @@
 
 use hip_bridge::HipResult;
 use hipfire_runtime::llama::{
-    embedding_lookup_dispatch, weight_gemv, ForwardScratch, KvCache, LlamaConfig, LlamaWeights,
+    embedding_lookup_dispatch, weight_gemv, weight_gemm, ForwardScratch, KvCache, LlamaConfig,
+    LlamaWeights,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
 
@@ -401,20 +402,31 @@ pub struct UnoBatchScratch {
     pub pbs: hipfire_runtime::llama::PrefillBatchScratch,
     norm: GpuTensor,
     ax: GpuTensor,
-    delta: GpuTensor,
     hidden: GpuTensor,
     pub(crate) draft_logits: GpuTensor,
     pub(crate) verify_logits: GpuTensor,
     pub(crate) proposals: GpuTensor,
     pub(crate) decisions: GpuTensor,
+    /// Per-row argmax sink (`argmax_f32_batched` writes one i32 per row).
+    pub(crate) picks: GpuTensor,
+    /// `sample_top_p_pf` scratch: result `[2]` + repeat `[1]` (no penalty).
+    pub(crate) sample_result: GpuTensor,
+    pub(crate) sample_repeat: GpuTensor,
+    /// Tree verify: per-row logsumexp, top-k round output, ancestor bias.
+    pub(crate) lse: GpuTensor,
+    pub(crate) topk: GpuTensor,
+    pub(crate) bias: GpuTensor,
 }
 
 impl UnoBatchScratch {
     pub fn new(gpu: &mut Gpu, config: &LlamaConfig, rank: usize, rows: usize, capacity: usize) -> HipResult<Self> {
         let pbs = hipfire_runtime::llama::PrefillBatchScratch::new(gpu, config, rows, capacity)?;
-        let mut tensors = Vec::with_capacity(8);
-        for size in [rows * config.dim, rows * rank, rows * config.hidden_dim.max(config.dim),
-            rows * config.hidden_dim, rows * config.vocab_size, rows * config.vocab_size, rows, rows * 2] {
+        let tree_cols = rows * rows;
+        let mut tensors = Vec::with_capacity(13);
+        for size in [rows * config.dim, rows * rank,
+            rows * config.hidden_dim, rows * config.vocab_size, rows * config.vocab_size, rows, rows * 2,
+            rows, 2, 1,
+            rows, rows * 2 * 8, tree_cols.max(1)] {
             match gpu.alloc_tensor(&[size], DType::F32) {
                 Ok(t) => tensors.push(t),
                 Err(e) => {
@@ -427,28 +439,59 @@ impl UnoBatchScratch {
         let mut tensors = tensors.into_iter();
         Ok(Self {
             pbs, norm: tensors.next().unwrap(), ax: tensors.next().unwrap(),
-            delta: tensors.next().unwrap(), hidden: tensors.next().unwrap(),
+            hidden: tensors.next().unwrap(),
             draft_logits: tensors.next().unwrap(), verify_logits: tensors.next().unwrap(),
             proposals: tensors.next().unwrap(), decisions: tensors.next().unwrap(),
+            picks: tensors.next().unwrap(), sample_result: tensors.next().unwrap(),
+            sample_repeat: tensors.next().unwrap(),
+            lse: tensors.next().unwrap(), topk: tensors.next().unwrap(),
+            bias: tensors.next().unwrap(),
         })
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) {
         self.pbs.free_gpu(gpu);
-        for tensor in [self.norm, self.ax, self.delta, self.hidden, self.draft_logits, self.verify_logits, self.proposals, self.decisions] { let _ = gpu.free_tensor(tensor); }
+        for tensor in [self.norm, self.ax, self.hidden, self.draft_logits, self.verify_logits, self.proposals, self.decisions, self.picks, self.sample_result, self.sample_repeat, self.lse, self.topk, self.bias] { let _ = gpu.free_tensor(tensor); }
     }
 
     fn delta(&self, gpu: &mut Gpu, p: &UnoProj, x: &GpuTensor, y: &GpuTensor, rows: usize) -> HipResult<()> {
-        // Gate row zero out by never launching or adding its delta.
+        // Gate row zero out by never launching or adding its delta. The
+        // A side (M=rank, K up to 12288) needs split-K to cover the GPU;
+        // the B side (M=proj, K=rank) has enough rows for the plain kernel
+        // and lands directly on the base projection (accumulate epilogue):
+        // two GEMV-shaped launches per module, no delta scratch, no add.
         let n = rows - 1;
         if n == 0 { return Ok(()); }
         let x = x.sub_offset(p.k, n * p.k);
         let y = y.sub_offset(p.m, n * p.m);
         let ax = self.ax.sub_offset(0, n * p.rank);
-        let delta = self.delta.sub_offset(0, n * p.m);
-        gpu.gemm_f32_batched(&p.a, &x, &ax, p.rank, p.k, n)?;
-        gpu.gemm_f32_batched(&p.b, &ax, &delta, p.m, p.rank, n)?;
-        gpu.add_inplace_f32(&y, &delta)
+        gpu.gemv_f32_xbatch_splitk(&p.a, &x, &ax, p.rank, p.k, n, 8)?;
+        gpu.gemv_f32_xbatch(&p.b, &ax, &y, p.m, p.rank, n, true)
+    }
+
+    /// Normed, original-basis input for a conditional projection delta. On
+    /// layouts whose `weight_gemm` arm rotates internally (MQ-V2 family) or
+    /// not at all (plain HFQ4/Q8), the chunk's `x_rot_batch` already holds
+    /// the plain normed rows — recompute only for the V1-MQ layouts where
+    /// the chunk pre-rotated it.
+    fn normed_input<'a>(
+        gpu: &mut Gpu,
+        config: &LlamaConfig,
+        weights: &LlamaWeights,
+        pbs: &'a hipfire_runtime::llama::PrefillBatchScratch,
+        norm_buf: &'a GpuTensor,
+        layer: usize,
+        rows: usize,
+        attn: bool,
+    ) -> HipResult<&'a GpuTensor> {
+        let projection = if attn { &weights.layers[layer].wq } else { &weights.layers[layer].w_gate };
+        if matches!(projection.gpu_dtype, DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256 | DType::MFP4G32) {
+            let weight = if attn { &weights.layers[layer].attn_norm } else { &weights.layers[layer].ffn_norm };
+            config.rmsnorm_batch(gpu, &pbs.x_batch, weight, norm_buf, rows)?;
+            Ok(norm_buf)
+        } else {
+            Ok(&pbs.x_rot_batch)
+        }
     }
 }
 
@@ -481,18 +524,18 @@ pub(crate) fn uno_forward_batch_device(
         let ul = &adapter.layers[layer];
         match stage {
             PrefillProjectionStage::Qkv => {
-                c.rmsnorm_batch(gpu, &pbs.x_batch, &w.layers[layer].attn_norm, &batch.norm, rows)?;
-                batch.delta(gpu, &ul.q_proj, &batch.norm, &pbs.fa_q_batch, rows)?;
-                batch.delta(gpu, &ul.k_proj, &batch.norm, &pbs.fa_k_batch, rows)?;
-                batch.delta(gpu, &ul.v_proj, &batch.norm, &pbs.fa_v_batch, rows)?;
+                let normed = UnoBatchScratch::normed_input(gpu, c, w, pbs, &batch.norm, layer, rows, true)?;
+                batch.delta(gpu, &ul.q_proj, normed, &pbs.fa_q_batch, rows)?;
+                batch.delta(gpu, &ul.k_proj, normed, &pbs.fa_k_batch, rows)?;
+                batch.delta(gpu, &ul.v_proj, normed, &pbs.fa_v_batch, rows)?;
             }
             PrefillProjectionStage::AttentionOutput => {
                 batch.delta(gpu, &ul.o_proj, &pbs.fa_attn_out_batch, &pbs.x_batch, rows)?;
             }
             PrefillProjectionStage::GateUp => {
-                c.rmsnorm_batch(gpu, &pbs.x_batch, &w.layers[layer].ffn_norm, &batch.norm, rows)?;
-                batch.delta(gpu, &ul.gate_proj, &batch.norm, &pbs.gate_ffn_batch, rows)?;
-                batch.delta(gpu, &ul.up_proj, &batch.norm, &pbs.up_batch, rows)?;
+                let normed = UnoBatchScratch::normed_input(gpu, c, w, pbs, &batch.norm, layer, rows, false)?;
+                batch.delta(gpu, &ul.gate_proj, normed, &pbs.gate_ffn_batch, rows)?;
+                batch.delta(gpu, &ul.up_proj, normed, &pbs.up_batch, rows)?;
             }
             PrefillProjectionStage::Down => {
                 let size = rows * c.hidden_dim;
@@ -505,11 +548,355 @@ pub(crate) fn uno_forward_batch_device(
     };
     forward_prefill_adapter_batch(gpu, weights, config, tokens, pos, kv,
         scratch, &batch.pbs, if uno.is_some() { Some(&mut hook) } else { None })?;
-    for row in 0..tokens.len() {
-        let x = batch.pbs.x_batch.sub_offset(row * config.dim, config.dim);
-        config.rmsnorm(gpu, &x, &weights.output_norm, &scratch.tmp)?;
-        let logits = output.sub_offset(row * config.vocab_size, config.vocab_size);
-        weight_gemv(gpu, &weights.output, &scratch.tmp, &logits)?;
+    // Batched output head: one norm + one batched GEMM reads the lm_head
+    // weights ONCE for all rows (the per-row GEMV loop re-read them per row —
+    // 8 full lm_head passes per window at block_len 4).
+    let rows = tokens.len();
+    let x_rows = batch.pbs.x_batch.sub_offset(0, rows * config.dim);
+    config.rmsnorm_batch(gpu, &x_rows, &weights.output_norm, &batch.norm, rows)?;
+    weight_gemm(
+        gpu,
+        &weights.output,
+        &batch.norm,
+        &output.sub_offset(0, rows * config.vocab_size),
+        rows,
+    )?;
+    Ok(())
+}
+
+// ── Ψ-Spec tree verification ────────────────────────────────────────────────
+// Port of ifm-ai/uno nano_vllm_uno/engine/draft_tree.py (best-first
+// prefix-closed tree over per-depth draft top-k candidates) plus the
+// tree-attention verify forward on hipfire's existing TreeMaskRef machinery
+// and the accepted-path KV compaction (upstream compact_tree_kv).
+
+/// One draft candidate: token id and temperature-scaled log-prob.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct TreeCandidate {
+    pub token: u32,
+    pub log_prob: f64,
+}
+
+struct TreeNode {
+    token: u32,
+    depth: i32,
+    parent: i32,
+    log_mass: f64,
+    children: std::collections::HashMap<u32, usize>,
+}
+
+/// A built draft tree in parent-before-child (root-first) order.
+pub(crate) struct DraftTree {
+    pub tokens: Vec<u32>,
+    pub parents: Vec<i32>,
+    pub depths: Vec<i32>,
+}
+
+/// Fixed-budget best-first tree: expose each built node's depth candidates,
+/// always grow the highest accumulated log-mass candidate (ties: lower depth,
+/// lower rank, lower token id, lower parent — the upstream deterministic
+/// ordering). The root (the already-committed clean token) is node 0.
+pub(crate) fn build_best_first_tree(
+    root: u32,
+    depth_candidates: &[Vec<TreeCandidate>],
+    max_nodes: usize,
+) -> DraftTree {
+    use std::cmp::{Ordering, Reverse};
+    let mut nodes = vec![TreeNode {
+        token: root,
+        depth: 0,
+        parent: -1,
+        log_mass: 0.0,
+        children: Default::default(),
+    }];
+    #[derive(PartialEq)]
+    struct Cand {
+        neg_mass: f64,
+        depth: i32,
+        rank: usize,
+        token: u32,
+        parent: usize,
+    }
+    impl Eq for Cand {}
+    impl Ord for Cand {
+        fn cmp(&self, other: &Self) -> Ordering {
+            self.neg_mass
+                .total_cmp(&other.neg_mass)
+                .then(self.depth.cmp(&other.depth))
+                .then(self.rank.cmp(&other.rank))
+                .then(self.token.cmp(&other.token))
+                .then(self.parent.cmp(&other.parent))
+        }
+    }
+    impl PartialOrd for Cand {
+        fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+            Some(self.cmp(other))
+        }
+    }
+    let mut heap: std::collections::BinaryHeap<Reverse<Cand>> = Default::default();
+
+    fn expose(
+        nodes: &[TreeNode],
+        depth_candidates: &[Vec<TreeCandidate>],
+        heap: &mut std::collections::BinaryHeap<Reverse<Cand>>,
+        parent_index: usize,
+    ) {
+        let parent_node = &nodes[parent_index];
+        let position = parent_node.depth as usize;
+        if position >= depth_candidates.len() {
+            return;
+        }
+        for (rank, cand) in depth_candidates[position].iter().enumerate() {
+            if parent_node.children.contains_key(&cand.token) {
+                continue;
+            }
+            heap.push(Reverse(Cand {
+                neg_mass: -(parent_node.log_mass + cand.log_prob),
+                depth: parent_node.depth + 1,
+                rank,
+                token: cand.token,
+                parent: parent_index,
+            }));
+        }
+    }
+
+    expose(&nodes, depth_candidates, &mut heap, 0);
+    while nodes.len() < max_nodes {
+        let Some(Reverse(cand)) = heap.pop() else { break };
+        if nodes[cand.parent].children.contains_key(&cand.token) {
+            continue;
+        }
+        let index = nodes.len();
+        nodes[cand.parent].children.insert(cand.token, index);
+        nodes.push(TreeNode {
+            token: cand.token,
+            depth: cand.depth,
+            parent: cand.parent as i32,
+            log_mass: -cand.neg_mass,
+            children: Default::default(),
+        });
+        expose(&nodes, depth_candidates, &mut heap, index);
+    }
+
+    DraftTree {
+        tokens: nodes.iter().map(|n| n.token).collect(),
+        parents: nodes.iter().map(|n| n.parent).collect(),
+        depths: nodes.iter().map(|n| n.depth).collect(),
+    }
+}
+
+/// Greedy-or-sampled traversal of the target picks through the draft tree
+/// (port of upstream `walk_tree`): at the current node take its target pick;
+/// commit it; descend into the child carrying that token while one exists and
+/// depth remains. Returns the committed tokens and the matched node path
+/// (root first) whose KV is base-correct for the committed prefix.
+pub(crate) fn walk_draft_tree(
+    tree: &DraftTree,
+    picks: &[u32],
+    max_depth: i32,
+    is_stop: impl Fn(u32) -> bool,
+) -> (Vec<u32>, Vec<usize>) {
+    let mut committed = Vec::new();
+    let mut path = vec![0usize];
+    let mut current = 0usize;
+    let mut depth = 0i32;
+    loop {
+        let pick = picks[current];
+        committed.push(pick);
+        if is_stop(pick) || depth >= max_depth {
+            break;
+        }
+        let child = (1..tree.tokens.len()).find(|&i| {
+            tree.parents[i] == current as i32 && tree.tokens[i] == pick
+        });
+        match child {
+            Some(c) => {
+                path.push(c);
+                current = c;
+                depth += 1;
+            }
+            None => break,
+        }
+    }
+    (committed, path)
+}
+
+/// Gather the accepted path's per-slot KV rows into the contiguous committed
+/// positions (upstream `compact_tree_kv`). Path nodes are parent-before-child,
+/// so every source slot index is ≥ its destination — the in-place left shift
+/// below never overwrites a row that is still needed.
+pub(crate) fn compact_tree_kv(
+    gpu: &mut Gpu,
+    kv: &hipfire_runtime::llama::KvCache,
+    path: &[usize],
+    position: usize,
+) -> HipResult<()> {
+    debug_assert!(kv.quant_q8, "tree KV compaction requires the Q8_0 layout");
+    let blocks_per_token = kv.n_kv_heads * (kv.head_dim / 32);
+    let row_bytes = blocks_per_token * 34; // Q8_0: 32 int8 + f16 scale per block
+    for (j, &node) in path.iter().enumerate().skip(1) {
+        let dst = (position + 1 + j) * row_bytes;
+        let src = (position + 1 + node) * row_bytes;
+        if dst == src {
+            continue;
+        }
+        for layer in 0..kv.k_gpu.len() {
+            gpu.hip.memcpy_dtod_at(&kv.k_gpu[layer].buf, dst, &kv.k_gpu[layer].buf, src, row_bytes)?;
+            gpu.hip.memcpy_dtod_at(&kv.v_gpu[layer].buf, dst, &kv.v_gpu[layer].buf, src, row_bytes)?;
+        }
     }
     Ok(())
+}
+
+/// Tree verify forward + per-node picks: one tree-attention batched forward
+/// (KV writes land on contiguous slots `position+1 ..`, RoPE uses depth
+/// positions), then one batched lm_head over all node rows and a pick per
+/// node (GPU argmax, or a fused GPU sample at temp>0). Returns the picks.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn uno_tree_verify_picks(
+    gpu: &mut Gpu,
+    weights: &LlamaWeights,
+    config: &LlamaConfig,
+    tree: &DraftTree,
+    position: usize,
+    kv: &mut KvCache,
+    scratch: &ForwardScratch,
+    batch: &UnoBatchScratch,
+    greedy: bool,
+    temp: f32,
+    rng: &mut u32,
+) -> HipResult<Vec<u32>> {
+    let nodes = tree.tokens.len();
+    // Ancestor bias: row i sees itself and its tree ancestors (0.0); every
+    // other in-block column is masked off (-INF). Prompt keys before the
+    // block stay fully visible in the attention kernel.
+    let mut bias = vec![f32::NEG_INFINITY; nodes * nodes];
+    for i in 0..nodes {
+        bias[i * nodes + i] = 0.0;
+        let mut anc = tree.parents[i];
+        while anc >= 0 {
+            bias[i * nodes + anc as usize] = 0.0;
+            anc = tree.parents[anc as usize];
+        }
+    }
+    let bytes: Vec<u8> = bias.iter().flat_map(|v| v.to_ne_bytes()).collect();
+    gpu.hip.memcpy_htod(&batch.bias.buf, &bytes)?;
+
+    let depth_positions: Vec<i32> =
+        tree.depths.iter().map(|&d| (position as i32 + 1 + d)).collect();
+
+    hipfire_runtime::llama::forward_prefill_batch_tree(
+        gpu,
+        weights,
+        config,
+        &tree.tokens,
+        position + 1,
+        &batch.bias,
+        &depth_positions,
+        kv,
+        scratch,
+        &batch.pbs,
+        None,
+    )?;
+
+    // Batched output head over all node rows → verify_logits [nodes × vocab].
+    let vocab = config.vocab_size;
+    let x_rows = batch.pbs.x_batch.sub_offset(0, nodes * config.dim);
+    config.rmsnorm_batch(gpu, &x_rows, &weights.output_norm, &batch.norm, nodes)?;
+    weight_gemm(
+        gpu,
+        &weights.output,
+        &batch.norm,
+        &batch.verify_logits.sub_offset(0, nodes * vocab),
+        nodes,
+    )?;
+
+    if greedy {
+        gpu.argmax_f32_batched(&batch.verify_logits, &batch.picks, vocab, nodes)?;
+        let mut raw = vec![0u8; nodes * 4];
+        gpu.hip.memcpy_dtoh(&mut raw, &batch.picks.buf)?;
+        Ok(raw
+            .chunks_exact(4)
+            .map(|b| u32::from_ne_bytes(b.try_into().unwrap()))
+            .collect())
+    } else {
+        let mut picks = Vec::with_capacity(nodes);
+        for row in 0..nodes {
+            let tok = crate::uno_spec::sample_row(
+                gpu,
+                &batch.verify_logits.sub_offset(row * vocab, vocab),
+                vocab,
+                temp,
+                &batch.sample_result,
+                &batch.sample_repeat,
+                rng,
+            ).map_err(|e| hip_bridge::HipError::new(0, &e))?;
+            picks.push(tok);
+        }
+        Ok(picks)
+    }
+}
+
+#[cfg(test)]
+mod uno_tree_tests {
+    use super::*;
+
+    fn cands(spec: &[(u32, f64)]) -> Vec<TreeCandidate> {
+        spec.iter().map(|&(t, p)| TreeCandidate { token: t, log_prob: p }).collect()
+    }
+
+    #[test]
+    fn best_first_tree_is_prefix_closed_budgeted_and_deterministic() {
+        // Depth 1: A (logp -0.1) beats B (-0.5); depth 2: C (-0.2), D (-0.3).
+        // Budget 4 → root + A + (A,C) + (A,D): the best-first order grows the
+        // highest-mass chain first and never emits an orphan.
+        let depths = vec![
+            cands(&[(100, -0.1), (200, -0.5)]),
+            cands(&[(300, -0.2), (400, -0.3)]),
+        ];
+        let tree = build_best_first_tree(7, &depths, 4);
+        assert_eq!(tree.tokens, vec![7, 100, 300, 400]);
+        assert_eq!(tree.parents, vec![-1, 0, 1, 1]);
+        assert_eq!(tree.depths, vec![0, 1, 2, 2]);
+        // Determinism: same inputs, same tree.
+        let again = build_best_first_tree(7, &depths, 4);
+        assert_eq!(again.tokens, tree.tokens);
+        // Budget 1 → root only.
+        let root_only = build_best_first_tree(7, &depths, 1);
+        assert_eq!(root_only.tokens, vec![7]);
+        // A second root child is preferred over a depth-2 grandchild when its
+        // mass wins: B(-0.5) vs (A,C) mass -0.3 → after root+A, next pop is
+        // (A,C) at -0.3, then B at -0.5, then (A,D) at -0.4... order check:
+        let tree3 = build_best_first_tree(7, &depths, 5);
+        assert_eq!(tree3.tokens, vec![7, 100, 300, 400, 200]);
+        assert_eq!(tree3.parents, vec![-1, 0, 1, 1, 0]);
+    }
+
+    #[test]
+    fn walk_commits_the_picked_path_and_stops_at_mismatch() {
+        // Tree: root 7 → {100 (node 1), 200 (node 4)}; 100 → {300 (2), 400 (3)}.
+        let tree = DraftTree {
+            tokens: vec![7, 100, 300, 400, 200],
+            parents: vec![-1, 0, 1, 1, 0],
+            depths: vec![0, 1, 2, 2, 1],
+        };
+        // Production supplies one pick per node. Root pick 100 descends; the
+        // depth-1 pick 300 descends again; the depth-2 pick 999 has no child
+        // so it is committed as the correction and the walk stops.
+        let picks = [100, 300, 999, 400, 200];
+        let (committed, path) = walk_draft_tree(&tree, &picks, 3, |t| t == 1);
+        assert_eq!(committed, vec![100, 300, 999]);
+        assert_eq!(path, vec![0, 1, 2]);
+        // A stop pick halts immediately after committing.
+        let picks = [100, 1, 999, 400, 200];
+        let (committed, path) = walk_draft_tree(&tree, &picks, 3, |t| t == 1);
+        assert_eq!(committed, vec![100, 1]);
+        assert_eq!(path, vec![0, 1]);
+        // Depth cap 1: the root pick descends once; the depth-1 node's pick
+        // commits, then the budget is spent.
+        let picks = [100, 300, 999, 400, 200];
+        let (committed, path) = walk_draft_tree(&tree, &picks, 1, |t| t == 1);
+        assert_eq!(committed, vec![100, 300]);
+        assert_eq!(path, vec![0, 1]);
+    }
 }

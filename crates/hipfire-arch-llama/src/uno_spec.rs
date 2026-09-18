@@ -5,7 +5,7 @@
 //! Reference: https://github.com/ifm-ai/uno (Apache-2.0).
 use crate::{uno::{uno_forward_row, uno_forward_batch, uno_forward_batch_device, UnoAdapter, UnoScratch, UnoBatchScratch}, LlamaBundle};
 use hipfire_runtime::{llama, spec::{request_rng_state, PrefillOutcome, SpecAdvance, SpecGrammar, SpecRequestConfig, SpecStep, SpecTarget, Speculator}};
-use rdna_compute::Gpu;
+use rdna_compute::{Gpu, GpuTensor};
 
 pub struct UnoSpeculator {
     adapter: UnoAdapter,
@@ -15,6 +15,9 @@ pub struct UnoSpeculator {
     noise_state: u64,
     request: SpecRequestConfig,
     rng: u32,
+    /// Ψ-Spec tree verify config: (max tree nodes incl. root, candidate top-k
+    /// per depth). `None` = linear chain windows.
+    tree: Option<(usize, usize)>,
 }
 
 impl UnoSpeculator {
@@ -23,18 +26,42 @@ impl UnoSpeculator {
         if c.dim != 4096 || c.n_layers != 36 || c.n_heads != 32 || c.n_kv_heads != 8 || c.head_dim != 128 || c.norm_groups != 4 || c.vocab_size != 250624 {
             return Err("Uno requires the K2-Horizon-7B target".into());
         }
-        let adapter = UnoAdapter::open(dir, c, gpu, 4, 1, 250623)?;
+        // Diffusion block length L (window = L rows: seed + L-1 noise). The
+        // reference implementation defaults to 8; 4 was the bring-up value.
+        // Tunable because the window arithmetic dominates: two full forwards
+        // amortize over up to L+1 emitted tokens.
+        let block_len = hipfire_config::developer_var("HIPFIRE_UNO_BLOCK")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|b| b.clamp(2, 8))
+            .unwrap_or(4);
+        // Ψ-Spec tree verify (upstream "tree sampler for high per-request
+        // throughput"): HIPFIRE_UNO_TREE = max tree nodes incl. root (0 =
+        // linear chain), HIPFIRE_UNO_TREE_K = candidates exposed per depth.
+        let tree_nodes = hipfire_config::developer_var("HIPFIRE_UNO_TREE")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|n| n.clamp(0, 64))
+            .unwrap_or(0);
+        let tree_top_k = hipfire_config::developer_var("HIPFIRE_UNO_TREE_K")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .map(|k| k.clamp(1, 32))
+            .unwrap_or(8);
+        let tree = (tree_nodes >= 2).then_some((tree_nodes, tree_top_k));
+        let batch_rows = tree.map_or(block_len, |(nodes, _)| nodes.max(block_len));
+        let adapter = UnoAdapter::open(dir, c, gpu, block_len, 1, 250623)?;
         let scratch = match UnoScratch::new(gpu, c) {
             Ok(s) => s,
             Err(e) => { adapter.free_gpu(gpu); return Err(format!("Uno scratch: {e:?}")); }
         };
         let batch = if gpu.arch == "gfx1101" && target.kv.quant_q8 {
-            match UnoBatchScratch::new(gpu, c, adapter.rank, adapter.block_len, target.kv.physical_cap) {
+            match UnoBatchScratch::new(gpu, c, adapter.rank, batch_rows, target.kv.physical_cap) {
                 Ok(batch) => Some(batch),
                 Err(e) => { scratch.free_gpu(gpu); adapter.free_gpu(gpu); return Err(format!("Uno batch scratch: {e:?}")); }
             }
         } else { None };
-        Ok(Box::new(Self { adapter, scratch, batch, capacity, noise_state: 42, request: SpecRequestConfig::default(), rng: 0x1357_9BDF }))
+        Ok(Box::new(Self { adapter, scratch, batch, capacity, noise_state: 42, request: SpecRequestConfig::default(), rng: 0x1357_9BDF, tree }))
     }
 
     fn forward(&mut self, gpu: &mut Gpu, target: &mut LlamaBundle, tokens: &[u32], pos: usize, gated: bool) -> Result<Vec<f32>, String> {
@@ -61,6 +88,191 @@ impl UnoSpeculator {
     fn sample_target(&mut self, gpu: &mut Gpu, target: &LlamaBundle) -> Result<u32, String> {
         let logits = gpu.download_f32(&target.scratch.logits).map_err(|e| format!("Uno prefill logits: {e:?}"))?;
         Ok(Distribution::from_logits(&logits, self.request)?.sample(&mut self.rng))
+    }
+
+    /// Draft noise rows. The reference implementation defaults to
+    /// `random_uniform`: tokens sampled from [noise_low, noise_high) — the
+    /// range the conditional LoRA was trained on (see upstream noise.py
+    /// `_noise_bounds` / `build_draft_batch`). Constant `noise_high` rows are
+    /// the upstream `mask` mode, a non-default choice that is
+    /// out-of-distribution for the adapter and collapses deep-row acceptance.
+    fn draw_noise(&mut self, n: usize) -> Vec<u32> {
+        let low = self.adapter.noise_low;
+        let span = (self.adapter.noise_high - low) as f64;
+        (0..n)
+            .map(|_| {
+                let u = uniform(&mut self.rng);
+                low + (u * span) as u32
+            })
+            .collect()
+    }
+
+    /// Ψ-Spec tree window (upstream tree sampler): draft once, grow a
+    /// best-first candidate tree from the per-depth draft top-k, verify the
+    /// whole tree in ONE tree-attention forward, walk the target picks
+    /// through it, and compact the accepted path's KV into the committed
+    /// slots. Lossless by the same per-position argument as upstream: every
+    /// committed token is the target's own draw at its prefix.
+    fn step_tree(&mut self, gpu: &mut Gpu, target: &mut LlamaBundle, position: usize, seed: u32, budget: usize, temp: f32, greedy: bool) -> Result<SpecStep, String> {
+        let (max_nodes, top_k) = self.tree.ok_or("Uno tree config missing")?;
+        let vocab = target.config.vocab_size;
+        let n = budget.saturating_sub(2).min(max_nodes.saturating_sub(1));
+        let mut noise = self.draw_noise(n);
+        noise.insert(0, seed);
+        let batch = self.batch.as_ref().ok_or("Uno batch scratch missing")?;
+
+        // DRAFT: conditional-LoRA forward over [seed, noise...] — logits stay
+        // on device in batch.draft_logits.
+        uno_forward_batch_device(gpu, &target.weights, &target.config, Some(&self.adapter),
+            &noise, position, &mut target.kv, &target.scratch, batch, &batch.draft_logits)
+            .map_err(|e| format!("Uno draft forward: {e:?}"))?;
+        let rows = n + 1;
+        let inv_temp = if greedy { 1.0 } else { 1.0 / temp };
+
+        // Root token: the target's own draw after the seed.
+        if greedy {
+            gpu.argmax_f32_batched(&batch.draft_logits, &batch.picks, vocab, rows)
+                .map_err(|e| format!("Uno tree argmax: {e:?}"))?;
+        }
+        let clean = if greedy {
+            let mut raw = [0u8; 4];
+            gpu.hip.memcpy_dtoh(&mut raw, &batch.picks.buf).map_err(|e| format!("Uno tree picks: {e:?}"))?;
+            u32::from_ne_bytes(raw)
+        } else {
+            sample_row(gpu, &batch.draft_logits.sub_offset(0, vocab), vocab, temp,
+                &batch.sample_result, &batch.sample_repeat, &mut self.rng)?
+        };
+        if budget == 1 || is_stop(clean) {
+            return Ok(SpecStep::new([clean], clean, 0, 0));
+        }
+
+        // Per-depth candidate lists: logsumexp then top_k masked-argmax
+        // rounds over the draft rows (row d carries depth d; row 0 is the
+        // seed row and is skipped). Mutates draft_logits — the tree path does
+        // not reuse it.
+        gpu.uno_row_lse(&batch.draft_logits, &batch.lse, rows, vocab, inv_temp)
+            .map_err(|e| format!("Uno tree lse: {e:?}"))?;
+        let mut lse_bytes = vec![0u8; rows * 4];
+        gpu.hip.memcpy_dtoh(&mut lse_bytes, &batch.lse.buf).map_err(|e| format!("Uno tree lse: {e:?}"))?;
+        let lse: Vec<f32> = lse_bytes.chunks_exact(4).map(|b| f32::from_ne_bytes(b.try_into().unwrap())).collect();
+        // n depth lists: draft row d (1..=n) carries the depth-d candidates.
+        let mut depth_candidates: Vec<Vec<crate::uno::TreeCandidate>> =
+            (0..n).map(|_| Vec::with_capacity(top_k)).collect();
+        let mut round = vec![0u8; rows * 8];
+        for _ in 0..top_k {
+            gpu.uno_topk_round(&batch.draft_logits, &batch.topk, rows, vocab)
+                .map_err(|e| format!("Uno tree topk: {e:?}"))?;
+            gpu.hip.memcpy_dtoh(&mut round, &batch.topk.buf).map_err(|e| format!("Uno tree topk: {e:?}"))?;
+            // Buffer slot = draft row (block id); the embedded f32 is the
+            // row's argmax token id (exact below 2^24) with its logit value.
+            for (row, chunk) in round.chunks_exact(8).enumerate() {
+                let token = f32::from_ne_bytes(chunk[0..4].try_into().unwrap()) as usize;
+                let val = f32::from_ne_bytes(chunk[4..8].try_into().unwrap());
+                if row == 0 || row >= rows || (row - 1) >= depth_candidates.len() {
+                    continue;
+                }
+                depth_candidates[row - 1].push(crate::uno::TreeCandidate {
+                    token: token as u32,
+                    log_prob: f64::from(val) * f64::from(inv_temp) - f64::from(lse[row]),
+                });
+            }
+        }
+
+        let tree = crate::uno::build_best_first_tree(clean, &depth_candidates, max_nodes);
+        if tree.tokens.len() < 2 {
+            return Ok(SpecStep::new([clean], clean, 0, 0));
+        }
+        let picks = crate::uno::uno_tree_verify_picks(
+            gpu, &target.weights, &target.config, &tree, position,
+            &mut target.kv, &target.scratch, batch, greedy, temp, &mut self.rng,
+        ).map_err(|e| format!("Uno tree verify: {e:?}"))?;
+        let (committed, path) = crate::uno::walk_draft_tree(&tree, &picks, (n) as i32, is_stop);
+        crate::uno::compact_tree_kv(gpu, &target.kv, &path, position)
+            .map_err(|e| format!("Uno tree compact: {e:?}"))?;
+        // The walk's picks are the tokens GENERATED after the root; the root
+        // (clean) itself is committed too and its KV sits at position+1, so
+        // it must lead the emit or every subsequent position drifts by one.
+        let mut emit = Vec::with_capacity(committed.len() + 1);
+        emit.push(clean);
+        emit.extend_from_slice(&committed);
+        let next = *emit.last().unwrap();
+        Ok(SpecStep::new(emit, next, tree.tokens.len() - 1, path.len() - 1))
+    }
+
+    /// Batch-scratch fast path: both forwards leave their logits on device;
+    /// only token ids (and the fused verifier's 8 B/row decisions) cross to
+    /// the host. Mirrors the reference implementation's device-resident
+    /// sampling/verify (ifm-ai/uno two_pass_decoding.py).
+    fn step_device(&mut self, gpu: &mut Gpu, target: &mut LlamaBundle, position: usize, seed: u32, budget: usize, temp: f32, greedy: bool) -> Result<SpecStep, String> {
+        let n = budget.saturating_sub(2);
+        let vocab = target.config.vocab_size;
+        let rows = n + 1;
+        let mut noise = self.draw_noise(n);
+        noise.insert(0, seed);
+        let batch = self.batch.as_ref().ok_or("Uno batch scratch missing")?;
+        // DRAFT: conditional-LoRA forward, logits stay in batch.draft_logits.
+        uno_forward_batch_device(gpu, &target.weights, &target.config, Some(&self.adapter),
+            &noise, position, &mut target.kv, &target.scratch, batch, &batch.draft_logits)
+            .map_err(|e| format!("Uno draft forward: {e:?}"))?;
+        let mut proposal: Vec<u32> = Vec::with_capacity(rows);
+        if greedy {
+            let picks = argmax_rows(gpu, &batch.draft_logits, &batch.picks, vocab, rows)?;
+            proposal.extend_from_slice(&picks);
+        } else {
+            for row in 0..rows {
+                proposal.push(sample_row(gpu, &batch.draft_logits.sub_offset(row * vocab, vocab),
+                    vocab, temp, &batch.sample_result, &batch.sample_repeat, &mut self.rng)?);
+            }
+        }
+        let clean = proposal[0];
+        if budget == 1 || is_stop(clean) { return Ok(SpecStep::new([clean], clean, 0, 0)); }
+        // VERIFY: base-only forward, logits stay in batch.verify_logits.
+        uno_forward_batch_device(gpu, &target.weights, &target.config, None,
+            &proposal, position + 1, &mut target.kv, &target.scratch, batch, &batch.verify_logits)
+            .map_err(|e| format!("Uno verify forward: {e:?}"))?;
+        let mut emit = Vec::with_capacity(rows + 1);
+        emit.push(clean);
+        let mut accepted = 0;
+        if greedy {
+            let picks = argmax_rows(gpu, &batch.verify_logits, &batch.picks, vocab, rows)?;
+            for row in 0..n {
+                emit.push(picks[row]);
+                if picks[row] != proposal[row + 1] { break; }
+                accepted += 1;
+                if is_stop(picks[row]) { break; }
+            }
+            if accepted == n && !is_stop(*emit.last().unwrap()) {
+                emit.push(picks[n]);
+            }
+        } else {
+            if n > 0 {
+                let bytes: Vec<u8> = proposal[1..].iter().flat_map(|t| t.to_ne_bytes()).collect();
+                gpu.hip.memcpy_htod(&batch.proposals.buf, &bytes).map_err(|e| format!("Uno proposals: {e:?}"))?;
+                // Reserve a fresh request-seeded stream for each verification window.
+                let _ = uniform(&mut self.rng);
+                gpu.uno_verify_logits(&batch.verify_logits, &batch.draft_logits.sub_offset(vocab, n * vocab),
+                    &batch.proposals, &batch.decisions, n, vocab, temp, self.rng)
+                    .map_err(|e| format!("Uno fused verify: {e:?}"))?;
+                let mut decisions = vec![0u8; n * 8];
+                gpu.hip.memcpy_dtoh(&mut decisions, &batch.decisions.buf).map_err(|e| format!("Uno decisions: {e:?}"))?;
+                for (row, pair) in decisions.chunks_exact(8).enumerate() {
+                    let status = u32::from_ne_bytes(pair[..4].try_into().unwrap());
+                    let correction = u32::from_ne_bytes(pair[4..].try_into().unwrap());
+                    match status {
+                        1 => { emit.push(proposal[row + 1]); accepted += 1; }
+                        0 if (correction as usize) < vocab => { emit.push(correction); break; }
+                        _ => return Err("Uno fused verifier rejected invalid logits or residual mass".into()),
+                    }
+                    if is_stop(*emit.last().unwrap()) { break; }
+                }
+            }
+            if accepted == n && !is_stop(*emit.last().unwrap()) {
+                emit.push(sample_row(gpu, &batch.verify_logits.sub_offset(n * vocab, vocab),
+                    vocab, temp, &batch.sample_result, &batch.sample_repeat, &mut self.rng)?);
+            }
+        }
+        let next = *emit.last().unwrap();
+        Ok(SpecStep::new(emit, next, n, accepted))
     }
 }
 
@@ -91,14 +303,24 @@ impl Speculator for UnoSpeculator {
         let target = target.as_any_mut().downcast_mut::<LlamaBundle>().ok_or("Uno target is not LlamaBundle")?;
         if target.kv.compact_offset != 0 { return Err("Uno does not support compacted KV".into()); }
         let n = budget.saturating_sub(2);
-        let noise: Vec<u32> = std::iter::once(seed)
-            .chain(std::iter::repeat(self.adapter.noise_high).take(n))
-            .collect();
         let vocab = target.config.vocab_size;
-        let fused = self.batch.is_some() && temp.is_finite() && temp > 1e-6
-            && (self.request.top_k == 0 || self.request.top_k >= vocab)
-            && !(self.request.top_p > 0.0 && self.request.top_p < 1.0)
-            && self.request.min_p <= 0.0;
+        // GPU-resident fast path: greedy verify via batched GPU argmax (16 B
+        // D2H per pass) and unfiltered temp>0 via the fused dual-softmax
+        // kernel + `sample_top_p_pf` proposals — full logits never leave the
+        // device. Filtered stochastic requests keep the host Distribution
+        // law (the fused kernel computes an unfiltered softmax q).
+        let greedy = !temp.is_finite() || temp <= 1e-6;
+        let filtered = (self.request.top_k > 0 && self.request.top_k < vocab)
+            || (self.request.top_p > 0.0 && self.request.top_p < 1.0)
+            || self.request.min_p > 0.0;
+        if self.batch.is_some() && (greedy || !filtered) {
+            if self.tree.is_some() {
+                return self.step_tree(gpu, target, position, seed, budget, temp, greedy);
+            }
+            return self.step_device(gpu, target, position, seed, budget, temp, greedy);
+        }
+        let mut noise = self.draw_noise(n);
+        noise.insert(0, seed);
         let draft_logits = self.forward(gpu, target, &noise, position, true)?;
         let clean = Distribution::from_logits(&draft_logits[..vocab], self.request)?.sample(&mut self.rng);
         if budget == 1 || is_stop(clean) { return Ok(SpecStep::new([clean], clean, 0, 0)); }
@@ -108,44 +330,7 @@ impl Speculator for UnoSpeculator {
         for row in draft_logits.chunks_exact(vocab).skip(1) {
             let q = Distribution::from_logits(row, self.request)?;
             proposal.push(q.sample(&mut self.rng));
-            if !fused { distributions.push(q); }
-        }
-        if fused {
-            let batch = self.batch.as_ref().unwrap();
-            uno_forward_batch_device(gpu, &target.weights, &target.config, None,
-                &proposal, position + 1, &mut target.kv, &target.scratch, batch,
-                &batch.verify_logits).map_err(|e| format!("Uno verify forward: {e:?}"))?;
-            let mut emit = Vec::with_capacity(budget);
-            emit.push(clean);
-            let mut accepted = 0;
-            if n > 0 {
-                let bytes: Vec<u8> = proposal[1..].iter().flat_map(|t| t.to_ne_bytes()).collect();
-                gpu.hip.memcpy_htod(&batch.proposals.buf, &bytes).map_err(|e| format!("Uno proposals: {e:?}"))?;
-                // Reserve a fresh request-seeded stream for each verification window.
-                let _ = uniform(&mut self.rng);
-                gpu.uno_verify_logits(&batch.verify_logits, &batch.draft_logits.sub_offset(vocab, n * vocab),
-                    &batch.proposals, &batch.decisions, n, vocab, temp, self.rng)
-                    .map_err(|e| format!("Uno fused verify: {e:?}"))?;
-                let mut decisions = vec![0u8; n * 8];
-                gpu.hip.memcpy_dtoh(&mut decisions, &batch.decisions.buf).map_err(|e| format!("Uno decisions: {e:?}"))?;
-                for (row, pair) in decisions.chunks_exact(8).enumerate() {
-                    let status = u32::from_ne_bytes(pair[..4].try_into().unwrap());
-                    let correction = u32::from_ne_bytes(pair[4..].try_into().unwrap());
-                    match status {
-                        1 => { emit.push(proposal[row + 1]); accepted += 1; }
-                        0 if (correction as usize) < vocab => { emit.push(correction); break; }
-                        _ => return Err("Uno fused verifier rejected invalid logits or residual mass".into()),
-                    }
-                    if is_stop(*emit.last().unwrap()) { break; }
-                }
-            }
-            if accepted == n && !is_stop(*emit.last().unwrap()) {
-                let logits = gpu.download_f32(&batch.verify_logits.sub_offset(n * vocab, vocab))
-                    .map_err(|e| format!("Uno bonus logits: {e:?}"))?;
-                emit.push(Distribution::from_logits(&logits, self.request)?.sample(&mut self.rng));
-            }
-            let next = *emit.last().unwrap();
-            return Ok(SpecStep::new(emit, next, n, accepted));
+            distributions.push(q);
         }
         // Base seed KV persists; verification overwrites the noise suffix.
         let verify_logits = self.forward(gpu, target, &proposal, position + 1, false)?;
@@ -155,7 +340,7 @@ impl Speculator for UnoSpeculator {
         for (row, q) in distributions.iter().enumerate() {
             let p = Distribution::from_logits(&verify_logits[row * vocab..(row + 1) * vocab], self.request)?;
             let token = proposal[row + 1];
-            let (next, keep) = verify_proposal(&p, q, token, temp <= 1e-6, &mut self.rng)?;
+            let (next, keep) = verify_proposal(&p, q, token, greedy, &mut self.rng)?;
             emit.push(next);
             if !keep { break; }
             accepted += 1;
@@ -167,6 +352,7 @@ impl Speculator for UnoSpeculator {
         let next = *emit.last().unwrap();
         Ok(SpecStep::new(emit, next, n, accepted))
     }
+
     fn repair_terminal_prefix(&mut self, _gpu: &mut Gpu, _target: &mut dyn SpecTarget, _start: usize, _seed: u32, _consumed: &[u32]) -> Result<bool, String> { Ok(true) }
     fn reset(&mut self, _gpu: &mut Gpu) -> Result<(), String> { self.noise_state = 42; Ok(()) }
     fn block_size(&self) -> usize { self.adapter.block_len + 1 }
@@ -179,6 +365,30 @@ impl Speculator for UnoSpeculator {
 }
 
 fn is_stop(token: u32) -> bool { matches!(token, 1 | 250019) }
+
+/// All `rows` argmaxes in one launch; only `rows × 4` bytes cross to host.
+fn argmax_rows(gpu: &mut Gpu, logits: &GpuTensor, picks: &GpuTensor, vocab: usize, rows: usize) -> Result<Vec<u32>, String> {
+    gpu.argmax_f32_batched(logits, picks, vocab, rows)
+        .map_err(|e| format!("Uno argmax: {e:?}"))?;
+    let mut bytes = vec![0u8; rows * 4];
+    gpu.hip.memcpy_dtoh(&mut bytes, &picks.buf)
+        .map_err(|e| format!("Uno picks: {e:?}"))?;
+    Ok(bytes
+        .chunks_exact(4)
+        .map(|b| u32::from_ne_bytes(b.try_into().unwrap()))
+        .collect())
+}
+
+/// One fused GPU draw (softmax + categorical) via the AR decode sampler —
+/// unfiltered only (the caller routes filtered requests to the host law).
+pub(crate) fn sample_row(gpu: &mut Gpu, logits: &GpuTensor, vocab: usize, temp: f32,
+    result: &GpuTensor, repeat: &GpuTensor, rng: &mut u32) -> Result<u32, String> {
+    let (tok, next) = gpu
+        .sample_top_p_pf(logits, result, repeat, vocab, temp, 1.0, *rng, 0, 1.0, 0.0, 0.0, None, None)
+        .map_err(|e| format!("Uno sample: {e:?}"))?;
+    *rng = next;
+    Ok(tok)
+}
 
 fn verify_proposal(p: &Distribution, q: &Distribution, token: u32, greedy: bool, rng: &mut u32) -> Result<(u32, bool), String> {
     let keep = if greedy { p.probability(token) > 0.0 }
