@@ -127,6 +127,10 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD` / `HIPFIRE_QWEN35_DSPARK_CONF_THRESHOLD` | per-arch conf | |
 | `HIPFIRE_DDTREE_BUDGET` / `HIPFIRE_DDTREE_TOPK` | tree draft | Runtime defaults 256/8 if env-only; CLI config defaults 0/4 |
 | `HIPFIRE_DDTREE_*` | research/diag family | See inventory; not product defaults |
+| `HIPFIRE_UNO_BLOCK` | **4**; clamp `2..=8` | Uno conditional-LoRA window rows (seed + L-1 noise). The upstream reference defaults to 8; 4 is the hipfire bring-up value — deeper blocks amortize two full forwards but accept rate decays past depth ~2. |
+| `HIPFIRE_UNO_TREE` | **0** (linear chain); `2..=64` enables Ψ-Spec tree verify | Tree nodes incl. root. |
+| `HIPFIRE_UNO_TREE_K` | **8**; clamp `1..=32` | Candidate top-k exposed per tree depth. |
+| `HIPFIRE_UNO_NOISE` | **random_uniform** \| `deterministic_uniform` \| `mask` | Draft noise law (upstream noise.py). `random_uniform` is the adapter-trained default; `mask` is out-of-distribution and collapses deep-row acceptance. |
 
 ### Vision tower sidecar
 
@@ -236,7 +240,7 @@ registry-authorized.
 
 The canonical documentation checker requires every `HIPFIRE_*` token in `AGENTS.md`, `README.md`, and `CONTRIBUTING.md` to appear in this file. Tokens historically routed from those surfaces (keep listed even if a root file is later thinned):
 
-`HIPFIRE_ATTN_FLASH`, `HIPFIRE_DDTREE_` (prefix family; concrete vars in inventory), `HIPFIRE_DFLASH_DRAFT`, `HIPFIRE_GRAPH`, `HIPFIRE_HOST_TIMING`, `HIPFIRE_KV_MODE`, `HIPFIRE_LM_HEAD_F16`, `HIPFIRE_LOCAL`, `HIPFIRE_NORMALIZE_PROMPT`, `HIPFIRE_PROMPT_HEAT_JSON`, `HIPFIRE_PROMPT_HEAT_LIMIT`, `HIPFIRE_PROMPT_TOKEN_HEAT`, `HIPFIRE_VERIFY_GRAPH`.
+`HIPFIRE_ATTN_FLASH`, `HIPFIRE_DDTREE_` (prefix family; concrete vars in inventory), `HIPFIRE_DFLASH_DRAFT`, `HIPFIRE_GRAPH`, `HIPFIRE_HOST_TIMING`, `HIPFIRE_KV_MODE`, `HIPFIRE_LM_HEAD_F16`, `HIPFIRE_LOCAL`, `HIPFIRE_NORMALIZE_PROMPT`, `HIPFIRE_PROMPT_HEAT_JSON`, `HIPFIRE_PROMPT_HEAT_LIMIT`, `HIPFIRE_PROMPT_TOKEN_HEAT`, `HIPFIRE_UNO_` (prefix family; concrete vars in inventory), `HIPFIRE_VERIFY_GRAPH`.
 
 ---
 
@@ -1049,6 +1053,10 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_TUI_BIN` | crates/hipfire-cli/src/main.rs |
 | `HIPFIRE_UNIFORM_GATE_UP` | crates/hipfire-runtime/examples/hfq_splice_attn.rs |
 | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | crates/hipfire-runtime/src/config.rs, crates/hipfire-runtime/src/multi_gpu.rs |
+| `HIPFIRE_UNO_BLOCK` | crates/hipfire-arch-llama/src/uno_spec.rs |
+| `HIPFIRE_UNO_NOISE` | crates/hipfire-arch-llama/src/uno_spec.rs |
+| `HIPFIRE_UNO_TREE` | crates/hipfire-arch-llama/src/uno_spec.rs |
+| `HIPFIRE_UNO_TREE_K` | crates/hipfire-arch-llama/src/uno_spec.rs |
 | `HIPFIRE_VAE_CONFIG_ONLY` | crates/hipfire-arch-diffusion/src/pipeline.rs |
 | `HIPFIRE_VAE_CONV` | crates/hipfire-arch-diffusion/src/vae_gpu.rs |
 | `HIPFIRE_VAE_FUSE_NORM` | crates/hipfire-arch-diffusion/src/vae_gpu.rs |

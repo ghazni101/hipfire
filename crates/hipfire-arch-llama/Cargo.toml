@@ -18,6 +18,7 @@ rdna-compute = { path = "../rdna-compute" }
 memmap2.workspace = true
 safetensors.workspace = true
 serde_json.workspace = true
+half.workspace = true
 
 [dev-dependencies]
 # Streaming MD5 of the pinned G3 fixture in tests: the tracker identity is an

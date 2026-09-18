@@ -7823,6 +7823,124 @@ impl Gpu {
         result
     }
 
+    /// F16-weight twin of [`Self::gemv_f32_xbatch`] for the Uno LoRA weights
+    /// (rank-128 A/B stored as __half; x/y stay F32, delta accumulates F32).
+    pub fn gemv_f16_xbatch(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        b: usize,
+        accumulate: bool,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert!((1..=8).contains(&b), "f16 xbatch batch {b} outside 1..=8");
+        self.ensure_kernel("gemv_f16_xbatch", kernels::GEMV_F32_XBATCH_SRC, "gemv_f16_xbatch")?;
+        let a_ptr = a.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let b_val = b as i32;
+        let acc_val = i32::from(accumulate);
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &b_val as *const _ as *mut c_void,
+            &acc_val as *const _ as *mut c_void,
+        ];
+        let bytes = m * k * 2 + b * (k * 4 + m * 4);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_f16_xbatch", bytes);
+        let result = self.launch_maybe_blob(
+            "gemv_f16_xbatch",
+            [m as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(a_ptr);
+                blob.push_ptr(x_ptr);
+                blob.push_ptr(y_ptr);
+                blob.push_i32(m_val);
+                blob.push_i32(k_val);
+                blob.push_i32(b_val);
+                blob.push_i32(acc_val);
+                blob
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// F16-weight twin of [`Self::gemv_f32_xbatch_splitk`].
+    pub fn gemv_f16_xbatch_splitk(
+        &mut self,
+        a: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        b: usize,
+        splits: u32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert!((1..=8).contains(&b), "f16 xbatch batch {b} outside 1..=8");
+        self.ensure_kernel(
+            "gemv_f16_xbatch_splitk",
+            kernels::GEMV_F32_XBATCH_SRC,
+            "gemv_f16_xbatch_splitk",
+        )?;
+        self.hip.memset(&y.buf, 0, b * m * 4)?;
+        let a_ptr = a.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let b_val = b as i32;
+        let splits_val = splits as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &b_val as *const _ as *mut c_void,
+            &splits_val as *const _ as *mut c_void,
+        ];
+        let bytes = m * k * 2 + b * (k * 4 + m * 4);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_f16_xbatch_splitk", bytes);
+        let result = self.launch_maybe_blob(
+            "gemv_f16_xbatch_splitk",
+            [m as u32, splits, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(a_ptr);
+                blob.push_ptr(x_ptr);
+                blob.push_ptr(y_ptr);
+                blob.push_i32(m_val);
+                blob.push_i32(k_val);
+                blob.push_i32(b_val);
+                blob.push_i32(splits_val);
+                blob
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     pub fn gemv_mq4g256v2(
         &mut self,
         a_raw: &GpuTensor,

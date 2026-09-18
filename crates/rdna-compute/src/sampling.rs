@@ -169,6 +169,38 @@ impl Gpu {
         })
     }
 
+    /// In-place top-K mask for Uno filtered verification. Reduces each row of
+    /// `logits` to its top-`top_k` support, flooring every other lane to a
+    /// finite `-1e30` (the fused `uno_verify_logits` isfinite guard rejects
+    /// -INF, and exp(-1e30) == 0 makes the floor massless under softmax). The
+    /// kept lanes keep their ORIGINAL values, so the fused kernel computes the
+    /// filtered p/q — the upstream `build_sparse_top_k_probs` support.
+    /// `top_k` clamped to [1, 1024] (kernel shared-memory bound).
+    pub fn uno_apply_topk_mask(&mut self, logits: &GpuTensor, rows: usize,
+        vocab: usize, top_k: usize) -> HipResult<()> {
+        let top_k = top_k.clamp(1, 1024);
+        let elements = rows.checked_mul(vocab).and_then(|n| n.checked_mul(4));
+        if rows == 0 || rows > u32::MAX as usize || vocab == 0 || vocab > i32::MAX as usize
+            || top_k > vocab
+            || elements.is_none_or(|bytes| logits.buf.size() < bytes)
+            || logits.dtype != DType::F32 {
+            return Err(HipError::new(0, "invalid uno_apply_topk_mask tensor shape"));
+        }
+        self.bind_thread()?;
+        self.ensure_kernel("uno_apply_topk_mask", include_str!("../../../kernels/src/uno_verify_logits.hip"), "uno_apply_topk_mask")?;
+        let mut lp = logits.buf.as_ptr();
+        let mut v = vocab as i32;
+        let mut k = top_k as i32;
+        let mut params = [
+            &mut lp as *mut _ as *mut c_void, &mut v as *mut _ as *mut c_void,
+            &mut k as *mut _ as *mut c_void,
+        ];
+        self.launch_maybe_blob("uno_apply_topk_mask", [rows as u32, 1, 1], [256, 1, 1], 0, &mut params, || {
+            let mut b = hip_bridge::KernargBlob::new();
+            b.push_ptr(lp); b.push_i32(v); b.push_i32(k); b
+        })
+    }
+
     /// Compute max softmax probability on GPU. Downloads 4 bytes instead of vocab×4.
     pub fn max_prob(
         &mut self,

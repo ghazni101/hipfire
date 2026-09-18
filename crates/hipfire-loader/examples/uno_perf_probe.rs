@@ -257,8 +257,14 @@ fn main() -> Result<(), String> {
     let mut emitted_texts: Vec<u32> = Vec::new();
     let mut mirror_texts: Vec<u32> = Vec::new();
     for (label, temp) in [("greedy", 0.0f32), ("temp1.0", 1.0)] {
+        let probe_top_k: usize = std::env::var("HIPFIRE_UNO_TOP_K").ok()
+            .and_then(|s| s.parse().ok()).unwrap_or(0);
+        let probe_top_p: f32 = std::env::var("HIPFIRE_UNO_TOP_P").ok()
+            .and_then(|s| s.parse().ok()).unwrap_or(1.0);
         spec.configure_request(hipfire_runtime::spec::SpecRequestConfig {
             temp,
+            top_k: probe_top_k,
+            top_p: probe_top_p,
             ..Default::default()
         });
         // Warmup 2 windows — identity-checked as well, so the mirror AR
@@ -311,11 +317,13 @@ fn main() -> Result<(), String> {
         }
         let (med, avg) = stats(&win_ms);
         let tok_s = emitted as f64 / (win_ms.iter().sum::<f64>() / 1000.0);
+        let tpf = emitted as f64 / (win_ms.len().max(1) * 2) as f64;
         eprintln!(
-            "[UNO {label}] windows={} emitted={} tau={:.3} median={:.2} ms/window avg={:.2} ms/window  ({:.1} tok/s) ms/token={:.2}{}",
+            "[UNO {label}] windows={} emitted={} tau={:.3} tpf={:.2} median={:.2} ms/window avg={:.2} ms/window  ({:.1} tok/s) ms/token={:.2}{}",
             win_ms.len(),
             emitted,
             accepted as f64 / proposed.max(1) as f64,
+            tpf,
             med,
             avg,
             tok_s,

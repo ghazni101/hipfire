@@ -161,3 +161,44 @@ extern "C" __global__ void uno_topk_round(
         p[vi[0]]=-INFINITY;
     }
 }
+
+// In-place top-K mask for Uno filtered verification: reduce each row to its
+// top-K support, flooring every other lane to a FINITE -1e30 (not -INF, so
+// the fused verifier's isfinite guard stays satisfied; exp(-1e30/temp)==0
+// and the online-softmax max-scale recurrence carries it to zero). Keeping
+// the top-K ORIGINAL values means the fused dual-softmax computes the
+// filtered p/q exactly — the upstream build_sparse_top_k_probs support.
+// top_k must be in [1, 1024].
+extern "C" __global__ void uno_apply_topk_mask(
+    float* __restrict__ logits, int vocab, int top_k) {
+    const int tid=threadIdx.x, row=blockIdx.x;
+    float* p=logits+size_t(row)*vocab;
+    __shared__ float vm[256];
+    __shared__ int vi[256];
+    __shared__ int keep_idx[1024];
+    __shared__ float keep_val[1024];
+    for (int r=0; r<top_k; ++r) {
+        float best=-INFINITY; int idx=vocab;
+        for (int i=tid; i<vocab; i+=256) {
+            float v=p[i];
+            if (v>best) { best=v; idx=i; }
+        }
+        vm[tid]=best; vi[tid]=idx;
+        __syncthreads();
+        for (int s=128; s; s>>=1) {
+            if (tid<s && vm[tid+s]>vm[tid]) { vm[tid]=vm[tid+s]; vi[tid]=vi[tid+s]; }
+            __syncthreads();
+        }
+        if (tid==0 && r<1024 && vi[0]<vocab) {
+            keep_idx[r]=vi[0];
+            keep_val[r]=vm[0];
+            p[vi[0]]=-INFINITY;
+        }
+        __syncthreads();
+    }
+    for (int i=tid; i<vocab; i+=256) p[i]=-1e30f;
+    __syncthreads();
+    for (int r=tid; r<top_k && r<1024; r+=256) {
+        if (keep_idx[r]<vocab) p[keep_idx[r]]=keep_val[r];
+    }
+}

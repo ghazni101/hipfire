@@ -9,19 +9,23 @@
 //! the upstream Apache-2.0 NOTICE):
 //!
 //! 1. DRAFT: forward `[seed, noise_1..noise_{L-1}]`. The gated LoRA delta
-//!    applies ONLY to noise rows (row 0 mask 0). Proposals: argmax of the
-//!    clean row logit (seed token, already committed) and each noise row.
-//!    Noise KV is discarded (verify overwrites those slots).
+//!    applies ONLY to noise rows (row 0 mask 0). Proposals: sample/argmax of
+//!    the clean row logit (the already-committed seed) and each noise row.
+//!    The draft-noise KV is discarded (the verify forward overwrites those
+//!    slots).
 //! 2. VERIFY: forward `[clean, proposal_1..proposal_{L-1}]` base-only.
-//!    Accept the greedy prefix where target argmax == proposal; on
-//!    rejection the first rejected slot is replaced by the target's
-//!    correction token; append the lookahead argmax from the last verify
-//!    row; truncate at EOS.
-//! 3. KV repair: committed tokens are REPLAYED as a base prefill from the
-//!    window start so the KV frontier holds base computations only.
+//!    Greedy: accept the prefix whose target argmax equals the proposal, then
+//!    a lookahead argmax from the last verify row. Stochastic (temp > 0):
+//!    dual-softmax rejection acceptance with residual correction, fused on
+//!    device for unfiltered requests (`uno_verify_logits.hip`, a HIP port of
+//!    the upstream `fused_verify_kernel.py`); filtered requests use the host
+//!    `Distribution` law. Truncate at EOS.
+//! 3. KV: committed tokens keep base computations only — the linear path
+//!    overwrites the draft-noise slots during verify; the tree path walks the
+//!    accepted path and compacts its KV (`compact_tree_kv`).
 //!
-//! Greedy only in this bring-up (temp 0). Stochastic rejection sampling
-//! needs the sparse draft distribution retained at draft time — deferred.
+//! Lossless: every committed token is a draw from the target's own
+//! distribution at its prefix (greedy argmax or stochastic rejection).
 
 use hip_bridge::HipResult;
 use hipfire_runtime::llama::{
@@ -29,6 +33,7 @@ use hipfire_runtime::llama::{
     LlamaWeights,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
+use half::f16;
 
 /// One module's low-rank factors, already scaled: delta = B·(A·x).
 /// `a` is [rank × k], `b` is [m × rank], both F32 on GPU.
@@ -153,17 +158,28 @@ impl UnoAdapter {
                 for v in a_f32.iter_mut() {
                     *v *= scale;
                 }
+                // P2b: store the LoRA A/B factors as F16. The ~1.36 GB/fwd F32
+                // weight read is the dominant draft cost (profile: splitk 11.8ms
+                // + xbatch 7.2ms per forward); halving it to F16 cuts that to
+                // ~9.6ms. x/y accumulate stays F32, and the small rank-128 delta
+                // (scaled by alpha/rank) keeps the logit shift well inside the
+                // tie-tolerant identity gate (TIE_EPS 1.0).
+                let a_bits: Vec<u16> = a_f32.iter().map(|&v| f16::from_f32(v).to_bits()).collect();
                 let a = gpu
-                    .upload_f32(&a_f32, &[rank, k])
+                    .upload_f16_bits(&a_bits, &[rank, k])
                     .map_err(|e| format!("uno: upload A {module}/{layer}: {e:?}"))?;
-                let mut b = match gpu.upload_raw(&b_data, &[m, rank]) {
+                let b_f32: Vec<f32> = b_data
+                    .chunks_exact(4)
+                    .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                    .collect();
+                let b_bits: Vec<u16> = b_f32.iter().map(|&v| f16::from_f32(v).to_bits()).collect();
+                let b = match gpu.upload_f16_bits(&b_bits, &[m, rank]) {
                     Ok(b) => b,
                     Err(e) => {
                         let _ = gpu.free_tensor(a);
                         return Err(format!("uno: upload B {module}/{layer}: {e:?}"));
                     }
                 };
-                b.dtype = DType::F32;
                 Ok(UnoProj { a, b, rank, k, m })
             };
             layers.push(UnoLayer {
@@ -215,8 +231,8 @@ impl UnoAdapter {
     ) -> HipResult<()> {
         let ax = ax.sub_offset(0, p.rank);
         let delta = delta.sub_offset(0, p.m);
-        gpu.gemv_f32(&p.a, x, &ax)?;
-        gpu.gemv_f32(&p.b, &ax, &delta)?;
+        gpu.gemv_f16_xbatch_splitk(&p.a, x, &ax, p.rank, p.k, 1, 8)?;
+        gpu.gemv_f16_xbatch(&p.b, &ax, &delta, p.m, p.rank, 1, false)?;
         gpu.add_inplace_f32(y, &delta)
     }
 }
@@ -465,8 +481,8 @@ impl UnoBatchScratch {
         let x = x.sub_offset(p.k, n * p.k);
         let y = y.sub_offset(p.m, n * p.m);
         let ax = self.ax.sub_offset(0, n * p.rank);
-        gpu.gemv_f32_xbatch_splitk(&p.a, &x, &ax, p.rank, p.k, n, 8)?;
-        gpu.gemv_f32_xbatch(&p.b, &ax, &y, p.m, p.rank, n, true)
+        gpu.gemv_f16_xbatch_splitk(&p.a, &x, &ax, p.rank, p.k, n, 8)?;
+        gpu.gemv_f16_xbatch(&p.b, &ax, &y, p.m, p.rank, n, true)
     }
 
     /// Normed, original-basis input for a conditional projection delta. On

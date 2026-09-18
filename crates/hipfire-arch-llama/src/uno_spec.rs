@@ -7,12 +7,38 @@ use crate::{uno::{uno_forward_row, uno_forward_batch, uno_forward_batch_device, 
 use hipfire_runtime::{llama, spec::{request_rng_state, PrefillOutcome, SpecAdvance, SpecGrammar, SpecRequestConfig, SpecStep, SpecTarget, Speculator}};
 use rdna_compute::{Gpu, GpuTensor};
 
+/// Draft noise law, matching upstream nano_vllm_uno/engine/noise.py.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum NoiseMode {
+    /// `torch.randint` in `[noise_low, noise_high)` — the law the adapter was
+    /// trained on (upstream default).
+    RandomUniform,
+    /// Deterministic splitmix64 stream mixed with the window seed token
+    /// (upstream `_make_deterministic_noise` semantics: reproducible for a
+    /// given request/window).
+    DeterministicUniform,
+    /// Constant `noise_high` (= mask token id) rows (upstream `_make_noise`
+    /// mask mode). Out-of-distribution for the adapter; kept for parity.
+    Mask,
+}
+
+impl NoiseMode {
+    fn parse(s: &str) -> NoiseMode {
+        match s {
+            "deterministic_uniform" => NoiseMode::DeterministicUniform,
+            "mask" => NoiseMode::Mask,
+            _ => NoiseMode::RandomUniform,
+        }
+    }
+}
+
 pub struct UnoSpeculator {
     adapter: UnoAdapter,
     scratch: UnoScratch,
     batch: Option<UnoBatchScratch>,
     capacity: usize,
     noise_state: u64,
+    noise_mode: NoiseMode,
     request: SpecRequestConfig,
     rng: u32,
     /// Ψ-Spec tree verify config: (max tree nodes incl. root, candidate top-k
@@ -49,6 +75,10 @@ impl UnoSpeculator {
             .map(|k| k.clamp(1, 32))
             .unwrap_or(8);
         let tree = (tree_nodes >= 2).then_some((tree_nodes, tree_top_k));
+        let noise_mode = hipfire_config::developer_var("HIPFIRE_UNO_NOISE")
+            .ok()
+            .map(|s| NoiseMode::parse(&s))
+            .unwrap_or(NoiseMode::RandomUniform);
         let batch_rows = tree.map_or(block_len, |(nodes, _)| nodes.max(block_len));
         let adapter = UnoAdapter::open(dir, c, gpu, block_len, 1, 250623)?;
         let scratch = match UnoScratch::new(gpu, c) {
@@ -61,7 +91,7 @@ impl UnoSpeculator {
                 Err(e) => { scratch.free_gpu(gpu); adapter.free_gpu(gpu); return Err(format!("Uno batch scratch: {e:?}")); }
             }
         } else { None };
-        Ok(Box::new(Self { adapter, scratch, batch, capacity, noise_state: 42, request: SpecRequestConfig::default(), rng: 0x1357_9BDF, tree }))
+        Ok(Box::new(Self { adapter, scratch, batch, capacity, noise_state: 42, noise_mode, request: SpecRequestConfig::default(), rng: 0x1357_9BDF, tree }))
     }
 
     fn forward(&mut self, gpu: &mut Gpu, target: &mut LlamaBundle, tokens: &[u32], pos: usize, gated: bool) -> Result<Vec<f32>, String> {
@@ -90,21 +120,27 @@ impl UnoSpeculator {
         Ok(Distribution::from_logits(&logits, self.request)?.sample(&mut self.rng))
     }
 
-    /// Draft noise rows. The reference implementation defaults to
-    /// `random_uniform`: tokens sampled from [noise_low, noise_high) — the
-    /// range the conditional LoRA was trained on (see upstream noise.py
-    /// `_noise_bounds` / `build_draft_batch`). Constant `noise_high` rows are
-    /// the upstream `mask` mode, a non-default choice that is
-    /// out-of-distribution for the adapter and collapses deep-row acceptance.
-    fn draw_noise(&mut self, n: usize) -> Vec<u32> {
+    /// Draft noise rows. `HIPFIRE_UNO_NOISE` selects the upstream noise mode
+    /// (noise.py): `random_uniform` (default; the law the conditional LoRA was
+    /// trained on — tokens from `[noise_low, noise_high)`), `deterministic_uniform`
+    /// (reproducible splitmix64 stream mixed with the window seed token), or
+    /// `mask` (constant `noise_high` = mask-token rows — a non-default choice
+    /// that is out-of-distribution for the adapter and collapses deep-row
+    /// acceptance).
+    fn draw_noise(&mut self, n: usize, seed_token: u32) -> Vec<u32> {
         let low = self.adapter.noise_low;
-        let span = (self.adapter.noise_high - low) as f64;
-        (0..n)
-            .map(|_| {
-                let u = uniform(&mut self.rng);
-                low + (u * span) as u32
-            })
-            .collect()
+        let high = self.adapter.noise_high;
+        match self.noise_mode {
+            NoiseMode::Mask => vec![high; n],
+            NoiseMode::RandomUniform => random_uniform_noise(low, high, n, &mut self.rng),
+            NoiseMode::DeterministicUniform => {
+                // Advance the per-request stream once per window so consecutive
+                // windows decorrelate while staying reproducible from the
+                // request RNG seed (configure_request re-seeds noise_state).
+                self.noise_state = self.noise_state.wrapping_add(0x9E37_79B1_85EB_CA87);
+                deterministic_uniform_noise(low, high, seed_token, self.noise_state, n)
+            }
+        }
     }
 
     /// Ψ-Spec tree window (upstream tree sampler): draft once, grow a
@@ -117,7 +153,7 @@ impl UnoSpeculator {
         let (max_nodes, top_k) = self.tree.ok_or("Uno tree config missing")?;
         let vocab = target.config.vocab_size;
         let n = budget.saturating_sub(2).min(max_nodes.saturating_sub(1));
-        let mut noise = self.draw_noise(n);
+        let mut noise = self.draw_noise(n, seed);
         noise.insert(0, seed);
         let batch = self.batch.as_ref().ok_or("Uno batch scratch missing")?;
 
@@ -207,13 +243,27 @@ impl UnoSpeculator {
         let n = budget.saturating_sub(2);
         let vocab = target.config.vocab_size;
         let rows = n + 1;
-        let mut noise = self.draw_noise(n);
+        // Filtered (top-k-only) device path: mask draft + verify logits to
+        // their top-K support so the fused dual-softmax kernel computes the
+        // filtered p/q — the upstream `build_sparse_top_k_probs` support.
+        // Greedy ignores the filter (argmax); top-p/min-p-only stay host-side.
+        let dev_topk = if greedy { None } else {
+            (self.request.top_k > 0 && self.request.top_k < vocab
+                && !(self.request.top_p > 0.0 && self.request.top_p < 1.0)
+                && self.request.min_p <= 0.0)
+                .then_some(self.request.top_k.min(1024))
+        };
+        let mut noise = self.draw_noise(n, seed);
         noise.insert(0, seed);
         let batch = self.batch.as_ref().ok_or("Uno batch scratch missing")?;
         // DRAFT: conditional-LoRA forward, logits stay in batch.draft_logits.
         uno_forward_batch_device(gpu, &target.weights, &target.config, Some(&self.adapter),
             &noise, position, &mut target.kv, &target.scratch, batch, &batch.draft_logits)
             .map_err(|e| format!("Uno draft forward: {e:?}"))?;
+        if let Some(k) = dev_topk {
+            gpu.uno_apply_topk_mask(&batch.draft_logits, rows, vocab, k)
+                .map_err(|e| format!("Uno draft topk mask: {e:?}"))?;
+        }
         let mut proposal: Vec<u32> = Vec::with_capacity(rows);
         if greedy {
             let picks = argmax_rows(gpu, &batch.draft_logits, &batch.picks, vocab, rows)?;
@@ -230,6 +280,10 @@ impl UnoSpeculator {
         uno_forward_batch_device(gpu, &target.weights, &target.config, None,
             &proposal, position + 1, &mut target.kv, &target.scratch, batch, &batch.verify_logits)
             .map_err(|e| format!("Uno verify forward: {e:?}"))?;
+        if let Some(k) = dev_topk {
+            gpu.uno_apply_topk_mask(&batch.verify_logits, rows, vocab, k)
+                .map_err(|e| format!("Uno verify topk mask: {e:?}"))?;
+        }
         let mut emit = Vec::with_capacity(rows + 1);
         emit.push(clean);
         let mut accepted = 0;
@@ -313,13 +367,21 @@ impl Speculator for UnoSpeculator {
         let filtered = (self.request.top_k > 0 && self.request.top_k < vocab)
             || (self.request.top_p > 0.0 && self.request.top_p < 1.0)
             || self.request.min_p > 0.0;
-        if self.batch.is_some() && (greedy || !filtered) {
+        // top-k-only filters are device-resident: step_device masks the draft
+        // and verify logits to their top-K support so the fused kernel computes
+        // the filtered p/q. top-p/min-p-only filtering keeps the host
+        // Distribution law (the fused kernel's full-vocab softmax can't
+        // express a nucleus support without the top-K selection).
+        let dev_filterable = filtered
+            && !(self.request.top_p > 0.0 && self.request.top_p < 1.0)
+            && self.request.min_p <= 0.0;
+        if self.batch.is_some() && (greedy || !filtered || dev_filterable) {
             if self.tree.is_some() {
                 return self.step_tree(gpu, target, position, seed, budget, temp, greedy);
             }
             return self.step_device(gpu, target, position, seed, budget, temp, greedy);
         }
-        let mut noise = self.draw_noise(n);
+        let mut noise = self.draw_noise(n, seed);
         noise.insert(0, seed);
         let draft_logits = self.forward(gpu, target, &noise, position, true)?;
         let clean = Distribution::from_logits(&draft_logits[..vocab], self.request)?.sample(&mut self.rng);
@@ -471,6 +533,36 @@ fn uniform(state: &mut u32) -> f64 {
     (f64::from(*state) + 0.5) / 4294967296.0
 }
 
+/// Upstream noise.py `_mix_u64`: the splitmix64 finalizer.
+#[inline]
+fn mix_u64(value: u64) -> u64 {
+    let mut v = value & 0xFFFF_FFFF_FFFF_FFFF;
+    v = (v ^ (v >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9) & 0xFFFF_FFFF_FFFF_FFFF;
+    v = (v ^ (v >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB) & 0xFFFF_FFFF_FFFF_FFFF;
+    (v ^ (v >> 31)) & 0xFFFF_FFFF_FFFF_FFFF
+}
+
+/// Upstream `random_uniform` noise rows: uniform in `[low, high)`.
+fn random_uniform_noise(low: u32, high: u32, n: usize, rng: &mut u32) -> Vec<u32> {
+    let span = (high - low) as f64;
+    (0..n)
+        .map(|_| low + (uniform(rng) * span) as u32)
+        .collect()
+}
+
+/// Upstream `deterministic_uniform` noise rows: a splitmix64 stream keyed by
+/// `stream` and the window `seed_token`, drawing `low + (mix % span)`.
+fn deterministic_uniform_noise(low: u32, high: u32, seed_token: u32, stream: u64, n: usize) -> Vec<u32> {
+    let span = (high - low) as u64;
+    let mut s = stream ^ (u64::from(seed_token).wrapping_mul(0x1656_67B1_9E37_79F9));
+    (0..n)
+        .map(|_| {
+            s = mix_u64(s.wrapping_add(0x9E37_79B1_85EB_CA87));
+            low + (s % span) as u32
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod uno_sampling_tests {
     use super::*;
@@ -563,5 +655,41 @@ mod uno_sampling_tests {
         assert!((p.probability(0) - 0.625).abs() < 1e-6);
         assert!((p.probability(1) - 0.375).abs() < 1e-6);
         assert_eq!(p.probability(2), 0.0);
+    }
+
+    #[test]
+    fn noise_mode_parse_maps_laws() {
+        assert_eq!(NoiseMode::parse("random_uniform"), NoiseMode::RandomUniform);
+        assert_eq!(NoiseMode::parse("deterministic_uniform"), NoiseMode::DeterministicUniform);
+        assert_eq!(NoiseMode::parse("mask"), NoiseMode::Mask);
+        assert_eq!(NoiseMode::parse("garbage"), NoiseMode::RandomUniform);
+    }
+
+    #[test]
+    fn random_uniform_noise_stays_in_law_bounds() {
+        let mut rng = 0x1357_9BDF;
+        let noise = random_uniform_noise(1, 250623, 8192, &mut rng);
+        assert!(noise.iter().all(|&t| (1..250623).contains(&t)), "random_uniform must draw from [low, high)");
+        // Two fresh streams with the same seed replay identically.
+        let mut rng_a = 0x1357_9BDF;
+        let mut rng_b = 0x1357_9BDF;
+        assert_eq!(
+            random_uniform_noise(1, 250623, 16, &mut rng_a),
+            random_uniform_noise(1, 250623, 16, &mut rng_b),
+            "must replay from a fresh seed"
+        );
+    }
+
+    #[test]
+    fn deterministic_noise_is_reproducible_and_in_bounds() {
+        let a = deterministic_uniform_noise(1, 250623, 42, 0xA_B_C, 256);
+        let b = deterministic_uniform_noise(1, 250623, 42, 0xA_B_C, 256);
+        assert_eq!(a, b, "deterministic mode must reproduce for a given seed/stream");
+        assert!(a.iter().all(|&t| (1..250623).contains(&t)), "deterministic rows in [low, high)");
+        // A different window stream (or seed token) decorrelates.
+        assert_ne!(a, deterministic_uniform_noise(1, 250623, 42, 0xA_B_C + 1, 256),
+            "a new window must not resample identical noise");
+        assert_ne!(a, deterministic_uniform_noise(1, 250623, 43, 0xA_B_C, 256),
+            "a different seed token must decorrelate");
     }
 }
