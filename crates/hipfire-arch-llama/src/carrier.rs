@@ -1169,20 +1169,23 @@ mod tests {
     }
 
     fn config() -> LlamaConfig {
-        LlamaConfig { norm_groups: 1, arch: ModelArch::Llama,
-        dim: 4,
-        hidden_dim: 8,
-        n_layers: 1,
-        n_heads: 1,
-        n_kv_heads: 1,
-        vocab_size: 8,
-        head_dim: 4,
-        norm_eps: 1e-5,
-        max_seq_len: 32,
-        rope_freq_base: 10_000.0,
-        bos_token: 1,
-        eos_token: 2,
-        has_qk_norm: false, }
+        LlamaConfig {
+            norm_groups: 1,
+            arch: ModelArch::Llama,
+            dim: 4,
+            hidden_dim: 8,
+            n_layers: 1,
+            n_heads: 1,
+            n_kv_heads: 1,
+            vocab_size: 8,
+            head_dim: 4,
+            norm_eps: 1e-5,
+            max_seq_len: 32,
+            rope_freq_base: 10_000.0,
+            bos_token: 1,
+            eos_token: 2,
+            has_qk_norm: false,
+        }
     }
 
     fn alias_projection() -> WeightProjection {
@@ -1256,8 +1259,11 @@ mod tests {
         }
         let mut transaction = WeightLoadTransaction::new(store);
         let error = match assemble_llama_weights(
-            &LlamaConfig { norm_groups: 1, n_layers: 0,
-            ..config() },
+            &LlamaConfig {
+                norm_groups: 1,
+                n_layers: 0,
+                ..config()
+            },
             &mut transaction,
         ) {
             Ok(_) => panic!("alias unexpectedly assembled as typed weights"),

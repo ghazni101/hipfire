@@ -396,12 +396,24 @@ impl SlotBackend {
         let prefix_cache = hipfire_config::active_or_local_process_config()
             .values
             .get("serve.prefix_cache")
-            .and_then(|v| if let hipfire_config::ConfigValue::Bool(b) = v { Some(*b) } else { None })
+            .and_then(|v| {
+                if let hipfire_config::ConfigValue::Bool(b) = v {
+                    Some(*b)
+                } else {
+                    None
+                }
+            })
             .unwrap_or(false);
         let prefix_cache_max_bytes = hipfire_config::active_or_local_process_config()
             .values
             .get("serve.prefix_cache_max_bytes")
-            .and_then(|v| if let hipfire_config::ConfigValue::Integer(i) = v { Some(*i as u64) } else { None })
+            .and_then(|v| {
+                if let hipfire_config::ConfigValue::Integer(i) = v {
+                    Some(*i as u64)
+                } else {
+                    None
+                }
+            })
             .unwrap_or(0);
         // Read the global trunk-row budget and minimum prefill quantum (spec
         // §5.2 S2 / §5.3 S3). Keys are registered in hipfire-config as
@@ -411,12 +423,24 @@ impl SlotBackend {
         let max_batch_tokens = hipfire_config::active_or_local_process_config()
             .values
             .get("serve.max_batch_tokens")
-            .and_then(|v| if let hipfire_config::ConfigValue::Integer(i) = v { Some(*i as usize) } else { None })
+            .and_then(|v| {
+                if let hipfire_config::ConfigValue::Integer(i) = v {
+                    Some(*i as usize)
+                } else {
+                    None
+                }
+            })
             .unwrap_or(4096);
         let prefill_min_tokens = hipfire_config::active_or_local_process_config()
             .values
             .get("serve.prefill_min_tokens")
-            .and_then(|v| if let hipfire_config::ConfigValue::Integer(i) = v { Some(*i as usize) } else { None })
+            .and_then(|v| {
+                if let hipfire_config::ConfigValue::Integer(i) = v {
+                    Some(*i as usize)
+                } else {
+                    None
+                }
+            })
             .unwrap_or(1);
         // Read the bounded waiting room config (spec §5.3 S3). Keys are
         // registered in hipfire-config as serve.max_queue /
@@ -429,17 +453,35 @@ impl SlotBackend {
         let wait_max_count = hipfire_config::active_or_local_process_config()
             .values
             .get("serve.max_queue")
-            .and_then(|v| if let hipfire_config::ConfigValue::Integer(i) = v { Some(*i as usize) } else { None })
+            .and_then(|v| {
+                if let hipfire_config::ConfigValue::Integer(i) = v {
+                    Some(*i as usize)
+                } else {
+                    None
+                }
+            })
             .unwrap_or(64);
         let wait_max_bytes = hipfire_config::active_or_local_process_config()
             .values
             .get("serve.max_queue_bytes")
-            .and_then(|v| if let hipfire_config::ConfigValue::Integer(i) = v { Some(*i as u64) } else { None })
+            .and_then(|v| {
+                if let hipfire_config::ConfigValue::Integer(i) = v {
+                    Some(*i as u64)
+                } else {
+                    None
+                }
+            })
             .unwrap_or(268435456);
         let queue_timeout_ms = hipfire_config::active_or_local_process_config()
             .values
             .get("serve.queue_timeout_ms")
-            .and_then(|v| if let hipfire_config::ConfigValue::Integer(i) = v { Some(*i as u64) } else { None })
+            .and_then(|v| {
+                if let hipfire_config::ConfigValue::Integer(i) = v {
+                    Some(*i as u64)
+                } else {
+                    None
+                }
+            })
             .unwrap_or(30000);
         // Read the structured-output jump-forward flag (spec §7.3 G3).
         // Key registered as serve.structured_jump_forward with env
@@ -448,7 +490,13 @@ impl SlotBackend {
         let structured_jump_forward = hipfire_config::active_or_local_process_config()
             .values
             .get("serve.structured_jump_forward")
-            .and_then(|v| if let hipfire_config::ConfigValue::Bool(b) = v { Some(*b) } else { None })
+            .and_then(|v| {
+                if let hipfire_config::ConfigValue::Bool(b) = v {
+                    Some(*b)
+                } else {
+                    None
+                }
+            })
             .unwrap_or(false);
 
         let vl_path = preflight.vl_path;
@@ -997,8 +1045,7 @@ impl SlotBackend {
                 .find(|m| m.role == Role::System)
                 .map(|m| m.content.as_str())
                 .or_else(|| msg.get("system").and_then(|v| v.as_str()));
-            match build_slot_vl_prompt(self, &image, system, &last_user.content, expected_prefix)
-            {
+            match build_slot_vl_prompt(self, &image, system, &last_user.content, expected_prefix) {
                 Ok((tokens, vd)) => {
                     visual_data = Some(vd);
                     (
@@ -1638,8 +1685,8 @@ fn cpu_preflight(model_path: &str) -> Result<Preflight, String> {
     // Read vision_config from the .vl file when present, else from the trunk.
     let vision_config = if is_vl {
         if let Some(vl) = &vl_path {
-            let vl_hfq = HfqFile::open(vl)
-                .map_err(|e| format!("open .vl file {}: {e}", vl.display()))?;
+            let vl_hfq =
+                HfqFile::open(vl).map_err(|e| format!("open .vl file {}: {e}", vl.display()))?;
             Some(
                 hipfire_arch_qwen35_vl::qwen35_vl::vision_config_from_hfq(&vl_hfq)
                     .ok_or_else(|| ".vl file missing vision_config in metadata".to_string())?,
@@ -1831,10 +1878,8 @@ pub fn validate_load_caps(msg: &serde_json::Value) -> Option<String> {
         .and_then(|v| v.as_str())
         .filter(|v| !v.is_empty())
     {
-        let resolved = hipfire_runtime::kv_mode::resolve(
-            raw,
-            &hipfire_runtime::kv_mode::QWEN35_SLOTS_POLICY,
-        );
+        let resolved =
+            hipfire_runtime::kv_mode::resolve(raw, &hipfire_runtime::kv_mode::QWEN35_SLOTS_POLICY);
         if resolved.warning.is_some() {
             return Some(format!(
                 "experimental multi-slot does not support kv_mode='{raw}' \
@@ -1987,7 +2032,11 @@ pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
     // Fields the wire accepts but the engine never reads must be refused,
     // not silently dropped: `n: 2` returning one completion is a silent
     // semantic downgrade (spec §7.1).
-    if msg.get("n").and_then(|v| v.as_u64()).is_some_and(|n| n != 1) {
+    if msg
+        .get("n")
+        .and_then(|v| v.as_u64())
+        .is_some_and(|n| n != 1)
+    {
         return Some("n != 1 not supported in experimental multi-slot".to_string());
     }
     if msg.get("best_of").is_some_and(|v| !v.is_null()) {
@@ -2570,11 +2619,15 @@ mod tests {
     }
 
     #[test]
-    fn generate_caps_rejects_tool_results() {
+    fn generate_caps_accepts_tool_results() {
+        // Tool support merged onto the multi-slot route (tool-support +
+        // open_think contract, f34ba2d4): tool-role messages and assistant
+        // tool_calls render through the ChatFrame tool contract, so the
+        // caps guard forwards them (only images+tools together is refused).
         let m = json!({"messages": [{"role": "tool", "content": "result"}], "experimental_multi_slot": true});
-        assert!(validate_generate_caps(&m).is_some());
+        assert!(validate_generate_caps(&m).is_none());
         let m2 = json!({"messages": [{"role": "assistant", "tool_calls": [{"id": "1", "type": "function", "function": {"name": "f"}}]}], "experimental_multi_slot": true});
-        assert!(validate_generate_caps(&m2).is_some());
+        assert!(validate_generate_caps(&m2).is_none());
     }
 
     #[test]
@@ -2662,8 +2715,10 @@ mod tests {
         assert!(validate_generate_caps(&m2).is_some());
         let m3 = json!({"logprobs": true, "experimental_multi_slot": true});
         assert!(validate_generate_caps(&m3).is_some());
+        // Finite think caps are enforced end-to-end (grammar cursor
+        // force-close), so they pass the caps guard.
         let m4 = json!({"max_think_tokens": 5, "experimental_multi_slot": true});
-        assert!(validate_generate_caps(&m4).is_some());
+        assert!(validate_generate_caps(&m4).is_none());
         let m5 = json!({"max_think_tokens": 1, "experimental_multi_slot": true});
         assert!(validate_generate_caps(&m5).is_none());
     }
@@ -2680,12 +2735,18 @@ mod tests {
             validate_generate_caps(&m).is_none(),
             "valid json_schema response_format should be accepted"
         );
-        // Non-json_schema response_format (text) is not rejected by this guard.
+        // Non-json_schema response_format is a typed rejection: only
+        // json_schema is supported, and silently ignoring a requested
+        // constraint is the §7.1 silent-semantic-downgrade the guard exists
+        // to prevent.
         let m2 = json!({
             "response_format": {"type": "text"},
             "experimental_multi_slot": true
         });
-        assert!(validate_generate_caps(&m2).is_none(), "text response_format should not be rejected here");
+        assert!(
+            validate_generate_caps(&m2).is_some(),
+            "text response_format must be a typed rejection"
+        );
         // Unsupported $ref is rejected before submit (spec §7 G1, §5.4 S4).
         let m3 = json!({
             "response_format": {"type": "json_schema", "json_schema": {"name": "test", "schema": {"$ref": "#/$defs/foo"}}},

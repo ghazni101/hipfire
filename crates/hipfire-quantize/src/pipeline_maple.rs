@@ -794,8 +794,12 @@ mod tests {
     }
 
     #[test]
-    fn head_quant_parses_and_defaults_to_bf16() {
-        assert_eq!(MapleHeadQuant::default(), MapleHeadQuant::Bf16);
+    fn head_quant_parses_and_defaults_to_q8() {
+        // Default flipped Bf16 -> Q8 (cbe22110): q8 measures identical mean KL
+        // at ~23% faster decode; Bf16 stays selectable for reproducing
+        // pre-e8fd55750 artifacts. This pin used to assert the old Bf16
+        // default and rotted when the flip landed.
+        assert_eq!(MapleHeadQuant::default(), MapleHeadQuant::Q8);
         assert_eq!(
             "bf16".parse::<MapleHeadQuant>().unwrap(),
             MapleHeadQuant::Bf16

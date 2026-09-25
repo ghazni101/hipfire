@@ -2027,7 +2027,7 @@ mod hfq_block_diag {
 mod tests {
     use super::*;
     use crate::hfq::{kmap_resolve, kmap_resolve_mode, QuantLevel};
-    use crate::model_filter::{is_q8_tensor, q8_class_of, should_quantize};
+    use crate::model_filter::{is_q8_tensor, q8_class_of, q8_class_selected, should_quantize};
     use crate::quant_fwht::{cpu_fwht_256, gen_fwht_signs};
 
     /// The MQ*-G256-GL codebooks are NOT stored in the `.hfq` file: the encoder
@@ -2609,30 +2609,47 @@ mod tests {
         // consulted. The K-map assertions in the sibling test passed the entire
         // time. Only a check that pins the CLASS SELECTION catches that gap.
         //
-        // SAFETY: single-threaded test; env is restored before returning.
-        let prev = hipfire_config::developer_var("HIPFIRE_Q8_CLASSES").ok();
-        unsafe { std::env::set_var("HIPFIRE_Q8_CLASSES", "lm_head,embed") };
-
-        assert!(is_q8_tensor("lm_head.weight"), "lm_head must be Q8");
+        // Pinned against the pure selection law, NOT the env wrapper:
+        // `developer_var` reads the process-start config snapshot (initialised
+        // once at the first config read anywhere in the process), so a
+        // `set_var` here is invisible to it — the env-driven version of this
+        // test failed or passed depending on which test initialised the
+        // snapshot first.
+        let narrowed = Some("lm_head,embed");
         assert!(
-            is_q8_tensor("model.language_model.embed_tokens.weight"),
+            q8_class_selected("lm_head", "lm_head.weight", narrowed),
+            "lm_head must be Q8"
+        );
+        assert!(
+            q8_class_selected(
+                "embed",
+                "model.language_model.embed_tokens.weight",
+                narrowed
+            ),
             "embed_tokens must be Q8"
         );
-        let attn_q8 = is_q8_tensor("model.language_model.layers.0.self_attn.q_proj.weight");
-        let gate_q8 = is_q8_tensor("model.language_model.layers.0.self_attn.gate_proj.weight");
         assert!(
-            !attn_q8,
+            !q8_class_selected(
+                "attn",
+                "model.language_model.layers.0.self_attn.q_proj.weight",
+                narrowed
+            ),
             "attention must NOT be pulled into Q8 by the glimmer default"
         );
         assert!(
-            !gate_q8,
+            !q8_class_selected(
+                "attn",
+                "model.language_model.layers.0.mlp.gate_proj.weight",
+                narrowed
+            ),
             "the Glimmer attention gate is a projection and must follow --format"
         );
-
-        match prev {
-            Some(v) => unsafe { std::env::set_var("HIPFIRE_Q8_CLASSES", v) },
-            None => unsafe { std::env::remove_var("HIPFIRE_Q8_CLASSES") },
-        }
+        // Unset compat var lifts every Q8 class (the wrapper's Err arm).
+        assert!(q8_class_selected(
+            "attn",
+            "model.layers.0.self_attn.q_proj.weight",
+            None
+        ));
     }
 
     #[test]

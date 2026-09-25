@@ -34,13 +34,13 @@
 //! Lossless: every committed token is a draw from the target's own
 //! distribution at its prefix (greedy argmax or stochastic rejection).
 
+use half::f16;
 use hip_bridge::HipResult;
 use hipfire_runtime::llama::{
-    embedding_lookup_dispatch, weight_gemv, weight_gemm, ForwardScratch, KvCache, LlamaConfig,
+    embedding_lookup_dispatch, weight_gemm, weight_gemv, ForwardScratch, KvCache, LlamaConfig,
     LlamaWeights,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
-use half::f16;
 
 /// One module's low-rank factors, already scaled: delta = B·(A·x).
 /// `a` is [rank × k], `b` is [m × rank], both F32 on GPU.
@@ -75,14 +75,21 @@ pub struct UnoAdapter {
     layers: Vec<UnoLayer>,
 }
 
-
 fn free_proj(gpu: &mut Gpu, p: UnoProj) {
     let _ = gpu.free_tensor(p.a);
     let _ = gpu.free_tensor(p.b);
 }
 
 fn free_layer(gpu: &mut Gpu, l: UnoLayer) {
-    for p in [l.q_proj, l.k_proj, l.v_proj, l.o_proj, l.gate_proj, l.up_proj, l.down_proj] {
+    for p in [
+        l.q_proj,
+        l.k_proj,
+        l.v_proj,
+        l.o_proj,
+        l.gate_proj,
+        l.up_proj,
+        l.down_proj,
+    ] {
         free_proj(gpu, p);
     }
 }
@@ -108,7 +115,9 @@ impl UnoAdapter {
             .and_then(|v| v.as_str())
             .ok_or("uno: peft_type missing")?;
         if peft != "LORA" {
-            return Err(format!("uno: refusing adapter peft_type {peft} (only LORA)"));
+            return Err(format!(
+                "uno: refusing adapter peft_type {peft} (only LORA)"
+            ));
         }
         let rank = cfg
             .get("r")
@@ -128,7 +137,13 @@ impl UnoAdapter {
             })
             .ok_or("uno: target_modules missing")?;
         let expected = [
-            "q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj",
+            "q_proj",
+            "k_proj",
+            "v_proj",
+            "o_proj",
+            "gate_proj",
+            "up_proj",
+            "down_proj",
         ];
         for t in expected {
             if !targets.iter().any(|x| x == t) {
@@ -150,7 +165,8 @@ impl UnoAdapter {
         );
 
         let path = dir.join("adapter_model.safetensors");
-        let file = std::fs::File::open(&path).map_err(|e| format!("uno: {}: {e}", path.display()))?;
+        let file =
+            std::fs::File::open(&path).map_err(|e| format!("uno: {}: {e}", path.display()))?;
         let mmap = unsafe { memmap2::Mmap::map(&file) }.map_err(|e| e.to_string())?;
         let st = safetensors::SafeTensors::deserialize(&mmap)
             .map_err(|e| format!("uno: safetensors parse: {e}"))?;
@@ -367,9 +383,9 @@ pub fn uno_forward_row(
             config.rope_freq_base,
         )?;
 
-    hipfire_runtime::llama::llama_kv_write_attend(
-        gpu, kv_cache, scratch, layer_idx, pos, n_heads, n_kv_heads, head_dim, kv_dim,
-    )?;
+        hipfire_runtime::llama::llama_kv_write_attend(
+            gpu, kv_cache, scratch, layer_idx, pos, n_heads, n_kv_heads, head_dim, kv_dim,
+        )?;
 
         weight_gemv(gpu, &layer.wo, &scratch.attn_out, &scratch.o)?;
         if lora {
@@ -489,19 +505,39 @@ pub struct UnoBatchScratch {
 }
 
 impl UnoBatchScratch {
-    pub fn new(gpu: &mut Gpu, config: &LlamaConfig, rank: usize, rows: usize, capacity: usize) -> HipResult<Self> {
+    pub fn new(
+        gpu: &mut Gpu,
+        config: &LlamaConfig,
+        rank: usize,
+        rows: usize,
+        capacity: usize,
+    ) -> HipResult<Self> {
         let pbs = hipfire_runtime::llama::PrefillBatchScratch::new(gpu, config, rows, capacity)?;
         let tree_cols = rows * rows;
         let mut tensors = Vec::with_capacity(15);
-        for size in [rows * config.dim, rows * rank,
-            rows * config.hidden_dim, rows * config.vocab_size, rows * config.vocab_size, rows, rows * 2,
-            rows, 2, 1,
-            rows, rows * 2 * 8, tree_cols.max(1),
-            rows * 64 * 2, rows * 64 * 2] {
+        for size in [
+            rows * config.dim,
+            rows * rank,
+            rows * config.hidden_dim,
+            rows * config.vocab_size,
+            rows * config.vocab_size,
+            rows,
+            rows * 2,
+            rows,
+            2,
+            1,
+            rows,
+            rows * 2 * 8,
+            tree_cols.max(1),
+            rows * 64 * 2,
+            rows * 64 * 2,
+        ] {
             match gpu.alloc_tensor(&[size], DType::F32) {
                 Ok(t) => tensors.push(t),
                 Err(e) => {
-                    for t in tensors { let _ = gpu.free_tensor(t); }
+                    for t in tensors {
+                        let _ = gpu.free_tensor(t);
+                    }
                     pbs.free_gpu(gpu);
                     return Err(e);
                 }
@@ -509,24 +545,56 @@ impl UnoBatchScratch {
         }
         let mut tensors = tensors.into_iter();
         Ok(Self {
-            pbs, norm: tensors.next().unwrap(), ax: tensors.next().unwrap(),
+            pbs,
+            norm: tensors.next().unwrap(),
+            ax: tensors.next().unwrap(),
             hidden: tensors.next().unwrap(),
-            draft_logits: tensors.next().unwrap(), verify_logits: tensors.next().unwrap(),
-            proposals: tensors.next().unwrap(), decisions: tensors.next().unwrap(),
-            picks: tensors.next().unwrap(), sample_result: tensors.next().unwrap(),
+            draft_logits: tensors.next().unwrap(),
+            verify_logits: tensors.next().unwrap(),
+            proposals: tensors.next().unwrap(),
+            decisions: tensors.next().unwrap(),
+            picks: tensors.next().unwrap(),
+            sample_result: tensors.next().unwrap(),
             sample_repeat: tensors.next().unwrap(),
-            lse: tensors.next().unwrap(), topk: tensors.next().unwrap(),
+            lse: tensors.next().unwrap(),
+            topk: tensors.next().unwrap(),
             bias: tensors.next().unwrap(),
-            filter_vals: tensors.next().unwrap(), filter_idxs: tensors.next().unwrap(),
+            filter_vals: tensors.next().unwrap(),
+            filter_idxs: tensors.next().unwrap(),
         })
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) {
         self.pbs.free_gpu(gpu);
-        for tensor in [self.norm, self.ax, self.hidden, self.draft_logits, self.verify_logits, self.proposals, self.decisions, self.picks, self.sample_result, self.sample_repeat, self.lse, self.topk, self.bias, self.filter_vals, self.filter_idxs] { let _ = gpu.free_tensor(tensor); }
+        for tensor in [
+            self.norm,
+            self.ax,
+            self.hidden,
+            self.draft_logits,
+            self.verify_logits,
+            self.proposals,
+            self.decisions,
+            self.picks,
+            self.sample_result,
+            self.sample_repeat,
+            self.lse,
+            self.topk,
+            self.bias,
+            self.filter_vals,
+            self.filter_idxs,
+        ] {
+            let _ = gpu.free_tensor(tensor);
+        }
     }
 
-    fn delta(&self, gpu: &mut Gpu, p: &UnoProj, x: &GpuTensor, y: &GpuTensor, rows: usize) -> HipResult<()> {
+    fn delta(
+        &self,
+        gpu: &mut Gpu,
+        p: &UnoProj,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        rows: usize,
+    ) -> HipResult<()> {
         // Gate row zero out by never launching or adding its delta. The
         // B side (M=proj, K=rank) lands directly on the base projection
         // (accumulate epilogue). A used to be split-K + memset: M=rank
@@ -539,7 +607,9 @@ impl UnoBatchScratch {
         // refusing the width.
         const XBATCH: usize = 8;
         let n = rows - 1;
-        if n == 0 { return Ok(()); }
+        if n == 0 {
+            return Ok(());
+        }
         let x = x.sub_offset(p.k, n * p.k);
         let y = y.sub_offset(p.m, n * p.m);
         let mut off = 0;
@@ -570,9 +640,20 @@ impl UnoBatchScratch {
         rows: usize,
         attn: bool,
     ) -> HipResult<&'a GpuTensor> {
-        let projection = if attn { &weights.layers[layer].wq } else { &weights.layers[layer].w_gate };
-        if matches!(projection.gpu_dtype, DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256 | DType::MFP4G32) {
-            let weight = if attn { &weights.layers[layer].attn_norm } else { &weights.layers[layer].ffn_norm };
+        let projection = if attn {
+            &weights.layers[layer].wq
+        } else {
+            &weights.layers[layer].w_gate
+        };
+        if matches!(
+            projection.gpu_dtype,
+            DType::MQ4G256 | DType::MQ6G256 | DType::MQ3G256 | DType::MFP4G32
+        ) {
+            let weight = if attn {
+                &weights.layers[layer].attn_norm
+            } else {
+                &weights.layers[layer].ffn_norm
+            };
             config.rmsnorm_batch(gpu, &pbs.x_batch, weight, norm_buf, rows)?;
             Ok(norm_buf)
         } else {
@@ -584,18 +665,19 @@ impl UnoBatchScratch {
 /// Upload window token ids + positions into the batch scratch. Kept outside
 /// hipGraph capture so replay can swap the 8 i32s without recapturing.
 pub(crate) fn uno_upload_window(
-    gpu: &Gpu, batch: &UnoBatchScratch, tokens: &[u32], pos: usize,
+    gpu: &Gpu,
+    batch: &UnoBatchScratch,
+    tokens: &[u32],
+    pos: usize,
 ) -> HipResult<()> {
     let n = tokens.len();
     let tokens_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-    let token_bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, n * 4)
-    };
+    let token_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, n * 4) };
     gpu.hip.memcpy_htod(&batch.pbs.tokens.buf, token_bytes)?;
     let positions_host: Vec<i32> = (0..n).map(|i| (pos + i) as i32).collect();
-    let pos_bytes: &[u8] = unsafe {
-        std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n * 4)
-    };
+    let pos_bytes: &[u8] =
+        unsafe { std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n * 4) };
     gpu.hip.memcpy_htod(&batch.pbs.positions.buf, pos_bytes)
 }
 
@@ -603,35 +685,59 @@ pub(crate) fn uno_upload_window(
 /// the adapter. `None` performs base verification. Returns token-major logits.
 #[allow(clippy::too_many_arguments)]
 pub fn uno_forward_batch(
-    gpu: &mut Gpu, weights: &LlamaWeights, config: &LlamaConfig,
-    uno: Option<&UnoAdapter>, tokens: &[u32], pos: usize,
-    kv: &mut KvCache, scratch: &ForwardScratch, batch: &UnoBatchScratch,
+    gpu: &mut Gpu,
+    weights: &LlamaWeights,
+    config: &LlamaConfig,
+    uno: Option<&UnoAdapter>,
+    tokens: &[u32],
+    pos: usize,
+    kv: &mut KvCache,
+    scratch: &ForwardScratch,
+    batch: &UnoBatchScratch,
 ) -> HipResult<Vec<f32>> {
-    let output = if uno.is_some() { &batch.draft_logits } else { &batch.verify_logits };
-    uno_forward_batch_device(gpu, weights, config, uno, tokens, pos, kv, scratch, batch, output)?;
+    let output = if uno.is_some() {
+        &batch.draft_logits
+    } else {
+        &batch.verify_logits
+    };
+    uno_forward_batch_device(
+        gpu, weights, config, uno, tokens, pos, kv, scratch, batch, output,
+    )?;
     gpu.download_f32(&output.sub_offset(0, tokens.len() * config.vocab_size))
 }
 
 /// Device-output variant for fused verification; does not download logits.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn uno_forward_batch_device(
-    gpu: &mut Gpu, weights: &LlamaWeights, config: &LlamaConfig,
-    uno: Option<&UnoAdapter>, tokens: &[u32], pos: usize,
-    kv: &mut KvCache, scratch: &ForwardScratch, batch: &UnoBatchScratch,
+    gpu: &mut Gpu,
+    weights: &LlamaWeights,
+    config: &LlamaConfig,
+    uno: Option<&UnoAdapter>,
+    tokens: &[u32],
+    pos: usize,
+    kv: &mut KvCache,
+    scratch: &ForwardScratch,
+    batch: &UnoBatchScratch,
     output: &GpuTensor,
 ) -> HipResult<()> {
     use hipfire_runtime::llama::{forward_prefill_adapter_batch, PrefillProjectionStage};
     if !gpu.graphs.capture_mode {
         uno_upload_window(gpu, batch, tokens, pos)?;
     }
-    let mut hook = |gpu: &mut Gpu, c: &LlamaConfig, w: &LlamaWeights,
-        pbs: &hipfire_runtime::llama::PrefillBatchScratch, layer: usize, rows: usize,
-        stage: PrefillProjectionStage| -> HipResult<()> {
+    let mut hook = |gpu: &mut Gpu,
+                    c: &LlamaConfig,
+                    w: &LlamaWeights,
+                    pbs: &hipfire_runtime::llama::PrefillBatchScratch,
+                    layer: usize,
+                    rows: usize,
+                    stage: PrefillProjectionStage|
+     -> HipResult<()> {
         let adapter = uno.expect("hook only installed with adapter");
         let ul = &adapter.layers[layer];
         match stage {
             PrefillProjectionStage::Qkv => {
-                let normed = UnoBatchScratch::normed_input(gpu, c, w, pbs, &batch.norm, layer, rows, true)?;
+                let normed =
+                    UnoBatchScratch::normed_input(gpu, c, w, pbs, &batch.norm, layer, rows, true)?;
                 batch.delta(gpu, &ul.q_proj, normed, &pbs.fa_q_batch, rows)?;
                 batch.delta(gpu, &ul.k_proj, normed, &pbs.fa_k_batch, rows)?;
                 batch.delta(gpu, &ul.v_proj, normed, &pbs.fa_v_batch, rows)?;
@@ -640,21 +746,34 @@ pub(crate) fn uno_forward_batch_device(
                 batch.delta(gpu, &ul.o_proj, &pbs.fa_attn_out_batch, &pbs.x_batch, rows)?;
             }
             PrefillProjectionStage::GateUp => {
-                let normed = UnoBatchScratch::normed_input(gpu, c, w, pbs, &batch.norm, layer, rows, false)?;
+                let normed =
+                    UnoBatchScratch::normed_input(gpu, c, w, pbs, &batch.norm, layer, rows, false)?;
                 batch.delta(gpu, &ul.gate_proj, normed, &pbs.gate_ffn_batch, rows)?;
                 batch.delta(gpu, &ul.up_proj, normed, &pbs.up_batch, rows)?;
             }
             PrefillProjectionStage::Down => {
                 let size = rows * c.hidden_dim;
-                gpu.silu_mul_f32(&pbs.gate_ffn_batch.sub_offset(0, size),
-                    &pbs.up_batch.sub_offset(0, size), &batch.hidden.sub_offset(0, size))?;
+                gpu.silu_mul_f32(
+                    &pbs.gate_ffn_batch.sub_offset(0, size),
+                    &pbs.up_batch.sub_offset(0, size),
+                    &batch.hidden.sub_offset(0, size),
+                )?;
                 batch.delta(gpu, &ul.down_proj, &batch.hidden, &pbs.x_batch, rows)?;
             }
         }
         Ok(())
     };
-    forward_prefill_adapter_batch(gpu, weights, config, tokens, pos, kv,
-        scratch, &batch.pbs, if uno.is_some() { Some(&mut hook) } else { None })?;
+    forward_prefill_adapter_batch(
+        gpu,
+        weights,
+        config,
+        tokens,
+        pos,
+        kv,
+        scratch,
+        &batch.pbs,
+        if uno.is_some() { Some(&mut hook) } else { None },
+    )?;
     // Batched output head: one norm + one batched GEMM reads the lm_head
     // weights ONCE for all rows (the per-row GEMV loop re-read them per row —
     // 8 full lm_head passes per window at block_len 4).
@@ -667,7 +786,12 @@ pub(crate) fn uno_forward_batch_device(
     if weights.output.gpu_dtype == DType::MQ4G256V2 {
         let x_rot = batch.pbs.v2_rot.sub_offset(0, rows * config.dim);
         hipfire_runtime::llama::mq4g256v2_window_rotate_project(
-            gpu, &weights.output, &batch.norm, &logits, &x_rot, rows,
+            gpu,
+            &weights.output,
+            &batch.norm,
+            &logits,
+            &x_rot,
+            rows,
         )?;
     } else {
         weight_gemm(gpu, &weights.output, &batch.norm, &logits, rows)?;
@@ -773,7 +897,9 @@ pub(crate) fn build_best_first_tree(
 
     expose(&nodes, depth_candidates, &mut heap, 0);
     while nodes.len() < max_nodes {
-        let Some(Reverse(cand)) = heap.pop() else { break };
+        let Some(Reverse(cand)) = heap.pop() else {
+            break;
+        };
         if nodes[cand.parent].children.contains_key(&cand.token) {
             continue;
         }
@@ -817,9 +943,8 @@ pub(crate) fn walk_draft_tree(
         if is_stop(pick) || depth >= max_depth {
             break;
         }
-        let child = (1..tree.tokens.len()).find(|&i| {
-            tree.parents[i] == current as i32 && tree.tokens[i] == pick
-        });
+        let child = (1..tree.tokens.len())
+            .find(|&i| tree.parents[i] == current as i32 && tree.tokens[i] == pick);
         match child {
             Some(c) => {
                 path.push(c);
@@ -852,8 +977,20 @@ pub(crate) fn compact_tree_kv(
             continue;
         }
         for layer in 0..kv.k_gpu.len() {
-            gpu.hip.memcpy_dtod_at(&kv.k_gpu[layer].buf, dst, &kv.k_gpu[layer].buf, src, row_bytes)?;
-            gpu.hip.memcpy_dtod_at(&kv.v_gpu[layer].buf, dst, &kv.v_gpu[layer].buf, src, row_bytes)?;
+            gpu.hip.memcpy_dtod_at(
+                &kv.k_gpu[layer].buf,
+                dst,
+                &kv.k_gpu[layer].buf,
+                src,
+                row_bytes,
+            )?;
+            gpu.hip.memcpy_dtod_at(
+                &kv.v_gpu[layer].buf,
+                dst,
+                &kv.v_gpu[layer].buf,
+                src,
+                row_bytes,
+            )?;
         }
     }
     Ok(())
@@ -911,8 +1048,11 @@ pub(crate) fn uno_tree_verify_picks(
     let bytes: Vec<u8> = bias.iter().flat_map(|v| v.to_ne_bytes()).collect();
     gpu.hip.memcpy_htod(&batch.bias.buf, &bytes)?;
 
-    let depth_positions: Vec<i32> =
-        tree.depths.iter().map(|&d| (position as i32 + 1 + d)).collect();
+    let depth_positions: Vec<i32> = tree
+        .depths
+        .iter()
+        .map(|&d| position as i32 + 1 + d)
+        .collect();
 
     hipfire_runtime::llama::forward_prefill_batch_tree(
         gpu,
@@ -997,7 +1137,8 @@ pub(crate) fn uno_tree_verify_picks(
                 &batch.sample_result,
                 &batch.sample_repeat,
                 rng,
-            ).map_err(|e| hip_bridge::HipError::new(0, &e))?;
+            )
+            .map_err(|e| hip_bridge::HipError::new(0, &e))?;
             picks.push(tok);
         }
         Ok(picks)
@@ -1009,7 +1150,12 @@ mod uno_tree_tests {
     use super::*;
 
     fn cands(spec: &[(u32, f64)]) -> Vec<TreeCandidate> {
-        spec.iter().map(|&(t, p)| TreeCandidate { token: t, log_prob: p }).collect()
+        spec.iter()
+            .map(|&(t, p)| TreeCandidate {
+                token: t,
+                log_prob: p,
+            })
+            .collect()
     }
 
     #[test]

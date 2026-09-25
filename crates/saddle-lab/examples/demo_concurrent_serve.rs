@@ -373,10 +373,10 @@ fn main() {
             next_pos: 0,
             decoding: false,
             vl_prefill: None,
-            mtp_active: false,
-            mtp_committed: 0,
-            mtp_cycles: 0,
-            mtp_retire_fails: 0,
+            spec: Default::default(),
+            spec_committed: 0,
+            spec_cycles: 0,
+            spec_retire_fails: 0,
             pos3_delta: 0,
         })
         .collect();

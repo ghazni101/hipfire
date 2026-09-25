@@ -2123,9 +2123,11 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         }
     }
     if let Some(draft) = &args.model_draft {
-        if !draft.is_file() && !(draft.is_dir()
-            && draft.join("adapter_config.json").is_file()
-            && draft.join("adapter_model.safetensors").is_file()) {
+        if !draft.is_file()
+            && !(draft.is_dir()
+                && draft.join("adapter_config.json").is_file()
+                && draft.join("adapter_model.safetensors").is_file())
+        {
             bail!("draft model or Uno adapter not found: {}", draft.display());
         }
     }
@@ -2342,8 +2344,9 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
 
     let mut content = String::new();
     let stream = !args.no_stream && !args.json;
+    let dump_events = std::env::var_os("HIPFIRE_DUMP_EVENTS").is_some();
     let done = engine.generate(&request, |event| {
-        if std::env::var_os("HIPFIRE_DUMP_EVENTS").is_some() {
+        if dump_events {
             eprintln!("EVT {event}");
         }
         if event.get("type").and_then(serde_json::Value::as_str) == Some("token") {
@@ -4493,6 +4496,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
                 args.reasoning_on,
             )?;
         }
+        let dump_events = std::env::var_os("HIPFIRE_DUMP_EVENTS").is_some();
         let mut decode = Vec::new();
         let mut tau = Vec::new();
         let mut output_md5 = Vec::new();
@@ -4510,7 +4514,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
                 args.reasoning_on,
             );
             let done = engine.generate(&request, |event| {
-                if std::env::var_os("HIPFIRE_DUMP_EVENTS").is_some() {
+                if dump_events {
                     eprintln!("EVT {event}");
                 }
                 // Identity evidence must cover every emitted channel: a
@@ -10233,8 +10237,22 @@ mod tests {
             let registry = hipfire_registry::bundled().unwrap();
             let shared = Arc::new(ServeShared {
                 capabilities: crate::serve::route_capabilities(
-                    false, 4, 8192, 1024, false, 0, false, false, 4096, 1, 64,
-                    268435456, 30000, 4 << 20, 30_000, 64 << 20,
+                    false,
+                    4,
+                    8192,
+                    1024,
+                    false,
+                    0,
+                    false,
+                    false,
+                    4096,
+                    1,
+                    64,
+                    268435456,
+                    30000,
+                    4 << 20,
+                    30_000,
+                    64 << 20,
                 ),
                 metrics: crate::serve::metrics::Metrics::default(),
                 runtime: Mutex::new(ServeRuntime {

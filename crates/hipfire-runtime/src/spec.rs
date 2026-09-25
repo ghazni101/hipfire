@@ -975,10 +975,10 @@ impl Default for SpecRequestConfig {
             cactus_delta: 0.0,
             rng_seed: 0x1357_9BDF,
             allow_ngram_modifier: false,
-repeat_penalty: 1.0,
-repeat_window: 0,
-presence_penalty: 0.0,
-frequency_penalty: 0.0,
+            repeat_penalty: 1.0,
+            repeat_window: 0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
         }
     }
 }

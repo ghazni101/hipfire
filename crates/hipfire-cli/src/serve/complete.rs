@@ -654,12 +654,22 @@ pub(crate) enum EndpointAdapterStatus {
 /// Pre-generation denial when tools are requested without a safe adapter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum EndpointAdapterError {
-    Unavailable { endpoint: &'static str },
-    Lossy { endpoint: &'static str },
+    Unavailable {
+        endpoint: &'static str,
+    },
+    Lossy {
+        endpoint: &'static str,
+    },
     /// Tool list exceeds the grammar compiler's bounds — rejected before
     /// admission so it is a typed 400, not a daemon-side panic.
-    TooManyTools { count: usize, max: usize },
-    ToolsTooLarge { bytes: usize, max: usize },
+    TooManyTools {
+        count: usize,
+        max: usize,
+    },
+    ToolsTooLarge {
+        bytes: usize,
+        max: usize,
+    },
 }
 
 impl std::fmt::Display for EndpointAdapterError {
@@ -675,7 +685,10 @@ impl std::fmt::Display for EndpointAdapterError {
                 write!(f, "too many tools: {count} exceeds the maximum of {max}")
             }
             Self::ToolsTooLarge { bytes, max } => {
-                write!(f, "tool definitions too large: {bytes} bytes exceeds the maximum of {max}")
+                write!(
+                    f,
+                    "tool definitions too large: {bytes} bytes exceeds the maximum of {max}"
+                )
             }
         }
     }
@@ -1643,9 +1656,9 @@ pub(crate) fn project_request_contract(
         .filter(|v| !v.is_null())
     {
         None => config_u64(resolved, "generation.max_tokens")?,
-        Some(v) => v.as_u64().ok_or_else(|| {
-            anyhow!("max_tokens must be an integer between 1 and 393216")
-        })?,
+        Some(v) => v
+            .as_u64()
+            .ok_or_else(|| anyhow!("max_tokens must be an integer between 1 and 393216"))?,
     };
     if max_tokens == 0 || max_tokens > 393_216 {
         bail!("max_tokens must be between 1 and 393216");
@@ -2631,14 +2644,11 @@ pub(crate) fn multi_slot_request_supported(body: &serde_json::Value) -> Result<(
     // Finite caps (>= 2) are now ENFORCED end-to-end on the multi-slot
     // route (the grammar cursor force-closes the span at the budget —
     // vLLM thinking_token_budget parity), so they are forwarded, not
-    // refused. `1` stays the no-thinking sentinel and `0` uncapped.
-    for pointer in ["/max_think_tokens", "/reasoning/max_tokens"] {
-        if let Some(cap) = body.pointer(pointer).and_then(serde_json::Value::as_u64) {
-            if cap == 0 {
-                return Err("finite reasoning cap must be at least 1".to_owned());
-            }
-        }
-    }
+    // refused. `1` stays the no-thinking sentinel and `0` uncapped — the
+    // daemon maps absent/0 to usize::MAX (slots.rs `think_budget`), so
+    // every u64 value is meaningful here and nothing is rejected. (An
+    // earlier revision refused `0` with "must be at least 1", contradicting
+    // the daemon contract, this comment, and the pinned test.)
     if let Some(budget) = body
         .get("thinking_budget")
         .and_then(serde_json::Value::as_str)
@@ -2649,7 +2659,6 @@ pub(crate) fn multi_slot_request_supported(body: &serde_json::Value) -> Result<(
     }
     Ok(())
 }
-
 
 /// Server-owned retry driver with cooperative cancellation.
 ///
@@ -7090,7 +7099,11 @@ mod tests {
     #[test]
     fn project_request_contract_rejects_malformed_max_tokens() {
         let resolved = contract_resolved_with_system("");
-        for bad in [serde_json::json!(-5), serde_json::json!(1.5), serde_json::json!("100")] {
+        for bad in [
+            serde_json::json!(-5),
+            serde_json::json!(1.5),
+            serde_json::json!("100"),
+        ] {
             let body = serde_json::json!({
                 "max_tokens": bad,
                 "messages": [{ "role": "user", "content": "hi" }]
@@ -7128,7 +7141,8 @@ mod tests {
             let err = project_request_contract(&body, &resolved, false)
                 .expect_err("unsupported field must be refused");
             assert!(
-                err.to_string().contains("not supported on this serve route"),
+                err.to_string()
+                    .contains("not supported on this serve route"),
                 "unexpected error for {k}: {err}"
             );
         }
@@ -7310,14 +7324,15 @@ mod tests {
         assert!(ok(serde_json::json!({ "repeat_penalty": 1.05 })));
         assert!(ok(serde_json::json!({ "min_p": 0.05 })));
         err_contains(serde_json::json!({ "min_p": 1.5 }), "min_p");
-        err_contains(
-            serde_json::json!({ "max_think_tokens": 2 }),
-            "reasoning cap",
-        );
-        err_contains(
-            serde_json::json!({ "reasoning": { "max_tokens": 2048 } }),
-            "reasoning cap",
-        );
+        // Finite caps are forwarded, not refused: the slot engine enforces
+        // them end-to-end (grammar cursor force-closes the span at the
+        // budget — d80611e4 / F6). These two asserts used to pin the
+        // pre-enforcement "reasoning cap" rejection and rotted when the
+        // enforcement landed.
+        assert!(ok(serde_json::json!({ "max_think_tokens": 2 })));
+        assert!(ok(
+            serde_json::json!({ "reasoning": { "max_tokens": 2048 } })
+        ));
         err_contains(serde_json::json!({ "thinking_budget": "high" }), "budget");
     }
 
@@ -7328,19 +7343,18 @@ mod tests {
     fn response_format_validation_accepts_and_rejects() {
         // Absent / null → None (no constraint).
         assert!(validate_response_format(None).unwrap().is_none());
-        assert!(
-            validate_response_format(Some(&serde_json::Value::Null))
-                .unwrap()
-                .is_none()
-        );
+        assert!(validate_response_format(Some(&serde_json::Value::Null))
+            .unwrap()
+            .is_none());
 
         // json_object → REJECTED (typed error). This serve route has no
         // json_object enforcement; silently dropping the requested
         // constraint and returning success would be the "silent semantic
         // downgrade" the spec forbids (§7.1/X2). It used to pass through as
         // None — an unconstrained 200.
-        assert!(validate_response_format(Some(&serde_json::json!({"type": "json_object"})))
-            .is_err());
+        assert!(
+            validate_response_format(Some(&serde_json::json!({"type": "json_object"}))).is_err()
+        );
 
         // Valid json_schema with a simple object schema.
         let rf = validate_response_format(Some(&serde_json::json!({

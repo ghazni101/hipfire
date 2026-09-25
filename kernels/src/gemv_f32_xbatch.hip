@@ -4,7 +4,7 @@
 
 #include <hip/hip_runtime.h>
 
-// F16-weight variants of the two LoRA GEMVs below (P2b: store the rank-128
+// F16-weight variant of the LoRA GEMV below (P2b: store the rank-128
 // LoRA A/B factors as __half to halve the ~1.36 GB/fwd weight read — the
 // dominant draft-forward cost). x and y stay F32 (activations/accumulators);
 // only the weight matrix is quantized, so the delta accumulates in F32 and
@@ -50,45 +50,6 @@ extern "C" __global__ void gemv_f16_xbatch(
             float* yb = y + (size_t)b * M + row;
             *yb = accumulate ? *yb + v : v;
         }
-    }
-}
-
-__launch_bounds__(32, 8)
-extern "C" __global__ void gemv_f16_xbatch_splitk(
-    const __half* __restrict__ A,
-    const float* __restrict__ x,
-    float* __restrict__ y,
-    int M, int K, int B, int splits
-) {
-    const int row = blockIdx.x;
-    if (row >= M) return;
-    const int s = blockIdx.y;
-    const int tid = threadIdx.x;
-    const int slice = (K + splits - 1) / splits;
-    const int k0 = s * slice;
-    const int k1 = k0 + slice < K ? k0 + slice : K;
-    const __half* arow = A + (size_t)row * K;
-
-    float acc[HIPFIRE_GEMV_F32_XBATCH_MAX];
-    #pragma unroll
-    for (int b = 0; b < HIPFIRE_GEMV_F32_XBATCH_MAX; b++) acc[b] = 0.0f;
-
-    for (int i = k0 + tid; i < k1; i += 32) {
-        const float w = __half2float(arow[i]);
-        #pragma unroll
-        for (int b = 0; b < HIPFIRE_GEMV_F32_XBATCH_MAX; b++) {
-            if (b >= B) break;
-            acc[b] += w * x[(size_t)b * K + i];
-        }
-    }
-
-    #pragma unroll
-    for (int b = 0; b < HIPFIRE_GEMV_F32_XBATCH_MAX; b++) {
-        if (b >= B) break;
-        float v = acc[b];
-        for (int offset = 16; offset > 0; offset >>= 1)
-            v += __shfl_down(v, offset);
-        if (tid == 0) atomicAdd(y + (size_t)b * M + row, v);
     }
 }
 
@@ -147,48 +108,5 @@ extern "C" __global__ void gemv_f32_xbatch(
             float* yb = y + (size_t)b * M + row;
             *yb = accumulate ? *yb + v : v;
         }
-    }
-}
-
-// Split-K companion for small-M/large-K shapes (the LoRA A side: M=rank=128,
-// K=4096..12288 — the plain kernel would launch only M blocks and starve the
-// GPU). Grid is (M, splits); block (row, s) reduces its K slice for all B
-// rows and atomicAdd's the partials. `y` MUST be zeroed first.
-__launch_bounds__(32, 8)
-extern "C" __global__ void gemv_f32_xbatch_splitk(
-    const float* __restrict__ A,
-    const float* __restrict__ x,
-    float* __restrict__ y,
-    int M, int K, int B, int splits
-) {
-    const int row = blockIdx.x;
-    if (row >= M) return;
-    const int s = blockIdx.y;
-    const int tid = threadIdx.x;
-    const int slice = (K + splits - 1) / splits;
-    const int k0 = s * slice;
-    const int k1 = k0 + slice < K ? k0 + slice : K;
-    const float* arow = A + (size_t)row * K;
-
-    float acc[HIPFIRE_GEMV_F32_XBATCH_MAX];
-    #pragma unroll
-    for (int b = 0; b < HIPFIRE_GEMV_F32_XBATCH_MAX; b++) acc[b] = 0.0f;
-
-    for (int i = k0 + tid; i < k1; i += 32) {
-        const float w = arow[i];
-        #pragma unroll
-        for (int b = 0; b < HIPFIRE_GEMV_F32_XBATCH_MAX; b++) {
-            if (b >= B) break;
-            acc[b] += w * x[(size_t)b * K + i];
-        }
-    }
-
-    #pragma unroll
-    for (int b = 0; b < HIPFIRE_GEMV_F32_XBATCH_MAX; b++) {
-        if (b >= B) break;
-        float v = acc[b];
-        for (int offset = 16; offset > 0; offset >>= 1)
-            v += __shfl_down(v, offset);
-        if (tid == 0) atomicAdd(y + (size_t)b * M + row, v);
     }
 }

@@ -1,5 +1,19 @@
 # K2-Horizon Uno vs AR decode throughput — gfx1100 measurement record
 
+**Lifecycle:** `historical`
+
+**Disposition:** bring-up measurement of the conditional-LoRA Uno speculator
+over K2-Horizon-7B (arch 16) on gfx1101-class hardware, fixture-bound below.
+Not a product baseline, admission, or `docs/BENCHMARKS.md` claim. Best result:
+1.103× AR at block 2 with byte-identical output. One defect this record left
+open — greedy spec decode ignoring the repetition penalty — was subsequently
+fixed by commit `df290664` (penalties in greedy spec decode, token-identity
+re-verified at repeat_penalty 1.0/1.05/2.0/3.0). Raw per-run JSON that
+accompanied this record (`results/`) was removed as scratch; every median,
+digest, and fixture identity it carried is recorded in this file. Promoted
+from the repo root (`K2-UNO-THROUGHPUT.md`) — content unchanged below this
+header.
+
 Status: **objective not met on throughput — but Uno does beat AR, by 10%.** The best
 configuration found (Uno block 2, greedy, one sampling law on both sides) decodes at
 **1.103x AR** (74.9 vs 67.9 tok/s), against a 2.0x bar. Earlier revisions of this file

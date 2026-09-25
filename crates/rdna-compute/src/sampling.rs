@@ -92,31 +92,71 @@ impl Gpu {
     /// Output contains U32 pairs [accepted, correction]; accepted=2 is a
     /// fail-closed numeric error.
     #[allow(clippy::too_many_arguments)]
-    pub fn uno_filter_verify(&mut self, p: &GpuTensor, q: &GpuTensor,
-        proposals: &GpuTensor, result: &GpuTensor, filter_vals: &GpuTensor,
-        filter_idxs: &GpuTensor, rows: usize, vocab: usize,
-        temperature: f32, top_p: f32, top_k_req: i32, seed: u32) -> HipResult<()> {
+    pub fn uno_filter_verify(
+        &mut self,
+        p: &GpuTensor,
+        q: &GpuTensor,
+        proposals: &GpuTensor,
+        result: &GpuTensor,
+        filter_vals: &GpuTensor,
+        filter_idxs: &GpuTensor,
+        rows: usize,
+        vocab: usize,
+        temperature: f32,
+        top_p: f32,
+        top_k_req: i32,
+        seed: u32,
+    ) -> HipResult<()> {
         let elements = rows.checked_mul(vocab).and_then(|n| n.checked_mul(4));
         let cand_bytes = |n: usize| n.checked_mul(64).and_then(|c| c.checked_mul(4));
-        if rows == 0 || rows > u32::MAX as usize || vocab == 0 || vocab > i32::MAX as usize
-            || !temperature.is_finite() || temperature <= 1e-6
-            || !top_p.is_finite() || !(0.0..=1.0).contains(&top_p)
+        if rows == 0
+            || rows > u32::MAX as usize
+            || vocab == 0
+            || vocab > i32::MAX as usize
+            || !temperature.is_finite()
+            || temperature <= 1e-6
+            || !top_p.is_finite()
+            || !(0.0..=1.0).contains(&top_p)
             || !(1..=64).contains(&top_k_req)
             || elements.is_none_or(|bytes| p.buf.size() < bytes || q.buf.size() < bytes)
-            || rows.checked_mul(8).is_none_or(|bytes| result.buf.size() < bytes)
-            || rows.checked_mul(4).is_none_or(|bytes| proposals.buf.size() < bytes)
-            || rows.checked_mul(128).is_none_or(|bytes| filter_vals.buf.size() < bytes)
-            || rows.checked_mul(128).is_none_or(|bytes| filter_idxs.buf.size() < bytes)
+            || rows
+                .checked_mul(8)
+                .is_none_or(|bytes| result.buf.size() < bytes)
+            || rows
+                .checked_mul(4)
+                .is_none_or(|bytes| proposals.buf.size() < bytes)
+            || rows
+                .checked_mul(128)
+                .is_none_or(|bytes| filter_vals.buf.size() < bytes)
+            || rows
+                .checked_mul(128)
+                .is_none_or(|bytes| filter_idxs.buf.size() < bytes)
             || cand_bytes(rows).is_none_or(|bytes| filter_vals.buf.size() < bytes)
             || cand_bytes(rows).is_none_or(|bytes| filter_idxs.buf.size() < bytes)
-            || [p, q, proposals, result, filter_vals, filter_idxs].iter().any(|t| t.dtype != DType::F32) {
-            return Err(HipError::new(0, "invalid Uno filter verifier tensor shape or parameters"));
+            || [p, q, proposals, result, filter_vals, filter_idxs]
+                .iter()
+                .any(|t| t.dtype != DType::F32)
+        {
+            return Err(HipError::new(
+                0,
+                "invalid Uno filter verifier tensor shape or parameters",
+            ));
         }
         self.bind_thread()?;
-        self.ensure_kernel("uno_filter_gather", include_str!("../../../kernels/src/uno_verify_logits.hip"), "uno_filter_gather")?;
-        self.ensure_kernel("uno_filter_finalize", include_str!("../../../kernels/src/uno_verify_logits.hip"), "uno_filter_finalize")?;
+        self.ensure_kernel(
+            "uno_filter_gather",
+            include_str!("../../../kernels/src/uno_verify_logits.hip"),
+            "uno_filter_gather",
+        )?;
+        self.ensure_kernel(
+            "uno_filter_finalize",
+            include_str!("../../../kernels/src/uno_verify_logits.hip"),
+            "uno_filter_finalize",
+        )?;
         // Gather target rows into the first half, draft rows into the second.
-        let half = rows.checked_mul(64).ok_or_else(|| HipError::new(0, "Uno filter scratch overflow"))?;
+        let half = rows
+            .checked_mul(64)
+            .ok_or_else(|| HipError::new(0, "Uno filter scratch overflow"))?;
         let pv = filter_vals.sub_offset(0, half);
         let pi = filter_idxs.sub_offset(0, half);
         let qv = filter_vals.sub_offset(half, half);
@@ -136,15 +176,29 @@ impl Gpu {
             // RDNA wave32 group-segment limit (same as the wide sampler
             // partial); no static smem on top, so the launch fits.
             const SMEM: u32 = 128 * 64 * 8;
-            self.launch_maybe_blob("uno_filter_gather", [rows as u32, 1, 1], [128, 1, 1], SMEM, &mut params, || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(lp); b.push_ptr(ov); b.push_ptr(oi); b.push_i32(v); b
-            })?;
+            self.launch_maybe_blob(
+                "uno_filter_gather",
+                [rows as u32, 1, 1],
+                [128, 1, 1],
+                SMEM,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(lp);
+                    b.push_ptr(ov);
+                    b.push_ptr(oi);
+                    b.push_i32(v);
+                    b
+                },
+            )?;
         }
         {
-            let mut pvp = pv.buf.as_ptr(); let mut pip = pi.buf.as_ptr();
-            let mut qvp = qv.buf.as_ptr(); let mut qip = qi.buf.as_ptr();
-            let mut tp = proposals.buf.as_ptr(); let mut out = result.buf.as_ptr();
+            let mut pvp = pv.buf.as_ptr();
+            let mut pip = pi.buf.as_ptr();
+            let mut qvp = qv.buf.as_ptr();
+            let mut qip = qi.buf.as_ptr();
+            let mut tp = proposals.buf.as_ptr();
+            let mut out = result.buf.as_ptr();
             let mut v = vocab as i32;
             let mut temp = temperature;
             let mut tp_p = top_p;
@@ -163,12 +217,28 @@ impl Gpu {
                 &mut tk as *mut _ as *mut std::ffi::c_void,
                 &mut rng as *mut _ as *mut std::ffi::c_void,
             ];
-            self.launch_maybe_blob("uno_filter_finalize", [rows as u32, 1, 1], [1, 1, 1], 0, &mut params, || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(pvp); b.push_ptr(pip); b.push_ptr(qvp); b.push_ptr(qip);
-                b.push_ptr(tp); b.push_ptr(out);
-                b.push_i32(v); b.push_f32(temp); b.push_f32(tp_p); b.push_i32(tk); b.push_u32(rng); b
-            })?;
+            self.launch_maybe_blob(
+                "uno_filter_finalize",
+                [rows as u32, 1, 1],
+                [1, 1, 1],
+                0,
+                &mut params,
+                || {
+                    let mut b = hip_bridge::KernargBlob::new();
+                    b.push_ptr(pvp);
+                    b.push_ptr(pip);
+                    b.push_ptr(qvp);
+                    b.push_ptr(qip);
+                    b.push_ptr(tp);
+                    b.push_ptr(out);
+                    b.push_i32(v);
+                    b.push_f32(temp);
+                    b.push_f32(tp_p);
+                    b.push_i32(tk);
+                    b.push_u32(rng);
+                    b
+                },
+            )?;
         }
         Ok(())
     }
@@ -177,88 +247,194 @@ impl Gpu {
     /// [accepted, correction]; accepted=2 is a fail-closed numeric error.
     /// Integer buffers use F32 storage, interpreted as raw U32 bytes.
     #[allow(clippy::too_many_arguments)]
-    pub fn uno_verify_logits(&mut self, p: &GpuTensor, q: &GpuTensor,
-        proposals: &GpuTensor, result: &GpuTensor, rows: usize, vocab: usize,
-        temperature: f32, seed: u32) -> HipResult<()> {
+    pub fn uno_verify_logits(
+        &mut self,
+        p: &GpuTensor,
+        q: &GpuTensor,
+        proposals: &GpuTensor,
+        result: &GpuTensor,
+        rows: usize,
+        vocab: usize,
+        temperature: f32,
+        seed: u32,
+    ) -> HipResult<()> {
         let elements = rows.checked_mul(vocab).and_then(|n| n.checked_mul(4));
-        if rows == 0 || rows > u32::MAX as usize || vocab == 0 || vocab > i32::MAX as usize
-            || !temperature.is_finite() || temperature <= 1e-6
+        if rows == 0
+            || rows > u32::MAX as usize
+            || vocab == 0
+            || vocab > i32::MAX as usize
+            || !temperature.is_finite()
+            || temperature <= 1e-6
             || elements.is_none_or(|bytes| p.buf.size() < bytes || q.buf.size() < bytes)
-            || rows.checked_mul(8).is_none_or(|bytes| result.buf.size() < bytes)
-            || rows.checked_mul(4).is_none_or(|bytes| proposals.buf.size() < bytes)
-            || [p, q, proposals, result].iter().any(|t| t.dtype != DType::F32) {
-            return Err(HipError::new(0, "invalid Uno verifier tensor shape or temperature"));
+            || rows
+                .checked_mul(8)
+                .is_none_or(|bytes| result.buf.size() < bytes)
+            || rows
+                .checked_mul(4)
+                .is_none_or(|bytes| proposals.buf.size() < bytes)
+            || [p, q, proposals, result]
+                .iter()
+                .any(|t| t.dtype != DType::F32)
+        {
+            return Err(HipError::new(
+                0,
+                "invalid Uno verifier tensor shape or temperature",
+            ));
         }
         self.bind_thread()?;
-        self.ensure_kernel("uno_verify_logits", include_str!("../../../kernels/src/uno_verify_logits.hip"), "uno_verify_logits")?;
-        let mut pp = p.buf.as_ptr(); let mut qp = q.buf.as_ptr();
-        let mut tp = proposals.buf.as_ptr(); let mut out = result.buf.as_ptr();
-        let mut v = vocab as i32; let mut temp = temperature; let mut rng = seed;
+        self.ensure_kernel(
+            "uno_verify_logits",
+            include_str!("../../../kernels/src/uno_verify_logits.hip"),
+            "uno_verify_logits",
+        )?;
+        let mut pp = p.buf.as_ptr();
+        let mut qp = q.buf.as_ptr();
+        let mut tp = proposals.buf.as_ptr();
+        let mut out = result.buf.as_ptr();
+        let mut v = vocab as i32;
+        let mut temp = temperature;
+        let mut rng = seed;
         let mut params = [
-            &mut pp as *mut _ as *mut c_void, &mut qp as *mut _ as *mut c_void,
-            &mut tp as *mut _ as *mut c_void, &mut out as *mut _ as *mut c_void,
-            &mut v as *mut _ as *mut c_void, &mut temp as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut qp as *mut _ as *mut c_void,
+            &mut tp as *mut _ as *mut c_void,
+            &mut out as *mut _ as *mut c_void,
+            &mut v as *mut _ as *mut c_void,
+            &mut temp as *mut _ as *mut c_void,
             &mut rng as *mut _ as *mut c_void,
         ];
-        self.launch_maybe_blob("uno_verify_logits", [rows as u32, 1, 1], [256, 1, 1], 0, &mut params, || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(pp); b.push_ptr(qp); b.push_ptr(tp); b.push_ptr(out);
-            b.push_i32(v); b.push_f32(temp); b.push_u32(rng); b
-        })
+        self.launch_maybe_blob(
+            "uno_verify_logits",
+            [rows as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(qp);
+                b.push_ptr(tp);
+                b.push_ptr(out);
+                b.push_i32(v);
+                b.push_f32(temp);
+                b.push_u32(rng);
+                b
+            },
+        )
     }
 
     /// Per-row logsumexp over temperature-scaled logits (`out[row]`).
     /// `inv_temp` is the multiplier applied to the logits (1/temp, or 1 for
     /// greedy tree-mass ordering).
-    pub fn uno_row_lse(&mut self, logits: &GpuTensor, out: &GpuTensor,
-        rows: usize, vocab: usize, inv_temp: f32) -> HipResult<()> {
+    pub fn uno_row_lse(
+        &mut self,
+        logits: &GpuTensor,
+        out: &GpuTensor,
+        rows: usize,
+        vocab: usize,
+        inv_temp: f32,
+    ) -> HipResult<()> {
         let elements = rows.checked_mul(vocab).and_then(|n| n.checked_mul(4));
-        if rows == 0 || rows > u32::MAX as usize || vocab == 0 || vocab > i32::MAX as usize
+        if rows == 0
+            || rows > u32::MAX as usize
+            || vocab == 0
+            || vocab > i32::MAX as usize
             || !inv_temp.is_finite()
             || elements.is_none_or(|bytes| logits.buf.size() < bytes)
-            || rows.checked_mul(4).is_none_or(|bytes| out.buf.size() < bytes)
-            || logits.dtype != DType::F32 || out.dtype != DType::F32 {
+            || rows
+                .checked_mul(4)
+                .is_none_or(|bytes| out.buf.size() < bytes)
+            || logits.dtype != DType::F32
+            || out.dtype != DType::F32
+        {
             return Err(HipError::new(0, "invalid uno_row_lse tensor shape"));
         }
         self.bind_thread()?;
-        self.ensure_kernel("uno_row_lse", include_str!("../../../kernels/src/uno_verify_logits.hip"), "uno_row_lse")?;
-        let mut lp = logits.buf.as_ptr(); let mut op = out.buf.as_ptr();
-        let mut v = vocab as i32; let mut it = inv_temp;
+        self.ensure_kernel(
+            "uno_row_lse",
+            include_str!("../../../kernels/src/uno_verify_logits.hip"),
+            "uno_row_lse",
+        )?;
+        let mut lp = logits.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut v = vocab as i32;
+        let mut it = inv_temp;
         let mut params = [
-            &mut lp as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
-            &mut v as *mut _ as *mut c_void, &mut it as *mut _ as *mut c_void,
+            &mut lp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut v as *mut _ as *mut c_void,
+            &mut it as *mut _ as *mut c_void,
         ];
-        self.launch_maybe_blob("uno_row_lse", [rows as u32, 1, 1], [256, 1, 1], 0, &mut params, || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(lp); b.push_ptr(op); b.push_i32(v); b.push_f32(it); b
-        })
+        self.launch_maybe_blob(
+            "uno_row_lse",
+            [rows as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(lp);
+                b.push_ptr(op);
+                b.push_i32(v);
+                b.push_f32(it);
+                b
+            },
+        )
     }
 
     /// One masked-argmax top-k round over `rows` logits rows: writes
     /// `[idx, f32bits(value)]` per row into `out` and sets the winning lane
     /// to -INF in place. Host loops this k times for a k-wide candidate list.
     /// NOTE: mutates `logits`.
-    pub fn uno_topk_round(&mut self, logits: &GpuTensor, out: &GpuTensor,
-        rows: usize, vocab: usize) -> HipResult<()> {
+    pub fn uno_topk_round(
+        &mut self,
+        logits: &GpuTensor,
+        out: &GpuTensor,
+        rows: usize,
+        vocab: usize,
+    ) -> HipResult<()> {
         let elements = rows.checked_mul(vocab).and_then(|n| n.checked_mul(4));
-        if rows == 0 || rows > u32::MAX as usize || vocab == 0 || vocab > i32::MAX as usize
+        if rows == 0
+            || rows > u32::MAX as usize
+            || vocab == 0
+            || vocab > i32::MAX as usize
             || elements.is_none_or(|bytes| logits.buf.size() < bytes)
-            || rows.checked_mul(8).is_none_or(|bytes| out.buf.size() < bytes)
-            || logits.dtype != DType::F32 || out.dtype != DType::F32 {
+            || rows
+                .checked_mul(8)
+                .is_none_or(|bytes| out.buf.size() < bytes)
+            || logits.dtype != DType::F32
+            || out.dtype != DType::F32
+        {
             return Err(HipError::new(0, "invalid uno_topk_round tensor shape"));
         }
         self.bind_thread()?;
-        self.ensure_kernel("uno_topk_round", include_str!("../../../kernels/src/uno_verify_logits.hip"), "uno_topk_round")?;
-        let mut lp = logits.buf.as_ptr(); let mut op = out.buf.as_ptr();
+        self.ensure_kernel(
+            "uno_topk_round",
+            include_str!("../../../kernels/src/uno_verify_logits.hip"),
+            "uno_topk_round",
+        )?;
+        let mut lp = logits.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
         let mut v = vocab as i32;
         let mut params = [
-            &mut lp as *mut _ as *mut c_void, &mut op as *mut _ as *mut c_void,
+            &mut lp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
             &mut v as *mut _ as *mut c_void,
         ];
-        self.launch_maybe_blob("uno_topk_round", [rows as u32, 1, 1], [256, 1, 1], 0, &mut params, || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(lp); b.push_ptr(op); b.push_i32(v); b
-        })
+        self.launch_maybe_blob(
+            "uno_topk_round",
+            [rows as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(lp);
+                b.push_ptr(op);
+                b.push_i32(v);
+                b
+            },
+        )
     }
 
     /// In-place top-K mask for Uno filtered verification. Reduces each row of
@@ -268,29 +444,53 @@ impl Gpu {
     /// kept lanes keep their ORIGINAL values, so the fused kernel computes the
     /// filtered p/q — the upstream `build_sparse_top_k_probs` support.
     /// `top_k` clamped to [1, 1024] (kernel shared-memory bound).
-    pub fn uno_apply_topk_mask(&mut self, logits: &GpuTensor, rows: usize,
-        vocab: usize, top_k: usize) -> HipResult<()> {
+    pub fn uno_apply_topk_mask(
+        &mut self,
+        logits: &GpuTensor,
+        rows: usize,
+        vocab: usize,
+        top_k: usize,
+    ) -> HipResult<()> {
         let top_k = top_k.clamp(1, 1024);
         let elements = rows.checked_mul(vocab).and_then(|n| n.checked_mul(4));
-        if rows == 0 || rows > u32::MAX as usize || vocab == 0 || vocab > i32::MAX as usize
+        if rows == 0
+            || rows > u32::MAX as usize
+            || vocab == 0
+            || vocab > i32::MAX as usize
             || top_k > vocab
             || elements.is_none_or(|bytes| logits.buf.size() < bytes)
-            || logits.dtype != DType::F32 {
+            || logits.dtype != DType::F32
+        {
             return Err(HipError::new(0, "invalid uno_apply_topk_mask tensor shape"));
         }
         self.bind_thread()?;
-        self.ensure_kernel("uno_apply_topk_mask", include_str!("../../../kernels/src/uno_verify_logits.hip"), "uno_apply_topk_mask")?;
+        self.ensure_kernel(
+            "uno_apply_topk_mask",
+            include_str!("../../../kernels/src/uno_verify_logits.hip"),
+            "uno_apply_topk_mask",
+        )?;
         let mut lp = logits.buf.as_ptr();
         let mut v = vocab as i32;
         let mut k = top_k as i32;
         let mut params = [
-            &mut lp as *mut _ as *mut c_void, &mut v as *mut _ as *mut c_void,
+            &mut lp as *mut _ as *mut c_void,
+            &mut v as *mut _ as *mut c_void,
             &mut k as *mut _ as *mut c_void,
         ];
-        self.launch_maybe_blob("uno_apply_topk_mask", [rows as u32, 1, 1], [256, 1, 1], 0, &mut params, || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(lp); b.push_i32(v); b.push_i32(k); b
-        })
+        self.launch_maybe_blob(
+            "uno_apply_topk_mask",
+            [rows as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(lp);
+                b.push_i32(v);
+                b.push_i32(k);
+                b
+            },
+        )
     }
 
     /// Compute max softmax probability on GPU. Downloads 4 bytes instead of vocab×4.
@@ -1910,41 +2110,47 @@ impl Gpu {
         self.bind_thread()?;
         if !self.functions.contains_key("sample_apply_repeat_penalty") {
             let src = sample_top_p_parallel_src();
-            self.ensure_kernel(
-                "sample_top_p_parallel",
-                &src,
-                "sample_apply_repeat_penalty",
-            )?;
+            self.ensure_kernel("sample_top_p_parallel", &src, "sample_apply_repeat_penalty")?;
         }
-        let func = &self.functions["sample_apply_repeat_penalty"];
-        let mut lp = row.buf.as_ptr();
-        let mut rp = repeat_buf.buf.as_ptr();
-        let mut vs = vocab as i32;
-        let mut rw = window as i32;
-        let mut rpen = repeat_penalty;
-        let mut pp = presence_penalty;
-        let mut fp = frequency_penalty;
+        let lp = row.buf.as_ptr();
+        let rp = repeat_buf.buf.as_ptr();
+        let vs = vocab as i32;
+        let rw = window as i32;
+        let rpen = repeat_penalty;
+        let pp = presence_penalty;
+        let fp = frequency_penalty;
         let mut params: Vec<*mut c_void> = vec![
-            &mut lp as *mut _ as *mut c_void,
-            &mut rp as *mut _ as *mut c_void,
-            &mut vs as *mut _ as *mut c_void,
-            &mut rw as *mut _ as *mut c_void,
-            &mut rpen as *mut _ as *mut c_void,
-            &mut pp as *mut _ as *mut c_void,
-            &mut fp as *mut _ as *mut c_void,
+            &lp as *const _ as *mut c_void,
+            &rp as *const _ as *mut c_void,
+            &vs as *const _ as *mut c_void,
+            &rw as *const _ as *mut c_void,
+            &rpen as *const _ as *mut c_void,
+            &pp as *const _ as *mut c_void,
+            &fp as *const _ as *mut c_void,
         ];
         // Same launch shape as the parallel sampler's prepass step: 1 block ×
-        // 256 threads striding the window. The kernel is blockDim-agnostic.
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [1, 1, 1],
-                [256, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        }
+        // 256 threads striding the window (the kernel is blockDim-agnostic).
+        // `launch_maybe_blob`, not a raw launch: the stack-kernarg form
+        // dangles when captured into a hipGraph (the raw-launch landmine
+        // class), and this prepass runs inside the multi-slot decode loop.
+        self.launch_maybe_blob(
+            "sample_apply_repeat_penalty",
+            [1, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(lp);
+                b.push_ptr(rp);
+                b.push_i32(vs);
+                b.push_i32(rw);
+                b.push_f32(rpen);
+                b.push_f32(pp);
+                b.push_f32(fp);
+                b
+            },
+        )
     }
 }
 

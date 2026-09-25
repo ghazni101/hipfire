@@ -45,24 +45,50 @@ pub struct LlamaConfig {
 }
 
 impl LlamaConfig {
-    pub fn rmsnorm(&self, gpu: &mut Gpu, x: &GpuTensor, weight: &GpuTensor, out: &GpuTensor) -> HipResult<()> {
+    pub fn rmsnorm(
+        &self,
+        gpu: &mut Gpu,
+        x: &GpuTensor,
+        weight: &GpuTensor,
+        out: &GpuTensor,
+    ) -> HipResult<()> {
         if self.norm_groups == 1 {
             return gpu.rmsnorm_f32(x, weight, out, self.norm_eps);
         }
         let width = self.dim / self.norm_groups;
         for group in 0..self.norm_groups {
             let offset = group * width;
-            gpu.rmsnorm_f32(&x.sub_offset(offset, width), &weight.sub_offset(offset, width), &out.sub_offset(offset, width), self.norm_eps)?;
+            gpu.rmsnorm_f32(
+                &x.sub_offset(offset, width),
+                &weight.sub_offset(offset, width),
+                &out.sub_offset(offset, width),
+                self.norm_eps,
+            )?;
         }
         Ok(())
     }
-    pub fn rmsnorm_batch(&self, gpu: &mut Gpu, x: &GpuTensor, weight: &GpuTensor, out: &GpuTensor, rows: usize) -> HipResult<()> {
+    pub fn rmsnorm_batch(
+        &self,
+        gpu: &mut Gpu,
+        x: &GpuTensor,
+        weight: &GpuTensor,
+        out: &GpuTensor,
+        rows: usize,
+    ) -> HipResult<()> {
         if self.norm_groups == 1 {
             return gpu.rmsnorm_batched(x, weight, out, rows, self.dim, self.norm_eps);
         }
         // Grouped norm: one batched launch instead of rows*groups scalar
         // rmsnorm_f32 calls (rows=4, groups=4 → 16 launches per site).
-        gpu.rmsnorm_grouped_batched(x, weight, out, rows, self.dim / self.norm_groups, self.norm_groups, self.norm_eps)
+        gpu.rmsnorm_grouped_batched(
+            x,
+            weight,
+            out,
+            rows,
+            self.dim / self.norm_groups,
+            self.norm_groups,
+            self.norm_eps,
+        )
     }
     pub fn from_gguf(gguf: &GgufFile) -> Option<Self> {
         let arch_str = gguf.meta_str("general.architecture")?;
@@ -2492,6 +2518,19 @@ pub fn forward_prefill_batch_tree(
     if n == 0 {
         return Ok(());
     }
+    // One KV row per node lands at slots position..position+n: a caller that
+    // sizes its tree by node budget alone (not by remaining context) would
+    // write past the cache allocation. `forward_prefill_adapter_batch` guards
+    // the same invariant for linear windows.
+    if position + n > kv_cache.physical_cap {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "forward_prefill_batch_tree: {n} tree rows at position {position} exceed KV capacity {}",
+                kv_cache.physical_cap
+            ),
+        ));
+    }
     assert!(
         n <= pbs.max_batch,
         "forward_prefill_batch_tree: tree size {n} exceeds pbs.max_batch {}",
@@ -2516,10 +2555,17 @@ pub fn forward_prefill_batch_tree(
     // so the Uno tree verify runs on K2 weights.
     let v2_ok = |dt: DType| dt == DType::MQ4G256V2 && mq4g256v2_window_batch_ok(arch);
     let weights_ok = weights.layers.iter().all(|l| {
-        [l.wq.gpu_dtype, l.wk.gpu_dtype, l.wv.gpu_dtype, l.wo.gpu_dtype,
-         l.w_gate.gpu_dtype, l.w_up.gpu_dtype, l.w_down.gpu_dtype]
-            .iter()
-            .all(|dt| is_batchable_la(*dt, arch) || v2_ok(*dt))
+        [
+            l.wq.gpu_dtype,
+            l.wk.gpu_dtype,
+            l.wv.gpu_dtype,
+            l.wo.gpu_dtype,
+            l.w_gate.gpu_dtype,
+            l.w_up.gpu_dtype,
+            l.w_down.gpu_dtype,
+        ]
+        .iter()
+        .all(|dt| is_batchable_la(*dt, arch) || v2_ok(*dt))
     });
     assert!(
         crate::config::get().prefill_batched && weights_ok,
@@ -2637,43 +2683,89 @@ fn q8_prefill_family_eligible(
 
 /// Projection boundaries for conditional adapters. Inputs remain in the model's
 /// original basis; the adapter must not consume FWHT-rotated base-kernel inputs.
-pub enum PrefillProjectionStage { Qkv, AttentionOutput, GateUp, Down }
+pub enum PrefillProjectionStage {
+    Qkv,
+    AttentionOutput,
+    GateUp,
+    Down,
+}
 
 pub type PrefillProjectionHook<'a> = dyn FnMut(
-    &mut Gpu, &LlamaConfig, &LlamaWeights, &PrefillBatchScratch, usize, usize,
-    PrefillProjectionStage,
-) -> HipResult<()> + 'a;
+        &mut Gpu,
+        &LlamaConfig,
+        &LlamaWeights,
+        &PrefillBatchScratch,
+        usize,
+        usize,
+        PrefillProjectionStage,
+    ) -> HipResult<()>
+    + 'a;
 
 /// One causal batch with optional conditional projection deltas, leaving every
 /// final residual row in `pbs.x_batch`. No output-head projection or capture.
 #[allow(clippy::too_many_arguments)]
 pub fn forward_prefill_adapter_batch(
-    gpu: &mut Gpu, weights: &LlamaWeights, config: &LlamaConfig,
-    tokens: &[u32], start_pos: usize, kv: &mut KvCache,
-    scratch: &ForwardScratch, pbs: &PrefillBatchScratch,
+    gpu: &mut Gpu,
+    weights: &LlamaWeights,
+    config: &LlamaConfig,
+    tokens: &[u32],
+    start_pos: usize,
+    kv: &mut KvCache,
+    scratch: &ForwardScratch,
+    pbs: &PrefillBatchScratch,
     hook: Option<&mut PrefillProjectionHook<'_>>,
 ) -> HipResult<()> {
     if tokens.is_empty() || tokens.len() > pbs.max_batch {
-        return Err(hip_bridge::HipError::new(0, &format!("conditional adapter batch rows={} exceed workspace={} or are empty", tokens.len(), pbs.max_batch)));
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "conditional adapter batch rows={} exceed workspace={} or are empty",
+                tokens.len(),
+                pbs.max_batch
+            ),
+        ));
     }
     if kv.compact_offset != 0 {
-        return Err(hip_bridge::HipError::new(0, &format!("conditional adapter batch requires uncompacted KV; offset={}", kv.compact_offset)));
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "conditional adapter batch requires uncompacted KV; offset={}",
+                kv.compact_offset
+            ),
+        ));
     }
-    if !start_pos.checked_add(tokens.len()).is_some_and(|end| end <= kv.physical_cap) {
+    if !start_pos
+        .checked_add(tokens.len())
+        .is_some_and(|end| end <= kv.physical_cap)
+    {
         return Err(hip_bridge::HipError::new(0, &format!("conditional adapter batch exceeds KV capacity: start={start_pos} rows={} capacity={}", tokens.len(), kv.physical_cap)));
     }
     if !(kv.quant_q8 || kv.quant_asym2 || kv.quant_asym3 || kv.quant_asym4) {
-        return Err(hip_bridge::HipError::new(0, "conditional adapter batch requires q8/asym2/asym3/asym4 KV"));
+        return Err(hip_bridge::HipError::new(
+            0,
+            "conditional adapter batch requires q8/asym2/asym3/asym4 KV",
+        ));
     }
     for (index, layer) in weights.layers.iter().enumerate() {
-        for (name, w) in [("q", &layer.wq), ("k", &layer.wk), ("v", &layer.wv), ("o", &layer.wo), ("gate", &layer.w_gate), ("up", &layer.w_up), ("down", &layer.w_down)] {
-            if !is_batchable_la(w.gpu_dtype, &gpu.arch) && !(w.gpu_dtype == DType::MQ4G256V2 && mq4g256v2_window_batch_ok(&gpu.arch)) {
+        for (name, w) in [
+            ("q", &layer.wq),
+            ("k", &layer.wk),
+            ("v", &layer.wv),
+            ("o", &layer.wo),
+            ("gate", &layer.w_gate),
+            ("up", &layer.w_up),
+            ("down", &layer.w_down),
+        ] {
+            if !is_batchable_la(w.gpu_dtype, &gpu.arch)
+                && !(w.gpu_dtype == DType::MQ4G256V2 && mq4g256v2_window_batch_ok(&gpu.arch))
+            {
                 return Err(hip_bridge::HipError::new(0, &format!("conditional adapter batch unsupported projection: layer={index} projection={name} dtype={:?} arch={}", w.gpu_dtype, gpu.arch)));
             }
         }
     }
-    forward_prefill_chunk(gpu, weights, config, tokens, start_pos, kv,
-        scratch, pbs, None, true, None, hook)
+    forward_prefill_chunk(
+        gpu, weights, config, tokens, start_pos, kv, scratch, pbs, None, true, None, hook,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -3000,7 +3092,15 @@ fn forward_prefill_chunk(
             )?;
         }
         if let Some(hook) = projection_hook.as_mut() {
-            hook(gpu, config, weights, pbs, layer_idx, n, PrefillProjectionStage::Qkv)?;
+            hook(
+                gpu,
+                config,
+                weights,
+                pbs,
+                layer_idx,
+                n,
+                PrefillProjectionStage::Qkv,
+            )?;
         }
 
         // Per-head Q/K rmsnorm (Qwen3 only — None on plain LLaMA).
@@ -3382,7 +3482,15 @@ fn forward_prefill_chunk(
             )?;
         }
         if let Some(hook) = projection_hook.as_mut() {
-            hook(gpu, config, weights, pbs, layer_idx, n, PrefillProjectionStage::AttentionOutput)?;
+            hook(
+                gpu,
+                config,
+                weights,
+                pbs,
+                layer_idx,
+                n,
+                PrefillProjectionStage::AttentionOutput,
+            )?;
         }
 
         // FFN: rmsnorm (+ FWHT for MQ — includes MFP4G32), gate+up, silu_mul,
@@ -3539,12 +3647,28 @@ fn forward_prefill_chunk(
             )?;
         }
         if let Some(hook) = projection_hook.as_mut() {
-            hook(gpu, config, weights, pbs, layer_idx, n, PrefillProjectionStage::GateUp)?;
+            hook(
+                gpu,
+                config,
+                weights,
+                pbs,
+                layer_idx,
+                n,
+                PrefillProjectionStage::GateUp,
+            )?;
         }
         // Down's delta reads ordinary SiLU(gate)*up, before the base path
         // rotates it. Adding to the residual here commutes with base down.
         if let Some(hook) = projection_hook.as_mut() {
-            hook(gpu, config, weights, pbs, layer_idx, n, PrefillProjectionStage::Down)?;
+            hook(
+                gpu,
+                config,
+                weights,
+                pbs,
+                layer_idx,
+                n,
+                PrefillProjectionStage::Down,
+            )?;
         }
         let w_down_is_mq = matches!(
             layer.w_down.gpu_dtype,
@@ -3572,7 +3696,14 @@ fn forward_prefill_chunk(
         if layer.w_down.gpu_dtype == DType::MQ4G256V2 {
             let projected = pbs.gate_ffn_batch.sub_offset(0, n * layer.w_down.m);
             let x_rot = pbs.v2_rot.sub_offset(0, n * layer.w_down.k);
-            mq4g256v2_window_rotate_project(gpu, &layer.w_down, &pbs.ffn_hidden_batch, &projected, &x_rot, n)?;
+            mq4g256v2_window_rotate_project(
+                gpu,
+                &layer.w_down,
+                &pbs.ffn_hidden_batch,
+                &projected,
+                &x_rot,
+                n,
+            )?;
             gpu.add_inplace_f32(&pbs.x_batch.sub_offset(0, n * dim), &projected)?;
         } else if w_down_is_hfq4g128 {
             // gate_ffn_batch is dead after silu_mul and is larger than the
@@ -8619,11 +8750,19 @@ mod tests {
 
     #[test]
     fn mq4g256v2_window_batch_ok_rdna3_rdna4() {
-        for arch in ["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201"] {
-            assert!(mq4g256v2_window_batch_ok(arch), "{arch} must admit V2 windows");
+        for arch in [
+            "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201",
+        ] {
+            assert!(
+                mq4g256v2_window_batch_ok(arch),
+                "{arch} must admit V2 windows"
+            );
         }
         for arch in ["gfx1010", "gfx1030", "gfx942", "gfx900"] {
-            assert!(!mq4g256v2_window_batch_ok(arch), "{arch} must refuse V2 windows");
+            assert!(
+                !mq4g256v2_window_batch_ok(arch),
+                "{arch} must refuse V2 windows"
+            );
         }
     }
 

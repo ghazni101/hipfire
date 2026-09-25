@@ -400,16 +400,33 @@ pub(crate) fn is_q8_tensor(name: &str) -> bool {
     if fixed_tier_override_applies(name) {
         return true;
     }
-    match hipfire_config::developer_var("HIPFIRE_Q8_CLASSES") {
-        Ok(list) => {
+    q8_class_selected(
+        class,
+        name,
+        hipfire_config::developer_var("HIPFIRE_Q8_CLASSES")
+            .ok()
+            .as_deref(),
+    )
+}
+
+/// Pure class-selection law of [`is_q8_tensor`]'s `HIPFIRE_Q8_CLASSES` arm:
+/// `None` (compat var unset) lifts every Q8 class; a comma list selects only
+/// the named classes, with `attn_full` independently retaining self-attention
+/// without linear attention. Extracted so tests can pin the law without
+/// mutating the environment: `developer_var` reads the process-start config
+/// snapshot (initialised once at the first config read), so a `set_var` in a
+/// test is invisible to it — and to any later reader — making an env-driven
+/// test order-dependent by construction.
+pub(crate) fn q8_class_selected(class: &str, name: &str, list: Option<&str>) -> bool {
+    match list {
+        Some(list) => {
             // validated at startup; still handle empty list as no lift.
-            // `attn_full` independently retains self-attention without linear_attn.
             list.split(',').any(|c| {
                 let c = c.trim();
                 c == class || (c == "attn_full" && is_attn_full_tensor(name))
             })
         }
-        Err(_) => true,
+        None => true,
     }
 }
 

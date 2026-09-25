@@ -7651,10 +7651,7 @@ impl Gpu {
         self.bind_thread()?;
         debug_assert!((1..=8).contains(&b), "xbatch batch {b} outside 1..=8");
         let (module, src) = if b <= 4 {
-            (
-                "gemv_mq4g256v2_xbatch",
-                kernels::GEMV_MQ4G256V2_XBATCH_SRC,
-            )
+            ("gemv_mq4g256v2_xbatch", kernels::GEMV_MQ4G256V2_XBATCH_SRC)
         } else {
             (
                 "gemv_mq4g256v2_xbatch8",
@@ -7678,13 +7675,8 @@ impl Gpu {
         ];
         let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + b * (k * 4 + m * 4);
         let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_mq4g256v2_xbatch", bytes);
-        let result = self.launch_maybe_blob(
-            module,
-            [m as u32, 1, 1],
-            [32, 1, 1],
-            0,
-            &mut params,
-            || {
+        let result =
+            self.launch_maybe_blob(module, [m as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
                 let mut blob = hip_bridge::KernargBlob::new();
                 blob.push_ptr(a_ptr);
                 blob.push_ptr(x_ptr);
@@ -7693,8 +7685,7 @@ impl Gpu {
                 blob.push_i32(k_val);
                 blob.push_i32(b_val);
                 blob
-            },
-        );
+            });
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
@@ -7715,8 +7706,19 @@ impl Gpu {
         accumulate: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        debug_assert!((1..=8).contains(&b), "f32 xbatch batch {b} outside 1..=8");
-        self.ensure_kernel("gemv_f32_xbatch", kernels::GEMV_F32_XBATCH_SRC, "gemv_f32_xbatch")?;
+        // Release-checked: the kernel's accumulator array is sized to 8 rows
+        // and silently computes only the first 8 when B is larger.
+        if !(1..=8).contains(&b) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("f32 xbatch batch {b} outside 1..=8"),
+            ));
+        }
+        self.ensure_kernel(
+            "gemv_f32_xbatch",
+            kernels::GEMV_F32_XBATCH_SRC,
+            "gemv_f32_xbatch",
+        )?;
         let a_ptr = a.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
         let y_ptr = y.buf.as_ptr();
@@ -7759,70 +7761,6 @@ impl Gpu {
         result
     }
 
-    /// Split-K variant of [`Self::gemv_f32_xbatch`] for small-M/large-K
-    /// shapes (the Uno LoRA A side: M=rank 128, K=4096..12288). `y` MUST be
-    /// zeroed first — block partials atomicAdd into it. Splits = 8 gives
-    /// 1024 workgroups at rank 128, enough to cover the GPU.
-    pub fn gemv_f32_xbatch_splitk(
-        &mut self,
-        a: &GpuTensor,
-        x: &GpuTensor,
-        y: &GpuTensor,
-        m: usize,
-        k: usize,
-        b: usize,
-        splits: u32,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        debug_assert!((1..=8).contains(&b), "f32 xbatch batch {b} outside 1..=8");
-        self.ensure_kernel(
-            "gemv_f32_xbatch_splitk",
-            kernels::GEMV_F32_XBATCH_SRC,
-            "gemv_f32_xbatch_splitk",
-        )?;
-        self.hip.memset(&y.buf, 0, b * m * 4)?;
-        let a_ptr = a.buf.as_ptr();
-        let x_ptr = x.buf.as_ptr();
-        let y_ptr = y.buf.as_ptr();
-        let m_val = m as i32;
-        let k_val = k as i32;
-        let b_val = b as i32;
-        let splits_val = splits as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &a_ptr as *const _ as *mut c_void,
-            &x_ptr as *const _ as *mut c_void,
-            &y_ptr as *const _ as *mut c_void,
-            &m_val as *const _ as *mut c_void,
-            &k_val as *const _ as *mut c_void,
-            &b_val as *const _ as *mut c_void,
-            &splits_val as *const _ as *mut c_void,
-        ];
-        let bytes = m * k * 4 + b * (k * 4 + m * 4);
-        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_f32_xbatch_splitk", bytes);
-        let result = self.launch_maybe_blob(
-            "gemv_f32_xbatch_splitk",
-            [m as u32, splits, 1],
-            [32, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut blob = hip_bridge::KernargBlob::new();
-                blob.push_ptr(a_ptr);
-                blob.push_ptr(x_ptr);
-                blob.push_ptr(y_ptr);
-                blob.push_i32(m_val);
-                blob.push_i32(k_val);
-                blob.push_i32(b_val);
-                blob.push_i32(splits_val);
-                blob
-            },
-        );
-        if let Some(t) = timer {
-            t.finish(&self.hip);
-        }
-        result
-    }
-
     /// F16-weight twin of [`Self::gemv_f32_xbatch`] for the Uno LoRA weights
     /// (rank-128 A/B stored as __half; x/y stay F32, delta accumulates F32).
     pub fn gemv_f16_xbatch(
@@ -7836,8 +7774,17 @@ impl Gpu {
         accumulate: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        debug_assert!((1..=8).contains(&b), "f16 xbatch batch {b} outside 1..=8");
-        self.ensure_kernel("gemv_f16_xbatch", kernels::GEMV_F32_XBATCH_SRC, "gemv_f16_xbatch")?;
+        if !(1..=8).contains(&b) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!("f16 xbatch batch {b} outside 1..=8"),
+            ));
+        }
+        self.ensure_kernel(
+            "gemv_f16_xbatch",
+            kernels::GEMV_F32_XBATCH_SRC,
+            "gemv_f16_xbatch",
+        )?;
         let a_ptr = a.buf.as_ptr();
         let x_ptr = x.buf.as_ptr();
         let y_ptr = y.buf.as_ptr();
@@ -7871,67 +7818,6 @@ impl Gpu {
                 blob.push_i32(k_val);
                 blob.push_i32(b_val);
                 blob.push_i32(acc_val);
-                blob
-            },
-        );
-        if let Some(t) = timer {
-            t.finish(&self.hip);
-        }
-        result
-    }
-
-    /// F16-weight twin of [`Self::gemv_f32_xbatch_splitk`].
-    pub fn gemv_f16_xbatch_splitk(
-        &mut self,
-        a: &GpuTensor,
-        x: &GpuTensor,
-        y: &GpuTensor,
-        m: usize,
-        k: usize,
-        b: usize,
-        splits: u32,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        debug_assert!((1..=8).contains(&b), "f16 xbatch batch {b} outside 1..=8");
-        self.ensure_kernel(
-            "gemv_f16_xbatch_splitk",
-            kernels::GEMV_F32_XBATCH_SRC,
-            "gemv_f16_xbatch_splitk",
-        )?;
-        self.hip.memset(&y.buf, 0, b * m * 4)?;
-        let a_ptr = a.buf.as_ptr();
-        let x_ptr = x.buf.as_ptr();
-        let y_ptr = y.buf.as_ptr();
-        let m_val = m as i32;
-        let k_val = k as i32;
-        let b_val = b as i32;
-        let splits_val = splits as i32;
-        let mut params: Vec<*mut c_void> = vec![
-            &a_ptr as *const _ as *mut c_void,
-            &x_ptr as *const _ as *mut c_void,
-            &y_ptr as *const _ as *mut c_void,
-            &m_val as *const _ as *mut c_void,
-            &k_val as *const _ as *mut c_void,
-            &b_val as *const _ as *mut c_void,
-            &splits_val as *const _ as *mut c_void,
-        ];
-        let bytes = m * k * 2 + b * (k * 4 + m * 4);
-        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_f16_xbatch_splitk", bytes);
-        let result = self.launch_maybe_blob(
-            "gemv_f16_xbatch_splitk",
-            [m as u32, splits, 1],
-            [32, 1, 1],
-            0,
-            &mut params,
-            || {
-                let mut blob = hip_bridge::KernargBlob::new();
-                blob.push_ptr(a_ptr);
-                blob.push_ptr(x_ptr);
-                blob.push_ptr(y_ptr);
-                blob.push_i32(m_val);
-                blob.push_i32(k_val);
-                blob.push_i32(b_val);
-                blob.push_i32(splits_val);
                 blob
             },
         );
