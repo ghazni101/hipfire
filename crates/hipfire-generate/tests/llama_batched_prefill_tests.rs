@@ -21,22 +21,35 @@ use hipfire_generate::common::*;
     use hipfire_runtime::llama::ModelArch;
 
     #[test]
-    fn route_stays_inside_validated_qwen3_q8_envelope() {
+    fn route_stays_inside_validated_envelopes() {
+        // (arch, model, enabled, q8, eviction, tokens, v2_weights, expected)
+        // Qwen3: the original validated envelope. Llama: admitted only with
+        // all-V2 weights (K2-Horizon) — a plain-llama model keeps the
+        // per-token route, as does any non-V2 or gfx10 layout.
         let cases = [
-            ("gfx1100", ModelArch::Qwen3, true, true, false, 256, true),
-            ("gfx1201", ModelArch::Qwen3, true, true, false, 4, true),
-            ("gfx1200", ModelArch::Qwen3, true, true, false, 256, false),
-            ("gfx1100", ModelArch::Llama, true, true, false, 256, false),
-            ("gfx1100", ModelArch::Qwen3, true, false, false, 256, false),
-            ("gfx1100", ModelArch::Qwen3, true, true, true, 256, false),
-            ("gfx1100", ModelArch::Qwen3, true, true, false, 3, false),
-            ("gfx1100", ModelArch::Qwen3, false, true, false, 256, false),
+            ("gfx1100", ModelArch::Qwen3, true, true, false, 256, false, true),
+            ("gfx1201", ModelArch::Qwen3, true, true, false, 4, false, true),
+            ("gfx1200", ModelArch::Qwen3, true, true, false, 256, false, false),
+            ("gfx1100", ModelArch::Llama, true, true, false, 256, false, false),
+            ("gfx1100", ModelArch::Qwen3, true, false, false, 256, false, false),
+            ("gfx1100", ModelArch::Qwen3, true, true, true, 256, false, false),
+            ("gfx1100", ModelArch::Qwen3, true, true, false, 3, false, false),
+            ("gfx1100", ModelArch::Qwen3, false, true, false, 256, false, false),
+            // K2-Horizon: Llama arch + all-MQ4G256V2 weights.
+            ("gfx1100", ModelArch::Llama, true, true, false, 256, true, true),
+            ("gfx1201", ModelArch::Llama, true, true, false, 8, true, true),
+            ("gfx1100", ModelArch::Llama, true, true, false, 3, true, false),
+            ("gfx1100", ModelArch::Llama, true, false, false, 256, true, false),
+            ("gfx1100", ModelArch::Llama, true, true, true, 256, true, false),
+            ("gfx1030", ModelArch::Llama, true, true, false, 256, true, false),
         ];
-        for (arch, model, enabled, q8, eviction, tokens, expected) in cases {
+        for (arch, model, enabled, q8, eviction, tokens, v2, expected) in cases {
             assert_eq!(
-                llama_qwen3_batched_prefill_eligible(arch, model, enabled, q8, eviction, tokens,),
+                llama_qwen3_batched_prefill_eligible(
+                    arch, model, enabled, q8, eviction, tokens, v2,
+                ),
                 expected,
-                "arch={arch} model={model:?}",
+                "arch={arch} model={model:?} v2={v2}",
             );
         }
     }

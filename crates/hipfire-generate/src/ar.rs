@@ -1626,6 +1626,19 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
 }
 
 #[inline]
+/// Batched-prefill routing for the llama-family AR path. Two validated
+/// envelopes:
+/// - Qwen3 (the original one — see `route_stays_inside_validated_qwen3_q8_envelope`);
+/// - Llama-family models whose projections are ALL MQ4G256V2 (K2-Horizon,
+///   arch 16): the batched chunk body has first-class V2 arms
+///   (`batched_prefill_weight_ok`), the same chunk body the conditional-LoRA
+///   adapter/tree paths already run on K2 fixtures, and gfx11/gfx12 decode
+///   attention defaults to flash (mode 2) so the batched Q8 attention is the
+///   tiled kernel, not the legacy proportional-LDS one. Without this arm the
+///   whole model prefills through the per-token ladder — one full weight pass
+///   per prompt token — so time-to-first-token grows linearly with context
+///   forever. `forward_prefill_batch_capture` re-guards the weights and falls
+///   back per-token if the coarse `v2_weights` check here was too optimistic.
 pub fn llama_qwen3_batched_prefill_eligible(
     gpu_arch: &str,
     model_arch: llama::ModelArch,
@@ -1633,8 +1646,10 @@ pub fn llama_qwen3_batched_prefill_eligible(
     quant_q8: bool,
     has_eviction: bool,
     token_count: usize,
+    v2_weights: bool,
 ) -> bool {
-    model_arch == llama::ModelArch::Qwen3
+    (model_arch == llama::ModelArch::Qwen3
+        || (model_arch == llama::ModelArch::Llama && v2_weights))
         && (gpu_arch.starts_with("gfx11") || gpu_arch == "gfx1201")
         && prefill_batched_enabled
         && quant_q8
@@ -5051,6 +5066,10 @@ pub fn generate(
         let kv = &mut b.kv;
 
         let mut rng_state = request_seed;
+        let v2_weights = weights.layers.iter().all(|l| {
+            l.wq.gpu_dtype == rdna_compute::DType::MQ4G256V2
+                && l.w_gate.gpu_dtype == rdna_compute::DType::MQ4G256V2
+        });
         let batched_prefill = llama_qwen3_batched_prefill_eligible(
             &gpu.arch,
             config.arch,
@@ -5058,6 +5077,7 @@ pub fn generate(
             kv.quant_q8,
             has_eviction,
             new_tokens.len(),
+            v2_weights,
         );
         let (mut next_token, sampled_rng) = if batched_prefill {
             if let Err(e) = llama::forward_prefill_batch(
