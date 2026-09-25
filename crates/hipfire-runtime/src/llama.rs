@@ -2119,6 +2119,19 @@ pub fn mq4g256v2_window_batch_ok(arch: &str) -> bool {
     )
 }
 
+/// Batched-prefill weight eligibility shared by every entry that drives
+/// `forward_prefill_chunk` with more than one row: the historically validated
+/// batchable layouts, plus the MQ4G256V2 carve-out (rotate-once + xbatch GEMV
+/// at <= 8 rows, WMMA batched launcher above) that the conditional-adapter and
+/// tree-verify paths already run on gfx11/gfx12. `forward_prefill_batch`'s
+/// K2-Horizon (arch 16, grouped-RMSNorm llama, all-V2 weights) enablement
+/// rides on this: without the carve-out the whole model falls to the
+/// per-token ladder, which re-reads every weight once PER PROMPT TOKEN and
+/// makes prefill time grow linearly with context.
+pub fn batched_prefill_weight_ok(dt: DType, arch: &str) -> bool {
+    is_batchable_la(dt, arch) || (dt == DType::MQ4G256V2 && mq4g256v2_window_batch_ok(arch))
+}
+
 /// Project already-rotated rows through an MQ4G256V2 weight. n<=8 uses the
 /// x-batched GEMV (one weight read against all rows); larger windows take
 /// the WMMA residual launcher.
@@ -2404,13 +2417,9 @@ pub fn forward_prefill_batch_capture(
     let kv_ok =
         kv_cache.quant_q8 || kv_cache.quant_asym2 || kv_cache.quant_asym3 || kv_cache.quant_asym4;
     let weights_ok = weights.layers.iter().all(|l| {
-        is_batchable_la(l.wq.gpu_dtype, arch)
-            && is_batchable_la(l.wk.gpu_dtype, arch)
-            && is_batchable_la(l.wv.gpu_dtype, arch)
-            && is_batchable_la(l.wo.gpu_dtype, arch)
-            && is_batchable_la(l.w_gate.gpu_dtype, arch)
-            && is_batchable_la(l.w_up.gpu_dtype, arch)
-            && is_batchable_la(l.w_down.gpu_dtype, arch)
+        [l.wq.gpu_dtype, l.wk.gpu_dtype, l.wv.gpu_dtype, l.wo.gpu_dtype, l.w_gate.gpu_dtype,
+         l.w_up.gpu_dtype, l.w_down.gpu_dtype]
+            .iter().all(|dt| batched_prefill_weight_ok(*dt, arch))
     });
     let eligible = !force_fallback && n >= MIN_BATCH && kv_ok && weights_ok;
 
@@ -2553,7 +2562,6 @@ pub fn forward_prefill_batch_tree(
     // Same MQ4G256V2 carve-out as `forward_prefill_adapter_batch`: the chunk's
     // V2 projection arms (rotate-once + xbatch GEMV) are batch-size-agnostic,
     // so the Uno tree verify runs on K2 weights.
-    let v2_ok = |dt: DType| dt == DType::MQ4G256V2 && mq4g256v2_window_batch_ok(arch);
     let weights_ok = weights.layers.iter().all(|l| {
         [
             l.wq.gpu_dtype,
@@ -2565,7 +2573,7 @@ pub fn forward_prefill_batch_tree(
             l.w_down.gpu_dtype,
         ]
         .iter()
-        .all(|dt| is_batchable_la(*dt, arch) || v2_ok(*dt))
+        .all(|dt| batched_prefill_weight_ok(*dt, arch))
     });
     assert!(
         crate::config::get().prefill_batched && weights_ok,
@@ -2756,9 +2764,7 @@ pub fn forward_prefill_adapter_batch(
             ("up", &layer.w_up),
             ("down", &layer.w_down),
         ] {
-            if !is_batchable_la(w.gpu_dtype, &gpu.arch)
-                && !(w.gpu_dtype == DType::MQ4G256V2 && mq4g256v2_window_batch_ok(&gpu.arch))
-            {
+            if !batched_prefill_weight_ok(w.gpu_dtype, &gpu.arch) {
                 return Err(hip_bridge::HipError::new(0, &format!("conditional adapter batch unsupported projection: layer={index} projection={name} dtype={:?} arch={}", w.gpu_dtype, gpu.arch)));
             }
         }
