@@ -531,6 +531,9 @@ pub(crate) struct BenchArgs {
     /// Speculation mode to benchmark (off, dflash, mtp, ngram, dspark, or auto).
     #[arg(long = "spec")]
     speculation: Option<String>,
+    /// Conditional-LoRA Uno adapter directory, or a DFlash draft file.
+    #[arg(long, alias = "md")]
+    model_draft: Option<PathBuf>,
     /// Let the model think during the benchmark. Off by default: a reasoning
     /// model cannot close its `<think>` span inside the benchmark's token
     /// budget, and the daemon fails such a turn closed as a validation error.
@@ -2340,6 +2343,9 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     let mut content = String::new();
     let stream = !args.no_stream && !args.json;
     let done = engine.generate(&request, |event| {
+        if std::env::var_os("HIPFIRE_DUMP_EVENTS").is_some() {
+            eprintln!("EVT {event}");
+        }
         if event.get("type").and_then(serde_json::Value::as_str) == Some("token") {
             if let Some(text) = event.get("text").and_then(serde_json::Value::as_str) {
                 content.push_str(text);
@@ -4479,18 +4485,56 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
         // 16-token budget cannot close a think span, and letting the warmup
         // think would abort the run before a single measured sample.
         let _ = bench_generate(&mut engine, "Hello", 16)?;
-        let mut decode = Vec::new();
-        let mut prefill = Vec::new();
-        let mut wall = Vec::new();
-        let mut ttft = Vec::new();
-        let mut prompt_tokens: Option<u64> = None;
-        for _ in 0..args.runs {
-            let done = bench_generate_with_reasoning(
+        for _ in 0..args.warmups {
+            let _ = bench_generate_with_reasoning(
                 &mut engine,
                 &prompt,
                 args.max_tokens as u64,
                 args.reasoning_on,
             )?;
+        }
+        let mut decode = Vec::new();
+        let mut tau = Vec::new();
+        let mut output_md5 = Vec::new();
+        let mut token_ids: Vec<Vec<u64>> = Vec::new();
+        let mut prefill = Vec::new();
+        let mut wall = Vec::new();
+        let mut ttft = Vec::new();
+        let mut prompt_tokens: Option<u64> = None;
+        for _ in 0..args.runs {
+            let mut text = String::new();
+            let mut ids: Vec<u64> = Vec::new();
+            let request = bench_generate_request_reasoning(
+                &prompt,
+                args.max_tokens as u64,
+                args.reasoning_on,
+            );
+            let done = engine.generate(&request, |event| {
+                if std::env::var_os("HIPFIRE_DUMP_EVENTS").is_some() {
+                    eprintln!("EVT {event}");
+                }
+                // Identity evidence must cover every emitted channel: a
+                // reasoning-model turn whose think span never closes puts every
+                // token on `reasoning`, so hashing only `token` recorded md5("")
+                // on both sides and proved nothing.
+                if matches!(
+                    event.get("type").and_then(serde_json::Value::as_str),
+                    Some("token") | Some("reasoning")
+                ) {
+                    if let Some(piece) = event.get("text").and_then(serde_json::Value::as_str) {
+                        text.push_str(piece);
+                    }
+                }
+                if let Some(tok) = event.get("tok_id").and_then(serde_json::Value::as_u64) {
+                    ids.push(tok);
+                }
+                Ok(())
+            })?;
+            output_md5.push(format!("{:x}", md5::compute(text.as_bytes())));
+            token_ids.push(ids);
+            if let Some(value) = done.get("tau").and_then(serde_json::Value::as_f64) {
+                tau.push(value);
+            }
             // Every run uses the same prompt, so the daemon's tokenized
             // prompt length is run-invariant; keep the first report. The
             // done event reports the prompt as `prefill_tokens` (rows the
@@ -4544,11 +4588,15 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
             "prompt_md5": prompt_md5,
             "prompt_chars": prompt_chars,
             "warnings": warnings,
+            "warmups": args.warmups,
             "decode_tok_s": sample_stats(&decode),
+            "tau": sample_stats(&tau),
+            "output_md5": output_md5,
+            "token_ids": token_ids,
             "prefill_tok_s": sample_stats(&prefill),
             "wall_tok_s": sample_stats(&wall),
             "ttft_ms": sample_stats(&ttft),
-            "samples": { "decode": decode, "prefill": prefill, "wall": wall, "ttft_ms": ttft },
+            "samples": { "decode": decode, "prefill": prefill, "wall": wall, "ttft_ms": ttft, "tau": tau },
         });
         if args.json {
             println!("{}", serde_json::to_string_pretty(&report)?);
@@ -4851,6 +4899,19 @@ fn open_bench_engine(
     if let Some(selector) = args.speculation.as_deref() {
         apply_speculation_selector(&mut params, selector)?;
     }
+    if let Some(draft) = &args.model_draft {
+        if !draft.is_file()
+            && !(draft.is_dir()
+                && draft.join("adapter_config.json").is_file()
+                && draft.join("adapter_model.safetensors").is_file())
+        {
+            bail!("draft model or Uno adapter not found: {}", draft.display());
+        }
+        params["draft"] = serde_json::json!(draft.display().to_string());
+        if args.speculation.is_none() {
+            apply_speculation_selector(&mut params, "dflash")?;
+        }
+    }
     // Registry sidecar for a final auto/on selector the config-time
     // load_params could not see (config-off + `bench --spec dflash`).
     resolve_dflash_sidecar(
@@ -4908,6 +4969,27 @@ fn open_bench_engine(
 /// a thought inside an arbitrary budget. `--reasoning-on` restores the
 /// thinking turn for anyone who wants to measure that path — with a budget
 /// large enough to close the span.
+/// Repetition penalty for the standard bench request.
+///
+/// A multiplicative penalty is part of the AR sampling law: AR divides the
+/// logits of recently-seen tokens before its argmax. The speculative verifier
+/// has no penalty input at all (`SpecRequestConfig` carries temp/top_p/top_k/
+/// min_p/`cactus_delta` only), so it computes an unpenalised argmax. Whenever
+/// this is not 1.0 the two sides are therefore decoding DIFFERENT distributions
+/// and no token-identity or throughput comparison between them is valid — with
+/// the historical hardcoded 1.1 this model rambles to the token cap on the
+/// answer-mode prompt instead of answering. 1.0 makes the two laws identical.
+///
+/// Default 1.1 preserves the historical bench behaviour; override with
+/// `HIPFIRE_BENCH_REPEAT_PENALTY` (set identically on both sides of an A/B).
+fn bench_repeat_penalty() -> f64 {
+    hipfire_config::developer_var("HIPFIRE_BENCH_REPEAT_PENALTY")
+        .ok()
+        .and_then(|s| s.parse::<f64>().ok())
+        .filter(|v| (1.0..=3.0).contains(v))
+        .unwrap_or(1.1)
+}
+
 fn bench_generate_request(prompt: &str, max_tokens: u64) -> serde_json::Value {
     bench_generate_request_reasoning(prompt, max_tokens, false)
 }
@@ -4923,7 +5005,7 @@ fn bench_generate_request_reasoning(
         "prompt": prompt,
         "temperature": 0.0,
         "top_p": 1.0,
-        "repeat_penalty": 1.1,
+        "repeat_penalty": bench_repeat_penalty(),
         "max_tokens": max_tokens,
         "attempt_id": 1,
     });
@@ -5154,6 +5236,7 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             kv_backend: None,
             redline: false,
             speculation: None,
+            model_draft: None,
             reasoning_on: false,
             concurrency: None,
             backend: "both".to_owned(),
@@ -11056,6 +11139,7 @@ mod tests {
             kv_backend: None,
             redline: false,
             speculation: None,
+            model_draft: None,
             reasoning_on: false,
             concurrency: None,
             backend: "both".to_owned(),

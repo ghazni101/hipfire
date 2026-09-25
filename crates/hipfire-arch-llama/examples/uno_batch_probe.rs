@@ -42,16 +42,48 @@ fn main() {
         embedding_lookup_dispatch(gpu, weights.embd_format, &weights.token_embd, &ar_scratch.x, token, config.dim).unwrap();
         gpu.hip.memcpy_htod(&ar_scratch.pos_buf, &(pos as i32).to_ne_bytes()).unwrap();
         forward_scratch_compute(gpu, &weights, &config, pos, &mut ar_kv, &ar_scratch).unwrap();
-        pick(&gpu.download_f32(&ar_scratch.logits).unwrap())
+        gpu.download_f32(&ar_scratch.logits).unwrap()
     };
-    let prompt = "<|ifm|im_start|>user\nSolve 2+2.<|ifm|im_end|><|ifm|im_start|>assistant\n<ifm|think_faster>\n";
+    let prompt_owned;
+    let prompt: &str = match std::env::var("HIPFIRE_UNO_PROBE_PROMPT") {
+        Ok(path) => {
+            prompt_owned = std::fs::read_to_string(&path)
+                .unwrap_or_else(|e| panic!("{path}: {e}"));
+            &prompt_owned
+        }
+        Err(_) => "<|ifm|im_start|>user\nSolve 2+2.<|ifm|im_end|><|ifm|im_start|>assistant\n<ifm|think_faster>\n",
+    };
     let mut prompt_tokens = vec![config.bos_token];
     prompt_tokens.extend(tokenizer.encode(prompt));
     let mut seed = 0;
+    let mut worst_gap = f32::INFINITY;
+    let mut worst_pos = 0usize;
+    let mut worst_abs = 0.0f32;
     for (pos, &token) in prompt_tokens.iter().enumerate() {
-        seed = pick(&uno_forward_row(&mut gpu, &weights, &config, &uno, token, pos, false, &mut kv, &scratch, &mut lora).unwrap());
-        assert_eq!(seed, ar(&mut gpu, token, pos), "prefill mismatch at {pos}");
+        let row_l = uno_forward_row(&mut gpu, &weights, &config, &uno, token, pos, false, &mut kv, &scratch, &mut lora).unwrap();
+        // Same token through the AR path; the raw logits expose whether a
+        // mismatch is a near-tie (numerics) or a wide-gap flip (a real bug).
+        let row_r = ar(&mut gpu, token, pos);
+        let a = pick(&row_l);
+        let b = pick(&row_r);
+        // Top-2 gap of each side, and the largest absolute logit difference.
+        let gap = |v: &[f32]| {
+            let mut top = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+            for &x in v.iter() {
+                if x > top.0 { top.1 = top.0; top.0 = x; } else if x > top.1 { top.1 = x; }
+            }
+            top.0 - top.1
+        };
+        let ma = row_l.iter().zip(row_r.iter()).map(|(x, y)| (x - y).abs()).fold(0.0f32, f32::max);
+        if a != b && gap(&row_r).min(gap(&row_l)) < worst_gap {
+            worst_gap = gap(&row_r).min(gap(&row_l));
+            worst_pos = pos;
+            worst_abs = ma;
+        }
+        seed = a;
+        assert_eq!(a, b, "prefill mismatch at {pos}: uno={a} ar={b} gap_uno={:.4} gap_ar={:.4} max_abs={ma}", gap(&row_l), gap(&row_r));
     }
+    eprintln!("[prefill] worst mismatch: pos={worst_pos} min_gap={worst_gap:.4} max_abs={worst_abs}");
     let mut position = prompt_tokens.len();
     let mut uno_tokens = vec![seed];
     let mut base_tokens = vec![seed];
@@ -84,7 +116,24 @@ fn main() {
         let drafts: Vec<u32> = logits.chunks_exact(config.vocab_size).skip(1).map(pick).collect();
         let verify: Vec<u32> = std::iter::once(clean).chain(drafts.iter().copied()).collect();
         let target_picks: Vec<u32> = if batched {
-            uno_forward_batch(&mut gpu, &weights, &config, None, &verify, position + 1, &mut kv, &scratch, &batch).unwrap().chunks_exact(config.vocab_size).map(pick).collect()
+            let candidate = uno_forward_batch(&mut gpu, &weights, &config, None, &verify, position + 1, &mut kv, &scratch, &batch).unwrap();
+            // Verify rows are where spec-decode divergences actually surface, and
+            // unlike the draft rows above they were never compared batched-vs-
+            // scalar. Measure them: this is the quantity that decides whether the
+            // window's committed token matches the per-token AR decode.
+            for (row, &token) in verify.iter().enumerate() {
+                let a = uno_forward_row(&mut gpu, &weights, &config, &uno, token, position + 1 + row, false, &mut kv, &scratch, &mut lora).unwrap();
+                let b = &candidate[row * config.vocab_size..(row + 1) * config.vocab_size];
+                let max_error = a.iter().zip(b).map(|(a, b)| (a - b).abs()).fold(0.0f32, f32::max);
+                let rms = (a.iter().zip(b).map(|(a, b)| f64::from(a - b).powi(2)).sum::<f64>() / a.len() as f64).sqrt();
+                // Top-2 gap of the batched row, to compare against the delta.
+                let mut top = (f32::NEG_INFINITY, f32::NEG_INFINITY);
+                for &v in b.iter() {
+                    if v > top.0 { top.1 = top.0; top.0 = v; } else if v > top.1 { top.1 = v; }
+                }
+                println!("verify window={window} row={row} max_abs={max_error} rms={rms} gap={:.4} scalar={} batch={}", top.0 - top.1, pick(&a), pick(b));
+            }
+            candidate.chunks_exact(config.vocab_size).map(pick).collect()
         } else {
             verify.iter().enumerate().map(|(row, &token)| pick(&uno_forward_row(&mut gpu, &weights, &config, &uno, token, position + 1 + row, false, &mut kv, &scratch, &mut lora).unwrap())).collect()
         };
@@ -94,7 +143,7 @@ fn main() {
         let step = SpecStep::new(emit, next_seed, drafts.len(), verdict.accepted);
         let mut previous = seed;
         for (row, &token) in step.emit.iter().enumerate() {
-            let expected = ar(&mut gpu, previous, position + row);
+            let expected = pick(&ar(&mut gpu, previous, position + row));
             uno_tokens.push(token);
             base_tokens.push(expected);
             println!("token pos={} base={expected} uno={token} base_text={:?} uno_text={:?}", position + row + 1, tokenizer.decode(&[expected]), tokenizer.decode(&[token]));

@@ -1627,11 +1627,9 @@ pub fn weight_gemm(
             // one 16-lane N-tile and underfills the GPU; the x-batched GEMV
             // reads the weight once against all rows at the scalar kernel's
             // bandwidth, bit-exact per row.
-            let r = if batch_size <= 8 {
-                gpu.gemv_mq4g256v2_xbatch(&w.buf, &x_rot, y, w.m, w.k, batch_size)
-            } else {
-                gpu.gemm_mq4g256v2_batched_lmhead(&w.buf, &x_rot, y, w.m, w.k, batch_size)
-            };
+            // Shared helper stays on the WMMA launcher. K2 window rows call
+            // gemv_mq4g256v2_xbatch from the prefill arms below.
+            let r = gpu.gemm_mq4g256v2_batched_lmhead(&w.buf, &x_rot, y, w.m, w.k, batch_size);
             gpu.free_tensor(x_rot)?;
             r
         }
@@ -2083,6 +2081,50 @@ pub fn gemm_rotates_internally(dt: DType) -> bool {
     )
 }
 
+/// MQ4G256V2 window projections (rotate-once + xbatch GEMV for n<=8, WMMA
+/// residual for n>8) run on RDNA3/RDNA4. `is_batchable_la` still refuses V2
+/// so generic llama prefill stays per-token; Uno adapter/tree verify use
+/// this carve-out. gfx1101-only was bring-up — gfx1100 is the same wave32
+/// WMMA ISA and the xbatch kernels are not arch-specialized.
+pub fn mq4g256v2_window_batch_ok(arch: &str) -> bool {
+    matches!(
+        arch,
+        "gfx1100" | "gfx1101" | "gfx1102" | "gfx1150" | "gfx1151" | "gfx1200" | "gfx1201"
+    )
+}
+
+/// Project already-rotated rows through an MQ4G256V2 weight. n<=8 uses the
+/// x-batched GEMV (one weight read against all rows); larger windows take
+/// the WMMA residual launcher.
+pub fn mq4g256v2_window_project(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x_rot: &GpuTensor,
+    y: &GpuTensor,
+    n: usize,
+) -> HipResult<()> {
+    if n <= 8 {
+        gpu.gemv_mq4g256v2_xbatch(&w.buf, x_rot, y, w.m, w.k, n)
+    } else {
+        gpu.gemm_mq4g256v2_batched_lmhead(&w.buf, x_rot, y, w.m, w.k, n)
+    }
+}
+
+/// Rotate original-basis rows then project. `x_rot` is persistent scratch
+/// (`PrefillBatchScratch::v2_rot`); this must not hipMalloc on the hot path.
+pub fn mq4g256v2_window_rotate_project(
+    gpu: &mut Gpu,
+    w: &WeightTensor,
+    x: &GpuTensor,
+    y: &GpuTensor,
+    x_rot: &GpuTensor,
+    n: usize,
+) -> HipResult<()> {
+    gpu.ensure_mq_signs()?;
+    rotate_x_mq_batched_for(gpu, w, x, x_rot, w.k, n)?;
+    mq4g256v2_window_project(gpu, w, x_rot, y, n)
+}
+
 /// Per-call scratch for `forward_prefill_batch`. Holds [N × ...] working
 /// buffers reused across the per-layer loop. Sized once per model from
 /// `LlamaConfig` and reused across cycles by callers that retain it.
@@ -2115,6 +2157,11 @@ pub struct PrefillBatchScratch {
     // Flash-attention partial-result scratch (sized to support max_batch
     // tokens × n_heads × max_tiles × (2 + head_dim)).
     pub flash_partials: GpuTensor,
+
+    // Persistent MQ4G256V2 rotate dest [max_batch × max(dim, hidden, q)].
+    // The V2 window arms used to hipMalloc this every layer; that device-syncs
+    // and leaves the GPU idle between projections.
+    pub v2_rot: GpuTensor,
 }
 
 impl PrefillBatchScratch {
@@ -2159,6 +2206,7 @@ impl PrefillBatchScratch {
             up_batch: gpu.alloc_tensor(&[max_batch * hidden_dim], DType::F32)?,
             ffn_hidden_batch: gpu.alloc_tensor(&[max_batch * hidden_dim], DType::F32)?,
             flash_partials: gpu.alloc_tensor(&[partials_size], DType::F32)?,
+            v2_rot: gpu.alloc_tensor(&[max_batch * hidden_dim.max(dim).max(q_dim)], DType::F32)?,
         })
     }
 
@@ -2177,6 +2225,7 @@ impl PrefillBatchScratch {
             self.up_batch,
             self.ffn_hidden_batch,
             self.flash_partials,
+            self.v2_rot,
         ] {
             let _ = gpu.free_tensor(t);
         }
@@ -2465,7 +2514,7 @@ pub fn forward_prefill_batch_tree(
     // Same MQ4G256V2 carve-out as `forward_prefill_adapter_batch`: the chunk's
     // V2 projection arms (rotate-once + xbatch GEMV) are batch-size-agnostic,
     // so the Uno tree verify runs on K2 weights.
-    let v2_ok = |dt: DType| dt == DType::MQ4G256V2 && arch == "gfx1101";
+    let v2_ok = |dt: DType| dt == DType::MQ4G256V2 && mq4g256v2_window_batch_ok(arch);
     let weights_ok = weights.layers.iter().all(|l| {
         [l.wq.gpu_dtype, l.wk.gpu_dtype, l.wv.gpu_dtype, l.wo.gpu_dtype,
          l.w_gate.gpu_dtype, l.w_up.gpu_dtype, l.w_down.gpu_dtype]
@@ -2618,13 +2667,13 @@ pub fn forward_prefill_adapter_batch(
     }
     for (index, layer) in weights.layers.iter().enumerate() {
         for (name, w) in [("q", &layer.wq), ("k", &layer.wk), ("v", &layer.wv), ("o", &layer.wo), ("gate", &layer.w_gate), ("up", &layer.w_up), ("down", &layer.w_down)] {
-            if !is_batchable_la(w.gpu_dtype, &gpu.arch) && !(w.gpu_dtype == DType::MQ4G256V2 && gpu.arch == "gfx1101") {
+            if !is_batchable_la(w.gpu_dtype, &gpu.arch) && !(w.gpu_dtype == DType::MQ4G256V2 && mq4g256v2_window_batch_ok(&gpu.arch)) {
                 return Err(hip_bridge::HipError::new(0, &format!("conditional adapter batch unsupported projection: layer={index} projection={name} dtype={:?} arch={}", w.gpu_dtype, gpu.arch)));
             }
         }
     }
     forward_prefill_chunk(gpu, weights, config, tokens, start_pos, kv,
-        scratch, pbs, None, false, None, hook)
+        scratch, pbs, None, true, None, hook)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2741,7 +2790,7 @@ fn forward_prefill_chunk(
     }
 
     let max_ctx_len = if gpu.graphs.capture_mode {
-        kv_cache.physical_cap
+        gpu.graphs.capture_max_ctx.unwrap_or(kv_cache.physical_cap)
     } else {
         start_pos + n
     };
@@ -2807,21 +2856,13 @@ fn forward_prefill_chunk(
             // Shared-input site: rotate the normed activations ONCE, then one
             // launch per projection (each weight read once). xbatch covers the
             // spec-window sizes (<= 8 rows); bigger batches take the WMMA
-            // batched-lmhead launcher.
+            // batched-lmhead launcher. Rotate dest is persistent (v2_rot).
             gpu.ensure_mq_signs()?;
-            let x_rot = gpu.alloc_tensor(&[n, dim], DType::F32)?;
+            let x_rot = pbs.v2_rot.sub_offset(0, n * dim);
             rotate_x_mq_batched_for(gpu, &layer.wq, &pbs.x_rot_batch, &x_rot, dim, n)?;
-            let r = if n <= 8 {
-                gpu.gemv_mq4g256v2_xbatch(&layer.wq.buf, &x_rot, &pbs.fa_q_batch, layer.wq.m, dim, n)
-                    .and_then(|_| gpu.gemv_mq4g256v2_xbatch(&layer.wk.buf, &x_rot, &pbs.fa_k_batch, layer.wk.m, dim, n))
-                    .and_then(|_| gpu.gemv_mq4g256v2_xbatch(&layer.wv.buf, &x_rot, &pbs.fa_v_batch, layer.wv.m, dim, n))
-            } else {
-                gpu.gemm_mq4g256v2_batched_lmhead(&layer.wq.buf, &x_rot, &pbs.fa_q_batch, layer.wq.m, dim, n)
-                    .and_then(|_| gpu.gemm_mq4g256v2_batched_lmhead(&layer.wk.buf, &x_rot, &pbs.fa_k_batch, layer.wk.m, dim, n))
-                    .and_then(|_| gpu.gemm_mq4g256v2_batched_lmhead(&layer.wv.buf, &x_rot, &pbs.fa_v_batch, layer.wv.m, dim, n))
-            };
-            gpu.free_tensor(x_rot)?;
-            r?;
+            mq4g256v2_window_project(gpu, &layer.wq, &x_rot, &pbs.fa_q_batch, n)?;
+            mq4g256v2_window_project(gpu, &layer.wk, &x_rot, &pbs.fa_k_batch, n)?;
+            mq4g256v2_window_project(gpu, &layer.wv, &x_rot, &pbs.fa_v_batch, n)?;
         } else if qkv_is_hfq4g128 {
             debug_assert!(
                 matches!(layer.wk.gpu_dtype, DType::HFQ4G128)
@@ -3271,7 +3312,8 @@ fn forward_prefill_chunk(
         };
         if layer.wo.gpu_dtype == DType::MQ4G256V2 {
             let projected = pbs.x_rot_batch.sub_offset(0, n * layer.wo.m);
-            weight_gemm(gpu, &layer.wo, &pbs.fa_attn_out_batch, &projected, n)?;
+            let x_rot = pbs.v2_rot.sub_offset(0, n * layer.wo.k);
+            mq4g256v2_window_rotate_project(gpu, &layer.wo, wo_input, &projected, &x_rot, n)?;
             gpu.add_inplace_f32(&pbs.x_batch.sub_offset(0, n * dim), &projected)?;
         } else if wo_is_hfq4g128 {
             // The generic G128 GEMM has overwrite semantics. Reuse x_rot_batch
@@ -3387,19 +3429,12 @@ fn forward_prefill_chunk(
         }
         if layer.w_gate.gpu_dtype == DType::MQ4G256V2 {
             // Shared-input site: one rotation feeds both gate and up (same
-            // xbatch/WMMA size split as the QKV arm above).
+            // xbatch/WMMA size split as the QKV arm above). Persistent v2_rot.
             gpu.ensure_mq_signs()?;
-            let x_rot = gpu.alloc_tensor(&[n, dim], DType::F32)?;
+            let x_rot = pbs.v2_rot.sub_offset(0, n * dim);
             rotate_x_mq_batched_for(gpu, &layer.w_gate, &pbs.x_rot_batch, &x_rot, dim, n)?;
-            let r = if n <= 8 {
-                gpu.gemv_mq4g256v2_xbatch(&layer.w_gate.buf, &x_rot, &pbs.gate_ffn_batch, layer.w_gate.m, dim, n)
-                    .and_then(|_| gpu.gemv_mq4g256v2_xbatch(&layer.w_up.buf, &x_rot, &pbs.up_batch, layer.w_up.m, dim, n))
-            } else {
-                gpu.gemm_mq4g256v2_batched_lmhead(&layer.w_gate.buf, &x_rot, &pbs.gate_ffn_batch, layer.w_gate.m, dim, n)
-                    .and_then(|_| gpu.gemm_mq4g256v2_batched_lmhead(&layer.w_up.buf, &x_rot, &pbs.up_batch, layer.w_up.m, dim, n))
-            };
-            gpu.free_tensor(x_rot)?;
-            r?;
+            mq4g256v2_window_project(gpu, &layer.w_gate, &x_rot, &pbs.gate_ffn_batch, n)?;
+            mq4g256v2_window_project(gpu, &layer.w_up, &x_rot, &pbs.up_batch, n)?;
         } else if ffn_is_hfq4g128 {
             debug_assert!(
                 matches!(layer.w_up.gpu_dtype, DType::HFQ4G128),
@@ -3536,7 +3571,8 @@ fn forward_prefill_chunk(
         }
         if layer.w_down.gpu_dtype == DType::MQ4G256V2 {
             let projected = pbs.gate_ffn_batch.sub_offset(0, n * layer.w_down.m);
-            weight_gemm(gpu, &layer.w_down, &pbs.ffn_hidden_batch, &projected, n)?;
+            let x_rot = pbs.v2_rot.sub_offset(0, n * layer.w_down.k);
+            mq4g256v2_window_rotate_project(gpu, &layer.w_down, &pbs.ffn_hidden_batch, &projected, &x_rot, n)?;
             gpu.add_inplace_f32(&pbs.x_batch.sub_offset(0, n * dim), &projected)?;
         } else if w_down_is_hfq4g128 {
             // gate_ffn_batch is dead after silu_mul and is larger than the
@@ -8562,13 +8598,10 @@ mod tests {
 
     #[test]
     fn is_batchable_la_mq4_v2_refused_everywhere() {
-        // `forward_prefill_chunk` has no V2 arms (its `qkv_is_mq` ~:2570,
-        // `wo_is_mq` ~:3025, `ffn_is_mq` ~:3117, `w_down_is_mq` ~:3248
-        // matchers list only V1 dtypes), so llama must refuse MQ4G256V2 and
-        // MQ4CG256 on EVERY arch — including gfx11/gfx12 — and stay on
-        // per-token decode. qwen35's chunk path has the arms and keeps the
-        // shared `mqv2_wmma_batchable` rule; see
-        // `qwen35_is_batchable_la_mq4_v2_gfx11_and_gfx12` for the admit side.
+        // Generic llama prefill still refuses V2 (window arms are the Uno
+        // adapter/tree carve-out via `mq4g256v2_window_batch_ok`). qwen35's
+        // chunk path has the arms and keeps the shared `mqv2_wmma_batchable`
+        // rule; see `qwen35_is_batchable_la_mq4_v2_gfx11_and_gfx12`.
         for arch in [
             "gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201", "gfx1010",
             "gfx1030", "gfx942",
@@ -8581,6 +8614,16 @@ mod tests {
                 !is_batchable_la(DType::MQ4CG256, arch),
                 "MQ4CG256 must fall back on {arch}"
             );
+        }
+    }
+
+    #[test]
+    fn mq4g256v2_window_batch_ok_rdna3_rdna4() {
+        for arch in ["gfx1100", "gfx1101", "gfx1102", "gfx1150", "gfx1151", "gfx1200", "gfx1201"] {
+            assert!(mq4g256v2_window_batch_ok(arch), "{arch} must admit V2 windows");
+        }
+        for arch in ["gfx1010", "gfx1030", "gfx942", "gfx900"] {
+            assert!(!mq4g256v2_window_batch_ok(arch), "{arch} must refuse V2 windows");
         }
     }
 

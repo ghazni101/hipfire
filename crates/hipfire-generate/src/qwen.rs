@@ -2681,6 +2681,14 @@ pub fn generate_dflash(
     // Min-p floor. 0.0 disables. Installed on SpecRequestConfig for MTP;
     // DFlash route selection still sends min_p requests to AR.
     min_p: f32,
+    // Repetition/presence/frequency penalties and the repeat window. These are
+    // part of AR's sampling law (AR scales the logits before its argmax), and
+    // the shipped repeat_penalty default is 1.05, so the verifier must apply the
+    // identical law or spec output is not token-identical to AR.
+    repeat_penalty: f32,
+    repeat_window: usize,
+    presence_penalty: f32,
+    frequency_penalty: f32,
     // Cactus-style acceptance bump. 0.0 → lossless (distribution-preserving).
     // >0 → deliberately lossy (KL-bounded τ-for-correctness tradeoff). The
     // daemon hardcodes 0.0; the param exists only so a future opt-in request
@@ -3111,6 +3119,10 @@ pub fn generate_dflash(
             top_p,
             top_k,
             min_p,
+            repeat_penalty,
+            repeat_window,
+            presence_penalty,
+            frequency_penalty,
             cactus_delta,
             rng_seed: request_seed,
             allow_ngram_modifier: spec_name == "mtp"
@@ -3869,6 +3881,23 @@ pub fn generate_spec(
             return None;
         }
     };
+    if let Some(msg) = spec.admission_error() {
+        crate::ar::emit_active_route_error(stdout, Some(id), msg, "validation", false, false);
+        let _ = stdout.flush();
+        return None;
+    }
+    if emit_req.enable_grammar && !spec.supports_grammar() {
+        crate::ar::emit_active_route_error(
+            stdout,
+            Some(id),
+            "Uno does not support grammar or JSON schema",
+            "validation",
+            false,
+            false,
+        );
+        let _ = stdout.flush();
+        return None;
+    }
     let prefill_outcome = spec.prefill(
         gpu,
         slot,
@@ -4905,7 +4934,31 @@ pub fn generate_spec(
     // differs per arch (qwen35: `dflash`/`tau`/`cycles` + ChatML token-replay
     // cache; ds4: `spec_k`/`spec_windows`/`spec_accept_pct`), so this core
     // returns a `SpecRun` summary instead of writing them itself.
-    let finish = emit.finish();
+    let mut finish = emit.finish();
+    // A think span still open when *we* stopped the model is not malformed
+    // output: the turn was truncated mid-thought, either at the token cap
+    // (`semantic_stop == None`) or by the emitter's think-cap hard stop
+    // (`ThinkCap`). On the llama route (K2-Horizon) the model's template opens
+    // the think span, so even a 128-token budget routinely ends inside it — and
+    // that arch's own AR path reports `length` for exactly that token stream
+    // (LlamaAr has no open-think guard). Failing the spec route closed on the
+    // same stream made the two producers disagree, so the llama route keeps the
+    // truncation visible as `length` instead. The Qwen route keeps its
+    // fail-closed contract, where the AR path errors identically.
+    let stopped_mid_think = matches!(semantic_stop, None | Some(StopReason::ThinkCap));
+    let llama_route = hipfire_loader::carrier_for(m.arch_id)
+        .map(|c| c.caps().is_llama_dflash())
+        .unwrap_or(false);
+    if finish.open_think && !finish.decoded_eot && stopped_mid_think && llama_route {
+        if hipfire_config::developer_var("HIPFIRE_UNO_TERMINAL_DEBUG").is_ok() {
+            eprintln!(
+                "[spec-terminal] llama route: unclosed think span at stop {semantic_stop:?} \
+                 (generated {generated}/{max_tokens}) — reporting length"
+            );
+        }
+        finish.open_think = false;
+        finish.finish_reason = "length";
+    }
     // Open-think / malformed finish reasons also need a truthful rollback when
     // grammar did not already reset (state may still be baked).
     if fail_closed_rollback.is_none()

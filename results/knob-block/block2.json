@@ -1,0 +1,124 @@
+{
+  "protocol": "native-generate-v1",
+  "model": "/models/hipfire/IFM/K2-Horizon-7B-MQ4/k2-horizon-7b.mq4",
+  "loaded": {
+    "type": "loaded",
+    "arch": "qwen3",
+    "dim": 4096,
+    "layers": 36,
+    "vocab": 250624,
+    "vl": false,
+    "reasoning_contract": "unsupported",
+    "reasoning_effort_native": false,
+    "reasoning_efforts": [],
+    "cache_capable": false,
+    "retry_reset_eligible": false,
+    "continuous_batch_capable": false
+  },
+  "gpu": {
+    "type": "diag",
+    "arch": "gfx1100",
+    "hip_version": "7.15",
+    "vram_free_mb": 15692,
+    "vram_total_mb": 24560,
+    "model_loaded": true,
+    "model_arch": "qwen3",
+    "kernels": 0,
+    "kernel_hashes": 0
+  },
+  "vram_free_before_mb": 24520,
+  "max_tokens": 128,
+  "runs": 5,
+  "batch": 1,
+  "prompt_tokens": 527,
+  "prompt_md5": "c77d12df7ff421ee819ff76d2bb6abc6",
+  "prompt_chars": 2508,
+  "warnings": [],
+  "warmups": 3,
+  "decode_tok_s": {
+    "median": 74.8,
+    "mean": 74.83999999999999,
+    "min": 74.8,
+    "max": 74.9,
+    "stdev": 0.04898979485566774
+  },
+  "tau": {
+    "median": 0.65,
+    "mean": 0.65,
+    "min": 0.65,
+    "max": 0.65,
+    "stdev": 0.0
+  },
+  "output_md5": [
+    "ca58558a3c874f08ea6822c0926c6cfb",
+    "ca58558a3c874f08ea6822c0926c6cfb",
+    "ca58558a3c874f08ea6822c0926c6cfb",
+    "ca58558a3c874f08ea6822c0926c6cfb",
+    "ca58558a3c874f08ea6822c0926c6cfb"
+  ],
+  "token_ids": [
+    [],
+    [],
+    [],
+    [],
+    []
+  ],
+  "prefill_tok_s": {
+    "median": 87.4,
+    "mean": 87.38,
+    "min": 87.3,
+    "max": 87.5,
+    "stdev": 0.07483314773548065
+  },
+  "wall_tok_s": {
+    "median": 16.5,
+    "mean": 16.52,
+    "min": 16.5,
+    "max": 16.6,
+    "stdev": 0.04000000000000057
+  },
+  "ttft_ms": {
+    "median": 6033.1,
+    "mean": 6032.5,
+    "min": 6023.4,
+    "max": 6038.6,
+    "stdev": 5.156355301955229
+  },
+  "samples": {
+    "decode": [
+      74.9,
+      74.9,
+      74.8,
+      74.8,
+      74.8
+    ],
+    "prefill": [
+      87.5,
+      87.4,
+      87.4,
+      87.3,
+      87.3
+    ],
+    "wall": [
+      16.6,
+      16.5,
+      16.5,
+      16.5,
+      16.5
+    ],
+    "ttft_ms": [
+      6023.4,
+      6031.5,
+      6033.1,
+      6038.6,
+      6035.9
+    ],
+    "tau": [
+      0.65,
+      0.65,
+      0.65,
+      0.65,
+      0.65
+    ]
+  }
+}

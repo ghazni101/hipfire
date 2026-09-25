@@ -104,6 +104,10 @@ pub struct GraphState {
     // AR forward (single-slot)
     pub capture_mode: bool,
     pub capture_blobs: Vec<Vec<u8>>,
+    /// When capturing, attention LDS/loop bound. None → physical_cap (too
+    /// large for the LDS Q8 kernel). Uno windows set this to a short-ctx cap
+    /// so replay stays numerically causal via positions[].
+    pub capture_max_ctx: Option<usize>,
     pub graph_exec: Option<GraphExec>,
     pub captured_graph: Option<Graph>,
     /// Kernarg blobs OWNED by the captured AR graph. Drained out of the shared

@@ -1378,6 +1378,7 @@ impl Gpu {
             graphs: crate::graph::GraphState {
                 capture_mode: false,
                 capture_blobs: Vec::new(),
+                capture_max_ctx: None,
                 graph_exec: None,
                 captured_graph: None,
                 ar_forward_blobs: Vec::new(),

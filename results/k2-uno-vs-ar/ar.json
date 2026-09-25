@@ -1,0 +1,112 @@
+{
+  "protocol": "native-generate-v1",
+  "model": "/models/hipfire/IFM/K2-Horizon-7B-MQ4/k2-horizon-7b.mq4",
+  "loaded": {
+    "type": "loaded",
+    "arch": "qwen3",
+    "dim": 4096,
+    "layers": 36,
+    "vocab": 250624,
+    "vl": false,
+    "reasoning_contract": "unsupported",
+    "reasoning_effort_native": false,
+    "reasoning_efforts": [],
+    "cache_capable": false,
+    "retry_reset_eligible": false,
+    "continuous_batch_capable": false
+  },
+  "gpu": {
+    "type": "diag",
+    "arch": "gfx1100",
+    "hip_version": "7.15",
+    "vram_free_mb": 16536,
+    "vram_total_mb": 24560,
+    "model_loaded": true,
+    "model_arch": "qwen3",
+    "kernels": 0,
+    "kernel_hashes": 0
+  },
+  "vram_free_before_mb": 24520,
+  "max_tokens": 128,
+  "runs": 5,
+  "batch": 1,
+  "prompt_tokens": 527,
+  "prompt_md5": "c77d12df7ff421ee819ff76d2bb6abc6",
+  "prompt_chars": 2508,
+  "warnings": [],
+  "warmups": 3,
+  "decode_tok_s": {
+    "median": 67.9,
+    "mean": 67.84,
+    "min": 67.7,
+    "max": 67.9,
+    "stdev": 0.08000000000000185
+  },
+  "tau": null,
+  "output_md5": [
+    "ca58558a3c874f08ea6822c0926c6cfb",
+    "ca58558a3c874f08ea6822c0926c6cfb",
+    "ca58558a3c874f08ea6822c0926c6cfb",
+    "ca58558a3c874f08ea6822c0926c6cfb",
+    "ca58558a3c874f08ea6822c0926c6cfb"
+  ],
+  "token_ids": [
+    [],
+    [],
+    [],
+    [],
+    []
+  ],
+  "prefill_tok_s": {
+    "median": 87.0,
+    "mean": 86.97999999999999,
+    "min": 86.9,
+    "max": 87.0,
+    "stdev": 0.039999999999997725
+  },
+  "wall_tok_s": {
+    "median": 16.1,
+    "mean": 16.1,
+    "min": 16.1,
+    "max": 16.1,
+    "stdev": 0.0
+  },
+  "ttft_ms": {
+    "median": 6059.5,
+    "mean": 6059.12,
+    "min": 6054.7,
+    "max": 6064.6,
+    "stdev": 3.3065994616828283
+  },
+  "samples": {
+    "decode": [
+      67.9,
+      67.8,
+      67.9,
+      67.7,
+      67.9
+    ],
+    "prefill": [
+      87.0,
+      87.0,
+      87.0,
+      86.9,
+      87.0
+    ],
+    "wall": [
+      16.1,
+      16.1,
+      16.1,
+      16.1,
+      16.1
+    ],
+    "ttft_ms": [
+      6059.5,
+      6057.0,
+      6054.7,
+      6064.6,
+      6059.8
+    ],
+    "tau": []
+  }
+}

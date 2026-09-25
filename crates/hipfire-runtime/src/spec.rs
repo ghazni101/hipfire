@@ -701,6 +701,17 @@ pub trait Speculator {
         false
     }
 
+    /// Whether in-step grammar masks are applied. Default true. Uno returns
+    /// false so a grammar request is refused before prefill.
+    fn supports_grammar(&self) -> bool {
+        true
+    }
+
+    /// Request-config refusal checked before prefill. Default: none.
+    fn admission_error(&self) -> Option<&'static str> {
+        None
+    }
+
     /// Short, human-readable drafter identity for per-request debug output
     /// (e.g. "dspark", "mtp", "dflash", "ngram"). The daemon logs this at
     /// request end so it's unambiguous which drafter actually ran (several
@@ -937,6 +948,19 @@ pub struct SpecRequestConfig {
     pub rng_seed: u64,
     /// When true, allow n-gram draft modifiers that touch the proposal stream.
     pub allow_ngram_modifier: bool,
+    /// Multiplicative repetition penalty. Part of AR's sampling law: AR scales
+    /// the logits of tokens inside the repeat window BEFORE its argmax, and the
+    /// shipped default is 1.05 (i.e. non-neutral), so a verifier that ignores
+    /// this is not token-identical to AR. `1.0` = neutral.
+    pub repeat_penalty: f32,
+    /// Request repeat window in tokens (wire `repeat_window`, default 128). The
+    /// effective ring is `min(64, repeat_window)`, matching
+    /// `ForwardScratch::repeat_buf`.
+    pub repeat_window: usize,
+    /// OpenAI-style additive presence penalty. `0.0` = neutral.
+    pub presence_penalty: f32,
+    /// OpenAI-style count-proportional frequency penalty. `0.0` = neutral.
+    pub frequency_penalty: f32,
 }
 
 impl Default for SpecRequestConfig {
@@ -951,6 +975,10 @@ impl Default for SpecRequestConfig {
             cactus_delta: 0.0,
             rng_seed: 0x1357_9BDF,
             allow_ngram_modifier: false,
+repeat_penalty: 1.0,
+repeat_window: 0,
+presence_penalty: 0.0,
+frequency_penalty: 0.0,
         }
     }
 }

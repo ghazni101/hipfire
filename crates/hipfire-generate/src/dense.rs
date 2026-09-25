@@ -503,6 +503,15 @@ pub fn generate_deepseek4_spec(
             top_p,
             top_k,
             min_p: 0.0,
+            // NOT YET WIRED: `generate_deepseek4_spec` does not receive the
+            // request's penalties, so this deepseek4 speculator still verifies
+            // with AR's neutral law. The llama/K2-Horizon Uno path (qwen.rs
+            // `generate_dflash`) is wired; this arm is the remaining staged
+            // work for the "greedy spec honours penalties" objective.
+            repeat_penalty: 1.0,
+            repeat_window: 0,
+            presence_penalty: 0.0,
+            frequency_penalty: 0.0,
             cactus_delta,
             rng_seed: request_seed as u64,
             allow_ngram_modifier: false,

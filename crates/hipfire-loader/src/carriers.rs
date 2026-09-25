@@ -1023,8 +1023,17 @@ impl Carrier for LlamaCarrier {
             ))
         } else if let Some(dp) = ctx.draft_path {
             if meta.arch_id == 16 && std::path::Path::new(dp).is_dir() {
+                let mut stop_ids = vec![meta.tokenizer.eos_id, bundle.config.eos_token];
+                if let Some(eot) = meta.tokenizer.eot_id {
+                    stop_ids.push(eot);
+                }
+                for marker in ["<|ifm|im_end|>", "<|ifm|endoftext|>"] {
+                    if let Some(id) = meta.tokenizer.special_token_id(marker) {
+                        stop_ids.push(id);
+                    }
+                }
                 let spec = match hipfire_arch_llama::uno_spec::UnoSpeculator::load(
-                    ctx.gpu, &bundle, std::path::Path::new(dp), ctx.max_seq,
+                    ctx.gpu, &bundle, std::path::Path::new(dp), ctx.max_seq, &stop_ids,
                 ) {
                     Ok(spec) => spec,
                     Err(error) => {

@@ -22,7 +22,7 @@
 //!    `fused_verify_kernel.py`); filtered requests are device-resident too —
 //!    top-k rows are masked to their top-K support, and top-p (optionally
 //!    with top_k) goes through the candidate-gather verifier
-//!    (`uno_filter_verify.hip`), which replicates the fused AR sampler's
+//!    (`uno_verify_logits.hip`), which replicates the fused AR sampler's
 //!    law (top-K gather → softmax → nucleus truncation → renormalize) so the
 //!    emitted distribution matches the daemon's non-speculative AR decode at
 //!    the same request config. min-p-only requests keep the host
@@ -75,6 +75,18 @@ pub struct UnoAdapter {
     layers: Vec<UnoLayer>,
 }
 
+
+fn free_proj(gpu: &mut Gpu, p: UnoProj) {
+    let _ = gpu.free_tensor(p.a);
+    let _ = gpu.free_tensor(p.b);
+}
+
+fn free_layer(gpu: &mut Gpu, l: UnoLayer) {
+    for p in [l.q_proj, l.k_proj, l.v_proj, l.o_proj, l.gate_proj, l.up_proj, l.down_proj] {
+        free_proj(gpu, p);
+    }
+}
+
 impl UnoAdapter {
     /// Read adapter_config.json + adapter_model.safetensors from `dir` and
     /// upload every factor to the GPU.
@@ -123,7 +135,19 @@ impl UnoAdapter {
                 return Err(format!("uno: target module {t} missing from adapter"));
             }
         }
-        let scale = alpha / rank as f32;
+        // PEFT scale is alpha/rank. The released K2 adapter_config has
+        // lora_alpha=8192 (scale 64); the paper trains alpha=256 (scale 2).
+        // HIPFIRE_UNO_LORA_SCALE replaces the folded scale so those two laws
+        // can be compared without rewriting the checkpoint.
+        let file_scale = alpha / rank as f32;
+        let scale = hipfire_config::developer_var("HIPFIRE_UNO_LORA_SCALE")
+            .ok()
+            .and_then(|s| s.parse::<f32>().ok())
+            .filter(|s| s.is_finite() && *s > 0.0)
+            .unwrap_or(file_scale);
+        eprintln!(
+            "[uno] lora scale {scale:.4} (file alpha/rank={file_scale:.4}, alpha={alpha}, rank={rank})"
+        );
 
         let path = dir.join("adapter_model.safetensors");
         let file = std::fs::File::open(&path).map_err(|e| format!("uno: {}: {e}", path.display()))?;
@@ -169,8 +193,8 @@ impl UnoAdapter {
                 // weight read is the dominant draft cost (profile: splitk 11.8ms
                 // + xbatch 7.2ms per forward); halving it to F16 cuts that to
                 // ~9.6ms. x/y accumulate stays F32, and the small rank-128 delta
-                // (scaled by alpha/rank) keeps the logit shift well inside the
-                // tie-tolerant identity gate (TIE_EPS 1.0).
+                // (scaled by alpha/rank) is a small additive delta on the
+                // base projection; greedy token-identity is the pass bar.
                 let a_bits: Vec<u16> = a_f32.iter().map(|&v| f16::from_f32(v).to_bits()).collect();
                 let a = gpu
                     .upload_f16_bits(&a_bits, &[rank, k])
@@ -189,14 +213,44 @@ impl UnoAdapter {
                 };
                 Ok(UnoProj { a, b, rank, k, m })
             };
+            let specs = [
+                ("self_attn.q_proj", q_out, dim),
+                ("self_attn.k_proj", kv_out, dim),
+                ("self_attn.v_proj", kv_out, dim),
+                ("self_attn.o_proj", dim, q_out),
+                ("mlp.gate_proj", hidden, dim),
+                ("mlp.up_proj", hidden, dim),
+                ("mlp.down_proj", dim, hidden),
+            ];
+            let mut projs = Vec::with_capacity(7);
+            let mut err = None;
+            for &(module, m, k) in &specs {
+                match mk(module, m, k, gpu) {
+                    Ok(p) => projs.push(p),
+                    Err(e) => {
+                        for p in projs.drain(..) {
+                            free_proj(gpu, p);
+                        }
+                        err = Some(e);
+                        break;
+                    }
+                }
+            }
+            if let Some(e) = err {
+                for l in layers.drain(..) {
+                    free_layer(gpu, l);
+                }
+                return Err(e);
+            }
+            let mut it = projs.into_iter();
             layers.push(UnoLayer {
-                q_proj: mk("self_attn.q_proj", q_out, dim, gpu)?,
-                k_proj: mk("self_attn.k_proj", kv_out, dim, gpu)?,
-                v_proj: mk("self_attn.v_proj", kv_out, dim, gpu)?,
-                o_proj: mk("self_attn.o_proj", dim, q_out, gpu)?,
-                gate_proj: mk("mlp.gate_proj", hidden, dim, gpu)?,
-                up_proj: mk("mlp.up_proj", hidden, dim, gpu)?,
-                down_proj: mk("mlp.down_proj", dim, hidden, gpu)?,
+                q_proj: it.next().expect("q_proj"),
+                k_proj: it.next().expect("k_proj"),
+                v_proj: it.next().expect("v_proj"),
+                o_proj: it.next().expect("o_proj"),
+                gate_proj: it.next().expect("gate_proj"),
+                up_proj: it.next().expect("up_proj"),
+                down_proj: it.next().expect("down_proj"),
             });
         }
         Ok(Self {
@@ -211,19 +265,7 @@ impl UnoAdapter {
 
     pub fn free_gpu(self, gpu: &mut Gpu) {
         for l in self.layers {
-            let UnoLayer {
-                q_proj,
-                k_proj,
-                v_proj,
-                o_proj,
-                gate_proj,
-                up_proj,
-                down_proj,
-            } = l;
-            for p in [q_proj, k_proj, v_proj, o_proj, gate_proj, up_proj, down_proj] {
-                let _ = gpu.free_tensor(p.a);
-                let _ = gpu.free_tensor(p.b);
-            }
+            free_layer(gpu, l);
         }
     }
 
@@ -238,7 +280,7 @@ impl UnoAdapter {
     ) -> HipResult<()> {
         let ax = ax.sub_offset(0, p.rank);
         let delta = delta.sub_offset(0, p.m);
-        gpu.gemv_f16_xbatch_splitk(&p.a, x, &ax, p.rank, p.k, 1, 8)?;
+        gpu.gemv_f16_xbatch(&p.a, x, &ax, p.rank, p.k, 1, false)?;
         gpu.gemv_f16_xbatch(&p.b, &ax, &delta, p.m, p.rank, 1, false)?;
         gpu.add_inplace_f32(y, &delta)
     }
@@ -486,17 +528,31 @@ impl UnoBatchScratch {
 
     fn delta(&self, gpu: &mut Gpu, p: &UnoProj, x: &GpuTensor, y: &GpuTensor, rows: usize) -> HipResult<()> {
         // Gate row zero out by never launching or adding its delta. The
-        // A side (M=rank, K up to 12288) needs split-K to cover the GPU;
-        // the B side (M=proj, K=rank) has enough rows for the plain kernel
-        // and lands directly on the base projection (accumulate epilogue):
-        // two GEMV-shaped launches per module, no delta scratch, no add.
+        // B side (M=proj, K=rank) lands directly on the base projection
+        // (accumulate epilogue). A used to be split-K + memset: M=rank
+        // (128) × 8 splits is 1024 workgroups plus a device memset per
+        // module × 7 × 36 layers — hundreds of extra launches on the
+        // draft forward. Plain xbatch overwrites `ax` and is enough
+        // waves for rank-128. `gemv_f16_xbatch` admits b in 1..=8.
+        // Upstream `max_diffusion_block_size` is 16, so a block of 16
+        // is 15 noise rows — chunk into 8-wide groups rather than
+        // refusing the width.
+        const XBATCH: usize = 8;
         let n = rows - 1;
         if n == 0 { return Ok(()); }
         let x = x.sub_offset(p.k, n * p.k);
         let y = y.sub_offset(p.m, n * p.m);
-        let ax = self.ax.sub_offset(0, n * p.rank);
-        gpu.gemv_f16_xbatch_splitk(&p.a, &x, &ax, p.rank, p.k, n, 8)?;
-        gpu.gemv_f16_xbatch(&p.b, &ax, &y, p.m, p.rank, n, true)
+        let mut off = 0;
+        while off < n {
+            let chunk = (n - off).min(XBATCH);
+            let x_c = x.sub_offset(off * p.k, chunk * p.k);
+            let y_c = y.sub_offset(off * p.m, chunk * p.m);
+            let ax = self.ax.sub_offset(0, chunk * p.rank);
+            gpu.gemv_f16_xbatch(&p.a, &x_c, &ax, p.rank, p.k, chunk, false)?;
+            gpu.gemv_f16_xbatch(&p.b, &ax, &y_c, p.m, p.rank, chunk, true)?;
+            off += chunk;
+        }
+        Ok(())
     }
 
     /// Normed, original-basis input for a conditional projection delta. On
@@ -525,6 +581,24 @@ impl UnoBatchScratch {
     }
 }
 
+/// Upload window token ids + positions into the batch scratch. Kept outside
+/// hipGraph capture so replay can swap the 8 i32s without recapturing.
+pub(crate) fn uno_upload_window(
+    gpu: &Gpu, batch: &UnoBatchScratch, tokens: &[u32], pos: usize,
+) -> HipResult<()> {
+    let n = tokens.len();
+    let tokens_host: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+    let token_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, n * 4)
+    };
+    gpu.hip.memcpy_htod(&batch.pbs.tokens.buf, token_bytes)?;
+    let positions_host: Vec<i32> = (0..n).map(|i| (pos + i) as i32).collect();
+    let pos_bytes: &[u8] = unsafe {
+        std::slice::from_raw_parts(positions_host.as_ptr() as *const u8, n * 4)
+    };
+    gpu.hip.memcpy_htod(&batch.pbs.positions.buf, pos_bytes)
+}
+
 /// Causal conditional-LoRA batch. Row zero is base-only; subsequent rows use
 /// the adapter. `None` performs base verification. Returns token-major logits.
 #[allow(clippy::too_many_arguments)]
@@ -547,6 +621,9 @@ pub(crate) fn uno_forward_batch_device(
     output: &GpuTensor,
 ) -> HipResult<()> {
     use hipfire_runtime::llama::{forward_prefill_adapter_batch, PrefillProjectionStage};
+    if !gpu.graphs.capture_mode {
+        uno_upload_window(gpu, batch, tokens, pos)?;
+    }
     let mut hook = |gpu: &mut Gpu, c: &LlamaConfig, w: &LlamaWeights,
         pbs: &hipfire_runtime::llama::PrefillBatchScratch, layer: usize, rows: usize,
         stage: PrefillProjectionStage| -> HipResult<()> {
@@ -584,13 +661,17 @@ pub(crate) fn uno_forward_batch_device(
     let rows = tokens.len();
     let x_rows = batch.pbs.x_batch.sub_offset(0, rows * config.dim);
     config.rmsnorm_batch(gpu, &x_rows, &weights.output_norm, &batch.norm, rows)?;
-    weight_gemm(
-        gpu,
-        &weights.output,
-        &batch.norm,
-        &output.sub_offset(0, rows * config.vocab_size),
-        rows,
-    )?;
+    // Window-sized lm_head: WMMA residual gets one 16-wide N-tile and
+    // underfills; xbatch reads the 250k-row head once against all rows.
+    let logits = output.sub_offset(0, rows * config.vocab_size);
+    if weights.output.gpu_dtype == DType::MQ4G256V2 {
+        let x_rot = batch.pbs.v2_rot.sub_offset(0, rows * config.dim);
+        hipfire_runtime::llama::mq4g256v2_window_rotate_project(
+            gpu, &weights.output, &batch.norm, &logits, &x_rot, rows,
+        )?;
+    } else {
+        weight_gemm(gpu, &weights.output, &batch.norm, &logits, rows)?;
+    }
     Ok(())
 }
 
@@ -795,6 +876,16 @@ pub(crate) fn uno_tree_verify_picks(
     greedy: bool,
     temp: f32,
     rng: &mut u32,
+    // AR's repeat/presence/frequency penalty, shared by every node row. The
+    // per-node history is `base_hist` plus that node's root path, since a node's
+    // token sits at the end of its own ancestor chain — the same convention the
+    // linear window uses (history includes the token being forwarded).
+    base_hist: &[u32],
+    repeat_buf: Option<&GpuTensor>,
+    repeat_penalty: f32,
+    presence_penalty: f32,
+    frequency_penalty: f32,
+    repeat_window: usize,
 ) -> HipResult<Vec<u32>> {
     let nodes = tree.tokens.len();
     // Ancestor bias: row i sees itself and its tree ancestors (0.0); every
@@ -840,6 +931,42 @@ pub(crate) fn uno_tree_verify_picks(
         &batch.verify_logits.sub_offset(0, nodes * vocab),
         nodes,
     )?;
+
+    // Phase 0 (AR's law) per node row, before the picks are taken. No-op when
+    // every penalty is neutral, so the common path costs nothing.
+    if let Some(buf) = repeat_buf {
+        if repeat_window > 0
+            && (repeat_penalty > 1.0 || presence_penalty > 0.0 || frequency_penalty > 0.0)
+        {
+            let mut hist: Vec<u32> = base_hist.to_vec();
+            let base_len = hist.len();
+            for node in 0..nodes {
+                hist.truncate(base_len);
+                // Root-first ancestor chain ending at this node.
+                let mut chain: Vec<u32> = vec![tree.tokens[node]];
+                let mut anc = tree.parents[node];
+                while anc >= 0 {
+                    chain.push(tree.tokens[anc as usize]);
+                    anc = tree.parents[anc as usize];
+                }
+                chain.reverse();
+                hist.extend_from_slice(&chain);
+                let last = hist.len().min(repeat_window);
+                let window = &hist[hist.len() - last..];
+                let bytes: Vec<u8> = window.iter().flat_map(|t| t.to_ne_bytes()).collect();
+                gpu.hip.memcpy_htod(&buf.buf, &bytes)?;
+                gpu.apply_repeat_penalty_row(
+                    &batch.verify_logits.sub_offset(node * vocab, vocab),
+                    buf,
+                    vocab,
+                    window.len(),
+                    repeat_penalty,
+                    presence_penalty,
+                    frequency_penalty,
+                )?;
+            }
+        }
+    }
 
     if greedy {
         gpu.argmax_f32_batched(&batch.verify_logits, &batch.picks, vocab, nodes)?;

@@ -1,0 +1,124 @@
+{
+  "protocol": "native-generate-v1",
+  "model": "/models/hipfire/IFM/K2-Horizon-7B-MQ4/k2-horizon-7b.mq4",
+  "loaded": {
+    "type": "loaded",
+    "arch": "qwen3",
+    "dim": 4096,
+    "layers": 36,
+    "vocab": 250624,
+    "vl": false,
+    "reasoning_contract": "unsupported",
+    "reasoning_effort_native": false,
+    "reasoning_efforts": [],
+    "cache_capable": false,
+    "retry_reset_eligible": false,
+    "continuous_batch_capable": false
+  },
+  "gpu": {
+    "type": "diag",
+    "arch": "gfx1100",
+    "hip_version": "7.15",
+    "vram_free_mb": 15546,
+    "vram_total_mb": 24560,
+    "model_loaded": true,
+    "model_arch": "qwen3",
+    "kernels": 0,
+    "kernel_hashes": 0
+  },
+  "vram_free_before_mb": 24520,
+  "max_tokens": 128,
+  "runs": 5,
+  "batch": 1,
+  "prompt_tokens": 527,
+  "prompt_md5": "c77d12df7ff421ee819ff76d2bb6abc6",
+  "prompt_chars": 2508,
+  "warnings": [],
+  "warmups": 3,
+  "decode_tok_s": {
+    "median": 30.4,
+    "mean": 30.18,
+    "min": 29.3,
+    "max": 30.4,
+    "stdev": 0.43999999999999917
+  },
+  "tau": {
+    "median": 2.57,
+    "mean": 2.5380000000000003,
+    "min": 2.41,
+    "max": 2.57,
+    "stdev": 0.06399999999999988
+  },
+  "output_md5": [
+    "ca58558a3c874f08ea6822c0926c6cfb",
+    "ca58558a3c874f08ea6822c0926c6cfb",
+    "ca58558a3c874f08ea6822c0926c6cfb",
+    "ca58558a3c874f08ea6822c0926c6cfb",
+    "ca58558a3c874f08ea6822c0926c6cfb"
+  ],
+  "token_ids": [
+    [],
+    [],
+    [],
+    [],
+    []
+  ],
+  "prefill_tok_s": {
+    "median": 86.9,
+    "mean": 86.9,
+    "min": 86.8,
+    "max": 87.0,
+    "stdev": 0.06324555320336848
+  },
+  "wall_tok_s": {
+    "median": 12.5,
+    "mean": 12.459999999999999,
+    "min": 12.3,
+    "max": 12.5,
+    "stdev": 0.07999999999999971
+  },
+  "ttft_ms": {
+    "median": 6062.2,
+    "mean": 6062.42,
+    "min": 6054.4,
+    "max": 6069.3,
+    "stdev": 4.928448031581694
+  },
+  "samples": {
+    "decode": [
+      30.4,
+      30.4,
+      29.3,
+      30.4,
+      30.4
+    ],
+    "prefill": [
+      87.0,
+      86.9,
+      86.9,
+      86.8,
+      86.9
+    ],
+    "wall": [
+      12.5,
+      12.5,
+      12.3,
+      12.5,
+      12.5
+    ],
+    "ttft_ms": [
+      6054.4,
+      6065.2,
+      6061.0,
+      6069.3,
+      6062.2
+    ],
+    "tau": [
+      2.57,
+      2.57,
+      2.41,
+      2.57,
+      2.57
+    ]
+  }
+}
