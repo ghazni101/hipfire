@@ -127,10 +127,13 @@ Values and defaults below match `hipfire-config`, the native CLI, and/or `Runtim
 | `HIPFIRE_QWEN3_DSPARK_CONF_THRESHOLD` / `HIPFIRE_QWEN35_DSPARK_CONF_THRESHOLD` | per-arch conf | |
 | `HIPFIRE_DDTREE_BUDGET` / `HIPFIRE_DDTREE_TOPK` | tree draft | Runtime defaults 256/8 if env-only; CLI config defaults 0/4 |
 | `HIPFIRE_DDTREE_*` | research/diag family | See inventory; not product defaults |
-| `HIPFIRE_UNO_BLOCK` | **4**; clamp `2..=8` | Uno conditional-LoRA window rows (seed + L-1 noise). The upstream reference defaults to 8; 4 is the hipfire bring-up value — deeper blocks amortize two full forwards but accept rate decays past depth ~2. |
-| `HIPFIRE_UNO_TREE` | **0** (linear chain); `2..=64` enables Ψ-Spec tree verify | Tree nodes incl. root. |
-| `HIPFIRE_UNO_TREE_K` | **8**; clamp `1..=32` | Candidate top-k exposed per tree depth. |
+| `HIPFIRE_UNO_BLOCK` | **4**; clamp `2..=16` | Uno conditional-LoRA window rows (seed + L-1 noise). The upstream reference defaults to 8 with `max_diffusion_block_size` 16; 4 is the hipfire bring-up value — deeper blocks amortize two full forwards but accept rate decays past depth ~2. |
+| `HIPFIRE_UNO_TREE` | **0** (linear chain); `2..=64` enables Ψ-Spec tree verify | Tree nodes incl. root. Takes greedy, unfiltered, and min_p-free filtered (top-k/top-p) requests; target picks run through the full request law. |
+| `HIPFIRE_UNO_TREE_K` | **16**; clamp `1..=32` | Candidate top-k exposed per tree depth. |
 | `HIPFIRE_UNO_NOISE` | **random_uniform** \| `deterministic_uniform` \| `mask` | Draft noise law (upstream noise.py). `random_uniform` is the adapter-trained default; `mask` is out-of-distribution and collapses deep-row acceptance. |
+| `HIPFIRE_UNO_LORA_SCALE` | adapter-config `lora_alpha/rank` (folded into A at upload) | Overrides the folded conditional-LoRA scale without rewriting the checkpoint. |
+| `HIPFIRE_UNO_TRACE` | **0** (off) | Per-window draft/verify trace (penalty windows, picks) to stderr. |
+| `HIPFIRE_UNO_GRAPH_CTX` | **0** (off); clamp `0..=8192` | hipGraph window-capture context cap (LDS budget: 8192 ≈ 34 KB/workgroup). 0 disables; windows past the cap run eager. The capture-window stale-logits defect is fixed (the instantiated exec is replayed once for the capture window); opt-in pending a recorded capture-on `uno_perf_probe` identity pass. |
 
 ### Vision tower sidecar
 
@@ -1054,7 +1057,10 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_UNIFORM_GATE_UP` | crates/hipfire-runtime/examples/hfq_splice_attn.rs |
 | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | crates/hipfire-runtime/src/config.rs, crates/hipfire-runtime/src/multi_gpu.rs |
 | `HIPFIRE_UNO_BLOCK` | crates/hipfire-arch-llama/src/uno_spec.rs |
+| `HIPFIRE_UNO_GRAPH_CTX` | crates/hipfire-arch-llama/src/uno_spec.rs |
+| `HIPFIRE_UNO_LORA_SCALE` | crates/hipfire-arch-llama/src/uno.rs |
 | `HIPFIRE_UNO_NOISE` | crates/hipfire-arch-llama/src/uno_spec.rs |
+| `HIPFIRE_UNO_TRACE` | crates/hipfire-arch-llama/src/uno_spec.rs |
 | `HIPFIRE_UNO_TREE` | crates/hipfire-arch-llama/src/uno_spec.rs |
 | `HIPFIRE_UNO_TREE_K` | crates/hipfire-arch-llama/src/uno_spec.rs |
 | `HIPFIRE_VAE_CONFIG_ONLY` | crates/hipfire-arch-diffusion/src/pipeline.rs |
