@@ -862,7 +862,9 @@ pub(crate) fn compact_tree_kv(
 /// Tree verify forward + per-node picks: one tree-attention batched forward
 /// (KV writes land on contiguous slots `position+1 ..`, RoPE uses depth
 /// positions), then one batched lm_head over all node rows and a pick per
-/// node (GPU argmax, or a fused GPU sample at temp>0). Returns the picks.
+/// node (GPU argmax, or a fused GPU sample at temp>0 under the request's
+/// top_p/top_k law — the reference runs every node pick through the full
+/// request sampler). Returns the picks.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn uno_tree_verify_picks(
     gpu: &mut Gpu,
@@ -875,6 +877,12 @@ pub(crate) fn uno_tree_verify_picks(
     batch: &UnoBatchScratch,
     greedy: bool,
     temp: f32,
+    // Request filter law for non-greedy picks (same expression as
+    // `step_device`): the tree's target draws must match AR decode at the
+    // same request config, exactly as the reference tree sampler filters
+    // every pick.
+    pick_top_p: f32,
+    pick_top_k: Option<u32>,
     rng: &mut u32,
     // AR's repeat/presence/frequency penalty, shared by every node row. The
     // per-node history is `base_hist` plus that node's root path, since a node's
@@ -984,8 +992,8 @@ pub(crate) fn uno_tree_verify_picks(
                 &batch.verify_logits.sub_offset(row * vocab, vocab),
                 vocab,
                 temp,
-                1.0,
-                None,
+                pick_top_p,
+                pick_top_k,
                 &batch.sample_result,
                 &batch.sample_repeat,
                 rng,

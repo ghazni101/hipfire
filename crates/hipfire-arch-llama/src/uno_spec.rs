@@ -277,6 +277,24 @@ impl UnoSpeculator {
         let rows = n + 1;
         let inv_temp = if greedy { 1.0 } else { 1.0 / temp };
 
+        // Target-pick law for the root and every node pick: the reference
+        // tree sampler draws ALL target tokens through the full request
+        // filters (two_pass_decoding.py runs root and per-node picks through
+        // the same `Sampler`), so mirror `step_device`'s request law instead
+        // of an unfiltered draw. `sample_row` drives the fused AR sampler, so
+        // the picks stay byte-identical to AR decode at this request config.
+        // Greedy ignores the filter (argmax arm below).
+        let (pick_top_p, pick_top_k) = if greedy {
+            (1.0, None)
+        } else if self.request.top_p > 0.0 && self.request.top_p < 1.0 {
+            (self.request.top_p.min(1.0),
+                (self.request.top_k > 0).then_some(self.request.top_k.min(64) as u32))
+        } else if self.request.top_k > 0 && self.request.top_k < vocab {
+            (1.0, Some(self.request.top_k.min(64) as u32))
+        } else {
+            (1.0, None)
+        };
+
         // AR's repeat history for this window, exactly as the linear path builds
         // it: last `min(repeat_window, 64)` of (prompt tail ++ emitted), where
         // `emitted` already ends with the pending seed. Only built when a penalty
@@ -309,7 +327,7 @@ impl UnoSpeculator {
             gpu.hip.memcpy_dtoh(&mut raw, &batch.picks.buf).map_err(|e| format!("Uno tree picks: {e:?}"))?;
             u32::from_ne_bytes(raw)
         } else {
-            sample_row(gpu, &batch.draft_logits.sub_offset(0, vocab), vocab, temp, 1.0, None,
+            sample_row(gpu, &batch.draft_logits.sub_offset(0, vocab), vocab, temp, pick_top_p, pick_top_k,
                 &batch.sample_result, &batch.sample_repeat, &mut self.rng)?
         };
         if budget == 1 || self.stops(clean) {
@@ -354,7 +372,8 @@ impl UnoSpeculator {
         }
         let picks = crate::uno::uno_tree_verify_picks(
             gpu, &target.weights, &target.config, &tree, position,
-            &mut target.kv, &target.scratch, batch, greedy, temp, &mut self.rng,
+            &mut target.kv, &target.scratch, batch, greedy, temp, pick_top_p, pick_top_k,
+            &mut self.rng,
             &hist_base, self.repeat_buf.as_ref(),
             self.request.repeat_penalty, self.request.presence_penalty,
             self.request.frequency_penalty, rw,
@@ -767,9 +786,15 @@ impl Speculator for UnoSpeculator {
         // Distribution law (the gather kernel has no min-p selector). Greedy
         // ignores all filters (argmax).
         let dev_filterable = filtered && self.request.min_p <= 0.0;
-        let dev_topk_only =
-            dev_filterable && !(self.request.top_p > 0.0 && self.request.top_p < 1.0);
-        if self.tree.is_some() && (greedy || !filtered || dev_topk_only) {
+        // The tree takes every request the device paths can express (greedy,
+        // unfiltered, and all min_p-free filters): like the reference tree
+        // sampler, its target picks run through the full request law
+        // (`step_tree` passes the filters into `sample_row`), and top-p needs
+        // no verifier-kernel support there because acceptance is by
+        // construction, not by p/q ratio. Requires batch scratch (the tree
+        // forwards are batch-device-resident); without it, fall through to the
+        // host law below.
+        if self.tree.is_some() && self.batch.is_some() && (greedy || !filtered || dev_filterable) {
             return self.step_tree(gpu, target, position, seed, emitted, budget, temp, greedy);
         }
         if self.batch.is_some() && (greedy || !filtered || dev_filterable) {
