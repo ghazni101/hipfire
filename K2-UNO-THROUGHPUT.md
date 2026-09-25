@@ -326,6 +326,16 @@ Fix: `UNO_GRAPH_CTX` now defaults to **0** (capture opt-in via
 `HIPFIRE_UNO_GRAPH_CTX`, clamp `0..=8192`). With capture off the probe reports
 `identity=PASS`; with capture on it fails at pos 23 in both blocks 2 and 4.
 
+Root cause + mechanism fix (later): stream capture *records* without executing,
+and the capture branch stored the graph and returned `Ok(())` without ever
+running the window — so the capture window sampled the **previous** window's
+logits out of the persistent `batch.draft_logits`/`verify_logits` buffers
+(exactly the byte-identical-proposals trace above; replay itself was never
+implicated). `uno_window_forward` now replays the freshly instantiated exec
+once for the capture window, and falls back to eager if that first replay
+fails. Default remains 0 until a capture-on `uno_perf_probe` identity pass is
+recorded on the fixture GPU.
+
 ### 2. Spec route failed every turn closed on a thinking model (fixed)
 
 `hipfire bench`/`run` on this model errored with

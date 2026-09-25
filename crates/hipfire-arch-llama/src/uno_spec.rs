@@ -626,15 +626,13 @@ fn parse_block_len(raw: Option<&str>) -> usize {
 /// fell back to eager and paid a full launch sequence per window (hundreds of
 /// launches per window forward). Raise with `HIPFIRE_UNO_GRAPH_CTX` to amortise
 /// those launches on long prompts.
-/// DISABLED by default (0). Window graph capture is retained behind
-/// `HIPFIRE_UNO_GRAPH_CTX` for experiments only: a captured window replayed at
-/// a later position returned the CAPTURE window's draft/verify logits instead
-/// of recomputing for the current tokens/positions, so two consecutive windows
-/// emitted byte-identical proposals from different seeds and the second
-/// window's commit could be a token the target never chose (observed
-/// divergence at `top2 gap 0.9994`, i.e. a wide-gap flip, not a ULP tie).
-/// `uno_perf_probe` passes token identity with capture off and fails with it
-/// on at the same positions.
+/// Opt-in (default 0). The original capture defect — the capture window was
+/// only recorded, never executed, so the caller sampled the previous window's
+/// draft/verify logits and two consecutive windows emitted byte-identical
+/// proposals from different seeds (`uno_perf_probe` token identity failed with
+/// capture on) — is fixed in `uno_window_forward`: the freshly instantiated
+/// exec is replayed once for the capture window itself. Default stays 0 until
+/// a capture-on `uno_perf_probe` identity pass is recorded on the fixture GPU.
 const UNO_GRAPH_CTX: usize = 0;
 
 /// Resolved capture cap (`HIPFIRE_UNO_GRAPH_CTX`, clamped to 0..=8192; 0
@@ -704,8 +702,32 @@ fn uno_window_forward(
                 match gpu.end_stream_capture() {
                     Ok(captured) => match gpu.hip.graph_instantiate(&captured) {
                         Ok(exec) => {
-                            let blobs = std::mem::take(&mut gpu.graphs.capture_blobs);
-                            *graph = Some((captured, exec, blobs));
+                            // The capture pass RECORDS this window without
+                            // executing it, so the forward must still run or
+                            // the caller samples the previous window's logits
+                            // out of the persistent batch buffers (two windows
+                            // emitting byte-identical proposals from different
+                            // seeds — the defect that kept capture disabled).
+                            // Replaying the exec once both executes this window
+                            // and proves the instantiated graph replays the
+                            // freshly uploaded tokens/positions before we
+                            // commit to reusing it. Same stream as every other
+                            // launch, so ordering with the following
+                            // argmax/sample reads is preserved.
+                            let launch = gpu
+                                .ensure_capture_stream()
+                                .and_then(|()| gpu.launch_graph(&exec));
+                            match launch {
+                                Ok(()) => {
+                                    let blobs = std::mem::take(&mut gpu.graphs.capture_blobs);
+                                    *graph = Some((captured, exec, blobs));
+                                }
+                                Err(_) => {
+                                    let _ = gpu.hip.graph_exec_destroy(exec);
+                                    let _ = gpu.hip.graph_destroy(captured);
+                                    gpu.graphs.capture_blobs.clear();
+                                }
+                            }
                         }
                         Err(_) => {
                             let _ = gpu.hip.graph_destroy(captured);
@@ -714,7 +736,9 @@ fn uno_window_forward(
                     },
                     Err(_) => gpu.graphs.capture_blobs.clear(),
                 }
-                return Ok(());
+                if graph.is_some() {
+                    return Ok(());
+                }
             }
             gpu.graphs.capture_mode = false;
             gpu.graphs.capture_max_ctx = None;
