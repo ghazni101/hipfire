@@ -1,0 +1,71 @@
+# K2-Horizon MoVA serving container — pre-built binaries on ROCm base.
+#
+# Serves K2-Horizon-MoVA-36B-A4B.mq4 (arch_id 16, MoVA) via hipfire serve,
+# AR decode only (spec decode is not wired for MoVA). ROCm base supplies
+# hipcc + HIP headers for kernel JIT — the daemon embeds all .hip sources.
+#
+# Build:
+#   docker build -f Containerfile.k2-horizon-mova -t k2-horizon-mova-serve .
+#
+# Run:
+#   docker run --rm -d \
+#     --device /dev/kfd --device /dev/dri \
+#     --security-opt seccomp=unconfined \
+#     -v /home/ghazni/models:/models:ro \
+#     -v k2-mova-kcache:/var/cache/hipfire \
+#     -p 9001:9001 \
+#     k2-horizon-mova-serve
+
+FROM docker.io/rocm/dev-ubuntu-24.04:7.2.4
+
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends \
+        ca-certificates libssl3 \
+    && rm -rf /var/lib/apt/lists/*
+
+ENV HIP_PATH=/opt/rocm \
+    HIPFIRE_KERNEL_CACHE=/var/cache/hipfire \
+    HIPFIRE_DAEMON_BIN=/opt/hipfire/bin/daemon \
+    HIPFIRE_DIR=/root/.hipfire
+RUN mkdir -p /var/cache/hipfire /root/.hipfire && chmod 1777 /var/cache/hipfire
+
+# Pre-built binaries from the host (dlopen'd ROCm, no hard link).
+# .docker-bin/ is gitignored — populate it before building:
+#   cargo build --release && mkdir -p .docker-bin && \
+#     cp target/release/daemon target/release/hipfire .docker-bin/
+COPY .docker-bin/daemon /opt/hipfire/bin/daemon
+COPY .docker-bin/hipfire /usr/local/bin/hipfire
+
+# Config: Q8 KV, 40k context (VRAM-safe for 24.5 GB gfx1100), AR-only.
+RUN mkdir -p /root/.hipfire
+COPY <<'EOF' /root/.hipfire/config.toml
+schema_version = 1
+
+[reasoning]
+# uncapped — no think-token cap; the model reasons until it closes the block.
+budget = "uncapped"
+
+[serve]
+multi_slot = false
+
+[speculation]
+# MoVA is AR-only — spec decode is not wired. "off" is explicit.
+dflash = "off"
+mtp = "off"
+
+[memory]
+kv_cache = "q8"
+max_seq = 8192
+EOF
+
+# Symlink model into the models directory so /v1/models lists it.
+RUN mkdir -p /root/.hipfire/models && \
+    ln -sf /models/hipfire/IFM/K2-Horizon-MoVA-36B-A4B-MQ4/K2-Horizon-MoVA-36B-A4B.mq4 \
+           /root/.hipfire/models/K2-Horizon-MoVA-36B-A4B.mq4
+
+VOLUME ["/var/cache/hipfire"]
+EXPOSE 9001
+
+ENTRYPOINT ["hipfire"]
+# --idle-timeout 0: never unload the model (keep ~24 GB resident).
+CMD ["serve", "K2-Horizon-MoVA-36B-A4B.mq4", "0.0.0.0:9001", "--kv-mode", "q8", "--idle-timeout", "0"]
