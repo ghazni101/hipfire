@@ -3970,6 +3970,7 @@ fn main() {
                         12 => "north_mini_code",
                         13 => "gemma4",
                         14 => "muse_glimmer",
+                        16 => "k2_horizon",
                         40 => "flux_mmdit",
                         45 => "flux2_mmdit",
                         _ => "qwen3",
