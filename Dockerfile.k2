@@ -1,0 +1,18 @@
+# K2-Horizon serve image — hipfire CLI + daemon from the current tree, ROCm base.
+# Serves AR (no draft) or Uno (draft dir via HIPFIRE_DFLASH_DRAFT) — same image.
+FROM local/rocm-base:10.0.0
+
+COPY target/release/daemon /opt/hipfire/bin/daemon
+COPY target/release/hipfire /usr/local/bin/hipfire
+
+ENV HIPFIRE_DAEMON_BIN=/opt/hipfire/bin/daemon \
+    HIPFIRE_DIR=/root/.hipfire \
+    HIP_PATH=/opt/rocm \
+    HIPFIRE_KERNEL_CACHE=/var/cache/hipfire
+
+RUN mkdir -p /var/cache/hipfire /root/.hipfire/models \
+    && chmod 1777 /var/cache/hipfire
+
+VOLUME ["/var/cache/hipfire"]
+EXPOSE 8420
+ENTRYPOINT ["hipfire"]
