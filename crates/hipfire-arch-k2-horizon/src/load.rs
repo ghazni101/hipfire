@@ -89,9 +89,20 @@ pub fn load_k2_horizon_bundle(
                         .iter()
                         .find_map(|l| l.attn.v_experts.first().map(|e| e.gpu_dtype))
                 });
-            let state =
-                K2HorizonState::new_with_max_seq(ctx.gpu, &config, ctx.max_seq, expert_dtype)
-                    .map_err(|e| format!("k2_horizon: new_with_max_seq failed: {e}"))?;
+            // Weight bytes (uploaded payload ≈ file minus metadata) drive the
+            // VRAM-aware MoVA cap — uniform qt20 frees ~5 GB vs mq4.
+            // Metadata is ~35 MB (tokenizer JSON); payload ≈ file minus it.
+            let weight_bytes = std::fs::metadata(hfq.path())
+                .map(|m| m.len().saturating_sub(35_000_000))
+                .ok();
+            let state = K2HorizonState::new_with_max_seq(
+                ctx.gpu,
+                &config,
+                ctx.max_seq,
+                expert_dtype,
+                weight_bytes,
+            )
+            .map_err(|e| format!("k2_horizon: new_with_max_seq failed: {e}"))?;
 
             // EOS: K2-Horizon uses <|ifm|endoftext|> (id 1) as primary EOS.
             // The config carries eos_token_id; fall back to 1.

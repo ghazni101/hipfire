@@ -36,25 +36,54 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 /// Validated VRAM ceiling per family on gfx1100 (24.5 GB usable):
 /// dense K2-7B ran 40960 with margin (64k OOM'd at KV alloc, 26 MB free),
 /// so the dense default must never exceed the demonstrated envelope.
-/// MoVA-36B @ mq4l weights (~20.6 GB on-device) leave ~3.9 GB for KV —
-/// Q8 KV is 104.5 KB/token (48 L × 8 KVH × 128 hd × 2 × 136 B), so the
-/// mq4l MoVA ceiling is 24576 (2.57 GB, ~0.1 GB margin). 40960 OOM'd
-/// reproducibly (20 MB free at KV alloc). MQ3G256Lloyd weights (~14 GB)
-/// free ~10.5 GB, which covers 65536 tokens (6.7 GB KV) with ~3.8 GB of
-/// state/scratch headroom; 131072 does not fit (13.4 GB KV alone).
+///
+/// MoVA-36B caps derive from the actual on-device weight bytes, not a
+/// per-format constant: Q8 KV is 104.5 KB/token (48 L × 8 KVH × 128 hd ×
+/// 2 × 136 B) and weights scale with the container's quant mix. Anchors
+/// measured on gfx1100:
+///   mq4 (qt44 uniform, ~21.5 GB on-device): 24576 fits (~0.1 GB margin);
+///       40960 OOM'd reproducibly (20 MB free at KV alloc).
+///   mq3 (qt20 uniform, 16.8 GB): 65536 fits (24.5/25.75 GB used).
+///   mq3e (qt44 attention + qt20 experts, ~19.1 GB): ~47k.
+/// VRAM_BUDGET keeps ~1.2 GB of scratch/state headroom — matches the
+/// observed 24.47 GB ceiling incl. HIP overhead on the qt20-uniform run.
 const DEFAULT_MAX_SEQ_DENSE: usize = 40960;
 const DEFAULT_MAX_SEQ_MOVA: usize = 24576;
-const DEFAULT_MAX_SEQ_MOVA_MQ3L: usize = 65536;
+const MOVA_VRAM_BUDGET: u64 = 24 * 1024 * 1024 * 1024;
+const MOVA_KV_BYTES_PER_TOKEN: u64 = 104_529; // 48 × 8 × 128 × 2 × 136 B (Q8)
 
-fn max_seq_cap(cfg: &K2HorizonConfig, expert_dtype: Option<DType>) -> usize {
-    if cfg.mova_num_experts > 0 {
-        if expert_dtype == Some(DType::MQ3G256Lloyd) {
-            DEFAULT_MAX_SEQ_MOVA_MQ3L
-        } else {
-            DEFAULT_MAX_SEQ_MOVA
+fn max_seq_cap(
+    cfg: &K2HorizonConfig,
+    expert_dtype: Option<DType>,
+    weight_bytes: Option<u64>,
+) -> usize {
+    if cfg.mova_num_experts == 0 {
+        return DEFAULT_MAX_SEQ_DENSE;
+    }
+    // Weight-bytes-aware cap: KV must fit in budget minus weights minus a
+    // fixed scratch/fragmentation reserve. When the caller has no byte count
+    // (config-only `new`), the conservative legacy constants apply.
+    const SCRATCH_RESERVE: u64 = 1_500_000_000; // ~1.4 GiB state+scratch
+    match weight_bytes {
+        Some(wb) if wb < MOVA_VRAM_BUDGET => {
+            // Pure-qt44 MoVA keeps its proven 24576 ceiling — the formula
+            // would over-predict it (measured ~0.1 GB margin at 24k).
+            if expert_dtype != Some(DType::MQ3G256Lloyd) {
+                return DEFAULT_MAX_SEQ_MOVA;
+            }
+            let kv_room = MOVA_VRAM_BUDGET
+                .saturating_sub(wb)
+                .saturating_sub(SCRATCH_RESERVE);
+            let cap = (kv_room / MOVA_KV_BYTES_PER_TOKEN) as usize;
+            cap.min(524_288).max(4096)
         }
-    } else {
-        DEFAULT_MAX_SEQ_DENSE
+        _ => {
+            if expert_dtype == Some(DType::MQ3G256Lloyd) {
+                65536
+            } else {
+                DEFAULT_MAX_SEQ_MOVA
+            }
+        }
     }
 }
 
@@ -221,8 +250,8 @@ impl K2HorizonState {
         // Config-only path has no weight dtype in scope → conservative cap.
         let max_seq = cfg
             .max_position_embeddings
-            .min(max_seq_cap(cfg, None));
-        Self::new_with_max_seq(gpu, cfg, max_seq, None)
+            .min(max_seq_cap(cfg, None, None));
+        Self::new_with_max_seq(gpu, cfg, max_seq, None, None)
     }
 
     pub fn new_with_max_seq(
@@ -230,10 +259,11 @@ impl K2HorizonState {
         cfg: &K2HorizonConfig,
         max_seq: usize,
         expert_dtype: Option<DType>,
+        weight_bytes: Option<u64>,
     ) -> Result<Self, String> {
         let max_seq = max_seq
             .min(cfg.max_position_embeddings)
-            .min(max_seq_cap(cfg, expert_dtype));
+            .min(max_seq_cap(cfg, expert_dtype, weight_bytes));
         let hidden = cfg.dim;
         let q_dim = cfg.n_heads * cfg.head_dim;
         let kv_dim = cfg.n_kv_heads * cfg.head_dim;

@@ -5065,6 +5065,18 @@ fn handle_main_quant(
             // ── K-map override ──────────────────────────────────────────────
             let kmap_level = outer.kmap.get(name).copied().unwrap_or(QuantLevel::Base);
 
+            // HIPFIRE_MOE_EXPERTS_MQ3L=1 (under --format mq4): generic-path
+            // per-expert 2D FFN experts go MQ3G256Lloyd. v_experts and
+            // router tensors do NOT match `.mlp.experts.` — they keep qt44.
+            let moe_experts_mq3l = hipfire_config::developer_var("HIPFIRE_MOE_EXPERTS_MQ3L")
+                .ok()
+                .as_deref()
+                == Some("1");
+            let is_moe_expert_2d = name.contains(".mlp.experts.")
+                && (name.ends_with("gate_proj.weight")
+                    || name.ends_with("up_proj.weight")
+                    || name.ends_with("down_proj.weight"));
+
             // AWQ sidecar scales for this tensor — populated only inside the
             // MQ4G256 arm when --awq is enabled and an imatrix entry exists
             // for this tensor's ggml-translated name. After the main tensor
@@ -5770,6 +5782,33 @@ fn handle_main_quant(
                         (q, QuantType::MQ4G256, 256u32, "MQ4G256")
                     } else {
                         // Fallback to standard HFQ4-G128 for non-256-aligned
+                        let q = if meta.shape.len() == 2 {
+                            let m = meta.shape[0];
+                            let k = meta.shape[1];
+                            quantize_hfq4g128_2d(&f32_data, m, k)
+                        } else {
+                            quantize_hfq4g128(&f32_data)
+                        };
+                        (q, QuantType::HFQ4G128, 128u32, "HFQ4G128")
+                    }
+                } else if flags.use_mq4v2 && moe_experts_mq3l && is_moe_expert_2d {
+                    // HIPFIRE_MOE_EXPERTS_MQ3L=1 under --format mq4: routed
+                    // FFN experts (per-expert 2D `.mlp.experts.N.*_proj`
+                    // tensors) ship at MQ3G256Lloyd (qt20, 3.5 bpw) while
+                    // attention/router/lm_head stay MQ4G256V2 (qt44). Same
+                    // intent as the mq4-mq3lloyd-* kmap recipe but for the
+                    // generic per-expert-2D path those archs (arch16 K2) use.
+                    let k_dim = if meta.shape.len() == 2 {
+                        meta.shape[1]
+                    } else {
+                        n_elements
+                    };
+                    if k_dim % 256 == 0 {
+                        let signs1 = gen_fwht_signs(42, 256);
+                        let signs2 = gen_fwht_signs(1042, 256);
+                        let q = quantize_mq3g256_lloyd(&f32_data, &signs1, &signs2);
+                        (q, QuantType::MQ3G256Lloyd, 256u32, "MQ3G256L")
+                    } else {
                         let q = if meta.shape.len() == 2 {
                             let m = meta.shape[0];
                             let k = meta.shape[1];
