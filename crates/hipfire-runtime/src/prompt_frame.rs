@@ -1423,6 +1423,22 @@ impl<'a> JinjaChatFrame<'a> {
                         .or_insert_with(|| serde_json::Value::String(String::new()));
                 }
             }
+            // K2's template raises when an assistant turn has no thinking
+            // string. An empty reasoning_content renders the empty
+            // `<ifm|think>` block. Other templates are unchanged.
+            if self.template.contains("ifm|think") {
+                for msg in &mut arr {
+                    let serde_json::Value::Object(map) = msg else { continue };
+                    let assistant = matches!(map.get("role"), Some(serde_json::Value::String(r)) if r == "assistant");
+                    if !assistant { continue; }
+                    let has = ["think", "think_fast", "think_faster", "reasoning", "reasoning_content"]
+                        .iter()
+                        .any(|k| matches!(map.get(*k), Some(serde_json::Value::String(_))));
+                    if !has {
+                        map.insert("reasoning_content".into(), serde_json::Value::String(String::new()));
+                    }
+                }
+            }
             Value::from_serialize(&arr)
         };
         let reasoning_strength_val = match self.reasoning_strength {
@@ -3539,6 +3555,57 @@ SYS:{{ build_system_message(system_message) }}:END
 {%- for m in conversation_messages -%}
 {{ m.role }}={{ m.content }};
 {%- endfor -%}";
+
+    #[test]
+    fn ifm_assistant_without_thinking_field_renders_empty_think() {
+        let t = make_tokenizer();
+        let template = "\
+{%- for message in messages -%}
+{%- if message.role == 'assistant' -%}
+{%- if message.reasoning_content is string -%}
+<ifm|think>{{ message.reasoning_content }}</ifm|think>{{ message.content }}
+{%- elif message.think is not defined and message.reasoning_content is not defined -%}
+{{ raise_exception('Assistant message is missing a thinking field') }}
+{%- endif -%}
+{%- else -%}
+{{ message.role }}:{{ message.content }}
+{%- endif -%}
+{%- endfor -%}";
+        let frame = JinjaChatFrame {
+            tokenizer: &t,
+            template,
+            system: None,
+            user: "",
+            enable_thinking: true,
+            bos_token: Some(""),
+            reasoning_strength: None,
+            reasoning_effort: None,
+        };
+        let messages = vec![
+            Message {
+                role: Role::User,
+                content: "hi".into(),
+                reasoning_content: None,
+                name: None,
+                rendered_name: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                tool_plan: String::new(),
+            },
+            Message {
+                role: Role::Assistant,
+                content: "4".into(),
+                reasoning_content: None,
+                name: None,
+                rendered_name: None,
+                tool_calls: Vec::new(),
+                tool_call_id: None,
+                tool_plan: String::new(),
+            },
+        ];
+        let out = frame.render_messages(&messages, None, None).expect("render");
+        assert!(out.contains("<ifm|think></ifm|think>4"), "{out:?}");
+    }
 
     #[test]
     fn minimax_explicit_system_message_renders_with_current_date() {
