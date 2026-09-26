@@ -36,9 +36,14 @@ pub struct DenseLayerWeights {
     pub wk: WeightTensor,        // [n_kv_heads * head_dim, dim] = [1024, 2560]
     pub wv: WeightTensor,        // [n_kv_heads * head_dim, dim] = [1024, 2560]
     pub wo: WeightTensor,        // [dim, n_heads * head_dim] = [2560, 4096]
-    pub attn_gate: WeightTensor, // [n_heads * head_dim, dim] = [4096, 2560]
+    /// Softplus post-attention gate. `None` on dense-only arch-16 models
+    /// (e.g. K2-Horizon-7B), which ship no `self_attn.gate_proj` tensor —
+    /// the forward path then skips the softplus multiply. MoVA models
+    /// always carry it.
+    pub attn_gate: Option<WeightTensor>, // [n_heads * head_dim, dim] = [4096, 2560]
     /// Fused [wq‖wk‖wv‖attn_gate] = [10240, 2560] single-GEMV weight +
     /// owning blob. When Some, wq/wk/wv/attn_gate are views into the owner.
+    /// A gate-free model fuses [wq‖wk‖wv] = [6144, 2560] instead.
     pub attn_fused: Option<(WeightTensor, GpuTensor)>,
     pub ffn_norm: GpuTensor,  // [dim]
     pub w_gate: WeightTensor, // [intermediate_size, dim] = [6144, 2560]
@@ -201,7 +206,9 @@ impl K2HorizonWeights {
                 layer.wq.free_all(gpu);
                 layer.wk.free_all(gpu);
                 layer.wv.free_all(gpu);
-                layer.attn_gate.free_all(gpu);
+                if let Some(g) = layer.attn_gate {
+                    g.free_all(gpu);
+                }
             }
             layer.wo.free_all(gpu);
             if let Some((_fused, owner)) = layer.ffn_fused {

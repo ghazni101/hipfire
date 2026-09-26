@@ -438,16 +438,19 @@ impl Architecture for K2Horizon {
 
             if dense_set.contains(&l) {
                 // ── Dense layer (0–2): standard MHA + dense SwiGLU MLP ──
-                // Fused [wq‖wk‖wv‖attn_gate] and [w_gate‖w_up] single-GEMV
-                // weights when all members share a packable dtype; falls
-                // back to per-tensor loads otherwise.
-                let attn_specs = [
-                    (format!("{p}.self_attn.q_proj.weight"), q_dim, hidden),
-                    (format!("{p}.self_attn.k_proj.weight"), kv_dim, hidden),
-                    (format!("{p}.self_attn.v_proj.weight"), kv_dim, hidden),
-                    (format!("{p}.self_attn.gate_proj.weight"), q_dim, hidden),
-                ];
-                let (wq, wk, wv, attn_gate, attn_fused) =
+                // Fused [wq‖wk‖wv‖attn_gate] (or [wq‖wk‖wv] on gate-free
+                // models like dense-only K2-7B) single-GEMV when all members
+                // share a packable dtype; falls back to per-tensor loads.
+                let has_attn_gate = hfq
+                    .find_tensor_info(&format!("{p}.self_attn.gate_proj.weight"))
+                    .is_some();
+                let (wq, wk, wv, attn_gate, attn_fused) = if has_attn_gate {
+                    let attn_specs = [
+                        (format!("{p}.self_attn.q_proj.weight"), q_dim, hidden),
+                        (format!("{p}.self_attn.k_proj.weight"), kv_dim, hidden),
+                        (format!("{p}.self_attn.v_proj.weight"), kv_dim, hidden),
+                        (format!("{p}.self_attn.gate_proj.weight"), q_dim, hidden),
+                    ];
                     match load_fused_wts(hfq, gpu, &attn_specs)? {
                         Some((fused, owner, views)) => {
                             let mut it = views.into_iter();
@@ -455,7 +458,7 @@ impl Architecture for K2Horizon {
                                 it.next().unwrap(),
                                 it.next().unwrap(),
                                 it.next().unwrap(),
-                                it.next().unwrap(),
+                                Some(it.next().unwrap()),
                                 Some((fused, owner)),
                             )
                         }
@@ -463,10 +466,38 @@ impl Architecture for K2Horizon {
                             load_wt(hfq, gpu, &attn_specs[0].0, q_dim, hidden)?,
                             load_wt(hfq, gpu, &attn_specs[1].0, kv_dim, hidden)?,
                             load_wt(hfq, gpu, &attn_specs[2].0, kv_dim, hidden)?,
-                            load_wt(hfq, gpu, &attn_specs[3].0, q_dim, hidden)?,
+                            Some(load_wt(hfq, gpu, &attn_specs[3].0, q_dim, hidden)?),
                             None,
                         ),
-                    };
+                    }
+                } else {
+                    // Gate-free dense attention (K2-Horizon-7B): no
+                    // self_attn.gate_proj tensor, no softplus multiply.
+                    let attn_specs = [
+                        (format!("{p}.self_attn.q_proj.weight"), q_dim, hidden),
+                        (format!("{p}.self_attn.k_proj.weight"), kv_dim, hidden),
+                        (format!("{p}.self_attn.v_proj.weight"), kv_dim, hidden),
+                    ];
+                    match load_fused_wts(hfq, gpu, &attn_specs)? {
+                        Some((fused, owner, views)) => {
+                            let mut it = views.into_iter();
+                            (
+                                it.next().unwrap(),
+                                it.next().unwrap(),
+                                it.next().unwrap(),
+                                None,
+                                Some((fused, owner)),
+                            )
+                        }
+                        None => (
+                            load_wt(hfq, gpu, &attn_specs[0].0, q_dim, hidden)?,
+                            load_wt(hfq, gpu, &attn_specs[1].0, kv_dim, hidden)?,
+                            load_wt(hfq, gpu, &attn_specs[2].0, kv_dim, hidden)?,
+                            None,
+                            None,
+                        ),
+                    }
+                };
                 let wo = load_wt(
                     hfq,
                     gpu,

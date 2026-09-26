@@ -112,8 +112,11 @@ struct RawK2HorizonConfig {
     num_shared_experts: usize,
     #[serde(default = "default_norm_topk")]
     norm_topk_prob: bool,
-    #[serde(default = "default_router_score")]
-    router_score_func: String,
+    // Option<String> rather than #[serde(default)] String: serde `default`
+    // only fires on absent keys, and the dense K2-7B config emits
+    // `"attention_gate_func": null` (HF default None). Null → default.
+    #[serde(default)]
+    router_score_func: Option<String>,
     #[serde(default = "default_router_scaling")]
     router_scaling_factor: f32,
     #[serde(default)]
@@ -122,8 +125,8 @@ struct RawK2HorizonConfig {
     mova_num_experts: usize,
     #[serde(default)]
     mova_num_experts_per_tok: usize,
-    #[serde(default = "default_gate_func")]
-    attention_gate_func: String,
+    #[serde(default)]
+    attention_gate_func: Option<String>,
     #[serde(default)]
     mlp_only_layers: Option<Vec<usize>>,
     #[serde(default)]
@@ -243,21 +246,33 @@ fn config_from_raw(raw: RawK2HorizonConfig) -> Result<K2HorizonConfig, String> {
     if raw.attention_bias {
         return Err("k2_horizon: attention_bias=true unsupported (no bias on q/k/o)".into());
     }
-    if raw.router_score_func != "sigmoid" {
+    let router_score_func = raw
+        .router_score_func
+        .clone()
+        .unwrap_or_else(default_router_score);
+    let attention_gate_func = raw
+        .attention_gate_func
+        .clone()
+        .unwrap_or_else(default_gate_func);
+    // Routing/gate checks only bind configs that actually route — a dense
+    // arch-16 model (num_experts == mova_num_experts == 0) never calls the
+    // sigmoid topk or softplus gate kernels, so its (often null) declared
+    // values are irrelevant. Fail closed only where the path is live.
+    let has_moe = raw.num_experts > 0;
+    let has_mova = raw.mova_num_experts > 0;
+    if (has_moe || has_mova) && router_score_func != "sigmoid" {
         return Err(format!(
-            "k2_horizon: router_score_func {:?} unsupported — forward is sigmoid-only",
-            raw.router_score_func
+            "k2_horizon: router_score_func {router_score_func:?} unsupported — forward is sigmoid-only"
         ));
     }
-    if !raw.norm_topk_prob {
+    if !raw.norm_topk_prob && (has_moe || has_mova) {
         return Err(
             "k2_horizon: norm_topk_prob=false unsupported — topk kernel always normalizes".into(),
         );
     }
-    if raw.attention_gate_func != "softplus" {
+    if has_mova && attention_gate_func != "softplus" {
         return Err(format!(
-            "k2_horizon: attention_gate_func {:?} unsupported — softplus gate only",
-            raw.attention_gate_func
+            "k2_horizon: attention_gate_func {attention_gate_func:?} unsupported — softplus gate only"
         ));
     }
     if raw.num_experts > 0 && raw.num_shared_experts != 1 {
@@ -366,12 +381,12 @@ fn config_from_raw(raw: RawK2HorizonConfig) -> Result<K2HorizonConfig, String> {
         moe_intermediate_size: raw.moe_intermediate_size,
         num_shared_experts: raw.num_shared_experts,
         norm_topk_prob: raw.norm_topk_prob,
-        router_score_func: raw.router_score_func,
+        router_score_func,
         router_scaling_factor: raw.router_scaling_factor,
         moe_gate_bias: raw.moe_gate_bias,
         mova_num_experts: raw.mova_num_experts,
         mova_num_experts_per_tok: raw.mova_num_experts_per_tok,
-        attention_gate_func: raw.attention_gate_func,
+        attention_gate_func,
         mlp_only_layers,
         layer_kinds,
         max_position_embeddings: raw.max_position_embeddings,
@@ -520,6 +535,65 @@ mod tests {
         let json = r#"{"hidden_size": 2560, "num_hidden_layers": 48, "vocab_size": 250624, "num_attention_heads": 32, "eos_token_id": [1, 250019]}"#;
         let cfg = config_from_json(json).expect("parse");
         assert_eq!(cfg.eos_token, 1);
+    }
+
+    /// The real dense K2-Horizon-7B config emits `"attention_gate_func": null`
+    /// (HF Python default None). Serde `default` ignores explicit null, so the
+    /// raw fields are Option<String> resolved in config_from_raw — dense must
+    /// parse, and must not be held to the MoVA softplus/sigmoid contracts it
+    /// never executes.
+    #[test]
+    fn dense_config_null_gate_func_parses() {
+        let json = r#"{
+            "hidden_size": 4096,
+            "num_hidden_layers": 36,
+            "vocab_size": 250624,
+            "num_attention_heads": 32,
+            "num_key_value_heads": 8,
+            "head_dim": 128,
+            "intermediate_size": 12288,
+            "attention_gate_func": null,
+            "router_score_func": "sigmoid",
+            "mlp_only_layers": [0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,29,30,31,32,33,34,35],
+            "mova_num_experts": 0,
+            "num_experts": 0,
+            "layernorm_num_groups": 4
+        }"#;
+        let cfg = config_from_json(json).expect("dense config with null gate func");
+        assert_eq!(cfg.attention_gate_func, "softplus"); // null → arch default
+        assert_eq!(cfg.mova_num_experts, 0);
+        assert_eq!(cfg.layer_kinds[35], LayerKind::Dense);
+    }
+
+    /// A dense config declaring a non-softplus gate parses (gate never runs);
+    /// the same declaration on a MoVA model must still fail closed.
+    #[test]
+    fn gate_func_check_scoped_to_mova() {
+        let dense = r#"{"hidden_size": 4096, "num_hidden_layers": 36, "vocab_size": 250624,
+            "num_attention_heads": 32, "attention_gate_func": "relu", "mova_num_experts": 0,
+            "num_experts": 0}"#;
+        config_from_json(dense).expect("dense ignores declared gate func");
+
+        let mova = r#"{"hidden_size": 4096, "num_hidden_layers": 36, "vocab_size": 250624,
+            "num_attention_heads": 32, "attention_gate_func": "relu",
+            "mova_num_experts": 64, "mova_num_experts_per_tok": 4}"#;
+        let err = config_from_json(mova).expect_err("mova must reject non-softplus");
+        assert!(err.contains("attention_gate_func"));
+    }
+
+    /// Sigmoid-router check likewise binds only routed configs.
+    #[test]
+    fn router_score_check_scoped_to_routed() {
+        let dense = r#"{"hidden_size": 4096, "num_hidden_layers": 36, "vocab_size": 250624,
+            "num_attention_heads": 32, "router_score_func": null, "mova_num_experts": 0,
+            "num_experts": 0}"#;
+        config_from_json(dense).expect("dense tolerates null router func");
+
+        let moe = r#"{"hidden_size": 4096, "num_hidden_layers": 36, "vocab_size": 250624,
+            "num_attention_heads": 32, "router_score_func": "softmax",
+            "num_experts": 8, "num_experts_per_tok": 2, "num_shared_experts": 1}"#;
+        let err = config_from_json(moe).expect_err("routed model must reject non-sigmoid");
+        assert!(err.contains("router_score_func"));
     }
 
     #[test]

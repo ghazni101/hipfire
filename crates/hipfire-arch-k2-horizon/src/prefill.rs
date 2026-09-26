@@ -363,11 +363,14 @@ fn forward_dense_layer_batch(
     // KV write + batched attention
     attend_batch(cfg, ps, kv, gpu, l, n, start_pos)?;
 
-    // softplus post-attention gate (fused, element-wise on [n × q_dim])
-    weight_gemm(gpu, &layer.attn_gate, &normed, &attn_gate_out, n)
-        .map_err(|e| format!("k2_horizon prefill L{l}: attn gate: {e}"))?;
-    gpu.softplus_gate_f32(&attn_gate_out, &fa_attn_out)
-        .map_err(|e| format!("k2_horizon prefill L{l}: softplus gate: {e:?}"))?;
+    // softplus post-attention gate (fused, element-wise on [n × q_dim]).
+    // Gate-free dense models (K2-Horizon-7B has no gate_proj) skip it.
+    if let Some(attn_gate) = &layer.attn_gate {
+        weight_gemm(gpu, attn_gate, &normed, &attn_gate_out, n)
+            .map_err(|e| format!("k2_horizon prefill L{l}: attn gate: {e}"))?;
+        gpu.softplus_gate_f32(&attn_gate_out, &fa_attn_out)
+            .map_err(|e| format!("k2_horizon prefill L{l}: softplus gate: {e:?}"))?;
+    }
 
     // h += o_proj(attn_out)
     weight_gemm(gpu, &layer.wo, &fa_attn_out, &scratch_h, n)

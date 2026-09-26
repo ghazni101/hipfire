@@ -853,10 +853,10 @@ fn forward_dense_layer(
     // rotated ONCE, reused by wq/wk/wv/attn_gate below.
     norm_and_rotate(cfg, &layer.attn_norm, state, gpu, l)?;
 
-    // q/k/v/gate: one fused GEMV when the packed [wq‖wk‖wv‖gate] weight is
-    // present (4 launches → 1); per-projection GEMVs otherwise. Views into
-    // attn_fused_out: q@[0..q_dim), k@[q_dim..q_dim+kv_dim),
-    // v@[q_dim+kv_dim..q_dim+2kv_dim), gate@[q_dim+2kv_dim..2q_dim+2kv_dim).
+    // q/k/v(/gate): one fused GEMV when the packed weight is present;
+    // per-projection GEMVs otherwise. Views into attn_fused_out:
+    // q@[0..q_dim), k@[q_dim..q_dim+kv_dim), v@[q_dim+kv_dim..q_dim+2kv_dim),
+    // gate@[q_dim+2kv_dim..2q_dim+2kv_dim) — only when attn_gate exists.
     let q_dim = cfg.n_heads * cfg.head_dim;
     let kv_dim = cfg.n_kv_heads * cfg.head_dim;
     let (q_t, k_t, v_t, gate_t);
@@ -866,7 +866,9 @@ fn forward_dense_layer(
         q_t = state.attn_fused_out.sub_offset(0, q_dim);
         k_t = state.attn_fused_out.sub_offset(q_dim, kv_dim);
         v_t = state.attn_fused_out.sub_offset(q_dim + kv_dim, kv_dim);
-        gate_t = state.attn_fused_out.sub_offset(q_dim + 2 * kv_dim, q_dim);
+        gate_t = layer.attn_gate.as_ref().map(|_| {
+            state.attn_fused_out.sub_offset(q_dim + 2 * kv_dim, q_dim)
+        });
     } else {
         gemv_normed(gpu, &layer.wq, state, &state.fa_q)
             .map_err(|e| format!("k2_horizon L{l}: q_proj: {e}"))?;
@@ -874,12 +876,17 @@ fn forward_dense_layer(
             .map_err(|e| format!("k2_horizon L{l}: k_proj: {e}"))?;
         gemv_normed(gpu, &layer.wv, state, &state.fa_v)
             .map_err(|e| format!("k2_horizon L{l}: v_proj: {e}"))?;
-        gemv_normed(gpu, &layer.attn_gate, state, &state.attn_gate_out)
-            .map_err(|e| format!("k2_horizon L{l}: attn gate: {e}"))?;
+        if let Some(attn_gate) = &layer.attn_gate {
+            gemv_normed(gpu, attn_gate, state, &state.attn_gate_out)
+                .map_err(|e| format!("k2_horizon L{l}: attn gate: {e}"))?;
+        }
         q_t = state.fa_q.sub_offset(0, q_dim);
         k_t = state.fa_k.sub_offset(0, kv_dim);
         v_t = state.fa_v.sub_offset(0, kv_dim);
-        gate_t = state.attn_gate_out.sub_offset(0, q_dim);
+        gate_t = layer
+            .attn_gate
+            .as_ref()
+            .map(|_| state.attn_gate_out.sub_offset(0, q_dim));
     }
 
     // RoPE on Q and K (full rotary, rope_head_dim == head_dim)
@@ -900,8 +907,11 @@ fn forward_dense_layer(
 
     // softplus post-attention gate: attn_out *= softplus_beta(gate_proj(normed))
     //   Fused: replaces scale→softplus→scale→mul (4 launches) with 1 launch.
-    gpu.softplus_gate_f32(&gate_t, &state.fa_attn_out)
-        .map_err(|e| format!("k2_horizon L{l}: softplus gate: {e:?}"))?;
+    //   Gate-free dense models (no gate_proj tensor) skip the multiply.
+    if let Some(gate_t) = &gate_t {
+        gpu.softplus_gate_f32(gate_t, &state.fa_attn_out)
+            .map_err(|e| format!("k2_horizon L{l}: softplus gate: {e:?}"))?;
+    }
 
     // h += o_proj(attn_out) — o_proj reads fa_attn_out (q_dim), rotated into
     // proj_rot; PM4-safe residual GEMV folds the add_inplace on gfx1100.

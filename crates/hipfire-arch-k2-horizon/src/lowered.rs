@@ -106,7 +106,10 @@ fn dense_attention_block(
         q_t = state.attn_fused_out.sub_offset(0, q_dim);
         k_t = state.attn_fused_out.sub_offset(q_dim, kv_dim);
         v_t = state.attn_fused_out.sub_offset(q_dim + kv_dim, kv_dim);
-        gate_t = state.attn_fused_out.sub_offset(q_dim + 2 * kv_dim, q_dim);
+        gate_t = layer
+            .attn_gate
+            .as_ref()
+            .map(|_| state.attn_fused_out.sub_offset(q_dim + 2 * kv_dim, q_dim));
     } else {
         gemv_normed(gpu, &layer.wq, state, &state.fa_q)
             .map_err(|e| format!("k2_horizon L{l}: q_proj: {e}"))?;
@@ -114,12 +117,17 @@ fn dense_attention_block(
             .map_err(|e| format!("k2_horizon L{l}: k_proj: {e}"))?;
         gemv_normed(gpu, &layer.wv, state, &state.fa_v)
             .map_err(|e| format!("k2_horizon L{l}: v_proj: {e}"))?;
-        gemv_normed(gpu, &layer.attn_gate, state, &state.attn_gate_out)
-            .map_err(|e| format!("k2_horizon L{l}: attn gate: {e}"))?;
+        if let Some(attn_gate) = &layer.attn_gate {
+            gemv_normed(gpu, attn_gate, state, &state.attn_gate_out)
+                .map_err(|e| format!("k2_horizon L{l}: attn gate: {e}"))?;
+        }
         q_t = state.fa_q.sub_offset(0, q_dim);
         k_t = state.fa_k.sub_offset(0, kv_dim);
         v_t = state.fa_v.sub_offset(0, kv_dim);
-        gate_t = state.attn_gate_out.sub_offset(0, q_dim);
+        gate_t = layer
+            .attn_gate
+            .as_ref()
+            .map(|_| state.attn_gate_out.sub_offset(0, q_dim));
     }
 
     gpu.rope_f32(
@@ -136,8 +144,10 @@ fn dense_attention_block(
     let seq_len = position as usize + 1;
     attend(cfg, state, gpu, l, seq_len, &q_t, &k_t, &v_t)?;
 
-    gpu.softplus_gate_f32(&gate_t, &state.fa_attn_out)
-        .map_err(|e| format!("k2_horizon L{l}: softplus gate: {e:?}"))?;
+    if let Some(gate_t) = &gate_t {
+        gpu.softplus_gate_f32(gate_t, &state.fa_attn_out)
+            .map_err(|e| format!("k2_horizon L{l}: softplus gate: {e:?}"))?;
+    }
 
     // o_proj reads fa_attn_out (q_dim), rotated into proj_rot.
     gpu.rotate_x_mq(&state.fa_attn_out, &state.proj_rot, layer.wo.k)
