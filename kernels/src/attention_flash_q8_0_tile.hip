@@ -403,3 +403,308 @@ __global__ void attention_flash_q8_0_tile(
         p[2 + d_base + 3] = out3;
     }
 }
+
+// ═══ GQA-fused tile kernel ═══
+//
+// One block per (kv_head, tile) computes all G sibling query heads instead
+// of one. The per-head kernel above launches [n_heads, n_tiles] blocks and
+// every one of the n_heads/n_kv_heads sibling blocks re-reads the SAME K/V
+// bytes of its kv head — at K2-Horizon's 32:8 ratio, 4x the KV traffic, at
+// ~10 GB/s effective on gfx1100, which was the entire long-context decode
+// decay (0.6 ms/layer at 6k ctx, growing linearly). Here K and V bytes are
+// loaded once per key and shared across the G sibling heads: G times less
+// KV traffic and G times fewer blocks, with the tile axis (grid y) still
+// position-bound for replay.
+//
+// Per-head arithmetic — the 4-product sum expression, half iteration
+// order, and the descending XOR wave reductions — is copied verbatim from
+// attention_flash_q8_0_tile, so scores and partials are bit-exact per head
+// and the shared `attention_flash_q8_0_reduce` consumes them unchanged.
+// Instantiated for the common GQA ratios G ∈ {2, 4, 8} (compile-time G
+// keeps the per-head accumulator arrays in registers); other ratios and
+// MHA keep the per-head kernel. Opt out with HIPFIRE_Q8_FLASH_GQA=0.
+
+#define HFIRE_Q8_GQA_TILE(G, MIN_WAVES)                                                        \
+extern "C" __launch_bounds__(32, MIN_WAVES)                                                    \
+__global__ void attention_flash_q8_0_tile_gqa##G(                                              \
+    const float* __restrict__ q,                                                               \
+    const unsigned char* __restrict__ k_cache,                                                 \
+    const unsigned char* __restrict__ v_cache,                                                 \
+    float* __restrict__ partials,                                                              \
+    const int* __restrict__ pos_buf,                                                           \
+    int n_heads, int n_kv_heads, int head_dim, int max_seq,                                    \
+    float scale_attn, int tile_size, int window, int effective_seq_len) {                      \
+    (void)effective_seq_len;                                                                   \
+    const int logical_seq_len = pos_buf[0] + 1;                                                \
+    const int seq_len = (window > 0) ? min(logical_seq_len, max_seq) : logical_seq_len;        \
+    const int win_lo = (window > 0) ? (seq_len - window) : 0;                                  \
+    const int kv_h = blockIdx.x;                                                               \
+    if (kv_h >= n_kv_heads) return;                                                            \
+    const int tile_id = blockIdx.y;                                                            \
+    const int tile_start = tile_id * tile_size;                                                \
+    const int tile_end = min(tile_start + tile_size, seq_len);                                 \
+    if (tile_start >= seq_len) return;                                                         \
+    const int tile_len = tile_end - tile_start;                                                \
+    const int blocks_per_head = head_dim / 32;                                                 \
+    const int total_blocks_per_pos = n_kv_heads * blocks_per_head;                             \
+    const int kv_head_block_start = kv_h * blocks_per_head;                                    \
+    const int row_stride = total_blocks_per_pos * 34;                                          \
+    const int n_halves = (head_dim + 127) / 128;                                               \
+    extern __shared__ float sdata[];                                                           \
+    float* q_lds = sdata;                  /* [G][head_dim] */                                 \
+    float* scores = sdata + (G) * head_dim; /* [G][tile_size] */                               \
+    const int tid = threadIdx.x;                                                               \
+    _Pragma("unroll")                                                                          \
+    for (int g = 0; g < G; g++) {                                                              \
+        const float* q_head = q + (kv_h * G + g) * head_dim;                                   \
+        for (int half = 0; half < n_halves; half++) {                                          \
+            const int d_base = half * 128 + tid * 4;                                           \
+            q_lds[g * head_dim + d_base + 0] = q_head[d_base + 0];                             \
+            q_lds[g * head_dim + d_base + 1] = q_head[d_base + 1];                             \
+            q_lds[g * head_dim + d_base + 2] = q_head[d_base + 2];                             \
+            q_lds[g * head_dim + d_base + 3] = q_head[d_base + 3];                             \
+        }                                                                                      \
+    }                                                                                          \
+    __syncthreads();                                                                           \
+    const int k_off = (tid % 8) * 4;                                                           \
+    int valid_start = win_lo - tile_start;                                                     \
+    if (valid_start < 0) valid_start = 0;                                                      \
+    if (valid_start > tile_len) valid_start = tile_len;                                        \
+    for (int t_local = 0; t_local < valid_start; t_local++) {                                  \
+        if (tid == 0) {                                                                        \
+            _Pragma("unroll")                                                                  \
+            for (int g = 0; g < G; g++) scores[g * tile_size + t_local] = -INFINITY;           \
+        }                                                                                      \
+    }                                                                                          \
+    int t_local = valid_start;                                                                 \
+    for (; t_local + 3 < tile_len; t_local += 4) {                                             \
+        const int t0 = tile_start + t_local + 0;                                               \
+        const int t1 = tile_start + t_local + 1;                                               \
+        const int t2 = tile_start + t_local + 2;                                               \
+        const int t3 = tile_start + t_local + 3;                                               \
+        const int s0 = (window > 0) ? (t0 % max_seq) : t0;                                     \
+        const int s1 = (window > 0) ? (t1 % max_seq) : t1;                                     \
+        const int s2 = (window > 0) ? (t2 % max_seq) : t2;                                     \
+        const int s3 = (window > 0) ? (t3 % max_seq) : t3;                                     \
+        float partial[G][4];                                                                   \
+        _Pragma("unroll")                                                                      \
+        for (int g = 0; g < G; g++) {                                                          \
+            partial[g][0] = 0.0f; partial[g][1] = 0.0f;                                        \
+            partial[g][2] = 0.0f; partial[g][3] = 0.0f;                                        \
+        }                                                                                      \
+        for (int half = 0; half < n_halves; half++) {                                          \
+            const int k_bi = half * 4 + tid / 8;                                               \
+            const int k_blk_off = (kv_head_block_start + k_bi) * 34;                           \
+            const unsigned char* kb0 = k_cache + (size_t)s0 * row_stride + k_blk_off;          \
+            const unsigned char* kb1 = k_cache + (size_t)s1 * row_stride + k_blk_off;          \
+            const unsigned char* kb2 = k_cache + (size_t)s2 * row_stride + k_blk_off;          \
+            const unsigned char* kb3 = k_cache + (size_t)s3 * row_stride + k_blk_off;          \
+            float ks0 = (float)*((const _Float16*)kb0);                                        \
+            float ks1 = (float)*((const _Float16*)kb1);                                        \
+            float ks2 = (float)*((const _Float16*)kb2);                                        \
+            float ks3 = (float)*((const _Float16*)kb3);                                        \
+            const signed char k00 = (signed char)kb0[2 + k_off + 0];                           \
+            const signed char k01 = (signed char)kb0[2 + k_off + 1];                           \
+            const signed char k02 = (signed char)kb0[2 + k_off + 2];                           \
+            const signed char k03 = (signed char)kb0[2 + k_off + 3];                           \
+            const signed char k10 = (signed char)kb1[2 + k_off + 0];                           \
+            const signed char k11 = (signed char)kb1[2 + k_off + 1];                           \
+            const signed char k12 = (signed char)kb1[2 + k_off + 2];                           \
+            const signed char k13 = (signed char)kb1[2 + k_off + 3];                           \
+            const signed char k20 = (signed char)kb2[2 + k_off + 0];                           \
+            const signed char k21 = (signed char)kb2[2 + k_off + 1];                           \
+            const signed char k22 = (signed char)kb2[2 + k_off + 2];                           \
+            const signed char k23 = (signed char)kb2[2 + k_off + 3];                           \
+            const signed char k30 = (signed char)kb3[2 + k_off + 0];                           \
+            const signed char k31 = (signed char)kb3[2 + k_off + 1];                           \
+            const signed char k32 = (signed char)kb3[2 + k_off + 2];                           \
+            const signed char k33 = (signed char)kb3[2 + k_off + 3];                           \
+            _Pragma("unroll")                                                                  \
+            for (int g = 0; g < G; g++) {                                                      \
+                const float* qb_thread = q_lds + g * head_dim + k_bi * 32 + k_off;             \
+                partial[g][0] += qb_thread[0] * (ks0 * (float)k00)                             \
+                               + qb_thread[1] * (ks0 * (float)k01)                             \
+                               + qb_thread[2] * (ks0 * (float)k02)                             \
+                               + qb_thread[3] * (ks0 * (float)k03);                            \
+                partial[g][1] += qb_thread[0] * (ks1 * (float)k10)                             \
+                               + qb_thread[1] * (ks1 * (float)k11)                             \
+                               + qb_thread[2] * (ks1 * (float)k12)                             \
+                               + qb_thread[3] * (ks1 * (float)k13);                            \
+                partial[g][2] += qb_thread[0] * (ks2 * (float)k20)                             \
+                               + qb_thread[1] * (ks2 * (float)k21)                             \
+                               + qb_thread[2] * (ks2 * (float)k22)                             \
+                               + qb_thread[3] * (ks2 * (float)k23);                            \
+                partial[g][3] += qb_thread[0] * (ks3 * (float)k30)                             \
+                               + qb_thread[1] * (ks3 * (float)k31)                             \
+                               + qb_thread[2] * (ks3 * (float)k32)                             \
+                               + qb_thread[3] * (ks3 * (float)k33);                            \
+            }                                                                                  \
+        }                                                                                      \
+        _Pragma("unroll")                                                                      \
+        for (int g = 0; g < G; g++) {                                                          \
+            _Pragma("unroll")                                                                  \
+            for (int i = 0; i < 4; i++) {                                                      \
+                for (int off = 16; off > 0; off >>= 1)                                         \
+                    partial[g][i] += __shfl_xor(partial[g][i], off);                           \
+            }                                                                                  \
+        }                                                                                      \
+        if (tid == 0) {                                                                        \
+            _Pragma("unroll")                                                                  \
+            for (int g = 0; g < G; g++) {                                                      \
+                scores[g * tile_size + t_local + 0] = partial[g][0] * scale_attn;              \
+                scores[g * tile_size + t_local + 1] = partial[g][1] * scale_attn;              \
+                scores[g * tile_size + t_local + 2] = partial[g][2] * scale_attn;              \
+                scores[g * tile_size + t_local + 3] = partial[g][3] * scale_attn;              \
+            }                                                                                  \
+        }                                                                                      \
+    }                                                                                          \
+    for (; t_local < tile_len; t_local++) {                                                    \
+        int t = tile_start + t_local;                                                          \
+        const int slot = (window > 0) ? (t % max_seq) : t;                                     \
+        float partial[G];                                                                      \
+        _Pragma("unroll")                                                                      \
+        for (int g = 0; g < G; g++) partial[g] = 0.0f;                                         \
+        for (int half = 0; half < n_halves; half++) {                                          \
+            const int k_bi = half * 4 + tid / 8;                                               \
+            const int k_blk_off = (kv_head_block_start + k_bi) * 34;                           \
+            const unsigned char* kb = k_cache + (size_t)slot * row_stride + k_blk_off;         \
+            float ks = (float)*((const _Float16*)kb);                                          \
+            _Pragma("unroll")                                                                  \
+            for (int g = 0; g < G; g++) {                                                      \
+                const float* qb_thread = q_lds + g * head_dim + k_bi * 32 + k_off;             \
+                partial[g] += qb_thread[0] * (ks * (float)((signed char)kb[2 + k_off + 0]))    \
+                            + qb_thread[1] * (ks * (float)((signed char)kb[2 + k_off + 1]))    \
+                            + qb_thread[2] * (ks * (float)((signed char)kb[2 + k_off + 2]))    \
+                            + qb_thread[3] * (ks * (float)((signed char)kb[2 + k_off + 3]));   \
+            }                                                                                  \
+        }                                                                                      \
+        _Pragma("unroll")                                                                      \
+        for (int g = 0; g < G; g++) {                                                          \
+            for (int off = 16; off > 0; off >>= 1)                                             \
+                partial[g] += __shfl_xor(partial[g], off);                                     \
+        }                                                                                      \
+        if (tid == 0) {                                                                        \
+            _Pragma("unroll")                                                                  \
+            for (int g = 0; g < G; g++) scores[g * tile_size + t_local] = partial[g] * scale_attn; \
+        }                                                                                      \
+    }                                                                                          \
+    __syncthreads();                                                                           \
+    const int max_tiles = (max_seq + tile_size - 1) / tile_size;                               \
+    _Pragma("unroll")                                                                          \
+    for (int g = 0; g < G; g++) {                                                              \
+        float tile_max = -1e30f;                                                               \
+        for (int i = tid; i < tile_len; i += 32)                                               \
+            tile_max = fmaxf(tile_max, scores[g * tile_size + i]);                             \
+        for (int off = 16; off > 0; off >>= 1)                                                 \
+            tile_max = fmaxf(tile_max, __shfl_xor(tile_max, off));                             \
+        float tile_sum = 0.0f;                                                                 \
+        for (int i = tid; i < tile_len; i += 32) {                                             \
+            float e = expf(scores[g * tile_size + i] - tile_max);                              \
+            scores[g * tile_size + i] = e;                                                     \
+            tile_sum += e;                                                                     \
+        }                                                                                      \
+        for (int off = 16; off > 0; off >>= 1)                                                 \
+            tile_sum += __shfl_xor(tile_sum, off);                                             \
+        if (tid == 0) {                                                                        \
+            float* pg = partials + ((kv_h * G + g) * max_tiles + tile_id) * (2 + head_dim);    \
+            pg[0] = tile_max;                                                                  \
+            pg[1] = tile_sum;                                                                  \
+        }                                                                                      \
+    }                                                                                          \
+    __syncthreads();                                                                           \
+    for (int half = 0; half < n_halves; half++) {                                              \
+        const int d_base = half * 128 + tid * 4;                                               \
+        const int bi = d_base / 32;                                                            \
+        const int bj_base = d_base % 32;                                                       \
+        const int v_blk_off = (kv_head_block_start + bi) * 34;                                 \
+        float out[G][4];                                                                       \
+        _Pragma("unroll")                                                                      \
+        for (int g = 0; g < G; g++) {                                                          \
+            out[g][0] = 0.0f; out[g][1] = 0.0f; out[g][2] = 0.0f; out[g][3] = 0.0f;            \
+        }                                                                                      \
+        int vt = 0;                                                                            \
+        for (; vt + 3 < tile_len; vt += 4) {                                                   \
+            int t0 = tile_start + vt + 0;                                                      \
+            int t1 = tile_start + vt + 1;                                                      \
+            int t2 = tile_start + vt + 2;                                                      \
+            int t3 = tile_start + vt + 3;                                                      \
+            int s0 = (window > 0) ? (t0 % max_seq) : t0;                                       \
+            int s1 = (window > 0) ? (t1 % max_seq) : t1;                                       \
+            int s2 = (window > 0) ? (t2 % max_seq) : t2;                                       \
+            int s3 = (window > 0) ? (t3 % max_seq) : t3;                                       \
+            const unsigned char* vb0 = v_cache + (size_t)s0 * row_stride + v_blk_off;          \
+            const unsigned char* vb1 = v_cache + (size_t)s1 * row_stride + v_blk_off;          \
+            const unsigned char* vb2 = v_cache + (size_t)s2 * row_stride + v_blk_off;          \
+            const unsigned char* vb3 = v_cache + (size_t)s3 * row_stride + v_blk_off;          \
+            float vs0 = (float)*((const _Float16*)vb0);                                        \
+            float vs1 = (float)*((const _Float16*)vb1);                                        \
+            float vs2 = (float)*((const _Float16*)vb2);                                        \
+            float vs3 = (float)*((const _Float16*)vb3);                                        \
+            const signed char v00 = (signed char)vb0[2 + bj_base + 0];                         \
+            const signed char v01 = (signed char)vb0[2 + bj_base + 1];                         \
+            const signed char v02 = (signed char)vb0[2 + bj_base + 2];                         \
+            const signed char v03 = (signed char)vb0[2 + bj_base + 3];                         \
+            const signed char v10 = (signed char)vb1[2 + bj_base + 0];                         \
+            const signed char v11 = (signed char)vb1[2 + bj_base + 1];                         \
+            const signed char v12 = (signed char)vb1[2 + bj_base + 2];                         \
+            const signed char v13 = (signed char)vb1[2 + bj_base + 3];                         \
+            const signed char v20 = (signed char)vb2[2 + bj_base + 0];                         \
+            const signed char v21 = (signed char)vb2[2 + bj_base + 1];                         \
+            const signed char v22 = (signed char)vb2[2 + bj_base + 2];                         \
+            const signed char v23 = (signed char)vb2[2 + bj_base + 3];                         \
+            const signed char v30 = (signed char)vb3[2 + bj_base + 0];                         \
+            const signed char v31 = (signed char)vb3[2 + bj_base + 1];                         \
+            const signed char v32 = (signed char)vb3[2 + bj_base + 2];                         \
+            const signed char v33 = (signed char)vb3[2 + bj_base + 3];                         \
+            _Pragma("unroll")                                                                  \
+            for (int g = 0; g < G; g++) {                                                      \
+                float w0 = scores[g * tile_size + vt + 0];                                     \
+                float w1 = scores[g * tile_size + vt + 1];                                     \
+                float w2 = scores[g * tile_size + vt + 2];                                     \
+                float w3 = scores[g * tile_size + vt + 3];                                     \
+                out[g][0] += w0 * (vs0 * (float)v00);                                          \
+                out[g][1] += w0 * (vs0 * (float)v01);                                          \
+                out[g][2] += w0 * (vs0 * (float)v02);                                          \
+                out[g][3] += w0 * (vs0 * (float)v03);                                          \
+                out[g][0] += w1 * (vs1 * (float)v10);                                          \
+                out[g][1] += w1 * (vs1 * (float)v11);                                          \
+                out[g][2] += w1 * (vs1 * (float)v12);                                          \
+                out[g][3] += w1 * (vs1 * (float)v13);                                          \
+                out[g][0] += w2 * (vs2 * (float)v20);                                          \
+                out[g][1] += w2 * (vs2 * (float)v21);                                          \
+                out[g][2] += w2 * (vs2 * (float)v22);                                          \
+                out[g][3] += w2 * (vs2 * (float)v23);                                          \
+                out[g][0] += w3 * (vs3 * (float)v30);                                          \
+                out[g][1] += w3 * (vs3 * (float)v31);                                          \
+                out[g][2] += w3 * (vs3 * (float)v32);                                          \
+                out[g][3] += w3 * (vs3 * (float)v33);                                          \
+            }                                                                                  \
+        }                                                                                      \
+        for (; vt < tile_len; vt++) {                                                          \
+            int t = tile_start + vt;                                                           \
+            int slot = (window > 0) ? (t % max_seq) : t;                                       \
+            const unsigned char* vb = v_cache + (size_t)slot * row_stride + v_blk_off;         \
+            float vs = (float)*((const _Float16*)vb);                                          \
+            _Pragma("unroll")                                                                  \
+            for (int g = 0; g < G; g++) {                                                      \
+                float w = scores[g * tile_size + vt];                                          \
+                out[g][0] += w * (vs * (float)((signed char)vb[2 + bj_base + 0]));             \
+                out[g][1] += w * (vs * (float)((signed char)vb[2 + bj_base + 1]));             \
+                out[g][2] += w * (vs * (float)((signed char)vb[2 + bj_base + 2]));             \
+                out[g][3] += w * (vs * (float)((signed char)vb[2 + bj_base + 3]));             \
+            }                                                                                  \
+        }                                                                                      \
+        _Pragma("unroll")                                                                      \
+        for (int g = 0; g < G; g++) {                                                          \
+            float* pg = partials + ((kv_h * G + g) * max_tiles + tile_id) * (2 + head_dim);    \
+            pg[2 + d_base + 0] = out[g][0];                                                    \
+            pg[2 + d_base + 1] = out[g][1];                                                    \
+            pg[2 + d_base + 2] = out[g][2];                                                    \
+            pg[2 + d_base + 3] = out[g][3];                                                    \
+        }                                                                                      \
+    }                                                                                          \
+}
+
+HFIRE_Q8_GQA_TILE(2, 8)
+HFIRE_Q8_GQA_TILE(4, 8)
+HFIRE_Q8_GQA_TILE(8, 4)

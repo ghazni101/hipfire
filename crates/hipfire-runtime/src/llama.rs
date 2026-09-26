@@ -2682,7 +2682,14 @@ fn q8_prefill_family_eligible(
     is_tree: bool,
     batch_size: usize,
 ) -> bool {
-    model_arch == ModelArch::Qwen3
+    // Llama-family joins Qwen3: the legacy batched Q8 attention this gate used
+    // to fall back to sizes its LDS as (max_ctx + block + head_dim) * 4, so
+    // occupancy collapses as context grows (K2-Horizon prefill fell off a
+    // cliff between 6k and 9k tokens — 1620 → 257 tok/s at identical shape).
+    // The paired M16 WMMA kernel the family dispatches is O(1) LDS and
+    // GQA-fused; tree-masked verify and singleton tails stay on the legacy
+    // path (is_tree / batch_size == 1).
+    (model_arch == ModelArch::Qwen3 || model_arch == ModelArch::Llama)
         && (gpu_arch.starts_with("gfx11") || gpu_arch == "gfx1201")
         && quant_q8
         && !is_tree
@@ -4806,15 +4813,27 @@ pub fn forward_scratch_layers(
             config.rope_freq_base,
         )?;
 
-        if kv_cache.quant_asym4 || kv_cache.quant_asym3 || kv_cache.quant_asym2 {
+        if kv_cache.quant_asym4
+            || kv_cache.quant_asym3
+            || kv_cache.quant_asym2
+            || kv_cache.quant_q8
+        {
             // Asym/Givens KV: the manual ladder below has no asym kernels, so
             // route KV-write + flash-attend through the dispatch attention
             // family (the same path qwen35 uses). tier_inputs() classifies the
             // tier from the cache's quant flags; run_attention does both the
             // KV write and the single-token flash attend.
+            // Q8 joins the same routing (flash_mode resolves to 2 on
+            // gfx11/gfx12): the legacy `attention_q8_0_kv` single-block
+            // kernel this ladder used for Q8 scans the whole sequence with
+            // one block per head and no KV-head sharing, which made decode
+            // time grow linearly with context at ~10 GB/s effective — the
+            // K2-Horizon long-context decay. The tiled flash kernel with the
+            // GQA-fused variant is the mainline Q8 decode attention.
             let ctx = DispatchCtx::new(gpu);
             let plan = KvTierPlan::derive(KvTierInputs {
                 pos,
+                flash_mode: attention_flash_mode(&gpu.arch),
                 ..kv_cache.tier_inputs()
             })
             .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
@@ -5382,15 +5401,27 @@ pub fn forward_scratch_compute_capture(
             config.rope_freq_base,
         )?;
 
-        if kv_cache.quant_asym4 || kv_cache.quant_asym3 || kv_cache.quant_asym2 {
+        if kv_cache.quant_asym4
+            || kv_cache.quant_asym3
+            || kv_cache.quant_asym2
+            || kv_cache.quant_q8
+        {
             // Asym/Givens KV: the manual ladder below has no asym kernels, so
             // route KV-write + flash-attend through the dispatch attention
             // family (the same path qwen35 uses). tier_inputs() classifies the
             // tier from the cache's quant flags; run_attention does both the
             // KV write and the single-token flash attend.
+            // Q8 joins the same routing (flash_mode resolves to 2 on
+            // gfx11/gfx12): the legacy `attention_q8_0_kv` single-block
+            // kernel this ladder used for Q8 scans the whole sequence with
+            // one block per head and no KV-head sharing, which made decode
+            // time grow linearly with context at ~10 GB/s effective — the
+            // K2-Horizon long-context decay. The tiled flash kernel with the
+            // GQA-fused variant is the mainline Q8 decode attention.
             let ctx = DispatchCtx::new(gpu);
             let plan = KvTierPlan::derive(KvTierInputs {
                 pos,
+                flash_mode: attention_flash_mode(&gpu.arch),
                 ..kv_cache.tier_inputs()
             })
             .map_err(|e| hip_bridge::HipError::new(0, &e.to_string()))?;
@@ -8959,15 +8990,19 @@ mod tests {
     // ── KvCache::tier_inputs() accessor pin test ─────────────────
 
     #[test]
-    fn q8_prefill_family_stays_inside_validated_qwen3_arch_envelope() {
+    fn q8_prefill_family_stays_inside_validated_arch_envelope() {
         let eligible =
             |arch, model, q8, tree, batch| q8_prefill_family_eligible(arch, model, q8, tree, batch);
         assert!(eligible("gfx1100", ModelArch::Qwen3, true, false, 256));
         assert!(eligible("gfx1201", ModelArch::Qwen3, true, false, 2));
+        // Llama-family joins the envelope (K2-Horizon): the legacy fallback
+        // kernel's context-proportional LDS collapsed prefill past ~8k tokens.
+        assert!(eligible("gfx1100", ModelArch::Llama, true, false, 256));
         assert!(!eligible("gfx1030", ModelArch::Qwen3, true, false, 256));
+        assert!(!eligible("gfx1030", ModelArch::Llama, true, false, 256));
         assert!(!eligible("gfx1200", ModelArch::Qwen3, true, false, 256));
-        assert!(!eligible("gfx1100", ModelArch::Llama, true, false, 256));
         assert!(!eligible("gfx1100", ModelArch::Qwen3, true, true, 256));
+        assert!(!eligible("gfx1100", ModelArch::Llama, true, true, 256));
         assert!(!eligible("gfx1100", ModelArch::Qwen3, true, false, 1));
         assert!(!eligible("gfx1100", ModelArch::Qwen3, false, false, 256));
     }
