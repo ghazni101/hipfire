@@ -36,16 +36,23 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 /// Validated VRAM ceiling per family on gfx1100 (24.5 GB usable):
 /// dense K2-7B ran 40960 with margin (64k OOM'd at KV alloc, 26 MB free),
 /// so the dense default must never exceed the demonstrated envelope.
-/// MoVA-36B weights (~21.5 GB on-device) leave ~2.6 GB for KV —
+/// MoVA-36B @ mq4l weights (~20.6 GB on-device) leave ~3.9 GB for KV —
 /// Q8 KV is 104.5 KB/token (48 L × 8 KVH × 128 hd × 2 × 136 B), so the
-/// MoVA ceiling is 24576 (2.57 GB, ~0.1 GB margin). 40960 OOM'd
-/// reproducibly (20 MB free at KV alloc).
+/// mq4l MoVA ceiling is 24576 (2.57 GB, ~0.1 GB margin). 40960 OOM'd
+/// reproducibly (20 MB free at KV alloc). MQ3G256Lloyd weights (~14 GB)
+/// free ~10.5 GB, which covers 65536 tokens (6.7 GB KV) with ~3.8 GB of
+/// state/scratch headroom; 131072 does not fit (13.4 GB KV alone).
 const DEFAULT_MAX_SEQ_DENSE: usize = 40960;
 const DEFAULT_MAX_SEQ_MOVA: usize = 24576;
+const DEFAULT_MAX_SEQ_MOVA_MQ3L: usize = 65536;
 
-fn max_seq_cap(cfg: &K2HorizonConfig) -> usize {
+fn max_seq_cap(cfg: &K2HorizonConfig, expert_dtype: Option<DType>) -> usize {
     if cfg.mova_num_experts > 0 {
-        DEFAULT_MAX_SEQ_MOVA
+        if expert_dtype == Some(DType::MQ3G256Lloyd) {
+            DEFAULT_MAX_SEQ_MOVA_MQ3L
+        } else {
+            DEFAULT_MAX_SEQ_MOVA
+        }
     } else {
         DEFAULT_MAX_SEQ_DENSE
     }
@@ -211,18 +218,22 @@ impl K2HorizonState {
     }
 
     pub fn new(gpu: &mut Gpu, cfg: &K2HorizonConfig) -> Result<Self, String> {
-        let max_seq = cfg.max_position_embeddings.min(max_seq_cap(cfg));
-        Self::new_with_max_seq(gpu, cfg, max_seq)
+        // Config-only path has no weight dtype in scope → conservative cap.
+        let max_seq = cfg
+            .max_position_embeddings
+            .min(max_seq_cap(cfg, None));
+        Self::new_with_max_seq(gpu, cfg, max_seq, None)
     }
 
     pub fn new_with_max_seq(
         gpu: &mut Gpu,
         cfg: &K2HorizonConfig,
         max_seq: usize,
+        expert_dtype: Option<DType>,
     ) -> Result<Self, String> {
         let max_seq = max_seq
             .min(cfg.max_position_embeddings)
-            .min(max_seq_cap(cfg));
+            .min(max_seq_cap(cfg, expert_dtype));
         let hidden = cfg.dim;
         let q_dim = cfg.n_heads * cfg.head_dim;
         let kv_dim = cfg.n_kv_heads * cfg.head_dim;
@@ -1056,16 +1067,31 @@ pub(crate) fn forward_mova_value_routing(
 
     // 5. V2 indexed MoE GEMV: all mova_top_k v_experts in one kernel launch.
     //    Writes [mova_top_k × kv_dim] to v_expanded.
-    gpu.gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded(
-        &attn.v_expert_ptrs,
-        &state.v_topk_indices,
-        &state.v_rot_batch,
-        &state.v_expanded,
-        kv_dim,
-        hidden,
-        mova_top_k,
-        1,
-    )
+    match attn.v_experts[0].gpu_dtype {
+        DType::MQ4G256V2 => gpu.gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded(
+            &attn.v_expert_ptrs,
+            &state.v_topk_indices,
+            &state.v_rot_batch,
+            &state.v_expanded,
+            kv_dim,
+            hidden,
+            mova_top_k,
+            1,
+        ),
+        DType::MQ3G256Lloyd => gpu.gemv_mq3g256_lloyd_moe_down_indexed_batched_expanded(
+            &attn.v_expert_ptrs,
+            &state.v_topk_indices,
+            &state.v_rot_batch,
+            &state.v_expanded,
+            kv_dim,
+            hidden,
+            mova_top_k,
+            1,
+        ),
+        other => return Err(format!(
+            "k2_horizon L{l}: v_expert dtype {other:?} — needs MQ4G256V2 or MQ3G256Lloyd"
+        )),
+    }
     .map_err(|e| format!("k2_horizon L{l}: v_expert indexed gemv: {e:?}"))?;
 
     // 6-7. Fused SiLU + weighted combine with overwrite semantics:
@@ -1151,17 +1177,33 @@ pub(crate) fn forward_sigmoid_moe_ffn(
     //    never set it), so the fixed FWHT rotation always applies.
 
     // 5. V2 indexed MoE gate_up GEMV: all top_k experts in one kernel launch.
-    gpu.gemv_mq4g256v2_moe_gate_up_k8_indexed_batched(
-        &ffn.expert_gate_up_ptrs,
-        &state.moe_topk_indices,
-        &state.normed_rot,
-        &state.gate_batch,
-        &state.up_batch,
-        2 * moe_inter,
-        hidden,
-        top_k,
-        1,
-    )
+    match ffn.experts[0].gate_up.gpu_dtype {
+        DType::MQ4G256V2 => gpu.gemv_mq4g256v2_moe_gate_up_k8_indexed_batched(
+            &ffn.expert_gate_up_ptrs,
+            &state.moe_topk_indices,
+            &state.normed_rot,
+            &state.gate_batch,
+            &state.up_batch,
+            2 * moe_inter,
+            hidden,
+            top_k,
+            1,
+        ),
+        DType::MQ3G256Lloyd => gpu.gemv_mq3g256_lloyd_moe_gate_up_indexed_batched(
+            &ffn.expert_gate_up_ptrs,
+            &state.moe_topk_indices,
+            &state.normed_rot,
+            &state.gate_batch,
+            &state.up_batch,
+            2 * moe_inter,
+            hidden,
+            top_k,
+            1,
+        ),
+        other => return Err(format!(
+            "k2_horizon L{l}: expert gate_up dtype {other:?} — needs MQ4G256V2 or MQ3G256Lloyd"
+        )),
+    }
     .map_err(|e| format!("k2_horizon L{l}: gate_up indexed gemv: {e:?}"))?;
 
     // 6. Fused silu_mul + FWHT rotate: rot_batch = FWHT(silu(gate) * up)
@@ -1179,16 +1221,31 @@ pub(crate) fn forward_sigmoid_moe_ffn(
 
     // 7. V2 indexed down GEMV: all top_k experts in one kernel launch.
     //    Writes [top_k × hidden] to down_expanded.
-    gpu.gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded(
-        &ffn.expert_down_ptrs,
-        &state.moe_topk_indices,
-        &state.rot_batch,
-        &state.down_expanded,
-        hidden,
-        moe_inter,
-        top_k,
-        1,
-    )
+    match ffn.experts[0].down.gpu_dtype {
+        DType::MQ4G256V2 => gpu.gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded(
+            &ffn.expert_down_ptrs,
+            &state.moe_topk_indices,
+            &state.rot_batch,
+            &state.down_expanded,
+            hidden,
+            moe_inter,
+            top_k,
+            1,
+        ),
+        DType::MQ3G256Lloyd => gpu.gemv_mq3g256_lloyd_moe_down_indexed_batched_expanded(
+            &ffn.expert_down_ptrs,
+            &state.moe_topk_indices,
+            &state.rot_batch,
+            &state.down_expanded,
+            hidden,
+            moe_inter,
+            top_k,
+            1,
+        ),
+        other => return Err(format!(
+            "k2_horizon L{l}: expert down dtype {other:?} — needs MQ4G256V2 or MQ3G256Lloyd"
+        )),
+    }
     .map_err(|e| format!("k2_horizon L{l}: down indexed gemv: {e:?}"))?;
 
     // 8. Combine: h += Σ weight[k] * down_expanded[k]

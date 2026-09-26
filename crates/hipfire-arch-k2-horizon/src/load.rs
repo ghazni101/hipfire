@@ -75,8 +75,23 @@ pub fn load_k2_horizon_bundle(
         ModelSource::Hfq(mut hfq) => {
             let config = <K2Horizon as Architecture>::config_from_hfq(&hfq)?;
             let weights = <K2Horizon as Architecture>::load_weights(&mut hfq, &config, ctx.gpu)?;
-            let state = K2HorizonState::new_with_max_seq(ctx.gpu, &config, ctx.max_seq)
-                .map_err(|e| format!("k2_horizon: new_with_max_seq failed: {e}"))?;
+            // Expert dtype drives the MoVA max_seq cap: MQ3G256Lloyd weights
+            // free ~7 GB of KV headroom vs MQ4G256V2, so the 64k cap is
+            // dtype-gated. Dense layers never carry experts → look at the
+            // first MoE layer's gate_up dtype.
+            let expert_dtype = weights
+                .moe_layers
+                .first()
+                .map(|l| l.ffn.experts[0].gate_up.gpu_dtype)
+                .or_else(|| {
+                    weights
+                        .moe_layers
+                        .iter()
+                        .find_map(|l| l.attn.v_experts.first().map(|e| e.gpu_dtype))
+                });
+            let state =
+                K2HorizonState::new_with_max_seq(ctx.gpu, &config, ctx.max_seq, expert_dtype)
+                    .map_err(|e| format!("k2_horizon: new_with_max_seq failed: {e}"))?;
 
             // EOS: K2-Horizon uses <|ifm|endoftext|> (id 1) as primary EOS.
             // The config carries eos_token_id; fall back to 1.

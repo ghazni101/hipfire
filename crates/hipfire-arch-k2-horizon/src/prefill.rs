@@ -453,16 +453,31 @@ fn forward_mova_value_routing_batch(
         .map_err(|e| format!("k2_horizon prefill L{l}: v replicate: {e:?}"))?;
 
     // 6. V2 indexed MoE down GEMV: all v_experts in one launch, batch_size=n
-    gpu.gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded(
-        &attn.v_expert_ptrs,
-        &v_topk_indices,
-        &v_rot_batch,
-        &v_expanded,
-        kv_dim,
-        hidden,
-        mova_top_k,
-        n,
-    )
+    match attn.v_experts[0].gpu_dtype {
+        DType::MQ4G256V2 => gpu.gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded(
+            &attn.v_expert_ptrs,
+            &v_topk_indices,
+            &v_rot_batch,
+            &v_expanded,
+            kv_dim,
+            hidden,
+            mova_top_k,
+            n,
+        ),
+        DType::MQ3G256Lloyd => gpu.gemv_mq3g256_lloyd_moe_down_indexed_batched_expanded(
+            &attn.v_expert_ptrs,
+            &v_topk_indices,
+            &v_rot_batch,
+            &v_expanded,
+            kv_dim,
+            hidden,
+            mova_top_k,
+            n,
+        ),
+        other => return Err(format!(
+            "k2_horizon prefill L{l}: v_expert dtype {other:?} — needs MQ4G256V2 or MQ3G256Lloyd"
+        )),
+    }
     .map_err(|e| format!("k2_horizon prefill L{l}: v_expert indexed gemv: {e:?}"))?;
 
     // 7. SiLU activation on all expert outputs
@@ -536,17 +551,33 @@ fn forward_sigmoid_moe_ffn_batch(
         .map_err(|e| format!("k2_horizon prefill L{l}: ffn rotate: {e:?}"))?;
 
     // 5. V2 indexed gate_up GEMV: all top_k experts, batch_size=n
-    gpu.gemv_mq4g256v2_moe_gate_up_k8_indexed_batched(
-        &ffn.expert_gate_up_ptrs,
-        &moe_topk_indices,
-        &ffn_x_rot,
-        &gate_batch,
-        &up_batch,
-        2 * moe_inter,
-        hidden,
-        top_k,
-        n,
-    )
+    match ffn.experts[0].gate_up.gpu_dtype {
+        DType::MQ4G256V2 => gpu.gemv_mq4g256v2_moe_gate_up_k8_indexed_batched(
+            &ffn.expert_gate_up_ptrs,
+            &moe_topk_indices,
+            &ffn_x_rot,
+            &gate_batch,
+            &up_batch,
+            2 * moe_inter,
+            hidden,
+            top_k,
+            n,
+        ),
+        DType::MQ3G256Lloyd => gpu.gemv_mq3g256_lloyd_moe_gate_up_indexed_batched(
+            &ffn.expert_gate_up_ptrs,
+            &moe_topk_indices,
+            &ffn_x_rot,
+            &gate_batch,
+            &up_batch,
+            2 * moe_inter,
+            hidden,
+            top_k,
+            n,
+        ),
+        other => return Err(format!(
+            "k2_horizon prefill L{l}: expert gate_up dtype {other:?} — needs MQ4G256V2 or MQ3G256Lloyd"
+        )),
+    }
     .map_err(|e| format!("k2_horizon prefill L{l}: gate_up indexed gemv: {e:?}"))?;
 
     // 6. Fused silu_mul + FWHT rotate → [n × k_top × moe_inter]
@@ -562,16 +593,31 @@ fn forward_sigmoid_moe_ffn_batch(
     .map_err(|e| format!("k2_horizon prefill L{l}: fused silu_mul rotate: {e:?}"))?;
 
     // 7. V2 indexed down GEMV: all top_k experts, batch_size=n
-    gpu.gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded(
-        &ffn.expert_down_ptrs,
-        &moe_topk_indices,
-        &rot_batch,
-        &down_expanded,
-        hidden,
-        moe_inter,
-        top_k,
-        n,
-    )
+    match ffn.experts[0].down.gpu_dtype {
+        DType::MQ4G256V2 => gpu.gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded(
+            &ffn.expert_down_ptrs,
+            &moe_topk_indices,
+            &rot_batch,
+            &down_expanded,
+            hidden,
+            moe_inter,
+            top_k,
+            n,
+        ),
+        DType::MQ3G256Lloyd => gpu.gemv_mq3g256_lloyd_moe_down_indexed_batched_expanded(
+            &ffn.expert_down_ptrs,
+            &moe_topk_indices,
+            &rot_batch,
+            &down_expanded,
+            hidden,
+            moe_inter,
+            top_k,
+            n,
+        ),
+        other => return Err(format!(
+            "k2_horizon prefill L{l}: expert down dtype {other:?} — needs MQ4G256V2 or MQ3G256Lloyd"
+        )),
+    }
     .map_err(|e| format!("k2_horizon prefill L{l}: down indexed gemv: {e:?}"))?;
 
     // 8. Combine: h += Σ weight[k] * down_expanded[k]

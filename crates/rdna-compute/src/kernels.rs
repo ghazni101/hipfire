@@ -7441,6 +7441,17 @@ pub const GEMV_MQ2G256_LLOYD_MOE_DOWN_INDEXED_BATCHED_K8ALL_SRC: &str =
 pub const GEMV_MQ3G256_LLOYD_MOE_DOWN_INDEXED_BATCHED_K4_SRC: &str =
     include_str!("../../../kernels/src/gemv_mq3g256_lloyd_moe_down_indexed_batched_k4.hip");
 
+/// K2-Horizon MoVA sibling — expanded per-expert outputs (no weighted
+/// residual fold) so callers can fuse silu before the combine. Same 112
+/// B/group decode loop as the _k4 residual variant.
+pub const GEMV_MQ3G256_LLOYD_MOE_DOWN_INDEXED_BATCHED_EXPANDED_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq3g256_lloyd_moe_down_indexed_batched_expanded.hip");
+
+/// Batched MQ3-Lloyd MoE gate_up — kernel file pre-existed unwrapped;
+/// identical launch contract to `gemv_mq4g256v2_moe_gate_up_k8_indexed_batched`.
+pub const GEMV_MQ3G256_LLOYD_MOE_GATE_UP_INDEXED_BATCHED_K4_SRC: &str =
+    include_str!("../../../kernels/src/gemv_mq3g256_lloyd_moe_gate_up_indexed_batched_k4.hip");
+
 /// DeepSeek V4 head HC mix — compute per-stream pre weights for the final
 /// 4-stream → hidden projection before lm_head.
 pub const HC_HEAD_COMPUTE_PRE_SRC: &str =

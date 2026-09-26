@@ -178,15 +178,16 @@ fn wt_from_raw(
     })
 }
 
-/// Quant types that share the 136 B/group stride and can be packed into
-/// layer-level blobs. All three have identical byte layout for
-/// concatenation — only the 8-byte group header interpretation differs,
-/// handled by kernel dispatch on `gpu_dtype`. qt=30 (MQ4G256Lloyd, 160
-/// B/group) and qt=47 (MQ6G256V2, 200 B/group) are excluded (different
-/// strides). Mirrors the fix/pack-mq4g256v2-experts approach.
+/// Quant types that can be packed into layer-level blobs. qt=13/44/45 share
+/// the 136 B/group stride; qt=20 (MQ3G256Lloyd, 112 B/group) packs too — the
+/// stride is tracked separately per blob, so a uniform-qt20 layer is valid.
+/// Mixed dtypes still bail to per-expert loading. qt=30 (MQ4G256Lloyd, 160
+/// B/group) and qt=47 (MQ6G256V2, 200 B/group) are excluded (no k2 kernels).
+/// Mirrors the fix/pack-mq4g256v2-experts approach.
 fn packable_mq4_dtype(qt: u8) -> Option<DType> {
     match qt {
         13 => Some(DType::MQ4G256),
+        20 => Some(DType::MQ3G256Lloyd),
         44 => Some(DType::MQ4G256V2),
         45 => Some(DType::MQ4CG256),
         _ => None,
@@ -341,17 +342,21 @@ fn load_packed_experts(
     Ok((views, Some(owner)))
 }
 
-/// The indexed MoE GEMV kernels used by the K2-Horizon forward path
-/// (`gemv_mq4g256v2_moe_*_k8_indexed_batched*`) decode fp16 per-128 group
-/// headers — the MQ4G256V2 (qt=44) layout. They are the only indexed kernels
-/// that support K2-Horizon's K dims (768 / 2560); the V1 kernels are
-/// hardcoded to K=512. Any other expert dtype would be silently misdecoded,
-/// so refuse it at load time rather than serve garbage.
-fn require_v2_expert_dtype(experts: &[WeightTensor], what: &str) -> Result<(), String> {
+/// The indexed MoE GEMV kernels used by the K2-Horizon forward path cover
+/// two expert dtypes: MQ4G256V2 (qt=44, fp16 per-128 group headers) via
+/// `gemv_mq4g256v2_moe_*_k8_indexed_batched*`, and MQ3G256Lloyd (qt=20, fp16
+/// 8-entry codebook per-256 group) via `gemv_mq3g256_lloyd_moe_*_batched*`.
+/// The forward dispatches on `gpu_dtype` per layer. Any other expert dtype
+/// would be silently misdecoded, so refuse it at load time rather than
+/// serve garbage.
+fn require_supported_expert_dtype(
+    experts: &[WeightTensor],
+    what: &str,
+) -> Result<(), String> {
     for (i, e) in experts.iter().enumerate() {
-        if e.gpu_dtype != DType::MQ4G256V2 {
+        if !matches!(e.gpu_dtype, DType::MQ4G256V2 | DType::MQ3G256Lloyd) {
             return Err(format!(
-                "k2_horizon: {what}[{i}] has dtype {:?} — indexed MoE GEMV requires MQ4G256V2 (qt=44); re-quantize with --format mq4",
+                "k2_horizon: {what}[{i}] has dtype {:?} — indexed MoE GEMV requires MQ4G256V2 (qt=44) or MQ3G256Lloyd (qt=20); re-quantize with --format mq4 or mq3-lloyd",
                 e.gpu_dtype
             ));
         }
@@ -400,7 +405,7 @@ impl Architecture for K2Horizon {
         // to F32 (2.57 GB). embedding_lookup_q8 dequantizes one row on-GPU
         // at lookup time. Matches minimax/deepseek4/cohere2moe pattern.
         // Fail-fast on any other quant type — a non-Q8 embed would silently
-        // misdecode every token (same class require_v2_expert_dtype guards).
+        // misdecode every token (same class require_supported_expert_dtype guards).
         let (embed_qt, embed_bytes) = read_tensor(hfq, "model.embed_tokens.weight")?;
         if embed_qt != 3 {
             return Err(format!(
@@ -590,7 +595,7 @@ impl Architecture for K2Horizon {
                 };
                 // The MoVA indexed GEMV is V2-only (fp16 per-128 headers);
                 // refuse any other expert dtype instead of misdecoding it.
-                require_v2_expert_dtype(&v_experts, &format!("{p}.self_attn.v_experts"))?;
+                require_supported_expert_dtype(&v_experts, &format!("{p}.self_attn.v_experts"))?;
                 // Device pointer table for indexed MoE GEMV: mova_n_exp u64
                 // device addresses stored as [2*mova_n_exp] F32 (8 B/ptr).
                 let ve_ptrs: Vec<u8> = v_experts
@@ -813,14 +818,13 @@ impl Architecture for K2Horizon {
                     }
                 };
 
-                // Same V2-only constraint as the MoVA v_experts — the indexed
-                // gate_up/down GEMV kernels decode fp16 per-128 headers only.
+                // Same constraint as the MoVA v_experts — the indexed
+                // gate_up/down GEMVs cover MQ4G256V2 and MQ3G256Lloyd only.
                 for (i, e) in experts.iter().enumerate() {
-                    if e.gate_up.gpu_dtype != DType::MQ4G256V2
-                        || e.down.gpu_dtype != DType::MQ4G256V2
-                    {
+                    let ok = |d: DType| matches!(d, DType::MQ4G256V2 | DType::MQ3G256Lloyd);
+                    if !ok(e.gate_up.gpu_dtype) || !ok(e.down.gpu_dtype) {
                         return Err(format!(
-                            "k2_horizon: {p}.mlp.experts.{i} has dtype {:?}/{:?} — indexed MoE GEMV requires MQ4G256V2 (qt=44); re-quantize with --format mq4",
+                            "k2_horizon: {p}.mlp.experts.{i} has dtype {:?}/{:?} — indexed MoE GEMV requires MQ4G256V2 (qt=44) or MQ3G256Lloyd (qt=20); re-quantize with --format mq4 or mq3-lloyd",
                             e.gate_up.gpu_dtype, e.down.gpu_dtype
                         ));
                     }

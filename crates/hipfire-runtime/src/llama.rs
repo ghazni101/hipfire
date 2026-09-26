@@ -1695,6 +1695,19 @@ pub fn weight_gemm(
             gpu.free_tensor(x_rot)?;
             r
         }
+        // qt=20 MQ3-Lloyd: same offline-FWHT input rotation, but the only
+        // batched kernel in the family is the *residual* WMMA (Y += W·X),
+        // so y is zeroed first — bit-exact vs the per-row GEMV fallback it
+        // replaces (~batch× faster on prefill).
+        DType::MQ3G256Lloyd => {
+            gpu.ensure_mq_signs()?;
+            let x_rot = gpu.alloc_tensor(&[batch_size, w.k], DType::F32)?;
+            rotate_x_mq_batched_for(gpu, w, x, &x_rot, w.k, batch_size)?;
+            gpu.hip.memset(&y.buf, 0, batch_size * w.m * 4)?;
+            let r = gpu.gemm_mq3g256_lloyd_residual_wmma(&w.buf, &x_rot, y, w.m, w.k, batch_size);
+            gpu.free_tensor(x_rot)?;
+            r
+        }
         DType::MQ2G256V2 => {
             gpu.ensure_mq_signs()?;
             let x_rot = gpu.alloc_tensor(&[batch_size, w.k], DType::F32)?;

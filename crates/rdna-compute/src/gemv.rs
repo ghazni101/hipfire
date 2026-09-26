@@ -14229,6 +14229,150 @@ impl Gpu {
         }
         result
     }
+
+    /// K2-Horizon MoVA: batched MQ3-Lloyd indexed gate_up GEMV (k4 LDS
+    /// codebook). Identical call contract to
+    /// `gemv_mq4g256v2_moe_gate_up_k8_indexed_batched` — same grid
+    /// (M, k_top, batch), same expert_ptrs table; only the 112 B/group
+    /// MQ3-Lloyd payload decode differs.
+    pub fn gemv_mq3g256_lloyd_moe_gate_up_indexed_batched(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        x: &GpuTensor,
+        y_gate: &GpuTensor,
+        y_up: &GpuTensor,
+        m: usize,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_mq3g256_lloyd_moe_gate_up_indexed_batched_k4",
+            kernels::GEMV_MQ3G256_LLOYD_MOE_GATE_UP_INDEXED_BATCHED_K4_SRC,
+            "gemv_mq3g256_lloyd_moe_gate_up_k8_indexed_batched_k4",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let xp = x.buf.as_ptr();
+        let ygp = y_gate.buf.as_ptr();
+        let yup = y_up.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &xp as *const _ as *mut c_void,
+            &ygp as *const _ as *mut c_void,
+            &yup as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        // MQ3-Lloyd: 112 B/group.
+        let mq3_weight_bytes = m * (k / 256) * 112;
+        let bytes = batch_size * k_top * (mq3_weight_bytes + k * 4 + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "gemv_mq3g256_lloyd_moe_gate_up_indexed_batched",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_mq3g256_lloyd_moe_gate_up_k8_indexed_batched_k4",
+            [m as u32, k_top as u32, batch_size as u32],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(xp);
+                b.push_ptr(ygp);
+                b.push_ptr(yup);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(kt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// K2-Horizon MoVA: batched MQ3-Lloyd indexed down GEMV with EXPANDED
+    /// per-expert outputs ([N × k_top × M] raw, unweighted) — the caller owns
+    /// the nonlinearity + combine (MoVA v experts need silu before the
+    /// weighted sum, so the fused residual variant cannot serve them).
+    pub fn gemv_mq3g256_lloyd_moe_down_indexed_batched_expanded(
+        &mut self,
+        expert_ptrs: &GpuTensor,
+        topk_indices: &GpuTensor,
+        rot_batch: &GpuTensor,
+        expert_outputs: &GpuTensor, // [batch × k_top × m] f32
+        m: usize,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemv_mq3g256_lloyd_moe_down_indexed_batched_expanded",
+            kernels::GEMV_MQ3G256_LLOYD_MOE_DOWN_INDEXED_BATCHED_EXPANDED_SRC,
+            "gemv_mq3g256_lloyd_moe_down_indexed_batched_expanded",
+        )?;
+        let pp = expert_ptrs.buf.as_ptr();
+        let ip = topk_indices.buf.as_ptr();
+        let rbp = rot_batch.buf.as_ptr();
+        let eop = expert_outputs.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &pp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &rbp as *const _ as *mut c_void,
+            &eop as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        let mq3_weight_bytes = m * (k / 256) * 112;
+        let bytes = batch_size * k_top * (mq3_weight_bytes + k * 4 + m * 4);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "gemv",
+            "gemv_mq3g256_lloyd_moe_down_indexed_batched_expanded",
+            bytes,
+        );
+        let result = self.launch_maybe_blob(
+            "gemv_mq3g256_lloyd_moe_down_indexed_batched_expanded",
+            [m as u32, k_top as u32, batch_size as u32],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp);
+                b.push_ptr(ip);
+                b.push_ptr(rbp);
+                b.push_ptr(eop);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(kt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
     pub fn deepseek4_gemv_mq2g256_lloyd_moe_gate_up_indexed(
         &mut self,
         expert_ptrs: &GpuTensor,  // [n_exp] u64 device pointers
