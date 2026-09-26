@@ -759,6 +759,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         kernel,
         "gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded"
             | "gemv_mq6g256v2_moe_down_k8_indexed_batched_expanded"
+            | "gemv_mq3g256_lloyd_moe_down_indexed_batched_expanded"
     ) {
         return Some(vec![read(0), read(8), read(16), write(24)]);
     }
@@ -953,6 +954,15 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             write(40),
         ]),
         "rmsnorm_reduce_gfx1100" => Some(vec![read(0), write(8)]),
+        // K2-Horizon MoVA norm+FWHT: x, weight, s1, s2 (read); out, x_rot (write).
+        "grouped_rmsnorm_mq_rotate" => Some(vec![
+            read(0),
+            read(8),
+            read(16),
+            read(24),
+            write(32),
+            write(40),
+        ]),
         "compressor_add_ape_f32_buf" => Some(vec![write(0), read(8), read(16)]),
         "compressor_overlap_concat_f32" => Some(vec![read(0), write(8)]),
         "compressor_softmax_pool_f32_buf" => Some(vec![read(0), read(8), write(16), read(24)]),
@@ -981,7 +991,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         "deepseek4_fused_silu_mul_clamp_mq_rotate" => {
             Some(vec![read(0), read(8), read(16), read(24), write(32)])
         }
-        "deepseek4_moe_topk_bias_aware_f32" => Some(vec![read(0), read(8), write(16), write(24)]),
+        "deepseek4_moe_topk_bias_aware_f32" | "deepseek4_moe_topk_bias_aware_sigmoid_f32" => Some(vec![read(0), read(8), write(16), write(24)]),
         "deepseek4_silu_mul_clamp_f32" => Some(vec![read(0), read(8), write(16)]),
         "embedding_q8_buf_broadcast" => Some(vec![read(0), write(8), read(16)]),
         "deepseek4_topk_kv_gather_f32_buf" | "deepseek4_topk_kv_gather_tiled_f32_buf" => {
@@ -1196,7 +1206,8 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
             read(32),
             write(40),
         ]),
-        "moe_down_combine_k8_batched" | "moe_down_combine_k8_batched_vec4" => {
+        "moe_down_combine_k8_batched" | "moe_down_combine_k8_batched_vec4"
+        | "moe_down_combine_silu_overwrite_k8_batched" => {
             Some(vec![read(0), read(8), write(16)])
         }
         "moe_down_combine_rmsnorm_mq_rotate_vecsum"
@@ -1294,6 +1305,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         "compressor_softmax_pool_f32_buf"
             | "deepseek4_fused_silu_mul_clamp_mq_rotate"
             | "deepseek4_moe_topk_bias_aware_f32"
+            | "deepseek4_moe_topk_bias_aware_sigmoid_f32"
             | "gemv_mfp4g32_e8_soa_grouped_gfx1151"
             | "gemv_mq2g256_lloyd_moe_down_expanded_k4"
             | "gemv_mq2g256_lloyd_moe_down_residual_scaled_k8_indexed"
@@ -1475,6 +1487,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
             | "gemv_mq6g256v2_moe_gate_up_k8_indexed"
             | "gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100"
             | "gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded"
+            | "gemv_mq3g256_lloyd_moe_down_indexed_batched_expanded"
             | "gemv_mq6g256v2_moe_down_k8_indexed_batched_expanded"
             | "gemv_mq4g256v2_moe_ninepath_d4"
             | "gemv_mq4g256v2_moe_ninepath_rpb8_gfx1100"
@@ -1585,6 +1598,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "kv_cache_write_q8_0"
         | "moe_down_combine_k8_batched"
         | "moe_down_combine_k8_batched_vec4"
+        | "moe_down_combine_silu_overwrite_k8_batched"
         | "moe_topk_renorm_k8"
         | "rmsnorm_f32"
         | "rmsnorm_f32_warp_reduce"
@@ -1639,6 +1653,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "attention_flash_q8_0_reduce_gated_mq_rotate_gfx1201"
         | "fused_rmsnorm_mq_rotate_wavegrid"
         | "rotate_with_rms_gfx1100"
+        | "grouped_rmsnorm_mq_rotate"
         | "attention_q8_0_kv" => Some(64),
         "moe_down_combine_rmsnorm_mq_rotate_vecsum"
         | "moe_down_combine_rmsnorm_mq_rotate_vecsum_gfx1151" => Some(72),
@@ -6032,6 +6047,10 @@ mod tests {
         "gemv_hfq4g256_moe_gate_up_k8_indexed_paired_waves_k2048_gfx1151",
         "gemv_mq4g256v2_moe_gate_up_k8_indexed_k2048_nolds_gfx1100",
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded",
+        "moe_down_combine_silu_overwrite_k8_batched",
+        "grouped_rmsnorm_mq_rotate",
+        "deepseek4_moe_topk_bias_aware_sigmoid_f32",
+        "gemv_mq3g256_lloyd_moe_down_indexed_batched_expanded",
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_cpol_slc",
         "gemv_hfq4g256_moe_down_k8_indexed_batched_expanded_row8_gfx1151",
         "gemv_hfq4g256_moe_down_k8_indexed_last_combine",
@@ -6890,6 +6909,7 @@ mod tests {
         for symbol in [
             "gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded",
             "gemv_mq6g256v2_moe_down_k8_indexed_batched_expanded",
+            "gemv_mq3g256_lloyd_moe_down_indexed_batched_expanded",
         ] {
             let mut blob = hip_bridge::KernargBlob::new();
             for _ in 0..4 {

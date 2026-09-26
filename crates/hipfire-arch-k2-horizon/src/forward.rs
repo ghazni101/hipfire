@@ -38,19 +38,27 @@ use rdna_compute::{DType, Gpu, GpuTensor};
 /// so the dense default must never exceed the demonstrated envelope.
 ///
 /// MoVA-36B caps derive from the actual on-device weight bytes, not a
-/// per-format constant: Q8 KV is 104.5 KB/token (48 L × 8 KVH × 128 hd ×
-/// 2 × 136 B) and weights scale with the container's quant mix. Anchors
-/// measured on gfx1100:
+/// per-format constant: Q8 KV is 104_448 B/token (48 L × 8 KVH × 4 blk
+/// × 34 B × K+V) and weights scale with the container's quant mix.
+/// Anchors measured on gfx1100:
 ///   mq4 (qt44 uniform, ~21.5 GB on-device): 24576 fits (~0.1 GB margin);
 ///       40960 OOM'd reproducibly (20 MB free at KV alloc).
 ///   mq3 (qt20 uniform, 16.8 GB): 65536 fits (24.5/25.75 GB used).
-///   mq3e (qt44 attention + qt20 experts, ~19.1 GB): ~47k.
+///   mq3e (qt44 attention + qt20 experts, 17.8 GB file): formula ~62k,
+///       loaded at 25.1/25.8 GB — thin but verified.
 /// VRAM_BUDGET keeps ~1.2 GB of scratch/state headroom — matches the
 /// observed 24.47 GB ceiling incl. HIP overhead on the qt20-uniform run.
 const DEFAULT_MAX_SEQ_DENSE: usize = 40960;
 const DEFAULT_MAX_SEQ_MOVA: usize = 24576;
 const MOVA_VRAM_BUDGET: u64 = 24 * 1024 * 1024 * 1024;
-const MOVA_KV_BYTES_PER_TOKEN: u64 = 104_529; // 48 × 8 × 128 × 2 × 136 B (Q8)
+
+/// Q8 KV cache bytes per token: n_layers × n_kv_heads × (head_dim/32 blocks)
+/// × 34 B/block (f16 scale + 32 int8) × 2 (K+V). MoVA-36B: 48·8·4·34·2 =
+/// 104_448 B. Derived from cfg so a future MoVA geometry change is priced
+/// correctly rather than silently reusing the 36B constant.
+fn mova_kv_bytes_per_token(cfg: &K2HorizonConfig) -> u64 {
+    (cfg.n_layers * cfg.n_kv_heads * (cfg.head_dim / 32) * 34 * 2) as u64
+}
 
 fn max_seq_cap(
     cfg: &K2HorizonConfig,
@@ -62,28 +70,27 @@ fn max_seq_cap(
     }
     // Weight-bytes-aware cap: KV must fit in budget minus weights minus a
     // fixed scratch/fragmentation reserve. When the caller has no byte count
-    // (config-only `new`), the conservative legacy constants apply.
+    // (config-only `new`) or weights blow the budget, fall back DOWN to the
+    // measured 24576 envelope — a formula-uncapped fallback would OOM at
+    // KV alloc for any container larger than expected.
     const SCRATCH_RESERVE: u64 = 1_500_000_000; // ~1.4 GiB state+scratch
     match weight_bytes {
         Some(wb) if wb < MOVA_VRAM_BUDGET => {
             // Pure-qt44 MoVA keeps its proven 24576 ceiling — the formula
             // would over-predict it (measured ~0.1 GB margin at 24k).
+            // Measured mq3e (qt44 attn + qt20 experts, 17.8 GB file):
+            // formula cap ~62k loaded at 25.1/25.8 GB — thin but verified.
+            // qt20/mixed experts pay the weight-saving dividend into ctx.
             if expert_dtype != Some(DType::MQ3G256Lloyd) {
                 return DEFAULT_MAX_SEQ_MOVA;
             }
             let kv_room = MOVA_VRAM_BUDGET
                 .saturating_sub(wb)
                 .saturating_sub(SCRATCH_RESERVE);
-            let cap = (kv_room / MOVA_KV_BYTES_PER_TOKEN) as usize;
+            let cap = (kv_room / mova_kv_bytes_per_token(cfg)) as usize;
             cap.min(524_288).max(4096)
         }
-        _ => {
-            if expert_dtype == Some(DType::MQ3G256Lloyd) {
-                65536
-            } else {
-                DEFAULT_MAX_SEQ_MOVA
-            }
-        }
+        _ => DEFAULT_MAX_SEQ_MOVA,
     }
 }
 
@@ -1040,16 +1047,18 @@ fn forward_moe_layer(
 /// 1. router GEMV → v_router_logits [64] (skipped when attn_fused — the
 ///    fused [wq‖wk‖v_router‖gate] GEMV already wrote them into
 ///    attn_fused_out)
-/// 2. sigmoid(router_logits) in-place
-/// 3. deepseek4_moe_topk_bias_aware_f32 → v_topk_indices + v_topk_weights (GPU)
-/// 4. replicate_batched_f32(normed_rot) → v_rot_batch (shared rotate, PM4-safe)
-/// 5. gemv_mq4g256v2_moe_down_k8_indexed_batched_expanded → v_expanded [k×kv_dim]
-/// 6. silu(v_expanded) in-place
-/// 7. moe_down_combine_k8_batched → fa_v = Σ weight[k] · v_expanded[k]
+/// 2. deepseek4_moe_topk_bias_aware_sigmoid_f32 → v_topk_indices +
+///    v_topk_weights (sigmoid applied inside the kernel; bias selects,
+///    sigmoid scores weight, then renorm × route_scale)
+/// 3. replicate_batched_f32(normed_rot) → v_rot_batch (shared rotate, PM4-safe)
+/// 4. gemv_{mq4g256v2|mq3g256_lloyd}_moe_down_*_batched_expanded →
+///    v_expanded [k×kv_dim] (dtype dispatched per layer)
+/// 5. moe_down_combine_silu_overwrite_k8_batched → fa_v =
+///    Σ weight[k] · silu(v_expanded[k]) — fused SiLU + overwrite
 ///
 /// Uses V2 indexed MoE GEMV kernels that decode fp16 per-128 headers
-/// (MQ4G256V2 / qt=44), replacing the V1 kernels that read f32 per-256
-/// headers. No D2H sync — fully PM4-capturable.
+/// (MQ4G256V2 / qt=44) or per-256 Lloyd codebooks (MQ3G256Lloyd / qt=20).
+/// No D2H sync — fully PM4-capturable.
 pub(crate) fn forward_mova_value_routing(
     cfg: &K2HorizonConfig,
     attn: &crate::weights::MovaAttnWeights,

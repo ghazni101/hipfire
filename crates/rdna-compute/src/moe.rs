@@ -102,6 +102,12 @@ impl Gpu {
         k_top: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        // Kernel unrolls a fixed 8-slot loop; k_top > 8 would silently drop
+        // experts. Fail loudly instead of mis-weighting the combine.
+        assert!(
+            k_top <= 8,
+            "moe_down_combine_silu_overwrite_k8_batched: k_top {k_top} exceeds the k8 family contract (<= 8)"
+        );
         self.bind_thread()?;
         self.ensure_kernel(
             "moe_down_combine_k8_batched",

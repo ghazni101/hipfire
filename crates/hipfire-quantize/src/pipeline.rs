@@ -111,6 +111,9 @@ struct MainQuantFlags {
     arch_id: u32,
     vision_quant: String,
     product_tier: Option<crate::model_filter::ProductTier>,
+    /// --allow-mq3-lloyd / HIPFIRE_ALLOW_MQ3_LLOYD — the shared gate every
+    /// MQ3G256Lloyd recipe requires (mirrors the top-level format checks).
+    allow_mq3_lloyd: bool,
 }
 
 struct MainQuantOuter<'a> {
@@ -499,6 +502,22 @@ pub(crate) fn run() {
             .ok()
             .as_deref()
             == Some("1");
+    // Env-gated mixed recipe for per-expert-2D MoE experts (K2-Horizon
+    // MoVA, cohere2moe-style layouts): HIPFIRE_MOE_EXPERTS_MQ3L under
+    // --format mq4 emits qt20 on `.mlp.experts.*_proj` tensors only. Same
+    // gate as every other Lloyd recipe — refuse silently-dropped env.
+    let moe_experts_mq3l_env =
+        hipfire_config::developer_var("HIPFIRE_MOE_EXPERTS_MQ3L")
+            .ok()
+            .as_deref()
+            == Some("1");
+    if moe_experts_mq3l_env && !allow_mq3_lloyd_for_mixed {
+        eprintln!(
+            "note: HIPFIRE_MOE_EXPERTS_MQ3L=1 requires --allow-mq3-lloyd or\n\
+             HIPFIRE_ALLOW_MQ3_LLOYD=1 (same gate as --format mq3-lloyd)."
+        );
+        std::process::exit(2);
+    }
     if use_mq4_mq3lloyd_kmap && !allow_mq3_lloyd_for_mixed {
         eprintln!(
             "note: --format mq4-mq3lloyd-kmap requires --allow-mq3-lloyd or\n\
@@ -2684,6 +2703,7 @@ pub(crate) fn run() {
                 arch_id,
                 vision_quant: vision_quant.to_string(),
                 product_tier,
+                allow_mq3_lloyd,
             };
             let outer = MainQuantOuter {
                 kmap: &kmap,
@@ -5068,10 +5088,13 @@ fn handle_main_quant(
             // HIPFIRE_MOE_EXPERTS_MQ3L=1 (under --format mq4): generic-path
             // per-expert 2D FFN experts go MQ3G256Lloyd. v_experts and
             // router tensors do NOT match `.mlp.experts.` — they keep qt44.
-            let moe_experts_mq3l = hipfire_config::developer_var("HIPFIRE_MOE_EXPERTS_MQ3L")
-                .ok()
-                .as_deref()
-                == Some("1");
+            // Requires --allow-mq3-lloyd / HIPFIRE_ALLOW_MQ3_LLOYD=1 like
+            // every other qt20 recipe (mq3-lloyd, mq4-mq3lloyd-*).
+            let moe_experts_mq3l = flags.allow_mq3_lloyd
+                && hipfire_config::developer_var("HIPFIRE_MOE_EXPERTS_MQ3L")
+                    .ok()
+                    .as_deref()
+                    == Some("1");
             let is_moe_expert_2d = name.contains(".mlp.experts.")
                 && (name.ends_with("gate_proj.weight")
                     || name.ends_with("up_proj.weight")
@@ -6960,6 +6983,7 @@ mod handle_main_quant_f16_fallback_tests {
             arch_id: 6,
             vision_quant: String::new(),
             product_tier: None,
+            allow_mq3_lloyd: false,
         }
     }
 

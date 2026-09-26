@@ -57,7 +57,7 @@ extern "C" __global__ void deepseek4_moe_topk_bias_aware_batched_f32(
 
     for (int k = 0; k < k_top; ++k) {
         float v  = (tid < n_exp) ? s_biased[tid] : -1e30f;
-        int   ix = tid;
+        int   ix = (tid < n_exp) ? tid : 0;
 
         const int warp_id = tid >> 5;
         const int lane_id = tid & 31;

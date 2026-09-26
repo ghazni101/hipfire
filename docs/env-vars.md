@@ -795,6 +795,7 @@ Copyable user, developer, and retained-PM4 TOML profiles are in
 | `HIPFIRE_MOE_DOWN_TIGHT_GRID` | crates/rdna-compute/src/gemv.rs |
 | `HIPFIRE_MOE_EXPERTS_MQ5` | crates/hipfire-quantize/src/main.rs |
 | `HIPFIRE_MOE_EXPERTS_MQ6` | crates/hipfire-quantize/src/main.rs |
+| `HIPFIRE_MOE_EXPERTS_MQ3L` | crates/hipfire-quantize/src/pipeline.rs |
 | `HIPFIRE_MOE_EXPERT_STATS` | crates/hipfire-arch-qwen35/src/qwen35.rs |
 | `HIPFIRE_MOE_EXPERT_STATS_OUT` | crates/hipfire-arch-qwen35/src/qwen35.rs, crates/hipfire-runtime/examples/eval_hipfire.rs |
 | `HIPFIRE_MOE_GATE_UP_CPOL` | crates/rdna-compute/src/gemv.rs |

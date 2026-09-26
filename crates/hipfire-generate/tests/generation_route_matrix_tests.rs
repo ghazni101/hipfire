@@ -528,6 +528,36 @@ fn precedence_pp_before_qwen_mtp() {
 }
 
 #[test]
+fn dense_k2_arch16_does_not_take_mova_route() {
+    // Dense K2-Horizon-7B shares arch_id 16 with MoVA but reports
+    // k2_mova=false — it must fall through to the llama family, and the
+    // MoVA AR-only short-circuit must not swallow it.
+    let ar = GenerationRouteInputs {
+        arch_id: 16,
+        k2_mova: false,
+        ..base()
+    };
+    assert_eq!(select_generation_route(&ar), GenerationRoute::LlamaAr);
+    let spec = GenerationRouteInputs {
+        arch_id: 16,
+        k2_mova: false,
+        has_speculator: true,
+        temp: 0.0,
+        ..base()
+    };
+    assert_eq!(select_generation_route(&spec), GenerationRoute::LlamaSpec);
+    // And the MoVA row stays pinned: k2_mova=true always routes K2HorizonAr.
+    let mova = GenerationRouteInputs {
+        arch_id: 16,
+        k2_mova: true,
+        has_speculator: true,
+        temp: 0.0,
+        ..base()
+    };
+    assert_eq!(select_generation_route(&mova), GenerationRoute::K2HorizonAr);
+}
+
+#[test]
 fn mtp_speculator_routes_through_qwen_dflash() {
     // Greedy MTP uses the generic QwenDflash wrapper.
     let i = GenerationRouteInputs {

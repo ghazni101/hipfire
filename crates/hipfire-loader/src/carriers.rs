@@ -145,7 +145,9 @@ fn source_is_k2_mova(src: &ModelSource) -> bool {
     serde_json::from_str::<serde_json::Value>(json)
         .ok()
         .and_then(|v| v.get("config").cloned())
-        .map(|cfg| cfg.get("mova_num_experts").is_some())
+        // > 0, not is_some: dense arch-16 configs (e.g. K2-Horizon-7B) may
+        // legitimately carry "mova_num_experts": 0 or null.
+        .map(|cfg| cfg.get("mova_num_experts").and_then(|v| v.as_u64()).unwrap_or(0) > 0)
         .unwrap_or(false)
 }
 

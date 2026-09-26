@@ -7058,6 +7058,7 @@ mod tests {
         assert!(is_model_file("deepseek-v4-flash-0731.mq2r"));
         assert!(is_model_file("deepseek-v4-flash-0731.mq2rxt"));
         assert!(is_model_file("draft.hfq"));
+        assert!(is_model_file("K2-Horizon-MoVA-36B-A4B.mq3e"));
         assert!(!is_model_file("model.triattn.bin"));
         assert!(!is_model_file("README.md"));
     }

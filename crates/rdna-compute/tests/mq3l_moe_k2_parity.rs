@@ -188,14 +188,16 @@ fn max_err(a: &[f32], b: &[f32]) -> f32 {
         .fold(0f32, f32::max)
 }
 
-/// Expanded-down parity: batch=2 rows, top-3 of 4 experts, K=1024 (4 groups,
-/// no tail) + K=2816 (11 groups, 3-tail) to cover the tail path.
+/// Expanded-down parity: batch=2 rows, top-3 of 4 experts. K=1024 (4 groups,
+/// no tail) + K=2816 (11 groups, 3-tail) cover generic tail logic; K=768
+/// (3 groups → quads=0, PURE tail) and K=2560 (10 groups, quads=2, tail=2)
+/// are the exact production shapes MoVA-36B hits (moe_intermediate and
+/// hidden dims) — the quads==0 all-tail path is otherwise untested.
 #[test]
 #[ignore]
 fn mq3l_down_expanded_parity() {
     let mut gpu = Gpu::init().expect("gpu init");
-    for &k in &[1024usize, 2816] {
-        let (m, n_exp, k_top, n) = (64usize, 4usize, 3usize, 2usize);
+    for &k in &[768usize, 1024, 2560, 2816] {
         // Per-expert packed weights.
         let mut expert_ptrs_host = Vec::new();
         let mut experts_gpu = Vec::new();
@@ -259,16 +261,13 @@ fn mq3l_down_expanded_parity() {
     }
 }
 
-/// Gate_up parity: y_gate/y_up split at M/2, K=1024 + K=2816.
+/// Gate_up parity: y_gate/y_up split at M/2. K covers generic no-tail/tail
+/// plus the two MoVA production shapes (768 pure-tail, 2560).
 #[test]
 #[ignore]
 fn mq3l_gate_up_batched_parity() {
     let mut gpu = Gpu::init().expect("gpu init");
-    for &k in &[1024usize, 2816] {
-        let (mi, n_exp, k_top, n) = (64usize, 4usize, 3usize, 2usize);
-        let m = 2 * mi;
-        let mut expert_ptrs_host = Vec::new();
-        let mut experts_gpu = Vec::new();
+    for &k in &[768usize, 1024, 2560, 2816] {
         let mut refs = Vec::new();
         for e in 0..n_exp {
             let packed = synth_mq3l(m, k, 0x5678 + e as u64);
