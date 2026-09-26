@@ -106,6 +106,22 @@ pub fn retry_candidate_reset_inventory() -> &'static [ResetCoreCoverage] {
             reason: "GPU fault parity pending",
         },
     };
+    // K2-Horizon (arch 16): dense grouped-RMSNorm llama — the same reset
+    // surface as LLAMA (pure attention KV + spec scratch); grouped norm adds
+    // no persistent state. Inherits llama's parity-pending eligibility.
+    const K2_HORIZON: ResetCoreCoverage = ResetCoreCoverage {
+        arch: "k2_horizon",
+        recurrent_or_conv: true, // pure attention — no recurrent residual
+        s_ef_residual: true,     // n/a
+        kv_or_aux_caches: true,  // compact_offset rewind; absolute KV overwrite
+        graphs: true,
+        drafter: true,
+        adaptive: true,
+        host_position_and_conversation: true,
+        eligibility: RetryResetEligibility::Ineligible {
+            reason: "GPU fault parity pending",
+        },
+    };
     // Explicitly ineligible until a full audit lands (do not fake Eligible).
     const QWEN2: ResetCoreCoverage = ResetCoreCoverage {
         arch: "qwen2",
@@ -244,6 +260,7 @@ pub fn retry_candidate_reset_inventory() -> &'static [ResetCoreCoverage] {
         QWEN35,
         DEEPSEEK4,
         LLAMA,
+        K2_HORIZON,
         QWEN2,
         COHERE2MOE,
         DOTS_OCR,
@@ -552,6 +569,7 @@ mod tests {
                 13 => Some("gemma4"),
                 14 => Some("muse_glimmer"),
                 15 => Some("maple"),
+                16 => Some("k2_horizon"),
                 40 => Some("flux"),
                 45 => Some("flux2"),
                 // Drafter sidecars (22, 23) are intentionally not retry

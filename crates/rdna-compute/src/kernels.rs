@@ -1573,6 +1573,33 @@ pub const GEMV_MQ4CG256_SRC: &str = include_str!("../../../kernels/src/gemv_mq4c
 /// s1/z1 for w128..255) instead of one f32 pair. Decode selects s/z by
 /// `tid < 16` (payload `gp+8+tid*4 < gp+8+64`).
 pub const GEMV_MQ4G256V2_SRC: &str = include_str!("../../../kernels/src/gemv_mq4g256v2.hip");
+/// x-batched MQ4G256V2 GEMV (`gemv_mq4g256v2_xbatch` in the same source):
+/// one weight pass dotted against up to 4 pre-rotated activation rows,
+/// bit-exact per row against the scalar GEMV. Built for small-batch
+/// speculative windows (Uno draft/verify), where the WMMA tile kernels
+/// underfill the GPU (batch 4 → a single 16-lane N-tile).
+pub const GEMV_MQ4G256V2_XBATCH_SRC: &str = concat!(
+    "#define HIPFIRE_MQ4G256V2_XBATCH 1\n",
+    "#define HIPFIRE_MQ4G256V2_XBATCH_MAX 4\n",
+    "#define HIPFIRE_MQ4G256V2_XBATCH_KERNEL gemv_mq4g256v2_xbatch\n",
+    include_str!("../../../kernels/src/gemv_mq4g256v2.hip")
+);
+/// 8-row variant of [`GEMV_MQ4G256V2_XBATCH_SRC`] for block_len-8 spec
+/// windows (the ifm-ai/uno reference default). Separate module + symbol so
+/// the register/occupancy fingerprint of the 4-row kernel is untouched.
+pub const GEMV_MQ4G256V2_XBATCH8_SRC: &str = concat!(
+    "#define HIPFIRE_MQ4G256V2_XBATCH 1\n",
+    "#define HIPFIRE_MQ4G256V2_XBATCH_MAX 8\n",
+    "#define HIPFIRE_MQ4G256V2_XBATCH_MIN_BLOCKS 4\n",
+    "#define HIPFIRE_MQ4G256V2_XBATCH_KERNEL gemv_mq4g256v2_xbatch8\n",
+    include_str!("../../../kernels/src/gemv_mq4g256v2.hip")
+);
+/// Batched grouped RMSNorm: `rows` vectors of `groups * width` elements,
+/// each group normalized independently with its own affine slice (the
+/// K2-Horizon `layernorm_num_groups` shape). One launch replaces the
+/// rows*groups grid of plain rmsnorm_f32 calls.
+pub const RMSNORM_GROUPED_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/rmsnorm_grouped_batched.hip");
 /// MQ5G256V2: dual-scale 5-bit (qt=48). Same 168 B stride and 5-bit payload as MQ5G256, header dual fp16.
 pub const GEMV_MQ5G256V2_SRC: &str = include_str!("../../../kernels/src/gemv_mq5g256v2.hip");
 /// MQ3G256V2: dual-scale 3-bit (qt=49).

@@ -7630,6 +7630,64 @@ impl Gpu {
         }
         result
     }
+    /// x-batched MQ4G256V2 GEMV: one weight pass dotted against `b`
+    /// pre-rotated activation rows. `x` is `[b × k]` row-major (FWHT-rotated,
+    /// same contract as `gemv_mq4g256v2`), `y` is `[b × m]` row-major.
+    /// Bit-exact per row against the scalar kernel — the same terms in the
+    /// same order, only the x vector indexed per batch row.
+    pub fn gemv_mq4g256v2_xbatch(
+        &mut self,
+        a_raw: &GpuTensor,
+        x: &GpuTensor,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        b: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        debug_assert!((1..=8).contains(&b), "xbatch batch {b} outside 1..=8");
+        let (module, src) = if b <= 4 {
+            ("gemv_mq4g256v2_xbatch", kernels::GEMV_MQ4G256V2_XBATCH_SRC)
+        } else {
+            (
+                "gemv_mq4g256v2_xbatch8",
+                kernels::GEMV_MQ4G256V2_XBATCH8_SRC,
+            )
+        };
+        self.ensure_kernel(module, src, module)?;
+        let a_ptr = a_raw.buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let y_ptr = y.buf.as_ptr();
+        let m_val = m as i32;
+        let k_val = k as i32;
+        let b_val = b as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &a_ptr as *const _ as *mut c_void,
+            &x_ptr as *const _ as *mut c_void,
+            &y_ptr as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &b_val as *const _ as *mut c_void,
+        ];
+        let bytes = crate::profile::gemv_hfq4g256_bytes(m, k) + b * (k * 4 + m * 4);
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", "gemv_mq4g256v2_xbatch", bytes);
+        let result =
+            self.launch_maybe_blob(module, [m as u32, 1, 1], [32, 1, 1], 0, &mut params, || {
+                let mut blob = hip_bridge::KernargBlob::new();
+                blob.push_ptr(a_ptr);
+                blob.push_ptr(x_ptr);
+                blob.push_ptr(y_ptr);
+                blob.push_i32(m_val);
+                blob.push_i32(k_val);
+                blob.push_i32(b_val);
+                blob
+            });
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// MQ4 v2 (qt=44) — plain GEMV. Faithful port of `gemv_hfq4g256` for the
     /// dual-scale format. Same arch gating, rows/R selection, grid/block
     /// geometry and kernarg order; only SRC, module (`_mq4v2` suffix) and

@@ -5178,7 +5178,13 @@ pub fn generate(
         // future arch quirks (Gemma 4 marker holdback, strip-think,
         // byte-level stop_at); see crates/engine/src/eos_filter.rs.
         let mut bytes_fed_to_filter = 0usize;
-        let mut filter = EosFilter::new(EosFilterConfig::default());
+        let mut filter_config = qwen_ar_eos_filter_config();
+        filter_config.stop_at.extend([b"<|ifm|im_end|>".to_vec(), b"<|ifm|endoftext|>".to_vec()]);
+        let mut filter = EosFilter::new(filter_config);
+        let mut think_router = ThinkOutputRouter::new(started_in_think);
+        let mut text_router = ToolOutputRouter::disabled();
+        let mut visible_acc = String::new();
+        let mut stopped = false;
 
         for _ in 0..max_tokens {
             // Decode-side abort check (mirrors the Qwen AR loop): a client
@@ -5203,17 +5209,17 @@ pub fn generate(
             let all_bytes = tokenizer.decode_bytes(&streamed_tokens);
             let new_bytes = &all_bytes[bytes_fed_to_filter..];
             bytes_fed_to_filter = all_bytes.len();
-            if let FilterAction::Emit(text_bytes) = filter.observe(new_bytes) {
-                let text = std::str::from_utf8(&text_bytes).unwrap();
-                let _ = writeln!(
-                    stdout,
-                    r#"{{"type":"token","id":"{}","text":{},"attempt_id":{}}}"#,
-                    id,
-                    serde_json::to_string(&text).unwrap_or_default(),
-                    active_attempt_id()
-                );
-                let _ = stdout.flush();
-            }
+            let filter_stopped = match qwen_ar_observe_and_route(
+                stdout, id, &mut filter, &mut think_router, &mut text_router,
+                new_bytes, &mut visible_acc,
+            ) {
+                Ok(stopped) => stopped,
+                Err(e) => {
+                    let _ = (config, weights, scratch, kv);
+                    crate::dense::dense_fail_closed_error(m, gpu, stdout, id, &format!("llama emission: {e:?}"));
+                    return;
+                }
+            };
 
             // Scope repeat_buf to this turn's prompt + generated tokens
             // (same logic as the Qwen3.5 path: prompt anchor + current turn).
@@ -5267,13 +5273,10 @@ pub fn generate(
                 }
             };
 
-            if next_token == config.eos_token {
-                break;
-            }
-            if im_end_token == Some(next_token) {
-                break;
-            }
-            if tokenizer.is_terminator(next_token) {
+            if filter_stopped || next_token == config.eos_token
+                || im_end_token == Some(next_token) || tokenizer.is_terminator(next_token)
+            {
+                stopped = true;
                 break;
             }
 
@@ -5294,6 +5297,13 @@ pub fn generate(
             rng_state = rng;
         }
         m.seq_pos += generated;
+        if let Err(e) = qwen_ar_drain_pending_into_router(
+            stdout, id, &mut filter, &mut think_router, &mut text_router, &mut visible_acc,
+        ) {
+            let _ = (config, weights, scratch, kv);
+            crate::dense::dense_fail_closed_error(m, gpu, stdout, id, &format!("llama emission finish: {e:?}"));
+            return;
+        }
 
         // ChatML \n boundary — run through forward to keep KV cache in sync
         if im_end_token == Some(*m.conversation_tokens.last().unwrap_or(&0)) && !nl.is_empty() {
@@ -5346,6 +5356,7 @@ pub fn generate(
             "type": "done",
             "id": id,
             "tokens": generated,
+            "finish_reason": if stopped { "stop" } else { "length" },
             "tok_s": (tok_s * 10.0).round() / 10.0,
             "prefill_tokens": prefill_tokens,
             "prefill_ms": ((prefill_s * 1000.0) * 10.0).round() / 10.0,

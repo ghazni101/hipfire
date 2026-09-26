@@ -248,8 +248,14 @@ extern "C" __global__ void HIPFIRE_MQ4G256V2_KERNEL(
 // Occupancy 8, not the scalar kernel's 16: B accumulator sets multiply the
 // live float state by B. Asking for 16 waves/SIMD at B=4 makes the compiler
 // spill, and a spilled accumulator is exactly what the scalar kernel's
-// comment warns changes the FMA sequence.
-__launch_bounds__(32, 8)
+// comment warns changes the FMA sequence. The MAX=8 build doubles the
+// accumulator state again and drops to 4 resident waves via the
+// HIPFIRE_MQ4G256V2_XBATCH_MIN_BLOCKS define.
+#ifndef HIPFIRE_MQ4G256V2_XBATCH_MIN_BLOCKS
+#define HIPFIRE_MQ4G256V2_XBATCH_MIN_BLOCKS 8
+#endif
+
+__launch_bounds__(32, HIPFIRE_MQ4G256V2_XBATCH_MIN_BLOCKS)
 extern "C" __global__ void HIPFIRE_MQ4G256V2_XBATCH_KERNEL(
     const char* __restrict__ A,
     const float* __restrict__ x,   // [B x K]
