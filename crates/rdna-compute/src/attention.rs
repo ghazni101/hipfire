@@ -5292,18 +5292,60 @@ impl Gpu {
         let gfx1151_tile_dpp = self.arch_caps.is_gfx1151()
             && hipfire_config::developer_var("HIPFIRE_GFX1151_ATTENTION_TILE_DPP").as_deref()
                 == Ok("1");
-        let (tile_module, tile_src) = if gfx1151_tile_dpp {
+        // GQA-fused tile kernel: at n_heads/n_kv_heads ratios > 1 the per-head
+        // kernel re-reads each kv head's K/V bytes once per sibling query head
+        // (4x the KV traffic at 32:8), which is the dominant long-context
+        // decode cost. The fused kernel computes all sibling heads per block
+        // with bit-exact per-head arithmetic and the same partials layout.
+        // Ratios outside {2,4,8} and the dpp/gated specializations keep the
+        // per-head kernel; HIPFIRE_Q8_FLASH_GQA=0 opts out.
+        let gqa_g: Option<usize> = if !gfx1151_tile_dpp && n_heads > n_kv_heads && n_heads % n_kv_heads == 0 {
+            let g = n_heads / n_kv_heads;
+            let enabled = hipfire_config::developer_var("HIPFIRE_Q8_FLASH_GQA").as_deref() != Ok("0");
+            (enabled && matches!(g, 2 | 4 | 8)).then_some(g)
+        } else {
+            None
+        };
+        let (tile_module, tile_entry, tile_src, tile_grid0, tile_shared): (&str, &str, &str, u32, u32) = if gfx1151_tile_dpp {
             (
                 "attention_flash_q8_0_tile_dpp_gfx1151",
+                "attention_flash_q8_0_tile",
                 kernels::ATTENTION_FLASH_Q8_0_TILE_DPP_GFX1151_SRC,
+                n_heads as u32,
+                ((tile_size + head_dim) * 4) as u32,
+            )
+        } else if let Some(g) = gqa_g {
+            (
+                match g {
+                    2 => "attention_flash_q8_0_tile_gqa2",
+                    4 => "attention_flash_q8_0_tile_gqa4",
+                    _ => "attention_flash_q8_0_tile_gqa8",
+                },
+                match g {
+                    2 => "attention_flash_q8_0_tile_gqa2",
+                    4 => "attention_flash_q8_0_tile_gqa4",
+                    _ => "attention_flash_q8_0_tile_gqa8",
+                },
+                kernels::ATTENTION_FLASH_Q8_0_TILE_SRC,
+                n_kv_heads as u32,
+                (g * (tile_size + head_dim) * 4) as u32,
             )
         } else {
             (
                 "attention_flash_q8_0_tile",
+                "attention_flash_q8_0_tile",
                 kernels::ATTENTION_FLASH_Q8_0_TILE_SRC,
+                n_heads as u32,
+                ((tile_size + head_dim) * 4) as u32,
             )
         };
-        self.ensure_kernel(tile_module, tile_src, "attention_flash_q8_0_tile")?;
+        if std::env::var_os("HIPFIRE_GQA_DEBUG").is_some() {
+            eprintln!(
+                "[gqa-debug] arch={} n_heads={} n_kv={} tile={} gqa={:?} module={}",
+                self.arch, n_heads, n_kv_heads, tile_size, gqa_g, tile_module
+            );
+        }
+        self.ensure_kernel(tile_module, tile_src, tile_entry)?;
         {
             let scale = 1.0f32 / (head_dim as f32).sqrt();
             let q_ptr = q.buf.as_ptr();
@@ -5319,8 +5361,8 @@ impl Gpu {
             let ts = tile_size as i32;
             let wn = window;
             let es = effective_seq_arg;
-            let grid = [n_heads as u32, launch_tiles as u32, 1];
-            let shared = ((tile_size + head_dim) * 4) as u32;
+            let grid = [tile_grid0, launch_tiles as u32, 1];
+            let shared = tile_shared;
             let mut params: Vec<*mut c_void> = vec![
                 &q_ptr as *const _ as *mut c_void,
                 &k_ptr as *const _ as *mut c_void,
@@ -5337,7 +5379,7 @@ impl Gpu {
                 &es as *const _ as *mut c_void,
             ];
             self.launch_maybe_blob_position_grid(
-                "attention_flash_q8_0_tile",
+                tile_entry,
                 grid,
                 [32, 1, 1],
                 shared,
