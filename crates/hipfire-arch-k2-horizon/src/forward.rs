@@ -33,12 +33,23 @@ use hipfire_runtime::llama::{
 use rdna_compute::{DType, Gpu, GpuTensor};
 // ─── State ──────────────────────────────────────────────────────────────
 
-/// Validated VRAM ceiling on gfx1100 (24.5 GB usable): 64k OOM'd at KV
-/// alloc (hipMalloc out of memory, 26 MB free); 40960 fits with margin for
-/// state buffers and the JIT kernel cache. Callers that need more must go
-/// through `new_with_max_seq` — this default must never exceed the
-/// demonstrated envelope.
-const DEFAULT_MAX_SEQ: usize = 40960;
+/// Validated VRAM ceiling per family on gfx1100 (24.5 GB usable):
+/// dense K2-7B ran 40960 with margin (64k OOM'd at KV alloc, 26 MB free),
+/// so the dense default must never exceed the demonstrated envelope.
+/// MoVA-36B weights (~21.5 GB on-device) leave ~2.6 GB for KV —
+/// Q8 KV is 104.5 KB/token (48 L × 8 KVH × 128 hd × 2 × 136 B), so the
+/// MoVA ceiling is 24576 (2.57 GB, ~0.1 GB margin). 40960 OOM'd
+/// reproducibly (20 MB free at KV alloc).
+const DEFAULT_MAX_SEQ_DENSE: usize = 40960;
+const DEFAULT_MAX_SEQ_MOVA: usize = 24576;
+
+fn max_seq_cap(cfg: &K2HorizonConfig) -> usize {
+    if cfg.mova_num_experts > 0 {
+        DEFAULT_MAX_SEQ_MOVA
+    } else {
+        DEFAULT_MAX_SEQ_DENSE
+    }
+}
 
 /// Flash prefill sub-batch size. Smaller = less VRAM. K2-Horizon has 32 heads
 /// × 128 head_dim; at max_seq=40960 this is 32×321×130×16 ≈ 21 MB per
@@ -200,7 +211,7 @@ impl K2HorizonState {
     }
 
     pub fn new(gpu: &mut Gpu, cfg: &K2HorizonConfig) -> Result<Self, String> {
-        let max_seq = cfg.max_position_embeddings.min(DEFAULT_MAX_SEQ);
+        let max_seq = cfg.max_position_embeddings.min(max_seq_cap(cfg));
         Self::new_with_max_seq(gpu, cfg, max_seq)
     }
 
@@ -211,7 +222,7 @@ impl K2HorizonState {
     ) -> Result<Self, String> {
         let max_seq = max_seq
             .min(cfg.max_position_embeddings)
-            .min(DEFAULT_MAX_SEQ);
+            .min(max_seq_cap(cfg));
         let hidden = cfg.dim;
         let q_dim = cfg.n_heads * cfg.head_dim;
         let kv_dim = cfg.n_kv_heads * cfg.head_dim;

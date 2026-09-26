@@ -55,7 +55,7 @@ mtp = "off"
 
 [memory]
 kv_cache = "q8"
-max_seq = 8192
+max_seq = 24576
 EOF
 
 # Symlink model into the models directory so /v1/models lists it.
