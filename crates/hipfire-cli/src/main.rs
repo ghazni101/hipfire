@@ -66,6 +66,10 @@ pub(crate) const MODEL_SUFFIXES: &[&str] = &[
     ".mq2r",
     ".mq2rxt",
     ".mq3",
+    // qt20 experts + qt44 dense siblings: mixed Magnum-Lloyd recipe emitted
+    // by `HIPFIRE_MOE_EXPERTS_MQ3L=1 --format mq4`. Separate suffix so a mixed
+    // container is never mistaken for a uniform qt20 `.mq3`.
+    ".mq3e",
     ".mq3p",
     ".mq4",
     ".mq4p",
