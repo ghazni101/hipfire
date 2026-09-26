@@ -25,8 +25,10 @@
 //   indices:      [k_top]      i32 (written as i32 little-endian raw)
 //   weights:      [k_top]      fp32
 //
-// Launch: grid = [1, 1, 1], block = [256, 1, 1]. n_exp must equal blockDim.x.
-// k_top ≤ 32 (DeepSeek V4: k_top=6).
+// Launch: grid = [1, 1, 1], block = [round_up(n_exp, 32), 1, 1]. n_exp ≤ 1024
+// (s_score/s_biased capacity). k_top ≤ 32 (DeepSeek V4: k_top=6).
+// blockDim MUST be warp-aligned: per-warp __shfl_down reads undefined values
+// from inactive lanes when n_exp % 32 != 0 (K2-Horizon n_exp=100).
 
 #include <hip/hip_runtime.h>
 #include <math.h>
@@ -43,6 +45,8 @@ extern "C" __global__ void deepseek4_moe_topk_bias_aware_f32(
     int   k_top,
     float route_scale
 ) {
+    if (n_exp > 1024 || k_top > MAX_K_TOP || k_top <= 0) return;
+
     const int tid = threadIdx.x;
 
     __shared__ float s_score[1024];        // scores[i] (raw, used for weights)
@@ -71,7 +75,9 @@ extern "C" __global__ void deepseek4_moe_topk_bias_aware_f32(
     for (int k = 0; k < k_top; ++k) {
         // Each thread loads its slot's biased value (or -inf if out of range).
         float v   = (tid < n_exp) ? s_biased[tid] : -1e30f;
-        int   ix  = tid;
+        // Clamp padded-lane index so a degenerate all-(-inf) argmax can never
+        // produce an out-of-range expert index.
+        int   ix  = (tid < n_exp) ? tid : 0;
 
         // Warp reduce.
         const int warp_id = tid >> 5;
@@ -119,6 +125,90 @@ extern "C" __global__ void deepseek4_moe_topk_bias_aware_f32(
 
     // Phase 4: write outputs. Normalize by sum then apply route_scale.
     // First k_top threads each write one slot.
+    if (tid < k_top) {
+        const float w = (s_w_unsum[tid] / s_sum) * route_scale;
+        indices[tid] = s_idx[tid];
+        weights[tid] = w;
+    }
+}
+
+// Sigmoid-fused variant for K2-Horizon: `scores` holds RAW router logits;
+// the kernel applies sigmoid in Phase 1, eliminating the separate
+// sigmoid_f32 launch. Semantics:
+//   s_score[i]  = sigmoid(logits[i])            (used for weights)
+//   s_biased[i] = sigmoid(logits[i]) + bias[i]  (selection only)
+// then identical top-K / normalize / route_scale as above.
+extern "C" __global__ void deepseek4_moe_topk_bias_aware_sigmoid_f32(
+    const float* __restrict__ logits,      // [n_exp] raw logits
+    const float* __restrict__ bias,        // [n_exp]
+    int*         __restrict__ indices,     // [k_top]
+    float*       __restrict__ weights,     // [k_top]
+    int   n_exp,
+    int   k_top,
+    float route_scale
+) {
+    if (n_exp > 1024 || k_top > MAX_K_TOP || k_top <= 0) return;
+
+    const int tid = threadIdx.x;
+
+    __shared__ float s_score[1024];
+    __shared__ float s_biased[1024];
+    __shared__ int   s_idx[MAX_K_TOP];
+    __shared__ float s_w_unsum[MAX_K_TOP];
+    __shared__ float s_sum;
+
+    if (tid < n_exp) {
+        const float sc = 1.0f / (1.0f + expf(-logits[tid]));
+        s_score[tid]  = sc;
+        s_biased[tid] = sc + bias[tid];
+    }
+    __syncthreads();
+
+    __shared__ float s_warp_max[WARP_SIZE];
+    __shared__ int   s_warp_arg[WARP_SIZE];
+
+    for (int k = 0; k < k_top; ++k) {
+        float v   = (tid < n_exp) ? s_biased[tid] : -1e30f;
+        int   ix  = (tid < n_exp) ? tid : 0;
+
+        const int warp_id = tid >> 5;
+        const int lane_id = tid & 31;
+        for (int off = 16; off > 0; off >>= 1) {
+            float ov = __shfl_down(v,  off);
+            int   oi = __shfl_down(ix, off);
+            if (ov > v) { v = ov; ix = oi; }
+        }
+        if (lane_id == 0) {
+            s_warp_max[warp_id] = v;
+            s_warp_arg[warp_id] = ix;
+        }
+        __syncthreads();
+
+        if (warp_id == 0) {
+            const int n_warps = (blockDim.x + 31) >> 5;
+            float ww = (lane_id < n_warps) ? s_warp_max[lane_id] : -1e30f;
+            int   wi = (lane_id < n_warps) ? s_warp_arg[lane_id] : 0;
+            for (int off = 16; off > 0; off >>= 1) {
+                float ov = __shfl_down(ww, off);
+                int   oi = __shfl_down(wi, off);
+                if (ov > ww) { ww = ov; wi = oi; }
+            }
+            if (lane_id == 0) {
+                s_idx[k] = wi;
+                s_w_unsum[k] = s_score[wi];
+                s_biased[wi] = -1e30f;
+            }
+        }
+        __syncthreads();
+    }
+
+    if (tid == 0) {
+        float sum = 0.0f;
+        for (int k = 0; k < k_top; ++k) sum += s_w_unsum[k];
+        s_sum = fmaxf(sum, 1e-12f);
+    }
+    __syncthreads();
+
     if (tid < k_top) {
         const float w = (s_w_unsum[tid] / s_sum) * route_scale;
         indices[tid] = s_idx[tid];

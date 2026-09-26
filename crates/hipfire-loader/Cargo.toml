@@ -14,7 +14,7 @@ default = [
 ]
 arch-qwen35 = ["dep:hipfire-arch-qwen35"]
 arch-qwen35-vl = ["dep:hipfire-arch-qwen35-vl"]
-arch-llama = ["dep:hipfire-arch-llama"]
+arch-llama = ["dep:hipfire-arch-llama", "dep:hipfire-arch-k2-horizon"]
 arch-qwen2 = ["dep:hipfire-arch-qwen2"]
 arch-deepseek4 = ["dep:hipfire-arch-deepseek4"]
 # Test-only: compile the HIPFIRE_EP_FAIL_RANK partial-load fault injector. OFF by
@@ -31,6 +31,9 @@ saddle-core = { path = "../saddle-core" }
 hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35", optional = true }
 hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl", optional = true }
 hipfire-arch-llama = { path = "../hipfire-arch-llama", optional = true }
+# K2-Horizon MoVA rides the llama carrier (both stamp arch_id 16; the carrier
+# disambiguates dense vs MoVA on the HFQ config), so it gates on arch-llama.
+hipfire-arch-k2-horizon = { path = "../hipfire-arch-k2-horizon", optional = true }
 hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2", optional = true }
 hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4", optional = true }
 # Non-optional arch deps — LoadedModel struct references these types.

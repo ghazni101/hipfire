@@ -133,6 +133,22 @@ fn dir_diag(src: &ModelSource) {
     }
 }
 
+/// arch-16 source disambiguation: `mova_num_experts` in the config JSON marks
+/// the MoVA variant (value-expert attention + sigmoid MoE FFN). Absent ⇒ the
+/// dense grouped-RMSNorm llama family.
+#[cfg(feature = "arch-llama")]
+fn source_is_k2_mova(src: &ModelSource) -> bool {
+    let json = match src {
+        ModelSource::Hfq(hfq) => hfq.metadata_json.as_str(),
+        ModelSource::Dir(dir) => dir.metadata_json(),
+    };
+    serde_json::from_str::<serde_json::Value>(json)
+        .ok()
+        .and_then(|v| v.get("config").cloned())
+        .map(|cfg| cfg.get("mova_num_experts").is_some())
+        .unwrap_or(false)
+}
+
 // ─── Qwen2Carrier ────────────────────────────────────────────────────
 
 pub struct Qwen2Carrier;
@@ -858,7 +874,11 @@ impl Carrier for LlamaCarrier {
         _n: usize,
         _prefill_err: &mut Option<String>,
     ) -> Option<bool> {
-        let b = m.llama_mut().unwrap();
+        let Some(b) = m.llama_mut() else {
+            // K2-Horizon MoVA (arch 16, K2HorizonBundle) — the dense-llama
+            // bench forward doesn't apply; MoVA has no bench_prefill port.
+            return None;
+        };
         let config = &b.config;
         let weights = &b.weights;
         let scratch = &b.scratch;
@@ -887,6 +907,27 @@ impl Carrier for LlamaCarrier {
         dir_diag(&src);
         let meta = resolve_source_meta(&src, ctx.path)?;
 
+        // K2-Horizon MoVA disambiguation: dense k2_horizon and MoVA k2_horizon
+        // both stamp arch_id 16 and claim this carrier (carriers_are_disjoint
+        // forbids a second claimant). The HFQ config splits them: MoVA files
+        // carry `mova_num_experts`; dense files don't. MoVA is AR-only — the
+        // DFlash/Uno/ngram speculator arms below all expect a LlamaBundle.
+        #[cfg(feature = "arch-llama")]
+        if meta.arch_id == 16 && source_is_k2_mova(&src) {
+            let bundle = hipfire_arch_k2_horizon::load::load_k2_horizon_bundle(src, ctx)?;
+            return Ok(LoadedModel {
+                state: Some(Box::new(bundle)),
+                speculator: None,
+                ..LoadedModel::skeleton(
+                    meta.arch_id,
+                    meta.tokenizer,
+                    ctx.max_seq,
+                    ctx.max_seq,
+                    ctx.path.to_string(),
+                    meta.chat_template,
+                )
+            });
+        }
         let mut bundle = hipfire_arch_llama::load_llama_bundle(src, ctx)?;
 
         // ── DSpark sidecar discovery ──────────────────────────────────────────

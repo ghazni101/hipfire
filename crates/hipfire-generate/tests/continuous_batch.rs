@@ -259,6 +259,7 @@ fn lfm_dense_is_dense_and_route_is_lfm_ar() {
         fast_sample_on: true,
         supports_temp_swor: false,
         supports_chain_nucleus_verify: false,
+        k2_mova: false,
         kv_adaptive: false,
     };
     assert_eq!(

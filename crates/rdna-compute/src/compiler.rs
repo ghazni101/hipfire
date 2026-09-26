@@ -805,13 +805,12 @@ impl KernelCompiler {
         let legacy_obj = self.cache_dir.join(format!("{name}.hsaco"));
         let legacy_hash = self.cache_dir.join(format!("{name}.hash"));
         if pair_valid(&legacy_obj, &legacy_hash, &src_hash) {
-            let hit_path = if publish_pair(&self.cache_dir, &stem, &legacy_obj, &src_hash, true)
-                .is_ok()
-            {
-                obj_path
-            } else {
-                legacy_obj
-            };
+            let hit_path =
+                if publish_pair(&self.cache_dir, &stem, &legacy_obj, &src_hash, true).is_ok() {
+                    obj_path
+                } else {
+                    legacy_obj
+                };
             if let Some(dir) = self.writeback_dir() {
                 writeback_cold(name, &hit_path, &src_hash, dir, false);
             }

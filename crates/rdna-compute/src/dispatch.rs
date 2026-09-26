@@ -1032,6 +1032,7 @@ impl Gpu {
     /// Name of the kernel most recently launched through the dispatch funnel,
     /// if any. Used to attribute a timed-out sync to the suspect kernel.
     pub fn last_launched_kernel(&self) -> Option<&str> {
+        // bind_thread: skip — pure-state getter, no device call.
         self.last_kernel.as_deref()
     }
 
@@ -1042,6 +1043,7 @@ impl Gpu {
         last_kernel: Option<&str>,
         deadline: std::time::Duration,
     ) -> hip_bridge::HipError {
+        // bind_thread: skip — static error builder, no device call.
         match last_kernel {
             Some(kernel) => hip_bridge::HipError::new(
                 0,
@@ -1362,6 +1364,7 @@ impl Gpu {
                 ksplit_det_partials_bytes: 0,
                 sample_partials: None,
                 sample_partials_bytes: 0,
+                argmax_result: None,
             },
             replay: crate::replay::ReplayController::from_config(),
             #[cfg(feature = "flash-attn-ck")]

@@ -85,3 +85,40 @@ void rmsnorm_f32_warp_reduce(
         out[row + d] = x[row + d] * weight[d] * rms;
     }
 }
+
+// Grouped RMSNorm: variance computed per n/n_groups contiguous chunk, not
+// over the full vector. Used by K2-Horizon (layernorm_num_groups=2).
+// Launch grid: (batch * n_groups, 1, 1). Each block handles one chunk of
+// length chunk_len = n / n_groups within one row.
+extern "C" __global__ void grouped_rmsnorm_f32(
+    const float* __restrict__ x,
+    const float* __restrict__ weight,
+    float* __restrict__ out,
+    int n, int n_groups, float eps
+) {
+    extern __shared__ float sdata[];
+    const int chunk_len = n / n_groups;
+    const int row = blockIdx.x / n_groups;       // which batch row
+    const int group = blockIdx.x % n_groups;      // which group within the row
+    const int offset = row * n + group * chunk_len;
+
+    float sum_sq = 0.0f;
+    for (int i = threadIdx.x; i < chunk_len; i += blockDim.x) {
+        float v = x[offset + i];
+        sum_sq += v * v;
+    }
+    sdata[threadIdx.x] = sum_sq;
+    __syncthreads();
+    for (int s = blockDim.x / 2; s > 0; s >>= 1) {
+        if (threadIdx.x < s) sdata[threadIdx.x] += sdata[threadIdx.x + s];
+        __syncthreads();
+    }
+    float rms = rsqrtf(sdata[0] / (float)chunk_len + eps);
+    for (int i = threadIdx.x; i < chunk_len; i += blockDim.x) {
+        int idx = offset + i;
+        // weight is [n] shared across batch rows — index it with the
+        // within-row position, not the global flat index (which overruns
+        // the buffer for row > 0 → IMA at batch > 1).
+        out[idx] = x[idx] * weight[group * chunk_len + i] * rms;
+    }
+}

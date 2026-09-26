@@ -33,6 +33,7 @@ remain fail-closed for every route outside that exact row; source-derived routin
 | 13 | Gemma 4 (dense text) | `hipfire-arch-gemma4` | `Gemma4Carrier` | Hybrid 5:1 sliding(RoPE θ=10k, hd 256)/full(partial RoPE θ=1e6, hd 512, K=V sharing) GQA, sandwich RMSNorm + `layer_scalar`, gelu_pytorch_tanh SwiGLU, tied lm_head, final logit softcap 30. Dir `gemma4` / `gemma4_text` → 13. Carrier also claims 22. |
 | 14 | Muse Glimmer (dense text) | `hipfire-arch-muse-glimmer` | `MuseGlimmerCarrier` | 3:1 sliding(RoPE θ=500k, SWA 2048)/full(**NoPE**, `layer_rope_theta[i]==0`) GQA 32:2 hd 128, sandwich RMSNorm (`rms_norm_eps` 1e-5 pre / `post_norm_eps` 1e-8 post), scale-less QK-norm + `qk_scale_factor` 3.87, `self_attn.gate_proj` gated attention, silu SwiGLU, **untied** lm_head, `output_multiplier` 0.196116 then softcap 20. Dir `muse_glimmer` / `muse_glimmer_text` → 14. Carrier claims 14 only; the arch-23 drafter rides `HIPFIRE_DFLASH_DRAFT`. `pp>1` and `params.drafter` are refused. |
 | 15 | Maple-Preview (natively-ternary MoE) | `hipfire-arch-maple` | `MapleCarrier` | 3:1 sliding(RoPE θ=10k, SWA 512)/full(**NoPE**, `nope_on_global_attention`) GQA 16:4 hd 128, **QK-norm applied BEFORE RoPE**, **partial rotary 0.5** (first 64 of 128 dims), MoE on EVERY layer (256 experts top-8, `moe_intermediate_size` 512, no shared experts, softmax→topk→renorm), **clamped SwiGLU** `silu(clamp(gate,max=7))*clamp(up,-7,7)`, **untied** lm_head, embedding tensor is `model.word_embeddings` (not `embed_tokens`). Weights are natively ternary and carried losslessly by qt=51 `MQ2G256LloydU`; `intermediate_size` 4096 and `quantize`/`preaffine` are dead keys. Dir `maple` → 15. |
+| 16 | K2-Horizon (dense 7B + MoVA-36B-A4B) | `hipfire-arch-llama` (dense) / `hipfire-arch-k2-horizon` (MoVA) | `LlamaCarrier` | Two model families share id 16; the carrier disambiguates on `mova_num_experts` in the HFQ config (`source_is_k2_mova`). Dense: grouped-RMSNorm llama-family transformer (DFlash/Uno spec-capable). MoVA: value-expert attention (64 experts, top-4, sigmoid router + bias, softplus post-attn gate) + sigmoid MoE FFN (100 experts top-8 + 1 shared), grouped RMSNorm (`layernorm_num_groups` 2), full RoPE, GQA 32:8 hd 128, dense layers 0-2 (`mlp_only_layers`), AR-only (`generate_k2_horizon`, route `k2_horizon_ar`). `model_type k2_horizon` → 16. `pp>1` refused. |
 
 Ids **2–4** are unused in the carrier registry (not claimed). Do not invent
 assignments without a carrier + source mapping.
@@ -54,10 +55,10 @@ them for ordinary dispatch.
 ## Image-generation component ids (40–47)
 
 Diffusion checkpoints are **components, not chat models**: loadable for image
-generation, never text-served. The block is deliberately **high** — ids 16–19
-stay free for the next sequential primary text arches, which a component
-claim would silently collide with (the registry disjointness sweep covers
-0..=64, so 40+ is still test-enforced).
+generation, never text-served. The block is deliberately **high** — ids 17–19
+stay free for the next sequential primary text arches (16 is now K2-Horizon),
+which a component claim would silently collide with (the registry
+disjointness sweep covers 0..=64, so 40+ is still test-enforced).
 
 The block is **grouped by family, extension-only**: FLUX.1 owns 40–43 (trunk +
 its two text encoders + the VAE it shares with FLUX.2), FLUX.2 owns 45–46 (44

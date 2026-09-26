@@ -89,6 +89,68 @@ impl Gpu {
         result
     }
 
+    /// MoVA value-routing combine (K2-Horizon): applies SiLU to each expert
+    /// output before weighting and OVERWRITES `out` (no residual add).
+    /// Replaces `silu_f32` + `zero_f32` + `moe_down_combine_k8_batched`
+    /// with one launch. PM4-safe.
+    pub fn moe_down_combine_silu_overwrite_k8_batched(
+        &mut self,
+        expert_outputs: &GpuTensor, // [batch_size × k_top × m] f32
+        topk_weights: &GpuTensor,   // [batch_size × k_top] f32
+        out: &GpuTensor,            // [batch_size × m] f32 overwritten
+        m: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "moe_down_combine_k8_batched",
+            kernels::MOE_DOWN_COMBINE_K8_BATCHED_SRC,
+            "moe_down_combine_silu_overwrite_k8_batched",
+        )?;
+        let eop = expert_outputs.buf.as_ptr();
+        let wp = topk_weights.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let m_val = m as i32;
+        let kt_val = k_top as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &eop as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &m_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+        ];
+        let bytes = (batch_size * k_top * m + batch_size * k_top + batch_size * m) * 4;
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "elementwise",
+            "moe_down_combine_silu_overwrite_k8_batched",
+            bytes,
+        );
+        let block_m: u32 = 256;
+        let grid_x = (m as u32).div_ceil(block_m);
+        let result = self.launch_maybe_blob(
+            "moe_down_combine_silu_overwrite_k8_batched",
+            [grid_x, batch_size as u32, 1],
+            [block_m, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(eop);
+                b.push_ptr(wp);
+                b.push_ptr(op);
+                b.push_i32(m_val);
+                b.push_i32(kt_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// gfx1100 decode experiment: finish one atomic-free routed-MoE row and
     /// immediately produce the following layer's RMS-normalized MQ rotation.
     /// This replaces `moe_down_combine_k8_batched` plus
@@ -843,10 +905,16 @@ impl Gpu {
             &mut rs as *mut _ as *mut c_void,
             &mut bs as *mut _ as *mut c_void,
         ];
+        // blockDim must be a multiple of 32: the kernel's per-warp
+        // __shfl_down reduction reads undefined values from inactive lanes
+        // when n_exp % 32 != 0 (e.g. K2-Horizon n_exp=100 → warp 3 has 28
+        // inactive lanes), which can poison the argmax with a garbage
+        // expert index → OOB expert_ptrs read downstream.
+        let block = ((n_exp as u32) + 31) & !31;
         self.launch_maybe_blob(
             "deepseek4_moe_topk_bias_aware_batched_f32",
             [batch_size as u32, 1, 1],
-            [n_exp as u32, 1, 1],
+            [block, 1, 1],
             0,
             &mut params,
             || {
@@ -895,10 +963,69 @@ impl Gpu {
             &mut kt as *mut _ as *mut c_void,
             &mut rs as *mut _ as *mut c_void,
         ];
+        // blockDim must be a multiple of 32 — see the batched variant above.
+        let block = ((n_exp as u32) + 31) & !31;
         self.launch_maybe_blob(
             "deepseek4_moe_topk_bias_aware_f32",
             [1, 1, 1],
-            [n_exp as u32, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(sp);
+                b.push_ptr(bp);
+                b.push_ptr(ip);
+                b.push_ptr(wp);
+                b.push_i32(ne);
+                b.push_i32(kt);
+                b.push_f32(rs);
+                b
+            },
+        )
+    }
+    /// Sigmoid-fused variant of `deepseek4_moe_topk_bias_aware_f32` for
+    /// K2-Horizon: `scores` holds RAW router logits; the kernel applies
+    /// sigmoid in its cooperative-load phase, eliminating the separate
+    /// `sigmoid_f32` launch. Same bias-for-selection semantics.
+    pub fn deepseek4_moe_topk_bias_aware_sigmoid_f32(
+        &mut self,
+        logits: &GpuTensor,  // [n_exp] fp32 raw logits
+        bias: &GpuTensor,    // [n_exp] fp32
+        indices: &GpuTensor, // [k_top] i32 (typed as F32; raw bytes)
+        weights: &GpuTensor, // [k_top] fp32
+        n_exp: i32,
+        k_top: i32,
+        route_scale: f32,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "deepseek4_moe_topk_bias_aware",
+            kernels::V4F_MOE_TOPK_BIAS_AWARE_SRC,
+            "deepseek4_moe_topk_bias_aware_sigmoid_f32",
+        )?;
+        let sp = logits.buf.as_ptr();
+        let bp = bias.buf.as_ptr();
+        let ip = indices.buf.as_ptr();
+        let wp = weights.buf.as_ptr();
+        let mut ne = n_exp;
+        let mut kt = k_top;
+        let mut rs = route_scale;
+        let mut params: Vec<*mut c_void> = vec![
+            &sp as *const _ as *mut c_void,
+            &bp as *const _ as *mut c_void,
+            &ip as *const _ as *mut c_void,
+            &wp as *const _ as *mut c_void,
+            &mut ne as *mut _ as *mut c_void,
+            &mut kt as *mut _ as *mut c_void,
+            &mut rs as *mut _ as *mut c_void,
+        ];
+        // blockDim must be a multiple of 32 — see the batched variant above.
+        let block = ((n_exp as u32) + 31) & !31;
+        self.launch_maybe_blob(
+            "deepseek4_moe_topk_bias_aware_sigmoid_f32",
+            [1, 1, 1],
+            [block, 1, 1],
             0,
             &mut params,
             || {
@@ -1522,11 +1649,7 @@ impl Gpu {
         assert!(self.arch_caps.supports_ds4_f16_compressor_cache());
         assert_eq!(cache.dtype, DType::F16);
         let symbol = "deepseek4_topk_kv_gather_f16_buf";
-        self.ensure_kernel(
-            symbol,
-            kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC,
-            symbol,
-        )?;
+        self.ensure_kernel(symbol, kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC, symbol)?;
         let cp = cache.buf.as_ptr();
         let ip = topk_idx.buf.as_ptr();
         let op = out.buf.as_ptr();
@@ -1582,11 +1705,7 @@ impl Gpu {
         assert!(self.arch_caps.supports_ds4_f16_compressor_cache());
         assert_eq!(cache.dtype, DType::F16);
         let symbol = "deepseek4_topk_kv_gather_identity_f16_buf";
-        self.ensure_kernel(
-            symbol,
-            kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC,
-            symbol,
-        )?;
+        self.ensure_kernel(symbol, kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC, symbol)?;
         let cp = cache.buf.as_ptr();
         let op = out.buf.as_ptr();
         let kbp = k_buf.buf.as_ptr();
@@ -1635,11 +1754,7 @@ impl Gpu {
         assert!(self.arch_caps.supports_ds4_f16_compressor_cache());
         assert_eq!(cache.dtype, DType::F16);
         let symbol = "deepseek4_topk_kv_gather_batched_tiled_f16";
-        self.ensure_kernel(
-            symbol,
-            kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC,
-            symbol,
-        )?;
+        self.ensure_kernel(symbol, kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC, symbol)?;
         let cp = cache.buf.as_ptr();
         let ip = topk_idx.buf.as_ptr();
         let op = out.buf.as_ptr();
@@ -1702,11 +1817,7 @@ impl Gpu {
         assert!(self.arch_caps.supports_ds4_f16_compressor_cache());
         assert_eq!(cache.dtype, DType::F16);
         let symbol = "deepseek4_topk_kv_gather_identity_batched_f16";
-        self.ensure_kernel(
-            symbol,
-            kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC,
-            symbol,
-        )?;
+        self.ensure_kernel(symbol, kernels::DEEPSEEK4_COMPRESSOR_CACHE_F16_SRC, symbol)?;
         let cp = cache.buf.as_ptr();
         let op = out.buf.as_ptr();
         let mut k = k_active;

@@ -226,7 +226,6 @@ impl Gpu {
         let width_val = width as i32;
         let groups_val = groups as i32;
         let eps_val = eps;
-
         let mut params: Vec<*mut c_void> = vec![
             &x_ptr as *const _ as *mut c_void,
             &w_ptr as *const _ as *mut c_void,
@@ -264,6 +263,173 @@ impl Gpu {
         if let Some(t) = timer {
             t.finish(&self.hip);
         }
+
+        result
+    }
+
+    /// Grouped RMSNorm: variance computed per `n / n_groups` contiguous chunk,
+    /// not over the full vector. Used by K2-Horizon (`layernorm_num_groups=2`).
+    ///
+    /// `weight` is `[n]` (full vector length, indexed by global position).
+    /// `x` and `out` are `[batch, n]` (or `[n]` when `batch == 1`).
+    /// Launches `batch * n_groups` blocks, each handling one chunk.
+    pub fn grouped_rmsnorm_f32(
+        &mut self,
+        x: &GpuTensor,
+        weight: &GpuTensor,
+        out: &GpuTensor,
+        batch: usize,
+        n: usize,
+        n_groups: usize,
+        eps: f32,
+    ) -> HipResult<()> {
+        assert!(
+            n % n_groups == 0,
+            "grouped_rmsnorm: n ({n}) must be divisible by n_groups ({n_groups})"
+        );
+        self.bind_thread()?;
+        self.ensure_kernel("rmsnorm", kernels::RMSNORM_SRC, "grouped_rmsnorm_f32")?;
+
+        let x_ptr = x.buf.as_ptr();
+        let w_ptr = weight.buf.as_ptr();
+        let out_ptr = out.buf.as_ptr();
+        let n_val = n as i32;
+        let n_groups_val = n_groups as i32;
+        let eps_val = eps;
+
+        let chunk_len = n / n_groups;
+        // The kernel's LDS reduction is a power-of-two tree
+        // (`for s = blockDim.x/2; s > 0; s >>= 1`) — a non-pow2 block would
+        // silently drop tail partials. Round down to the previous pow2.
+        let capped = 256usize.min(chunk_len).max(1);
+        let block_size = if capped.is_power_of_two() {
+            capped
+        } else {
+            capped.next_power_of_two() / 2
+        } as u32;
+        let shared_mem = block_size * 4;
+        let grid = (batch * n_groups) as u32;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &x_ptr as *const _ as *mut c_void,
+            &w_ptr as *const _ as *mut c_void,
+            &out_ptr as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+            &n_groups_val as *const _ as *mut c_void,
+            &eps_val as *const _ as *mut c_void,
+        ];
+
+        let bytes = crate::profile::rmsnorm_bytes(batch * n);
+        let timer = crate::profile::begin_timer(&self.hip, "rmsnorm", "grouped_rmsnorm_f32", bytes);
+        let result = self.launch_maybe_blob(
+            "grouped_rmsnorm_f32",
+            [grid, 1, 1],
+            [block_size, 1, 1],
+            shared_mem,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(x_ptr);
+                b.push_ptr(w_ptr);
+                b.push_ptr(out_ptr);
+                b.push_i32(n_val);
+                b.push_i32(n_groups_val);
+                b.push_f32(eps_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
+    /// Fused grouped RMSNorm + FWHT rotation (K2-Horizon decode hot path).
+    /// Replaces `grouped_rmsnorm_f32` + `rotate_x_mq` with one launch.
+    /// Writes both `out` (normed) and `x_rot` (FWHT(normed) * signs).
+    ///
+    /// Requires `chunk_len = n / n_groups` to be a multiple of 256 (FWHT
+    /// group size); callers must check and fall back to the unfused pair.
+    /// PM4-safe: single `launch_maybe_blob`, device-pointer kernargs only.
+    pub fn grouped_rmsnorm_rotate_mq(
+        &mut self,
+        x: &GpuTensor,
+        weight: &GpuTensor,
+        out: &GpuTensor,
+        x_rot: &GpuTensor,
+        batch: usize,
+        n: usize,
+        n_groups: usize,
+        eps: f32,
+    ) -> HipResult<()> {
+        assert!(
+            n % n_groups == 0,
+            "grouped_rmsnorm_rotate_mq: n ({n}) must be divisible by n_groups ({n_groups})"
+        );
+        assert!(
+            (n / n_groups) % 256 == 0,
+            "grouped_rmsnorm_rotate_mq: chunk_len ({}) must be a multiple of 256",
+            n / n_groups
+        );
+        self.bind_thread()?;
+        self.ensure_mq_signs()?;
+        self.ensure_kernel(
+            "grouped_rmsnorm_mq_rotate",
+            kernels::GROUPED_RMSNORM_MQ_ROTATE_SRC,
+            "grouped_rmsnorm_mq_rotate",
+        )?;
+
+        let s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let x_ptr = x.buf.as_ptr();
+        let w_ptr = weight.buf.as_ptr();
+        let out_ptr = out.buf.as_ptr();
+        let rot_ptr = x_rot.buf.as_ptr();
+        let n_val = n as i32;
+        let n_groups_val = n_groups as i32;
+        let eps_val = eps;
+
+        let mut params: Vec<*mut c_void> = vec![
+            &x_ptr as *const _ as *mut c_void,
+            &w_ptr as *const _ as *mut c_void,
+            &s1_ptr as *const _ as *mut c_void,
+            &s2_ptr as *const _ as *mut c_void,
+            &out_ptr as *const _ as *mut c_void,
+            &rot_ptr as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+            &n_groups_val as *const _ as *mut c_void,
+            &eps_val as *const _ as *mut c_void,
+        ];
+
+        let grid = (batch * n_groups) as u32;
+        let bytes = crate::profile::rmsnorm_bytes(batch * n);
+        let timer =
+            crate::profile::begin_timer(&self.hip, "rmsnorm", "grouped_rmsnorm_mq_rotate", bytes);
+        let result = self.launch_maybe_blob(
+            "grouped_rmsnorm_mq_rotate",
+            [grid, 1, 1],
+            [256, 1, 1],
+            256 * 4,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(x_ptr);
+                b.push_ptr(w_ptr);
+                b.push_ptr(s1_ptr);
+                b.push_ptr(s2_ptr);
+                b.push_ptr(out_ptr);
+                b.push_ptr(rot_ptr);
+                b.push_i32(n_val);
+                b.push_i32(n_groups_val);
+                b.push_f32(eps_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        self.invalidate_x_caches_for(out_ptr);
+        self.invalidate_x_caches_for(rot_ptr);
         result
     }
 
@@ -537,6 +703,55 @@ impl Gpu {
             },
         )
     }
+
+    /// Replicate [N × K] → [N × K_TOP × K] for batched MoVA value routing.
+    pub fn replicate_batched_f32(
+        &mut self,
+        input: &GpuTensor,
+        output: &GpuTensor,
+        k: usize,
+        k_top: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "replicate_batched",
+            kernels::REPLICATE_BATCHED_F32_SRC,
+            "replicate_batched_f32",
+        )?;
+        let ip = input.buf.as_ptr();
+        let op = output.buf.as_ptr();
+        let k_val = k as i32;
+        let kt_val = k_top as i32;
+        let n_val = batch_size as i32;
+        let total = (batch_size * k_top * k) as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &ip as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &k_val as *const _ as *mut c_void,
+            &kt_val as *const _ as *mut c_void,
+            &n_val as *const _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = (total as u32).div_ceil(block);
+        let result = self.launch_maybe_blob(
+            "replicate_batched_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(ip);
+                b.push_ptr(op);
+                b.push_i32(k_val);
+                b.push_i32(kt_val);
+                b.push_i32(n_val);
+                b
+            },
+        );
+        result
+    }
     /// Zero inactive rows of a 2D F32 tensor [rows, cols] row-major.
     /// `active_mask` lane bit i selects row i as active. Only inactive rows
     /// are written with exact +0.0f; active rows are left byte-identical.
@@ -651,7 +866,6 @@ impl Gpu {
     pub fn silu_f32(&mut self, x: &GpuTensor, out: &GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("silu", kernels::SILU_SRC, "silu_f32")?;
-        let func = &self.functions["silu_f32"];
 
         let n = x.numel() as i32;
         let mut x_ptr = x.buf.as_ptr();
@@ -666,10 +880,26 @@ impl Gpu {
 
         let block = 256u32;
         let grid = ((n as u32) + block - 1) / block;
-        unsafe {
-            self.hip
-                .launch_kernel(func, [grid, 1, 1], [block, 1, 1], 0, None, &mut params)
+        let bytes = crate::profile::elementwise_bytes(n as usize);
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", "silu_f32", bytes);
+        let result = self.launch_maybe_blob(
+            "silu_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(x_ptr);
+                b.push_ptr(out_ptr);
+                b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
         }
+        result
     }
 
     /// out = silu(gate) * up — fused to avoid intermediate buffer
@@ -2239,7 +2469,6 @@ impl Gpu {
     pub fn softplus_f32(&mut self, x: &GpuTensor) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("softplus", kernels::SOFTPLUS_SRC, "softplus_f32")?;
-        let func = &self.functions["softplus_f32"];
         let mut xp = x.buf.as_ptr();
         let mut n = x.numel() as i32;
         let mut params: Vec<*mut c_void> = vec![
@@ -2248,16 +2477,68 @@ impl Gpu {
         ];
         let block = 256u32;
         let grid = ((n as u32) + block - 1) / block;
-        unsafe {
-            self.hip.launch_kernel(
-                func,
-                [grid, 1, 1],
-                [block, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
+        let bytes = crate::profile::elementwise1_bytes(n as usize);
+        let timer = crate::profile::begin_timer(&self.hip, "elementwise", "softplus_f32", bytes);
+        let result = self.launch_maybe_blob(
+            "softplus_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_i32(n);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
         }
+        result
+    }
+
+    /// Fused softplus post-attention gate: out[i] *= softplus_beta(gate[i]).
+    /// Replaces scale→softplus→scale→mul (4 launches) with 1 launch.
+    #[cfg(feature = "deltanet")]
+    pub fn softplus_gate_f32(&mut self, gate: &GpuTensor, out: &GpuTensor) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "softplus_gate",
+            kernels::SOFTPLUS_GATE_SRC,
+            "softplus_gate_f32",
+        )?;
+        let gp = gate.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let n = gate.numel() as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &gp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &n as *const _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = ((n as u32) + block - 1) / block;
+        let bytes = crate::profile::elementwise_bytes(n as usize);
+        let timer =
+            crate::profile::begin_timer(&self.hip, "elementwise", "softplus_gate_f32", bytes);
+        let result = self.launch_maybe_blob(
+            "softplus_gate_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(gp);
+                b.push_ptr(op);
+                b.push_i32(n);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
     }
 
     /// L2 normalization per head, in-place. One warp per head.
@@ -4041,7 +4322,6 @@ impl Gpu {
     pub fn scale_f32(&mut self, x: &GpuTensor, scale: f32) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel("scale_f32", kernels::SCALE_F32_SRC, "scale_f32")?;
-        let func = &self.functions["scale_f32"];
         let n = x.numel();
         let mut xp = x.buf.as_ptr();
         let mut nv = n as i32;
@@ -4055,16 +4335,20 @@ impl Gpu {
         let grid = ((n as u32) + block - 1) / block;
         let bytes = crate::profile::elementwise1_bytes(n);
         let timer = crate::profile::begin_timer(&self.hip, "elementwise", "scale_f32", bytes);
-        let result = unsafe {
-            self.hip.launch_kernel(
-                func,
-                [grid, 1, 1],
-                [block, 1, 1],
-                0,
-                self.stream_ref(),
-                &mut params,
-            )
-        };
+        let result = self.launch_maybe_blob(
+            "scale_f32",
+            [grid, 1, 1],
+            [block, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_i32(nv);
+                b.push_f32(sv);
+                b
+            },
+        );
         if let Some(t) = timer {
             t.finish(&self.hip);
         }

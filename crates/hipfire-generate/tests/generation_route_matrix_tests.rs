@@ -36,6 +36,7 @@ fn base() -> GenerationRouteInputs {
         fast_sample_on: true,
         supports_temp_swor: false,
         supports_chain_nucleus_verify: false,
+        k2_mova: false,
         kv_adaptive: false,
     }
 }
@@ -201,6 +202,19 @@ fn capability_rows() -> Vec<(GenerationRoute, GenerationRouteInputs)> {
             GenerationRoute::LlamaSpec,
             GenerationRouteInputs {
                 arch_id: 0,
+                has_speculator: true,
+                temp: 0.0,
+                ..base()
+            },
+        ),
+        (
+            // K2-Horizon MoVA: same arch_id (16) as dense k2_horizon —
+            // the carrier disambiguates via the bundle type, published
+            // here as k2_mova. AR-only: has_speculator must not divert it.
+            GenerationRoute::K2HorizonAr,
+            GenerationRouteInputs {
+                arch_id: 16,
+                k2_mova: true,
                 has_speculator: true,
                 temp: 0.0,
                 ..base()

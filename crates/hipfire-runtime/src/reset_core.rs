@@ -106,9 +106,11 @@ pub fn retry_candidate_reset_inventory() -> &'static [ResetCoreCoverage] {
             reason: "GPU fault parity pending",
         },
     };
-    // K2-Horizon (arch 16): dense grouped-RMSNorm llama — the same reset
-    // surface as LLAMA (pure attention KV + spec scratch); grouped norm adds
-    // no persistent state. Inherits llama's parity-pending eligibility.
+    // K2-Horizon (arch 16): two families share the id. Dense = grouped-
+    // RMSNorm llama (same reset surface as LLAMA). MoVA = K2HorizonBundle
+    // whose K2HorizonState::reset clears the q8 KV cache and drops
+    // retained-replay warm state (the fail-closed reset path calls it via
+    // common.rs). Neither family is a retry candidate.
     const K2_HORIZON: ResetCoreCoverage = ResetCoreCoverage {
         arch: "k2_horizon",
         recurrent_or_conv: true, // pure attention — no recurrent residual

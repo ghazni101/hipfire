@@ -765,6 +765,9 @@ pub enum GenerationRoute {
     LlamaSpec,
     GlimmerAr,
     GlimmerSpec,
+    /// K2-Horizon MoVA (arch_id 16 with `mova_num_experts`). Dense k2_horizon
+    /// keeps LlamaAr/LlamaSpec — same arch_id, different bundle type.
+    K2HorizonAr,
     PipelineParallel,
     DotsOcr,
     Unknown,
@@ -793,6 +796,7 @@ impl GenerationRoute {
         Self::LlamaSpec,
         Self::GlimmerAr,
         Self::GlimmerSpec,
+        Self::K2HorizonAr,
         Self::PipelineParallel,
         Self::DotsOcr,
         Self::Unknown,
@@ -848,6 +852,7 @@ impl GenerationRoute {
             Self::LlamaSpec => "llama_spec",
             Self::GlimmerAr => "glimmer_ar",
             Self::GlimmerSpec => "glimmer_spec",
+            Self::K2HorizonAr => "k2_horizon_ar",
             Self::PipelineParallel => "pipeline_parallel",
             Self::DotsOcr => "dots_ocr",
             Self::Unknown => "unknown",
@@ -1192,6 +1197,7 @@ define_route_start!(pipeline_parallel_route_start, 5);
 define_route_start!(dots_ocr_route_start, 8);
 define_route_start!(unknown_route_start, 255);
 
+define_route_start!(k2_horizon_ar_route_start, 16);
 define_route_terminal!(qwen_ar_route_terminal, GenerationRoute::QwenAr);
 define_route_terminal!(qwen_dflash_route_terminal, GenerationRoute::QwenDflash);
 define_route_terminal!(qwen2_ar_route_terminal, GenerationRoute::Qwen2Ar);
@@ -1214,6 +1220,10 @@ define_route_terminal!(llama_ar_route_terminal, GenerationRoute::LlamaAr);
 define_route_terminal!(llama_spec_route_terminal, GenerationRoute::LlamaSpec);
 define_route_terminal!(glimmer_ar_route_terminal, GenerationRoute::GlimmerAr);
 define_route_terminal!(glimmer_spec_route_terminal, GenerationRoute::GlimmerSpec);
+define_route_terminal!(
+    k2_horizon_ar_route_terminal,
+    GenerationRoute::K2HorizonAr
+);
 define_route_terminal!(
     pipeline_parallel_route_terminal,
     GenerationRoute::PipelineParallel
@@ -1319,6 +1329,11 @@ pub fn generation_route_adapter(route: GenerationRoute) -> Option<GenerationRout
             route,
             start: glimmer_spec_route_start,
             terminal: glimmer_spec_route_terminal,
+        },
+        GenerationRoute::K2HorizonAr => GenerationRouteAdapter {
+            route,
+            start: k2_horizon_ar_route_start,
+            terminal: k2_horizon_ar_route_terminal,
         },
         GenerationRoute::PipelineParallel => GenerationRouteAdapter {
             route,
@@ -1491,6 +1506,10 @@ pub struct GenerationRouteInputs {
     /// though [`Self::supports_temp_swor`] is also true; DDTree SWOR leaves
     /// this false and still refuses user-explicit non-temperature controls.
     pub supports_chain_nucleus_verify: bool,
+    /// `LoadedModel.state` is a `K2HorizonBundle` (arch_id 16, MoVA variant).
+    /// Dense k2_horizon loads a `LlamaBundle` under the same arch_id — the
+    /// arch alone cannot pick the route, so the carrier publishes the type.
+    pub k2_mova: bool,
     pub kv_adaptive: bool,
 }
 
@@ -1566,6 +1585,13 @@ pub fn select_generation_route(i: &GenerationRouteInputs) -> GenerationRoute {
         }
         8 => return GenerationRoute::DotsOcr,
         _ => {}
+    }
+
+    // K2-Horizon MoVA is arch_id 16, same id the dense k2_horizon file
+    // stamps — the carrier disambiguates by bundle type via `k2_mova`.
+    // AR-only path (no speculator is ever built for it).
+    if i.arch_id == 16 && i.k2_mova {
+        return GenerationRoute::K2HorizonAr;
     }
 
     // 3. Pipeline-parallel.
@@ -1763,6 +1789,7 @@ pub fn generate(
         fast_sample_on: hipfire_runtime::config::get().dflash_fast_sample,
         supports_temp_swor,
         supports_chain_nucleus_verify,
+        k2_mova: m.k2_horizon().is_some(),
         kv_adaptive: m.kv_adaptive.is_some(),
     };
     let selected_route = select_generation_route(&route_inputs);
@@ -2107,6 +2134,45 @@ pub fn generate(
                 enable_thinking,
                 repeat_penalty,
                 repeat_window,
+            );
+            return;
+        }
+        GenerationRoute::K2HorizonAr => {
+            // K2-Horizon MoVA AR path — no pflash, no eviction, no spec
+            // decode. Think handling (force-close + effort→tag mapping)
+            // lives inside generate_k2_horizon.
+            let _ = (
+                budget_alert_at_tok,
+                budget_alert_text,
+                assistant_prefix,
+                pflash_state,
+                pflash_cfg,
+                think_mode,
+            );
+            crate::dense::generate_k2_horizon(
+                m,
+                gpu,
+                stdout,
+                id,
+                prompt,
+                system_prompt,
+                temp,
+                top_p,
+                max_tokens,
+                max_think_tokens,
+                request_seed,
+                reasoning_effort,
+                enable_thinking,
+                stop,
+                top_k,
+                min_p,
+                repeat_penalty,
+                repeat_window,
+                presence_penalty,
+                frequency_penalty,
+                logprobs_top_k,
+                tools,
+                messages_history,
             );
             return;
         }

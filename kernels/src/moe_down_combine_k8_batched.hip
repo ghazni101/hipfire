@@ -49,3 +49,38 @@ extern "C" __global__ void moe_down_combine_k8_batched(
 
     x_residual[residual_off] += acc;
 }
+
+// MoVA value-routing variant (K2-Horizon): applies SiLU to each expert
+// output before weighting and OVERWRITES `out` instead of accumulating.
+// Replaces the separate silu_f32 + zero_f32 + combine sequence with one
+// launch. Same grid/block contract as moe_down_combine_k8_batched.
+//
+//   out[bid, col] = Σ_k topk_weights[bid,k] * silu(expert_outputs[bid,k,col])
+//
+// where silu(v) = v / (1 + exp(-v)).
+extern "C" __global__ void moe_down_combine_silu_overwrite_k8_batched(
+    const float* __restrict__ expert_outputs, // [N × K_TOP × M]
+    const float* __restrict__ topk_weights,   // [N × K_TOP]
+    float*       __restrict__ out,            // [N × M] overwritten
+    int M, int K_TOP
+) {
+    const int bid = blockIdx.y;
+    const int col = blockIdx.x * blockDim.x + threadIdx.x;
+    if (col >= M) return;
+
+    const long long token_base   = (long long)bid * K_TOP * M;
+    const int       weights_base = bid * K_TOP;
+    const long long out_off      = (long long)bid * M + col;
+
+    float acc = 0.0f;
+    #pragma unroll
+    for (int k = 0; k < 8; k++) {
+        if (k < K_TOP) {
+            float w = topk_weights[weights_base + k];
+            float v = expert_outputs[token_base + (long long)k * M + col];
+            acc += w * (v / (1.0f + expf(-v)));
+        }
+    }
+
+    out[out_off] = acc;
+}

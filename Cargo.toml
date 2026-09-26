@@ -13,6 +13,7 @@ members = [
     "crates/hipfire-pflash",
     "crates/hipfire-arch-qwen35-vl",
     "crates/hipfire-arch-llama",
+    "crates/hipfire-arch-k2-horizon",
     "crates/hipfire-arch-deepseek4",
     "crates/hipfire-ds4-parent",
     "crates/hipfire-arch-gemma4",

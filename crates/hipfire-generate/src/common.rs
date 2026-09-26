@@ -1309,6 +1309,14 @@ pub fn fail_closed_reset_target_and_spec(
         if let Some(bundle) = m.muse_glimmer_mut() {
             bundle.reset_session_state();
         }
+        if let Some(b) = m.k2_horizon_mut() {
+            // Cursor + retained-replay state reset (n_tokens, KV cursors,
+            // retained_warmed_up/poisoned). Without this an abort leaves
+            // mid-turn KV live while rolled_back is attested.
+            if let Err(e) = b.state.reset(gpu) {
+                push_reset_err(&mut first_err, "k2_horizon.reset", e);
+            }
+        }
         if let Some(ad) = m.kv_adaptive.as_mut() {
             if let Some(b) = m.state.as_mut().and_then(|s| {
                 (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()

@@ -327,6 +327,7 @@ pub fn is_batch_request_eligible(
             != Some("0"),
         supports_temp_swor,
         supports_chain_nucleus_verify,
+        k2_mova: m.k2_horizon().is_some(),
         kv_adaptive: has_adaptive,
     };
     let route = select_generation_route(&route_inputs);
@@ -2913,6 +2914,7 @@ pub fn is_qwen_ep_batch_request_eligible(
             .speculator
             .as_ref()
             .is_some_and(|s| s.supports_chain_nucleus_verify()),
+        k2_mova: m.k2_horizon().is_some(),
         kv_adaptive: m.kv_adaptive.is_some(),
     };
     let route = select_generation_route(&route_inputs);

@@ -1706,6 +1706,16 @@ pub const GEMV_MQ4G256V2_RESIDUAL_R1_K4096_GFX1100_NOSCRATCH_SRC: &str = concat!
     "#define HIPFIRE_MQ4G256V2_RESIDUAL_EPILOGUE 1\n",
     include_str!("../../../kernels/src/gemv_mq4g256v2.hip")
 );
+/// Generic-K one-row residual variant of the plain V2 body: residual store
+/// (`y[row] += acc`), unique symbol, no private scratch — retained-PM4
+/// qualified. For K2-Horizon o_proj (K=4096), shared down (K=768), and
+/// dense down (K=6144) where the fixed-K4096 variant does not apply.
+/// Launcher-gated to gfx1100 + MQ4G256V2.
+pub const GEMV_MQ4G256V2_RESIDUAL_R1_GENERIC_NOSCRATCH_SRC: &str = concat!(
+    "#define HIPFIRE_MQ4G256V2_KERNEL gemv_mq4g256v2_residual_r1_generic_noscratch\n",
+    "#define HIPFIRE_MQ4G256V2_RESIDUAL_EPILOGUE 1\n",
+    include_str!("../../../kernels/src/gemv_mq4g256v2.hip")
+);
 /// Ornith qt44 shared-expert down fuse: fixed K=512 dual-half MQ4G256V2 body with
 /// lane-0 `sigmoid(c_buf[0]) * acc` residual store. ABI is 40 B (A/x/y/c_buf/M/K).
 /// Launcher-gated to exact gfx1100|gfx1201 / M=2048 / K=512; default shared-down
@@ -5047,6 +5057,10 @@ pub const RMSNORM_SRC: &str = include_str!("../../../kernels/src/rmsnorm.hip");
 /// for rows*groups independent normalizations with per-group affine slices.
 pub const RMSNORM_GROUPED_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/rmsnorm_grouped_batched.hip");
+/// Fused grouped RMSNorm + FWHT rotation (K2-Horizon): per-chunk variance
+/// (n/n_groups) then per-256-group FWHT. Writes normed `out` and `x_rot`.
+pub const GROUPED_RMSNORM_MQ_ROTATE_SRC: &str =
+    include_str!("../../../kernels/src/grouped_rmsnorm_mq_rotate.hip");
 
 /// Fused sandwich post-norm + residual-add: out = residual + rmsnorm(x, weight).
 /// Collapses (rmsnorm + memcpy + add_inplace) 3 launches into 1 (gemma4 L4).
@@ -5846,6 +5860,11 @@ pub const SIGMOID_SRC: &str = include_str!("../../../kernels/src/sigmoid.hip");
 /// Softplus: log(1 + exp(x)), numerically stable. Element-wise, in-place.
 #[cfg(feature = "deltanet")]
 pub const SOFTPLUS_SRC: &str = include_str!("../../../kernels/src/softplus.hip");
+
+/// Fused softplus post-attention gate: out[i] *= softplus_beta(gate[i]).
+/// Replaces scale→softplus→scale→mul (4 launches) with 1 launch.
+#[cfg(feature = "deltanet")]
+pub const SOFTPLUS_GATE_SRC: &str = include_str!("../../../kernels/src/softplus_gate.hip");
 
 /// L2 normalization per head: out[i] = x[i] / sqrt(sum(x²) + eps).
 /// Grid: [n_heads]. Block: [32]. Each warp normalizes one head of head_dim elements.
@@ -7747,6 +7766,10 @@ mod gfx1201_e8_decode_identity {
         }
     }
 }
+
+/// Replicate [N × K] → [N × K_TOP × K] for batched MoVA value routing.
+pub const REPLICATE_BATCHED_F32_SRC: &str =
+    include_str!("../../../kernels/src/replicate_batched.hip");
 
 #[cfg(test)]
 mod dispatch_tests {
