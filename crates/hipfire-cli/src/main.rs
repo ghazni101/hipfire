@@ -3684,7 +3684,10 @@ pub(crate) fn apply_http_reasoning_request(
     // contract-blind short-circuit: a client legitimately requesting a 1-token
     // cap would be silently reinterpreted. Gate on contract and participate in
     // disabled-wins, so every off-path is contract-aware.
-    let is_off_max_think_one = matches!(contract, ReasoningContract::QwenJinja)
+    let is_off_max_think_one = matches!(
+        contract,
+        ReasoningContract::QwenJinja | ReasoningContract::IfmThink
+    )
         && body
             .get("max_think_tokens")
             .and_then(serde_json::Value::as_u64)
@@ -3734,7 +3737,7 @@ pub(crate) fn apply_http_reasoning_request(
     }
     request["thinking_enabled"] = serde_json::json!(thinking_enabled);
     let prefix = match contract {
-        ReasoningContract::QwenJinja | ReasoningContract::DeepSeek4 => {
+        ReasoningContract::QwenJinja | ReasoningContract::DeepSeek4 | ReasoningContract::IfmThink => {
             if thinking_enabled {
                 "open_think"
             } else {
@@ -4044,6 +4047,24 @@ pub(crate) fn apply_http_reasoning_request(
             request["reasoning_effort"] = serde_json::json!(normalized);
         }
         ReasoningContract::GemmaBoolean => {
+            effective_effort = None;
+        }
+        // IFM think_fast/think_faster are primer spellings, not effort
+        // levels — effort requests are dropped with the template-does-not-
+        // -support wording, like non-native QwenJinja.
+        ReasoningContract::IfmThink => {
+            if has_explicit_effort {
+                push_warn(format!(
+                    "reasoning_effort '{}' dropped: template does not natively support effort (ifm_think); use max_think_tokens for cap",
+                    effort_raw.unwrap()
+                ));
+            }
+            if config_effort_is_explicit && config_effort != "auto" {
+                push_warn(format!(
+                    "reasoning.effort '{}' dropped: template does not natively support effort",
+                    config_effort
+                ));
+            }
             effective_effort = None;
         }
         ReasoningContract::Unsupported => {

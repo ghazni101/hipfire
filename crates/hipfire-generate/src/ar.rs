@@ -5226,6 +5226,24 @@ pub fn generate(
         let mut visible_acc = String::new();
         let mut stopped = false;
 
+        // Think-span enforcement for IFM-style templates: K2's chat template
+        // unconditionally opens `<|ifm|think>` in its generation prompt and
+        // the markers are plain text (not special tokens), so neither a
+        // template gate nor a closed-think primer can close the span. When
+        // thinking is disabled, or a finite budget is exhausted while the
+        // span is still open, the close sequence is force-committed through
+        // the same forward/observe path as sampled tokens; the span then
+        // closes and the remaining budget decodes content.
+        let think_close_ids = tokenizer.encode("</ifm|think>");
+        let mut forced_close: Vec<u32> =
+            if !enable_thinking && started_in_think && !think_close_ids.is_empty() {
+                think_close_ids.clone()
+            } else {
+                Vec::new()
+            };
+        let mut close_fired = !forced_close.is_empty();
+        let mut think_used = 0usize;
+
         for _ in 0..max_tokens {
             // Decode-side abort check (mirrors the Qwen AR loop): a client
             // cancel bails at the next iteration with an attested
@@ -5260,6 +5278,12 @@ pub fn generate(
                     return;
                 }
             };
+
+            if think_router.in_think() {
+                think_used += 1;
+            } else {
+                close_fired = false;
+            }
 
             // Scope repeat_buf to this turn's prompt + generated tokens
             // (same logic as the Qwen3.5 path: prompt anchor + current turn).
@@ -5333,8 +5357,28 @@ pub fn generate(
                 );
                 return;
             }
-            next_token = tok;
-            rng_state = rng;
+            // Budget enforcement: replace the sampled token with the think
+            // close while the span is still open past its budget (or when
+            // thinking is disabled and the template opened it anyway). The
+            // RNG state is left untouched — forced tokens consume no draws.
+            if think_router.in_think()
+                && !close_fired
+                && !think_close_ids.is_empty()
+                && (!enable_thinking
+                    || (max_think_tokens >= 2 && think_used >= max_think_tokens))
+            {
+                forced_close = think_close_ids.clone();
+                close_fired = true;
+            }
+            if !think_router.in_think() {
+                forced_close.clear();
+            }
+            if forced_close.is_empty() {
+                next_token = tok;
+                rng_state = rng;
+            } else {
+                next_token = forced_close.remove(0);
+            }
         }
         m.seq_pos += generated;
         if let Err(e) = qwen_ar_drain_pending_into_router(
