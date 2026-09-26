@@ -4609,7 +4609,8 @@ pub fn forward_scratch_layers(
         if kv_cache.quant_asym4
             || kv_cache.quant_asym3
             || kv_cache.quant_asym2
-            || kv_cache.quant_q8
+            || (kv_cache.quant_q8
+                && hipfire_config::developer_var("HIPFIRE_Q8_DECODE_FLASH").as_deref() != Ok("0"))
         {
             // Asym/Givens KV: the manual ladder below has no asym kernels, so
             // route KV-write + flash-attend through the dispatch attention
@@ -5197,7 +5198,8 @@ pub fn forward_scratch_compute_capture(
         if kv_cache.quant_asym4
             || kv_cache.quant_asym3
             || kv_cache.quant_asym2
-            || kv_cache.quant_q8
+            || (kv_cache.quant_q8
+                && hipfire_config::developer_var("HIPFIRE_Q8_DECODE_FLASH").as_deref() != Ok("0"))
         {
             // Asym/Givens KV: the manual ladder below has no asym kernels, so
             // route KV-write + flash-attend through the dispatch attention

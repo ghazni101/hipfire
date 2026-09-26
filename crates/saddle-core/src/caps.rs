@@ -38,6 +38,12 @@ pub enum ReasoningContract {
     DeepSeek4,
     GemmaBoolean,
     MuseGlimmer,
+    /// IFM-family think tags (K2-Horizon arch 16): `<|ifm|think>` /
+    /// `<|ifm|think_fast>` / `<|ifm|think_faster>` openers with matching
+    /// closers. Toggle maps to the open/closed assistant primer; finite
+    /// max_think_tokens caps resolve like QwenJinja (effort is not native —
+    /// the fast/faster variants are primer spellings, not effort levels).
+    IfmThink,
 }
 
 impl ReasoningContract {
@@ -48,6 +54,7 @@ impl ReasoningContract {
             Self::DeepSeek4 => "deepseek4",
             Self::GemmaBoolean => "gemma_boolean",
             Self::MuseGlimmer => "muse_glimmer",
+            Self::IfmThink => "ifm_think",
         }
     }
 
@@ -58,6 +65,7 @@ impl ReasoningContract {
             "deepseek4" => Some(Self::DeepSeek4),
             "gemma_boolean" => Some(Self::GemmaBoolean),
             "muse_glimmer" => Some(Self::MuseGlimmer),
+            "ifm_think" => Some(Self::IfmThink),
             _ => None,
         }
     }

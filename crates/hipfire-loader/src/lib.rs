@@ -4895,6 +4895,11 @@ mod registry_tests {
         assert_eq!(
             caps_of("llama"),
             ArchCaps {
+                // K2-Horizon (arch 16) rides the llama carrier and speaks the
+                // IFM think-tag contract: the toggle maps to the assistant
+                // primer and max_think_tokens resolves (the think span is
+                // force-closed engine-side — the template has no gate).
+                reasoning_contract: ReasoningContract::IfmThink,
                 dflash: Some(DflashKind::Llama),
                 ..text_only
             }

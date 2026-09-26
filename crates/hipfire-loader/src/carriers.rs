@@ -786,7 +786,7 @@ impl Carrier for LlamaCarrier {
             semantic_contract_version: None,
             has_deltanet: false,
             supports_images: false,
-            reasoning_contract: saddle_core::caps::ReasoningContract::Unsupported,
+            reasoning_contract: saddle_core::caps::ReasoningContract::IfmThink,
         }
     }
     fn sampling_defaults(&self) -> saddle_core::sampling::SamplingDefaults {
