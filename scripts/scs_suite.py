@@ -839,15 +839,23 @@ def b10(t):
 @cell("C", "C1", "cold -> warm exact reuse + byte-identical replay")
 def c1(t):
     p = prompt_cold("verrow", keyword_instruction("LANTERN"))
-    r1 = chat(t.cfg, user(p), temperature=0, max_tokens=32)
+    # presence_penalty pins BOTH arms to the AR path: speculative verify
+    # (MTP/DFlash) retires on penalized requests, and warm (reused-prefix)
+    # admits retire spec as well. Without the pin the cold run may decode on
+    # the spec path while the warm run retires to AR — the verify lm_head is
+    # a batched WMMA GEMM whose argmax is NOT bit-identical to the decode
+    # GEMV at ULP near-ties, so cross-path byte-compare can diverge with no
+    # cache corruption (reproduced: ~1 flip per 300-1200 tokens).
+    pen = {"presence_penalty": 0.1}
+    r1 = chat(t.cfg, user(p), temperature=0, max_tokens=32, **pen)
     t.ev("cold cached=%s prompt=%s" % (r1.cached_tokens, r1.usage["prompt_tokens"]))
     t.check(r1.cached_tokens == 0, "cold run already cached=%s (fixture collision?)" % r1.cached_tokens)
     t.check("LANTERN" in r1.content, "cold output %r" % r1.content[:80])
-    r2 = chat(t.cfg, user(p), temperature=0, max_tokens=32)
+    r2 = chat(t.cfg, user(p), temperature=0, max_tokens=32, **pen)
     t.ev("warm cached=%s" % r2.cached_tokens)
     t.check(r2.cached_tokens >= 128, "warm reused only %s tokens (<1 page)" % r2.cached_tokens)
     t.check(r2.cached_tokens <= r2.usage["prompt_tokens"], "cached > prompt_tokens")
-    r3 = chat(t.cfg, user(p), temperature=0, max_tokens=32)
+    r3 = chat(t.cfg, user(p), temperature=0, max_tokens=32, **pen)
     t.check(r2.cached_tokens == r3.cached_tokens,
             "warm reuse unstable: %s vs %s" % (r2.cached_tokens, r3.cached_tokens))
     t.check(r1.content == r2.content == r3.content,
@@ -857,16 +865,20 @@ def c1(t):
 @cell("C", "C2", "A10 long-generation page-crossing replay")
 def c2(t):
     p = prompt_cold("wexholm", "Retell the survey details in your own words, at length.")
-    r1 = chat(t.cfg, user(p), temperature=0, max_tokens=384)
+    # Same-path pin as C1: cold under spec and warm under AR are different
+    # numeric pipelines; the reuse contract is only falsifiable same-path.
+    pen = {"presence_penalty": 0.1}
+    r1 = chat(t.cfg, user(p), temperature=0, max_tokens=384, **pen)
     t.check(r1.finish in ("stop", "length"), "finish %s" % r1.finish)
     t.ev("cold gen=%s tok cached=%s" % (r1.usage["completion_tokens"], r1.cached_tokens))
     bad, stats = is_attractor(r1.content)
     t.check(not bad, "attractor in long generation: %s" % stats)
-    r2 = chat(t.cfg, user(p), temperature=0, max_tokens=384)
+    r2 = chat(t.cfg, user(p), temperature=0, max_tokens=384, **pen)
     t.ev("warm cached=%s" % r2.cached_tokens)
     t.check(r2.cached_tokens >= 128, "no reuse on warm long-gen (%s)" % r2.cached_tokens)
     t.check(r1.content == r2.content,
-            "warm long-gen replay differs from cold (candidate rows leaked into cache?)"
+            "warm long-gen replay differs from cold under same-path AR "
+            "(reused pages/checkpoint corrupted state?)"
             "\n  cold head=%r\n  warm head=%r" % (r1.content[:150], r2.content[:150]))
 
 
