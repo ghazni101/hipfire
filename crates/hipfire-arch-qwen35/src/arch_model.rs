@@ -75,6 +75,8 @@ impl ArchModel for Qwen35Bundle {
             pp_scratch_set,
             vision_config: _,
             vision_weights,
+            taichu_vision_config: _,
+            taichu_vision_weights,
             qwen35_decode_batch,
         } = *self;
         debug_assert!(
@@ -96,6 +98,9 @@ impl ArchModel for Qwen35Bundle {
         dn_state.free_gpu(gpu);
         if let Some(vw) = vision_weights {
             vw.free_gpu(gpu);
+        }
+        if let Some(tw) = taichu_vision_weights {
+            tw.free_gpu(gpu);
         }
     }
 }

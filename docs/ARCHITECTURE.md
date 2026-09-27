@@ -176,7 +176,7 @@ one** matching carrier (zero → error; two → ambiguous error).
 |---|---|---|
 | `LlamaCarrier` | 0, 1 | `hipfire-arch-llama` (dense LLaMA/Mistral/plain Qwen3) |
 | `Qwen2Carrier` | 7 | `hipfire-arch-qwen2` (Q/K/V attention bias path) |
-| `Qwen35Carrier` | 5, 6 | `hipfire-arch-qwen35` (+ optional `hipfire-arch-qwen35-vl`) |
+| `Qwen35Carrier` | 5, 6 | `hipfire-arch-qwen35` (+ optional `hipfire-arch-qwen35-vl`; ZDTaichu-5.0 packs ride arch 5 with the `hipfire-arch-taichu-vl` C-RADIO tower, detected by `vision_model.radio_model.*` tensors) |
 | `DotsOcrCarrier` | 8 | `hipfire-arch-dots-ocr` (vision + Qwen2 text decoder fields) |
 | `Deepseek4Carrier` | 9 | `hipfire-arch-deepseek4` |
 | `MinimaxCarrier` | 10 | `hipfire-arch-minimax` |

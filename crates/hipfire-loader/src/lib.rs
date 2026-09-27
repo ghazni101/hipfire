@@ -1223,6 +1223,20 @@ impl LoadedModel {
         self.qwen35_mut().and_then(|b| b.vision_weights.as_mut())
     }
 
+    /// ZDTaichu-5.0 C-RADIO vision config/weights (arch 5 bundle fields).
+    /// `Some` only for a `zdtaichu5_0` HFQ pack; mutually exclusive with the
+    /// SigLIP `vision_*` pair.
+    pub fn taichu_vision_config(
+        &self,
+    ) -> Option<&hipfire_arch_taichu_vl::vision::TaichuVisionConfig> {
+        self.qwen35().and_then(|b| b.taichu_vision_config.as_ref())
+    }
+    pub fn taichu_vision_weights(
+        &self,
+    ) -> Option<&hipfire_arch_taichu_vl::vision::TaichuVisionWeights> {
+        self.qwen35().and_then(|b| b.taichu_vision_weights.as_ref())
+    }
+
     /// Declared vision capability across ALL carriers that can carry a
     /// tower: qwen35-vl (arch 5/6 bundle field), dots-ocr (arch 8), and
     /// lfm2-vl (arch-11 bundle field). The daemon's image gate consults
@@ -1236,7 +1250,8 @@ impl LoadedModel {
                 return true;
             }
         }
-        self.qwen35().is_some_and(|b| b.vision_config.is_some())
+        self.qwen35()
+            .is_some_and(|b| b.vision_config.is_some() || b.taichu_vision_config.is_some())
     }
 
     /// LFM2-VL (arch 11) projected-vision config + weights, when loaded
@@ -1789,6 +1804,7 @@ fn rollback_unfinished_qwen35(
     err: String,
     bundle: Qwen35Bundle,
     vision_weights: Option<qwen35_vl::VisionWeights>,
+    taichu_weights: Option<hipfire_arch_taichu_vl::vision::TaichuVisionWeights>,
     gpu: &mut Gpu,
 ) -> String {
     let mut notes = Vec::new();
@@ -1797,6 +1813,9 @@ fn rollback_unfinished_qwen35(
     }
     if let Some(vw) = vision_weights {
         vw.free_gpu(gpu);
+    }
+    if let Some(tw) = taichu_weights {
+        tw.free_gpu(gpu);
     }
     gpu.invalidate_graph_state();
     gpu.drain_pool();
@@ -1902,6 +1921,8 @@ fn finish_qwen35_load(
     ctx: &mut LoadCtx,
     vision_config: Option<qwen35_vl::VisionConfig>,
     vision_weights: Option<qwen35_vl::VisionWeights>,
+    taichu_vision_config: Option<hipfire_arch_taichu_vl::vision::TaichuVisionConfig>,
+    taichu_vision_weights: Option<hipfire_arch_taichu_vl::vision::TaichuVisionWeights>,
 ) -> Result<LoadedModel, String> {
     // ── Eviction (only hard-error stage before publish) ────────────
     // Built before long-lived borrows so rollback can move `bundle`.
@@ -1916,6 +1937,7 @@ fn finish_qwen35_load(
                 e,
                 bundle,
                 vision_weights,
+                taichu_vision_weights,
                 ctx.gpu,
             ));
         }
@@ -2085,6 +2107,7 @@ fn finish_qwen35_load(
                         ),
                         bundle,
                         vision_weights,
+                        taichu_vision_weights,
                         ctx.gpu,
                     ));
                 }
@@ -2196,6 +2219,7 @@ fn finish_qwen35_load(
                     ),
                     bundle,
                     vision_weights,
+                    taichu_vision_weights,
                     ctx.gpu,
                 ));
             }
@@ -2232,6 +2256,8 @@ fn finish_qwen35_load(
     let mut bundle = bundle;
     bundle.vision_config = vision_config;
     bundle.vision_weights = vision_weights;
+    bundle.taichu_vision_config = taichu_vision_config;
+    bundle.taichu_vision_weights = taichu_vision_weights;
     let kv_adaptive = bundle.kv_adaptive.take();
     let state: Option<Box<dyn hipfire_runtime::arch_model::ArchModel>> = Some(Box::new(bundle));
     let mut model = LoadedModel {

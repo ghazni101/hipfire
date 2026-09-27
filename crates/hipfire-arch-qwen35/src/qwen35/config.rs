@@ -866,10 +866,17 @@ fn default_norm_topk() -> bool {
 /// Shared by both `config_from_hfq` and `config_from_safetensors`: the two
 /// envelope sources are byte-identical past the `meta["config"]` node.
 fn from_config_value(config: &serde_json::Value) -> Result<Qwen35Config, String> {
-    let tc = config.get("text_config").unwrap_or(config);
+    // Text block descends into `text_config` (HF composite VL convention) or
+    // `llm_config` (ZDTaichu-5.0 convention) when present.
+    let tc = config
+        .get("text_config")
+        .or_else(|| config.get("llm_config"))
+        .unwrap_or(config);
     let raw: RawQwen35Config = serde_json::from_value(tc.clone())
         .map_err(|e| format!("qwen35: parsing config failed: {e}"))?;
-    let is_vl_text = config.get("text_config").is_some() && config.get("vision_config").is_some();
+    let is_vl_text = (config.get("text_config").is_some()
+        || config.get("llm_config").is_some())
+        && config.get("vision_config").is_some();
 
     let dim = raw.hidden_size;
     let n_heads = raw.num_attention_heads;
@@ -913,7 +920,13 @@ fn from_config_value(config: &serde_json::Value) -> Result<Qwen35Config, String>
         n_layers: raw.num_hidden_layers,
         vocab_size: raw.vocab_size,
         norm_eps: raw.rms_norm_eps,
-        eos_token: first_token_or(raw.eos_token_id.as_ref(), 248044),
+        // eos: text block first, then the composite top level (ZDTaichu's
+        // llm_config.eos_token_id is null; the real <|im_end|> id lives on the
+        // outer config). 248044 = Qwen3.5 pad default.
+        eos_token: match first_token_or(raw.eos_token_id.as_ref(), 0) {
+            0 => first_token_or(config.get("eos_token_id"), 248044),
+            t => t,
+        },
         n_heads,
         n_kv_heads,
         head_dim,

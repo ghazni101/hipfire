@@ -1972,7 +1972,9 @@ fn main() {
                                 gpu.replay.transport_name()
                             );
                         }
-                        let vl = m.vision_config().is_some() || m.dots_ocr().is_some();
+                        let vl = m.vision_config().is_some()
+                            || m.dots_ocr().is_some()
+                            || m.taichu_vision_config().is_some();
                         let (dim, layers, vocab) = m.ack_dims();
 
                         // Apply MTP config from load-message params.

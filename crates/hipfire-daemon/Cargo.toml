@@ -16,6 +16,7 @@ deltanet = [
     "rdna-compute/deltanet",
     "hipfire-pflash/deltanet",
     "hipfire-arch-qwen35-vl/deltanet",
+    "hipfire-arch-taichu-vl/deltanet",
 ]
 flash-attn-ck = [
     "rdna-compute/flash-attn-ck",
@@ -43,6 +44,7 @@ hipfire-generate = { path = "../hipfire-generate" }
 hipfire-pflash = { path = "../hipfire-pflash" }
 hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
 hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
+hipfire-arch-taichu-vl = { path = "../hipfire-arch-taichu-vl" }
 
 # Arches via loader/generate; qwen35 direct for slots.
 

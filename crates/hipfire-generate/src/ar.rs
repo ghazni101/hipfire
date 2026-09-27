@@ -4801,6 +4801,9 @@ pub fn generate(
                     &mut rng_state,
                 )
             };
+            if std::env::var("HIPFIRE_DEBUG_TOKENS").is_ok() && generated < 24 {
+                eprintln!("[dbg] tok[{generated}] = {next_token} {:?}", tokenizer.decode(&[next_token]));
+            }
             if grammar_active {
                 let text = tokenizer.decode(&[next_token]);
                 let was_detected = grammar_matcher.attractor_detected();

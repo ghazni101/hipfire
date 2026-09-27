@@ -48,6 +48,10 @@ pub(crate) fn should_quantize(name: &str) -> bool {
         || name.starts_with("model.vision_tower.")
         || name.starts_with("model.vision_adapter.")
         || name.starts_with("model.vision_projection.")
+        // ZDTaichu-5.0: C-RADIO tower + mlp1 projector (see
+        // vision_sidecar::is_vision_tower_tensor — same set).
+        || name.starts_with("vision_model.")
+        || name.starts_with("mlp1.")
         // LFM2/Idefics-style multimodal projector rides the vision group
         // (VL artifact contract) — F16 under --include-vision, skipped without.
         || name.starts_with("model.multi_modal_projector.")

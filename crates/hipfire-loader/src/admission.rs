@@ -89,8 +89,16 @@ fn probe_vision(src: &ModelSource, arch_id: u32) -> Result<bool, String> {
     };
     let (has_tensor, has_config) = match arch_id {
         5 | 6 => (
+            // SigLIP (qwen35-vl) OR C-RADIO (ZDTaichu) tower tensor — the
+            // tower's presence alone decides; which tower is resolved in
+            // carriers.rs by the same probes.
             hfq.tensor_data("model.visual.patch_embed.proj.weight")
-                .is_some(),
+                .is_some()
+                || hfq
+                    .tensor_data(
+                        "vision_model.radio_model.model.patch_generator.embedder.weight",
+                    )
+                    .is_some(),
             // Qwen3.5 does not use the config in the decision; config parse is
             // soft (carriers.rs:527-544). A dummy `false` is never read.
             false,

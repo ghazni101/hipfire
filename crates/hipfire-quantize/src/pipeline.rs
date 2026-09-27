@@ -2125,6 +2125,10 @@ pub(crate) fn run() {
                 "  [skip-I64] {} {:?} ({} elements) — unexpected I64 tensor, not ingested",
                 name, meta.shape, n_elements
             );
+            // `total_params` was already incremented for this tensor (pre-loop
+            // position), so a skip must subtract — the closing check requires
+            // quantized == total with skipped excluded from both sides.
+            total_params -= n_elements as u64;
             skipped_params += n_elements as u64;
             continue;
         }

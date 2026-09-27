@@ -4939,6 +4939,67 @@ impl Gpu {
         )
     }
 
+    /// Exact erf GELU (in-place capable if x == out). PyTorch `nn.GELU()`
+    /// semantics; use this over `gelu_tanh_f32` for towers whose reference
+    /// implementation is the erf form (C-RADIO / timm ViT blocks).
+    pub fn gelu_erf_f32(&mut self, x: &GpuTensor, out: &GpuTensor, n: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("gelu_erf_f32", kernels::GELU_ERF_SRC, "gelu_erf_f32")?;
+        let xp = x.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let ni = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &ni as *const _ as *mut c_void,
+        ];
+        let blocks = ((n + 255) / 256) as u32;
+        self.launch_maybe_blob(
+            "gelu_erf_f32",
+            [blocks, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(op);
+                b.push_i32(ni);
+                b
+            },
+        )
+    }
+
+    /// Squared ReLU (relu(x)², in-place capable). ZDTaichu-5.0 vision
+    /// projector activation — `SquaredReLU` in its `mlp1` Sequential.
+    pub fn squared_relu_f32(&mut self, x: &GpuTensor, out: &GpuTensor, n: usize) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel("squared_relu_f32", kernels::SQUARED_RELU_SRC, "squared_relu_f32")?;
+        let xp = x.buf.as_ptr();
+        let op = out.buf.as_ptr();
+        let ni = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &xp as *const _ as *mut c_void,
+            &op as *const _ as *mut c_void,
+            &ni as *const _ as *mut c_void,
+        ];
+        let blocks = ((n + 255) / 256) as u32;
+        self.launch_maybe_blob(
+            "squared_relu_f32",
+            [blocks, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(xp);
+                b.push_ptr(op);
+                b.push_i32(ni);
+                b
+            },
+        )
+    }
+
     /// Bias-add: x[batch, n] += bias[n] (in-place, broadcast over batch dim)
     pub fn bias_add_f32(
         &mut self,

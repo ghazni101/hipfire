@@ -83,6 +83,8 @@ fn qwen35_tensor_name_candidates(name: &str) -> Vec<String> {
     if name == "lm_head.weight" {
         push(name.to_string());
         push("model.language_model.lm_head.weight".to_string());
+        // ZDTaichu-5.0 checkpoint layout: `language_model.lm_head`.
+        push("language_model.lm_head.weight".to_string());
         push("model.lm_head.weight".to_string());
         return out;
     }
@@ -90,6 +92,8 @@ fn qwen35_tensor_name_candidates(name: &str) -> Vec<String> {
     if name.starts_with("model.") {
         push(name.to_string());
     } else {
+        // ZDTaichu-5.0 nests the text tower as `language_model.model.*`.
+        push(format!("language_model.model.{name}"));
         push(format!("model.language_model.{name}"));
         push(format!("model.{name}"));
         push(name.to_string());
@@ -2611,19 +2615,30 @@ impl WeightSource for ParoSource<'_> {
         let mp = self.mp;
         let c = self.c;
         let source = self.source;
-        let has_separate = source.tensor_data("lm_head.weight").is_some();
+        // lm_head candidates mirror qwen35_tensor_name_candidates: bare,
+        // model.language_model., language_model. (ZDTaichu), model.
+        let lm_head_name = [
+            "lm_head.weight",
+            "model.language_model.lm_head.weight",
+            "language_model.lm_head.weight",
+            "model.lm_head.weight",
+        ]
+        .iter()
+        .find(|n| source.tensor_data(n).is_some())
+        .copied();
         resolve_lm_head(
             gpu,
-            has_separate,
+            lm_head_name.is_some(),
             can_alias,
             embd,
             embd_fmt,
             c.vocab_size,
             c.dim,
             |gpu| {
+                let name = lm_head_name.unwrap();
                 let (_, f16) = source
-                    .tensor_data("lm_head.weight")
-                    .ok_or_else(|| HipError::new(0, "PARO tensor not found: lm_head.weight"))?;
+                    .tensor_data(name)
+                    .ok_or_else(|| HipError::new(0, &format!("PARO tensor not found: {name}")))?;
                 reupload_f16_as_f32(gpu, &f16, c.vocab_size, c.dim)
             },
             |gpu| {

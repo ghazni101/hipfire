@@ -30,6 +30,11 @@ pub fn is_vision_tower_tensor(name: &str) -> bool {
         || name.starts_with("model.vision_tower.")
         || name.starts_with("model.vision_adapter.")
         || name.starts_with("model.vision_projection.")
+        // ZDTaichu-5.0: C-RADIO tower (`vision_model.radio_model.*`) and the
+        // mlp1 projector (`mlp1.*`) — detector prefixes used by
+        // `is_taichu_vision_hfq` / the carrier's tower probe.
+        || name.starts_with("vision_model.")
+        || name.starts_with("mlp1.")
 }
 
 /// Full vision group: tower tensors plus the LFM2/Idefics-style

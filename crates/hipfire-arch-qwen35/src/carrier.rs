@@ -32,6 +32,12 @@ pub struct Qwen35Bundle {
     /// text checkpoints; the bundle's text path is unaffected.
     pub vision_config: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionConfig>,
     pub vision_weights: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionWeights>,
+    /// Optional ZDTaichu-5.0 C-RADIO vision tower — `Some` when the HFQ
+    /// carried `vision_model.radio_model.*` tensors (model_type
+    /// `zdtaichu5_0`). Distinct from the qwen35-vl SigLIP tower above;
+    /// mutually exclusive in practice.
+    pub taichu_vision_config: Option<hipfire_arch_taichu_vl::vision::TaichuVisionConfig>,
+    pub taichu_vision_weights: Option<hipfire_arch_taichu_vl::vision::TaichuVisionWeights>,
     /// Continuous-batch decode state for Qwen3.5 (single-GPU). `Some` when
     /// `HIPFIRE_CONTINUOUS_BATCH` staged a batch (arch 5/6, pp=1, non-EP).
     /// Freed via `Qwen35DecodeBatchState::free_gpu` in `ArchModel::free_gpu`
@@ -103,6 +109,8 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
         pp_scratch_set: None,
         vision_config: None,
         vision_weights: None,
+        taichu_vision_config: None,
+        taichu_vision_weights: None,
         qwen35_decode_batch: None,
     })
 }
@@ -465,6 +473,8 @@ pub fn free_qwen35_bundle(bundle: Qwen35Bundle, gpu: &mut rdna_compute::Gpu) -> 
         vision_config: _,
         vision_weights,
         qwen35_decode_batch,
+        taichu_vision_config: _,
+        taichu_vision_weights,
     } = bundle;
     debug_assert!(
         pp_scratch_set.is_none(),
@@ -484,6 +494,9 @@ pub fn free_qwen35_bundle(bundle: Qwen35Bundle, gpu: &mut rdna_compute::Gpu) -> 
     dn_state.free_gpu(gpu);
     if let Some(vw) = vision_weights {
         vw.free_gpu(gpu);
+    }
+    if let Some(tw) = taichu_vision_weights {
+        tw.free_gpu(gpu);
     }
     let vmm = note_vmm_after_free(gpu);
     match (first, vmm) {

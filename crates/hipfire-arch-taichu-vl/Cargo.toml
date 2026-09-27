@@ -1,0 +1,20 @@
+[package]
+name = "hipfire-arch-taichu-vl"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "ZDTaichu-5.0 vision-language architecture (C-RADIOv4-H tower + Qwen3.5 text) for hipfire"
+
+[features]
+# `deltanet` mirrors hipfire-arch-qwen35-vl: the tower + image path need
+# rdna-compute's deltanet-gated surface; `mrope` stays a pure helper.
+default = ["deltanet"]
+deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet"]
+
+[dependencies]
+hipfire-config = { path = "../hipfire-config" }
+hipfire-runtime = { path = "../hipfire-runtime" }
+hip-bridge = { path = "../hip-bridge" }
+rdna-compute = { path = "../rdna-compute" }
+serde_json.workspace = true
+image.workspace = true

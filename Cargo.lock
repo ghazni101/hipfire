@@ -1302,6 +1302,7 @@ version = "0.3.1"
 dependencies = [
  "hip-bridge",
  "hipfire-arch-qwen35-vl",
+ "hipfire-arch-taichu-vl",
  "hipfire-config",
  "hipfire-dispatch",
  "hipfire-reap",
@@ -1325,6 +1326,18 @@ dependencies = [
  "rdna-compute",
  "serde_json",
  "va-bridge",
+]
+
+[[package]]
+name = "hipfire-arch-taichu-vl"
+version = "0.3.1"
+dependencies = [
+ "hip-bridge",
+ "hipfire-config",
+ "hipfire-runtime",
+ "image",
+ "rdna-compute",
+ "serde_json",
 ]
 
 [[package]]
@@ -1400,6 +1413,7 @@ dependencies = [
  "hip-bridge",
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",
+ "hipfire-arch-taichu-vl",
  "hipfire-config",
  "hipfire-engine",
  "hipfire-generate",
@@ -1488,6 +1502,7 @@ dependencies = [
  "hipfire-arch-qwen2",
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",
+ "hipfire-arch-taichu-vl",
  "hipfire-config",
  "hipfire-dispatch",
  "hipfire-engine",
@@ -1519,6 +1534,7 @@ dependencies = [
  "hipfire-arch-qwen2",
  "hipfire-arch-qwen35",
  "hipfire-arch-qwen35-vl",
+ "hipfire-arch-taichu-vl",
  "hipfire-config",
  "hipfire-runtime",
  "rdna-compute",

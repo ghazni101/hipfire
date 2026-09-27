@@ -358,6 +358,8 @@ pub(crate) fn parse_layer_idx(name: &str) -> Option<usize> {
         || name.starts_with("model.vision_projection.")
         || name.starts_with("model.visual.")
         || name.starts_with("visual.")
+        || name.starts_with("vision_model.")
+        || name.starts_with("mlp1.")
     {
         return None;
     }
@@ -430,6 +432,8 @@ pub(crate) fn kmap_resolve_mode(
         || name.starts_with("model.vision_projection.")
         || name.starts_with("model.visual.")
         || name.starts_with("visual.")
+        || name.starts_with("vision_model.")
+        || name.starts_with("mlp1.")
     {
         return QuantLevel::F16;
     }

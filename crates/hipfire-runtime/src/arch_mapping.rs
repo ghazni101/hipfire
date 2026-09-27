@@ -43,6 +43,11 @@ pub const MODEL_TYPE_TO_ARCH_ID: &[(&str, u32)] = &[
     ("ornith-1.5", 5),
     ("ornith1.5", 5),
     ("ornith_1.5", 5),
+    // arch 5 — zdtaichu5_0 (ZDTaichu-5.0 VL: C-RADIO tower + qwen3.5-hybrid
+    // text). Shares the qwen3.5 dense loader; the vision tower is detected
+    // per-artifact (vision_model.radio_model.* tensors), not by arch_id.
+    ("zdtaichu", 5),
+    ("zdtaichu5_0", 5),
     // arch 6 — qwen3.5 MoE (explicit model_type strings; the safetensors path also
     // derives 6 from has_experts==true for the qwen3.5/3.6 family)
     ("qwen3_5_moe", 6),

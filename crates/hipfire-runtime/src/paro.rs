@@ -107,10 +107,16 @@ pub fn paro_text_prefix(source: &dyn ModelSource) -> HipResult<&'static str> {
         .is_some()
     {
         Ok("model.language_model")
+    // ZDTaichu-5.0 nests as `language_model.model.*`.
+    } else if source
+        .tensor_info("language_model.model.embed_tokens.weight")
+        .is_some()
+    {
+        Ok("language_model.model")
     } else if source.tensor_info("model.embed_tokens.weight").is_some() {
         Ok("model")
     } else {
-        Err(HipError::new(0, "ParoQuant: embed_tokens.weight not found under either model.language_model. or model. layout"))
+        Err(HipError::new(0, "ParoQuant: embed_tokens.weight not found under either model.language_model., language_model.model., or model. layout"))
     }
 }
 

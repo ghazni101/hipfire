@@ -6561,6 +6561,14 @@ pub const LAYERNORM_SRC: &str = include_str!("../../../kernels/src/layernorm.hip
 /// GELU activation (tanh approximation, matches gelu_pytorch_tanh).
 pub const GELU_TANH_SRC: &str = include_str!("../../../kernels/src/gelu_tanh.hip");
 
+/// Exact GELU (erf form, PyTorch default `nn.GELU`). timm ViT towers
+/// (C-RADIO v4-h in ZDTaichu-5.0) use this, not the tanh approximation.
+pub const GELU_ERF_SRC: &str = include_str!("../../../kernels/src/gelu_erf_f32.hip");
+
+/// Squared ReLU (relu(x)²). ZDTaichu-5.0's vision projector MLP activation.
+pub const SQUARED_RELU_SRC: &str =
+    include_str!("../../../kernels/src/squared_relu_f32.hip");
+
 /// Gemma 4 E-series batched PLE activation with a strided per-layer input.
 pub const GEMMA4_PLE_ACTIVATION_SRC: &str =
     include_str!("../../../kernels/src/gemma4_ple_activation.hip");

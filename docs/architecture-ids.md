@@ -22,7 +22,7 @@ remain fail-closed for every route outside that exact row; source-derived routin
 |---:|---|---|---|---|
 | 0 | LLaMA / Mistral | `hipfire-arch-llama` | `LlamaCarrier` | Dense FA. Trait marker `Llama::arch_id() == 0`. |
 | 1 | plain Qwen3 | `hipfire-arch-llama` | `LlamaCarrier` | Same crate; `config_from_hfq` branches on metadata. Dir `model_type`/`architectures` qwen3 → 1. |
-| 5 | Qwen3.5 / 3.6 / 3.8 dense | `hipfire-arch-qwen35` | `Qwen35Carrier` | Hybrid DeltaNet + dense FFN. Trait marker returns 5. Optional VL via `hipfire-arch-qwen35-vl` under the same ids. |
+| 5 | Qwen3.5 / 3.6 / 3.8 dense + ZDTaichu-5.0 VL | `hipfire-arch-qwen35` | `Qwen35Carrier` | Hybrid DeltaNet + dense FFN. Trait marker returns 5. Optional VL via `hipfire-arch-qwen35-vl` under the same ids. ZDTaichu-5.0 (dir `zdtaichu5_0` → 5) shares the qwen3.5 text loader; its C-RADIO v4-h tower + mlp1 projector live in `hipfire-arch-taichu-vl`, detected per-artifact via `vision_model.radio_model.*` tensors. |
 | 6 | Qwen3.5 / 3.6 / 3.8 MoE (A3B) | `hipfire-arch-qwen35` | `Qwen35Carrier` | MoE expert routing; same crate as 5. |
 | 7 | Qwen2 dense | `hipfire-arch-qwen2` | `Qwen2Carrier` | Standalone path so Q/K/V `attention_bias` loads (llama dir path would drop them). Dir `qwen2` → 7. |
 | 8 | dots.ocr (Qwen2-VL family) | `hipfire-arch-dots-ocr` | `DotsOcrCarrier` | Vision tower + Qwen2 text decoder fields on `LoadedModel`. |
@@ -86,7 +86,7 @@ sidecars next to the trunk file; no carrier claims a sidecar id on its own.
 | Namespace | Origin | Examples |
 |---|---|---|
 | HFQ header | `HfqFile::arch_id` written at quantize/pack time | Primary table above; sidecars 20/21 |
-| Safetensors dir | `derive_arch_id(&config)` | `llama`/`mistral`→0, `qwen3`→1, `qwen3.5`/`qwen3.6` (+experts→6 else 5), `qwen2`→7, `dots_ocr`→8, `deepseek_v4`→9, `minimax_m2`→10, `lfm2`/`lfm2_moe`/`lfm2_vl`→11 (runtime `arch_mapping.rs` MODEL_TYPE_TO_ARCH_ID also carries `lfm2_vl`), `cohere2_moe`→12 |
+| Safetensors dir | `derive_arch_id(&config)` | `llama`/`mistral`→0, `qwen3`→1, `qwen3.5`/`qwen3.6` (+experts→6 else 5), `qwen2`→7, `dots_ocr`→8, `deepseek_v4`→9, `minimax_m2`→10, `lfm2`/`lfm2_moe`/`lfm2_vl`→11 (runtime `arch_mapping.rs` MODEL_TYPE_TO_ARCH_ID also carries `lfm2_vl`), `cohere2_moe`→12, `zdtaichu`/`zdtaichu5_0`→5 (via `MODEL_TYPE_TO_ARCH_ID`; the C-RADIO tower is detected per-artifact, not by arch_id) |
 
 `Carrier::claims_arch_id(arch_id, is_dir)` may distinguish the two namespaces.
 Today’s carriers are disjoint on bare id for the ids they claim; registry unit

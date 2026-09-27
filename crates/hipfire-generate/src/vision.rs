@@ -14,6 +14,7 @@ use hipfire_arch_qwen35::qwen35;
 use hipfire_arch_qwen35::speculative;
 use hipfire_arch_qwen35_vl::image;
 use hipfire_arch_qwen35_vl::qwen35_vl;
+use hipfire_arch_taichu_vl::{image as taichu_image, mrope as taichu_mrope, vision as taichu_vision};
 use hipfire_engine::emit::{emit_reasoning_token, emit_visible_token};
 use hipfire_engine::scheduler::block_attractor_unclosed_cpu;
 use hipfire_engine::terminal::{
@@ -599,6 +600,80 @@ pub(crate) fn build_vl_mrope_ctx(
         built.rope_delta,
     ))
 }
+/// Taichu twin of [`build_vl_mrope_ctx`]: InternVL-style per-tile mrope.
+/// `tile_side` is `TaichuVisionConfig::tile_tokens_per_side`; `tile_rows`/
+/// `tile_cols` count GRID tiles only (thumbnail excluded).
+pub(crate) fn build_taichu_mrope_ctx(
+    prompt_ids: &[u32],
+    image_pad_id: u32,
+    n_visual: usize,
+    tile_rows: usize,
+    tile_cols: usize,
+    has_thumbnail: bool,
+    tile_side: usize,
+    base: usize,
+    config: &qwen35::Qwen35Config,
+) -> Option<qwen35::MropeCtx> {
+    if n_visual == 0 || tile_side == 0 {
+        return None;
+    }
+    let bail = |why: &str| -> Option<qwen35::MropeCtx> {
+        eprintln!("[daemon/vl] taichu mrope disabled ({why}) — falling back to 1D positions");
+        None
+    };
+    if base > 0 {
+        return bail("base > 0: cross-turn mrope cursor continuity not modelled");
+    }
+    let Some(start) = prompt_ids.iter().position(|&t| t == image_pad_id) else {
+        return bail("no <|image_pad|> in the prompt despite n_visual > 0");
+    };
+    if start + n_visual > prompt_ids.len() {
+        return bail("image span runs past the prompt");
+    }
+    if !prompt_ids[start..start + n_visual]
+        .iter()
+        .all(|&t| t == image_pad_id)
+    {
+        return bail("image-pad run is not contiguous");
+    }
+    if prompt_ids[start + n_visual..].contains(&image_pad_id) {
+        return bail("more than one image-pad run (multi-image not wired)");
+    }
+
+    let spans = [taichu_mrope::TaichuImageSpan {
+        start,
+        len: n_visual,
+        tile_rows,
+        tile_cols,
+        has_thumbnail,
+    }];
+    let built = taichu_mrope::build_taichu_mrope_positions(prompt_ids.len(), &spans, tile_side);
+    if built.positions.len() != prompt_ids.len() {
+        return bail(&format!(
+            "build_taichu_mrope_positions returned {} positions for {} tokens",
+            built.positions.len(),
+            prompt_ids.len()
+        ));
+    }
+
+    let base_i = base as i32;
+    let positions: Vec<[i32; 3]> = built
+        .positions
+        .iter()
+        .map(|p| [p[0] + base_i, p[1] + base_i, p[2] + base_i])
+        .collect();
+    eprintln!(
+        "[daemon/vl] taichu mrope: span start={start} len={n_visual} grid={tile_rows}x{tile_cols} \
+         thumb={has_thumbnail} side={tile_side} base={base} rope_delta={} section={:?}",
+        built.rope_delta, config.mrope_section
+    );
+    Some(qwen35::MropeCtx::new(
+        config,
+        base,
+        positions,
+        built.rope_delta,
+    ))
+}
 /// Strip an optional `data:...;base64,` prefix and base64-decode image bytes.
 /// Shared by the VCN pre-pass and the CPU fallback below so both see the
 /// same bytes (and the same errors).
@@ -685,7 +760,26 @@ pub fn generate_vl(
         }
     }
     let tokenizer = m.tokenizer.as_ref().unwrap();
-    let vision_config = m.vision_config().unwrap().clone();
+    // Two arch-5 vision towers share this generate body: the qwen35-vl SigLIP
+    // tower (`vision_config`) and the ZDTaichu-5.0 C-RADIO tower
+    // (`taichu_vision_config`). Mutually exclusive per pack.
+    enum VlTower {
+        Qwen,
+        Taichu,
+    }
+    let vl_tower = if m.taichu_vision_config().is_some() {
+        VlTower::Taichu
+    } else {
+        VlTower::Qwen
+    };
+    let vision_config = match vl_tower {
+        VlTower::Qwen => Some(m.vision_config().unwrap().clone()),
+        VlTower::Taichu => None,
+    };
+    let taichu_config = match vl_tower {
+        VlTower::Taichu => Some(m.taichu_vision_config().unwrap().clone()),
+        VlTower::Qwen => None,
+    };
 
     // Vision special-token IDs resolved from the tokenizer rather than
     // hardcoded constants. Different VL-capable Qwen variants ship with
@@ -720,18 +814,18 @@ pub fn generate_vl(
     // terminal sync, never across generation.
     #[cfg(feature = "vcn-jpeg")]
     let vcn_prepass: Option<(image::VcnDecoded<'static>, Vec<u8>)> = (|| {
-        if image::resolve_image_decode() == image::ImageDecode::Cpu {
+        // VCN decode path exists only for the qwen35-vl SigLIP tower.
+        if !matches!(vl_tower, VlTower::Qwen)
+            || image::resolve_image_decode() == image::ImageDecode::Cpu
+        {
             return None;
         }
+        let vc = vision_config.as_ref()?;
         let bytes = match image_source {
             ImageSource::Path(path) => std::fs::read(path).ok()?,
             ImageSource::Base64(b64) => decode_image_bytes(b64).ok()?,
         };
-        image::vcn_decode(
-            &bytes,
-            vision_config.patch_size,
-            vision_config.spatial_merge_size,
-        )
+        image::vcn_decode(&bytes, vc.patch_size, vc.spatial_merge_size)
         .map(|d| (d, bytes))
     })();
     #[cfg(feature = "vcn-jpeg")]
@@ -744,56 +838,124 @@ pub fn generate_vl(
     // before the capacity check — we need img_h/img_w to estimate visual
     // tokens, and rejecting an over-budget request before vision_forward
     // saves expensive GPU work.
-    let (pixels, img_h, img_w) = match vcn_dims {
-        Some((h, w)) => (Vec::new(), h, w),
-        None => match image_source {
-            ImageSource::Path(path) => {
-                eprintln!("[VL-DEBUG] preprocessing image: path: {}", path);
-                match image::load_and_preprocess(
-                    Path::new(path),
-                    vision_config.patch_size,
-                    vision_config.spatial_merge_size,
-                ) {
-                    Ok(result) => result,
-                    Err(e) => {
-                        write_error(stdout, id, &e);
-                        return;
-                    }
-                }
-            }
-            ImageSource::Base64(b64) => {
-                let bytes = match decode_image_bytes(b64) {
-                    Ok(b) => b,
-                    Err(e) => {
-                        write_error(stdout, id, &e);
-                        return;
-                    }
-                };
-                eprintln!(
-                    "[VL-DEBUG] preprocessing image: <{}-byte buffer>",
-                    bytes.len()
-                );
-                match image::load_and_preprocess_from_bytes(
-                    &bytes,
-                    vision_config.patch_size,
-                    vision_config.spatial_merge_size,
-                ) {
-                    Ok(result) => result,
-                    Err(e) => {
-                        write_error(stdout, id, &e);
-                        return;
-                    }
-                }
-            }
+    // Per-tower preprocess. Qwen: smart-resize to a single merged image →
+    // (pixels, img_h, img_w). Taichu: InternVL dynamic tiling → TiledImage
+    // (patch rows + grid shape + pad-token count).
+    enum VlPrepped {
+        Qwen {
+            pixels: Vec<f32>,
+            img_h: usize,
+            img_w: usize,
         },
+        Taichu {
+            tiled: taichu_image::TiledImage,
+        },
+    }
+    let prepped = match vl_tower {
+        VlTower::Qwen => {
+            let vc = vision_config.as_ref().unwrap();
+            let (pixels, img_h, img_w) = match vcn_dims {
+                Some((h, w)) => (Vec::new(), h, w),
+                None => match image_source {
+                    ImageSource::Path(path) => {
+                        eprintln!("[VL-DEBUG] preprocessing image: path: {}", path);
+                        match image::load_and_preprocess(
+                            Path::new(path),
+                            vc.patch_size,
+                            vc.spatial_merge_size,
+                        ) {
+                            Ok(result) => result,
+                            Err(e) => {
+                                write_error(stdout, id, &e);
+                                return;
+                            }
+                        }
+                    }
+                    ImageSource::Base64(b64) => {
+                        let bytes = match decode_image_bytes(b64) {
+                            Ok(b) => b,
+                            Err(e) => {
+                                write_error(stdout, id, &e);
+                                return;
+                            }
+                        };
+                        eprintln!(
+                            "[VL-DEBUG] preprocessing image: <{}-byte buffer>",
+                            bytes.len()
+                        );
+                        match image::load_and_preprocess_from_bytes(
+                            &bytes,
+                            vc.patch_size,
+                            vc.spatial_merge_size,
+                        ) {
+                            Ok(result) => result,
+                            Err(e) => {
+                                write_error(stdout, id, &e);
+                                return;
+                            }
+                        }
+                    }
+                },
+            };
+            eprintln!("[VL-DEBUG] preprocessed: {}x{}", img_w, img_h);
+            VlPrepped::Qwen { pixels, img_h, img_w }
+        }
+        VlTower::Taichu => {
+            let tc = taichu_config.as_ref().unwrap();
+            let tiled = match image_source {
+                ImageSource::Path(path) => {
+                    eprintln!("[VL-DEBUG] taichu tiling image: path: {}", path);
+                    match taichu_image::decode_and_tile(Path::new(path), tc) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            write_error(stdout, id, &e);
+                            return;
+                        }
+                    }
+                }
+                ImageSource::Base64(b64) => {
+                    let bytes = match decode_image_bytes(b64) {
+                        Ok(b) => b,
+                        Err(e) => {
+                            write_error(stdout, id, &e);
+                            return;
+                        }
+                    };
+                    eprintln!(
+                        "[VL-DEBUG] taichu tiling image: <{}-byte buffer>",
+                        bytes.len()
+                    );
+                    match taichu_image::decode_and_tile_bytes(&bytes, tc) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            write_error(stdout, id, &e);
+                            return;
+                        }
+                    }
+                }
+            };
+            eprintln!(
+                "[VL-DEBUG] taichu tiled: {} tiles ({}x{} grid) → {} visual tokens",
+                tiled.n_tiles, tiled.tile_rows, tiled.tile_cols, tiled.n_visual_tokens
+            );
+            VlPrepped::Taichu { tiled }
+        }
     };
-    eprintln!("[VL-DEBUG] preprocessed: {}x{}", img_w, img_h);
-
-    let grid_h = img_h / vision_config.patch_size;
-    let grid_w = img_w / vision_config.patch_size;
-    let n_patches = grid_h * grid_w;
-    let n_visual_tokens =
-        n_patches / (vision_config.spatial_merge_size * vision_config.spatial_merge_size);
+    let (n_visual_tokens, qwen_grid, pixels) = match &prepped {
+        VlPrepped::Qwen { pixels, img_h, img_w } => {
+            let vc = vision_config.as_ref().unwrap();
+            let grid_h = img_h / vc.patch_size;
+            let grid_w = img_w / vc.patch_size;
+            let n_patches = grid_h * grid_w;
+            (
+                n_patches / (vc.spatial_merge_size * vc.spatial_merge_size),
+                Some((grid_h, grid_w)),
+                pixels.as_slice(),
+            )
+        }
+        VlPrepped::Taichu { tiled } => (tiled.n_visual_tokens, None, &[][..]),
+    };
+    let pixels: Vec<f32> = pixels.to_vec();
 
     // Capacity estimate including system prompt — a long system prompt
     // on first turn would otherwise let an over-budget request through
@@ -892,7 +1054,16 @@ pub fn generate_vl(
     let scratch = &b.scratch;
     let kv = &mut b.kv_cache;
     let dn = &mut b.dn_state;
-    let vision_weights = b.vision_weights.as_ref().unwrap();
+    // Disjoint field borrows: `vision_weights`/`taichu_vision_weights` are
+    // read-only tower refs while `kv`/`dn` are mutable decode state.
+    let vision_weights = match vl_tower {
+        VlTower::Qwen => Some(b.vision_weights.as_ref().unwrap()),
+        VlTower::Taichu => None,
+    };
+    let taichu_weights = match vl_tower {
+        VlTower::Taichu => Some(b.taichu_vision_weights.as_ref().unwrap()),
+        VlTower::Qwen => None,
+    };
 
     // Build the actual prompt token sequence BEFORE running the GPU vision
     // encoder so the hard capacity check uses the real prefill length, not
@@ -962,25 +1133,78 @@ pub fn generate_vl(
         }
         None
     } else {
-        build_vl_mrope_ctx(
-            &prompt_tokens,
-            image_pad_id,
-            n_visual_tokens,
-            grid_h,
-            grid_w,
-            vision_config.spatial_merge_size,
-            m.seq_pos,
-            config,
-        )
+        match &prepped {
+            VlPrepped::Qwen { .. } => {
+                let vc = vision_config.as_ref().unwrap();
+                let (grid_h, grid_w) = qwen_grid.unwrap();
+                build_vl_mrope_ctx(
+                    &prompt_tokens,
+                    image_pad_id,
+                    n_visual_tokens,
+                    grid_h,
+                    grid_w,
+                    vc.spatial_merge_size,
+                    m.seq_pos,
+                    config,
+                )
+            }
+            VlPrepped::Taichu { tiled } => {
+                let tc = taichu_config.as_ref().unwrap();
+                build_taichu_mrope_ctx(
+                    &prompt_tokens,
+                    image_pad_id,
+                    n_visual_tokens,
+                    tiled.tile_rows,
+                    tiled.tile_cols,
+                    tc.use_thumbnail && tiled.n_tiles > tiled.tile_rows * tiled.tile_cols,
+                    tc.tile_tokens_per_side,
+                    m.seq_pos,
+                    config,
+                )
+            }
+        }
     };
     let mrope = mrope_ctx.as_ref();
 
-    // Now safe to run the expensive GPU vision encoder. VCN images arrive
-    // as a pooled decode: kernels build device patches (no CPU pixels, no
-    // upload) and the tower runs on the resident tensor; everything else
-    // takes today's extract + upload path.
-    #[cfg(feature = "vcn-jpeg")]
-    let visual_tokens = match vcn_prepass {
+       // Tower encode → shared [n_visual, dim] host rows for the pad splice.
+    // The VCN feature gates only the Qwen arm's patch-build path; Taichu has
+    // no VCN route (InternVL tiling is CPU-side by design).
+    let visual_tokens: Vec<f32> = match (&vl_tower, &prepped) {
+        (VlTower::Taichu, VlPrepped::Taichu { tiled }) => {
+            match taichu_vision::taichu_vision_forward(
+                gpu,
+                taichu_weights.unwrap(),
+                taichu_config.as_ref().unwrap(),
+                &tiled.patches,
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    vl_forward_fail(
+                        stdout,
+                        id,
+                        "taichu_vision_forward",
+                        e,
+                        gpu,
+                        dn,
+                        kv,
+                        &mut m.kv_adaptive,
+                        &mut m.seq_pos,
+                        &mut m.conversation_tokens,
+                        &mut m.prefill_checkpoints,
+                    );
+                    return;
+                }
+            }
+        }
+        (VlTower::Qwen, VlPrepped::Qwen { img_h, img_w, .. }) => {
+            let vc = vision_config.as_ref().unwrap();
+            let vision_weights = vision_weights.unwrap();
+            let (img_h, img_w) = (*img_h, *img_w);
+            let (grid_h, grid_w) = qwen_grid.unwrap();
+            let pixels = &pixels[..];
+            #[cfg(feature = "vcn-jpeg")]
+            {
+                match vcn_prepass {
         Some((d, bytes)) => {
             // By value: `vcn_to_patches` consumes the session lease after
             // its terminal sync, so the surface is reusable (and the mutex
@@ -990,9 +1214,9 @@ pub fn generate_vl(
             let vcn_patches = match image::vcn_to_patches(
                 gpu,
                 d,
-                vision_config.patch_size,
-                vision_config.temporal_patch_size,
-                vision_config.spatial_merge_size,
+                vc.patch_size,
+                vc.temporal_patch_size,
+                vc.spatial_merge_size,
             ) {
                 Ok(vp) => Some(vp),
                 Err(e) if e.fallback_safe() => {
@@ -1033,7 +1257,7 @@ pub fn generate_vl(
                     match qwen35_vl::vision_forward_patches(
                         gpu,
                         vision_weights,
-                        &vision_config,
+                        vc,
                         vp.patches,
                         vp.grid_h,
                         vp.grid_w,
@@ -1060,8 +1284,8 @@ pub fn generate_vl(
                 None => {
                     let (pixels, fb_h, fb_w) = match image::load_and_preprocess_from_bytes(
                         &bytes,
-                        vision_config.patch_size,
-                        vision_config.spatial_merge_size,
+                        vc.patch_size,
+                        vc.spatial_merge_size,
                     ) {
                         Ok(result) => result,
                         Err(e) => {
@@ -1088,14 +1312,14 @@ pub fn generate_vl(
                         3,
                         img_h,
                         img_w,
-                        vision_config.patch_size,
-                        vision_config.temporal_patch_size,
-                        vision_config.spatial_merge_size,
+                        vc.patch_size,
+                        vc.temporal_patch_size,
+                        vc.spatial_merge_size,
                     );
                     match qwen35_vl::vision_forward(
                         gpu,
                         vision_weights,
-                        &vision_config,
+                        vc,
                         &patches,
                         grid_h,
                         grid_w,
@@ -1123,18 +1347,18 @@ pub fn generate_vl(
         }
         None => {
             let patches = hipfire_arch_qwen35_vl::image::extract_patches(
-                &pixels,
+                pixels,
                 3,
                 img_h,
                 img_w,
-                vision_config.patch_size,
-                vision_config.temporal_patch_size,
-                vision_config.spatial_merge_size,
+                vc.patch_size,
+                vc.temporal_patch_size,
+                vc.spatial_merge_size,
             );
             match qwen35_vl::vision_forward(
                 gpu,
                 vision_weights,
-                &vision_config,
+                vc,
                 &patches,
                 grid_h,
                 grid_w,
@@ -1158,61 +1382,65 @@ pub fn generate_vl(
                 }
             }
         }
-    };
-    #[cfg(not(feature = "vcn-jpeg"))]
-    let visual_tokens = {
-        // `image.decode = vcn|auto` requests the VCN path, but this binary
-        // was built without the `vcn-jpeg` cargo feature (the standard
-        // daemon build carries it; custom builds may not). CPU decode is
-        // correct — warn once so the operator intent never silently no-ops.
-        static VCN_FEATURE_WARNED: std::sync::Once = std::sync::Once::new();
-        if hipfire_arch_qwen35_vl::image::resolve_image_decode()
-            != hipfire_arch_qwen35_vl::image::ImageDecode::Cpu
-        {
-            VCN_FEATURE_WARNED.call_once(|| {
-                eprintln!(
-                    "[daemon/vl] image.decode requests VCN but this binary lacks the `vcn-jpeg` feature — CPU fallback"
+    }
+            }
+            #[cfg(not(feature = "vcn-jpeg"))]
+            {
+                // `image.decode = vcn|auto` requests the VCN path, but this binary
+                // was built without the `vcn-jpeg` cargo feature (the standard
+                // daemon build carries it; custom builds may not). CPU decode is
+                // correct — warn once so the operator intent never silently no-ops.
+                static VCN_FEATURE_WARNED: std::sync::Once = std::sync::Once::new();
+                if hipfire_arch_qwen35_vl::image::resolve_image_decode()
+                    != hipfire_arch_qwen35_vl::image::ImageDecode::Cpu
+                {
+                    VCN_FEATURE_WARNED.call_once(|| {
+                        eprintln!(
+                            "[daemon/vl] image.decode requests VCN but this binary lacks the `vcn-jpeg` feature — CPU fallback"
+                        );
+                    });
+                }
+                let patches = hipfire_arch_qwen35_vl::image::extract_patches(
+                    pixels,
+                    3,
+                    img_h,
+                    img_w,
+                    vc.patch_size,
+                    vc.temporal_patch_size,
+                    vc.spatial_merge_size,
                 );
-            });
-        }
-        let patches = hipfire_arch_qwen35_vl::image::extract_patches(
-            &pixels,
-            3,
-            img_h,
-            img_w,
-            vision_config.patch_size,
-            vision_config.temporal_patch_size,
-            vision_config.spatial_merge_size,
-        );
-        match qwen35_vl::vision_forward(
-            gpu,
-            vision_weights,
-            &vision_config,
-            &patches,
-            grid_h,
-            grid_w,
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                vl_forward_fail(
-                    stdout,
-                    id,
-                    "vision_forward",
-                    e,
+                match qwen35_vl::vision_forward(
                     gpu,
-                    dn,
-                    kv,
-                    &mut m.kv_adaptive,
-                    &mut m.seq_pos,
-                    &mut m.conversation_tokens,
-                    &mut m.prefill_checkpoints,
-                );
-                return;
+                    vision_weights,
+                    vc,
+                    &patches,
+                    grid_h,
+                    grid_w,
+                ) {
+                    Ok(v) => v,
+                    Err(e) => {
+                        vl_forward_fail(
+                            stdout,
+                            id,
+                            "vision_forward",
+                            e,
+                            gpu,
+                            dn,
+                            kv,
+                            &mut m.kv_adaptive,
+                            &mut m.seq_pos,
+                            &mut m.conversation_tokens,
+                            &mut m.prefill_checkpoints,
+                        );
+                        return;
+                    }
+                }
             }
         }
+        _ => unreachable!("tower/prepped variant mismatch"),
     };
 
-    let im_end_token = if im_end.len() == 1 {
+ let im_end_token = if im_end.len() == 1 {
         Some(im_end[0])
     } else {
         None
@@ -1463,6 +1691,9 @@ pub fn generate_vl(
         min_p: None,
     };
     let mut next_token = sampler::sample_cpu(&mut logits, &[], &vl_cfg_first);
+    if std::env::var("HIPFIRE_DEBUG_TOKENS").is_ok() {
+        eprintln!("[dbg] tok0 = {next_token} {:?}", tokenizer.decode(&[next_token]));
+    }
     let t_prefill = Instant::now();
     let mut generated = 0;
     let mut streamed_tokens: Vec<u32> = Vec::new();
@@ -1667,6 +1898,9 @@ pub fn generate_vl(
         }
 
         next_token = sampler::sample_cpu(&mut logits, vl_ngram_scope, &vl_cfg);
+        if std::env::var("HIPFIRE_DEBUG_TOKENS").is_ok() && generated < 24 {
+            eprintln!("[dbg] tok[{generated}] = {next_token} {:?}", tokenizer.decode(&[next_token]));
+        }
 
         if max_think_tokens > 0 {
             if let Some((open, close)) = think_pair {

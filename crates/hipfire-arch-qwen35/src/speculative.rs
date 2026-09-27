@@ -777,6 +777,10 @@ pub struct ModelSlot {
     /// tower while the bundle is out of `ModelState`.
     pub vision_config: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionConfig>,
     pub vision_weights: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionWeights>,
+    /// ZDTaichu-5.0 C-RADIO tower — parked alongside `vision_*` for the same
+    /// round-trip reason (the slot never drives it).
+    pub taichu_vision_config: Option<hipfire_arch_taichu_vl::vision::TaichuVisionConfig>,
+    pub taichu_vision_weights: Option<hipfire_arch_taichu_vl::vision::TaichuVisionWeights>,
 }
 
 impl ModelSlot {
@@ -806,6 +810,8 @@ impl ModelSlot {
             pp_scratch_set,
             vision_config,
             vision_weights,
+            taichu_vision_config,
+            taichu_vision_weights,
             qwen35_decode_batch,
         } = bundle;
         debug_assert!(
@@ -830,6 +836,8 @@ impl ModelSlot {
             dspark_extract_layers: Vec::new(),
             vision_config,
             vision_weights,
+            taichu_vision_config,
+            taichu_vision_weights,
         })
     }
 
@@ -849,6 +857,8 @@ impl ModelSlot {
             pp_scratch_set: None,
             vision_config: self.vision_config,
             vision_weights: self.vision_weights,
+            taichu_vision_config: self.taichu_vision_config,
+            taichu_vision_weights: self.taichu_vision_weights,
             qwen35_decode_batch: None,
         }
     }
@@ -966,6 +976,8 @@ impl ModelSlot {
             dspark_extract_layers: Vec::new(),
             vision_config: None,
             vision_weights: None,
+            taichu_vision_config: None,
+            taichu_vision_weights: None,
         })
     }
 

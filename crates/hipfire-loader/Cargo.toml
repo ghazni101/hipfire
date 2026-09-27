@@ -13,7 +13,7 @@ default = [
     "arch-deepseek4",
 ]
 arch-qwen35 = ["dep:hipfire-arch-qwen35"]
-arch-qwen35-vl = ["dep:hipfire-arch-qwen35-vl"]
+arch-qwen35-vl = ["dep:hipfire-arch-qwen35-vl", "dep:hipfire-arch-taichu-vl"]
 arch-llama = ["dep:hipfire-arch-llama"]
 arch-qwen2 = ["dep:hipfire-arch-qwen2"]
 arch-deepseek4 = ["dep:hipfire-arch-deepseek4"]
@@ -30,6 +30,7 @@ saddle-core = { path = "../saddle-core" }
 # Optional arch crate deps — feature-gated.
 hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35", optional = true }
 hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl", optional = true }
+hipfire-arch-taichu-vl = { path = "../hipfire-arch-taichu-vl", optional = true }
 hipfire-arch-llama = { path = "../hipfire-arch-llama", optional = true }
 hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2", optional = true }
 hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4", optional = true }

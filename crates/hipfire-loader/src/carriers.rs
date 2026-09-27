@@ -369,6 +369,8 @@ fn load_qwen35_pp(
         pp_scratch_set: Some(scratch_set),
         vision_config: None,
         vision_weights: None,
+        taichu_vision_config: None,
+        taichu_vision_weights: None,
         qwen35_decode_batch: None,
     };
     Ok(LoadedModel {
@@ -647,6 +649,36 @@ impl Carrier for Qwen35Carrier {
                     }
                 };
 
+                // ZDTaichu-5.0 C-RADIO tower: detected per-artifact via
+                // `vision_model.radio_model.*` tensors (arch_id stays 5 —
+                // the text path is the same qwen3.5 loader). Mutually
+                // exclusive with the SigLIP sidecar path above.
+                let (taichu_vision_config, taichu_vision_weights) =
+                    if hipfire_arch_taichu_vl::vision::is_taichu_vision_hfq(&hfq_file) {
+                        let tc = hipfire_arch_taichu_vl::vision::taichu_vision_config_from_hfq(
+                            &hfq_file,
+                        );
+                        match tc {
+                            Some(tc) => {
+                                let tw = hipfire_arch_taichu_vl::vision::load_taichu_vision_weights(
+                                    &mut hfq_file,
+                                    &tc,
+                                    ctx.gpu,
+                                )
+                                .map_err(|e| eprintln!("  taichu vision weight load failed: {e}"))
+                                .ok();
+                                eprintln!(
+                                    "  ZDTaichu VL model: C-RADIO vision encoder (hidden={}, layers={}, tile={})",
+                                    tc.hidden_size, tc.num_layers, tc.image_size
+                                );
+                                (Some(tc), tw)
+                            }
+                            _ => (None, None),
+                        }
+                    } else {
+                        (None, None)
+                    };
+
                 // Trunk bundle after optional VL upload. On bundle failure, reclaim
                 // any vision weights already on-device (HFQ is single-pass: VL must
                 // load from the same file before the carrier consumes it).
@@ -658,6 +690,9 @@ impl Carrier for Qwen35Carrier {
                     Err(e) => {
                         if let Some(vw) = vision_weights {
                             vw.free_gpu(ctx.gpu);
+                        }
+                        if let Some(tw) = taichu_vision_weights {
+                            tw.free_gpu(ctx.gpu);
                         }
                         return Err(e);
                     }
@@ -671,9 +706,20 @@ impl Carrier for Qwen35Carrier {
                     ctx,
                     vision_config,
                     vision_weights,
+                    taichu_vision_config,
+                    taichu_vision_weights,
                 )
             }
             ModelSource::Dir(source) => {
+                if source
+                    .tensor_info("vision_model.radio_model.model.patch_generator.embedder.weight")
+                    .is_some()
+                {
+                    eprintln!(
+                        "  warning: ZDTaichu vision tower present in safetensors dir but Dir sources \
+                         load text only — quantize to .hfq (hipfire-quantize) to enable vision"
+                    );
+                }
                 let config = hipfire_arch_qwen35::qwen35::config_from_safetensors(&source)
                     .map_err(|e| format!("failed to parse Qwen3.5 config from config.json: {e}"))?;
                 if ctx.draft_path.is_some() {
@@ -787,6 +833,8 @@ impl Carrier for Qwen35Carrier {
                     pp_scratch_set: None,
                     vision_config: None,
                     vision_weights: None,
+                    taichu_vision_config: None,
+                    taichu_vision_weights: None,
                     qwen35_decode_batch: None,
                 };
                 Ok(LoadedModel {

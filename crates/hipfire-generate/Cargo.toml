@@ -35,6 +35,7 @@ hipfire-engine = { path = "../hipfire-engine" }
 hipfire-pflash = { path = "../hipfire-pflash" }
 hipfire-arch-qwen35 = { path = "../hipfire-arch-qwen35" }
 hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
+hipfire-arch-taichu-vl = { path = "../hipfire-arch-taichu-vl" }
 hipfire-arch-llama = { path = "../hipfire-arch-llama" }
 hipfire-arch-qwen2 = { path = "../hipfire-arch-qwen2" }
 hipfire-arch-deepseek4 = { path = "../hipfire-arch-deepseek4" }

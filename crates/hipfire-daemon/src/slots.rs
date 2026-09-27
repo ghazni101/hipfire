@@ -233,6 +233,9 @@ pub struct SlotBackend {
     layers: usize,
     vocab: usize,
     is_vl: bool,
+    /// ZDTaichu C-RADIO pack — image requests are refused at the
+    /// generate gate (multi-slot VL is qwen35-vl-only).
+    taichu_vision: bool,
     vision_config: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionConfig>,
     /// Per-slot context cap handed to the engine at load. Admission-side
     /// only (the engine re-enforces it per token); kept here so an
@@ -389,6 +392,7 @@ impl SlotBackend {
         let vocab = preflight.vocab;
         let tokenizer = preflight.tokenizer;
         let is_vl = preflight.is_vl;
+        let taichu_vision = preflight.taichu_vision;
         let vision_config = preflight.vision_config;
         // Read prefix cache config (spec §4.5–4.6). Keys are registered in
         // hipfire-config as serve.prefix_cache / serve.prefix_cache_max_bytes
@@ -503,6 +507,7 @@ impl SlotBackend {
             active: AtomicUsize::new(0),
             tool_grammar,
             pending_tools: Mutex::new(PendingToolBroker::default()),
+            taichu_vision,
         })
     }
 
@@ -979,7 +984,11 @@ impl SlotBackend {
             hipfire_engine::emit::emit_active_attempt_error(
                 stdout,
                 Some(id),
-                "model has no vision encoder",
+                if self.taichu_vision {
+                    "ZDTaichu vision input is not supported in experimental multi-slot — use the sequential daemon path"
+                } else {
+                    "model has no vision encoder"
+                },
                 "validation",
                 false,
                 false,
@@ -1613,6 +1622,10 @@ struct Preflight {
     tokenizer: Tokenizer,
     chat_template: Option<String>,
     is_vl: bool,
+    /// C-RADIO tower present (ZDTaichu pack): the multi-slot VL path is
+    /// qwen35-vl-only, so image requests are refused with a message naming
+    /// the sequential daemon rather than "no vision encoder".
+    taichu_vision: bool,
     vision_config: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionConfig>,
     /// Discovered .vl sidecar path. When set, the slot engine loads vision
     /// weights from this file instead of the trunk HFQ.
@@ -1633,6 +1646,8 @@ fn cpu_preflight(model_path: &str) -> Result<Preflight, String> {
     // tensors. If no .vl file exists, fall back to inline (backward compat).
     let vl_path = discover_vl_sidecar(model_path);
     let has_inline_vision = is_vision_hfq(&hfq);
+    let taichu_vision =
+        hipfire_arch_taichu_vl::vision::is_taichu_vision_hfq(&hfq);
     let is_vl = vl_path.is_some() || has_inline_vision;
 
     // Read vision_config from the .vl file when present, else from the trunk.
@@ -1685,6 +1700,7 @@ fn cpu_preflight(model_path: &str) -> Result<Preflight, String> {
         tokenizer,
         chat_template,
         is_vl,
+        taichu_vision,
         vision_config,
         vl_path,
     })
