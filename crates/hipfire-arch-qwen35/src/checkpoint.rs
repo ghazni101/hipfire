@@ -545,33 +545,45 @@ fn plan_resume_inner<B: CheckpointBlob>(
             let byte_cost = if ep == 0 {
                 0
             } else {
-                pool.peek(domain, ep, prefix_fingerprint(&prompt_tokens[..ep as usize])).map(|b| b.bytes_len()).unwrap_or(0)
+                pool.peek(
+                    domain,
+                    ep,
+                    prefix_fingerprint(&prompt_tokens[..ep as usize]),
+                )
+                .map(|b| b.bytes_len())
+                .unwrap_or(0)
             };
             let bundle = complete_bundle(drafter);
-            ResumePlan::new(ep, bundle, byte_cost, LastTokenHandling::EarlierBoundary)
-                .map_err(|e| match e {
+            ResumePlan::new(ep, bundle, byte_cost, LastTokenHandling::EarlierBoundary).map_err(
+                |e| match e {
                     ResumePlanError::MissingComponent(_) => MissReason::NoCheckpoint,
-                })
+                },
+            )
         }
         Some(p) => {
             // Normal: p < prompt_len (or prompt_len == 0 with p > 0 — shouldn't
             // normally happen, but SuffixRecompute is still safe).
-            let byte_cost = pool.peek(domain, p, prefix_fingerprint(&prompt_tokens[..p as usize])).map(|b| b.bytes_len()).unwrap_or(0);
+            let byte_cost = pool
+                .peek(domain, p, prefix_fingerprint(&prompt_tokens[..p as usize]))
+                .map(|b| b.bytes_len())
+                .unwrap_or(0);
             let bundle = complete_bundle(drafter);
-            ResumePlan::new(p, bundle, byte_cost, LastTokenHandling::SuffixRecompute)
-                .map_err(|e| match e {
+            ResumePlan::new(p, bundle, byte_cost, LastTokenHandling::SuffixRecompute).map_err(|e| {
+                match e {
                     ResumePlanError::MissingComponent(_) => MissReason::NoCheckpoint,
-                })
+                }
+            })
         }
         None => {
             // No checkpoint at any page-aligned boundary <= resumable.
             if resumable == 0 && prompt_len == 0 {
                 // Empty prompt: p=0, no underflow (spec §4.5).
                 let bundle = complete_bundle(drafter);
-                ResumePlan::new(0, bundle, 0, LastTokenHandling::SuffixRecompute)
-                    .map_err(|e| match e {
+                ResumePlan::new(0, bundle, 0, LastTokenHandling::SuffixRecompute).map_err(|e| {
+                    match e {
                         ResumePlanError::MissingComponent(_) => MissReason::NoCheckpoint,
-                    })
+                    }
+                })
             } else if pool.was_evicted(domain, resumable) {
                 Err(MissReason::Evicted)
             } else {
@@ -613,7 +625,10 @@ pub fn capture_checkpoint(
     state: &DeltaNetState,
 ) -> HipResult<CheckpointId> {
     if !QwenCheckpointPool::<DeltaNetSnapshot>::is_aligned(p) {
-        return Err(HipError::new(0, "capture_checkpoint: boundary not page-aligned"));
+        return Err(HipError::new(
+            0,
+            "capture_checkpoint: boundary not page-aligned",
+        ));
     }
 
     // Pre-check the pool ceiling BEFORE allocating the snapshot and paying
@@ -621,7 +636,10 @@ pub fn capture_checkpoint(
     // soft refusal, indistinguishable from a hard failure only after the
     // work is already spent.
     let bytes = DeltaNetSnapshot::bytes_for(state);
-    if !pool.can_afford(&(domain.clone(), p, prefix_fingerprint(boundary_tokens)), bytes) {
+    if !pool.can_afford(
+        &(domain.clone(), p, prefix_fingerprint(boundary_tokens)),
+        bytes,
+    ) {
         return Ok(CheckpointId::NONE);
     }
 
@@ -671,8 +689,7 @@ pub fn restore_private(
 mod tests {
     use super::*;
     use hipfire_runtime::serve_contract::{
-        ArchPolicy, DeviceTopology, KvLayout, SharingNamespace, TemplateIdentity,
-        TokenizerIdentity,
+        ArchPolicy, DeviceTopology, KvLayout, SharingNamespace, TemplateIdentity, TokenizerIdentity,
     };
 
     /// Host test double: just byte-length accounting, no device buffers.
@@ -735,15 +752,16 @@ mod tests {
 
     /// Deterministic prompt of `n` tokens for fingerprint tests.
     fn toks(n: u64) -> Vec<u32> {
-        (0..n as u32).map(|i| i.wrapping_mul(2654435761).wrapping_add(1)).collect()
+        (0..n as u32)
+            .map(|i| i.wrapping_mul(2654435761).wrapping_add(1))
+            .collect()
     }
 
     /// Fingerprint of `toks(n)[..p]` — the prefix a checkpoint at boundary p
     /// was captured under.
     fn fp(p: u64) -> u64 {
-        prefix_fingerprint(&toks(p.max(1)) [..p as usize])
+        prefix_fingerprint(&toks(p.max(1))[..p as usize])
     }
-
 
     // ── A7: structural — capture at p=128, plan 200-token prompt ────────
 
@@ -837,14 +855,8 @@ mod tests {
         let dom = test_domain("a7-empty");
 
         // No checkpoints, empty prompt, resumable=0.
-        let plan = plan_resume(
-            &mut pool,
-            &dom,
-            &toks(0),
-            &lookup(0),
-            DrafterDecision::Ar,
-        )
-        .expect("empty prompt should not underflow");
+        let plan = plan_resume(&mut pool, &dom, &toks(0), &lookup(0), DrafterDecision::Ar)
+            .expect("empty prompt should not underflow");
 
         assert_eq!(plan.boundary, 0);
         assert_eq!(plan.last_token, LastTokenHandling::SuffixRecompute);
@@ -986,7 +998,10 @@ mod tests {
         // Insert a third — should evict the oldest (p=0).
         let (id256, _) = pool.insert(dom.clone(), 256, fp(256), HostBlob { bytes: 4096 });
         assert_eq!(pool.len(), 2, "should still have 2 entries after eviction");
-        assert!(!pool.contains(&dom, 0, fp(0)), "oldest (p=0) should be evicted");
+        assert!(
+            !pool.contains(&dom, 0, fp(0)),
+            "oldest (p=0) should be evicted"
+        );
         assert!(pool.contains(&dom, 128, fp(128)));
         assert!(pool.contains(&dom, 256, fp(256)));
         assert_ne!(id0, CheckpointId::NONE);
@@ -1053,8 +1068,14 @@ mod tests {
         // NOT p=0 (pinned, older).
         pool.insert(dom.clone(), 256, fp(256), HostBlob { bytes: 4096 });
 
-        assert!(pool.contains(&dom, 0, fp(0)), "pinned p=0 must survive eviction");
-        assert!(!pool.contains(&dom, 128, fp(128)), "unpinned p=128 should be evicted");
+        assert!(
+            pool.contains(&dom, 0, fp(0)),
+            "pinned p=0 must survive eviction"
+        );
+        assert!(
+            !pool.contains(&dom, 128, fp(128)),
+            "unpinned p=128 should be evicted"
+        );
         assert!(pool.contains(&dom, 256, fp(256)));
     }
 
@@ -1074,7 +1095,10 @@ mod tests {
         // Insert a third — p=128 (now oldest) should be evicted.
         pool.insert(dom.clone(), 256, fp(256), HostBlob { bytes: 4096 });
 
-        assert!(pool.contains(&dom, 0, fp(0)), "recently accessed p=0 survives");
+        assert!(
+            pool.contains(&dom, 0, fp(0)),
+            "recently accessed p=0 survives"
+        );
         assert!(!pool.contains(&dom, 128, fp(128)), "oldest p=128 evicted");
     }
 
@@ -1132,7 +1156,10 @@ mod tests {
         pool.insert(dom_a.clone(), 256, fp(256), HostBlob { bytes: 4096 });
 
         assert!(!pool.contains(&dom_a, 128, fp(128)), "dom_a p=128 evicted");
-        assert!(pool.contains(&dom_b, 128, fp(128)), "dom_b p=128 must survive");
+        assert!(
+            pool.contains(&dom_b, 128, fp(128)),
+            "dom_b p=128 must survive"
+        );
     }
 
     // ── Page alignment: non-aligned boundary is rejected ────────────────
@@ -1143,7 +1170,11 @@ mod tests {
         let dom = test_domain("align");
 
         let (id, _) = pool.insert(dom.clone(), 100, fp(100), HostBlob { bytes: 4096 });
-        assert_eq!(id, CheckpointId::NONE, "non-page-aligned boundary must be rejected");
+        assert_eq!(
+            id,
+            CheckpointId::NONE,
+            "non-page-aligned boundary must be rejected"
+        );
         assert!(!pool.contains(&dom, 100, fp(100)));
         assert_eq!(pool.total_bytes(), 0);
     }
@@ -1312,7 +1343,11 @@ mod tests {
     /// diverges after — the "other" prefix at the same boundary.
     fn toks_variant(n: u64) -> Vec<u32> {
         (0..n as u32)
-            .map(|i| i.wrapping_mul(2654435761).wrapping_add(1).wrapping_add(0x9e3779b9))
+            .map(|i| {
+                i.wrapping_mul(2654435761)
+                    .wrapping_add(1)
+                    .wrapping_add(0x9e3779b9)
+            })
             .collect()
     }
 
@@ -1331,11 +1366,20 @@ mod tests {
         let (id_b, _) = pool.insert(dom.clone(), 128, fp_variant(128), HostBlob { bytes: 8192 });
 
         // Distinct entries, distinct ids — B did NOT replace A.
-        assert_ne!(id_a, id_b, "divergent prefixes must not share a checkpoint id");
+        assert_ne!(
+            id_a, id_b,
+            "divergent prefixes must not share a checkpoint id"
+        );
         assert_eq!(pool.len(), 2, "both prefixes' checkpoints must coexist");
         // Each resolves to its own blob.
-        assert_eq!(pool.peek(&dom, 128, fp(128)).map(|b| b.bytes_len()), Some(4096));
-        assert_eq!(pool.peek(&dom, 128, fp_variant(128)).map(|b| b.bytes_len()), Some(8192));
+        assert_eq!(
+            pool.peek(&dom, 128, fp(128)).map(|b| b.bytes_len()),
+            Some(4096)
+        );
+        assert_eq!(
+            pool.peek(&dom, 128, fp_variant(128)).map(|b| b.bytes_len()),
+            Some(8192)
+        );
     }
 
     #[test]
@@ -1348,20 +1392,34 @@ mod tests {
         pool.insert(dom.clone(), 128, fp_variant(128), HostBlob { bytes: 8192 });
 
         // A 200-token prompt on prefix A resumes at 128 with A's state.
-        let plan_a = plan_resume(&mut pool, &dom, &toks(200), &lookup(128), DrafterDecision::Ar)
-            .expect("prefix A should resume");
+        let plan_a = plan_resume(
+            &mut pool,
+            &dom,
+            &toks(200),
+            &lookup(128),
+            DrafterDecision::Ar,
+        )
+        .expect("prefix A should resume");
         assert_eq!(plan_a.boundary, 128);
         assert_eq!(
-            pool.peek(&dom, plan_a.boundary, fp(128)).map(|b| b.bytes_len()),
+            pool.peek(&dom, plan_a.boundary, fp(128))
+                .map(|b| b.bytes_len()),
             Some(4096),
             "prefix A must resolve its own checkpoint, not B's"
         );
 
         // A prompt on prefix B resolves B's state, not A's.
-        let plan_b = plan_resume(&mut pool, &dom, &toks_variant(200), &lookup(128), DrafterDecision::Ar)
-            .expect("prefix B should resume");
+        let plan_b = plan_resume(
+            &mut pool,
+            &dom,
+            &toks_variant(200),
+            &lookup(128),
+            DrafterDecision::Ar,
+        )
+        .expect("prefix B should resume");
         assert_eq!(
-            pool.peek(&dom, plan_b.boundary, fp_variant(128)).map(|b| b.bytes_len()),
+            pool.peek(&dom, plan_b.boundary, fp_variant(128))
+                .map(|b| b.bytes_len()),
             Some(8192),
             "prefix B must resolve its own checkpoint, not A's"
         );
@@ -1377,8 +1435,14 @@ mod tests {
         pool.insert(dom.clone(), 128, fp(128), HostBlob { bytes: 4096 });
 
         // A longer prompt on the SAME prefix (toks(300)[..128] == toks(128)).
-        let plan = plan_resume(&mut pool, &dom, &toks(300), &lookup(128), DrafterDecision::Ar)
-            .expect("shared prefix should resume");
+        let plan = plan_resume(
+            &mut pool,
+            &dom,
+            &toks(300),
+            &lookup(128),
+            DrafterDecision::Ar,
+        )
+        .expect("shared prefix should resume");
         assert_eq!(plan.boundary, 128);
     }
 }

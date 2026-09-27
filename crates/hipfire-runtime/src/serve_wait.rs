@@ -421,7 +421,7 @@ mod tests {
         let mut q = queue(8, 1 << 20, 5);
         q.try_enqueue(1, 10, 0).unwrap(); // deadline 5
         q.try_enqueue(2, 20, 0).unwrap(); // deadline 5, still queued behind 1
-        // At tick 6 both are expired; pop_ready returns None and clears them.
+                                          // At tick 6 both are expired; pop_ready returns None and clears them.
         assert!(q.pop_ready(6).is_none());
         assert_eq!(q.queued_count(), 0);
         assert_eq!(q.queued_bytes(), 0);
@@ -433,7 +433,7 @@ mod tests {
         let mut q = queue(8, 1 << 20, 10);
         q.try_enqueue(1, 10, 0).unwrap(); // deadline 10
         q.try_enqueue(2, 20, 5).unwrap(); // deadline 15
-        // At tick 11: waiter 1 expired, waiter 2 still live.
+                                          // At tick 11: waiter 1 expired, waiter 2 still live.
         assert_eq!(q.pop_ready(11).map(|w| w.id), Some(2));
         assert_eq!(q.queued_count(), 0);
         assert_eq!(q.queued_bytes(), 0);

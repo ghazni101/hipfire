@@ -3072,7 +3072,6 @@ pub(crate) fn find_model_path(
     candidates.into_iter().next()
 }
 
-
 /// Clap value parser for `--kv-backend`: shared `KvBackend::from_str` so the old
 /// `contiguous` spelling returns the migration error naming `legacy`.
 fn parse_kv_backend_arg(raw: &str) -> std::result::Result<String, String> {
@@ -3300,10 +3299,7 @@ pub(crate) fn load_params(
     if let Some(kv_v) = authored_kv_axis(resolved, "memory.kv_v")? {
         params["kv_v"] = serde_json::json!(kv_v);
     }
-    let max_seq_source = &resolved
-        .get("memory.max_seq")
-        .expect("schema field")
-        .source;
+    let max_seq_source = &resolved.get("memory.max_seq").expect("schema field").source;
     if matches!(
         max_seq_source,
         ConfigSource::GlobalUser { .. }
@@ -5280,8 +5276,9 @@ fn bench_ttft(
             }
             Ok(())
         })?;
-        let elapsed =
-            first.ok_or_else(|| anyhow!("no streamed token observed; cannot measure client-side TTFT"))?;
+        let elapsed = first.ok_or_else(|| {
+            anyhow!("no streamed token observed; cannot measure client-side TTFT")
+        })?;
         ttft_ms_samples.push(elapsed.as_secs_f64() * 1000.0);
         if prompt_tokens.is_none() {
             prompt_tokens = bench_prompt_tokens_from_done(&done);
@@ -7599,7 +7596,6 @@ mod tests {
         );
     }
 
-
     #[test]
     pub(crate) fn resolved_for_model_applies_qwen_tag_policy_and_excludes_original_and_sidecars() {
         let paths = test_paths("registry-qwen-tag-policy");
@@ -7812,7 +7808,10 @@ mod tests {
             Some(entry),
         )
         .unwrap();
-        assert_eq!(config_string(&resolved, "memory.kv_backend").unwrap(), "vmm");
+        assert_eq!(
+            config_string(&resolved, "memory.kv_backend").unwrap(),
+            "vmm"
+        );
 
         // DeepSeek tags keep generation.max_tokens only; no max_seq/backend pin.
         for tag in [
@@ -7923,9 +7922,7 @@ mod tests {
 
         // Global user override wins over registry tag policy (registry below global).
         let mut user_layer = ConfigLayer::default();
-        user_layer
-            .set_cli("memory.kv_backend", "legacy")
-            .unwrap();
+        user_layer.set_cli("memory.kv_backend", "legacy").unwrap();
         user_layer.set_cli("memory.max_seq", "32768").unwrap();
         user_layer.set_cli("generation.max_tokens", "1024").unwrap();
         let overridden = hipfire_config::resolve(vec![
@@ -8012,9 +8009,7 @@ mod tests {
 
         // Precedence: flag > model config > global config.
         let mut global_layer = ConfigLayer::default();
-        global_layer
-            .set_cli("memory.kv_backend", "legacy")
-            .unwrap();
+        global_layer.set_cli("memory.kv_backend", "legacy").unwrap();
         let mut model_layer = ConfigLayer::default();
         model_layer.set_cli("memory.kv_backend", "vmm").unwrap();
         let model_over_global = hipfire_config::resolve(vec![
@@ -8416,11 +8411,13 @@ mod tests {
 
     fn sha256_hex(bytes: &[u8]) -> String {
         let digest = Sha256::digest(bytes);
-        digest.iter().fold(String::with_capacity(64), |mut out, byte| {
-            out.push(char::from_digit((byte >> 4) as u32, 16).unwrap());
-            out.push(char::from_digit((byte & 0x0F) as u32, 16).unwrap());
-            out
-        })
+        digest
+            .iter()
+            .fold(String::with_capacity(64), |mut out, byte| {
+                out.push(char::from_digit((byte >> 4) as u32, 16).unwrap());
+                out.push(char::from_digit((byte & 0x0F) as u32, 16).unwrap());
+                out
+            })
     }
 
     /// A manifest-v1 `.xdna.zip` binding the given payloads, written to the
@@ -8783,7 +8780,10 @@ mod tests {
             None,
         )
         .unwrap();
-        assert!(params.get("xdna").is_none(), "flag-off must not project xdna");
+        assert!(
+            params.get("xdna").is_none(),
+            "flag-off must not project xdna"
+        );
         fs::remove_dir_all(&paths.root).unwrap();
     }
 
@@ -10950,8 +10950,21 @@ mod tests {
             let registry = hipfire_registry::bundled().unwrap();
             let shared = Arc::new(ServeShared {
                 capabilities: crate::serve::route_capabilities(
-                    false, 4, 8192, 1024, false, 0, false, 4096, 1, 64, 268435456,
-                    30000, 4 << 20, 30_000, 64 << 20,
+                    false,
+                    4,
+                    8192,
+                    1024,
+                    false,
+                    0,
+                    false,
+                    4096,
+                    1,
+                    64,
+                    268435456,
+                    30000,
+                    4 << 20,
+                    30_000,
+                    64 << 20,
                 ),
                 metrics: crate::serve::metrics::Metrics::default(),
                 runtime: Mutex::new(ServeRuntime {

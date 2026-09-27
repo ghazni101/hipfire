@@ -13,7 +13,10 @@ use hipfire_config::developer_var;
 /// Any other mode passes the `HIPFIRE_VISION_SIDECAR` / `params.vision`
 /// ladder result through untouched. Pure string plumbing — no arch or
 /// tensor knowledge; admission still validates the surviving path.
-pub(crate) fn apply_vision_mode_gate(vision_mode: &str, raw_vision: Option<String>) -> Option<String> {
+pub(crate) fn apply_vision_mode_gate(
+    vision_mode: &str,
+    raw_vision: Option<String>,
+) -> Option<String> {
     if vision_mode == "off" {
         None
     } else {
@@ -34,7 +37,9 @@ pub(crate) fn apply_vision_mode_gate(vision_mode: &str, raw_vision: Option<Strin
 /// arm used to discover a `.vl` sibling of its own accord and never read
 /// either knob, so `vision_mode=off` still paid the tower's ~1 GB and
 /// `serve --vision` was silently ignored on that route.
-pub(crate) fn resolve_vision_ladder(msg: &serde_json::Value) -> (String, Option<String>, Option<String>) {
+pub(crate) fn resolve_vision_ladder(
+    msg: &serde_json::Value,
+) -> (String, Option<String>, Option<String>) {
     let vision_mode = msg
         .get("params")
         .and_then(|p| p.get("vision_mode"))

@@ -442,7 +442,6 @@ impl PagePool {
         self.k_arena_bytes()
     }
 
-
     /// Bounds-check a physical page index. Every public entry point that
     /// takes a `phys` calls this first — a stale or fabricated index must
     /// produce `Err`, never an out-of-bounds `page_meta` panic.
@@ -1040,7 +1039,10 @@ impl PagePool {
             }
         }
 
-        Ok(CowPlan { copies, armed: true })
+        Ok(CowPlan {
+            copies,
+            armed: true,
+        })
     }
 
     /// Rebind the block table entries per `plan` and adjust refcounts on
@@ -1067,7 +1069,9 @@ impl PagePool {
             match table.physical(c.logical_page) {
                 Some(p) if p == c.src_phys => {}
                 other => {
-                    let got = other.map(|p| p.to_string()).unwrap_or_else(|| "none".into());
+                    let got = other
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| "none".into());
                     failure = Some(format!(
                         "commit_cow: logical page {} maps to {} not src {} — \
                          table changed since plan_cow; aborted",
@@ -1153,10 +1157,7 @@ impl PagePool {
         self.check_phys(phys)?;
         let meta = &mut self.page_meta[phys as usize];
         if meta.inflight_refs == 0 {
-            return Err(format!(
-                "release_inflight_ref: underflow for phys {}",
-                phys
-            ));
+            return Err(format!("release_inflight_ref: underflow for phys {}", phys));
         }
         meta.inflight_refs -= 1;
         Ok(())
@@ -1251,10 +1252,7 @@ impl PagePool {
             self.check_phys(phys)?;
             let meta = &mut self.page_meta[phys as usize];
             if meta.cache_refs == 0 {
-                return Err(format!(
-                    "release_cache_ref: underflow for phys {}",
-                    phys
-                ));
+                return Err(format!("release_cache_ref: underflow for phys {}", phys));
             }
             meta.cache_refs -= 1;
             if meta.table_refs == 0 && meta.cache_refs == 0 {
@@ -1375,8 +1373,7 @@ mod tests {
         let mut plans: Vec<Option<(usize, CowPlan)>> = (0..4).map(|_| None).collect();
         // Cache refs the fuzz itself holds — a page can carry more than
         // one across a free/realloc cycle, so count them.
-        let mut cache_held: std::collections::HashMap<u32, u32> =
-            std::collections::HashMap::new();
+        let mut cache_held: std::collections::HashMap<u32, u32> = std::collections::HashMap::new();
         for step in 0..2000 {
             let t = rng.below(4) as usize;
             match rng.below(10) {
@@ -2200,7 +2197,10 @@ mod tests {
         // Release one in-flight — still pending (one ref remains)
         pool.release_inflight_ref(phys).unwrap();
         let freed = pool.drain_completed();
-        assert!(freed.is_empty(), "page with active in-flight must not drain");
+        assert!(
+            freed.is_empty(),
+            "page with active in-flight must not drain"
+        );
         assert_eq!(pool.page_state(phys), PageState::ReclaimPending);
 
         // Release last in-flight — now drainable

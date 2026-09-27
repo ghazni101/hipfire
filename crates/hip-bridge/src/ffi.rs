@@ -388,9 +388,8 @@ pub struct HipRuntime {
         *mut *mut c_void,
         *mut *mut c_void,
     ) -> u32,
-    fn_module_occupancy_max_active_blocks: Option<
-        unsafe extern "C" fn(*mut c_int, HipFunction, c_int, usize) -> u32
-    >,
+    fn_module_occupancy_max_active_blocks:
+        Option<unsafe extern "C" fn(*mut c_int, HipFunction, c_int, usize) -> u32>,
     // Events
     fn_event_create: unsafe extern "C" fn(*mut HipEvent) -> u32,
     fn_event_create_with_flags: unsafe extern "C" fn(*mut HipEvent, c_uint) -> u32,
@@ -901,7 +900,6 @@ impl HipRuntime {
             .to_string_lossy()
             .into_owned())
     }
-
 
     pub fn set_device(&self, id: i32) -> HipResult<()> {
         let code = unsafe { (self.fn_set_device)(id) };
@@ -1616,7 +1614,14 @@ impl HipRuntime {
             ));
         };
         let mut n: c_int = 0;
-        let code = unsafe { occ(&mut n as *mut c_int, func.0, block_size as c_int, dynamic_smem) };
+        let code = unsafe {
+            occ(
+                &mut n as *mut c_int,
+                func.0,
+                block_size as c_int,
+                dynamic_smem,
+            )
+        };
         self.check(code, "hipModuleOccupancyMaxActiveBlocksPerMultiprocessor")?;
         Ok(n)
     }

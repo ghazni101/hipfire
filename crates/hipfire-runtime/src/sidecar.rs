@@ -23,8 +23,18 @@ use std::path::{Path, PathBuf};
 /// Quant/build suffixes hipfire writes into model filenames. Stripping one
 /// maps `model.<quant>.hfq` to the companion's `model.<ext>`.
 const QUANT_SUFFIXES: &[&str] = &[
-    ".mq4v2", ".mq6v2", ".mq5v2", ".mq3v2", ".mq2v2", ".mq4cg256", ".mq4", ".mq6", ".mq8", ".q8",
-    ".q4", ".bf16",
+    ".mq4v2",
+    ".mq6v2",
+    ".mq5v2",
+    ".mq3v2",
+    ".mq2v2",
+    ".mq4cg256",
+    ".mq4",
+    ".mq6",
+    ".mq8",
+    ".q8",
+    ".q4",
+    ".bf16",
 ];
 
 /// `Path` extension of a companion file (`"mtp"`, `"vl"`).
@@ -75,7 +85,9 @@ pub fn vl_sidecar_candidates(trunk: &Path) -> Vec<PathBuf> {
 /// First existing `.vl` sibling of `trunk`, ignoring the `HIPFIRE_VL_FILE`
 /// override. Used where only the on-disk sibling convention matters.
 pub fn find_vl_sidecar(trunk: &Path) -> Option<PathBuf> {
-    vl_sidecar_candidates(trunk).into_iter().find(|p| p.exists())
+    vl_sidecar_candidates(trunk)
+        .into_iter()
+        .find(|p| p.exists())
 }
 
 /// Resolve the vision tower for `trunk` exactly as a model load does:
@@ -104,10 +116,8 @@ mod tests {
 
     /// One temp dir per test process; the tests never share it.
     fn scratch(tag: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!(
-            "hipfire-sidecar-{tag}-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("hipfire-sidecar-{tag}-{}", std::process::id()));
         let _ = fs::remove_dir_all(&dir);
         fs::create_dir_all(&dir).expect("scratch dir");
         dir

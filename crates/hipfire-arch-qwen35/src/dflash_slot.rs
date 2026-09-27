@@ -38,18 +38,16 @@
 //!   the slot path does not maintain.
 
 use hip_bridge::HipResult;
-use hipfire_runtime::dflash::{
-    self, DflashConfig, DflashScratch, DflashWeights,
-};
+use hipfire_runtime::dflash::{self, DflashConfig, DflashScratch, DflashWeights};
 use hipfire_runtime::hfq::HfqFile;
 use hipfire_runtime::spec::accept_greedy_prefix;
 use rdna_compute::slot_pool::SlotId;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::path::Path;
 
+use crate::forward_slots::SpecHiddenCapture;
 use crate::qwen35::{DeltaNetState, PrefillBatchScratch, Qwen35Config, Qwen35Weights};
 use crate::speculative::{DeltaNetSnapshot, GdnTape, VerifyScratch};
-use crate::forward_slots::SpecHiddenCapture;
 
 /// Draft-side state shared by every DFlash slot: the draft weights and the
 /// resolved draft-context policy. One per engine load; `None` when DFlash
@@ -191,8 +189,7 @@ pub fn load_dflash_shared(
     requested_ctx: usize,
     max_batch: usize,
 ) -> Result<DflashShared, String> {
-    let draft_hfq =
-        HfqFile::open(Path::new(draft_path)).map_err(|e| format!("{e}"))?;
+    let draft_hfq = HfqFile::open(Path::new(draft_path)).map_err(|e| format!("{e}"))?;
     let draft_config = DflashConfig::from_hfq(&draft_hfq)
         .ok_or_else(|| "draft: failed to parse DflashConfig from HFQ metadata".to_string())?;
 
@@ -370,8 +367,8 @@ pub fn new_dflash_slot_state(
         hidden_k,
     )
     .map_err(|e| format!("VerifyScratch: {e}"))?;
-    let trunk_snap = DeltaNetSnapshot::new_for(gpu, dn_state)
-        .map_err(|e| format!("DeltaNetSnapshot: {e}"))?;
+    let trunk_snap =
+        DeltaNetSnapshot::new_for(gpu, dn_state).map_err(|e| format!("DeltaNetSnapshot: {e}"))?;
     Ok(DflashSlotState {
         scratch,
         verify_scratch,
@@ -431,7 +428,11 @@ pub fn scatter_staging_rows_to_interleaved(
         let mut done = 0usize;
         while done < n {
             let abs = pos + done;
-            let slot = if modulus == usize::MAX { abs } else { abs % modulus };
+            let slot = if modulus == usize::MAX {
+                abs
+            } else {
+                abs % modulus
+            };
             let seg = if modulus == usize::MAX {
                 n - done
             } else {
@@ -445,18 +446,14 @@ pub fn scatter_staging_rows_to_interleaved(
                         abs + r
                     } else {
                         (abs + r) % modulus
-                    }) * ne * h
+                    }) * ne
+                        * h
                         + i * h,
                     h,
                 );
                 let src_row = src.sub_offset((done + r) * h, h);
-                gpu.hip.memcpy_dtod_at(
-                    &dst_row.buf,
-                    0,
-                    &src_row.buf,
-                    0,
-                    h * 4,
-                )?;
+                gpu.hip
+                    .memcpy_dtod_at(&dst_row.buf, 0, &src_row.buf, 0, h * 4)?;
             }
             done += seg;
         }
@@ -519,8 +516,7 @@ pub fn dflash_slot_draft_step(
                     .map_err(|e| format!("noise embed: {e}"))?,
                 _ => {
                     return Err(
-                        "dflash slot: unsupported target embedding format for noise lookup"
-                            .into(),
+                        "dflash slot: unsupported target embedding format for noise lookup".into(),
                     )
                 }
             }
@@ -548,8 +544,7 @@ pub fn dflash_slot_draft_step(
         .len()
         .min(position)
         .min(st.scratch.max_ctx_len);
-    let positions_q: Vec<i32> =
-        (position as i32..(position + b) as i32).collect();
+    let positions_q: Vec<i32> = (position as i32..(position + b) as i32).collect();
     let mut positions_k: Vec<i32> = Vec::with_capacity(effective_ctx_len + b);
     {
         let th_abs = st.scratch.thlog.abs_positions();
@@ -687,7 +682,9 @@ pub fn dflash_slot_verify_accept(
     // Post-output-norm the slot's verify rows out of x_batch — the trunk
     // lm_head consumes post-norm hidden (same convention as MTP's
     // mtp_batched_verify_accept_from_batch).
-    let verify_raw = pbs.x_batch.sub_offset(hidden_row_offset * dim, n_verify * dim);
+    let verify_raw = pbs
+        .x_batch
+        .sub_offset(hidden_row_offset * dim, n_verify * dim);
     let verify_hidden = st.verify_scratch.final_hidden.sub_offset(0, n_verify * dim);
     gpu.rmsnorm_batched(
         &verify_raw,
@@ -731,11 +728,8 @@ pub fn dflash_slot_verify_accept(
     // Greedy accept: drafts = verify_tokens[1..] (the B−1 proposals);
     // target_pick[i] is the trunk's pick at verify row i. committed =
     // accepted drafts + bonus (seed excluded — it was committed last cycle).
-    let accepted = accept_greedy_prefix(
-        &draft.verify_tokens[1..],
-        &target_pick,
-        Some(eos_token_id),
-    );
+    let accepted =
+        accept_greedy_prefix(&draft.verify_tokens[1..], &target_pick, Some(eos_token_id));
     let mut committed = accepted.committed;
     let mut hit_eos = accepted.hit_eos;
 
@@ -779,15 +773,8 @@ pub fn dflash_slot_verify_accept(
     // slot's verify range are the kept ones (seed + accepted drafts; the
     // bonus row's hidden is NOT committed — it becomes next cycle's seed
     // and its hidden is captured by next cycle's verify row 0).
-    scatter_staging_rows_to_interleaved(
-        gpu,
-        shared,
-        st,
-        hidden_row_offset,
-        pos,
-        advance,
-    )
-    .map_err(|e| format!("hidden scatter: {e}"))?;
+    scatter_staging_rows_to_interleaved(gpu, shared, st, hidden_row_offset, pos, advance)
+        .map_err(|e| format!("hidden scatter: {e}"))?;
     st.scratch.thlog.append_committed(pos, advance, 0);
     st.seeded_through = pos + advance;
 

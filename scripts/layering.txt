@@ -19,12 +19,16 @@
  0 hipfire-atlas
  0 hipfire-config
  0 hipfire-detect
+ 0 hipfire-xdna
+ 0 peacemaker-ir
  0 radiowave
  0 redline
  1 hip-bridge
  1 hipfire-client
+ 1 hipfire-isa
  1 hipfire-registry
  1 hsa-bridge
+ 1 peacemaker-lift
  1 redline-rocr
  1 va-bridge
  2 hipfire-tui

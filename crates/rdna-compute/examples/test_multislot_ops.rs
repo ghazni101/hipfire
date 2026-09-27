@@ -482,8 +482,8 @@ mod dn {
         for (s, positions) in positions_per_slot.iter().enumerate() {
             let desc = descs[s];
             let cap = rdna_compute::kv_slots::legacy_cap(desc.seq_len as usize);
-            let region =
-                &arena[desc.legacy_k_base as usize..desc.legacy_k_base as usize + cap * KV_PER_POS_BYTES];
+            let region = &arena
+                [desc.legacy_k_base as usize..desc.legacy_k_base as usize + cap * KV_PER_POS_BYTES];
             let decoded = decode_q8_0(region);
             let mut candidate = Vec::with_capacity(positions.len() * KV_DIM);
             for &p in positions {
@@ -574,8 +574,8 @@ mod dn {
 
             for (s, &desc) in descs.iter().enumerate() {
                 let cap = rdna_compute::kv_slots::legacy_cap(desc.seq_len as usize);
-                let region =
-                    &arena[desc.legacy_k_base as usize..desc.legacy_k_base as usize + cap * KV_PER_POS_BYTES];
+                let region = &arena[desc.legacy_k_base as usize
+                    ..desc.legacy_k_base as usize + cap * KV_PER_POS_BYTES];
                 let decoded = decode_q8_0(region);
                 if s == target {
                     let mut candidate = Vec::with_capacity(positions.len() * KV_DIM);
@@ -632,7 +632,7 @@ mod dn {
                 positions.len(),
                 Some(&descs_dev),
                 Some(&row_slot_dev),
-            false,
+                false,
             )
             .expect("positive control write");
             gpu.hip.device_synchronize().expect("sync");
@@ -646,8 +646,8 @@ mod dn {
 
             let desc_b = descs[bystander];
             let cap_b = rdna_compute::kv_slots::legacy_cap(desc_b.seq_len as usize);
-            let region_b =
-                &arena[desc_b.legacy_k_base as usize..desc_b.legacy_k_base as usize + cap_b * KV_PER_POS_BYTES];
+            let region_b = &arena[desc_b.legacy_k_base as usize
+                ..desc_b.legacy_k_base as usize + cap_b * KV_PER_POS_BYTES];
             let decoded_b = decode_q8_0(region_b);
             let n_finite = decoded_b.iter().filter(|v| v.is_finite()).count();
             assert!(
@@ -660,8 +660,8 @@ mod dn {
 
             let desc_t = descs[target];
             let cap_t = rdna_compute::kv_slots::legacy_cap(desc_t.seq_len as usize);
-            let region_t =
-                &arena[desc_t.legacy_k_base as usize..desc_t.legacy_k_base as usize + cap_t * KV_PER_POS_BYTES];
+            let region_t = &arena[desc_t.legacy_k_base as usize
+                ..desc_t.legacy_k_base as usize + cap_t * KV_PER_POS_BYTES];
             let decoded_t = decode_q8_0(region_t);
             assert!(
                 decoded_t.iter().all(|v| !v.is_finite()),
@@ -726,7 +726,7 @@ mod dn {
             positions.len(),
             Some(&descs_dev),
             Some(&row_slot_dev),
-        false,
+            false,
         )
         .expect("negative-control write");
         gpu.hip.device_synchronize().expect("sync");
@@ -743,8 +743,8 @@ mod dn {
         // never got touched and still reads the zero fill.
         let desc_t = descs[target];
         let cap_t = rdna_compute::kv_slots::legacy_cap(desc_t.seq_len as usize);
-        let region_t =
-            &arena[desc_t.legacy_k_base as usize..desc_t.legacy_k_base as usize + cap_t * KV_PER_POS_BYTES];
+        let region_t = &arena[desc_t.legacy_k_base as usize
+            ..desc_t.legacy_k_base as usize + cap_t * KV_PER_POS_BYTES];
         let decoded_t = decode_q8_0(region_t);
         let mut candidate = Vec::with_capacity(positions.len() * KV_DIM);
         for &p in &positions {
@@ -805,8 +805,7 @@ mod dn {
             match pool.block_table(SlotId(i)) {
                 Some(bt) if bt.num_pages() > 0 => {
                     let indices = bt.page_indices();
-                    let bytes: Vec<u8> =
-                        indices.iter().flat_map(|x| x.to_ne_bytes()).collect();
+                    let bytes: Vec<u8> = indices.iter().flat_map(|x| x.to_ne_bytes()).collect();
                     let dev = gpu
                         .upload_raw(&bytes, &[indices.len()])
                         .expect("block table upload");
@@ -865,8 +864,8 @@ mod dn {
 
         // Positions crossing page boundaries in both slots.
         let positions_per_slot: Vec<Vec<usize>> = vec![
-            vec![0, 100, 127, 128, 129],           // B: 130 live, 2 pages
-            vec![0, 127, 128, 200, 255, 256],      // C: 257 live, 3 pages
+            vec![0, 100, 127, 128, 129],      // B: 130 live, 2 pages
+            vec![0, 127, 128, 200, 255, 256], // C: 257 live, 3 pages
         ];
 
         let mut src = Vec::new();
@@ -915,7 +914,7 @@ mod dn {
             positions_flat.len(),
             Some(&descs_dev),
             Some(&row_slot_dev),
-        false,
+            false,
         )
         .expect("paged multi-slot kv write");
         gpu.hip.device_synchronize().expect("sync");
@@ -935,7 +934,11 @@ mod dn {
                 let src_slice: Vec<f32> = (0..KV_DIM).map(|e| kv_src_value(s.0, p, e)).collect();
                 let reference = kv_legacy_reference(gpu, ref_cap, &src_slice, &[p]);
                 assert_close(
-                    &format!("KV paged golden slot={} pos={p} (page {})", s.0, pages[p / PAGE_TOKENS]),
+                    &format!(
+                        "KV paged golden slot={} pos={p} (page {})",
+                        s.0,
+                        pages[p / PAGE_TOKENS]
+                    ),
                     &candidate,
                     &reference,
                 );
@@ -959,7 +962,9 @@ mod dn {
             println!(
                 "  KV paged golden slot={} (pages {:?}, {live} live): OK ({} written positions \
                  match reference, {checked} unwritten positions still poison)",
-                s.0, pages, written.len()
+                s.0,
+                pages,
+                written.len()
             );
         }
 
@@ -1019,7 +1024,7 @@ mod dn {
             positions.len(),
             Some(&descs_dev),
             Some(&row_slot_dev),
-        false,
+            false,
         )
         .expect("paged isolation write");
         gpu.hip.device_synchronize().expect("sync");
@@ -1040,8 +1045,12 @@ mod dn {
 
         // Target C: its full live length decodes finite and correct.
         for &p in &positions {
-            let candidate =
-                decode_paged_position(&arena, pool.block_table(c).unwrap().page_indices(), KV_PER_POS_BYTES, p);
+            let candidate = decode_paged_position(
+                &arena,
+                pool.block_table(c).unwrap().page_indices(),
+                KV_PER_POS_BYTES,
+                p,
+            );
             assert!(
                 candidate.iter().all(|v| v.is_finite()),
                 "KV paged isolation: target slot {} position {p} came back non-finite",
@@ -1119,7 +1128,7 @@ mod dn {
             positions_flat.len(),
             Some(&descs_dev),
             Some(&row_slot_dev),
-        false,
+            false,
         )
         .expect("paged kv write (attn setup)");
         gpu.hip.device_synchronize().expect("sync");
@@ -1254,9 +1263,12 @@ mod dn {
         gpu.free_tensor(v_paged).expect("free v_paged");
         gpu.free_tensor(k_legacy).expect("free k_legacy");
         gpu.free_tensor(v_legacy).expect("free v_legacy");
-        gpu.free_tensor(legacy_descs_dev).expect("free legacy descs");
-        gpu.free_tensor(positions_attn).expect("free positions_attn");
-        gpu.free_tensor(row_slot_attn_dev).expect("free row_slot_attn");
+        gpu.free_tensor(legacy_descs_dev)
+            .expect("free legacy descs");
+        gpu.free_tensor(positions_attn)
+            .expect("free positions_attn");
+        gpu.free_tensor(row_slot_attn_dev)
+            .expect("free row_slot_attn");
         gpu.free_tensor(q).expect("free q");
         gpu.free_tensor(out_paged).expect("free out_paged");
         gpu.free_tensor(out_legacy).expect("free out_legacy");
@@ -1980,7 +1992,9 @@ mod dn {
         println!("\n### KV write: negative control (candidate arm only) ###");
         test_kv_write_negative_control(&mut gpu);
 
-        println!("\n### KV write PAGED (SP4 paged block tables): golden across page boundaries ###");
+        println!(
+            "\n### KV write PAGED (SP4 paged block tables): golden across page boundaries ###"
+        );
         test_kv_write_paged_golden(&mut gpu);
         println!("\n### KV write PAGED: cross-slot isolation over scattered pages ###");
         test_kv_write_paged_isolation(&mut gpu);

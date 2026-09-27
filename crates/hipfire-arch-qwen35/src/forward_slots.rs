@@ -96,11 +96,11 @@ use hipfire_dispatch::context::DispatchCtx;
 use hipfire_dispatch::families::gemv::{GemvFamily, RotateInputs};
 use hipfire_dispatch::pipeline::{execute_steps, GemvInput, Step};
 use hipfire_dispatch::types::KernelKey;
+use hipfire_runtime::kv_mode::KvMode;
 use hipfire_runtime::llama::{
     fused_rmsnorm_rotate_mq_batched_for, fused_silu_mul_rotate_mq_batched_for,
     rotate_x_mq_batched_for, EmbeddingFormat, WeightTensor,
 };
-use hipfire_runtime::kv_mode::KvMode;
 use rdna_compute::kv_slots::{build_tiles, KvSlotDesc};
 use rdna_compute::slot_pool::{SlotId, SlotPool};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -946,13 +946,8 @@ impl SpecVerifyCapture<'_> {
             return Ok(());
         };
         let row_bytes = h.dim * 4;
-        gpu.hip.memcpy_dtod_at(
-            &h.staging[ext].buf,
-            0,
-            &pbs.x_batch.buf,
-            0,
-            n * row_bytes,
-        )
+        gpu.hip
+            .memcpy_dtod_at(&h.staging[ext].buf, 0, &pbs.x_batch.buf, 0, n * row_bytes)
     }
 }
 
@@ -972,7 +967,11 @@ fn spec_tape_layer_rows(
     qkv_dim: usize,
     n_v_heads: usize,
 ) -> HipResult<()> {
-    debug_assert!(m <= cap.stride, "verify rows {m} exceed tape stride {}", cap.stride);
+    debug_assert!(
+        m <= cap.stride,
+        "verify rows {m} exceed tape stride {}",
+        cap.stride
+    );
     let tape_off = slot * cap.stride;
     let tape = &mut *cap.tape;
     gpu.memcpy_dtod_at_auto(
@@ -1795,8 +1794,12 @@ fn kv_write_slots(
             k_batch,
             v_batch,
             positions,
-            kv.givens_cos.as_ref().expect("asym2 tier without givens cos"),
-            kv.givens_sin.as_ref().expect("asym2 tier without givens sin"),
+            kv.givens_cos
+                .as_ref()
+                .expect("asym2 tier without givens cos"),
+            kv.givens_sin
+                .as_ref()
+                .expect("asym2 tier without givens sin"),
             n_kv_heads,
             head_dim,
             n_rows,
@@ -1809,8 +1812,12 @@ fn kv_write_slots(
             k_batch,
             v_batch,
             positions,
-            kv.givens_cos.as_ref().expect("asym3 tier without givens cos"),
-            kv.givens_sin.as_ref().expect("asym3 tier without givens sin"),
+            kv.givens_cos
+                .as_ref()
+                .expect("asym3 tier without givens cos"),
+            kv.givens_sin
+                .as_ref()
+                .expect("asym3 tier without givens sin"),
             n_kv_heads,
             head_dim,
             n_rows,
@@ -1823,8 +1830,12 @@ fn kv_write_slots(
             k_batch,
             v_batch,
             positions,
-            kv.givens_cos.as_ref().expect("asym4 tier without givens cos"),
-            kv.givens_sin.as_ref().expect("asym4 tier without givens sin"),
+            kv.givens_cos
+                .as_ref()
+                .expect("asym4 tier without givens cos"),
+            kv.givens_sin
+                .as_ref()
+                .expect("asym4 tier without givens sin"),
             n_kv_heads,
             head_dim,
             n_rows,
@@ -1963,8 +1974,12 @@ fn tier_attend_slots(
             v_cache,
             out,
             positions,
-            kv.givens_cos.as_ref().expect("asym2 tier without givens cos"),
-            kv.givens_sin.as_ref().expect("asym2 tier without givens sin"),
+            kv.givens_cos
+                .as_ref()
+                .expect("asym2 tier without givens cos"),
+            kv.givens_sin
+                .as_ref()
+                .expect("asym2 tier without givens sin"),
             n_heads,
             n_kv_heads,
             head_dim,
@@ -1981,8 +1996,12 @@ fn tier_attend_slots(
             v_cache,
             out,
             positions,
-            kv.givens_cos.as_ref().expect("asym3 tier without givens cos"),
-            kv.givens_sin.as_ref().expect("asym3 tier without givens sin"),
+            kv.givens_cos
+                .as_ref()
+                .expect("asym3 tier without givens cos"),
+            kv.givens_sin
+                .as_ref()
+                .expect("asym3 tier without givens sin"),
             n_heads,
             n_kv_heads,
             head_dim,
@@ -2002,8 +2021,12 @@ fn tier_attend_slots(
             v_cache,
             out,
             positions,
-            kv.givens_cos.as_ref().expect("asym4 tier without givens cos"),
-            kv.givens_sin.as_ref().expect("asym4 tier without givens sin"),
+            kv.givens_cos
+                .as_ref()
+                .expect("asym4 tier without givens cos"),
+            kv.givens_sin
+                .as_ref()
+                .expect("asym4 tier without givens sin"),
             n_heads,
             n_kv_heads,
             head_dim,
@@ -3182,7 +3205,10 @@ fn decode_graph_m_hash(
 /// Prefill chunks (any other m) keep the plain path — their shapes vary
 /// step to step and would thrash the capture cache.
 pub fn spec_verify_graph_shape(m_per_slot: &[usize], verify_rows: usize) -> bool {
-    verify_rows > 0 && m_per_slot.iter().all(|&m| m == 0 || m == 1 || m == verify_rows)
+    verify_rows > 0
+        && m_per_slot
+            .iter()
+            .all(|&m| m == 0 || m == 1 || m == verify_rows)
 }
 
 /// A hipGraph of one pure-decode step, reused across steps.
@@ -3355,8 +3381,7 @@ pub fn forward_batch_slots_graphed_opts(
             &batch.m_per_slot,
             lm_head_skip,
             batch.pos3.len() == batch.positions.len() && !batch.pos3.is_empty(),
-            batch.ext_emb.len() == batch.positions.len()
-                && batch.ext_emb.iter().any(|&e| e >= 0),
+            batch.ext_emb.len() == batch.positions.len() && batch.ext_emb.iter().any(|&e| e >= 0),
         ),
     };
 
@@ -3571,11 +3596,7 @@ pub fn upload_step_inputs(
         gpu.hip.memcpy_htod(&pbs.pos3.buf, &pos3_bytes)?;
     }
     if batch.ext_emb.len() == batch.positions.len() && batch.ext_emb.iter().any(|&e| e >= 0) {
-        let idx_bytes: Vec<u8> = batch
-            .ext_emb
-            .iter()
-            .flat_map(|x| x.to_ne_bytes())
-            .collect();
+        let idx_bytes: Vec<u8> = batch.ext_emb.iter().flat_map(|x| x.to_ne_bytes()).collect();
         gpu.hip.memcpy_htod(&pbs.ext_emb_index.buf, &idx_bytes)?;
     }
 
@@ -3755,15 +3776,11 @@ pub fn forward_batch_slots_opts(
     // captured graph replays with fresh values, and the index array is
     // uploaded here from the batch. The kernel itself is a no-op on rows
     // with a negative index, and skips null pointers defensively.
-    let use_ext = batch.ext_emb.len() == batch.positions.len()
-        && batch.ext_emb.iter().any(|&e| e >= 0);
+    let use_ext =
+        batch.ext_emb.len() == batch.positions.len() && batch.ext_emb.iter().any(|&e| e >= 0);
     if use_ext {
         if !opts.skip_uploads {
-            let idx_bytes: Vec<u8> = batch
-                .ext_emb
-                .iter()
-                .flat_map(|x| x.to_ne_bytes())
-                .collect();
+            let idx_bytes: Vec<u8> = batch.ext_emb.iter().flat_map(|x| x.to_ne_bytes()).collect();
             gpu.hip.memcpy_htod(&pbs.ext_emb_index.buf, &idx_bytes)?;
         }
         gpu.embedding_scatter_ext_batched(
@@ -4038,15 +4055,14 @@ pub fn forward_batch_slots_opts(
                 ));
             }
         }
-            // DFlash2 extract-layer hidden capture: copy this step's
-            // post-layer hidden rows into the shared staging buffer. Runs
-            // for every layer kind (extract layers can be DeltaNet or
-            // FullAttention); `capture_hidden_rows` is a no-op when the
-            // capture is unset or this layer is not an extract layer.
-            if let Some(cap) = spec_capture.as_deref() {
-                cap.capture_hidden_rows(gpu, pbs, layer_idx, n)?;
-            }
-
+        // DFlash2 extract-layer hidden capture: copy this step's
+        // post-layer hidden rows into the shared staging buffer. Runs
+        // for every layer kind (extract layers can be DeltaNet or
+        // FullAttention); `capture_hidden_rows` is a no-op when the
+        // capture is unset or this layer is not an extract layer.
+        if let Some(cap) = spec_capture.as_deref() {
+            cap.capture_hidden_rows(gpu, pbs, layer_idx, n)?;
+        }
     }
 
     if max_layer.is_some() {
@@ -4058,7 +4074,16 @@ pub fn forward_batch_slots_opts(
     }
 
     // ── 5. Final norm + per-slot last-token logits ──────────────────────
-    final_logits_per_slot(gpu, weights, config, batch, pbs, s, logits_out, lm_head_skip)?;
+    final_logits_per_slot(
+        gpu,
+        weights,
+        config,
+        batch,
+        pbs,
+        s,
+        logits_out,
+        lm_head_skip,
+    )?;
 
     // ── 6. Advance each slot's logical KV length ────────────────────────
     //

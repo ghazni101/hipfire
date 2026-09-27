@@ -29,9 +29,7 @@ fn main() {
 
 #[cfg(feature = "deltanet")]
 mod ora {
-    use hipfire_arch_qwen35::qwen35::{
-        self, DeltaNetState, PrefillBatchScratch, Qwen35Scratch,
-    };
+    use hipfire_arch_qwen35::qwen35::{self, DeltaNetState, PrefillBatchScratch, Qwen35Scratch};
     use hipfire_arch_qwen35::speculative::HiddenStateRingBuffer;
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::llama::KvCache;
@@ -138,9 +136,12 @@ mod ora {
         let logical: usize = t.shape.iter().product::<usize>() * t.dtype.size();
         let n = logical.min(t.buf.size());
         let mut out = vec![0u8; n];
-        gpu.hip
-            .memcpy_dtoh(&mut out, &t.buf)
-            .unwrap_or_else(|e| panic!("download_raw (logical {logical} physical {}): {e:?}", t.buf.size()));
+        gpu.hip.memcpy_dtoh(&mut out, &t.buf).unwrap_or_else(|e| {
+            panic!(
+                "download_raw (logical {logical} physical {}): {e:?}",
+                t.buf.size()
+            )
+        });
         out
     }
     pub fn download_f32_vec(gpu: &Gpu, t: &GpuTensor) -> Vec<u8> {
@@ -154,8 +155,7 @@ mod ora {
     }
     /// Snapshot Gpu-owned scratch behind a raw pointer (Borrowed wrapper: never freed).
     pub fn download_ptr(gpu: &Gpu, ptr: *mut std::ffi::c_void, nbytes: usize) -> Vec<u8> {
-        let buf =
-            unsafe { hip_bridge::DeviceBuffer::from_raw(ptr, nbytes) };
+        let buf = unsafe { hip_bridge::DeviceBuffer::from_raw(ptr, nbytes) };
         let mut out = vec![0u8; nbytes];
         gpu.hip
             .memcpy_dtoh(&mut out, &buf)
@@ -244,7 +244,12 @@ mod ora {
         (0..n * k).map(|i| prng_f32(i as u64, salt)).collect()
     }
     /// Snapshot prepared FP8 bytes for (x_view, n, k): codes + half-sums + row-scales.
-    fn snap_prepared(gpu: &mut Gpu, x: &GpuTensor, n: usize, k: usize) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
+    fn snap_prepared(
+        gpu: &mut Gpu,
+        x: &GpuTensor,
+        n: usize,
+        k: usize,
+    ) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         let p = gpu
             .prepare_mq4v2_fp8_x(x, n, k, 1)
             .unwrap_or_else(|e| panic!("prepare_mq4v2_fp8_x n={n} k={k}: {e:?}"));
@@ -270,7 +275,9 @@ mod ora {
         let blob = pack_v2(&w, m, k);
         let x_h = det_x(c, k, 0xB0B);
         let y0_h: Vec<f32> = if nonzero_y {
-            (0..c * m).map(|i| prng_f32(i as u64, 0xADD) * 0.25).collect()
+            (0..c * m)
+                .map(|i| prng_f32(i as u64, 0xADD) * 0.25)
+                .collect()
         } else {
             vec![0.0; c * m]
         };
@@ -280,7 +287,14 @@ mod ora {
         // Whole-C prepared snapshot, then launch.
         let (pa, ha, sa) = snap_prepared(&mut *gpu, &d_x, c, k);
         gpu.gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8_lloyd(
-            &d_a, &d_x, &d_y, m, k, c, 1, [0, 0, 0, 0],
+            &d_a,
+            &d_x,
+            &d_y,
+            m,
+            k,
+            c,
+            1,
+            [0, 0, 0, 0],
         )
         .unwrap_or_else(|e| panic!("arm1/{name} whole-C: {e:?}"));
         sync(&mut *gpu);
@@ -315,7 +329,14 @@ mod ora {
             );
             let yv = d_yb.sub_offset(o * m, n * m);
             gpu.gemm_hfq4g256_residual_wmma_gfx12_mq4v2_fp8_lloyd(
-                &d_a, &xv, &yv, m, k, n, 1, [0, 0, 0, 0],
+                &d_a,
+                &xv,
+                &yv,
+                m,
+                k,
+                n,
+                1,
+                [0, 0, 0, 0],
             )
             .unwrap_or_else(|e| panic!("arm1/{name} seg{s}: {e:?}"));
             sync(&mut *gpu);
@@ -340,7 +361,18 @@ mod ora {
         let d_yu = gpu.zeros(&[c * um], DType::F32).unwrap();
         let (pa, ha, sa) = snap_prepared(&mut *gpu, &d_x, c, k);
         gpu.gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd(
-            &d_ag, &d_au, &d_x, &d_yg, &d_yu, gm, um, k, c, 1, [0, 0, 0, 0], [0, 0, 0, 0],
+            &d_ag,
+            &d_au,
+            &d_x,
+            &d_yg,
+            &d_yu,
+            gm,
+            um,
+            k,
+            c,
+            1,
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
         )
         .unwrap_or_else(|e| panic!("arm1/gate_up whole-C: {e:?}"));
         sync(&mut *gpu);
@@ -352,29 +384,55 @@ mod ora {
             let xv = d_xb.sub_offset(o * k, n * k);
             let (pb, hb, sb) = snap_prepared(&mut *gpu, &xv, n, k);
             let groups = k / 256;
-            cmp.check("arm1", &format!("gate_up/prep-codes-seg{s}"), &pa[o*k..(o+n)*k], &pb);
+            cmp.check(
+                "arm1",
+                &format!("gate_up/prep-codes-seg{s}"),
+                &pa[o * k..(o + n) * k],
+                &pb,
+            );
             cmp.check(
                 "arm1",
                 &format!("gate_up/prep-halfsums-seg{s}"),
-                &ha[o*groups*8..(o+n)*groups*8],
+                &ha[o * groups * 8..(o + n) * groups * 8],
                 &hb,
             );
             cmp.check(
                 "arm1",
                 &format!("gate_up/prep-rowscales-seg{s}"),
-                &sa[o*4..(o+n)*4],
+                &sa[o * 4..(o + n) * 4],
                 &sb,
             );
             let ygv = d_ygb.sub_offset(o * gm, n * gm);
             let yuv = d_yub.sub_offset(o * um, n * um);
             gpu.gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd(
-                &d_ag, &d_au, &xv, &ygv, &yuv, gm, um, k, n, 1, [0, 0, 0, 0], [0, 0, 0, 0],
+                &d_ag,
+                &d_au,
+                &xv,
+                &ygv,
+                &yuv,
+                gm,
+                um,
+                k,
+                n,
+                1,
+                [0, 0, 0, 0],
+                [0, 0, 0, 0],
             )
             .unwrap_or_else(|e| panic!("arm1/gate_up seg{s}: {e:?}"));
             sync(&mut *gpu);
         }
-        cmp.check("arm1", "gate_up/f32-gate", &download_f32_vec(&mut *gpu, &d_yg), &download_f32_vec(&mut *gpu, &d_ygb));
-        cmp.check("arm1", "gate_up/f32-up", &download_f32_vec(&mut *gpu, &d_yu), &download_f32_vec(&mut *gpu, &d_yub));
+        cmp.check(
+            "arm1",
+            "gate_up/f32-gate",
+            &download_f32_vec(&mut *gpu, &d_yg),
+            &download_f32_vec(&mut *gpu, &d_ygb),
+        );
+        cmp.check(
+            "arm1",
+            "gate_up/f32-up",
+            &download_f32_vec(&mut *gpu, &d_yu),
+            &download_f32_vec(&mut *gpu, &d_yub),
+        );
         for t in [d_ag, d_au, d_x, d_yg, d_yu, d_xb, d_ygb, d_yub] {
             gpu.free_tensor(t).unwrap();
         }
@@ -400,8 +458,26 @@ mod ora {
         );
         let (pa, ha, sa) = snap_prepared(&mut *gpu, &d_x, c, k);
         gpu.gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd(
-            &d_q, &d_z, &d_b, &d_a, &d_x, &yq, &yz, &yb, &ya, qm, zm, bm, am, k, c, 1,
-            [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0],
+            &d_q,
+            &d_z,
+            &d_b,
+            &d_a,
+            &d_x,
+            &yq,
+            &yz,
+            &yb,
+            &ya,
+            qm,
+            zm,
+            bm,
+            am,
+            k,
+            c,
+            1,
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
         )
         .unwrap_or_else(|e| panic!("arm1/qkvza whole-C: {e:?}"));
         sync(&mut *gpu);
@@ -417,26 +493,76 @@ mod ora {
             let xv = d_xb.sub_offset(o * k, n * k);
             let (pb, hb, sb) = snap_prepared(&mut *gpu, &xv, n, k);
             let groups = k / 256;
-            cmp.check("arm1", &format!("qkvza/prep-codes-seg{s}"), &pa[o*k..(o+n)*k], &pb);
-            cmp.check("arm1", &format!("qkvza/prep-halfsums-seg{s}"), &ha[o*groups*8..(o+n)*groups*8], &hb);
-            cmp.check("arm1", &format!("qkvza/prep-rowscales-seg{s}"), &sa[o*4..(o+n)*4], &sb);
+            cmp.check(
+                "arm1",
+                &format!("qkvza/prep-codes-seg{s}"),
+                &pa[o * k..(o + n) * k],
+                &pb,
+            );
+            cmp.check(
+                "arm1",
+                &format!("qkvza/prep-halfsums-seg{s}"),
+                &ha[o * groups * 8..(o + n) * groups * 8],
+                &hb,
+            );
+            cmp.check(
+                "arm1",
+                &format!("qkvza/prep-rowscales-seg{s}"),
+                &sa[o * 4..(o + n) * 4],
+                &sb,
+            );
             gpu.gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd(
-                &d_q, &d_z, &d_b, &d_a, &xv,
+                &d_q,
+                &d_z,
+                &d_b,
+                &d_a,
+                &xv,
                 &yqb.sub_offset(o * qm, n * qm),
                 &yzb.sub_offset(o * zm, n * zm),
                 &ybb.sub_offset(o * bm, n * bm),
                 &yab.sub_offset(o * am, n * am),
-                qm, zm, bm, am, k, n, 1,
-                [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0],
+                qm,
+                zm,
+                bm,
+                am,
+                k,
+                n,
+                1,
+                [0, 0, 0, 0],
+                [0, 0, 0, 0],
+                [0, 0, 0, 0],
+                [0, 0, 0, 0],
             )
             .unwrap_or_else(|e| panic!("arm1/qkvza seg{s}: {e:?}"));
             sync(&mut *gpu);
         }
-        cmp.check("arm1", "qkvza/f32-qkv", &download_f32_vec(&mut *gpu, &yq), &download_f32_vec(&mut *gpu, &yqb));
-        cmp.check("arm1", "qkvza/f32-z", &download_f32_vec(&mut *gpu, &yz), &download_f32_vec(&mut *gpu, &yzb));
-        cmp.check("arm1", "qkvza/f32-beta", &download_f32_vec(&mut *gpu, &yb), &download_f32_vec(&mut *gpu, &ybb));
-        cmp.check("arm1", "qkvza/f32-alpha", &download_f32_vec(&mut *gpu, &ya), &download_f32_vec(&mut *gpu, &yab));
-        for t in [d_q, d_z, d_b, d_a, d_x, yq, yz, yb, ya, d_xb, yqb, yzb, ybb, yab] {
+        cmp.check(
+            "arm1",
+            "qkvza/f32-qkv",
+            &download_f32_vec(&mut *gpu, &yq),
+            &download_f32_vec(&mut *gpu, &yqb),
+        );
+        cmp.check(
+            "arm1",
+            "qkvza/f32-z",
+            &download_f32_vec(&mut *gpu, &yz),
+            &download_f32_vec(&mut *gpu, &yzb),
+        );
+        cmp.check(
+            "arm1",
+            "qkvza/f32-beta",
+            &download_f32_vec(&mut *gpu, &yb),
+            &download_f32_vec(&mut *gpu, &ybb),
+        );
+        cmp.check(
+            "arm1",
+            "qkvza/f32-alpha",
+            &download_f32_vec(&mut *gpu, &ya),
+            &download_f32_vec(&mut *gpu, &yab),
+        );
+        for t in [
+            d_q, d_z, d_b, d_a, d_x, yq, yz, yb, ya, d_xb, yqb, yzb, ybb, yab,
+        ] {
             gpu.free_tensor(t).unwrap();
         }
     }
@@ -458,8 +584,22 @@ mod ora {
         );
         let (pa, ha, sa) = snap_prepared(&mut *gpu, &d_x, c, k);
         gpu.gemm_qkv_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd(
-            &d_q, &d_k, &d_v, &d_x, &yq, &yk, &yv, qm, km, vm, k, c, 1,
-            [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0],
+            &d_q,
+            &d_k,
+            &d_v,
+            &d_x,
+            &yq,
+            &yk,
+            &yv,
+            qm,
+            km,
+            vm,
+            k,
+            c,
+            1,
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
+            [0, 0, 0, 0],
         )
         .unwrap_or_else(|e| panic!("arm1/fa-qkv whole-C: {e:?}"));
         sync(&mut *gpu);
@@ -474,23 +614,63 @@ mod ora {
             let xv = d_xb.sub_offset(o * k, n * k);
             let (pb, hb, sb) = snap_prepared(&mut *gpu, &xv, n, k);
             let groups = k / 256;
-            cmp.check("arm1", &format!("fa-qkv/prep-codes-seg{s}"), &pa[o*k..(o+n)*k], &pb);
-            cmp.check("arm1", &format!("fa-qkv/prep-halfsums-seg{s}"), &ha[o*groups*8..(o+n)*groups*8], &hb);
-            cmp.check("arm1", &format!("fa-qkv/prep-rowscales-seg{s}"), &sa[o*4..(o+n)*4], &sb);
+            cmp.check(
+                "arm1",
+                &format!("fa-qkv/prep-codes-seg{s}"),
+                &pa[o * k..(o + n) * k],
+                &pb,
+            );
+            cmp.check(
+                "arm1",
+                &format!("fa-qkv/prep-halfsums-seg{s}"),
+                &ha[o * groups * 8..(o + n) * groups * 8],
+                &hb,
+            );
+            cmp.check(
+                "arm1",
+                &format!("fa-qkv/prep-rowscales-seg{s}"),
+                &sa[o * 4..(o + n) * 4],
+                &sb,
+            );
             gpu.gemm_qkv_hfq4g256_wmma_gfx12_mq4v2_fp8_lloyd(
-                &d_q, &d_k, &d_v, &xv,
+                &d_q,
+                &d_k,
+                &d_v,
+                &xv,
                 &yqb.sub_offset(o * qm, n * qm),
                 &ykb.sub_offset(o * km, n * km),
                 &yvb.sub_offset(o * vm, n * vm),
-                qm, km, vm, k, n, 1,
-                [0, 0, 0, 0], [0, 0, 0, 0], [0, 0, 0, 0],
+                qm,
+                km,
+                vm,
+                k,
+                n,
+                1,
+                [0, 0, 0, 0],
+                [0, 0, 0, 0],
+                [0, 0, 0, 0],
             )
             .unwrap_or_else(|e| panic!("arm1/fa-qkv seg{s}: {e:?}"));
             sync(&mut *gpu);
         }
-        cmp.check("arm1", "fa-qkv/f32-q", &download_f32_vec(&mut *gpu, &yq), &download_f32_vec(&mut *gpu, &yqb));
-        cmp.check("arm1", "fa-qkv/f32-k", &download_f32_vec(&mut *gpu, &yk), &download_f32_vec(&mut *gpu, &ykb));
-        cmp.check("arm1", "fa-qkv/f32-v", &download_f32_vec(&mut *gpu, &yv), &download_f32_vec(&mut *gpu, &yvb));
+        cmp.check(
+            "arm1",
+            "fa-qkv/f32-q",
+            &download_f32_vec(&mut *gpu, &yq),
+            &download_f32_vec(&mut *gpu, &yqb),
+        );
+        cmp.check(
+            "arm1",
+            "fa-qkv/f32-k",
+            &download_f32_vec(&mut *gpu, &yk),
+            &download_f32_vec(&mut *gpu, &ykb),
+        );
+        cmp.check(
+            "arm1",
+            "fa-qkv/f32-v",
+            &download_f32_vec(&mut *gpu, &yv),
+            &download_f32_vec(&mut *gpu, &yvb),
+        );
         for t in [d_q, d_k, d_v, d_x, yq, yk, yv, d_xb, yqb, ykb, yvb] {
             gpu.free_tensor(t).unwrap();
         }
@@ -543,9 +723,15 @@ mod ora {
         s0: Vec<f32>,
     }
     fn gdn_inputs(n: usize, salt: u32, gate_mode: u32) -> GdnInputs {
-        let q = (0..n * GVD).map(|i| prng_f32(i as u64, salt) * 0.5).collect();
-        let k = (0..n * GVD).map(|i| prng_f32(i as u64, salt ^ 1) * 0.5).collect();
-        let v = (0..n * GVD).map(|i| prng_f32(i as u64, salt ^ 2) * 0.5).collect();
+        let q = (0..n * GVD)
+            .map(|i| prng_f32(i as u64, salt) * 0.5)
+            .collect();
+        let k = (0..n * GVD)
+            .map(|i| prng_f32(i as u64, salt ^ 1) * 0.5)
+            .collect();
+        let v = (0..n * GVD)
+            .map(|i| prng_f32(i as u64, salt ^ 2) * 0.5)
+            .collect();
         let gate = (0..n * GH)
             .map(|i| match gate_mode {
                 0 => -0.001 + prng_f32(i as u64, salt ^ 3) * 0.0001,
@@ -559,14 +745,26 @@ mod ora {
         let s0 = (0..GH * GD * GD)
             .map(|i| prng_f32(i as u64, salt ^ 5) * 0.05)
             .collect();
-        GdnInputs { q, k, v, gate, beta, s0 }
+        GdnInputs {
+            q,
+            k,
+            v,
+            gate,
+            beta,
+            s0,
+        }
     }
     struct GdnState {
         sq: GpuTensor,
         sc: GpuTensor,
         ef: Option<GpuTensor>,
     }
-    fn upload_gdn_state(gpu: &mut Gpu, codes: &[i8], scales: &[f32], ef: Option<&[u16]>) -> GdnState {
+    fn upload_gdn_state(
+        gpu: &mut Gpu,
+        codes: &[i8],
+        scales: &[f32],
+        ef: Option<&[u16]>,
+    ) -> GdnState {
         let sq = upload_i8(&mut *gpu, codes, &[GH * GD * GD]);
         let sc = gpu.upload_f32(scales, &[GH * GD]).unwrap();
         let ef_t = ef.map(|e| upload_u16(&mut *gpu, e, &[GH * GD * GD]));
@@ -575,7 +773,11 @@ mod ora {
     fn download_gdn_state(gpu: &mut Gpu, st: &GdnState) -> (Vec<u8>, Vec<u8>, Vec<u8>) {
         let a = download_raw(&mut *gpu, &st.sq);
         let b = download_f32_vec(&mut *gpu, &st.sc);
-        let c = st.ef.as_ref().map(|t| download_raw(&mut *gpu, t)).unwrap_or_default();
+        let c = st
+            .ef
+            .as_ref()
+            .map(|t| download_raw(&mut *gpu, t))
+            .unwrap_or_default();
         (a, b, c)
     }
     fn gdn_commit(
@@ -590,7 +792,18 @@ mod ora {
         n: usize,
     ) {
         gpu.gated_delta_net_q8_batch_seq(
-            q, k, v, g, b, &st.sq, &st.sc, out, n, GH, GD, st.ef.as_ref(),
+            q,
+            k,
+            v,
+            g,
+            b,
+            &st.sq,
+            &st.sc,
+            out,
+            n,
+            GH,
+            GD,
+            st.ef.as_ref(),
         )
         .unwrap_or_else(|e| panic!("gdn commit n={n}: {e:?}"));
         sync(&mut *gpu);
@@ -608,7 +821,11 @@ mod ora {
         use_ef: bool,
     ) {
         let (codes, scales, efv) = if zero_state {
-            (vec![0i8; GH * GD * GD], vec![1.0f32; GH * GD], vec![0u16; GH * GD * GD])
+            (
+                vec![0i8; GH * GD * GD],
+                vec![1.0f32; GH * GD],
+                vec![0u16; GH * GD * GD],
+            )
         } else {
             quantize_s(&inp.s0)
         };
@@ -632,21 +849,34 @@ mod ora {
             let (o, m) = (s * 512, (n - s * 512).min(512));
             // Candidate commit on views.
             restore_gdn_requant_frame_checkpoint(frame0 + (o as u32));
-            gdn_commit(&mut *gpu, &cst,
-            &cq.sub_offset(o * GVD, m * GVD),
-            &ck.sub_offset(o * GVD, m * GVD),
-            &cv.sub_offset(o * GVD, m * GVD),
-            &cg.sub_offset(o * GH, m * GH),
-            &cb.sub_offset(o * GH, m * GH),
-            &cout.sub_offset(o * GVD, m * GVD),
-            m,);
+            gdn_commit(
+                &mut *gpu,
+                &cst,
+                &cq.sub_offset(o * GVD, m * GVD),
+                &ck.sub_offset(o * GVD, m * GVD),
+                &cv.sub_offset(o * GVD, m * GVD),
+                &cg.sub_offset(o * GH, m * GH),
+                &cb.sub_offset(o * GH, m * GH),
+                &cout.sub_offset(o * GVD, m * GVD),
+                m,
+            );
             // Legacy commit on independent clones of the same bytes.
             restore_gdn_requant_frame_checkpoint(frame0 + (o as u32));
-            let lq = gpu.upload_f32(&inp.q[o * GVD..(o + m) * GVD], &[m, GVD]).unwrap();
-            let lk = gpu.upload_f32(&inp.k[o * GVD..(o + m) * GVD], &[m, GVD]).unwrap();
-            let lv = gpu.upload_f32(&inp.v[o * GVD..(o + m) * GVD], &[m, GVD]).unwrap();
-            let lg = gpu.upload_f32(&inp.gate[o * GH..(o + m) * GH], &[m, GH]).unwrap();
-            let lb = gpu.upload_f32(&inp.beta[o * GH..(o + m) * GH], &[m, GH]).unwrap();
+            let lq = gpu
+                .upload_f32(&inp.q[o * GVD..(o + m) * GVD], &[m, GVD])
+                .unwrap();
+            let lk = gpu
+                .upload_f32(&inp.k[o * GVD..(o + m) * GVD], &[m, GVD])
+                .unwrap();
+            let lv = gpu
+                .upload_f32(&inp.v[o * GVD..(o + m) * GVD], &[m, GVD])
+                .unwrap();
+            let lg = gpu
+                .upload_f32(&inp.gate[o * GH..(o + m) * GH], &[m, GH])
+                .unwrap();
+            let lb = gpu
+                .upload_f32(&inp.beta[o * GH..(o + m) * GH], &[m, GH])
+                .unwrap();
             let lo = gpu.zeros(&[m, GVD], DType::F32).unwrap();
             gdn_commit(&mut *gpu, &lst, &lq, &lk, &lv, &lg, &lb, &lo, m);
             // Compare this commit's outputs + full state.
@@ -684,23 +914,63 @@ mod ora {
     pub fn run_arm2(gpu: &mut Gpu, cmp: &mut Cmp, c: usize) {
         eprintln!("arm2: GDN seam differential (views vs independent, per-512 commits)");
         for &gate_mode in &[0u32, 1, 2] {
-            arm2_case(&mut *gpu, cmp, &format!("c{c}-gate{gate_mode}"), &gdn_inputs(c, 0x6D4, gate_mode), c, false, true);
+            arm2_case(
+                &mut *gpu,
+                cmp,
+                &format!("c{c}-gate{gate_mode}"),
+                &gdn_inputs(c, 0x6D4, gate_mode),
+                c,
+                false,
+                true,
+            );
         }
         // Zero-state fixture.
         let zn = c.min(1024);
-        arm2_case(&mut *gpu, cmp, "zero-state", &gdn_inputs(zn, 0x2E0, 2), zn, true, true);
+        arm2_case(
+            &mut *gpu,
+            cmp,
+            "zero-state",
+            &gdn_inputs(zn, 0x2E0, 2),
+            zn,
+            true,
+            true,
+        );
         // Tails keep the original schedule: same commit sequence both arms.
         for &tn in &[513usize, 1025] {
-            arm2_case(&mut *gpu, cmp, &format!("tail{tn}"), &gdn_inputs(tn, 0x7A1, 2), tn, false, true);
+            arm2_case(
+                &mut *gpu,
+                cmp,
+                &format!("tail{tn}"),
+                &gdn_inputs(tn, 0x7A1, 2),
+                tn,
+                false,
+                true,
+            );
         }
         // EF-off determinism under identical frame checkpoints (oracle-only restore).
         let en = 512usize;
-        arm2_case(&mut *gpu, cmp, "ef-off", &gdn_inputs(en, 0x0EF0, 2), en, false, false);
+        arm2_case(
+            &mut *gpu,
+            cmp,
+            "ef-off",
+            &gdn_inputs(en, 0x0EF0, 2),
+            en,
+            false,
+            false,
+        );
         // Per-token-requant exclusion route: same schedule both arms, must agree.
         let prev = std::env::var("HIPFIRE_DN_REQUANT_PER_TOKEN").ok();
         std::env::set_var("HIPFIRE_DN_REQUANT_PER_TOKEN", "1");
         let rn = 1024usize;
-        arm2_case(&mut *gpu, cmp, "rpt-on", &gdn_inputs(rn, 0x09A7, 2), rn, false, true);
+        arm2_case(
+            &mut *gpu,
+            cmp,
+            "rpt-on",
+            &gdn_inputs(rn, 0x09A7, 2),
+            rn,
+            false,
+            true,
+        );
         match prev {
             Some(v) => std::env::set_var("HIPFIRE_DN_REQUANT_PER_TOKEN", v),
             None => std::env::remove_var("HIPFIRE_DN_REQUANT_PER_TOKEN"),
@@ -711,9 +981,15 @@ mod ora {
     const CV: usize = 6144;
     const CCH: usize = 2 * CK + CV; // 10240
     fn conv_case(gpu: &mut Gpu, cmp: &mut Cmp, tag: &str, n: usize) {
-        let inp_h: Vec<f32> = (0..n * CCH).map(|i| prng_f32(i as u64, 0xC04) * 0.5).collect();
-        let w_h: Vec<f32> = (0..CCH * 4).map(|i| prng_f32(i as u64, 0xE16) * 0.25).collect();
-        let ring0: Vec<f32> = (0..CCH * 3).map(|i| prng_f32(i as u64, 0x916) * 0.25).collect();
+        let inp_h: Vec<f32> = (0..n * CCH)
+            .map(|i| prng_f32(i as u64, 0xC04) * 0.5)
+            .collect();
+        let w_h: Vec<f32> = (0..CCH * 4)
+            .map(|i| prng_f32(i as u64, 0xE16) * 0.25)
+            .collect();
+        let ring0: Vec<f32> = (0..CCH * 3)
+            .map(|i| prng_f32(i as u64, 0x916) * 0.25)
+            .collect();
         // Candidate: one whole-n call on shared buffers.
         let di = gpu.upload_f32(&inp_h, &[n, CCH]).unwrap();
         let dw = gpu.upload_f32(&w_h, &[CCH * 4]).unwrap();
@@ -743,17 +1019,41 @@ mod ora {
                 &dk2.sub_offset(o * CK, m * CK),
                 &dv2.sub_offset(o * CV, m * CV),
                 &di2.sub_offset(o * CCH, m * CCH),
-                &dw, &ds2, CK, CV, m,
+                &dw,
+                &ds2,
+                CK,
+                CV,
+                m,
             )
             .unwrap_or_else(|e| panic!("arm3/{tag} seg{seg}: {e:?}"));
             sync(&mut *gpu);
             o += m;
             seg += 1;
         }
-        cmp.check("arm3", &format!("{tag}/q-raw"), &download_f32_vec(&mut *gpu, &dq), &download_f32_vec(&mut *gpu, &dq2));
-        cmp.check("arm3", &format!("{tag}/k-raw"), &download_f32_vec(&mut *gpu, &dk), &download_f32_vec(&mut *gpu, &dk2));
-        cmp.check("arm3", &format!("{tag}/v-raw"), &download_f32_vec(&mut *gpu, &dv), &download_f32_vec(&mut *gpu, &dv2));
-        cmp.check("arm3", &format!("{tag}/ring-final"), &download_f32_vec(&mut *gpu, &ds), &download_f32_vec(&mut *gpu, &ds2));
+        cmp.check(
+            "arm3",
+            &format!("{tag}/q-raw"),
+            &download_f32_vec(&mut *gpu, &dq),
+            &download_f32_vec(&mut *gpu, &dq2),
+        );
+        cmp.check(
+            "arm3",
+            &format!("{tag}/k-raw"),
+            &download_f32_vec(&mut *gpu, &dk),
+            &download_f32_vec(&mut *gpu, &dk2),
+        );
+        cmp.check(
+            "arm3",
+            &format!("{tag}/v-raw"),
+            &download_f32_vec(&mut *gpu, &dv),
+            &download_f32_vec(&mut *gpu, &dv2),
+        );
+        cmp.check(
+            "arm3",
+            &format!("{tag}/ring-final"),
+            &download_f32_vec(&mut *gpu, &ds),
+            &download_f32_vec(&mut *gpu, &ds2),
+        );
         for t in [di, dw, ds, dq, dk, dv, di2, ds2, dq2, dk2, dv2] {
             gpu.free_tensor(t).unwrap();
         }
@@ -799,7 +1099,9 @@ mod ora {
                         let r = prng_u32((g * 64 + kv * 8 + b) as u64 * 32 + cc as u64, salt);
                         codes[cc] = ((r % 61) as i8).wrapping_sub(30);
                     }
-                    let scale = 0.01 + (prng_u32((g * 32 + kv * 8 + b) as u64, salt ^ 0xabc) % 100) as f32 * 0.001;
+                    let scale = 0.01
+                        + (prng_u32((g * 32 + kv * 8 + b) as u64, salt ^ 0xabc) % 100) as f32
+                            * 0.001;
                     let blk = pack_q8_blk(scale, &codes);
                     let off = g * AROW + (kv * ABPH + b) * AQ8B;
                     buf[off..off + 34].copy_from_slice(&blk);
@@ -818,9 +1120,12 @@ mod ora {
                 for g3 in 0..32 {
                     let mut packed = 0u32;
                     for i in 0..8 {
-                        packed |= ((prng_u32((g * 256 + kv * 64 + g3 * 8 + i) as u64, salt) % 8) as u32) << (3 * i);
+                        packed |= ((prng_u32((g * 256 + kv * 64 + g3 * 8 + i) as u64, salt) % 8)
+                            as u32)
+                            << (3 * i);
                     }
-                    buf[base + 4 + g3 * 3..base + 4 + g3 * 3 + 3].copy_from_slice(&packed.to_le_bytes()[..3]);
+                    buf[base + 4 + g3 * 3..base + 4 + g3 * 3 + 3]
+                        .copy_from_slice(&packed.to_le_bytes()[..3]);
                 }
             }
         }
@@ -833,13 +1138,26 @@ mod ora {
         }
         b
     }
-    fn check_pos_view(gpu: &mut Gpu, cmp: &mut Cmp, arm: &str, tag: &str, base: &GpuTensor, view: &GpuTensor, start: usize, row0: usize, n: usize) {
+    fn check_pos_view(
+        gpu: &mut Gpu,
+        cmp: &mut Cmp,
+        arm: &str,
+        tag: &str,
+        base: &GpuTensor,
+        view: &GpuTensor,
+        start: usize,
+        row0: usize,
+        n: usize,
+    ) {
         // Geometry: view byte pointer must sit exactly 4*row0 past the base
         // (Raw positions: 4 bytes per i32; mirrors the repaired F1 contract).
         let delta = (view.buf.as_ptr() as usize).wrapping_sub(base.buf.as_ptr() as usize);
         if delta != 4 * row0 {
             cmp.failures += 1;
-            eprintln!("  FAIL {arm} {tag}/pos-geometry: byte_delta={delta} want={}", 4 * row0);
+            eprintln!(
+                "  FAIL {arm} {tag}/pos-geometry: byte_delta={delta} want={}",
+                4 * row0
+            );
         }
         let got = download_raw(&mut *gpu, view);
         let mut exp = Vec::with_capacity(n * 4);
@@ -850,16 +1168,41 @@ mod ora {
     }
     /// Tiled-views arm vs independent-operands arm at (batch=C, start, seq_len).
     /// Per-tile launch args identical: batch=512, tile-local max_ctx=start+o+512.
-    fn attn_case(gpu: &mut Gpu, cmp: &mut Cmp, tag: &str, batch: usize, start: usize, seq_len: usize, fwht3: bool, s1: &GpuTensor, s2: &GpuTensor) {
+    fn attn_case(
+        gpu: &mut Gpu,
+        cmp: &mut Cmp,
+        tag: &str,
+        batch: usize,
+        start: usize,
+        seq_len: usize,
+        fwht3: bool,
+        s1: &GpuTensor,
+        s2: &GpuTensor,
+    ) {
         assert!(batch % 512 == 0 && batch >= 512);
         let pos_h: Vec<i32> = (0..batch).map(|b| (start + b) as i32).collect();
-        let q_h: Vec<f32> = (0..batch * AQO).map(|i| prng_f32(i as u64, 0x911) * 0.5).collect();
-        let k_h = if fwht3 { fill_f3k(seq_len, 0x922) } else { fill_q8(seq_len, 0x922) };
+        let q_h: Vec<f32> = (0..batch * AQO)
+            .map(|i| prng_f32(i as u64, 0x911) * 0.5)
+            .collect();
+        let k_h = if fwht3 {
+            fill_f3k(seq_len, 0x922)
+        } else {
+            fill_q8(seq_len, 0x922)
+        };
         let v_h = fill_q8(seq_len, 0x933);
         let pos_b = pos_bytes_of(&pos_h);
-        let launch = |g: &mut Gpu, q: &GpuTensor, kk: &GpuTensor, vv: &GpuTensor, o: &GpuTensor, p: &GpuTensor, bsz: usize, mctx: usize| {
+        let launch = |g: &mut Gpu,
+                      q: &GpuTensor,
+                      kk: &GpuTensor,
+                      vv: &GpuTensor,
+                      o: &GpuTensor,
+                      p: &GpuTensor,
+                      bsz: usize,
+                      mctx: usize| {
             if fwht3 {
-                g.attention_q8_0_fa2_gqa_fwht3k_gfx1201(q, kk, vv, o, p, s1, s2, ANH, ANKV, AHD, mctx, bsz)
+                g.attention_q8_0_fa2_gqa_fwht3k_gfx1201(
+                    q, kk, vv, o, p, s1, s2, ANH, ANKV, AHD, mctx, bsz,
+                )
             } else {
                 g.attention_q8_0_fa2_gqa_gfx1201(q, kk, vv, o, p, ANH, ANKV, AHD, mctx, bsz)
             }
@@ -877,7 +1220,17 @@ mod ora {
             let qv = dq.sub_offset(o * AQO, 512 * AQO);
             let ov = dout.sub_offset(o * AQO, 512 * AQO);
             let pv = dp.sub_offset(4 * o, 4 * 512);
-            check_pos_view(&mut *gpu, cmp, "arm4", &format!("{tag}/tile{s}"), &dp, &pv, start, o, 512);
+            check_pos_view(
+                &mut *gpu,
+                cmp,
+                "arm4",
+                &format!("{tag}/tile{s}"),
+                &dp,
+                &pv,
+                start,
+                o,
+                512,
+            );
             launch(&mut *gpu, &qv, &dk, &dv, &ov, &pv, 512, start + o + 512);
         }
         // Legacy: independent operands per tile (same bytes, fresh tensors).
@@ -887,25 +1240,73 @@ mod ora {
             let o = s * 512;
             let dk2 = gpu.upload_raw(&k_h, &[k_h.len()]).unwrap();
             let dv2 = gpu.upload_raw(&v_h, &[v_h.len()]).unwrap();
-            let dq2 = gpu.upload_f32(&q_h[o * AQO..(o + 512) * AQO], &[512, ANH, AHD]).unwrap();
-            let dp2 = gpu.upload_raw(&pos_b[4 * o..4 * (o + 512)], &[4 * 512]).unwrap();
+            let dq2 = gpu
+                .upload_f32(&q_h[o * AQO..(o + 512) * AQO], &[512, ANH, AHD])
+                .unwrap();
+            let dp2 = gpu
+                .upload_raw(&pos_b[4 * o..4 * (o + 512)], &[4 * 512])
+                .unwrap();
             let do2 = gpu.zeros(&[512 * AQO], DType::F32).unwrap();
             let pv2 = dp2.sub_offset(0, 4 * 512);
-            launch(&mut *gpu, &dq2, &dk2, &dv2, &do2, &pv2, 512, start + o + 512);
+            launch(
+                &mut *gpu,
+                &dq2,
+                &dk2,
+                &dv2,
+                &do2,
+                &pv2,
+                512,
+                start + o + 512,
+            );
             indep_out.extend_from_slice(&download_f32_vec(&mut *gpu, &do2));
             indep_q.extend_from_slice(&download_f32_vec(&mut *gpu, &dq2));
             // Cache bytes after each tile must be untouched.
-            cmp.check("arm4", &format!("{tag}/tile{s}/k-guard"), &download_raw(&mut *gpu, &dk2), &k_h);
-            cmp.check("arm4", &format!("{tag}/tile{s}/v-guard"), &download_raw(&mut *gpu, &dv2), &v_h);
+            cmp.check(
+                "arm4",
+                &format!("{tag}/tile{s}/k-guard"),
+                &download_raw(&mut *gpu, &dk2),
+                &k_h,
+            );
+            cmp.check(
+                "arm4",
+                &format!("{tag}/tile{s}/v-guard"),
+                &download_raw(&mut *gpu, &dv2),
+                &v_h,
+            );
             for t in [dk2, dv2, dq2, dp2, do2] {
                 gpu.free_tensor(t).unwrap();
             }
         }
-        cmp.check("arm4", &format!("{tag}/out"), &download_f32_vec(&mut *gpu, &dout), &indep_out);
-        cmp.check("arm4", &format!("{tag}/q-unchanged"), &download_f32_vec(&mut *gpu, &dq), &indep_q);
-        cmp.check("arm4", &format!("{tag}/k-cache"), &download_raw(&mut *gpu, &dk), &k_h);
-        cmp.check("arm4", &format!("{tag}/v-cache"), &download_raw(&mut *gpu, &dv), &v_h);
-        cmp.check("arm4", &format!("{tag}/pos-guard"), &download_raw(&mut *gpu, &dp), &pos_b);
+        cmp.check(
+            "arm4",
+            &format!("{tag}/out"),
+            &download_f32_vec(&mut *gpu, &dout),
+            &indep_out,
+        );
+        cmp.check(
+            "arm4",
+            &format!("{tag}/q-unchanged"),
+            &download_f32_vec(&mut *gpu, &dq),
+            &indep_q,
+        );
+        cmp.check(
+            "arm4",
+            &format!("{tag}/k-cache"),
+            &download_raw(&mut *gpu, &dk),
+            &k_h,
+        );
+        cmp.check(
+            "arm4",
+            &format!("{tag}/v-cache"),
+            &download_raw(&mut *gpu, &dv),
+            &v_h,
+        );
+        cmp.check(
+            "arm4",
+            &format!("{tag}/pos-guard"),
+            &download_raw(&mut *gpu, &dp),
+            &pos_b,
+        );
         for t in [dk, dv, dq, dp, dout] {
             gpu.free_tensor(t).unwrap();
         }
@@ -926,12 +1327,52 @@ mod ora {
             (1024, 7168, 8192),
         ];
         for &(b, st, seqlen) in cases {
-            attn_case(&mut *gpu, cmp, &format!("q8-b{b}-s{st}-L{seqlen}"), b, st, seqlen, false, &d_s1, &d_s2);
-            attn_case(&mut *gpu, cmp, &format!("f3-b{b}-s{st}-L{seqlen}"), b, st, seqlen, true, &d_s1, &d_s2);
+            attn_case(
+                &mut *gpu,
+                cmp,
+                &format!("q8-b{b}-s{st}-L{seqlen}"),
+                b,
+                st,
+                seqlen,
+                false,
+                &d_s1,
+                &d_s2,
+            );
+            attn_case(
+                &mut *gpu,
+                cmp,
+                &format!("f3-b{b}-s{st}-L{seqlen}"),
+                b,
+                st,
+                seqlen,
+                true,
+                &d_s1,
+                &d_s2,
+            );
         }
         if c >= 1024 {
-            attn_case(&mut *gpu, cmp, &format!("q8-b{c}-s0"), c, 0, c, false, &d_s1, &d_s2);
-            attn_case(&mut *gpu, cmp, &format!("f3-b{c}-s0"), c, 0, c, true, &d_s1, &d_s2);
+            attn_case(
+                &mut *gpu,
+                cmp,
+                &format!("q8-b{c}-s0"),
+                c,
+                0,
+                c,
+                false,
+                &d_s1,
+                &d_s2,
+            );
+            attn_case(
+                &mut *gpu,
+                cmp,
+                &format!("f3-b{c}-s0"),
+                c,
+                0,
+                c,
+                true,
+                &d_s1,
+                &d_s2,
+            );
         }
         gpu.free_tensor(d_s1).unwrap();
         gpu.free_tensor(d_s2).unwrap();
@@ -946,9 +1387,15 @@ mod ora {
         let config = qwen35::config_from_hfq(&hfq).expect("read config");
         eprintln!(
             "model: dim={} layers={} kv_heads={} head_dim={} vocab={} la_k={}x{} la_v={}x{}",
-            config.dim, config.n_layers, config.n_kv_heads, config.head_dim,
-            config.vocab_size, config.linear_num_key_heads, config.linear_key_head_dim,
-            config.linear_num_value_heads, config.linear_value_head_dim,
+            config.dim,
+            config.n_layers,
+            config.n_kv_heads,
+            config.head_dim,
+            config.vocab_size,
+            config.linear_num_key_heads,
+            config.linear_key_head_dim,
+            config.linear_num_value_heads,
+            config.linear_value_head_dim,
         );
         let mut src = qwen35::HfqSource::new(&mut hfq, &config);
         let layout = qwen35::Layout::single(config.n_layers);
@@ -957,7 +1404,9 @@ mod ora {
         ModelCtx { config, weights }
     }
     fn det_tokens(l: usize, vocab: usize) -> Vec<u32> {
-        (0..l).map(|i| (((i * 131) % (vocab - 1)) + 1) as u32).collect()
+        (0..l)
+            .map(|i| (((i * 131) % (vocab - 1)) + 1) as u32)
+            .collect()
     }
     pub struct Snap {
         pub dn_s: Vec<Vec<u8>>,
@@ -971,18 +1420,67 @@ mod ora {
         pub hidden: Vec<u8>,
         pub logits: Vec<u8>,
     }
-    fn snap_state(gpu: &mut Gpu, dn: &DeltaNetState, kv: &KvCache, scratch: &Qwen35Scratch, hbuf: &GpuTensor) -> Snap {
-        let dn_s = dn.s_matrices.iter().map(|t| download_raw(&mut *gpu, t)).collect();
-        let dn_sc = dn.s_scales.iter().map(|t| download_f32_vec(&mut *gpu, t)).collect();
-        let dn_ef = dn.s_ef_residual.iter().map(|t| download_raw(&mut *gpu, t)).collect();
-        let conv = dn.conv_states.iter().map(|t| download_f32_vec(&mut *gpu, t)).collect();
-        let kv_k = kv.k_gpu.iter().map(|t| download_raw(&mut *gpu, t)).collect();
-        let kv_v = kv.v_gpu.iter().map(|t| download_raw(&mut *gpu, t)).collect();
-        let kv_ks = kv.k_scales.iter().map(|t| download_raw(&mut *gpu, t)).collect();
-        let kv_vs = kv.v_scales.iter().map(|t| download_raw(&mut *gpu, t)).collect();
+    fn snap_state(
+        gpu: &mut Gpu,
+        dn: &DeltaNetState,
+        kv: &KvCache,
+        scratch: &Qwen35Scratch,
+        hbuf: &GpuTensor,
+    ) -> Snap {
+        let dn_s = dn
+            .s_matrices
+            .iter()
+            .map(|t| download_raw(&mut *gpu, t))
+            .collect();
+        let dn_sc = dn
+            .s_scales
+            .iter()
+            .map(|t| download_f32_vec(&mut *gpu, t))
+            .collect();
+        let dn_ef = dn
+            .s_ef_residual
+            .iter()
+            .map(|t| download_raw(&mut *gpu, t))
+            .collect();
+        let conv = dn
+            .conv_states
+            .iter()
+            .map(|t| download_f32_vec(&mut *gpu, t))
+            .collect();
+        let kv_k = kv
+            .k_gpu
+            .iter()
+            .map(|t| download_raw(&mut *gpu, t))
+            .collect();
+        let kv_v = kv
+            .v_gpu
+            .iter()
+            .map(|t| download_raw(&mut *gpu, t))
+            .collect();
+        let kv_ks = kv
+            .k_scales
+            .iter()
+            .map(|t| download_raw(&mut *gpu, t))
+            .collect();
+        let kv_vs = kv
+            .v_scales
+            .iter()
+            .map(|t| download_raw(&mut *gpu, t))
+            .collect();
         let hidden = download_f32_vec(&mut *gpu, hbuf);
         let logits = download_f32_vec(&mut *gpu, &scratch.logits);
-        Snap { dn_s, dn_sc, dn_ef, conv, kv_k, kv_v, kv_ks, kv_vs, hidden, logits }
+        Snap {
+            dn_s,
+            dn_sc,
+            dn_ef,
+            conv,
+            kv_k,
+            kv_v,
+            kv_ks,
+            kv_vs,
+            hidden,
+            logits,
+        }
     }
     fn cmp_snap(cmp: &mut Cmp, arm: &str, tag: &str, a: &Snap, b: &Snap, skip_kv: bool) {
         assert_eq!(a.dn_s.len(), b.dn_s.len(), "dn layer count");
@@ -994,7 +1492,10 @@ mod ora {
             cmp.check(arm, &format!("{tag}/L{li}/scales"), x, y);
         }
         assert_eq!(a.dn_ef.len(), b.dn_ef.len(), "EF layer count");
-        assert!(!a.dn_ef.is_empty(), "{tag}: EF residual empty — not Q8+EF, admission void");
+        assert!(
+            !a.dn_ef.is_empty(),
+            "{tag}: EF residual empty — not Q8+EF, admission void"
+        );
         for (li, (x, y)) in a.dn_ef.iter().zip(b.dn_ef.iter()).enumerate() {
             cmp.check(arm, &format!("{tag}/L{li}/EF"), x, y);
         }
@@ -1023,29 +1524,84 @@ mod ora {
     fn full_run(gpu: &mut Gpu, m: &ModelCtx, l: usize, ceiling: usize, resume_p: usize) -> Snap {
         std::env::set_var("HIPFIRE_PREFILL_MAX_BATCH", format!("{ceiling}"));
         let kv_seq = (l + 16).max(512);
-        let mut kv = KvCache::new_gpu_q8(&mut *gpu, m.config.n_layers, m.config.n_kv_heads, m.config.head_dim, kv_seq)
-            .unwrap_or_else(|e| panic!("kv q8 kv_seq={kv_seq}: {e:?}"));
+        let mut kv = KvCache::new_gpu_q8(
+            &mut *gpu,
+            m.config.n_layers,
+            m.config.n_kv_heads,
+            m.config.head_dim,
+            kv_seq,
+        )
+        .unwrap_or_else(|e| panic!("kv q8 kv_seq={kv_seq}: {e:?}"));
         let mut dn = DeltaNetState::new(&mut *gpu, &m.config).expect("dn fresh");
-        assert!(!dn.s_ef_residual.is_empty(), "fresh DN has no EF — not Q8+EF");
+        assert!(
+            !dn.s_ef_residual.is_empty(),
+            "fresh DN has no EF — not Q8+EF"
+        );
         let scratch = Qwen35Scratch::new_with_kv_max(&mut *gpu, &m.config, 128, kv_seq)
             .unwrap_or_else(|e| panic!("scratch kv_seq={kv_seq}: {e:?}"));
-        let admitted = qwen35::ordinary_prefill_chunk_limit(&*gpu, &m.weights, &m.config, &dn, None);
+        let admitted =
+            qwen35::ordinary_prefill_chunk_limit(&*gpu, &m.weights, &m.config, &dn, &kv, None);
         match &admitted {
             Ok(a) => eprintln!("  run L={l} resume_p={resume_p}: requested={ceiling} admitted={a}"),
             Err(e) => eprintln!("  run L={l} resume_p={resume_p}: requested={ceiling} admission-query failed: {e:?}"),
         }
-        let hbuf = gpu.alloc_tensor(&[l, m.config.dim], DType::F32).expect("hbuf");
+        let hbuf = gpu
+            .alloc_tensor(&[l, m.config.dim], DType::F32)
+            .expect("hbuf");
         let toks = det_tokens(l, m.config.vocab_size);
         if resume_p == 0 {
-            qwen35::forward_prefill_batch(&mut *gpu, &m.weights, &m.config, &toks, 0, &mut kv, &mut dn, &scratch, None, Some(&hbuf), None, None)
-                .unwrap_or_else(|e| panic!("forward l={l} ceiling={ceiling}: {e:?}"));
+            qwen35::forward_prefill_batch(
+                &mut *gpu,
+                &m.weights,
+                &m.config,
+                &toks,
+                0,
+                &mut kv,
+                &mut dn,
+                &scratch,
+                None,
+                Some(&hbuf),
+                None,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("forward l={l} ceiling={ceiling}: {e:?}"));
         } else {
-            let hbuf_p = gpu.alloc_tensor(&[resume_p, m.config.dim], DType::F32).expect("hbuf-p");
-            qwen35::forward_prefill_batch(&mut *gpu, &m.weights, &m.config, &toks[..resume_p], 0, &mut kv, &mut dn, &scratch, None, Some(&hbuf_p), None, None)
-                .unwrap_or_else(|e| panic!("forward prefix p={resume_p}: {e:?}"));
-            let hbuf2 = gpu.alloc_tensor(&[(l - resume_p), m.config.dim], DType::F32).expect("hbuf2");
-            qwen35::forward_prefill_batch(&mut *gpu, &m.weights, &m.config, &toks[resume_p..], resume_p, &mut kv, &mut dn, &scratch, None, Some(&hbuf2), None, None)
-                .unwrap_or_else(|e| panic!("forward extend l={l} p={resume_p}: {e:?}"));
+            let hbuf_p = gpu
+                .alloc_tensor(&[resume_p, m.config.dim], DType::F32)
+                .expect("hbuf-p");
+            qwen35::forward_prefill_batch(
+                &mut *gpu,
+                &m.weights,
+                &m.config,
+                &toks[..resume_p],
+                0,
+                &mut kv,
+                &mut dn,
+                &scratch,
+                None,
+                Some(&hbuf_p),
+                None,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("forward prefix p={resume_p}: {e:?}"));
+            let hbuf2 = gpu
+                .alloc_tensor(&[(l - resume_p), m.config.dim], DType::F32)
+                .expect("hbuf2");
+            qwen35::forward_prefill_batch(
+                &mut *gpu,
+                &m.weights,
+                &m.config,
+                &toks[resume_p..],
+                resume_p,
+                &mut kv,
+                &mut dn,
+                &scratch,
+                None,
+                Some(&hbuf2),
+                None,
+                None,
+            )
+            .unwrap_or_else(|e| panic!("forward extend l={l} p={resume_p}: {e:?}"));
             sync(&mut *gpu);
             // Splice prefix + extend hidden rows into hbuf for comparison.
             let pre = download_f32_vec(&mut *gpu, &hbuf_p);
@@ -1067,7 +1623,9 @@ mod ora {
     }
     pub fn run_arm5(gpu: &mut Gpu, cmp: &mut Cmp, c: usize, m: &ModelCtx) {
         eprintln!("arm5: full model fresh + resumed-prefix, 512 vs {c}");
-        let lens: &[usize] = &[512, 1024, 2048, 4096, 8192, 32768, 511, 513, 1023, 1025, 1537, 2049, 4097, 8193];
+        let lens: &[usize] = &[
+            512, 1024, 2048, 4096, 8192, 32768, 511, 513, 1023, 1025, 1537, 2049, 4097, 8193,
+        ];
         for &l in lens {
             let p = l / 2;
             eprintln!("  L={l} (resume_p={p}) ...");
@@ -1101,11 +1659,31 @@ mod ora {
             let o = gpu.zeros(&[n, GVD], DType::F32).unwrap();
             let st = upload_gdn_state(&mut *gpu, &codes, &scales, Some(&efv));
             restore_gdn_requant_frame_checkpoint(frame0);
-            gdn_commit(&mut *gpu, &st, &q.sub_offset(0, 512*GVD), &k.sub_offset(0, 512*GVD), &v.sub_offset(0, 512*GVD), &g.sub_offset(0, 512*GH), &b.sub_offset(0, 512*GH), &o.sub_offset(0, 512*GVD), 512);
+            gdn_commit(
+                &mut *gpu,
+                &st,
+                &q.sub_offset(0, 512 * GVD),
+                &k.sub_offset(0, 512 * GVD),
+                &v.sub_offset(0, 512 * GVD),
+                &g.sub_offset(0, 512 * GH),
+                &b.sub_offset(0, 512 * GH),
+                &o.sub_offset(0, 512 * GVD),
+                512,
+            );
             let saved = download_gdn_state(&mut *gpu, &st);
             let frame1 = gdn_requant_frame_checkpoint();
-            gdn_commit(&mut *gpu, &st, &q.sub_offset(512*GVD, 512*GVD), &k.sub_offset(512*GVD, 512*GVD), &v.sub_offset(512*GVD, 512*GVD), &g.sub_offset(512*GH, 512*GH), &b.sub_offset(512*GH, 512*GH), &o.sub_offset(512*GVD, 512*GVD), 512);
-            let out_full = download_raw(&mut *gpu, &o.sub_offset(512*GVD, 512*GVD));
+            gdn_commit(
+                &mut *gpu,
+                &st,
+                &q.sub_offset(512 * GVD, 512 * GVD),
+                &k.sub_offset(512 * GVD, 512 * GVD),
+                &v.sub_offset(512 * GVD, 512 * GVD),
+                &g.sub_offset(512 * GH, 512 * GH),
+                &b.sub_offset(512 * GH, 512 * GH),
+                &o.sub_offset(512 * GVD, 512 * GVD),
+                512,
+            );
+            let out_full = download_raw(&mut *gpu, &o.sub_offset(512 * GVD, 512 * GVD));
             let st_full = download_gdn_state(&mut *gpu, &st);
             // Restore snapshot bytes + frame, re-extend with the same rows.
             gpu.hip.memcpy_htod(&st.sq.buf, &saved.0).unwrap();
@@ -1115,8 +1693,23 @@ mod ora {
             }
             restore_gdn_requant_frame_checkpoint(frame1);
             let o2 = gpu.zeros(&[512, GVD], DType::F32).unwrap();
-            gdn_commit(&mut *gpu, &st, &q.sub_offset(512*GVD, 512*GVD), &k.sub_offset(512*GVD, 512*GVD), &v.sub_offset(512*GVD, 512*GVD), &g.sub_offset(512*GH, 512*GH), &b.sub_offset(512*GH, 512*GH), &o2, 512);
-            cmp.check("arm6", "save-restore/out", &download_f32_vec(&mut *gpu, &o2), &out_full);
+            gdn_commit(
+                &mut *gpu,
+                &st,
+                &q.sub_offset(512 * GVD, 512 * GVD),
+                &k.sub_offset(512 * GVD, 512 * GVD),
+                &v.sub_offset(512 * GVD, 512 * GVD),
+                &g.sub_offset(512 * GH, 512 * GH),
+                &b.sub_offset(512 * GH, 512 * GH),
+                &o2,
+                512,
+            );
+            cmp.check(
+                "arm6",
+                "save-restore/out",
+                &download_f32_vec(&mut *gpu, &o2),
+                &out_full,
+            );
             let st2 = download_gdn_state(&mut *gpu, &st);
             cmp.check("arm6", "save-restore/S", &st2.0, &st_full.0);
             cmp.check("arm6", "save-restore/scales", &st2.1, &st_full.1);
@@ -1165,7 +1758,9 @@ mod ora {
             eprintln!("  arm6/capture-mode={cap} replay-recording={rec}");
             if cap || rec {
                 cmp.failures += 1;
-                eprintln!("  FAIL arm6 capture/recording active — widened route would be misadmitted");
+                eprintln!(
+                    "  FAIL arm6 capture/recording active — widened route would be misadmitted"
+                );
             }
         }
         // 6f. Allocation failure before publication: state untouched.
@@ -1186,7 +1781,12 @@ mod ora {
             }
             let after = download_gdn_state(&mut *gpu, &st);
             cmp.check("arm6", "alloc-failure/S-untouched", &before.0, &after.0);
-            cmp.check("arm6", "alloc-failure/scales-untouched", &before.1, &after.1);
+            cmp.check(
+                "arm6",
+                "alloc-failure/scales-untouched",
+                &before.1,
+                &after.1,
+            );
             cmp.check("arm6", "alloc-failure/EF-untouched", &before.2, &after.2);
             for t in [st.sq, st.sc] {
                 gpu.free_tensor(t).unwrap();
@@ -1216,7 +1816,9 @@ mod ora {
             let s_after_second = download_gdn_state(&mut *gpu, &st).0;
             if first_diff(&s_after_first, &s_after_second).is_none() {
                 cmp.failures += 1;
-                eprintln!("  FAIL arm6 negative-control: reused state identical — comparisons vacuous");
+                eprintln!(
+                    "  FAIL arm6 negative-control: reused state identical — comparisons vacuous"
+                );
             } else {
                 eprintln!("  ok   arm6 negative-control: reused state differs as expected");
             }
@@ -1237,16 +1839,49 @@ mod ora {
                 let toks = det_tokens(l, m.config.vocab_size);
                 let kv_seq = (l + 16).max(512);
                 let fresh = full_run(&mut *gpu, m, l, 512, 0);
-                let mut kv = KvCache::new_gpu_q8(&mut *gpu, m.config.n_layers, m.config.n_kv_heads, m.config.head_dim, kv_seq).unwrap();
+                let mut kv = KvCache::new_gpu_q8(
+                    &mut *gpu,
+                    m.config.n_layers,
+                    m.config.n_kv_heads,
+                    m.config.head_dim,
+                    kv_seq,
+                )
+                .unwrap();
                 let mut dn = DeltaNetState::new(&mut *gpu, &m.config).unwrap();
-                let scratch = Qwen35Scratch::new_with_kv_max(&mut *gpu, &m.config, 128, kv_seq).unwrap();
+                let scratch =
+                    Qwen35Scratch::new_with_kv_max(&mut *gpu, &m.config, 128, kv_seq).unwrap();
                 // Pollute, then reset, then run the same prompt.
                 let junk: Vec<u32> = vec![7; 256];
-                qwen35::forward_prefill_batch(&mut *gpu, &m.weights, &m.config, &junk, 0, &mut kv, &mut dn, &scratch, None, None, None, None).unwrap();
+                qwen35::forward_prefill_batch(
+                    &mut *gpu, &m.weights, &m.config, &junk, 0, &mut kv, &mut dn, &scratch, None,
+                    None, None, None,
+                )
+                .unwrap();
                 dn.reset(&mut *gpu).unwrap();
-                let mut kv2 = KvCache::new_gpu_q8(&mut *gpu, m.config.n_layers, m.config.n_kv_heads, m.config.head_dim, kv_seq).unwrap();
+                let mut kv2 = KvCache::new_gpu_q8(
+                    &mut *gpu,
+                    m.config.n_layers,
+                    m.config.n_kv_heads,
+                    m.config.head_dim,
+                    kv_seq,
+                )
+                .unwrap();
                 let hbuf = gpu.alloc_tensor(&[l, m.config.dim], DType::F32).unwrap();
-                qwen35::forward_prefill_batch(&mut *gpu, &m.weights, &m.config, &toks, 0, &mut kv2, &mut dn, &scratch, None, Some(&hbuf), None, None).unwrap();
+                qwen35::forward_prefill_batch(
+                    &mut *gpu,
+                    &m.weights,
+                    &m.config,
+                    &toks,
+                    0,
+                    &mut kv2,
+                    &mut dn,
+                    &scratch,
+                    None,
+                    Some(&hbuf),
+                    None,
+                    None,
+                )
+                .unwrap();
                 sync(&mut *gpu);
                 let reset_snap = snap_state(&mut *gpu, &dn, &kv2, &scratch, &hbuf);
                 // Fresh-vs-reset: DN + hidden + logits must match (KV fresh both).
@@ -1267,12 +1902,38 @@ mod ora {
                 let kv_seq = (l + 16).max(512);
                 let mut tiny_at = |ceiling: usize| -> Snap {
                     std::env::set_var("HIPFIRE_PREFILL_MAX_BATCH", format!("{ceiling}"));
-                    let mut kv = KvCache::new_gpu_q8(&mut *gpu, m.config.n_layers, m.config.n_kv_heads, m.config.head_dim, kv_seq).unwrap();
+                    let mut kv = KvCache::new_gpu_q8(
+                        &mut *gpu,
+                        m.config.n_layers,
+                        m.config.n_kv_heads,
+                        m.config.head_dim,
+                        kv_seq,
+                    )
+                    .unwrap();
                     let mut dn = DeltaNetState::new(&mut *gpu, &m.config).unwrap();
-                    let scratch = Qwen35Scratch::new_with_kv_max(&mut *gpu, &m.config, 128, kv_seq).unwrap();
-                    let pbs = PrefillBatchScratch::new(&mut *gpu, &m.config, 256).expect("tiny pbs");
+                    let scratch =
+                        Qwen35Scratch::new_with_kv_max(&mut *gpu, &m.config, 128, kv_seq).unwrap();
+                    let pbs =
+                        PrefillBatchScratch::new(&mut *gpu, &m.config, 256).expect("tiny pbs");
                     let hbuf = gpu.alloc_tensor(&[l, m.config.dim], DType::F32).unwrap();
-                    qwen35::forward_prefill_batch_with_pbs(&mut *gpu, &m.weights, &m.config, &toks, 0, &mut kv, &mut dn, &scratch, None, Some(&hbuf), None, None, Some(&pbs), None, None).unwrap();
+                    qwen35::forward_prefill_batch_with_pbs(
+                        &mut *gpu,
+                        &m.weights,
+                        &m.config,
+                        &toks,
+                        0,
+                        &mut kv,
+                        &mut dn,
+                        &scratch,
+                        None,
+                        Some(&hbuf),
+                        None,
+                        None,
+                        Some(&pbs),
+                        None,
+                        None,
+                    )
+                    .unwrap();
                     sync(&mut *gpu);
                     let s = snap_state(&mut *gpu, &dn, &kv, &scratch, &hbuf);
                     gpu.free_tensor(hbuf).unwrap();
@@ -1296,12 +1957,41 @@ mod ora {
                 let mid = m.config.n_layers / 2;
                 let mut ring_at = |ceiling: usize| -> Snap {
                     std::env::set_var("HIPFIRE_PREFILL_MAX_BATCH", format!("{ceiling}"));
-                    let mut kv = KvCache::new_gpu_q8(&mut *gpu, m.config.n_layers, m.config.n_kv_heads, m.config.head_dim, kv_seq).unwrap();
+                    let mut kv = KvCache::new_gpu_q8(
+                        &mut *gpu,
+                        m.config.n_layers,
+                        m.config.n_kv_heads,
+                        m.config.head_dim,
+                        kv_seq,
+                    )
+                    .unwrap();
                     let mut dn = DeltaNetState::new(&mut *gpu, &m.config).unwrap();
-                    let scratch = Qwen35Scratch::new_with_kv_max(&mut *gpu, &m.config, 128, kv_seq).unwrap();
-                    let mut ring = HiddenStateRingBuffer::new_for_layers(&mut *gpu, &[mid], m.config.dim, 256, 256).expect("ring");
+                    let scratch =
+                        Qwen35Scratch::new_with_kv_max(&mut *gpu, &m.config, 128, kv_seq).unwrap();
+                    let mut ring = HiddenStateRingBuffer::new_for_layers(
+                        &mut *gpu,
+                        &[mid],
+                        m.config.dim,
+                        256,
+                        256,
+                    )
+                    .expect("ring");
                     let hbuf = gpu.alloc_tensor(&[l, m.config.dim], DType::F32).unwrap();
-                    qwen35::forward_prefill_batch(&mut *gpu, &m.weights, &m.config, &toks, 0, &mut kv, &mut dn, &scratch, Some(&mut ring), Some(&hbuf), None, None).unwrap();
+                    qwen35::forward_prefill_batch(
+                        &mut *gpu,
+                        &m.weights,
+                        &m.config,
+                        &toks,
+                        0,
+                        &mut kv,
+                        &mut dn,
+                        &scratch,
+                        Some(&mut ring),
+                        Some(&hbuf),
+                        None,
+                        None,
+                    )
+                    .unwrap();
                     sync(&mut *gpu);
                     let s = snap_state(&mut *gpu, &dn, &kv, &scratch, &hbuf);
                     gpu.free_tensor(hbuf).unwrap();
@@ -1315,7 +2005,14 @@ mod ora {
                 };
                 let r512 = ring_at(512);
                 let rc = ring_at(c);
-                cmp_snap(cmp, "arm6", "hidden-ring-ceiling-invariant", &r512, &rc, false);
+                cmp_snap(
+                    cmp,
+                    "arm6",
+                    "hidden-ring-ceiling-invariant",
+                    &r512,
+                    &rc,
+                    false,
+                );
             }
         }
         let _ = c;
@@ -1336,11 +2033,23 @@ mod ora {
         let mut i = 1;
         while i < a.len() {
             match a[i].as_str() {
-                "--model" => { model = Some(PathBuf::from(&a[i + 1])); i += 2; }
-                "--chunk" => { chunk = a[i + 1].parse().unwrap_or(0); i += 2; }
-                "--out-dir" => { out_dir = PathBuf::from(&a[i + 1]); i += 2; }
+                "--model" => {
+                    model = Some(PathBuf::from(&a[i + 1]));
+                    i += 2;
+                }
+                "--chunk" => {
+                    chunk = a[i + 1].parse().unwrap_or(0);
+                    i += 2;
+                }
+                "--out-dir" => {
+                    out_dir = PathBuf::from(&a[i + 1]);
+                    i += 2;
+                }
                 "--arms" => {
-                    arms = a[i + 1].split(',').map(|s| s.parse().expect("--arms values")).collect();
+                    arms = a[i + 1]
+                        .split(',')
+                        .map(|s| s.parse().expect("--arms values"))
+                        .collect();
                     i += 2;
                 }
                 "--skip-model" => {
@@ -1348,7 +2057,9 @@ mod ora {
                     i += 1;
                 }
                 h => {
-                    eprintln!("unknown flag {h}; want --model --chunk --out-dir [--arms] [--skip-model]");
+                    eprintln!(
+                        "unknown flag {h}; want --model --chunk --out-dir [--arms] [--skip-model]"
+                    );
                     std::process::exit(2);
                 }
             }
@@ -1357,7 +2068,12 @@ mod ora {
             eprintln!("--chunk must be one of 512,1024,2048,4096,8192 (got {chunk})");
             std::process::exit(2);
         }
-        Args { model, chunk, out_dir, arms }
+        Args {
+            model,
+            chunk,
+            out_dir,
+            arms,
+        }
     }
     pub fn real_main() {
         let args = parse_args();
@@ -1374,7 +2090,10 @@ mod ora {
             eprintln!("oracle requires exact gfx1201, got {}", gpu.arch);
             std::process::exit(2);
         }
-        eprintln!("tmp_gfx1201_chunk_exactness arch={} chunk={c} arms={:?}", gpu.arch, args.arms);
+        eprintln!(
+            "tmp_gfx1201_chunk_exactness arch={} chunk={c} arms={:?}",
+            gpu.arch, args.arms
+        );
         // Oracle-executed schedule line (mirrors H's production log contract).
         println!("prefill_chunk: requested={c} admitted={c} commit_stride=512");
         let need_model = args.arms.iter().any(|x| *x == 5);
@@ -1401,7 +2120,12 @@ mod ora {
             run_arm4(&mut gpu, &mut cmp, c);
         }
         if args.arms.contains(&5) {
-            run_arm5(&mut gpu, &mut cmp, c, m.as_ref().expect("arm5 needs --model"));
+            run_arm5(
+                &mut gpu,
+                &mut cmp,
+                c,
+                m.as_ref().expect("arm5 needs --model"),
+            );
         }
         if args.arms.contains(&6) {
             run_arm6(&mut gpu, &mut cmp, c, m.as_ref());
@@ -1418,8 +2142,11 @@ mod ora {
             env_show("HOME"),
         );
         eprint!("{summary}");
-        std::fs::write(args.out_dir.join(format!("oracle_results_{c}.txt")), &summary)
-            .unwrap_or_else(|e| panic!("write summary: {e:?}"));
+        std::fs::write(
+            args.out_dir.join(format!("oracle_results_{c}.txt")),
+            &summary,
+        )
+        .unwrap_or_else(|e| panic!("write summary: {e:?}"));
         if !pass {
             std::process::exit(1);
         }

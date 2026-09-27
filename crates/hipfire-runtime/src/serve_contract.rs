@@ -904,30 +904,38 @@ mod tests {
         // Missing attention pages.
         let mut b = complete_bundle();
         b.attention_pages = false;
-        let err = ResumePlan::new(128, b, 4096, LastTokenHandling::SuffixRecompute)
-            .unwrap_err();
-        assert!(matches!(err, ResumePlanError::MissingComponent("attention_pages")));
+        let err = ResumePlan::new(128, b, 4096, LastTokenHandling::SuffixRecompute).unwrap_err();
+        assert!(matches!(
+            err,
+            ResumePlanError::MissingComponent("attention_pages")
+        ));
 
         // Missing DeltaNet matrices/scales.
         let mut b = complete_bundle();
         b.dn_matrices_scales = false;
-        let err = ResumePlan::new(128, b, 4096, LastTokenHandling::SuffixRecompute)
-            .unwrap_err();
-        assert!(matches!(err, ResumePlanError::MissingComponent("dn_matrices_scales")));
+        let err = ResumePlan::new(128, b, 4096, LastTokenHandling::SuffixRecompute).unwrap_err();
+        assert!(matches!(
+            err,
+            ResumePlanError::MissingComponent("dn_matrices_scales")
+        ));
 
         // Missing conv rings.
         let mut b = complete_bundle();
         b.conv_rings = false;
-        let err = ResumePlan::new(128, b, 4096, LastTokenHandling::EarlierBoundary)
-            .unwrap_err();
-        assert!(matches!(err, ResumePlanError::MissingComponent("conv_rings")));
+        let err = ResumePlan::new(128, b, 4096, LastTokenHandling::EarlierBoundary).unwrap_err();
+        assert!(matches!(
+            err,
+            ResumePlanError::MissingComponent("conv_rings")
+        ));
 
         // Missing EF residual.
         let mut b = complete_bundle();
         b.ef_residual = false;
-        let err = ResumePlan::new(128, b, 4096, LastTokenHandling::SuffixRecompute)
-            .unwrap_err();
-        assert!(matches!(err, ResumePlanError::MissingComponent("ef_residual")));
+        let err = ResumePlan::new(128, b, 4096, LastTokenHandling::SuffixRecompute).unwrap_err();
+        assert!(matches!(
+            err,
+            ResumePlanError::MissingComponent("ef_residual")
+        ));
     }
 
     #[test]
@@ -998,6 +1006,9 @@ mod tests {
 
     #[test]
     fn release_disposition_variants_are_distinct() {
-        assert_ne!(ReleaseDisposition::CacheResident, ReleaseDisposition::ReclaimPending);
+        assert_ne!(
+            ReleaseDisposition::CacheResident,
+            ReleaseDisposition::ReclaimPending
+        );
     }
 }

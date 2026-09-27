@@ -105,15 +105,24 @@ fn main() {
         let out = gpu.alloc_tensor(&[n * HIDDEN], DType::F32).expect("alloc");
 
         let trials = if n > 700 { 3 } else { 10 };
-        let t_naive = time_kernel(&mut gpu, |g| {
-            g.vit_attention_f32(&qkv, &out, n, HIDDEN, HEADS, HEAD_DIM)
-        }, 2, trials);
-        let t_opt = time_kernel(&mut gpu, |g| {
-            g.vit_attention_opt(&qkv, &out, n, HIDDEN, HEADS, HEAD_DIM)
-        }, 2, trials);
-        let t_qtiled = time_kernel(&mut gpu, |g| {
-            g.vit_attention_qtiled_f32(&qkv, &out, n, HIDDEN, HEADS, HEAD_DIM)
-        }, 2, trials);
+        let t_naive = time_kernel(
+            &mut gpu,
+            |g| g.vit_attention_f32(&qkv, &out, n, HIDDEN, HEADS, HEAD_DIM),
+            2,
+            trials,
+        );
+        let t_opt = time_kernel(
+            &mut gpu,
+            |g| g.vit_attention_opt(&qkv, &out, n, HIDDEN, HEADS, HEAD_DIM),
+            2,
+            trials,
+        );
+        let t_qtiled = time_kernel(
+            &mut gpu,
+            |g| g.vit_attention_qtiled_f32(&qkv, &out, n, HIDDEN, HEADS, HEAD_DIM),
+            2,
+            trials,
+        );
 
         let (err_naive, err_opt, err_qtiled) = if n <= 676 {
             let host_ref = cpu_reference(&qkv_h, n);
@@ -148,13 +157,9 @@ fn main() {
             )
         };
 
-        let traffic_gb = (LAYERS as f64)
-            * (HEADS as f64)
-            * (n as f64)
-            * (n as f64)
-            * (HEAD_DIM as f64)
-            * 8.0
-            / 1e9;
+        let traffic_gb =
+            (LAYERS as f64) * (HEADS as f64) * (n as f64) * (n as f64) * (HEAD_DIM as f64) * 8.0
+                / 1e9;
         println!(
             "N={n:5}  naive {t_naive:8.1} ms   opt {t_opt:8.1} ms   qtiled {t_qtiled:8.1} ms   \
              speedup {:6.2}x   |err| n/a-opt {err_naive:.2e}/{err_opt:.2e}/q {err_qtiled:.2e}   \

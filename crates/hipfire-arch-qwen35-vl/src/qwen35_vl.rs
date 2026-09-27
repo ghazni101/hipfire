@@ -1067,7 +1067,9 @@ impl VisionTowerJob {
 
         // Diagnostic stage dumps (env-gated; see `vl_dump_slice`).
         let dump_dir: Option<std::path::PathBuf> =
-            hipfire_config::developer_var("HIPFIRE_VL_DUMP_DIR").ok().map(Into::into);
+            hipfire_config::developer_var("HIPFIRE_VL_DUMP_DIR")
+                .ok()
+                .map(Into::into);
         let dd = dump_dir.as_deref();
         if dd.is_some() {
             eprintln!(
@@ -1192,7 +1194,9 @@ impl VisionTowerJob {
         let t0 = std::time::Instant::now();
 
         let dump_dir: Option<std::path::PathBuf> =
-            hipfire_config::developer_var("HIPFIRE_VL_DUMP_DIR").ok().map(Into::into);
+            hipfire_config::developer_var("HIPFIRE_VL_DUMP_DIR")
+                .ok()
+                .map(Into::into);
         let dd = dump_dir.as_deref();
         if dd.is_some() {
             eprintln!(
@@ -1322,7 +1326,15 @@ impl VisionTowerJob {
 
         // LayerNorm1 → tmp
         let tmp = gpu.alloc_tensor(&[n * h], DType::F32)?;
-        gpu.layernorm_batched(&self.x, &lw.norm1_w, &lw.norm1_b, &tmp, n, h, config.norm_eps)?;
+        gpu.layernorm_batched(
+            &self.x,
+            &lw.norm1_w,
+            &lw.norm1_b,
+            &tmp,
+            n,
+            h,
+            config.norm_eps,
+        )?;
 
         // QKV projection → [n, 3h]
         let qkv = linear_f16(gpu, &lw.qkv_w, &tmp, &lw.qkv_b, 3 * h, h, n)?;
@@ -1344,14 +1356,7 @@ impl VisionTowerJob {
         if self.attn_naive {
             gpu.vit_attention_f32(&qkv, &attn_out, n, h, config.num_heads, config.head_dim)?;
         } else {
-            gpu.vit_attention_qtiled_f32(
-                &qkv,
-                &attn_out,
-                n,
-                h,
-                config.num_heads,
-                config.head_dim,
-            )?;
+            gpu.vit_attention_qtiled_f32(&qkv, &attn_out, n, h, config.num_heads, config.head_dim)?;
         }
         gpu.free_tensor(qkv)?;
 
@@ -1365,7 +1370,15 @@ impl VisionTowerJob {
 
         // LayerNorm2 → tmp
         let tmp2 = gpu.alloc_tensor(&[n * h], DType::F32)?;
-        gpu.layernorm_batched(&self.x, &lw.norm2_w, &lw.norm2_b, &tmp2, n, h, config.norm_eps)?;
+        gpu.layernorm_batched(
+            &self.x,
+            &lw.norm2_w,
+            &lw.norm2_b,
+            &tmp2,
+            n,
+            h,
+            config.norm_eps,
+        )?;
 
         // MLP: fc1 → GELU → fc2 + residual
         let fc1 = linear_f16(gpu, &lw.fc1_w, &tmp2, &lw.fc1_b, config.mlp_dim, h, n)?;

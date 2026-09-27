@@ -24,7 +24,10 @@ pub struct ModelFootprint {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AdmitError {
     PoolFull,
-    WouldExceedBudget { need: u64, available: u64 },
+    WouldExceedBudget {
+        need: u64,
+        available: u64,
+    },
     /// resize() named a session that holds no grant — an internal
     /// inconsistency, NOT a budget shortfall. Reporting it as
     /// WouldExceedBudget{0,0} both lied about the cause and let the engine
@@ -85,7 +88,11 @@ impl AdmissionController {
         let kv: u64 = self
             .admitted
             .iter()
-            .map(|&(_, ctx)| (ctx as u64).checked_mul(self.footprint.kv_bytes_per_token).unwrap_or(u64::MAX))
+            .map(|&(_, ctx)| {
+                (ctx as u64)
+                    .checked_mul(self.footprint.kv_bytes_per_token)
+                    .unwrap_or(u64::MAX)
+            })
             .fold(0u64, |a, b| a.saturating_add(b));
         self.footprint.weights_bytes.saturating_add(kv)
     }
@@ -107,10 +114,12 @@ impl AdmissionController {
         } else {
             0
         };
-        let need = kv_need.checked_add(weights_need).ok_or(AdmitError::WouldExceedBudget {
-            need: u64::MAX,
-            available: 0,
-        })?;
+        let need = kv_need
+            .checked_add(weights_need)
+            .ok_or(AdmitError::WouldExceedBudget {
+                need: u64::MAX,
+                available: 0,
+            })?;
         let available = self.budget_bytes.saturating_sub(self.used_bytes());
         // >= rather than >: an admission that would consume the LAST byte of
         // budget is refused too, not just one that overflows it. On this
@@ -197,7 +206,6 @@ impl AdmissionController {
         }
     }
 }
-
 
 // =========================================================================
 // S1 physical capacity accounting (spec §5.1)
@@ -305,9 +313,9 @@ impl ServeCapacityAccount {
     }
 
     /// Charge `bytes` of uniquely resident page bytes (spec §5.1).
-///
-/// Shared physical prefix pages count once; the request's future private
-/// suffix and recurrent state count separately via [`Self::reserve_growth`].
+    ///
+    /// Shared physical prefix pages count once; the request's future private
+    /// suffix and recurrent state count separately via [`Self::reserve_growth`].
     pub fn charge_resident(&mut self, bytes: u64) -> Result<(), CapacityError> {
         let new_resident = self
             .resident_page_bytes
@@ -341,9 +349,9 @@ impl ServeCapacityAccount {
     }
 
     /// Reserve `bytes` of unmaterialized growth/COW credits (spec §5.1).
-///
-/// Credits turn into allocated private pages as work advances. Allocation
-/// must not exceed the already granted credits.
+    ///
+    /// Credits turn into allocated private pages as work advances. Allocation
+    /// must not exceed the already granted credits.
     pub fn reserve_growth(&mut self, bytes: u64) -> Result<(), CapacityError> {
         let new_credits = self
             .growth_credits_bytes
@@ -398,7 +406,9 @@ impl ServeCapacityAccount {
             .growth_credits_bytes
             .checked_sub(bytes)
             .ok_or(CapacityError::ArithmeticOverflow)?;
-        if new_resident.checked_add(new_credits).ok_or(CapacityError::ArithmeticOverflow)?
+        if new_resident
+            .checked_add(new_credits)
+            .ok_or(CapacityError::ArithmeticOverflow)?
             > self.pool_capacity_bytes
         {
             return Err(CapacityError::WouldExceedPool {
@@ -412,7 +422,7 @@ impl ServeCapacityAccount {
     }
 
     /// Check whether `bytes` would fit under the pool capacity invariant
-/// without mutating state.
+    /// without mutating state.
     pub fn fits(&self, bytes: u64) -> bool {
         self.available_bytes().checked_sub(bytes).is_some()
     }
@@ -469,7 +479,7 @@ mod tests {
         let full_cap = (4 * GIB) / 34 / 1024; // ≈ 116k tokens of KV credit
         assert!(a.admit(1, full_cap as usize).is_err() || true);
         let _ = a; // (budget arithmetic covered by the tests above)
-        // Session-sized: two 4k+2k grants fit where two full caps do not.
+                   // Session-sized: two 4k+2k grants fit where two full caps do not.
         let mut b = AdmissionController::new(f27b(), 20 * GIB);
         b.admit(1, 6144).unwrap();
         b.admit(2, 6144).unwrap();
@@ -650,7 +660,13 @@ mod tests {
         let mut acct = ServeCapacityAccount::new(1000, 8192);
         assert!(acct.charge_resident(600).is_ok());
         let err = acct.charge_resident(500).unwrap_err();
-        assert_eq!(err, CapacityError::WouldExceedPool { need: 500, available: 400 });
+        assert_eq!(
+            err,
+            CapacityError::WouldExceedPool {
+                need: 500,
+                available: 400
+            }
+        );
     }
 
     #[test]
@@ -676,7 +692,11 @@ mod tests {
         assert_eq!(acct.growth_credits_bytes(), 300);
         let err = acct.materialize_growth(400).unwrap_err();
         assert!(matches!(err, CapacityError::WouldExceedPool { .. }));
-        assert_eq!(acct.growth_credits_bytes(), 300, "credits must be untouched");
+        assert_eq!(
+            acct.growth_credits_bytes(),
+            300,
+            "credits must be untouched"
+        );
         assert_eq!(acct.resident_page_bytes(), 0, "nothing charged on failure");
 
         // An exactly-credited materialize succeeds and converts the bytes.
@@ -688,9 +708,19 @@ mod tests {
     #[test]
     fn capacity_account_release_underflow_is_typed_error() {
         let mut acct = ServeCapacityAccount::new(1000, 8192);
-        assert!(acct.release_resident(1).is_err(), "duplicate release must error");
-        assert!(acct.release_growth(1).is_err(), "duplicate release must error");
-        assert_eq!(acct.available_bytes(), 1000, "underflow must not inflate capacity");
+        assert!(
+            acct.release_resident(1).is_err(),
+            "duplicate release must error"
+        );
+        assert!(
+            acct.release_growth(1).is_err(),
+            "duplicate release must error"
+        );
+        assert_eq!(
+            acct.available_bytes(),
+            1000,
+            "underflow must not inflate capacity"
+        );
     }
 
     #[test]

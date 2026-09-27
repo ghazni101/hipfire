@@ -76,7 +76,7 @@ fn json_response_result(
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "application/json")
-                .body(boxed_full(bytes))
+        .body(boxed_full(bytes))
         .map_err(|err| format!("failed to build HTTP response: {err}"))
 }
 
@@ -86,7 +86,7 @@ fn static_server_error() -> Response<BoxBody> {
     Response::builder()
         .status(500)
         .header(header::CONTENT_TYPE, "application/json")
-                .body(boxed_full(
+        .body(boxed_full(
             br#"{"error":{"message":"internal server error","type":"server_error"}}"#.to_vec(),
         ))
         // Static status, headers, and body: the builder cannot fail on these
@@ -382,11 +382,9 @@ impl hyper::body::Body for ChannelBody {
                 // bound", never wrap into a permanent false stall.
                 if let Some(pending) = &self.pending_bytes {
                     let bytes = chunk.bytes.len() as u64;
-                    let _ = pending.fetch_update(
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                        |v| Some(v.saturating_sub(bytes)),
-                    );
+                    let _ = pending.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |v| {
+                        Some(v.saturating_sub(bytes))
+                    });
                 }
                 if chunk.fail {
                     self.failed = true;
@@ -585,7 +583,7 @@ async fn handle_request(
                     header::CONTENT_TYPE,
                     "text/plain; version=0.0.4; charset=utf-8",
                 )
-                                .body(boxed_full(body.into_bytes()))
+                .body(boxed_full(body.into_bytes()))
                 .unwrap();
             resp
         }
@@ -617,10 +615,7 @@ async fn handle_request(
             });
             json_response(body, 200)
         }
-        (Method::OPTIONS, _) => Response::builder()
-            .status(403)
-            .body(boxed_empty())
-            .unwrap(),
+        (Method::OPTIONS, _) => Response::builder().status(403).body(boxed_empty()).unwrap(),
         (Method::POST, "/v1/chat/completions") => {
             let max_bytes = shared.max_request_bytes;
             if req
@@ -1275,7 +1270,11 @@ impl StreamBackpressure {
                 }
                 // A cancelled request's consumer is gone: abort now rather
                 // than sleeping to the deadline.
-                if self.cancelled.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) {
+                if self
+                    .cancelled
+                    .as_ref()
+                    .is_some_and(|c| c.load(Ordering::SeqCst))
+                {
                     return Err(StreamStallError);
                 }
                 if Instant::now() >= deadline {
@@ -1294,7 +1293,10 @@ impl StreamBackpressure {
             // the stall bound on a healthy stream. Over-charging (charge
             // first, refund on Full) only ever delays production briefly.
             self.pending_bytes.fetch_add(chunk_bytes, Ordering::Relaxed);
-            match self.sender.try_send(chunk.take().expect("chunk present at loop top")) {
+            match self
+                .sender
+                .try_send(chunk.take().expect("chunk present at loop top"))
+            {
                 Ok(()) => {
                     self.forwarded_bytes = self.forwarded_bytes.saturating_add(chunk_bytes);
                     // Progress: leave the stall (the consumer drained).
@@ -1314,7 +1316,11 @@ impl StreamBackpressure {
                     if self.stall_started.is_none() {
                         self.stall_started = Some(Instant::now());
                     }
-                    if self.cancelled.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) {
+                    if self
+                        .cancelled
+                        .as_ref()
+                        .is_some_and(|c| c.load(Ordering::SeqCst))
+                    {
                         drop(returned);
                         return Err(StreamStallError);
                     }
@@ -1389,7 +1395,6 @@ async fn handle_streaming(
     let pending_bytes = Arc::new(AtomicU64::new(0));
     let bp_pending = Arc::clone(&pending_bytes);
 
-
     let tx_clone = tx.clone();
     let shared_clone = Arc::clone(&shared);
     let id_clone = id.clone();
@@ -1415,7 +1420,9 @@ async fn handle_streaming(
                 "model": model_clone,
                 "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": null }],
             });
-            let _ = backpressure.borrow_mut().send(ResponseChunk::plain(sse_data(&first)));
+            let _ = backpressure
+                .borrow_mut()
+                .send(ResponseChunk::plain(sse_data(&first)));
             complete_request_cancellable(
                 &shared_clone,
                 &body,
@@ -1455,7 +1462,10 @@ async fn handle_streaming(
         }));
         let result = match outcome {
             Ok(result) => result,
-            Err(payload) => Err(anyhow::anyhow!("streaming worker panicked: {}", panic_message(payload))),
+            Err(payload) => Err(anyhow::anyhow!(
+                "streaming worker panicked: {}",
+                panic_message(payload)
+            )),
         };
         finish_sse_stream(tx_clone, result);
     });
@@ -1465,7 +1475,7 @@ async fn handle_streaming(
         .status(200)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
-                .body(boxed(body))
+        .body(boxed(body))
         .unwrap();
     // Ensure chunked; hyper sets it automatically for streaming bodies.
     resp
@@ -1583,7 +1593,7 @@ async fn handle_nonstreaming(
             let resp = Response::builder()
                 .status(200)
                 .header(header::CONTENT_TYPE, "application/json")
-                                .body(boxed(body))
+                .body(boxed(body))
                 .unwrap();
             resp
         }
@@ -1697,11 +1707,7 @@ fn daemon_error_class(message: &str) -> Option<&str> {
     let class = &rest[..end];
     // Guard against an arbitrary bracketed non-daemon string: the class
     // vocabulary is closed (hipfire_client::error_class).
-    if class
-        .chars()
-        .all(|c| c.is_ascii_lowercase() || c == '_')
-        && !class.is_empty()
-    {
+    if class.chars().all(|c| c.is_ascii_lowercase() || c == '_') && !class.is_empty() {
         Some(class)
     } else {
         None
@@ -2089,17 +2095,23 @@ mod tests {
         // consumer blocked the forwarder forever.
         let (tx, rx) = tokio::sync::mpsc::channel::<ResponseChunk>(32);
         let pending = Arc::new(AtomicU64::new(0));
-        let mut bp = StreamBackpressure::new(tx, Arc::clone(&pending), 10, Duration::from_millis(80));
+        let mut bp =
+            StreamBackpressure::new(tx, Arc::clone(&pending), 10, Duration::from_millis(80));
 
         // A 13-byte chunk against a 10-byte bound: this send is allowed
         // (pending was 0 — a producer must always make progress on an empty
         // buffer), but pending is now over the bound.
-        assert!(bp.send(ResponseChunk::plain(b"data: first\n\n".to_vec())).is_ok());
+        assert!(bp
+            .send(ResponseChunk::plain(b"data: first\n\n".to_vec()))
+            .is_ok());
         assert_eq!(pending.load(Ordering::Relaxed), 13);
 
         // The next send stalls: bound exceeded, no drain within the window.
         let result = bp.send(ResponseChunk::plain(b"data: second\n\n".to_vec()));
-        assert!(result.is_err(), "send should stall while pending exceeds the bound");
+        assert!(
+            result.is_err(),
+            "send should stall while pending exceeds the bound"
+        );
         assert!(bp.is_stalled(), "should be marked stalled");
         drop(rx);
     }
@@ -2108,15 +2120,21 @@ mod tests {
     fn stream_backpressure_resumes_after_consumer_drains() {
         let (tx, rx) = tokio::sync::mpsc::channel::<ResponseChunk>(32);
         let pending = Arc::new(AtomicU64::new(0));
-        let mut bp = StreamBackpressure::new(tx, Arc::clone(&pending), 10, Duration::from_millis(200));
+        let mut bp =
+            StreamBackpressure::new(tx, Arc::clone(&pending), 10, Duration::from_millis(200));
 
-        assert!(bp.send(ResponseChunk::plain(b"data: first\n\n".to_vec())).is_ok());
-        assert!(bp.send(ResponseChunk::plain(b"data: 2nd\n\n".to_vec())).is_err());
+        assert!(bp
+            .send(ResponseChunk::plain(b"data: first\n\n".to_vec()))
+            .is_ok());
+        assert!(bp
+            .send(ResponseChunk::plain(b"data: 2nd\n\n".to_vec()))
+            .is_err());
 
         // Consumer drains (the ChannelBody poll loop does this subtraction).
         pending.store(0, Ordering::Relaxed);
         assert!(
-            bp.send(ResponseChunk::plain(b"data: third\n\n".to_vec())).is_ok(),
+            bp.send(ResponseChunk::plain(b"data: third\n\n".to_vec()))
+                .is_ok(),
             "progress after drain must clear the stall"
         );
         assert!(!bp.is_stalled());
@@ -2127,31 +2145,45 @@ mod tests {
     fn stream_backpressure_aborts_after_stall_timeout() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<ResponseChunk>(32);
         let pending = Arc::new(AtomicU64::new(0));
-        let mut bp = StreamBackpressure::new(tx, Arc::clone(&pending), 10, Duration::from_millis(30));
+        let mut bp =
+            StreamBackpressure::new(tx, Arc::clone(&pending), 10, Duration::from_millis(30));
 
         // First chunk goes out (progress on an empty buffer is mandatory)
         // and leaves pending over the 10-byte bound.
-        assert!(bp.send(ResponseChunk::plain(b"data: big\n\n".to_vec())).is_ok());
+        assert!(bp
+            .send(ResponseChunk::plain(b"data: big\n\n".to_vec()))
+            .is_ok());
 
         // The next send blocks through the whole stall window (retrying)
         // and then aborts with the typed error.
         let started = Instant::now();
         let result = bp.send(ResponseChunk::plain(b"data: more\n\n".to_vec()));
         assert!(result.is_err(), "send must abort once the deadline passes");
-        assert!(started.elapsed() >= Duration::from_millis(25), "the grace window must elapse before abort");
-        assert!(bp.check_stall_timeout(), "stall timeout should have elapsed");
+        assert!(
+            started.elapsed() >= Duration::from_millis(25),
+            "the grace window must elapse before abort"
+        );
+        assert!(
+            bp.check_stall_timeout(),
+            "stall timeout should have elapsed"
+        );
     }
 
     #[test]
     fn stream_backpressure_clear_stall_resets_state() {
         let (tx, _rx) = tokio::sync::mpsc::channel::<ResponseChunk>(32);
         let pending = Arc::new(AtomicU64::new(0));
-        let mut bp = StreamBackpressure::new(tx, Arc::clone(&pending), 10, Duration::from_millis(40));
+        let mut bp =
+            StreamBackpressure::new(tx, Arc::clone(&pending), 10, Duration::from_millis(40));
 
         // Over the bound: the second send stalls out after the window.
         // "data: aaa\n\n" is 11 bytes > the 10-byte bound.
-        assert!(bp.send(ResponseChunk::plain(b"data: aaa\n\n".to_vec())).is_ok());
-        assert!(bp.send(ResponseChunk::plain(b"data: b\n\n".to_vec())).is_err());
+        assert!(bp
+            .send(ResponseChunk::plain(b"data: aaa\n\n".to_vec()))
+            .is_ok());
+        assert!(bp
+            .send(ResponseChunk::plain(b"data: b\n\n".to_vec()))
+            .is_err());
         assert!(bp.is_stalled());
 
         // Clear the stall.
@@ -2184,7 +2216,8 @@ mod tests {
         let cancelled = Arc::new(AtomicBool::new(false));
         let pending = Arc::new(AtomicU64::new(0));
         let (tx, rx) = tokio::sync::mpsc::channel::<ResponseChunk>(4);
-        tx.try_send(ResponseChunk::plain(b"data: hello\n\n".to_vec())).unwrap();
+        tx.try_send(ResponseChunk::plain(b"data: hello\n\n".to_vec()))
+            .unwrap();
         // Simulate the producer's accounting.
         pending.fetch_add(13, Ordering::Relaxed);
 
@@ -2194,6 +2227,10 @@ mod tests {
             Pin::new(&mut body).poll_frame(&mut cx),
             Poll::Ready(Some(Ok(_)))
         ));
-        assert_eq!(pending.load(Ordering::Relaxed), 0, "consumed bytes must be released");
+        assert_eq!(
+            pending.load(Ordering::Relaxed),
+            0,
+            "consumed bytes must be released"
+        );
     }
 }

@@ -115,12 +115,17 @@ fn main() {
                 if naive_out[i] != host_ref[i] {
                     println!(
                         "  [{i}] naive={:08x}({}) q={:08x}({}) cpu={:08x}({})",
-                        naive_out[i].to_bits(), naive_out[i],
-                        q_out[i].to_bits(), q_out[i],
-                        host_ref[i].to_bits(), host_ref[i]
+                        naive_out[i].to_bits(),
+                        naive_out[i],
+                        q_out[i].to_bits(),
+                        q_out[i],
+                        host_ref[i].to_bits(),
+                        host_ref[i]
                     );
                     shown += 1;
-                    if shown >= 4 { break; }
+                    if shown >= 4 {
+                        break;
+                    }
                 }
             }
         }

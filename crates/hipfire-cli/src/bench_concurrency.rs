@@ -14,9 +14,9 @@
 //! reader-thread frames.
 
 use anyhow::{bail, Result};
+use serde_json::Value;
 use std::sync::mpsc::{self, RecvTimeoutError};
 use std::time::{Duration, Instant};
-use serde_json::Value;
 
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum BackendSel {
@@ -244,12 +244,7 @@ fn slot_request(prompt: &str, max_tokens: u64, id: &str, attempt_id: u64) -> Val
 
 /// Multi-turn slot request using a `messages` array so the daemon slot engine
 /// can match the prior turn's conversation hash and reuse KV.
-fn slot_request_messages(
-    messages: &Value,
-    max_tokens: u64,
-    id: &str,
-    attempt_id: u64,
-) -> Value {
+fn slot_request_messages(messages: &Value, max_tokens: u64, id: &str, attempt_id: u64) -> Value {
     serde_json::json!({
         "type": "generate",
         "id": id,
@@ -348,8 +343,7 @@ fn drain_streams(
                         }
                         Some("commit_ready") => {
                             // The staged done payload carries cached_tokens.
-                            if let Some(cached) =
-                                frame.get("cached_tokens").and_then(Value::as_u64)
+                            if let Some(cached) = frame.get("cached_tokens").and_then(Value::as_u64)
                             {
                                 if cached > 0 {
                                     outcomes[idx].prefix_hits += 1;
@@ -480,8 +474,7 @@ impl ConcurrencyBackend for SlotDriver {
 
         // ── Turn 2 (multi-turn only) ─────────────────────────────────────
         if turns == 2 {
-            let mut streams2: Vec<(String, u64, mpsc::Receiver<Value>)> =
-                Vec::with_capacity(k);
+            let mut streams2: Vec<(String, u64, mpsc::Receiver<Value>)> = Vec::with_capacity(k);
             for i in 0..k {
                 let id = format!("bench-slot-{run}-{i}");
                 let first_prompt = stream_prompt(run, i);
@@ -526,7 +519,12 @@ impl ConcurrencyBackend for SlotDriver {
 /// `drive_qwen_continuous_batch`; without it the request runs sequentially and
 /// the resulting numbers would describe a non-batched run. Answer-mode fields
 /// mirror `bench_generate_request` so both backends measure the same turn.
-pub fn batch_request(prompt: &str, max_tokens: u64, id: &str, attempt_id: u64) -> serde_json::Value {
+pub fn batch_request(
+    prompt: &str,
+    max_tokens: u64,
+    id: &str,
+    attempt_id: u64,
+) -> serde_json::Value {
     serde_json::json!({
         "type": "generate",
         "id": id,

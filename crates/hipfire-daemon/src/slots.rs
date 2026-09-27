@@ -277,12 +277,16 @@ impl SlotLoadParams {
         // DFlash2 draft: HIPFIRE_DFLASH_DRAFT (non-empty wins, empty opts out)
         // > params.draft; dflash_mode=off suppresses either way.
         let dflash_mode = param_str("dflash_mode").unwrap_or("auto");
-        let raw_draft: Option<String> =
-            match hipfire_config::developer_var("HIPFIRE_DFLASH_DRAFT").ok().as_deref() {
-                Some("") => None,
-                Some(p) => Some(p.to_string()),
-                None => param_str("draft").filter(|s| !s.is_empty()).map(str::to_string),
-            };
+        let raw_draft: Option<String> = match hipfire_config::developer_var("HIPFIRE_DFLASH_DRAFT")
+            .ok()
+            .as_deref()
+        {
+            Some("") => None,
+            Some(p) => Some(p.to_string()),
+            None => param_str("draft")
+                .filter(|s| !s.is_empty())
+                .map(str::to_string),
+        };
         let dflash_draft = if dflash_mode == "off" {
             if let Some(d) = raw_draft {
                 eprintln!("[hipfire-daemon] dflash_mode=off — skipping draft load ({d})");
@@ -490,12 +494,24 @@ impl SlotBackend {
         let prefix_cache = hipfire_config::active_or_local_process_config()
             .values
             .get("serve.prefix_cache")
-            .and_then(|v| if let hipfire_config::ConfigValue::Bool(b) = v { Some(*b) } else { None })
+            .and_then(|v| {
+                if let hipfire_config::ConfigValue::Bool(b) = v {
+                    Some(*b)
+                } else {
+                    None
+                }
+            })
             .unwrap_or(false);
         let prefix_cache_max_bytes = hipfire_config::active_or_local_process_config()
             .values
             .get("serve.prefix_cache_max_bytes")
-            .and_then(|v| if let hipfire_config::ConfigValue::Integer(i) = v { Some(*i as u64) } else { None })
+            .and_then(|v| {
+                if let hipfire_config::ConfigValue::Integer(i) = v {
+                    Some(*i as u64)
+                } else {
+                    None
+                }
+            })
             .unwrap_or(0);
         // Read the global trunk-row budget and minimum prefill quantum (spec
         // §5.2 S2 / §5.3 S3). Keys are registered in hipfire-config as
@@ -505,12 +521,24 @@ impl SlotBackend {
         let max_batch_tokens = hipfire_config::active_or_local_process_config()
             .values
             .get("serve.max_batch_tokens")
-            .and_then(|v| if let hipfire_config::ConfigValue::Integer(i) = v { Some(*i as usize) } else { None })
+            .and_then(|v| {
+                if let hipfire_config::ConfigValue::Integer(i) = v {
+                    Some(*i as usize)
+                } else {
+                    None
+                }
+            })
             .unwrap_or(4096);
         let prefill_min_tokens = hipfire_config::active_or_local_process_config()
             .values
             .get("serve.prefill_min_tokens")
-            .and_then(|v| if let hipfire_config::ConfigValue::Integer(i) = v { Some(*i as usize) } else { None })
+            .and_then(|v| {
+                if let hipfire_config::ConfigValue::Integer(i) = v {
+                    Some(*i as usize)
+                } else {
+                    None
+                }
+            })
             .unwrap_or(1);
         // Read the bounded waiting room config (spec §5.3 S3). Keys are
         // registered in hipfire-config as serve.max_queue /
@@ -523,17 +551,35 @@ impl SlotBackend {
         let wait_max_count = hipfire_config::active_or_local_process_config()
             .values
             .get("serve.max_queue")
-            .and_then(|v| if let hipfire_config::ConfigValue::Integer(i) = v { Some(*i as usize) } else { None })
+            .and_then(|v| {
+                if let hipfire_config::ConfigValue::Integer(i) = v {
+                    Some(*i as usize)
+                } else {
+                    None
+                }
+            })
             .unwrap_or(64);
         let wait_max_bytes = hipfire_config::active_or_local_process_config()
             .values
             .get("serve.max_queue_bytes")
-            .and_then(|v| if let hipfire_config::ConfigValue::Integer(i) = v { Some(*i as u64) } else { None })
+            .and_then(|v| {
+                if let hipfire_config::ConfigValue::Integer(i) = v {
+                    Some(*i as u64)
+                } else {
+                    None
+                }
+            })
             .unwrap_or(268435456);
         let queue_timeout_ms = hipfire_config::active_or_local_process_config()
             .values
             .get("serve.queue_timeout_ms")
-            .and_then(|v| if let hipfire_config::ConfigValue::Integer(i) = v { Some(*i as u64) } else { None })
+            .and_then(|v| {
+                if let hipfire_config::ConfigValue::Integer(i) = v {
+                    Some(*i as u64)
+                } else {
+                    None
+                }
+            })
             .unwrap_or(30000);
         // Read the structured-output jump-forward flag (spec §7.3 G3).
         // Key registered as serve.structured_jump_forward with env
@@ -542,7 +588,13 @@ impl SlotBackend {
         let structured_jump_forward = hipfire_config::active_or_local_process_config()
             .values
             .get("serve.structured_jump_forward")
-            .and_then(|v| if let hipfire_config::ConfigValue::Bool(b) = v { Some(*b) } else { None })
+            .and_then(|v| {
+                if let hipfire_config::ConfigValue::Bool(b) = v {
+                    Some(*b)
+                } else {
+                    None
+                }
+            })
             .unwrap_or(false);
 
         let vl_path = preflight.vl_path;
@@ -1120,8 +1172,7 @@ impl SlotBackend {
                 .find(|m| m.role == Role::System)
                 .map(|m| m.content.as_str())
                 .or_else(|| msg.get("system").and_then(|v| v.as_str()));
-            match build_slot_vl_prompt(self, &image, system, &last_user.content, expected_prefix)
-            {
+            match build_slot_vl_prompt(self, &image, system, &last_user.content, expected_prefix) {
                 Ok((tokens, vd)) => {
                     visual_data = Some(vd);
                     (
@@ -1773,8 +1824,8 @@ fn cpu_preflight(
     // Read vision_config from the .vl file when present, else from the trunk.
     let vision_config = if is_vl {
         if let Some(vl) = &vl_path {
-            let vl_hfq = HfqFile::open(vl)
-                .map_err(|e| format!("open .vl file {}: {e}", vl.display()))?;
+            let vl_hfq =
+                HfqFile::open(vl).map_err(|e| format!("open .vl file {}: {e}", vl.display()))?;
             Some(
                 hipfire_arch_qwen35_vl::qwen35_vl::vision_config_from_hfq(&vl_hfq)
                     .ok_or_else(|| ".vl file missing vision_config in metadata".to_string())?,
@@ -1947,10 +1998,8 @@ pub fn validate_load_caps(msg: &serde_json::Value) -> Option<String> {
         .and_then(|v| v.as_str())
         .filter(|v| !v.is_empty())
     {
-        let resolved = hipfire_runtime::kv_mode::resolve(
-            raw,
-            &hipfire_runtime::kv_mode::QWEN35_SLOTS_POLICY,
-        );
+        let resolved =
+            hipfire_runtime::kv_mode::resolve(raw, &hipfire_runtime::kv_mode::QWEN35_SLOTS_POLICY);
         if resolved.warning.is_some() {
             return Some(format!(
                 "experimental multi-slot does not support kv_mode='{raw}' \
@@ -2941,8 +2990,12 @@ mod tests {
                 "n={bad} must be refused, not silently downgraded to one completion"
             );
         }
-        assert!(validate_generate_caps(&json!({"n": 1, "experimental_multi_slot": true})).is_none());
-        assert!(validate_generate_caps(&json!({"n": null, "experimental_multi_slot": true})).is_none());
+        assert!(
+            validate_generate_caps(&json!({"n": 1, "experimental_multi_slot": true})).is_none()
+        );
+        assert!(
+            validate_generate_caps(&json!({"n": null, "experimental_multi_slot": true})).is_none()
+        );
         // `echo: false` is the OpenAI default this route honours by not
         // echoing; `true` and non-boolean spellings are refused.
         assert!(
@@ -2951,7 +3004,10 @@ mod tests {
         );
         for bad in [json!(true), json!(1)] {
             let m = json!({"echo": bad, "experimental_multi_slot": true});
-            assert!(validate_generate_caps(&m).is_some(), "echo={bad} must be refused");
+            assert!(
+                validate_generate_caps(&m).is_some(),
+                "echo={bad} must be refused"
+            );
         }
     }
 
@@ -2979,10 +3035,7 @@ mod tests {
         });
         let reason = validate_generate_caps(&m2)
             .expect("a text response_format must be refused at the daemon door");
-        assert!(
-            reason.contains("is not supported"),
-            "unexpected: {reason}"
-        );
+        assert!(reason.contains("is not supported"), "unexpected: {reason}");
         // Unsupported $ref is rejected before submit (spec §7 G1, §5.4 S4).
         let m3 = json!({
             "response_format": {"type": "json_schema", "json_schema": {"name": "test", "schema": {"$ref": "#/$defs/foo"}}},

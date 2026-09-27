@@ -59,9 +59,9 @@ pub fn arm_mtp_full_reject(on: bool) {
 }
 use crate::speculative::{apply_topp_trunc, sample_categorical, sample_residual};
 use crate::speculative::{DeltaNetSnapshot, GdnTape, ModelSlot};
-use hipfire_runtime::llama::KvCache;
 use hip_bridge::{Event, Graph, GraphExec, HipResult, Stream};
 use hipfire_runtime::llama;
+use hipfire_runtime::llama::KvCache;
 use rdna_compute::{DType, Gpu, GpuTensor};
 use std::time::Instant;
 
@@ -605,13 +605,7 @@ impl MtpSpecState {
         kv_mode: crate::mtp_head::MtpKvMode,
     ) -> HipResult<Self> {
         Self::new_for_components_with_verify_capacity(
-            gpu,
-            config,
-            dn_state,
-            head,
-            max_n,
-            max_n,
-            kv_mode,
+            gpu, config, dn_state, head, max_n, max_n, kv_mode,
         )
     }
 
@@ -1153,13 +1147,7 @@ fn run_mtp_proposal_graph_body_q8(
 
     for k in 0..max_n {
         let token_slot = state.mtp_token_chain.sub_offset(k, 1);
-        embed_device_token_into(
-            gpu,
-            weights,
-            &state.mtp_token_embed,
-            &token_slot,
-            dim,
-        )?;
+        embed_device_token_into(gpu, weights, &state.mtp_token_embed, &token_slot, dim)?;
 
         let pos_slot = state.mtp_positions.sub_offset(k, 1);
         if k == 0 {
@@ -1679,13 +1667,9 @@ fn mtp_accept_and_rollback(
     if !full_accept_no_eos {
         state.trunk_snap.restore_to(dn_state, gpu)?;
         if tape_captured {
-            state.trunk_gdn_tape.replay_gdn(
-                gpu,
-                trunk_weights,
-                config,
-                dn_state,
-                advance,
-            )?;
+            state
+                .trunk_gdn_tape
+                .replay_gdn(gpu, trunk_weights, config, dn_state, advance)?;
         } else {
             if advance >= 2 {
                 let replay = &verify_tokens[..advance];
@@ -1862,7 +1846,10 @@ pub fn mtp_dn_repair_from_tape(
     tape_row_off: usize,
     advance: usize,
 ) -> HipResult<()> {
-    assert!(advance >= 1, "mtp_dn_repair_from_tape: advance must be >= 1");
+    assert!(
+        advance >= 1,
+        "mtp_dn_repair_from_tape: advance must be >= 1"
+    );
     assert!(
         tape_row_off + advance <= tape.max_n,
         "mtp_dn_repair_from_tape: rows {}..{} exceed tape max_n {}",
@@ -1902,9 +1889,12 @@ pub fn mtp_dn_repair_from_tape(
         };
 
         // Taped rows for this slot, at the slot's stride offset.
-        let qkv_rows = tape.qkv_bufs[la_idx].sub_offset(tape_row_off * tape.qkv_dim, advance * tape.qkv_dim);
-        let alpha_rows = tape.alpha_bufs[la_idx].sub_offset(tape_row_off * n_v_heads, advance * n_v_heads);
-        let beta_rows = tape.beta_bufs[la_idx].sub_offset(tape_row_off * n_v_heads, advance * n_v_heads);
+        let qkv_rows =
+            tape.qkv_bufs[la_idx].sub_offset(tape_row_off * tape.qkv_dim, advance * tape.qkv_dim);
+        let alpha_rows =
+            tape.alpha_bufs[la_idx].sub_offset(tape_row_off * n_v_heads, advance * n_v_heads);
+        let beta_rows =
+            tape.beta_bufs[la_idx].sub_offset(tape_row_off * n_v_heads, advance * n_v_heads);
 
         // 1. conv1d + SiLU + split — advances the conv ring state.
         gpu.conv1d_silu_split_f32_n(
@@ -1945,8 +1935,10 @@ pub fn mtp_dn_repair_from_tape(
             )?;
         } else {
             let bytes = advance * k_dim * 4;
-            gpu.hip.memcpy_dtod_at(&tape.q_scratch.buf, 0, &tape.q_raw_scratch.buf, 0, bytes)?;
-            gpu.hip.memcpy_dtod_at(&tape.k_scratch.buf, 0, &tape.k_raw_scratch.buf, 0, bytes)?;
+            gpu.hip
+                .memcpy_dtod_at(&tape.q_scratch.buf, 0, &tape.q_raw_scratch.buf, 0, bytes)?;
+            gpu.hip
+                .memcpy_dtod_at(&tape.k_scratch.buf, 0, &tape.k_raw_scratch.buf, 0, bytes)?;
         }
 
         // 4. GDN recurrence — advances S/scales/EF residual.
@@ -2020,7 +2012,9 @@ pub fn mtp_batched_verify_accept_from_batch(
     // staging so acceptance compares against exactly what the AR path would
     // sample; skipping this skews every argmax by the per-channel γ scale and
     // breaks the MTP ≡ AR-at-greedy identity (the bonus token in particular).
-    let verify_raw = pbs.x_batch.sub_offset(hidden_row_offset * dim, n_verify * dim);
+    let verify_raw = pbs
+        .x_batch
+        .sub_offset(hidden_row_offset * dim, n_verify * dim);
     let verify_hidden = state.verify_hidden.sub_offset(0, n_verify * dim);
     gpu.rmsnorm_batched(
         &verify_raw,
@@ -2312,10 +2306,9 @@ where
     // We can't do both simultaneously through `target`, so we inline the body
     // here using the ModelSlot field accesses directly.
     let mut on_committed_boundary = on_committed_boundary;
-    let Some(chunk_max) = mtp_prompt_fill_scratch_rows(
-        prompt_tokens.len(),
-        qwen35::prefill_max_batch(gpu),
-    ) else {
+    let Some(chunk_max) =
+        mtp_prompt_fill_scratch_rows(prompt_tokens.len(), qwen35::prefill_max_batch(gpu))
+    else {
         return Ok(TrunkSpinePrefillTimings::default());
     };
 
@@ -2474,12 +2467,19 @@ pub fn prefill_trunk_and_mtp_cache_inner<F>(
     mut on_committed_boundary: F,
 ) -> HipResult<TrunkSpinePrefillTimings>
 where
-    F: FnMut(&mut Gpu, &Qwen35Weights, &Qwen35Config, &mut KvCache, &mut DeltaNetState, &mut Qwen35Scratch, usize) -> HipResult<()>,
+    F: FnMut(
+        &mut Gpu,
+        &Qwen35Weights,
+        &Qwen35Config,
+        &mut KvCache,
+        &mut DeltaNetState,
+        &mut Qwen35Scratch,
+        usize,
+    ) -> HipResult<()>,
 {
-    let Some(chunk_max) = mtp_prompt_fill_scratch_rows(
-        prompt_tokens.len(),
-        qwen35::prefill_max_batch(gpu),
-    ) else {
+    let Some(chunk_max) =
+        mtp_prompt_fill_scratch_rows(prompt_tokens.len(), qwen35::prefill_max_batch(gpu))
+    else {
         return Ok(TrunkSpinePrefillTimings::default());
     };
 
@@ -2596,7 +2596,15 @@ where
             mtp_prompt_fill_secs += t_mtp_fill.elapsed().as_secs_f64();
 
             // Committed boundary: trunk + MTP private KV now cover [0, committed_pos).
-            on_committed_boundary(gpu, weights, config, kv_cache, dn_state, scratch, committed_pos)?;
+            on_committed_boundary(
+                gpu,
+                weights,
+                config,
+                kv_cache,
+                dn_state,
+                scratch,
+                committed_pos,
+            )?;
             off = end;
         }
 

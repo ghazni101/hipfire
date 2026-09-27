@@ -109,9 +109,10 @@ fn main() {
     };
     let json_prompt: Vec<u32> = {
         let mut v = prefix.clone();
-        v.extend(tokenizer.encode(
-            " Reply with a JSON object {\"city\": \"<name>\"} naming Italy's capital.",
-        ));
+        v.extend(
+            tokenizer
+                .encode(" Reply with a JSON object {\"city\": \"<name>\"} naming Italy's capital."),
+        );
         v
     };
     assert!(italy.len() > PAGE * 2);
@@ -170,11 +171,7 @@ fn main() {
         }
     }
 
-    fn run(
-        engine: &SlotEngine,
-        prompt: Vec<u32>,
-        spec: &RunSpec,
-    ) -> (usize, Vec<u32>) {
+    fn run(engine: &SlotEngine, prompt: Vec<u32>, spec: &RunSpec) -> (usize, Vec<u32>) {
         let (tx, rx) = channel::<Event>();
         engine
             .submit(SubmitRequest {
@@ -195,8 +192,8 @@ fn main() {
                 json_schema: spec.json_schema.clone(),
                 started_in_think: false,
                 think_budget: usize::MAX,
-        queue_bytes: 0,
-        request_tag: 1,
+                queue_bytes: 0,
+                request_tag: 1,
                 reply: tx,
             })
             .expect("submit");
@@ -224,7 +221,10 @@ fn main() {
     if fault_publish {
         println!("--- A19 fault-publish mode ---");
         let (reused_cold, toks_cold) = run(&engine, italy.clone(), &greedy);
-        println!("  fault cold Italy: reused={reused_cold} generated={}", toks_cold.len());
+        println!(
+            "  fault cold Italy: reused={reused_cold} generated={}",
+            toks_cold.len()
+        );
         assert_eq!(reused_cold, 0);
         assert!(!toks_cold.is_empty());
         let (reused_warm, toks_warm) = run(&engine, italy.clone(), &greedy);
@@ -281,8 +281,8 @@ fn main() {
                 json_schema: None,
                 started_in_think: false,
                 think_budget: usize::MAX,
-        queue_bytes: 0,
-        request_tag: 2,
+                queue_bytes: 0,
+                request_tag: 2,
                 reply: tx,
             })
             .expect("faulted submit");
@@ -350,7 +350,10 @@ fn main() {
                 out
             }
         };
-        println!("  recovery: reused={reused_rec} generated={}", toks_rec.len());
+        println!(
+            "  recovery: reused={reused_rec} generated={}",
+            toks_rec.len()
+        );
         assert_eq!(
             toks_rec, toks_ref,
             "post-fault recovery must match the reference exactly"
@@ -376,9 +379,7 @@ fn main() {
         // Spill/restore on the live engine. Two slots: S and T fill them,
         // a third cold request forces the LRU idle session (S) out to
         // swap; a named reentry on S must restore it.
-        let submit_turn = |continuation: Continuation,
-                           convo: Vec<u64>|
-         -> (u64, usize, Vec<u32>) {
+        let submit_turn = |continuation: Continuation, convo: Vec<u64>| -> (u64, usize, Vec<u32>) {
             let (tx, rx) = channel::<Event>();
             engine
                 .submit(SubmitRequest {
@@ -601,10 +602,8 @@ fn main() {
         reused_g >= PAGE,
         "grammar AR must reuse the published prefix, got {reused_g}"
     );
-    let parsed: serde_json::Value =
-        serde_json::from_str(json_text.trim()).unwrap_or_else(|e| {
-            panic!("grammar output is not JSON ({e}): {json_text:?}")
-        });
+    let parsed: serde_json::Value = serde_json::from_str(json_text.trim())
+        .unwrap_or_else(|e| panic!("grammar output is not JSON ({e}): {json_text:?}"));
     assert!(
         parsed.get("city").and_then(|v| v.as_str()).is_some(),
         "grammar JSON missing city string: {parsed}"
@@ -668,11 +667,9 @@ fn main() {
     // short warm requests: all must complete — the long prefill may not
     // starve behind the warm hits, and the warm hits may not starve behind
     // the long prefill (FairQueue rotation + prefill quantum).
-    let mut atlantis: Vec<u32> = tokenizer.encode(
-        "The lost city of Atlantis was said to lie beyond the pillars. ",
-    );
-    let atl_filler =
-        tokenizer.encode("Sailors traded pearls and told of shining harbors there. ");
+    let mut atlantis: Vec<u32> =
+        tokenizer.encode("The lost city of Atlantis was said to lie beyond the pillars. ");
+    let atl_filler = tokenizer.encode("Sailors traded pearls and told of shining harbors there. ");
     while atlantis.len() < PAGE * 6 {
         atlantis.extend_from_slice(&atl_filler);
     }
@@ -708,8 +705,8 @@ fn main() {
             json_schema: None,
             started_in_think: false,
             think_budget: usize::MAX,
-        queue_bytes: 0,
-        request_tag: 4,
+            queue_bytes: 0,
+            request_tag: 4,
             reply: tx_long,
         })
         .expect("submit long");
@@ -730,8 +727,14 @@ fn main() {
         toks_long.len(),
         toks_short.len()
     );
-    assert!(!toks_long.is_empty(), "the long cold prefill must complete (no starvation)");
-    assert!(!toks_short.is_empty(), "the short warm request must complete (no starvation)");
+    assert!(
+        !toks_long.is_empty(),
+        "the long cold prefill must complete (no starvation)"
+    );
+    assert!(
+        !toks_short.is_empty(),
+        "the short warm request must complete (no starvation)"
+    );
     assert_eq!(
         reused_long, 0,
         "the distinct long prefix must be a cold miss"
@@ -854,7 +857,10 @@ fn main() {
         .collect();
     for (i, h) in handles.into_iter().enumerate() {
         let (reused, tokens, expect, elapsed) = h.join().expect("concurrent thread");
-        assert!(!tokens.is_empty(), "concurrent request {i} produced no tokens");
+        assert!(
+            !tokens.is_empty(),
+            "concurrent request {i} produced no tokens"
+        );
         assert!(
             elapsed < WAIT_BOUND,
             "request {i} exceeded the per-request wait bound ({elapsed:?} >= {WAIT_BOUND:?})"

@@ -299,8 +299,7 @@ impl SlotPool {
             ));
         }
         if let Some(pool) = self.page_pool.as_mut() {
-            let bt = self
-                .block_tables[id.0]
+            let bt = self.block_tables[id.0]
                 .as_mut()
                 .ok_or_else(|| format!("SlotPool: slot {} has no block table", id.0))?;
             pool.ensure_capacity(bt, seq_len)?;
@@ -335,8 +334,7 @@ impl SlotPool {
             ));
         }
         if let Some(pool) = self.page_pool.as_mut() {
-            let bt = self
-                .block_tables[id.0]
+            let bt = self.block_tables[id.0]
                 .as_mut()
                 .ok_or_else(|| format!("SlotPool: slot {} has no block table", id.0))?;
             pool.ensure_capacity(bt, seq_len)?;
@@ -452,7 +450,10 @@ impl SlotPool {
 
     /// True when `slot`'s block table has changed since last upload.
     pub fn block_table_dirty(&self, slot: SlotId) -> bool {
-        self.block_tables_dirty.get(slot.0).copied().unwrap_or(false)
+        self.block_tables_dirty
+            .get(slot.0)
+            .copied()
+            .unwrap_or(false)
     }
 
     /// Activate paged mode for `slot`: set the descriptor's `block_table`
@@ -483,12 +484,7 @@ impl SlotPool {
     /// into the same physical page with no error raised. After sharing, set
     /// dst's live length to `n_pages * PAGE_TOKENS` (its fork point); further
     /// growth allocates fresh pages only.
-    pub fn share_prefix(
-        &mut self,
-        src: SlotId,
-        dst: SlotId,
-        n_pages: usize,
-    ) -> Result<(), String> {
+    pub fn share_prefix(&mut self, src: SlotId, dst: SlotId, n_pages: usize) -> Result<(), String> {
         // Every final validation runs BEFORE any mutation. The pool's own
         // refusal arms are contractually non-mutating; this wrapper's cap arm
         // used to run AFTER the pages were already shared into dst, so a
@@ -547,11 +543,7 @@ impl SlotPool {
     /// but a list of physical page indices from the prefix cache's published
     /// handles. The caller must have already sealed those pages and taken
     /// cache refs via `PagePool::seal` + `PagePool::add_cache_ref`.
-    pub fn share_published_pages(
-        &mut self,
-        dst: SlotId,
-        phys_pages: &[u32],
-    ) -> Result<(), String> {
+    pub fn share_published_pages(&mut self, dst: SlotId, phys_pages: &[u32]) -> Result<(), String> {
         // Validate everything that can refuse BEFORE the first mutation: a
         // refused share must leave dst holding no pages and no refs.
         let live = phys_pages.len() * PAGE_TOKENS;
@@ -692,10 +684,7 @@ impl SlotPool {
             ));
         }
         if !self.in_use[lease.id.0] {
-            return Err(format!(
-                "SlotPool: slot {} is not in use",
-                lease.id.0
-            ));
+            return Err(format!("SlotPool: slot {} is not in use", lease.id.0));
         }
         Ok(())
     }
@@ -711,11 +700,7 @@ impl SlotPool {
 
     /// Set a slot's logical KV length with generation validation (spec
     /// §4.3).  A stale lease is rejected before any mutation.
-    pub fn set_seq_len_leased(
-        &mut self,
-        lease: &SlotLease,
-        seq_len: usize,
-    ) -> Result<(), String> {
+    pub fn set_seq_len_leased(&mut self, lease: &SlotLease, seq_len: usize) -> Result<(), String> {
         self.validate_generation(lease)?;
         self.set_seq_len(lease.id, seq_len)
     }
@@ -896,7 +881,10 @@ mod tests {
         let mut p = SlotPool::new_paged(2, 256, PPB, 16).unwrap();
         assert!(p.is_paged());
         let slot = p.acquire().unwrap();
-        assert!(p.block_table(slot).is_some(), "acquired slot must have a block table");
+        assert!(
+            p.block_table(slot).is_some(),
+            "acquired slot must have a block table"
+        );
         assert_eq!(p.block_table(slot).unwrap().num_pages(), 0);
         assert_eq!(p.block_table(slot).unwrap().live_tokens(), 0);
     }
@@ -938,7 +926,10 @@ mod tests {
         assert_eq!(p.free_pages(), 13);
         p.release(slot);
         assert_eq!(p.free_pages(), 16, "release must free all pages");
-        assert!(p.block_table(slot).is_none(), "release must clear block table");
+        assert!(
+            p.block_table(slot).is_none(),
+            "release must clear block table"
+        );
     }
 
     #[test]
@@ -1038,10 +1029,7 @@ mod tests {
         let b = p.acquire().unwrap();
         p.set_seq_len(a, 300).unwrap();
         let err = p.share_prefix(a, b, 3).unwrap_err();
-        assert!(
-            err.contains("partially-filled"),
-            "unexpected: {err}"
-        );
+        assert!(err.contains("partially-filled"), "unexpected: {err}");
         // The refused share must not have mutated dst or the refcounts.
         assert_eq!(p.block_table(b).unwrap().num_pages(), 0);
         assert_eq!(p.free_pages(), 13);

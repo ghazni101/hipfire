@@ -401,11 +401,7 @@ impl Admission {
     pub(crate) fn new(max_queue: usize, timeout: Duration) -> Self {
         Self::new_with_capacity_and_bytes(max_queue, timeout, 1, 0)
     }
-    pub(crate) fn new_with_capacity(
-        max_queue: usize,
-        timeout: Duration,
-        capacity: usize,
-    ) -> Self {
+    pub(crate) fn new_with_capacity(max_queue: usize, timeout: Duration, capacity: usize) -> Self {
         Self::new_with_capacity_and_bytes(max_queue, timeout, capacity, 0)
     }
 
@@ -573,8 +569,7 @@ impl Admission {
                     };
                     if !can_acquire {
                         state.queued = state.queued.saturating_sub(1);
-                        state.queued_bytes =
-                            state.queued_bytes.saturating_sub(request_bytes);
+                        state.queued_bytes = state.queued_bytes.saturating_sub(request_bytes);
                         return Err(AdmissionError {
                             message: format!(
                                 "serve queue wait exceeded {}ms",
@@ -743,8 +738,7 @@ impl Admission {
                 };
                 if can_acquire {
                     state.queued = state.queued.saturating_sub(1);
-                    state.queued_bytes =
-                        state.queued_bytes.saturating_sub(request_bytes);
+                    state.queued_bytes = state.queued_bytes.saturating_sub(request_bytes);
                     queued.disarm();
                     if is_eligible {
                         state.eligible += 1;
@@ -1782,7 +1776,10 @@ pub(crate) fn validate_serve_pid(
     if owns_port == Some(true) || record.legacy && owns_port.is_none() {
         Ok(())
     } else {
-        bail!("could not prove PID {} owns the tracked serve port", record.pid)
+        bail!(
+            "could not prove PID {} owns the tracked serve port",
+            record.pid
+        )
     }
 }
 
@@ -2585,7 +2582,10 @@ mod tests {
     #[test]
     fn multi_slot_startup_rejects_prefill_min_above_chunk() {
         let err = validate_multi_slot_startup(true, 1, 64, 2048, 2048, 1024, 2).unwrap_err();
-        assert!(err.contains("must be <= serve.multi_slot_prefill_chunk"), "{err}");
+        assert!(
+            err.contains("must be <= serve.multi_slot_prefill_chunk"),
+            "{err}"
+        );
     }
 
     #[test]
@@ -2614,9 +2614,8 @@ mod tests {
         let _holder = admission.acquire().unwrap();
         // Second request with 60 bytes queues (0 + 60 ≤ 100).
         let adm2 = Arc::clone(&admission);
-        let handle = thread::spawn(move || {
-            adm2.acquire_for_with_bytes(true, Some("m"), 60).unwrap()
-        });
+        let handle =
+            thread::spawn(move || adm2.acquire_for_with_bytes(true, Some("m"), 60).unwrap());
         // Wait for it to queue.
         for _ in 0..100 {
             if admission.queued_bytes() > 0 {
@@ -2647,7 +2646,9 @@ mod tests {
         ));
         let _holder = admission.acquire().unwrap();
         // Large bytes should not be rejected by the byte budget.
-        let err = admission.acquire_for_with_bytes(true, Some("m"), 999_999_999).unwrap_err();
+        let err = admission
+            .acquire_for_with_bytes(true, Some("m"), 999_999_999)
+            .unwrap_err();
         // Should be a timeout (queue wait), not a QueueFull byte error.
         assert_eq!(err.kind(), AdmissionErrorKind::QueueTimeout);
     }
@@ -2662,7 +2663,9 @@ mod tests {
             2,
             1024,
         ));
-        let guard = admission.acquire_for_with_bytes(true, Some("m"), 100).unwrap();
+        let guard = admission
+            .acquire_for_with_bytes(true, Some("m"), 100)
+            .unwrap();
         assert_eq!(admission.inflight(), 1);
         assert_eq!(admission.queued_bytes(), 0); // bytes released from queue on admit
         drop(guard);
@@ -2738,17 +2741,20 @@ mod tests {
             1024,
         ));
         // Fast path: no queueing, queue_bytes = 0.
-        let guard = admission.acquire_for_with_bytes(true, Some("m"), 500).unwrap();
+        let guard = admission
+            .acquire_for_with_bytes(true, Some("m"), 500)
+            .unwrap();
         assert_eq!(guard.queue_bytes(), 0);
         assert!(guard.is_eligible());
         drop(guard);
 
         // Queued path: queue_bytes = charged bytes.
-        let holder = admission.acquire_for_with_bytes(true, Some("m"), 0).unwrap();
+        let holder = admission
+            .acquire_for_with_bytes(true, Some("m"), 0)
+            .unwrap();
         let adm2 = Arc::clone(&admission);
-        let handle = thread::spawn(move || {
-            adm2.acquire_for_with_bytes(true, Some("m"), 400).unwrap()
-        });
+        let handle =
+            thread::spawn(move || adm2.acquire_for_with_bytes(true, Some("m"), 400).unwrap());
         // Wait for queue, then release holder so the waiter acquires.
         for _ in 0..100 {
             if admission.queued_bytes() == 400 {
@@ -2896,8 +2902,21 @@ mod capabilities_tests {
     #[test]
     fn standard_route_advertises_honest_absence() {
         let caps = route_capabilities(
-            false, 4, 8192, 1024, false, 0, false, 4096, 1, 64, 268435456, 30000,
-            4 << 20, 30_000, 64 << 20,
+            false,
+            4,
+            8192,
+            1024,
+            false,
+            0,
+            false,
+            4096,
+            1,
+            64,
+            268435456,
+            30000,
+            4 << 20,
+            30_000,
+            64 << 20,
         );
         assert_eq!(caps["mode"], "standard");
         assert_eq!(caps["multi_slot"], false);
@@ -2926,7 +2945,10 @@ mod capabilities_tests {
         std::fs::write(&trunk, b"x").unwrap();
         std::fs::write(dir.join("model.mtp"), b"x").unwrap();
         let caps = model_capabilities(&route(), &trunk);
-        assert_eq!(caps["mtp_sidecar"], true, "quant-stripped .mtp sibling found");
+        assert_eq!(
+            caps["mtp_sidecar"], true,
+            "quant-stripped .mtp sibling found"
+        );
         std::fs::remove_dir_all(&dir).ok();
     }
 }

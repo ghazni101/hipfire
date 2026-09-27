@@ -23,14 +23,14 @@ mod gemma4_ext;
 mod gemma4_ops;
 pub mod gemv;
 pub mod graph;
-mod kernels;
 pub mod kernel_registry;
+mod kernels;
 pub mod kv_slots;
-pub mod page_pool;
 pub mod moe;
 pub mod mq_f16_producers;
 pub mod mq_f16_residual_producers;
 pub mod norm;
+pub mod page_pool;
 pub mod pool;
 pub mod profile;
 pub mod profile_rocprof;
@@ -40,7 +40,9 @@ pub mod rdna;
 pub mod replay;
 pub mod sampling;
 pub mod scratch;
-pub use scratch::{Int4MmqPrepared, Int4MmqReservation, Int8MmqPrepared, Int8MmqReservation, Mq4v2Fp8Prepared};
+pub use scratch::{
+    Int4MmqPrepared, Int4MmqReservation, Int8MmqPrepared, Int8MmqReservation, Mq4v2Fp8Prepared,
+};
 pub mod slot_pool;
 pub mod text_encoder;
 pub mod vae;

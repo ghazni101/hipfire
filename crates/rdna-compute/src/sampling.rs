@@ -1726,11 +1726,7 @@ impl Gpu {
         self.bind_thread()?;
         if !self.functions.contains_key("sample_apply_repeat_penalty") {
             let src = sample_top_p_parallel_src();
-            self.ensure_kernel(
-                "sample_top_p_parallel",
-                &src,
-                "sample_apply_repeat_penalty",
-            )?;
+            self.ensure_kernel("sample_top_p_parallel", &src, "sample_apply_repeat_penalty")?;
         }
         let func = &self.functions["sample_apply_repeat_penalty"];
         let mut lp = row.buf.as_ptr();

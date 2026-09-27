@@ -34,6 +34,18 @@ pub mod arch;
 pub mod arch_model;
 #[cfg(feature = "deltanet")]
 pub mod carrier;
+/// Qwen3.5 hybrid-state checkpoint pool for serving prefix-cache resume
+/// (spec §4.5 C5). Byte-bounded LRU of immutable `DeltaNetSnapshot`
+/// bundles keyed by `(CacheDomain, boundary_p)`, with `plan_resume`
+/// last-token semantics and GPU-backed capture/restore paths.
+#[cfg(feature = "deltanet")]
+pub mod checkpoint;
+/// DFlash2 speculative decode for the multi-slot serve engine: shared draft
+/// state, per-slot draft context, and the draft/verify-accept steps that
+/// plug into `serve_engine`'s batched forward. Deltanet-gated like
+/// `dflash_spec` (the draft forward consumes `ModelSlot`-family types).
+#[cfg(feature = "deltanet")]
+pub mod dflash_slot;
 /// Qwen3.5 DFlash / DDTree speculative-decode state (`DflashState`,
 /// `load_dflash_state`) and the `DflashSpeculator` impl of the arch-generic
 /// `hipfire_runtime::spec::Speculator`. Deltanet-gated — it owns `ModelSlot`-
@@ -45,12 +57,6 @@ pub mod dflash_spec;
 /// route-proof counters; `speculative` owns the GPU half.
 /// Not deltanet-gated, matching `speculative`, which consumes it.
 pub mod dflash_verify_pm4;
-/// DFlash2 speculative decode for the multi-slot serve engine: shared draft
-/// state, per-slot draft context, and the draft/verify-accept steps that
-/// plug into `serve_engine`'s batched forward. Deltanet-gated like
-/// `dflash_spec` (the draft forward consumes `ModelSlot`-family types).
-#[cfg(feature = "deltanet")]
-pub mod dflash_slot;
 /// SP3 Task 2 — `forward_batch_slots`, the N-slot forward pass. A PARALLEL
 /// entry point to `qwen35::forward_prefill_batch_with_pbs_opts` (never a
 /// modification of it — see the module doc for why), routing attention
@@ -85,12 +91,6 @@ pub mod serve_engine;
 #[cfg(feature = "deltanet")]
 mod spec_impl;
 pub mod speculative;
-/// Qwen3.5 hybrid-state checkpoint pool for serving prefix-cache resume
-/// (spec §4.5 C5). Byte-bounded LRU of immutable `DeltaNetSnapshot`
-/// bundles keyed by `(CacheDomain, boundary_p)`, with `plan_resume`
-/// last-token semantics and GPU-backed capture/restore paths.
-#[cfg(feature = "deltanet")]
-pub mod checkpoint;
 
 /// Grammar-guided decoding for tool-call format — re-exported from `saddle_core::grammar::json`.
 ///

@@ -654,12 +654,22 @@ pub(crate) enum EndpointAdapterStatus {
 /// Pre-generation denial when tools are requested without a safe adapter.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum EndpointAdapterError {
-    Unavailable { endpoint: &'static str },
-    Lossy { endpoint: &'static str },
+    Unavailable {
+        endpoint: &'static str,
+    },
+    Lossy {
+        endpoint: &'static str,
+    },
     /// Tool list exceeds the grammar compiler's bounds — rejected before
     /// admission so it is a typed 400, not a daemon-side panic.
-    TooManyTools { count: usize, max: usize },
-    ToolsTooLarge { bytes: usize, max: usize },
+    TooManyTools {
+        count: usize,
+        max: usize,
+    },
+    ToolsTooLarge {
+        bytes: usize,
+        max: usize,
+    },
 }
 
 impl std::fmt::Display for EndpointAdapterError {
@@ -675,7 +685,10 @@ impl std::fmt::Display for EndpointAdapterError {
                 write!(f, "too many tools: {count} exceeds the maximum of {max}")
             }
             Self::ToolsTooLarge { bytes, max } => {
-                write!(f, "tool definitions too large: {bytes} bytes exceeds the maximum of {max}")
+                write!(
+                    f,
+                    "tool definitions too large: {bytes} bytes exceeds the maximum of {max}"
+                )
             }
         }
     }
@@ -1670,9 +1683,9 @@ fn project_request_contract_inner(
         .filter(|v| !v.is_null())
     {
         None => config_u64(resolved, "generation.max_tokens")?,
-        Some(v) => v.as_u64().ok_or_else(|| {
-            anyhow!("max_tokens must be an integer between 1 and 393216")
-        })?,
+        Some(v) => v
+            .as_u64()
+            .ok_or_else(|| anyhow!("max_tokens must be an integer between 1 and 393216"))?,
     };
     if max_tokens == 0 || max_tokens > 393_216 {
         bail!("max_tokens must be between 1 and 393216");
@@ -1702,7 +1715,10 @@ fn project_request_contract_inner(
                 .filter(|v| v.is_finite())
                 .ok_or_else(|| anyhow!("{field} must be a finite number"))?;
             if number < min || number > max || field == "top_p" && number == 0.0 {
-                bail!("{field} must be within {}", if field == "top_p" { "(0, 1]" } else { "[0, 2]" });
+                bail!(
+                    "{field} must be within {}",
+                    if field == "top_p" { "(0, 1]" } else { "[0, 2]" }
+                );
             }
         }
     }
@@ -1745,7 +1761,16 @@ fn project_request_contract_inner(
                 .get("role")
                 .and_then(serde_json::Value::as_str)
                 .ok_or_else(|| anyhow!("each message must have a string role"))?;
-            if !matches!(role, "developer" | "system" | "user" | "assistant" | "tool" | "toolResult" | "tool_result") {
+            if !matches!(
+                role,
+                "developer"
+                    | "system"
+                    | "user"
+                    | "assistant"
+                    | "tool"
+                    | "toolResult"
+                    | "tool_result"
+            ) {
                 bail!("unknown message role: {role}");
             }
         }
@@ -2745,7 +2770,6 @@ pub(crate) fn multi_slot_request_supported(body: &serde_json::Value) -> Result<(
     }
     Ok(())
 }
-
 
 /// Server-owned retry driver with cooperative cancellation.
 ///
@@ -7271,7 +7295,11 @@ mod tests {
     #[test]
     fn project_request_contract_rejects_malformed_max_tokens() {
         let resolved = contract_resolved_with_system("");
-        for bad in [serde_json::json!(-5), serde_json::json!(1.5), serde_json::json!("100")] {
+        for bad in [
+            serde_json::json!(-5),
+            serde_json::json!(1.5),
+            serde_json::json!("100"),
+        ] {
             let body = serde_json::json!({
                 "max_tokens": bad,
                 "messages": [{ "role": "user", "content": "hi" }]
@@ -7309,7 +7337,8 @@ mod tests {
             let err = project_request_contract(&body, &resolved, false)
                 .expect_err("unsupported field must be refused");
             assert!(
-                err.to_string().contains("not supported on this serve route"),
+                err.to_string()
+                    .contains("not supported on this serve route"),
                 "unexpected error for {k}: {err}"
             );
         }
@@ -7496,7 +7525,9 @@ mod tests {
         // and the nested `reasoning.max_tokens` alias are inputs, not
         // refusals. `0` = uncapped and `1` = no-thinking sentinel.
         assert!(ok(serde_json::json!({ "max_think_tokens": 2 })));
-        assert!(ok(serde_json::json!({ "reasoning": { "max_tokens": 2048 } })));
+        assert!(ok(
+            serde_json::json!({ "reasoning": { "max_tokens": 2048 } })
+        ));
         err_contains(serde_json::json!({ "thinking_budget": "high" }), "budget");
     }
 
@@ -7507,19 +7538,18 @@ mod tests {
     fn response_format_validation_accepts_and_rejects() {
         // Absent / null → None (no constraint).
         assert!(validate_response_format(None).unwrap().is_none());
-        assert!(
-            validate_response_format(Some(&serde_json::Value::Null))
-                .unwrap()
-                .is_none()
-        );
+        assert!(validate_response_format(Some(&serde_json::Value::Null))
+            .unwrap()
+            .is_none());
 
         // json_object → REJECTED (typed error). This serve route has no
         // json_object enforcement; silently dropping the requested
         // constraint and returning success would be the "silent semantic
         // downgrade" the spec forbids (§7.1/X2). It used to pass through as
         // None — an unconstrained 200.
-        assert!(validate_response_format(Some(&serde_json::json!({"type": "json_object"})))
-            .is_err());
+        assert!(
+            validate_response_format(Some(&serde_json::json!({"type": "json_object"}))).is_err()
+        );
 
         // Valid json_schema with a simple object schema.
         let rf = validate_response_format(Some(&serde_json::json!({

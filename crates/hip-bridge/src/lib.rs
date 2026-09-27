@@ -19,8 +19,8 @@ pub use error::{
     HIP_ERROR_PEER_ACCESS_ALREADY_ENABLED, HIP_ERROR_PEER_ACCESS_NOT_ENABLED,
     HIP_ERROR_PEER_ACCESS_UNSUPPORTED,
 };
-pub use ffi::launch_counters;
 pub use ffi::arm_hip_fault;
+pub use ffi::launch_counters;
 pub use ffi::{
     Event, Function, Graph, GraphExec, HipMemAccessDesc, HipMemAllocationProp,
     HipMemGenericAllocationHandle, HipMemLocation, HipPointerAttribute, HipRuntime, Module, Stream,

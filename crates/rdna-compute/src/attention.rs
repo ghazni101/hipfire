@@ -91,14 +91,15 @@ fn q8_flash_default_tile_size(
 const Q8_FLASH_REDUCE_SHARED_FLOATS: usize = 32 * 1024 / 4;
 
 fn q8_flash_reduce_safe_tile_size(tile_size: usize, head_dim: usize, max_seq: usize) -> usize {
-    let tile_capacity = Q8_FLASH_REDUCE_SHARED_FLOATS.saturating_sub(head_dim).max(1);
+    let tile_capacity = Q8_FLASH_REDUCE_SHARED_FLOATS
+        .saturating_sub(head_dim)
+        .max(1);
     if max_seq <= tile_capacity.saturating_mul(tile_size) {
         tile_size
     } else {
         max_seq.div_ceil(tile_capacity).next_power_of_two()
     }
 }
-
 
 /// Architecture- and shape-aware tile geometry for scalar Q8 decode attention.
 ///
@@ -119,7 +120,9 @@ pub fn q8_flash_tile_size(
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| matches!(value, 16 | 32 | 64 | 128 | 256))
-        .unwrap_or_else(|| q8_flash_default_tile_size(arch, n_heads, n_kv_heads, head_dim, max_seq));
+        .unwrap_or_else(|| {
+            q8_flash_default_tile_size(arch, n_heads, n_kv_heads, head_dim, max_seq)
+        });
     q8_flash_reduce_safe_tile_size(preferred, head_dim, max_seq)
 }
 
@@ -160,7 +163,9 @@ fn check_native_kv_capacity(
     if have < need {
         return Err(hip_bridge::HipError::new(
             0,
-            &format!("{what}: cache holds {have} bytes, need {need} (tokens={tokens} row={row_bytes})"),
+            &format!(
+                "{what}: cache holds {have} bytes, need {need} (tokens={tokens} row={row_bytes})"
+            ),
         ));
     }
     Ok(())
@@ -1763,7 +1768,10 @@ impl Gpu {
         self.bind_thread()?;
         let row = fp8_e4m3_row_bytes(n_kv_heads, head_dim);
         check_native_kv_capacity(dst, 1, row, "kv_cache_write_fp8_e4m3_batched")?;
-        if !self.functions.contains_key("kv_cache_write_fp8_e4m3_batched") {
+        if !self
+            .functions
+            .contains_key("kv_cache_write_fp8_e4m3_batched")
+        {
             let stripped = kernels::KV_CACHE_WRITE_FP8_E4M3_BATCHED_SRC
                 .replace("#include \"kv_slot_desc.h\"", "");
             let src = format!("{}\n{}", kernels::KV_SLOT_DESC_H, stripped);
@@ -1787,8 +1795,8 @@ impl Gpu {
             &hd as *const _ as *mut c_void,
             &bs as *const _ as *mut c_void,
         ];
-        let bytes = crate::profile::kv_cache_write_fp8_e4m3_bytes(n_kv_heads, head_dim)
-            * batch_size;
+        let bytes =
+            crate::profile::kv_cache_write_fp8_e4m3_bytes(n_kv_heads, head_dim) * batch_size;
         let timer = crate::profile::begin_timer(
             &self.hip,
             "kv_write",
@@ -3666,10 +3674,18 @@ impl Gpu {
         // Profile bytes: f32 Q + K/V re-read over the causal prefix (ctx =
         // max_ctx_len; see `attention_q8_0_flash_prefill_bytes`) + f32 out.
         let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
-            batch_size, n_heads, n_kv_heads, head_dim, max_ctx_len,
+            batch_size,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
         );
-        let timer =
-            crate::profile::begin_timer(&self.hip, "attention", "attention_q8_0_flash_prefill", bytes);
+        let timer = crate::profile::begin_timer(
+            &self.hip,
+            "attention",
+            "attention_q8_0_flash_prefill",
+            bytes,
+        );
         let result = self.launch_maybe_blob(
             "attention_q8_0_flash_prefill",
             [grid_x, n_heads as u32, 1],
@@ -3766,8 +3782,16 @@ impl Gpu {
             && (64..=32768).contains(&max_ctx_len)
         {
             return self.attention_q8_0_fa2_gqa_gfx11(
-                q, k_cache, v_cache, out, positions, n_heads, n_kv_heads, head_dim,
-                max_ctx_len, batch_size,
+                q,
+                k_cache,
+                v_cache,
+                out,
+                positions,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_ctx_len,
+                batch_size,
             );
         }
         // Default-on: gfx1201 GQA-fused FA2 prefill. Exact arch/shape/
@@ -3790,8 +3814,16 @@ impl Gpu {
             // arithmetic does not exist (B4 pending), so there is nothing to
             // select here.
             return self.attention_q8_0_fa2_gqa_gfx1201(
-                q, k_cache, v_cache, out, positions, n_heads, n_kv_heads, head_dim,
-                max_ctx_len, batch_size,
+                q,
+                k_cache,
+                v_cache,
+                out,
+                positions,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_ctx_len,
+                batch_size,
             );
         }
         // Default-on: gfx11 (RDNA3) GQA-fused FA2 prefill. Exact
@@ -3815,13 +3847,33 @@ impl Gpu {
             && (64..=32768).contains(&max_ctx_len)
         {
             return self.attention_q8_0_fa2_gqa_gfx11(
-                q, k_cache, v_cache, out, positions, n_heads, n_kv_heads, head_dim,
-                max_ctx_len, batch_size,
+                q,
+                k_cache,
+                v_cache,
+                out,
+                positions,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                max_ctx_len,
+                batch_size,
             );
         }
         self.attention_q8_0_flash_prefill_wmma_slots(
-            q, k_cache, v_cache, out, positions, n_heads, n_kv_heads, head_dim, max_ctx_len,
-            batch_size, None, None, None, None,
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
+            None,
+            None,
+            None,
+            None,
         )
     }
 
@@ -4020,7 +4072,11 @@ impl Gpu {
         // Profile bytes: f32 Q + K/V re-read over the causal prefix (ctx =
         // max_ctx_len; see `attention_q8_0_flash_prefill_bytes`) + f32 out.
         let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
-            batch_size, n_heads, n_kv_heads, head_dim, max_ctx_len,
+            batch_size,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
         );
         let timer = crate::profile::begin_timer(
             &self.hip,
@@ -4162,7 +4218,9 @@ impl Gpu {
         ) {
             self.invalidate_for_scratch_growth();
         }
-        let q16_ptr = self.scratch.ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
+        let q16_ptr = self
+            .scratch
+            .ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
         let grid_x = batch_size.div_ceil(8) as u32;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q16_arg = q16_ptr;
@@ -4191,14 +4249,13 @@ impl Gpu {
         // (f32 Q + K/V re-read over the causal prefix + f32 out); timing
         // itself remains exact HIP-event timing.
         let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
-            batch_size, n_heads, n_kv_heads, head_dim, max_ctx_len,
+            batch_size,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
         );
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "attention",
-            symbol,
-            bytes,
-        );
+        let timer = crate::profile::begin_timer(&self.hip, "attention", symbol, bytes);
         // F4b: pre-convert f32 Q -> f16 scratch on the same stream, then run
         // the body against the scratch. Both via launch_maybe_blob so graph
         // capture stays valid. The blob ABI below is unchanged (q16 reuses
@@ -4343,7 +4400,9 @@ impl Gpu {
         ) {
             self.invalidate_for_scratch_growth();
         }
-        let q16_ptr = self.scratch.ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
+        let q16_ptr = self
+            .scratch
+            .ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
         let grid_x = batch_size.div_ceil(8) as u32;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q16_arg = q16_ptr;
@@ -4372,14 +4431,13 @@ impl Gpu {
         // (f32 Q + K/V re-read over the causal prefix + f32 out); timing
         // itself remains exact HIP-event timing.
         let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
-            batch_size, n_heads, n_kv_heads, head_dim, max_ctx_len,
+            batch_size,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
         );
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "attention",
-            SYMBOL,
-            bytes,
-        );
+        let timer = crate::profile::begin_timer(&self.hip, "attention", SYMBOL, bytes);
         // F4b: pre-convert f32 Q -> f16 scratch on the same stream, then run
         // the body against the scratch. Both via launch_maybe_blob so graph
         // capture stays valid. The blob ABI below is unchanged (q16 reuses
@@ -4511,8 +4569,7 @@ impl Gpu {
         // Stage-b scratch: e4m3 codes + f32 sq + route-Q scale plane
         // (n_heads/head_dim validated H24/D256 above), Gpu-owned,
         // grows-never-shrinks. Direct launch: one split.
-        let (need_fp8_bytes, sq_off, _) =
-            crate::scratch::fa2_fp8_q_needed(batch_size, 1, true);
+        let (need_fp8_bytes, sq_off, _) = crate::scratch::fa2_fp8_q_needed(batch_size, 1, true);
         // Same pre-growth invalidation contract as the f16 FA2 scratch:
         // the body reads this scratch from the captured graph's kernargs.
         if crate::scratch::scratch_will_grow(
@@ -4554,26 +4611,19 @@ impl Gpu {
         // (f32 Q + K/V re-read over the causal prefix + f32 out); timing
         // itself remains exact HIP-event timing.
         let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
-            batch_size, n_heads, n_kv_heads, head_dim, max_ctx_len,
+            batch_size,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
         );
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "attention",
-            SYMBOL,
-            bytes,
-        );
+        let timer = crate::profile::begin_timer(&self.hip, "attention", SYMBOL, bytes);
         // Stage-b pre-convert f32 Q -> e4m3 codes + f32 sq on the same
         // stream, then run the body against the scratch. Both via
         // launch_maybe_blob so graph capture stays valid. The blob ABI
         // below is the frozen contract (codes reuse the old f32 Q slot:
         // same offset 0, same size).
-        self.launch_fa2_q_preconvert_fp8(
-            PRECONVERT,
-            q.buf.as_ptr(),
-            q8_ptr,
-            sq_ptr,
-            batch_size,
-        )?;
+        self.launch_fa2_q_preconvert_fp8(PRECONVERT, q.buf.as_ptr(), q8_ptr, sq_ptr, batch_size)?;
         // Stage-b arms use exactly 32768 B dynamic LDS (fp8 planes); keyed
         // off the arm, not the flag — the f16 arms above keep 65536.
         let result = self.launch_maybe_blob(
@@ -4692,8 +4742,7 @@ impl Gpu {
         // Stage-b scratch: e4m3 codes + f32 sq, no scale plane (route N
         // reads scales from the native row header), Gpu-owned,
         // grows-never-shrinks. Direct launch: one split.
-        let (need_fp8_bytes, sq_off, _) =
-            crate::scratch::fa2_fp8_q_needed(batch_size, 1, false);
+        let (need_fp8_bytes, sq_off, _) = crate::scratch::fa2_fp8_q_needed(batch_size, 1, false);
         // Same pre-growth invalidation contract as the f16 FA2 scratch.
         if crate::scratch::scratch_will_grow(
             self.scratch.fa2_fp8_q_scratch_bytes,
@@ -4734,24 +4783,17 @@ impl Gpu {
         // (f32 Q + K/V re-read over the causal prefix + f32 out); timing
         // itself remains exact HIP-event timing.
         let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
-            batch_size, n_heads, n_kv_heads, head_dim, max_ctx_len,
+            batch_size,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
         );
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "attention",
-            SYMBOL,
-            bytes,
-        );
+        let timer = crate::profile::begin_timer(&self.hip, "attention", SYMBOL, bytes);
         // Stage-b pre-convert f32 Q -> e4m3 codes + f32 sq on the same
         // stream, then run the body against the scratch. Both via
         // launch_maybe_blob so graph capture stays valid.
-        self.launch_fa2_q_preconvert_fp8(
-            PRECONVERT,
-            q.buf.as_ptr(),
-            q8_ptr,
-            sq_ptr,
-            batch_size,
-        )?;
+        self.launch_fa2_q_preconvert_fp8(PRECONVERT, q.buf.as_ptr(), q8_ptr, sq_ptr, batch_size)?;
         // Stage-b arms use exactly 32768 B dynamic LDS (fp8 planes); the
         // Q0 arm keeps 65536.
         let result = self.launch_maybe_blob(
@@ -4862,8 +4904,7 @@ impl Gpu {
         if !self.functions.contains_key(SYMBOL) {
             self.ensure_kernel(SYMBOL, src, SYMBOL)?;
         }
-        let (need_fp8_bytes, _, _) =
-            crate::scratch::fa2_fp8_q_needed(batch_size, 1, false);
+        let (need_fp8_bytes, _, _) = crate::scratch::fa2_fp8_q_needed(batch_size, 1, false);
         if crate::scratch::scratch_will_grow(
             self.scratch.fa2_fp8_q_scratch_bytes,
             self.scratch.fa2_fp8_q_scratch.is_some(),
@@ -4903,14 +4944,13 @@ impl Gpu {
             &mut sc as *mut _ as *mut c_void,
         ];
         let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
-            batch_size, n_heads, n_kv_heads, head_dim, max_ctx_len,
+            batch_size,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
         );
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "attention",
-            SYMBOL,
-            bytes,
-        );
+        let timer = crate::profile::begin_timer(&self.hip, "attention", SYMBOL, bytes);
         // Packet arms use exactly 49408 B dynamic LDS (paired planes +
         // transpose scratch + shared scale headers); block 256.
         let result = self.launch_maybe_blob(
@@ -5027,16 +5067,27 @@ impl Gpu {
         max_ctx_len: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        if q.dtype != crate::DType::Raw
-            || q.buf.size() < batch_size * n_heads * (head_dim + 4)
-        {
-            return Err(hip_bridge::HipError::new(0, "Q8 resident attention requires Raw codes and scales"));
+        if q.dtype != crate::DType::Raw || q.buf.size() < batch_size * n_heads * (head_dim + 4) {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "Q8 resident attention requires Raw codes and scales",
+            ));
         }
         self.qresident_launch(
             "attention_fp8_e4m3_fa2_gqa_qresident_v2_q8_gfx1201",
             kernels::ATTENTION_FP8_E4M3_FA2_GQA_QRESIDENT_V2_Q8_GFX1201_SRC,
-            QRESIDENT_V2_LDS_BYTES, true, q, k_cache, v_cache, out, positions,
-            n_heads, n_kv_heads, head_dim, max_ctx_len, batch_size,
+            QRESIDENT_V2_LDS_BYTES,
+            true,
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
         )
     }
 
@@ -5085,9 +5136,7 @@ impl Gpu {
         if max_ctx_len == 0 || max_ctx_len > 262_144 {
             return Err(hip_bridge::HipError::new(
                 0,
-                &format!(
-                    "{symbol} requires 1 <= max_ctx_len <= 262144, got {max_ctx_len}"
-                ),
+                &format!("{symbol} requires 1 <= max_ctx_len <= 262144, got {max_ctx_len}"),
             ));
         }
         let need_qo = batch_size * n_heads * head_dim;
@@ -5141,7 +5190,11 @@ impl Gpu {
             params.insert(1, &mut q_scales as *mut _ as *mut c_void);
         }
         let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
-            batch_size, n_heads, n_kv_heads, head_dim, max_ctx_len,
+            batch_size,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
         );
         let timer = crate::profile::begin_timer(&self.hip, "attention", symbol, bytes);
         let result = self.launch_maybe_blob(
@@ -5199,8 +5252,8 @@ impl Gpu {
         n_splits: usize,
     ) -> HipResult<()> {
         self.stageb_split_impl(
-            q, k_cache, v_cache, out, positions, partials, n_heads,
-            n_kv_heads, head_dim, batch_size, n_splits, false,
+            q, k_cache, v_cache, out, positions, partials, n_heads, n_kv_heads, head_dim,
+            batch_size, n_splits, false,
         )
     }
     /// Benchmark/oracle-only split-KV packet path (S partitions + stable
@@ -5225,8 +5278,8 @@ impl Gpu {
         n_splits: usize,
     ) -> HipResult<()> {
         self.stageb_split_impl(
-            q, k_cache, v_cache, out, positions, partials, n_heads,
-            n_kv_heads, head_dim, batch_size, n_splits, true,
+            q, k_cache, v_cache, out, positions, partials, n_heads, n_kv_heads, head_dim,
+            batch_size, n_splits, true,
         )
     }
     #[allow(clippy::too_many_arguments)]
@@ -5246,11 +5299,18 @@ impl Gpu {
         packet: bool,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let tag = if packet { "packet_split" } else { "stageb_split" };
+        let tag = if packet {
+            "packet_split"
+        } else {
+            "stageb_split"
+        };
         if self.arch != "gfx1201" {
             return Err(hip_bridge::HipError::new(
                 0,
-                &format!("attention_fp8_e4m3_fa2_gqa_{tag}_gfx1201_bench requires gfx1201, got {}", self.arch),
+                &format!(
+                    "attention_fp8_e4m3_fa2_gqa_{tag}_gfx1201_bench requires gfx1201, got {}",
+                    self.arch
+                ),
             ));
         }
         if n_heads != 24 || n_kv_heads != 4 || head_dim != 256 {
@@ -5317,8 +5377,7 @@ impl Gpu {
             self.ensure_kernel(merge, src, merge)?;
         }
         // Stage-b scratch: e4m3 codes + f32 sq (same contract as direct).
-        let (need_fp8_bytes, sq_off, _) =
-            crate::scratch::fa2_fp8_q_needed(batch_size, 1, false);
+        let (need_fp8_bytes, sq_off, _) = crate::scratch::fa2_fp8_q_needed(batch_size, 1, false);
         if crate::scratch::scratch_will_grow(
             self.scratch.fa2_fp8_q_scratch_bytes,
             self.scratch.fa2_fp8_q_scratch.is_some(),
@@ -5361,13 +5420,7 @@ impl Gpu {
             &mut sc as *mut _ as *mut c_void,
             &mut ns as *mut _ as *mut c_void,
         ];
-        self.launch_fa2_q_preconvert_fp8(
-            PRECONVERT,
-            q.buf.as_ptr(),
-            q8_ptr,
-            sq_ptr,
-            batch_size,
-        )?;
+        self.launch_fa2_q_preconvert_fp8(PRECONVERT, q.buf.as_ptr(), q8_ptr, sq_ptr, batch_size)?;
         self.launch_maybe_blob(
             partial,
             [grid_x, 4, n_splits as u32],
@@ -5406,16 +5459,23 @@ impl Gpu {
         ];
         let n_rec = batch_size * n_heads;
         let merge_grid_x = n_rec.div_ceil(8) as u32;
-        self.launch_maybe_blob(merge, [merge_grid_x, 1, 1], [256, 1, 1], 0, &mut mparams, || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(pp_ptr);
-            b.push_ptr(o_ptr);
-            b.push_i32(mbs);
-            b.push_i32(mnh);
-            b.push_i32(mhd);
-            b.push_i32(mns);
-            b
-        })
+        self.launch_maybe_blob(
+            merge,
+            [merge_grid_x, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut mparams,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp_ptr);
+                b.push_ptr(o_ptr);
+                b.push_i32(mbs);
+                b.push_i32(mnh);
+                b.push_i32(mhd);
+                b.push_i32(mns);
+                b
+            },
+        )
     }
 
     /// Stage-b on-device Q pre-convert shared by the FA2 stage-b launchers.
@@ -5582,7 +5642,9 @@ impl Gpu {
         ) {
             self.invalidate_for_scratch_growth();
         }
-        let q16_ptr = self.scratch.ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
+        let q16_ptr = self
+            .scratch
+            .ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
         let grid_x = batch_size.div_ceil(8) as u32;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q16_arg = q16_ptr;
@@ -5611,14 +5673,13 @@ impl Gpu {
         // (f32 Q + K/V re-read over the causal prefix + f32 out); timing
         // itself remains exact HIP-event timing.
         let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
-            batch_size, n_heads, n_kv_heads, head_dim, max_ctx_len,
+            batch_size,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
         );
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "attention",
-            symbol,
-            bytes,
-        );
+        let timer = crate::profile::begin_timer(&self.hip, "attention", symbol, bytes);
         // F4b: pre-convert (rotation fused) f32 Q -> f16 scratch on the same
         // stream, then run the body against the scratch. Both via
         // launch_maybe_blob so graph capture stays valid. The body blob ABI
@@ -5889,7 +5950,9 @@ impl Gpu {
         ) {
             self.invalidate_for_scratch_growth();
         }
-        let q16_ptr = self.scratch.ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
+        let q16_ptr = self
+            .scratch
+            .ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
         let grid_x = batch_size.div_ceil(if q16_tile { 16 } else { 8 }) as u32;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q16_arg = q16_ptr;
@@ -5918,7 +5981,11 @@ impl Gpu {
         // (f32 Q + K/V re-read over the causal prefix + f32 out); timing
         // itself remains exact HIP-event timing.
         let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
-            batch_size, n_heads, n_kv_heads, head_dim, max_ctx_len,
+            batch_size,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
         );
         let timer = crate::profile::begin_timer(
             &self.hip,
@@ -6088,7 +6155,9 @@ impl Gpu {
         ) {
             self.invalidate_for_scratch_growth();
         }
-        let q16_ptr = self.scratch.ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
+        let q16_ptr = self
+            .scratch
+            .ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
         let grid_x = batch_size.div_ceil(8) as u32;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q16_arg = q16_ptr;
@@ -6117,7 +6186,11 @@ impl Gpu {
         // (f32 Q + K/V re-read over the causal prefix + f32 out); timing
         // itself remains exact HIP-event timing.
         let bytes = crate::profile::attention_q8_0_flash_prefill_bytes(
-            batch_size, n_heads, n_kv_heads, head_dim, max_ctx_len,
+            batch_size,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
         );
         let timer = crate::profile::begin_timer(
             &self.hip,
@@ -6257,7 +6330,9 @@ impl Gpu {
         ) {
             self.invalidate_for_scratch_growth();
         }
-        let q16_ptr = self.scratch.ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
+        let q16_ptr = self
+            .scratch
+            .ensure_fa2_q16_scratch(&self.hip, need_q16_bytes)?;
         let grid_x = batch_size.div_ceil(8) as u32;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let mut q16_arg = q16_ptr;
@@ -6335,16 +6410,23 @@ impl Gpu {
         ];
         let n_rec = batch_size * n_heads;
         let merge_grid_x = n_rec.div_ceil(8) as u32;
-        self.launch_maybe_blob(merge, [merge_grid_x, 1, 1], [256, 1, 1], 0, &mut mparams, || {
-            let mut b = hip_bridge::KernargBlob::new();
-            b.push_ptr(pp_ptr);
-            b.push_ptr(o_ptr);
-            b.push_i32(mbs);
-            b.push_i32(mnh);
-            b.push_i32(mhd);
-            b.push_i32(mns);
-            b
-        })
+        self.launch_maybe_blob(
+            merge,
+            [merge_grid_x, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut mparams,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(pp_ptr);
+                b.push_ptr(o_ptr);
+                b.push_i32(mbs);
+                b.push_i32(mnh);
+                b.push_i32(mhd);
+                b.push_i32(mns);
+                b
+            },
+        )
     }
 
     /// Benchmark-only direct call to the preserved incumbent Q8 WMMA flash
@@ -6366,8 +6448,20 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.attention_q8_0_flash_prefill_wmma_slots(
-            q, k_cache, v_cache, out, positions, n_heads, n_kv_heads, head_dim, max_ctx_len,
-            batch_size, None, None, None, None,
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            max_ctx_len,
+            batch_size,
+            None,
+            None,
+            None,
+            None,
         )
     }
 
@@ -7758,7 +7852,9 @@ impl Gpu {
                 stripped
             )
         };
-        let obj_path = self.compiler.compile_for_symbol(name, &full_src, func_name)?;
+        let obj_path = self
+            .compiler
+            .compile_for_symbol(name, &full_src, func_name)?;
         let obj_path_str = obj_path.to_str().unwrap().to_string();
         if !self.modules.contains_key(name) {
             let module = crate::scratch::module_load_or_recompile(
@@ -9261,7 +9357,6 @@ impl Gpu {
         self.kv_cache_write_q8_0_batched(v_dst, v_src, positions, n_kv_heads, head_dim, batch_size)
     }
 
-
     /// Multi-slot variant of [`Self::kv_cache_write_asym4_batched`] — the K
     /// write and the Q8_0 V write both resolve their destination through the
     /// descriptor selected by `row_slot[row]` (V through `legacy_v_base`,
@@ -9306,14 +9401,7 @@ impl Gpu {
             row_slot,
         )?;
         self.kv_cache_write_q8_0_batched_slots(
-            v_dst,
-            v_src,
-            positions,
-            n_kv_heads,
-            head_dim,
-            batch_size,
-            slot_descs,
-            row_slot,
+            v_dst, v_src, positions, n_kv_heads, head_dim, batch_size, slot_descs, row_slot,
             /*use_v_base=*/ true,
         )
     }
@@ -9363,7 +9451,6 @@ impl Gpu {
         )
     }
 
-
     /// Multi-slot variant of [`Self::kv_cache_write_fwht4_batched`] — the K
     /// write and the Q8_0 V write both resolve their destination through the
     /// descriptor selected by `row_slot[row]` (V through `legacy_v_base`,
@@ -9408,14 +9495,7 @@ impl Gpu {
             row_slot,
         )?;
         self.kv_cache_write_q8_0_batched_slots(
-            v_dst,
-            v_src,
-            positions,
-            n_kv_heads,
-            head_dim,
-            batch_size,
-            slot_descs,
-            row_slot,
+            v_dst, v_src, positions, n_kv_heads, head_dim, batch_size, slot_descs, row_slot,
             /*use_v_base=*/ true,
         )
     }
@@ -9451,7 +9531,6 @@ impl Gpu {
         )?;
         self.kv_cache_write_q8_0_batched(v_dst, v_src, positions, n_kv_heads, head_dim, batch_size)
     }
-
 
     /// Multi-slot variant of [`Self::kv_cache_write_asym2_batched`] — the K
     /// write and the Q8_0 V write both resolve their destination through the
@@ -9497,14 +9576,7 @@ impl Gpu {
             row_slot,
         )?;
         self.kv_cache_write_q8_0_batched_slots(
-            v_dst,
-            v_src,
-            positions,
-            n_kv_heads,
-            head_dim,
-            batch_size,
-            slot_descs,
-            row_slot,
+            v_dst, v_src, positions, n_kv_heads, head_dim, batch_size, slot_descs, row_slot,
             /*use_v_base=*/ true,
         )
     }
@@ -9552,7 +9624,6 @@ impl Gpu {
         )
     }
 
-
     /// Multi-slot variant of [`Self::kv_cache_write_fwht2_batched`] — the K
     /// write and the Q8_0 V write both resolve their destination through the
     /// descriptor selected by `row_slot[row]` (V through `legacy_v_base`,
@@ -9597,14 +9668,7 @@ impl Gpu {
             row_slot,
         )?;
         self.kv_cache_write_q8_0_batched_slots(
-            v_dst,
-            v_src,
-            positions,
-            n_kv_heads,
-            head_dim,
-            batch_size,
-            slot_descs,
-            row_slot,
+            v_dst, v_src, positions, n_kv_heads, head_dim, batch_size, slot_descs, row_slot,
             /*use_v_base=*/ true,
         )
     }
@@ -10428,14 +10492,7 @@ impl Gpu {
         }
         // V: batched Q8_0 write through the V base.
         self.kv_cache_write_q8_0_batched_slots(
-            v_dst,
-            v_src,
-            positions,
-            n_kv_heads,
-            head_dim,
-            batch_size,
-            slot_descs,
-            row_slot,
+            v_dst, v_src, positions, n_kv_heads, head_dim, batch_size, slot_descs, row_slot,
             /*use_v_base=*/ true,
         )
     }
@@ -10469,18 +10526,11 @@ impl Gpu {
         );
         self.bind_thread()?;
         self.kv_cache_write_fwht3_vec_batched_slots(
-            k_dst, k_src, positions, signs1, signs2, n_kv_heads, head_dim, batch_size,
-            slot_descs, row_slot,
+            k_dst, k_src, positions, signs1, signs2, n_kv_heads, head_dim, batch_size, slot_descs,
+            row_slot,
         )?;
         self.kv_cache_write_q8_0_batched_slots(
-            v_dst,
-            v_src,
-            positions,
-            n_kv_heads,
-            head_dim,
-            batch_size,
-            slot_descs,
-            row_slot,
+            v_dst, v_src, positions, n_kv_heads, head_dim, batch_size, slot_descs, row_slot,
             /*use_v_base=*/ true,
         )
     }
@@ -13222,12 +13272,9 @@ impl Gpu {
         // exactly one lane, so there is no intra-block reuse to pay for.)
         const QB: usize = 16;
         const K_TILE: usize = 64;
-        let shared_mem = ((K_TILE * head_dim
-            + 2 * QB * head_dim
-            + QB * K_TILE
-            + 2 * QB * 16
-            + QB * 2)
-            * 4) as u32;
+        let shared_mem =
+            ((K_TILE * head_dim + 2 * QB * head_dim + QB * K_TILE + 2 * QB * 16 + QB * 2) * 4)
+                as u32;
         unsafe {
             self.hip.launch_kernel(
                 func,
@@ -20559,7 +20606,6 @@ fn pack_attention_q8_0_fa2_gqa_gfx11_kernarg(
     b
 }
 
-
 #[cfg(test)]
 mod tests {
     use super::{
@@ -20569,7 +20615,6 @@ mod tests {
     };
     use crate::DType;
     use std::ffi::c_void;
-
 
     /// C0: FA2 gfx11 blob must match the pointer-array ABI (q,k,v,out,positions,
     /// 4×i32, f32). The old capture-only path omitted `out`, shifting every
@@ -20588,22 +20633,18 @@ mod tests {
         let bs = 512i32;
         let scale = 1.0f32 / 16.0;
 
-        let blob = pack_attention_q8_0_fa2_gqa_gfx11_kernarg(
-            q, k, v, out, pos, nh, nkv, hd, bs, scale,
-        );
+        let blob =
+            pack_attention_q8_0_fa2_gqa_gfx11_kernarg(q, k, v, out, pos, nh, nkv, hd, bs, scale);
         let bytes = blob.as_bytes();
         // Five 8-byte pointers + five 4-byte scalars = 60 argument bytes.
         assert_eq!(bytes.len(), 60, "kernarg payload size");
 
-        let read_usize = |off: usize| -> usize {
-            usize::from_ne_bytes(bytes[off..off + 8].try_into().unwrap())
-        };
-        let read_i32 = |off: usize| -> i32 {
-            i32::from_ne_bytes(bytes[off..off + 4].try_into().unwrap())
-        };
-        let read_f32 = |off: usize| -> f32 {
-            f32::from_ne_bytes(bytes[off..off + 4].try_into().unwrap())
-        };
+        let read_usize =
+            |off: usize| -> usize { usize::from_ne_bytes(bytes[off..off + 8].try_into().unwrap()) };
+        let read_i32 =
+            |off: usize| -> i32 { i32::from_ne_bytes(bytes[off..off + 4].try_into().unwrap()) };
+        let read_f32 =
+            |off: usize| -> f32 { f32::from_ne_bytes(bytes[off..off + 4].try_into().unwrap()) };
 
         assert_eq!(read_usize(0), q as usize, "q @0");
         assert_eq!(read_usize(8), k as usize, "k @8");

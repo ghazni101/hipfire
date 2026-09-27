@@ -275,10 +275,7 @@ pub fn capture_slot(
             )));
         }
 
-        for (arenas, per_pos) in [
-            (k_arenas, per_pos_k),
-            (v_arenas, per_pos_v),
-        ] {
+        for (arenas, per_pos) in [(k_arenas, per_pos_k), (v_arenas, per_pos_v)] {
             let page_bytes = page_tokens * per_pos;
             for arena in arenas {
                 // Copy full pages.
@@ -400,10 +397,7 @@ pub fn restore_slot(
             )));
         }
 
-        for (arenas, per_pos) in [
-            (k_arenas, per_pos_k),
-            (v_arenas, per_pos_v),
-        ] {
+        for (arenas, per_pos) in [(k_arenas, per_pos_k), (v_arenas, per_pos_v)] {
             let page_bytes = page_tokens * per_pos;
             for arena in arenas {
                 // Copy full pages.

@@ -2674,27 +2674,18 @@ mod sidecar_probe_tests {
             c.iter().any(|p| p.ends_with("qwen3.5-4b.mq4v2.mtp")),
             "{c:?}"
         );
-        assert!(
-            c.iter().any(|p| p.ends_with("qwen3.5-4b.mtp")),
-            "{c:?}"
-        );
+        assert!(c.iter().any(|p| p.ends_with("qwen3.5-4b.mtp")), "{c:?}");
     }
 
     #[test]
     fn mq4_probes_stem_mtp() {
         let c = mtp_sidecar_candidates(Path::new("/models/qwen3.5-4b.mq4"));
-        assert!(
-            c.iter().any(|p| p.ends_with("qwen3.5-4b.mtp")),
-            "{c:?}"
-        );
+        assert!(c.iter().any(|p| p.ends_with("qwen3.5-4b.mtp")), "{c:?}");
     }
 
     #[test]
     fn find_mtp_sidecar_uses_stem_when_last_extension_missing() {
-        let dir = std::env::temp_dir().join(format!(
-            "hipfire-mtp-probe-{}",
-            std::process::id()
-        ));
+        let dir = std::env::temp_dir().join(format!("hipfire-mtp-probe-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).expect("temp dir");
         let trunk = dir.join("qwen3.5-4b.mq4v2.hfq");

@@ -327,8 +327,8 @@ fn main() {
         let mut dn_states: Vec<DeltaNetState> = (0..n_slots)
             .map(|_| DeltaNetState::new(gpu, config).expect("candidate: DeltaNetState::new"))
             .collect();
-        let mut desc_staging =
-            SlotDescStaging::new(gpu, n_slots, max_batch, 0).expect("candidate: SlotDescStaging::new");
+        let mut desc_staging = SlotDescStaging::new(gpu, n_slots, max_batch, 0)
+            .expect("candidate: SlotDescStaging::new");
         // q8 tier, no rotation tables — this harness compares against the
         // q8 sequential reference.
         let kv_tier = hipfire_arch_qwen35::forward_slots::SlotKvTier::q8();

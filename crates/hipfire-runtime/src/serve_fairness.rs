@@ -189,7 +189,11 @@ impl FairRequest {
     /// Total rows this request needs this step, using checked arithmetic.
     /// A verify request does not also count a decode row (spec §5.3 S3).
     fn needed_rows(&self) -> Option<u64> {
-        let decode = if self.wants_decode && self.verify_rows == 0 { 1u64 } else { 0u64 };
+        let decode = if self.wants_decode && self.verify_rows == 0 {
+            1u64
+        } else {
+            0u64
+        };
         let a = decode.checked_add(self.uncached_prefill_tokens)?;
         let b = a.checked_add(self.verify_rows)?;
         b.checked_add(self.forced_rows)
@@ -307,11 +311,7 @@ impl FairQueue {
 
     /// Update a request's remaining uncached prefill tokens (cache-locality
     /// weight). Called as prefill progresses.
-    pub fn set_uncached_prefill(
-        &mut self,
-        id: u64,
-        tokens: u64,
-    ) -> Result<(), FairnessError> {
+    pub fn set_uncached_prefill(&mut self, id: u64, tokens: u64) -> Result<(), FairnessError> {
         let req = self
             .requests
             .iter_mut()
@@ -577,7 +577,8 @@ impl FairQueue {
             .filter(|(_, r)| r.verify_rows > 0 && !served_ids.contains(&r.id))
             .map(|(i, _)| i)
             .collect();
-        verify_candidates.sort_by(|&a, &b| Self::fairness_cmp(&self.requests[a], &self.requests[b]));
+        verify_candidates
+            .sort_by(|&a, &b| Self::fairness_cmp(&self.requests[a], &self.requests[b]));
         for &idx in &verify_candidates {
             let rows = self.requests[idx].verify_rows;
             let avail = match remaining_rows.checked_sub(used) {
@@ -607,7 +608,8 @@ impl FairQueue {
             .filter(|(_, r)| r.forced_rows > 0 && !served_ids.contains(&r.id))
             .map(|(i, _)| i)
             .collect();
-        forced_candidates.sort_by(|&a, &b| Self::fairness_cmp(&self.requests[a], &self.requests[b]));
+        forced_candidates
+            .sort_by(|&a, &b| Self::fairness_cmp(&self.requests[a], &self.requests[b]));
         for &idx in &forced_candidates {
             let rows = self.requests[idx].forced_rows;
             let avail = match remaining_rows.checked_sub(used) {
@@ -643,18 +645,18 @@ impl FairQueue {
         let mut best_starved: Option<usize> = None;
         for (i, r) in self.requests.iter().enumerate() {
             let prefill_remaining = r.uncached_prefill_tokens;
-            let got_prefill = grants.iter().any(|g| {
-                matches!(g, Grant::Prefill { id, .. } if *id == r.id)
-            });
-            let got_decode = grants.iter().any(|g| {
-                matches!(g, Grant::Decode { id } if *id == r.id)
-            });
-            let got_verify = grants.iter().any(|g| {
-                matches!(g, Grant::Verify { id, .. } if *id == r.id)
-            });
-            let got_forced = grants.iter().any(|g| {
-                matches!(g, Grant::Forced { id, .. } if *id == r.id)
-            });
+            let got_prefill = grants
+                .iter()
+                .any(|g| matches!(g, Grant::Prefill { id, .. } if *id == r.id));
+            let got_decode = grants
+                .iter()
+                .any(|g| matches!(g, Grant::Decode { id } if *id == r.id));
+            let got_verify = grants
+                .iter()
+                .any(|g| matches!(g, Grant::Verify { id, .. } if *id == r.id));
+            let got_forced = grants
+                .iter()
+                .any(|g| matches!(g, Grant::Forced { id, .. } if *id == r.id));
             let unserved = (prefill_remaining > 0 && !got_prefill)
                 || (r.wants_decode && r.verify_rows == 0 && !got_decode)
                 || (r.verify_rows > 0 && !got_verify)
@@ -716,8 +718,14 @@ mod tests {
         q.set_needs(1, false, 0, 0).unwrap();
 
         let sel = q.select(2, 1, 8188);
-        assert!(sel.grants.iter().any(|g| matches!(g, Grant::Decode { id: 0 })));
-        assert!(sel.grants.iter().any(|g| matches!(g, Grant::Prefill { id: 1, .. })));
+        assert!(sel
+            .grants
+            .iter()
+            .any(|g| matches!(g, Grant::Decode { id: 0 })));
+        assert!(sel
+            .grants
+            .iter()
+            .any(|g| matches!(g, Grant::Prefill { id: 1, .. })));
         assert!(
             !sel.starved_oldest,
             "both requests received service — starvation must not latch"
@@ -750,7 +758,7 @@ mod tests {
         let mut q = queue(4096, 0, 1);
         q.admit(1, "s1", 100).unwrap(); // A: bad cache (high uncached)
         q.admit(2, "s2", 50).unwrap(); // B: better cache (lower uncached)
-        // Both prefilling, no decode.
+                                       // Both prefilling, no decode.
         q.set_needs(1, false, 0, 0).unwrap();
         q.set_needs(2, false, 0, 0).unwrap();
 
@@ -866,7 +874,10 @@ mod tests {
         // 4 decode grants + 1 prefill grant (6 rows).
         assert_eq!(sel.grants.len(), 5);
         // The oldest request got prefill.
-        assert!(sel.grants.iter().any(|g| matches!(g, Grant::Prefill { id: 1, rows: 6 })));
+        assert!(sel
+            .grants
+            .iter()
+            .any(|g| matches!(g, Grant::Prefill { id: 1, rows: 6 })));
 
         // Now test actual starvation: remaining_rows too small for prefill_min.
         // Reset: re-admit with fresh queue.
@@ -891,7 +902,10 @@ mod tests {
         // Oldest request (id=1) has 50 uncached, needed_rows=50 <= 10? No!
         // 50 > 10, so it's NOT individually feasible. starved_oldest should be false.
         // Let me fix: make the oldest request's needs fit in max_batch_tokens.
-        assert!(!sel.starved_oldest, "oldest not individually feasible, should not starve");
+        assert!(
+            !sel.starved_oldest,
+            "oldest not individually feasible, should not starve"
+        );
 
         // Now make oldest individually feasible: uncached=5 (fits in 10).
         let mut q = queue(10, 4, 5);
@@ -972,14 +986,20 @@ mod tests {
     fn duplicate_admit_rejected() {
         let mut q = queue(4096, 4, 1);
         q.admit(1, "s1", 100).unwrap();
-        assert!(matches!(q.admit(1, "s1", 50), Err(FairnessError::DuplicateId(1))));
+        assert!(matches!(
+            q.admit(1, "s1", 50),
+            Err(FairnessError::DuplicateId(1))
+        ));
     }
 
     /// set_needs on unknown id is rejected.
     #[test]
     fn set_needs_unknown_id() {
         let mut q = queue(4096, 4, 1);
-        assert!(matches!(q.set_needs(99, true, 0, 0), Err(FairnessError::NotFound(99))));
+        assert!(matches!(
+            q.set_needs(99, true, 0, 0),
+            Err(FairnessError::NotFound(99))
+        ));
     }
 
     /// remove works and clamps cursor.
@@ -1045,9 +1065,18 @@ mod tests {
         q.set_needs(2, false, 0, 0).unwrap();
         q.set_needs(3, false, 2, 0).unwrap();
         let sel = q.select(4, 64, 4096);
-        let has_decode = sel.grants.iter().any(|g| matches!(g, Grant::Decode { id: 1 }));
-        let has_prefill = sel.grants.iter().any(|g| matches!(g, Grant::Prefill { id: 2, .. }));
-        let has_verify = sel.grants.iter().any(|g| matches!(g, Grant::Verify { id: 3, .. }));
+        let has_decode = sel
+            .grants
+            .iter()
+            .any(|g| matches!(g, Grant::Decode { id: 1 }));
+        let has_prefill = sel
+            .grants
+            .iter()
+            .any(|g| matches!(g, Grant::Prefill { id: 2, .. }));
+        let has_verify = sel
+            .grants
+            .iter()
+            .any(|g| matches!(g, Grant::Verify { id: 3, .. }));
         assert!(has_decode && has_prefill && has_verify);
     }
 
@@ -1064,7 +1093,10 @@ mod tests {
         let remaining = 20u64;
         let sel = q.select(4, 64, remaining);
         let total: u64 = sel.grants.iter().map(|g| g.rows()).sum();
-        assert!(total <= remaining, "total {total} exceeds remaining {remaining}");
+        assert!(
+            total <= remaining,
+            "total {total} exceeds remaining {remaining}"
+        );
     }
 
     /// Prefill tail smaller than the minimum quantum must still be granted
@@ -1094,7 +1126,10 @@ mod tests {
         q.admit(1, "s1", 3).unwrap();
         q.set_needs(1, false, 0, 0).unwrap();
         let sel = q.select(0, 512, 2);
-        assert!(sel.grants.is_empty(), "2-row non-completing sliver stays refused");
+        assert!(
+            sel.grants.is_empty(),
+            "2-row non-completing sliver stays refused"
+        );
     }
 
     #[test]

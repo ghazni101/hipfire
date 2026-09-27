@@ -1568,7 +1568,11 @@ impl DeltaNetSnapshot {
         for (src, d) in self.conv_state_bufs.iter().zip(dst.conv_state_bufs.iter()) {
             gpu.hip.memcpy_dtod(d, src, src.size())?;
         }
-        for (src, d) in self.s_ef_residual_bufs.iter().zip(dst.s_ef_residual_bufs.iter()) {
+        for (src, d) in self
+            .s_ef_residual_bufs
+            .iter()
+            .zip(dst.s_ef_residual_bufs.iter())
+        {
             gpu.hip.memcpy_dtod(d, src, src.size())?;
         }
         Ok(())
@@ -2959,7 +2963,11 @@ fn verify_dflash_block_inner(
         )
     })?;
     qwen35::prefill::release_widened_pbs_for_kv_growth(
-        gpu, &target.kv_cache, &target.config, &target.scratch, required_tokens,
+        gpu,
+        &target.kv_cache,
+        &target.config,
+        &target.scratch,
+        required_tokens,
     )?;
     // Verify replay bypasses the regular qwen35 forward wrappers.
     target

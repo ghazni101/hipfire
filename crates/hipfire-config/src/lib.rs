@@ -5711,10 +5711,7 @@ mod tests {
         // Both TOML-layer set and config-set CLI paths share field.validate.
         let mut layer = ConfigLayer::default();
         layer
-            .set(
-                "memory.kv_backend",
-                ConfigValue::String("legacy".into()),
-            )
+            .set("memory.kv_backend", ConfigValue::String("legacy".into()))
             .expect("legacy must validate on TOML load path");
         assert!(layer
             .set(
@@ -5722,7 +5719,9 @@ mod tests {
                 ConfigValue::String("contiguous".into()),
             )
             .is_err());
-        let set_cli_err = layer.set_cli("memory.kv_backend", "contiguous").unwrap_err();
+        let set_cli_err = layer
+            .set_cli("memory.kv_backend", "contiguous")
+            .unwrap_err();
         let set_cli_msg = set_cli_err.to_string();
         assert!(
             set_cli_msg.contains("legacy"),
@@ -5794,11 +5793,9 @@ mod tests {
         );
 
         // Default profile still authors only memory.kv_cache = q8, not K/V axes.
-        let default = load_config_profile(
-            &ConfigPaths::under(temp_root("profile-kv-axes")),
-            "default",
-        )
-        .unwrap();
+        let default =
+            load_config_profile(&ConfigPaths::under(temp_root("profile-kv-axes")), "default")
+                .unwrap();
         assert_eq!(
             default.get("memory.kv_cache"),
             Some(&ConfigValue::String("q8".into()))
@@ -5806,7 +5803,6 @@ mod tests {
         assert!(default.get("memory.kv_k").is_none());
         assert!(default.get("memory.kv_v").is_none());
     }
-
 
     #[test]
     fn documented_config_profiles_match_the_schema() {

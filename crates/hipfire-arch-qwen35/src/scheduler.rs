@@ -219,9 +219,9 @@ impl Scheduler {
         // per-row pos3/ext side arrays exist whenever some slot is VL — or
         // carries a continuation rope delta, whose rows need the shifted
         // phases for the same kernel.
-        let any_pos3 = work.iter().any(|w| {
-            (w.vl_prefill.is_some() && !self.vl_sequential) || w.pos3_delta != 0
-        });
+        let any_pos3 = work
+            .iter()
+            .any(|w| (w.vl_prefill.is_some() && !self.vl_sequential) || w.pos3_delta != 0);
         let mut b = SlotBatch::default();
         b.m_per_slot = vec![0; n];
 
@@ -233,7 +233,9 @@ impl Scheduler {
         let mut alloc = vec![0usize; n];
         let mut used = 0usize;
         for i in 0..n {
-            if !is_runnable_decode(&work[i], self.vl_sequential) || !eligible.get(i).copied().unwrap_or(false) {
+            if !is_runnable_decode(&work[i], self.vl_sequential)
+                || !eligible.get(i).copied().unwrap_or(false)
+            {
                 continue;
             }
             if used + 1 > remaining_rows {
@@ -252,7 +254,10 @@ impl Scheduler {
         let mut avail = remaining_rows.saturating_sub(used);
         if avail > 0 {
             let prefill_slots: Vec<usize> = (0..n)
-                .filter(|&i| is_runnable_prefill(&work[i], self.vl_sequential) && eligible.get(i).copied().unwrap_or(false))
+                .filter(|&i| {
+                    is_runnable_prefill(&work[i], self.vl_sequential)
+                        && eligible.get(i).copied().unwrap_or(false)
+                })
                 .collect();
             if !prefill_slots.is_empty() {
                 let n_pr = prefill_slots.len();
@@ -404,13 +409,22 @@ mod tests {
 
     #[test]
     fn a_long_prompt_is_chunked_not_run_whole() {
-        let mut s = Scheduler { chunk_size: 256, vl_sequential: false, prefill_cursor: 0 };
+        let mut s = Scheduler {
+            chunk_size: 256,
+            vl_sequential: false,
+            prefill_cursor: 0,
+        };
         let mut work = vec![PendingWork {
             slot: SlotId(0),
             remaining_prompt: prompt(1000),
             next_pos: 0,
             decoding: false,
-            vl_prefill: None, spec: SpecKind::None, spec_cycles: 0, spec_committed: 0, spec_retire_fails: 0, pos3_delta: 0,
+            vl_prefill: None,
+            spec: SpecKind::None,
+            spec_cycles: 0,
+            spec_committed: 0,
+            spec_retire_fails: 0,
+            pos3_delta: 0,
         }];
         let b = s.next_batch(&mut work, 4096, 1);
         assert_eq!(
@@ -424,21 +438,35 @@ mod tests {
 
     #[test]
     fn prefill_and_decode_mix_in_one_batch() {
-        let mut s = Scheduler { chunk_size: 256, vl_sequential: false, prefill_cursor: 0 };
+        let mut s = Scheduler {
+            chunk_size: 256,
+            vl_sequential: false,
+            prefill_cursor: 0,
+        };
         let mut work = vec![
             PendingWork {
                 slot: SlotId(0),
                 remaining_prompt: prompt(300),
                 next_pos: 0,
                 decoding: false,
-                vl_prefill: None, spec: SpecKind::None, spec_cycles: 0, spec_committed: 0, spec_retire_fails: 0, pos3_delta: 0,
+                vl_prefill: None,
+                spec: SpecKind::None,
+                spec_cycles: 0,
+                spec_committed: 0,
+                spec_retire_fails: 0,
+                pos3_delta: 0,
             },
             PendingWork {
                 slot: SlotId(1),
                 remaining_prompt: vec![42],
                 next_pos: 10,
                 decoding: true,
-                vl_prefill: None, spec: SpecKind::None, spec_cycles: 0, spec_committed: 0, spec_retire_fails: 0, pos3_delta: 0,
+                vl_prefill: None,
+                spec: SpecKind::None,
+                spec_cycles: 0,
+                spec_committed: 0,
+                spec_retire_fails: 0,
+                pos3_delta: 0,
             },
         ];
         let b = s.next_batch(&mut work, 4096, 1);
@@ -451,13 +479,22 @@ mod tests {
 
     #[test]
     fn a_prompt_shorter_than_a_chunk_completes_in_one_batch() {
-        let mut s = Scheduler { chunk_size: 256, vl_sequential: false, prefill_cursor: 0 };
+        let mut s = Scheduler {
+            chunk_size: 256,
+            vl_sequential: false,
+            prefill_cursor: 0,
+        };
         let mut work = vec![PendingWork {
             slot: SlotId(0),
             remaining_prompt: prompt(10),
             next_pos: 0,
             decoding: false,
-            vl_prefill: None, spec: SpecKind::None, spec_cycles: 0, spec_committed: 0, spec_retire_fails: 0, pos3_delta: 0,
+            vl_prefill: None,
+            spec: SpecKind::None,
+            spec_cycles: 0,
+            spec_committed: 0,
+            spec_retire_fails: 0,
+            pos3_delta: 0,
         }];
         let b = s.next_batch(&mut work, 4096, 1);
         assert_eq!(b.total_rows(), 10);
@@ -466,13 +503,22 @@ mod tests {
 
     #[test]
     fn an_idle_slot_contributes_nothing() {
-        let mut s = Scheduler { chunk_size: 256, vl_sequential: false, prefill_cursor: 0 };
+        let mut s = Scheduler {
+            chunk_size: 256,
+            vl_sequential: false,
+            prefill_cursor: 0,
+        };
         let mut work = vec![PendingWork {
             slot: SlotId(0),
             remaining_prompt: vec![],
             next_pos: 0,
             decoding: false,
-            vl_prefill: None, spec: SpecKind::None, spec_cycles: 0, spec_committed: 0, spec_retire_fails: 0, pos3_delta: 0,
+            vl_prefill: None,
+            spec: SpecKind::None,
+            spec_cycles: 0,
+            spec_committed: 0,
+            spec_retire_fails: 0,
+            pos3_delta: 0,
         }];
         let b = s.next_batch(&mut work, 4096, 1);
         assert!(b.is_empty());
@@ -485,16 +531,29 @@ mod tests {
         // (chunk_size above the prompt length, the serve default) must be
         // trimmed to 256 rows so the round ends at the boundary; the 27-row
         // tail completes in the next round.
-        let mut s = Scheduler { chunk_size: 1024, vl_sequential: false, prefill_cursor: 0 };
+        let mut s = Scheduler {
+            chunk_size: 1024,
+            vl_sequential: false,
+            prefill_cursor: 0,
+        };
         let mut work = vec![PendingWork {
             slot: SlotId(0),
             remaining_prompt: prompt(283),
             next_pos: 0,
             decoding: false,
-            vl_prefill: None, spec: SpecKind::None, spec_cycles: 0, spec_committed: 0, spec_retire_fails: 0, pos3_delta: 0,
+            vl_prefill: None,
+            spec: SpecKind::None,
+            spec_cycles: 0,
+            spec_committed: 0,
+            spec_retire_fails: 0,
+            pos3_delta: 0,
         }];
         let b = s.next_batch(&mut work, 4096, 1);
-        assert_eq!(b.total_rows(), 256, "completing round must end at the page boundary");
+        assert_eq!(
+            b.total_rows(),
+            256,
+            "completing round must end at the page boundary"
+        );
         assert_eq!(work[0].next_pos, 256);
         let b2 = s.next_batch(&mut work, 4096, 1);
         assert_eq!(b2.total_rows(), 27, "the sub-page tail completes prefill");
@@ -505,13 +564,22 @@ mod tests {
     #[test]
     fn a_page_aligned_prompt_prefills_in_one_round() {
         // 256 is exactly one page multiple: no trim, no extra round.
-        let mut s = Scheduler { chunk_size: 1024, vl_sequential: false, prefill_cursor: 0 };
+        let mut s = Scheduler {
+            chunk_size: 1024,
+            vl_sequential: false,
+            prefill_cursor: 0,
+        };
         let mut work = vec![PendingWork {
             slot: SlotId(0),
             remaining_prompt: prompt(256),
             next_pos: 0,
             decoding: false,
-            vl_prefill: None, spec: SpecKind::None, spec_cycles: 0, spec_committed: 0, spec_retire_fails: 0, pos3_delta: 0,
+            vl_prefill: None,
+            spec: SpecKind::None,
+            spec_cycles: 0,
+            spec_committed: 0,
+            spec_retire_fails: 0,
+            pos3_delta: 0,
         }];
         let b = s.next_batch(&mut work, 4096, 1);
         assert_eq!(b.total_rows(), 256);
@@ -523,16 +591,29 @@ mod tests {
         // An operator prefill_min_tokens above one page opts out of the
         // alignment trim — the configured service floor must not be silently
         // undercut.
-        let mut s = Scheduler { chunk_size: 1024, vl_sequential: false, prefill_cursor: 0 };
+        let mut s = Scheduler {
+            chunk_size: 1024,
+            vl_sequential: false,
+            prefill_cursor: 0,
+        };
         let mut work = vec![PendingWork {
             slot: SlotId(0),
             remaining_prompt: prompt(283),
             next_pos: 0,
             decoding: false,
-            vl_prefill: None, spec: SpecKind::None, spec_cycles: 0, spec_committed: 0, spec_retire_fails: 0, pos3_delta: 0,
+            vl_prefill: None,
+            spec: SpecKind::None,
+            spec_cycles: 0,
+            spec_committed: 0,
+            spec_retire_fails: 0,
+            pos3_delta: 0,
         }];
         let b = s.next_batch(&mut work, 4096, 200);
-        assert_eq!(b.total_rows(), 283, "quantum above a page: no alignment trim");
+        assert_eq!(
+            b.total_rows(),
+            283,
+            "quantum above a page: no alignment trim"
+        );
         assert!(work[0].remaining_prompt.is_empty());
     }
 
@@ -568,7 +649,11 @@ mod tests {
         // Embeddings not yet produced: the slot must not enter the batch
         // (image pads would embed garbage), but the decoding slot next to it
         // is unaffected.
-        let mut s = Scheduler { chunk_size: 256, vl_sequential: false, prefill_cursor: 0 };
+        let mut s = Scheduler {
+            chunk_size: 256,
+            vl_sequential: false,
+            prefill_cursor: 0,
+        };
         let mut work = vec![
             PendingWork {
                 slot: SlotId(0),
@@ -579,14 +664,23 @@ mod tests {
                     embeddings: vec![],
                     ..vl_state(1, 10)
                 }),
-                spec: SpecKind::None, spec_cycles: 0, spec_committed: 0, spec_retire_fails: 0, pos3_delta: 0,
+                spec: SpecKind::None,
+                spec_cycles: 0,
+                spec_committed: 0,
+                spec_retire_fails: 0,
+                pos3_delta: 0,
             },
             PendingWork {
                 slot: SlotId(1),
                 remaining_prompt: vec![7],
                 next_pos: 3,
                 decoding: true,
-                vl_prefill: None, spec: SpecKind::None, spec_cycles: 0, spec_committed: 0, spec_retire_fails: 0, pos3_delta: 0,
+                vl_prefill: None,
+                spec: SpecKind::None,
+                spec_cycles: 0,
+                spec_committed: 0,
+                spec_retire_fails: 0,
+                pos3_delta: 0,
             },
         ];
         let b = s.next_batch(&mut work, 4096, 1);
@@ -598,7 +692,11 @@ mod tests {
 
     #[test]
     fn batched_vl_rows_carry_mrope_phases() {
-        let mut s = Scheduler { chunk_size: 256, vl_sequential: false, prefill_cursor: 0 };
+        let mut s = Scheduler {
+            chunk_size: 256,
+            vl_sequential: false,
+            prefill_cursor: 0,
+        };
         // Prompt where position 4 is an image pad.
         let mut toks = prompt(10);
         toks[4] = 42;
@@ -608,7 +706,11 @@ mod tests {
             next_pos: 0,
             decoding: false,
             vl_prefill: Some(vl_state(1, 10)),
-            spec: SpecKind::None, spec_cycles: 0, spec_committed: 0, spec_retire_fails: 0, pos3_delta: 0,
+            spec: SpecKind::None,
+            spec_cycles: 0,
+            spec_committed: 0,
+            spec_retire_fails: 0,
+            pos3_delta: 0,
         }];
         let b = s.next_batch(&mut work, 4096, 1);
         assert_eq!(b.total_rows(), 10);
@@ -621,14 +723,22 @@ mod tests {
 
     #[test]
     fn vl_decode_rows_use_pos_plus_rope_delta() {
-        let mut s = Scheduler { chunk_size: 4, vl_sequential: false, prefill_cursor: 0 };
+        let mut s = Scheduler {
+            chunk_size: 4,
+            vl_sequential: false,
+            prefill_cursor: 0,
+        };
         let mut work = vec![PendingWork {
             slot: SlotId(0),
             remaining_prompt: vec![9],
             next_pos: 12,
             decoding: true,
             vl_prefill: Some(vl_state(2, 4)),
-            spec: SpecKind::None, spec_cycles: 0, spec_committed: 0, spec_retire_fails: 0, pos3_delta: 0,
+            spec: SpecKind::None,
+            spec_cycles: 0,
+            spec_committed: 0,
+            spec_retire_fails: 0,
+            pos3_delta: 0,
         }];
         let b = s.next_batch(&mut work, 4096, 1);
         assert_eq!(b.total_rows(), 1);
@@ -639,14 +749,22 @@ mod tests {
 
     #[test]
     fn sequential_vl_slots_still_bypass_the_batch() {
-        let mut s = Scheduler { chunk_size: 256, vl_sequential: true, prefill_cursor: 0 };
+        let mut s = Scheduler {
+            chunk_size: 256,
+            vl_sequential: true,
+            prefill_cursor: 0,
+        };
         let mut work = vec![PendingWork {
             slot: SlotId(0),
             remaining_prompt: prompt(10),
             next_pos: 0,
             decoding: false,
             vl_prefill: Some(vl_state(1, 10)),
-            spec: SpecKind::None, spec_cycles: 0, spec_committed: 0, spec_retire_fails: 0, pos3_delta: 0,
+            spec: SpecKind::None,
+            spec_cycles: 0,
+            spec_committed: 0,
+            spec_retire_fails: 0,
+            pos3_delta: 0,
         }];
         let b = s.next_batch(&mut work, 4096, 1);
         assert!(b.is_empty(), "sequential mode owns the slot");
@@ -655,7 +773,12 @@ mod tests {
     }
 
     #[test]
-    fn mtp_prefill_slots_batch_but_decoding_mtp_slots_are_skipped() {        let mut s = Scheduler { chunk_size: 256, vl_sequential: false, prefill_cursor: 0 };
+    fn mtp_prefill_slots_batch_but_decoding_mtp_slots_are_skipped() {
+        let mut s = Scheduler {
+            chunk_size: 256,
+            vl_sequential: false,
+            prefill_cursor: 0,
+        };
         let mut work = vec![
             PendingWork {
                 // MTP slot still prefilling: its prompt chunk flows through
@@ -668,7 +791,8 @@ mod tests {
                 spec: SpecKind::Mtp,
                 spec_cycles: 0,
                 spec_committed: 0,
-                spec_retire_fails: 0, pos3_delta: 0,
+                spec_retire_fails: 0,
+                pos3_delta: 0,
             },
             PendingWork {
                 // MTP slot decoding: owned by the draft/verify cycle; its
@@ -681,7 +805,8 @@ mod tests {
                 spec: SpecKind::Mtp,
                 spec_cycles: 0,
                 spec_committed: 0,
-                spec_retire_fails: 0, pos3_delta: 0,
+                spec_retire_fails: 0,
+                pos3_delta: 0,
             },
         ];
         let b = s.next_batch(&mut work, 4096, 1);
@@ -702,7 +827,11 @@ mod tests {
         // rope delta must phase-shift every row while ext_emb stays -1 (no
         // vision matrix exists any more). A pure-text neighbour keeps
         // [p, p, p].
-        let mut s = Scheduler { chunk_size: 256, vl_sequential: false, prefill_cursor: 0 };
+        let mut s = Scheduler {
+            chunk_size: 256,
+            vl_sequential: false,
+            prefill_cursor: 0,
+        };
         let mut work = vec![
             PendingWork {
                 slot: SlotId(0),
@@ -740,7 +869,11 @@ mod tests {
 
     #[test]
     fn plain_text_step_still_skips_the_pos3_arrays() {
-        let mut s = Scheduler { chunk_size: 256, vl_sequential: false, prefill_cursor: 0 };
+        let mut s = Scheduler {
+            chunk_size: 256,
+            vl_sequential: false,
+            prefill_cursor: 0,
+        };
         let mut work = vec![PendingWork {
             slot: SlotId(0),
             remaining_prompt: prompt(4),
@@ -793,7 +926,11 @@ mod tests {
     fn mixed_decode_and_prefill_never_exceeds_max_batch_tokens() {
         // 4 decode slots + 1 prefill slot (300 tokens, chunk 256). Budget 6.
         // Decode gets 4 rows (one each), prefill gets 2 (remaining budget).
-        let mut s = Scheduler { chunk_size: 256, vl_sequential: false, prefill_cursor: 0 };
+        let mut s = Scheduler {
+            chunk_size: 256,
+            vl_sequential: false,
+            prefill_cursor: 0,
+        };
         let mut work = vec![
             work_decode(0, 1, 10),
             work_decode(1, 2, 20),
@@ -807,7 +944,11 @@ mod tests {
             "batch must not exceed budget: got {}",
             b.total_rows()
         );
-        assert_eq!(b.m_per_slot[0..4], vec![1, 1, 1, 1], "all 4 decode slots served");
+        assert_eq!(
+            b.m_per_slot[0..4],
+            vec![1, 1, 1, 1],
+            "all 4 decode slots served"
+        );
         assert_eq!(b.m_per_slot[4], 2, "prefill gets the remaining 2 rows");
         assert_eq!(work[4].remaining_prompt.len(), 298);
         assert_eq!(work[4].next_pos, 2);
@@ -817,7 +958,11 @@ mod tests {
     fn one_huge_prefill_chunk_is_truncated_to_remaining_budget() {
         // A single prefill slot with a huge prompt. Budget 10, chunk 256.
         // The slot gets only 10 rows (the budget), not the whole chunk.
-        let mut s = Scheduler { chunk_size: 256, vl_sequential: false, prefill_cursor: 0 };
+        let mut s = Scheduler {
+            chunk_size: 256,
+            vl_sequential: false,
+            prefill_cursor: 0,
+        };
         let mut work = vec![work_prefill(0, 1000, 0)];
         let b = s.next_batch(&mut work, 10, 1);
         assert_eq!(b.total_rows(), 10, "prefill truncated to remaining budget");
@@ -833,11 +978,12 @@ mod tests {
         // up to chunk, then slot 1. With chunk=256 and budget=4, slot 0
         // gets 4 rows total (quantum 1 + 3 extra), slot 1 gets 0.
         // Tick 2: cursor advances to 1 → slot 1 gets the quantum first.
-        let mut s = Scheduler { chunk_size: 256, vl_sequential: false, prefill_cursor: 0 };
-        let mut work = vec![
-            work_prefill(0, 100, 0),
-            work_prefill(1, 100, 0),
-        ];
+        let mut s = Scheduler {
+            chunk_size: 256,
+            vl_sequential: false,
+            prefill_cursor: 0,
+        };
+        let mut work = vec![work_prefill(0, 100, 0), work_prefill(1, 100, 0)];
         // Tick 1: cursor=0, slot 0 is the head.
         let b1 = s.next_batch(&mut work, 4, 1);
         assert_eq!(b1.total_rows(), 4);
@@ -857,21 +1003,30 @@ mod tests {
     #[test]
     fn zero_remaining_budget_returns_empty_batch() {
         // Budget 0: no rows can be allocated, even with runnable work.
-        let mut s = Scheduler { chunk_size: 256, vl_sequential: false, prefill_cursor: 0 };
-        let mut work = vec![
-            work_decode(0, 1, 10),
-            work_prefill(1, 300, 0),
-        ];
+        let mut s = Scheduler {
+            chunk_size: 256,
+            vl_sequential: false,
+            prefill_cursor: 0,
+        };
+        let mut work = vec![work_decode(0, 1, 10), work_prefill(1, 300, 0)];
         let b = s.next_batch(&mut work, 0, 1);
         assert!(b.is_empty(), "zero budget → empty batch");
         assert_eq!(work[0].remaining_prompt, vec![1], "decode seed untouched");
-        assert_eq!(work[1].remaining_prompt.len(), 300, "prefill prompt untouched");
+        assert_eq!(
+            work[1].remaining_prompt.len(),
+            300,
+            "prefill prompt untouched"
+        );
     }
 
     #[test]
     fn decode_lanes_admitted_only_up_to_budget() {
         // 5 decode slots, budget 3: only 3 decode lanes get a row.
-        let mut s = Scheduler { chunk_size: 256, vl_sequential: false, prefill_cursor: 0 };
+        let mut s = Scheduler {
+            chunk_size: 256,
+            vl_sequential: false,
+            prefill_cursor: 0,
+        };
         let mut work = vec![
             work_decode(0, 1, 10),
             work_decode(1, 2, 20),
@@ -891,11 +1046,12 @@ mod tests {
     fn prefill_min_tokens_guaranteed_when_space_remains() {
         // 1 decode (1 row) + 1 prefill (100 tokens). Budget 5, prefill_min 3.
         // Decode gets 1, prefill gets at least 3 (the min quantum).
-        let mut s = Scheduler { chunk_size: 256, vl_sequential: false, prefill_cursor: 0 };
-        let mut work = vec![
-            work_decode(0, 1, 10),
-            work_prefill(1, 100, 0),
-        ];
+        let mut s = Scheduler {
+            chunk_size: 256,
+            vl_sequential: false,
+            prefill_cursor: 0,
+        };
+        let mut work = vec![work_decode(0, 1, 10), work_prefill(1, 100, 0)];
         let b = s.next_batch(&mut work, 5, 3);
         assert_eq!(b.m_per_slot[0], 1, "decode gets 1 row");
         assert!(
@@ -912,29 +1068,51 @@ mod tests {
     /// un-granted slot must contribute 0 rows (spec §5.3 S3).
     #[test]
     fn ineligible_slot_contributes_zero_rows_and_keeps_its_prompt() {
-        let mut s = Scheduler { chunk_size: 256, vl_sequential: false, prefill_cursor: 0 };
+        let mut s = Scheduler {
+            chunk_size: 256,
+            vl_sequential: false,
+            prefill_cursor: 0,
+        };
         let mut work = vec![
             PendingWork {
                 slot: SlotId(0),
                 remaining_prompt: prompt(100),
                 next_pos: 0,
                 decoding: false,
-                vl_prefill: None, spec: SpecKind::None, spec_cycles: 0, spec_committed: 0, spec_retire_fails: 0, pos3_delta: 0,
+                vl_prefill: None,
+                spec: SpecKind::None,
+                spec_cycles: 0,
+                spec_committed: 0,
+                spec_retire_fails: 0,
+                pos3_delta: 0,
             },
             PendingWork {
                 slot: SlotId(1),
                 remaining_prompt: prompt(100),
                 next_pos: 0,
                 decoding: false,
-                vl_prefill: None, spec: SpecKind::None, spec_cycles: 0, spec_committed: 0, spec_retire_fails: 0, pos3_delta: 0,
+                vl_prefill: None,
+                spec: SpecKind::None,
+                spec_cycles: 0,
+                spec_committed: 0,
+                spec_retire_fails: 0,
+                pos3_delta: 0,
             },
         ];
         // Only slot 0 is eligible (FairQueue granted it); slot 1 is not.
         let eligible = [true, false];
         let b = s.next_batch_eligible(&mut work, 4096, 1, &eligible);
-        assert_eq!(b.m_per_slot, vec![100, 0], "ineligible slot contributes 0 rows");
+        assert_eq!(
+            b.m_per_slot,
+            vec![100, 0],
+            "ineligible slot contributes 0 rows"
+        );
         // Slot 1's prompt is untouched (not drained).
-        assert_eq!(work[1].remaining_prompt.len(), 100, "ineligible slot keeps its prompt");
+        assert_eq!(
+            work[1].remaining_prompt.len(),
+            100,
+            "ineligible slot keeps its prompt"
+        );
         assert_eq!(work[1].next_pos, 0);
         // Slot 0's prompt was consumed.
         assert!(work[0].remaining_prompt.is_empty());

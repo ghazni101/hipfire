@@ -280,9 +280,7 @@ fn main() {
             }
             // Keep the full metadata (config.vision_config is inside config).
             write_hfq(out, arch, &meta_json, &kept).expect("write");
-            eprintln!(
-                "done. Place {out} next to the trunk model as <stem>.vl for auto-discovery."
-            );
+            eprintln!("done. Place {out} next to the trunk model as <stem>.vl for auto-discovery.");
         }
         _ => {
             eprintln!(

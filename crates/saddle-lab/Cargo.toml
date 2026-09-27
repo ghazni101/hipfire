@@ -258,6 +258,13 @@ required-features = []
 name = "imatrix_collect"
 required-features = []
 
+# Research probe; include_str!()s kernels from the untracked
+# .codeinsight+research/ scratch tree, so it only builds where that tree
+# exists. Gate it out of the default graph or every clean checkout fails.
+[[example]]
+name = "kx3_foldfree_probe"
+required-features = ["lab"]
+
 [package.metadata.cargo-machete]
 # byteorder: deliberately kept (workspace from_le_bytes convention); never referenced by path in code.
 # hipfire-dispatch: no direct code reference, but [features].deltanet forwards hipfire-dispatch/deltanet.

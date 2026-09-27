@@ -4,9 +4,9 @@
 
 fn main() {
     use hipfire_arch_qwen35::serve_engine::{EngineConfig, SlotEngine};
+    use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::serve::{Continuation, Event, RejectClass, SubmitRequest};
     use hipfire_runtime::tokenizer::Tokenizer;
-    use hipfire_runtime::hfq::HfqFile;
     use std::path::{Path, PathBuf};
     use std::sync::mpsc::channel;
     use std::time::Duration;
@@ -32,8 +32,12 @@ fn main() {
     };
     let prompt_tokens = tok.encode(rendered);
 
-    let schema_path = std::env::args().skip(2).find(|a| !a.starts_with('-') && !a.parse::<usize>().is_ok());
-    let max_tok = std::env::args().skip(2).find_map(|a| a.parse::<usize>().ok());
+    let schema_path = std::env::args()
+        .skip(2)
+        .find(|a| !a.starts_with('-') && !a.parse::<usize>().is_ok());
+    let max_tok = std::env::args()
+        .skip(2)
+        .find_map(|a| a.parse::<usize>().ok());
     let schema: serde_json::Value = if let Some(p) = schema_path {
         serde_json::from_str(&std::fs::read_to_string(&p).expect("schema file")).expect("schema")
     } else {
@@ -107,7 +111,9 @@ fn main() {
             break;
         }
         match reply_rx.recv_timeout(Duration::from_secs(5)) {
-            Ok(Event::Accepted { reused, prefill, .. }) => {
+            Ok(Event::Accepted {
+                reused, prefill, ..
+            }) => {
                 println!("Accepted reused={reused} prefill={prefill}");
             }
             Ok(Event::Token { id }) => text.push_str(&tok.decode(&[id])),

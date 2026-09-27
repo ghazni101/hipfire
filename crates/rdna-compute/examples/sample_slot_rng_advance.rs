@@ -62,7 +62,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         for (slot, p) in params.iter().enumerate() {
             seeds[slot].push(p.seed);
         }
-        gpu.sample_per_slot(&logits, &mut params, &repeat_windows, SLOTS, VOCAB, &out_tokens)?;
+        gpu.sample_per_slot(
+            &logits,
+            &mut params,
+            &repeat_windows,
+            SLOTS,
+            VOCAB,
+            &out_tokens,
+        )?;
         gpu.hip.device_synchronize()?;
         let mut ids = vec![0i32; SLOTS];
         let bytes: &mut [u8] =

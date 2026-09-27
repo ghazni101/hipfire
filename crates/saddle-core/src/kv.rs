@@ -468,7 +468,9 @@ impl SlotKvTierPlan {
                 if head_dim == 0 || !head_dim.is_multiple_of(32) {
                     return Err(hip_bridge::HipError::new(
                         0,
-                        &format!("Q8_0 V slot KV requires head_dim divisible by 32 (got {head_dim})"),
+                        &format!(
+                            "Q8_0 V slot KV requires head_dim divisible by 32 (got {head_dim})"
+                        ),
                     ));
                 }
                 n_kv_heads * (head_dim / 32) * 34
@@ -603,14 +605,14 @@ impl KvCache {
             }
             // BF16 is flat unscaled: 2 bytes/element, same rows as the
             // contiguous bf16 constructor (per-token row = n_kv_heads*D*2).
-            KvMode::Bf16 => head_dim.checked_mul(2).ok_or_else(|| {
-                hip_bridge::HipError::new(0, "VMM bf16 K head stride overflowed")
-            }),
+            KvMode::Bf16 => head_dim
+                .checked_mul(2)
+                .ok_or_else(|| hip_bridge::HipError::new(0, "VMM bf16 K head stride overflowed")),
             // FP8 token-local rows: D codes + one inline f16 scale per head.
             // Same 1032-byte rows at Hkv4/D256 as the contiguous constructor.
-            KvMode::Fp8 => head_dim.checked_add(2).ok_or_else(|| {
-                hip_bridge::HipError::new(0, "VMM fp8 K head stride overflowed")
-            }),
+            KvMode::Fp8 => head_dim
+                .checked_add(2)
+                .ok_or_else(|| hip_bridge::HipError::new(0, "VMM fp8 K head stride overflowed")),
             KvMode::Asym2 | KvMode::Fwht2 => head_dim
                 .checked_div(4)
                 .and_then(|n| n.checked_add(4))
@@ -1717,13 +1719,13 @@ impl KvCache {
             physical_cap > 0 && physical_cap <= max_seq_len,
             "physical_cap ({physical_cap}) must be in (0, max_seq_len={max_seq_len}]"
         );
-        let kv_dim = n_kv_heads.checked_mul(head_dim).ok_or_else(|| {
-            hip_bridge::HipError::new(0, "bf16 KV kv_dim overflowed")
-        })?;
+        let kv_dim = n_kv_heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| hip_bridge::HipError::new(0, "bf16 KV kv_dim overflowed"))?;
         let row_bytes = Self::bf16_row_bytes(n_kv_heads, head_dim)?;
-        let cache_bytes = row_bytes.checked_mul(physical_cap).ok_or_else(|| {
-            hip_bridge::HipError::new(0, "bf16 KV cache byte size overflowed")
-        })?;
+        let cache_bytes = row_bytes
+            .checked_mul(physical_cap)
+            .ok_or_else(|| hip_bridge::HipError::new(0, "bf16 KV cache byte size overflowed"))?;
         let cache_elems = cache_bytes.div_ceil(4);
         let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, cache_elems, cache_elems, is_kv_layer)?;
         let n_kv = is_kv_layer.iter().filter(|b| **b).count();
@@ -2077,7 +2079,9 @@ impl KvCache {
     /// Same fast no-growth gate used by `ensure_mapped_capacity`. Optional
     /// caches need not scan every KV layer on each decode token.
     pub fn needs_mapped_growth(&self, required_tokens: usize) -> HipResult<bool> {
-        Ok(self.fast_mapped_token_capacity()?.is_some_and(|capacity| required_tokens > capacity))
+        Ok(self
+            .fast_mapped_token_capacity()?
+            .is_some_and(|capacity| required_tokens > capacity))
     }
 
     /// Physical bytes the next `ensure_mapped_capacity` would map. Used by
@@ -2097,7 +2101,10 @@ impl KvCache {
             for tensor in tensors {
                 if !tensor.buf.is_vmm_owner() {
                     if tensor.numel() > 1 {
-                        return Err(hip_bridge::HipError::new(0, "VMM KV contains a non-VMM tensor"));
+                        return Err(hip_bridge::HipError::new(
+                            0,
+                            "VMM KV contains a non-VMM tensor",
+                        ));
                     }
                     continue;
                 }
@@ -3085,15 +3092,15 @@ impl KvCache {
                 ),
             ));
         }
-        let codes = n_kv_heads.checked_mul(head_dim).ok_or_else(|| {
-            hip_bridge::HipError::new(0, "fp8 KV codes bytes overflowed")
-        })?;
-        let scales = n_kv_heads.checked_mul(2).ok_or_else(|| {
-            hip_bridge::HipError::new(0, "fp8 KV scales bytes overflowed")
-        })?;
-        codes.checked_add(scales).ok_or_else(|| {
-            hip_bridge::HipError::new(0, "fp8 KV row bytes overflowed")
-        })
+        let codes = n_kv_heads
+            .checked_mul(head_dim)
+            .ok_or_else(|| hip_bridge::HipError::new(0, "fp8 KV codes bytes overflowed"))?;
+        let scales = n_kv_heads
+            .checked_mul(2)
+            .ok_or_else(|| hip_bridge::HipError::new(0, "fp8 KV scales bytes overflowed"))?;
+        codes
+            .checked_add(scales)
+            .ok_or_else(|| hip_bridge::HipError::new(0, "fp8 KV row bytes overflowed"))
     }
 
     /// This cache's fp8 bytes-per-token-row per side. Rejects non-fp8
@@ -3187,9 +3194,9 @@ impl KvCache {
             .checked_mul(head_dim)
             .ok_or_else(|| hip_bridge::HipError::new(0, "fp8 KV kv_dim overflowed"))?;
         let row_bytes = Self::fp8_row_bytes(n_kv_heads, head_dim)?;
-        let cache_bytes = row_bytes.checked_mul(physical_cap).ok_or_else(|| {
-            hip_bridge::HipError::new(0, "fp8 KV cache byte size overflowed")
-        })?;
+        let cache_bytes = row_bytes
+            .checked_mul(physical_cap)
+            .ok_or_else(|| hip_bridge::HipError::new(0, "fp8 KV cache byte size overflowed"))?;
         // Allocator is typed F32; rows are 8-byte aligned by construction
         // (Hkv*(D+2) is even for every real geometry) so the ceil is exact.
         let cache_elems = cache_bytes.div_ceil(4);
@@ -5745,10 +5752,20 @@ mod fp8_bf16_format_tests {
     #[test]
     fn validate_admits_fp8_bf16_legacy_and_vmm() {
         // Legacy: fp8 exact geometry, bf16 any non-zero geometry.
-        KvCache::validate_mode_with_backend(KvMode::Fp8, KvBackend::Legacy, true, &mask_dims(256, None))
-            .unwrap();
-        KvCache::validate_mode_with_backend(KvMode::Bf16, KvBackend::Legacy, true, &mask_dims(128, None))
-            .unwrap();
+        KvCache::validate_mode_with_backend(
+            KvMode::Fp8,
+            KvBackend::Legacy,
+            true,
+            &mask_dims(256, None),
+        )
+        .unwrap();
+        KvCache::validate_mode_with_backend(
+            KvMode::Bf16,
+            KvBackend::Legacy,
+            true,
+            &mask_dims(128, None),
+        )
+        .unwrap();
         let err = KvCache::validate_mode_with_backend(
             KvMode::Fp8,
             KvBackend::Legacy,
@@ -5759,17 +5776,37 @@ mod fp8_bf16_format_tests {
         .to_string();
         assert!(err.contains("head_dim=256"), "{err}");
         // VMM: mask + cap required, single-GPU only, exact geometry.
-        KvCache::validate_mode_with_backend(KvMode::Fp8, KvBackend::Vmm, true, &mask_dims(256, Some(512)))
-            .unwrap();
-        KvCache::validate_mode_with_backend(KvMode::Bf16, KvBackend::Vmm, true, &mask_dims(256, Some(512)))
-            .unwrap();
-        let err = KvCache::validate_mode_with_backend(KvMode::Fp8, KvBackend::Vmm, true, &mask_dims(128, Some(512)))
-            .unwrap_err()
-            .to_string();
+        KvCache::validate_mode_with_backend(
+            KvMode::Fp8,
+            KvBackend::Vmm,
+            true,
+            &mask_dims(256, Some(512)),
+        )
+        .unwrap();
+        KvCache::validate_mode_with_backend(
+            KvMode::Bf16,
+            KvBackend::Vmm,
+            true,
+            &mask_dims(256, Some(512)),
+        )
+        .unwrap();
+        let err = KvCache::validate_mode_with_backend(
+            KvMode::Fp8,
+            KvBackend::Vmm,
+            true,
+            &mask_dims(128, Some(512)),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("head_dim=256"), "{err}");
-        let err = KvCache::validate_mode_with_backend(KvMode::Fp8, KvBackend::Vmm, false, &mask_dims(256, Some(512)))
-            .unwrap_err()
-            .to_string();
+        let err = KvCache::validate_mode_with_backend(
+            KvMode::Fp8,
+            KvBackend::Vmm,
+            false,
+            &mask_dims(256, Some(512)),
+        )
+        .unwrap_err()
+        .to_string();
         assert!(err.contains("single-GPU"), "{err}");
         let flat = KvDims {
             layers: KvLayers::Flat(64),
@@ -5849,7 +5886,10 @@ mod fp8_bf16_format_tests {
 
     #[test]
     fn indivisible_tiers_stay_out_of_residual_ladders() {
-        for cache in [indivisible_standin(true, false), indivisible_standin(false, true)] {
+        for cache in [
+            indivisible_standin(true, false),
+            indivisible_standin(false, true),
+        ] {
             assert!(!cache.quant_q4_residual());
             assert!(!cache.is_hfq8_kv());
         }
@@ -6020,7 +6060,11 @@ mod fp8_bf16_format_tests {
         } else {
             2f32.powi(e - 7) * (1.0 + m / 8.0)
         };
-        if s { -v } else { v }
+        if s {
+            -v
+        } else {
+            v
+        }
     }
 
     /// Frozen scale rule: smallest positive f16 `s >= amax/448`, floor
@@ -6123,7 +6167,11 @@ mod fp8_bf16_format_tests {
             let exp = (xorshift(&mut state) % 17) as i32 - 10;
             for x in xs.iter_mut() {
                 let mant = 1.0 + (xorshift(&mut state) % 1000) as f32 / 1000.0;
-                let sign = if xorshift(&mut state) & 1 == 0 { 1.0 } else { -1.0 };
+                let sign = if xorshift(&mut state) & 1 == 0 {
+                    1.0
+                } else {
+                    -1.0
+                };
                 *x = sign * mant * 2f32.powi(exp);
                 amax = amax.max(x.abs());
             }
@@ -6138,7 +6186,10 @@ mod fp8_bf16_format_tests {
                 let target = x / s;
                 let bound = (target.abs() * 0.065).max(2f32.powi(-10));
                 let err = (v - target).abs();
-                assert!(err <= bound, "x={x} s={s} code={code:#x} err={err} bound={bound}");
+                assert!(
+                    err <= bound,
+                    "x={x} s={s} code={code:#x} err={err} bound={bound}"
+                );
                 worst = worst.max(err);
                 // Fill-side decode point: f16(f32(s) * code) stays finite.
                 let fill = f32_to_f16_rne_bits(s * v);

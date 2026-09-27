@@ -274,7 +274,10 @@ impl std::fmt::Display for InsertError {
             ),
             Self::InvalidHandle(s) => write!(f, "invalid page handle: {}", s),
             Self::MisalignedHandle => {
-                write!(f, "misaligned page handle (not page-aligned or count mismatch)")
+                write!(
+                    f,
+                    "misaligned page handle (not page-aligned or count mismatch)"
+                )
             }
             Self::CacheByteBoundExceeded { retained, max } => write!(
                 f,
@@ -493,12 +496,7 @@ impl PrefixIndex {
 
     /// Inspect the index for the three token counts without claiming a Hit
     /// and without pinning (spec §4.2: for metrics).
-    pub fn inspect(
-        &self,
-        domain: &CacheDomain,
-        tokens: &[u32],
-        pool: &PagePool,
-    ) -> InspectResult {
+    pub fn inspect(&self, domain: &CacheDomain, tokens: &[u32], pool: &PagePool) -> InspectResult {
         let walk = self.walk(domain, tokens, pool);
         InspectResult {
             matched_tokens: walk.matched_tokens,
@@ -759,8 +757,7 @@ impl PrefixIndex {
                     // permanently inflating the retained total until the
                     // byte ceiling wedged (see the ownership doc).
                     self.retained_bytes = self.retained_bytes.saturating_add(
-                        pages_adopted
-                            * (pool.k_page_bytes() + pool.v_page_bytes()),
+                        pages_adopted * (pool.k_page_bytes() + pool.v_page_bytes()),
                     );
                     return Ok(());
                 }
@@ -781,8 +778,7 @@ impl PrefixIndex {
                     // empty root does not count against the bound forever.
                     if is_new_tree {
                         if let Some(t) = self.trees.remove(domain) {
-                            self.total_nodes =
-                                self.total_nodes.saturating_sub(t.node_count());
+                            self.total_nodes = self.total_nodes.saturating_sub(t.node_count());
                         }
                     }
                     return Err(e);
@@ -790,7 +786,6 @@ impl PrefixIndex {
             }
         }
     }
-
 
     // ── Pin / Unpin ───────────────────────────────────────────────────
 
@@ -875,11 +870,7 @@ impl PrefixIndex {
     /// children are gone).
     ///
     /// Returns the physical page indices that were evicted.
-    pub fn evict_unpinned_leaves(
-        &mut self,
-        pool: &mut PagePool,
-        max_bytes: usize,
-    ) -> Vec<u32> {
+    pub fn evict_unpinned_leaves(&mut self, pool: &mut PagePool, max_bytes: usize) -> Vec<u32> {
         let mut evicted_phys: Vec<u32> = Vec::new();
         let mut bytes_freed: usize = 0;
 
@@ -1028,12 +1019,23 @@ impl PrefixIndex {
         };
 
         let root = tree.root;
-        let child_id = match tree.nodes.get(&root).and_then(|n| n.children.get(&first_token).copied()) {
+        let child_id = match tree
+            .nodes
+            .get(&root)
+            .and_then(|n| n.children.get(&first_token).copied())
+        {
             Some(id) => id,
             None => return Err(InsertError::InvalidHandle("child not found".to_string())),
         };
 
-        let delta = split_edge(tree, root, child_id, split_tokens, self.max_cpu_nodes, self.total_nodes)?;
+        let delta = split_edge(
+            tree,
+            root,
+            child_id,
+            split_tokens,
+            self.max_cpu_nodes,
+            self.total_nodes,
+        )?;
         self.total_nodes = (self.total_nodes as i32 + delta) as usize;
         Ok(())
     }
@@ -1074,7 +1076,11 @@ fn insert_into_tree(
                     } else {
                         node.edge_tokens.len() as u64
                     };
-                    if !node.checkpoints.iter().any(|cb| cb.token_offset == token_offset) {
+                    if !node
+                        .checkpoints
+                        .iter()
+                        .any(|cb| cb.token_offset == token_offset)
+                    {
                         node.checkpoints.push(CheckpointBoundary {
                             token_offset,
                             checkpoint: ckpt,
@@ -1091,31 +1097,31 @@ fn insert_into_tree(
             None => return Ok((delta, pages_adopted)),
         };
 
-            let next_token = tokens[query_pos];
-            let child_id = match node.children.get(&next_token).copied() {
-                Some(id) => id,
-                None => {
-                    let remaining_tokens = &tokens[query_pos..];
-                    // query_pos may sit mid-page (a partial-node match leaves
-                    // the cursor inside the new key's current page): the
-                    // branch's first node claims only the tail of that page.
-                    let remaining_handles = &handles[query_pos / PAGE_TOKENS..];
-                    let (d, p) = create_chain(
-                        tree,
-                        current,
-                        remaining_tokens,
-                        remaining_handles,
-                        query_pos % PAGE_TOKENS,
-                        checkpoint,
-                        pool,
-                        max_cpu_nodes,
-                        current_total + delta as usize,
-                    )?;
-                    delta += d;
-                    pages_adopted += p;
-                    return Ok((delta, pages_adopted));
-                }
-            };
+        let next_token = tokens[query_pos];
+        let child_id = match node.children.get(&next_token).copied() {
+            Some(id) => id,
+            None => {
+                let remaining_tokens = &tokens[query_pos..];
+                // query_pos may sit mid-page (a partial-node match leaves
+                // the cursor inside the new key's current page): the
+                // branch's first node claims only the tail of that page.
+                let remaining_handles = &handles[query_pos / PAGE_TOKENS..];
+                let (d, p) = create_chain(
+                    tree,
+                    current,
+                    remaining_tokens,
+                    remaining_handles,
+                    query_pos % PAGE_TOKENS,
+                    checkpoint,
+                    pool,
+                    max_cpu_nodes,
+                    current_total + delta as usize,
+                )?;
+                delta += d;
+                pages_adopted += p;
+                return Ok((delta, pages_adopted));
+            }
+        };
 
         let child = match tree.nodes.get(&child_id) {
             Some(c) => c,
@@ -1144,7 +1150,14 @@ fn insert_into_tree(
             let split_pos = edge_match;
             let divergence = query_pos + edge_match;
 
-            delta += split_edge(tree, current, child_id, split_pos, max_cpu_nodes, current_total + delta as usize)?;
+            delta += split_edge(
+                tree,
+                current,
+                child_id,
+                split_pos,
+                max_cpu_nodes,
+                current_total + delta as usize,
+            )?;
 
             let parent = tree.nodes.get(&current).unwrap();
             let split_node_id = parent.children.get(&next_token).copied().unwrap();
@@ -1154,7 +1167,11 @@ fn insert_into_tree(
                     if ckpt.is_some() {
                         let split_node = tree.nodes.get_mut(&split_node_id).unwrap();
                         let token_offset = split_node.edge_tokens.len() as u64;
-                        if !split_node.checkpoints.iter().any(|cb| cb.token_offset == token_offset) {
+                        if !split_node
+                            .checkpoints
+                            .iter()
+                            .any(|cb| cb.token_offset == token_offset)
+                        {
                             split_node.checkpoints.push(CheckpointBoundary {
                                 token_offset,
                                 checkpoint: ckpt,
@@ -1248,7 +1265,12 @@ fn create_chain(
 
         let is_last_node = token_pos + span >= tokens.len();
 
-        let mut new_node = Node::new(insert_seq, current_parent, chunk.to_vec(), vec![page_handle]);
+        let mut new_node = Node::new(
+            insert_seq,
+            current_parent,
+            chunk.to_vec(),
+            vec![page_handle],
+        );
         new_node.first_page_skip = skip;
 
         if is_last_node {
@@ -1271,7 +1293,11 @@ fn create_chain(
             // pre-existing sibling of `parent`. Each created node held one
             // cache ref: release them all so the pages stay reclaimable.
             if let Some((_, first_ft, _)) = created.first().copied() {
-                tree.nodes.get_mut(&parent).unwrap().children.remove(&first_ft);
+                tree.nodes
+                    .get_mut(&parent)
+                    .unwrap()
+                    .children
+                    .remove(&first_ft);
             }
             for (id, _, ph) in created.into_iter().rev() {
                 tree.nodes.remove(&id);
@@ -1292,7 +1318,11 @@ fn create_chain(
         // eviction later.
         if let Err(e) = pool.add_cache_ref(page_handle.phys) {
             if let Some((_, first_ft, _)) = created.first().copied() {
-                tree.nodes.get_mut(&parent).unwrap().children.remove(&first_ft);
+                tree.nodes
+                    .get_mut(&parent)
+                    .unwrap()
+                    .children
+                    .remove(&first_ft);
             }
             for (id, _, ph) in created.into_iter().rev() {
                 tree.nodes.remove(&id);
@@ -1308,11 +1338,15 @@ fn create_chain(
         created.push((node_id, first_token, page_handle));
         added += 1;
 
-        tree.nodes.get_mut(&current_parent).unwrap().children.insert(first_token, node_id);
+        tree.nodes
+            .get_mut(&current_parent)
+            .unwrap()
+            .children
+            .insert(first_token, node_id);
 
-            current_parent = node_id;
-            token_pos += span;
-            handle_idx += 1;
+        current_parent = node_id;
+        token_pos += span;
+        handle_idx += 1;
     }
 
     // Every created node adopted exactly one page (one cache ref each) —
@@ -1331,12 +1365,7 @@ fn create_chain(
 /// re-linked under the original parent at the original first token, and the
 /// marker is removed. No cache refs move — the split moved handle slots
 /// between nodes without taking or releasing any.
-fn unsplit_edge(
-    tree: &mut DomainTree,
-    parent: NodeId,
-    split_node_id: NodeId,
-    child_id: NodeId,
-) {
+fn unsplit_edge(tree: &mut DomainTree, parent: NodeId, split_node_id: NodeId, child_id: NodeId) {
     let Some(marker) = tree.nodes.remove(&split_node_id) else {
         return;
     };
@@ -1441,9 +1470,17 @@ fn split_edge(
     // The remaining child now hangs off the split node, not the old parent.
     remaining_child.parent = Some(split_node_id);
 
-    tree.nodes.get_mut(&parent).unwrap().children.insert(first_token, split_node_id);
+    tree.nodes
+        .get_mut(&parent)
+        .unwrap()
+        .children
+        .insert(first_token, split_node_id);
     let remaining_first_token = tree.nodes.get(&child_id).unwrap().edge_tokens[0];
-    tree.nodes.get_mut(&split_node_id).unwrap().children.insert(remaining_first_token, child_id);
+    tree.nodes
+        .get_mut(&split_node_id)
+        .unwrap()
+        .children
+        .insert(remaining_first_token, child_id);
 
     Ok(1)
 }
@@ -1545,7 +1582,11 @@ mod tests {
             pool.seal(phys).unwrap();
             let gen = pool.page_generation(phys);
             handles.push(Handle {
-                handle: PageHandle { phys, epoch: pool.epoch(), generation: gen },
+                handle: PageHandle {
+                    phys,
+                    epoch: pool.epoch(),
+                    generation: gen,
+                },
                 token_offset: (lp * PAGE_TOKENS) as u64,
             });
         }
@@ -1610,8 +1651,7 @@ mod tests {
                     let mut key: Vec<u32> = Vec::new();
                     if !keys.is_empty() && rng.below(2) == 0 {
                         let base = &keys[rng.below(keys.len() as u64) as usize];
-                        let take_pages =
-                            rng.below((base.len() / PAGE_TOKENS) as u64 + 1) as usize;
+                        let take_pages = rng.below((base.len() / PAGE_TOKENS) as u64 + 1) as usize;
                         key.extend_from_slice(&base[..take_pages * PAGE_TOKENS]);
                     }
                     let extra = 1 + rng.below(3) as usize;
@@ -1675,8 +1715,7 @@ mod tests {
                         continue;
                     }
                     let key = &keys[rng.below(keys.len() as u64) as usize];
-                    let (_res, _h, ticket) =
-                        index.lookup_with_pages(&domain, key, &pool, None);
+                    let (_res, _h, ticket) = index.lookup_with_pages(&domain, key, &pool, None);
                     if !ticket.is_empty() {
                         tickets.push(ticket);
                     }
@@ -1702,10 +1741,7 @@ mod tests {
             if !keys.is_empty() {
                 let probe = &keys[rng.below(keys.len() as u64) as usize];
                 let got = index.inspect(&domain, probe, &pool);
-                let probe_pids: Vec<u32> = probe
-                    .chunks(PAGE_TOKENS)
-                    .map(|c| c[0])
-                    .collect();
+                let probe_pids: Vec<u32> = probe.chunks(PAGE_TOKENS).map(|c| c[0]).collect();
                 let mut n = 0usize;
                 while n < probe_pids.len() {
                     let prefix = &probe_pids[..n + 1];
@@ -1746,7 +1782,9 @@ mod tests {
         let mut index = PrefixIndex::new(1000);
         let domain = sample_domain(1);
 
-        index.insert(&domain, &tokens, &handles, Some(CheckpointId(1)), &mut pool).unwrap();
+        index
+            .insert(&domain, &tokens, &handles, Some(CheckpointId(1)), &mut pool)
+            .unwrap();
 
         // 1 token matches the edge but no full page is completed → no checkpoint
         // at that boundary → NoCheckpoint.
@@ -1764,9 +1802,12 @@ mod tests {
         let mut index = PrefixIndex::new(1000);
         let domain = sample_domain(1);
 
-        index.insert(&domain, &tokens, &handles, Some(CheckpointId(1)), &mut pool).unwrap();
+        index
+            .insert(&domain, &tokens, &handles, Some(CheckpointId(1)), &mut pool)
+            .unwrap();
 
-        let (result, _h, mut _ticket) = index.lookup_with_pages(&domain, &tokens[..127], &pool, None);
+        let (result, _h, mut _ticket) =
+            index.lookup_with_pages(&domain, &tokens[..127], &pool, None);
         assert!(
             matches!(result, PrefixLookupResult::Miss(MissReason::NoCheckpoint)),
             "127-token query should be NoCheckpoint, got {result:?}"
@@ -1780,7 +1821,9 @@ mod tests {
         let mut index = PrefixIndex::new(1000);
         let domain = sample_domain(1);
 
-        index.insert(&domain, &tokens, &handles, Some(CheckpointId(1)), &mut pool).unwrap();
+        index
+            .insert(&domain, &tokens, &handles, Some(CheckpointId(1)), &mut pool)
+            .unwrap();
 
         let (result, _h, mut _ticket) = index.lookup_with_pages(&domain, &tokens, &pool, None);
         match result {
@@ -1802,11 +1845,22 @@ mod tests {
 
         // Insert first page with checkpoint at 128, then full 2 pages with
         // checkpoint at 256.
-        index.insert(&domain, &tokens[..PAGE_TOKENS], &handles[..1], Some(CheckpointId(1)), &mut pool).unwrap();
-        index.insert(&domain, &tokens, &handles, Some(CheckpointId(2)), &mut pool).unwrap();
+        index
+            .insert(
+                &domain,
+                &tokens[..PAGE_TOKENS],
+                &handles[..1],
+                Some(CheckpointId(1)),
+                &mut pool,
+            )
+            .unwrap();
+        index
+            .insert(&domain, &tokens, &handles, Some(CheckpointId(2)), &mut pool)
+            .unwrap();
 
         // Query 129 tokens: matched=129, resumable=128 (checkpoint at 128).
-        let (result, _h, mut _ticket) = index.lookup_with_pages(&domain, &tokens[..129], &pool, None);
+        let (result, _h, mut _ticket) =
+            index.lookup_with_pages(&domain, &tokens[..129], &pool, None);
         match result {
             PrefixLookupResult::Hit(lk) => {
                 assert_eq!(lk.matched_tokens, 129);
@@ -1824,7 +1878,9 @@ mod tests {
         let mut index = PrefixIndex::new(1000);
         let domain = sample_domain(1);
 
-        index.publish_sealed_pages(&domain, &tokens, &handles, Some(CheckpointId(1)), &mut pool).unwrap();
+        index
+            .publish_sealed_pages(&domain, &tokens, &handles, Some(CheckpointId(1)), &mut pool)
+            .unwrap();
 
         let (result, _h, mut _ticket) = index.lookup_with_pages(&domain, &tokens, &pool, None);
         match result {
@@ -1845,12 +1901,23 @@ mod tests {
         let domain = sample_domain(1);
 
         // Insert first page with checkpoint at 128.
-        index.insert(&domain, &tokens[..PAGE_TOKENS], &handles[..1], Some(CheckpointId(1)), &mut pool).unwrap();
+        index
+            .insert(
+                &domain,
+                &tokens[..PAGE_TOKENS],
+                &handles[..1],
+                Some(CheckpointId(1)),
+                &mut pool,
+            )
+            .unwrap();
         // Insert full 2 pages with checkpoint at 256.
-        index.insert(&domain, &tokens, &handles, Some(CheckpointId(2)), &mut pool).unwrap();
+        index
+            .insert(&domain, &tokens, &handles, Some(CheckpointId(2)), &mut pool)
+            .unwrap();
 
         // Query 128 tokens: matched=128, resumable=128 (checkpoint at 128).
-        let (result, _h, mut _ticket) = index.lookup_with_pages(&domain, &tokens[..PAGE_TOKENS], &pool, None);
+        let (result, _h, mut _ticket) =
+            index.lookup_with_pages(&domain, &tokens[..PAGE_TOKENS], &pool, None);
         match result {
             PrefixLookupResult::Hit(lk) => {
                 assert_eq!(lk.matched_tokens, PAGE_TOKENS as u64);
@@ -1869,8 +1936,18 @@ mod tests {
         let domain = sample_domain(1);
 
         // Insert first page with checkpoint at 128.
-        index.insert(&domain, &tokens[..PAGE_TOKENS], &handles[..1], Some(CheckpointId(1)), &mut pool).unwrap();
-        index.insert(&domain, &tokens, &handles, Some(CheckpointId(2)), &mut pool).unwrap();
+        index
+            .insert(
+                &domain,
+                &tokens[..PAGE_TOKENS],
+                &handles[..1],
+                Some(CheckpointId(1)),
+                &mut pool,
+            )
+            .unwrap();
+        index
+            .insert(&domain, &tokens, &handles, Some(CheckpointId(2)), &mut pool)
+            .unwrap();
 
         // Query: 128 match + 1 divergent token.
         let mut query = tokens[..PAGE_TOKENS].to_vec();
@@ -1894,13 +1971,18 @@ mod tests {
         let mut index = PrefixIndex::new(1000);
         let domain = sample_domain(1);
 
-        index.insert(&domain, &tokens, &handles, Some(CheckpointId(1)), &mut pool).unwrap();
+        index
+            .insert(&domain, &tokens, &handles, Some(CheckpointId(1)), &mut pool)
+            .unwrap();
 
         let r0 = index.lookup(&domain, &[], &pool, None);
         assert!(matches!(r0, PrefixLookupResult::Miss(MissReason::NoMatch)));
 
         let r1 = index.lookup(&domain, &tokens[..1], &pool, None);
-        assert!(matches!(r1, PrefixLookupResult::Miss(MissReason::NoCheckpoint)));
+        assert!(matches!(
+            r1,
+            PrefixLookupResult::Miss(MissReason::NoCheckpoint)
+        ));
 
         let insp = index.inspect(&domain, &[], &pool);
         assert_eq!(insp.matched_tokens, 0);
@@ -1923,9 +2005,13 @@ mod tests {
         let domain = sample_domain(1);
 
         // Insert the same prefix twice.
-        index.publish_sealed_pages(&domain, &tokens, &handles, Some(CheckpointId(1)), &mut pool).unwrap();
+        index
+            .publish_sealed_pages(&domain, &tokens, &handles, Some(CheckpointId(1)), &mut pool)
+            .unwrap();
         let nodes_after_first = index.total_nodes();
-        index.publish_sealed_pages(&domain, &tokens, &handles, Some(CheckpointId(1)), &mut pool).unwrap();
+        index
+            .publish_sealed_pages(&domain, &tokens, &handles, Some(CheckpointId(1)), &mut pool)
+            .unwrap();
         let nodes_after_second = index.total_nodes();
 
         // Second insert should not add nodes (canonical entry).
@@ -1945,7 +2031,9 @@ mod tests {
         let mut index = PrefixIndex::new(1000);
         let domain = sample_domain(1);
 
-        index.publish_sealed_pages(&domain, &tokens, &handles, Some(CheckpointId(1)), &mut pool).unwrap();
+        index
+            .publish_sealed_pages(&domain, &tokens, &handles, Some(CheckpointId(1)), &mut pool)
+            .unwrap();
 
         // Lookup pins the pages.
         let (result, _h, mut _ticket) = index.lookup_with_pages(&domain, &tokens, &pool, None);
@@ -1981,7 +2069,15 @@ mod tests {
         let domain_a = sample_domain(1);
         let domain_b = domain_with("model", "");
 
-        index.insert(&domain_a, &tokens, &handles, Some(CheckpointId(1)), &mut pool).unwrap();
+        index
+            .insert(
+                &domain_a,
+                &tokens,
+                &handles,
+                Some(CheckpointId(1)),
+                &mut pool,
+            )
+            .unwrap();
 
         let (result, _h, mut _ticket) = index.lookup_with_pages(&domain_b, &tokens, &pool, None);
         assert!(
@@ -2002,7 +2098,15 @@ mod tests {
         let domain_a = sample_domain(1);
         let domain_b = domain_with("template", "");
 
-        index.insert(&domain_a, &tokens, &handles, Some(CheckpointId(1)), &mut pool).unwrap();
+        index
+            .insert(
+                &domain_a,
+                &tokens,
+                &handles,
+                Some(CheckpointId(1)),
+                &mut pool,
+            )
+            .unwrap();
 
         let (result, _h, mut _ticket) = index.lookup_with_pages(&domain_b, &tokens, &pool, None);
         assert!(
@@ -2020,7 +2124,15 @@ mod tests {
         let domain_a = sample_domain(1);
         let domain_b = domain_with("tokenizer", "");
 
-        index.insert(&domain_a, &tokens, &handles, Some(CheckpointId(1)), &mut pool).unwrap();
+        index
+            .insert(
+                &domain_a,
+                &tokens,
+                &handles,
+                Some(CheckpointId(1)),
+                &mut pool,
+            )
+            .unwrap();
 
         let (result, _h, mut _ticket) = index.lookup_with_pages(&domain_b, &tokens, &pool, None);
         assert!(
@@ -2038,7 +2150,15 @@ mod tests {
         let domain_a = sample_domain(1);
         let domain_b = domain_with("namespace", "owner-beta");
 
-        index.insert(&domain_a, &tokens, &handles, Some(CheckpointId(1)), &mut pool).unwrap();
+        index
+            .insert(
+                &domain_a,
+                &tokens,
+                &handles,
+                Some(CheckpointId(1)),
+                &mut pool,
+            )
+            .unwrap();
 
         let (result, _h, mut _ticket) = index.lookup_with_pages(&domain_b, &tokens, &pool, None);
         assert!(
@@ -2056,7 +2176,9 @@ mod tests {
         let mut index = PrefixIndex::new(1000);
         let domain = sample_domain(1);
 
-        index.insert(&domain, &tokens, &handles, Some(CheckpointId(1)), &mut pool).unwrap();
+        index
+            .insert(&domain, &tokens, &handles, Some(CheckpointId(1)), &mut pool)
+            .unwrap();
 
         // Verify hit before eviction.
         let (result, _h, mut _ticket) = index.lookup_with_pages(&domain, &tokens, &pool, None);
@@ -2082,7 +2204,9 @@ mod tests {
         let mut index = PrefixIndex::new(1000);
         let domain = sample_domain(1);
 
-        index.publish_sealed_pages(&domain, &tokens, &handles, Some(CheckpointId(1)), &mut pool).unwrap();
+        index
+            .publish_sealed_pages(&domain, &tokens, &handles, Some(CheckpointId(1)), &mut pool)
+            .unwrap();
 
         // Lookup pins pages.
         let (result, _h, mut _ticket) = index.lookup_with_pages(&domain, &tokens, &pool, None);
@@ -2116,9 +2240,23 @@ mod tests {
         let tokens_c = make_tokens_from(2000, PAGE_TOKENS);
 
         // Insert A (root + 1 node = 2 total).
-        idx.insert(&domain, &tokens_a, &handles[..1], Some(CheckpointId(1)), &mut pool).unwrap();
+        idx.insert(
+            &domain,
+            &tokens_a,
+            &handles[..1],
+            Some(CheckpointId(1)),
+            &mut pool,
+        )
+        .unwrap();
         // Insert B (root + 2 nodes = 3 total).
-        idx.insert(&domain, &tokens_b, &handles[1..2], Some(CheckpointId(2)), &mut pool).unwrap();
+        idx.insert(
+            &domain,
+            &tokens_b,
+            &handles[1..2],
+            Some(CheckpointId(2)),
+            &mut pool,
+        )
+        .unwrap();
 
         // Pin both leaves: insert-time eviction (spec §4.4) may reclaim
         // unpinned leaves to make room, so the bound only refuses when
@@ -2128,7 +2266,13 @@ mod tests {
 
         // Third insert should fail (would need 4 nodes > max 3, and no
         // leaf is evictable).
-        let result = idx.insert(&domain, &tokens_c, &handles[2..3], Some(CheckpointId(3)), &mut pool);
+        let result = idx.insert(
+            &domain,
+            &tokens_c,
+            &handles[2..3],
+            Some(CheckpointId(3)),
+            &mut pool,
+        );
         assert!(
             matches!(result, Err(InsertError::CpuNodeBoundExceeded { .. })),
             "third insert should fail, got {result:?}"
@@ -2147,15 +2291,38 @@ mod tests {
         let tokens_b = make_tokens_from(1000, PAGE_TOKENS);
         let tokens_c = make_tokens_from(2000, PAGE_TOKENS);
 
-        idx.insert(&domain, &tokens_a, &handles[..1], Some(CheckpointId(1)), &mut pool).unwrap();
-        idx.insert(&domain, &tokens_b, &handles[1..2], Some(CheckpointId(2)), &mut pool).unwrap();
+        idx.insert(
+            &domain,
+            &tokens_a,
+            &handles[..1],
+            Some(CheckpointId(1)),
+            &mut pool,
+        )
+        .unwrap();
+        idx.insert(
+            &domain,
+            &tokens_b,
+            &handles[1..2],
+            Some(CheckpointId(2)),
+            &mut pool,
+        )
+        .unwrap();
 
         // Evict to make room for 1 more node.
         idx.evict_for_capacity(&mut pool, 1).unwrap();
 
         // Now insert should succeed.
-        let result = idx.insert(&domain, &tokens_c, &handles[2..3], Some(CheckpointId(3)), &mut pool);
-        assert!(result.is_ok(), "insert after eviction should succeed, got {result:?}");
+        let result = idx.insert(
+            &domain,
+            &tokens_c,
+            &handles[2..3],
+            Some(CheckpointId(3)),
+            &mut pool,
+        );
+        assert!(
+            result.is_ok(),
+            "insert after eviction should succeed, got {result:?}"
+        );
     }
 
     // ── publish_sealed_pages refuses partial last page ────────────────
@@ -2181,7 +2348,13 @@ mod tests {
         let domain = sample_domain(1);
 
         let tokens = make_tokens(PAGE_TOKENS * 2);
-        let result = index.publish_sealed_pages(&domain, &tokens, &handles, Some(CheckpointId(1)), &mut pool);
+        let result = index.publish_sealed_pages(
+            &domain,
+            &tokens,
+            &handles,
+            Some(CheckpointId(1)),
+            &mut pool,
+        );
         assert!(result.is_ok());
     }
 
@@ -2194,7 +2367,9 @@ mod tests {
         let mut index = PrefixIndex::new(1000);
         let domain = sample_domain(1);
 
-        index.insert(&domain, &tokens, &handles, Some(CheckpointId(1)), &mut pool).unwrap();
+        index
+            .insert(&domain, &tokens, &handles, Some(CheckpointId(1)), &mut pool)
+            .unwrap();
 
         let insp = index.inspect(&domain, &tokens, &pool);
         assert_eq!(insp.matched_tokens, PAGE_TOKENS as u64);
@@ -2219,22 +2394,35 @@ mod tests {
         let domain = sample_domain(1);
 
         // Insert with checkpoints at 128 and 256.
-        index.insert(&domain, &tokens[..PAGE_TOKENS], &handles[..1], Some(CheckpointId(1)), &mut pool).unwrap();
-        index.insert(&domain, &tokens, &handles, Some(CheckpointId(2)), &mut pool).unwrap();
+        index
+            .insert(
+                &domain,
+                &tokens[..PAGE_TOKENS],
+                &handles[..1],
+                Some(CheckpointId(1)),
+                &mut pool,
+            )
+            .unwrap();
+        index
+            .insert(&domain, &tokens, &handles, Some(CheckpointId(2)), &mut pool)
+            .unwrap();
 
         // Query 256 tokens: matched=256, resumable=256 → not partial → Hit.
         let policy = CachePolicy::qwen35();
-        let (result, _h, mut _ticket) = index.lookup_with_pages(&domain, &tokens, &pool, Some(&policy));
+        let (result, _h, mut _ticket) =
+            index.lookup_with_pages(&domain, &tokens, &pool, Some(&policy));
         assert!(matches!(result, PrefixLookupResult::Hit(_)));
         index.release_pin(&domain, std::mem::take(&mut _ticket));
 
         // Query 128 tokens: matched=128, resumable=128 → not partial → Hit.
-        let (result, _h, mut _ticket) = index.lookup_with_pages(&domain, &tokens[..PAGE_TOKENS], &pool, Some(&policy));
+        let (result, _h, mut _ticket) =
+            index.lookup_with_pages(&domain, &tokens[..PAGE_TOKENS], &pool, Some(&policy));
         assert!(matches!(result, PrefixLookupResult::Hit(_)));
         index.release_pin(&domain, std::mem::take(&mut _ticket));
 
         // Query 129 tokens: matched=129, resumable=128 → partial → IncompatiblePolicy.
-        let (result, _h, mut _ticket) = index.lookup_with_pages(&domain, &tokens[..129], &pool, Some(&policy));
+        let (result, _h, mut _ticket) =
+            index.lookup_with_pages(&domain, &tokens[..129], &pool, Some(&policy));
         assert!(
             matches!(result, PrefixLookupResult::Miss(MissReason::IncompatiblePolicy)),
             "mid-sequence partial with allow_partial=false should be IncompatiblePolicy, got {result:?}"
@@ -2248,11 +2436,22 @@ mod tests {
         let mut index = PrefixIndex::new(1000);
         let domain = sample_domain(1);
 
-        index.insert(&domain, &tokens[..PAGE_TOKENS], &handles[..1], Some(CheckpointId(1)), &mut pool).unwrap();
-        index.insert(&domain, &tokens, &handles, Some(CheckpointId(2)), &mut pool).unwrap();
+        index
+            .insert(
+                &domain,
+                &tokens[..PAGE_TOKENS],
+                &handles[..1],
+                Some(CheckpointId(1)),
+                &mut pool,
+            )
+            .unwrap();
+        index
+            .insert(&domain, &tokens, &handles, Some(CheckpointId(2)), &mut pool)
+            .unwrap();
 
         // Query 129 tokens with no policy → Hit with resumable=128.
-        let (result, _h, mut _ticket) = index.lookup_with_pages(&domain, &tokens[..129], &pool, None);
+        let (result, _h, mut _ticket) =
+            index.lookup_with_pages(&domain, &tokens[..129], &pool, None);
         match result {
             PrefixLookupResult::Hit(lk) => {
                 assert_eq!(lk.matched_tokens, 129);
@@ -2282,7 +2481,9 @@ mod tests {
         let mut index = PrefixIndex::new(1000);
         let domain = sample_domain(1);
 
-        index.publish_sealed_pages(&domain, &tokens, &handles, Some(CheckpointId(1)), &mut pool).unwrap();
+        index
+            .publish_sealed_pages(&domain, &tokens, &handles, Some(CheckpointId(1)), &mut pool)
+            .unwrap();
 
         // Split the edge from root at 128 tokens.
         let first_token = tokens[0];
@@ -2353,11 +2554,19 @@ mod tests {
         pool.seal(phys1).unwrap();
         let handles = vec![
             Handle {
-                handle: PageHandle { phys: phys0, epoch: 0, generation: pool.page_generation(phys0) },
+                handle: PageHandle {
+                    phys: phys0,
+                    epoch: 0,
+                    generation: pool.page_generation(phys0),
+                },
                 token_offset: 0,
             },
             Handle {
-                handle: PageHandle { phys: phys1, epoch: 0, generation: pool.page_generation(phys1) },
+                handle: PageHandle {
+                    phys: phys1,
+                    epoch: 0,
+                    generation: pool.page_generation(phys1),
+                },
                 token_offset: PAGE_TOKENS as u64,
             },
         ];
@@ -2388,8 +2597,14 @@ mod tests {
         // 1 stays cache-resident.
         index.test_drop_page_ref(&mut pool, &domain, phys0);
         pool.release_table(&mut table).unwrap();
-        assert_eq!(pool.page_state(phys0), rdna_compute::page_pool::PageState::Free);
-        assert_eq!(pool.page_state(phys1), rdna_compute::page_pool::PageState::CacheOnly);
+        assert_eq!(
+            pool.page_state(phys0),
+            rdna_compute::page_pool::PageState::Free
+        );
+        assert_eq!(
+            pool.page_state(phys1),
+            rdna_compute::page_pool::PageState::CacheOnly
+        );
 
         // The boundary below the gap must NOT be resumable anymore.
         let (r, h, _ticket) = index.lookup_with_pages(&domain, &tokens, &pool, None);
@@ -2397,7 +2612,10 @@ mod tests {
             matches!(r, PrefixLookupResult::Miss(MissReason::NoCheckpoint)),
             "gap below the 128 boundary must force NoCheckpoint, got {r:?}"
         );
-        assert!(h.is_empty(), "no handles may be issued for an unresumable boundary");
+        assert!(
+            h.is_empty(),
+            "no handles may be issued for an unresumable boundary"
+        );
     }
 
     // ── CPU node bound: failed inserts leave accounting whole ──────────
@@ -2412,8 +2630,14 @@ mod tests {
         let domain = sample_domain(1);
 
         let tokens_a = make_tokens(PAGE_TOKENS);
-        idx.insert(&domain, &tokens_a, &handles[..1], Some(CheckpointId(1)), &mut pool)
-            .unwrap();
+        idx.insert(
+            &domain,
+            &tokens_a,
+            &handles[..1],
+            Some(CheckpointId(1)),
+            &mut pool,
+        )
+        .unwrap();
         assert_eq!(idx.total_nodes(), 2);
 
         // 3-page chain: first node fits (3 total), second trips the bound.
@@ -2428,11 +2652,18 @@ mod tests {
             Some(CheckpointId(3)),
             &mut pool,
         );
-        assert!(matches!(result, Err(InsertError::CpuNodeBoundExceeded { .. })));
+        assert!(matches!(
+            result,
+            Err(InsertError::CpuNodeBoundExceeded { .. })
+        ));
 
         // Accounting must still match reality: the rolled-back chain left
         // exactly root + A behind.
-        assert_eq!(idx.total_nodes(), 2, "failed insert must not change node accounting");
+        assert_eq!(
+            idx.total_nodes(),
+            2,
+            "failed insert must not change node accounting"
+        );
 
         // The rolled-back prefix must be gone: its first page misses.
         let r = idx.lookup(&domain, &tokens_c, &pool, None);
@@ -2440,15 +2671,27 @@ mod tests {
 
         // And the bound still binds: exactly one more 1-page insert fits.
         let tokens_b = make_tokens_from(1000, PAGE_TOKENS);
-        idx.insert(&domain, &tokens_b, &handles[1..2], Some(CheckpointId(2)), &mut pool)
-            .unwrap();
+        idx.insert(
+            &domain,
+            &tokens_b,
+            &handles[1..2],
+            Some(CheckpointId(2)),
+            &mut pool,
+        )
+        .unwrap();
         assert_eq!(idx.total_nodes(), 3);
         // A 4th node would exceed the bound, but B's leaf is unpinned:
         // insert-time eviction reclaims it and the insert succeeds (spec
         // §4.4: reclaim cache-only pages before rejecting work).
         let tokens_d = make_tokens_from(3000, PAGE_TOKENS);
-        idx.insert(&domain, &tokens_d, &handles[2..3], Some(CheckpointId(4)), &mut pool)
-            .unwrap();
+        idx.insert(
+            &domain,
+            &tokens_d,
+            &handles[2..3],
+            Some(CheckpointId(4)),
+            &mut pool,
+        )
+        .unwrap();
         assert_eq!(idx.total_nodes(), 3);
         // B's evicted prefix misses; A's pinned prefix still hits.
         let r = idx.lookup(&domain, &tokens_b, &pool, None);
@@ -2470,7 +2713,13 @@ mod tests {
 
         let tokens_a = make_tokens(PAGE_TOKENS);
         index
-            .insert(&domain, &tokens_a, &handles[..1], Some(CheckpointId(1)), &mut pool)
+            .insert(
+                &domain,
+                &tokens_a,
+                &handles[..1],
+                Some(CheckpointId(1)),
+                &mut pool,
+            )
             .unwrap();
         assert_eq!(index.total_nodes(), 2);
 
@@ -2515,7 +2764,13 @@ mod tests {
         // And the bound still binds: exactly one more node fits.
         let tokens_c = make_tokens_from(4000, PAGE_TOKENS);
         index
-            .insert(&domain, &tokens_c, &handles[2..3], Some(CheckpointId(3)), &mut pool)
+            .insert(
+                &domain,
+                &tokens_c,
+                &handles[2..3],
+                Some(CheckpointId(3)),
+                &mut pool,
+            )
             .unwrap();
         assert_eq!(index.total_nodes(), 3);
     }
@@ -2552,7 +2807,13 @@ mod tests {
         // The same domain is fully usable once the ceiling can hold a page.
         index.set_max_retained_bytes(page_bytes * 2);
         index
-            .insert(&domain, &tokens_a, &handles[..1], Some(CheckpointId(1)), &mut pool)
+            .insert(
+                &domain,
+                &tokens_a,
+                &handles[..1],
+                Some(CheckpointId(1)),
+                &mut pool,
+            )
             .unwrap();
         assert_eq!(index.total_nodes(), 2, "root + one page node");
         let r = index.lookup(&domain, &tokens_a, &pool, None);
@@ -2576,7 +2837,13 @@ mod tests {
         // A: two full pages.
         let tokens_a = make_tokens(PAGE_TOKENS * 2);
         index
-            .insert(&domain, &tokens_a, &handles[..2], Some(CheckpointId(1)), &mut pool)
+            .insert(
+                &domain,
+                &tokens_a,
+                &handles[..2],
+                Some(CheckpointId(1)),
+                &mut pool,
+            )
             .unwrap();
         let nodes_before = index.total_nodes();
         assert_eq!(index.retained_bytes(), 2 * page_bytes);
@@ -2587,7 +2854,13 @@ mod tests {
         tokens_b.extend(make_tokens_from(9000, PAGE_TOKENS / 2));
         assert_eq!(tokens_b.len(), PAGE_TOKENS * 2);
         index
-            .insert(&domain, &tokens_b, &handles[2..4], Some(CheckpointId(2)), &mut pool)
+            .insert(
+                &domain,
+                &tokens_b,
+                &handles[2..4],
+                Some(CheckpointId(2)),
+                &mut pool,
+            )
             .unwrap();
 
         // The fork added the zero-page split marker plus B's one-page chain
@@ -2604,7 +2877,10 @@ mod tests {
         );
 
         let (r, h, _t) = index.lookup_with_pages(&domain, &tokens_a, &pool, None);
-        assert!(matches!(r, PrefixLookupResult::Hit(_)), "A must stay resumable: {r:?}");
+        assert!(
+            matches!(r, PrefixLookupResult::Hit(_)),
+            "A must stay resumable: {r:?}"
+        );
         assert_eq!(h.len(), 2);
 
         let (r, h, _t) = index.lookup_with_pages(&domain, &tokens_b, &pool, None);
@@ -2632,7 +2908,13 @@ mod tests {
         // Key A: 2 adopted pages.
         let tokens_a = make_tokens(PAGE_TOKENS * 2);
         index
-            .insert(&domain, &tokens_a, &handles[..2], Some(CheckpointId(1)), &mut pool)
+            .insert(
+                &domain,
+                &tokens_a,
+                &handles[..2],
+                Some(CheckpointId(1)),
+                &mut pool,
+            )
             .unwrap();
         assert_eq!(index.retained_bytes(), 2 * page_bytes);
 
@@ -2642,7 +2924,13 @@ mod tests {
         let mut tokens_b = tokens_a[..60].to_vec();
         tokens_b.extend(make_tokens_from(5000, PAGE_TOKENS * 2 - 60));
         index
-            .insert(&domain, &tokens_b, &handles[2..4], Some(CheckpointId(2)), &mut pool)
+            .insert(
+                &domain,
+                &tokens_b,
+                &handles[2..4],
+                Some(CheckpointId(2)),
+                &mut pool,
+            )
             .expect("mid-page fork must insert");
         assert_eq!(
             index.retained_bytes(),
@@ -2682,19 +2970,34 @@ mod tests {
         // Key A: 2 pages of tokens 1..=256.
         let tokens_a = make_tokens(PAGE_TOKENS * 2);
         index
-            .insert(&domain, &tokens_a, &handles[..2], Some(CheckpointId(1)), &mut pool)
+            .insert(
+                &domain,
+                &tokens_a,
+                &handles[..2],
+                Some(CheckpointId(1)),
+                &mut pool,
+            )
             .unwrap();
 
         // Key B: shares the first 60 tokens (mid-page), then diverges.
         let mut tokens_b = tokens_a[..60].to_vec();
         tokens_b.extend(make_tokens_from(5000, PAGE_TOKENS * 2 - 60));
         index
-            .insert(&domain, &tokens_b, &handles[2..4], Some(CheckpointId(2)), &mut pool)
+            .insert(
+                &domain,
+                &tokens_b,
+                &handles[2..4],
+                Some(CheckpointId(2)),
+                &mut pool,
+            )
             .expect("mid-page fork must insert");
 
         // A still hits fully.
         let (r, _h, _t) = index.lookup_with_pages(&domain, &tokens_a, &pool, None);
-        assert!(matches!(r, PrefixLookupResult::Hit(_)), "A must still hit: {r:?}");
+        assert!(
+            matches!(r, PrefixLookupResult::Hit(_)),
+            "A must still hit: {r:?}"
+        );
 
         // B hits: its divergent tail is now cached. The matched span is
         // B's full key; resumability is bounded by B's checkpoint at its
@@ -2724,7 +3027,13 @@ mod tests {
         let mut tokens_c = tokens_b[..100].to_vec();
         tokens_c.extend(make_tokens_from(9000, PAGE_TOKENS * 2 - 100));
         index
-            .insert(&domain, &tokens_c, &handles[..2], Some(CheckpointId(3)), &mut pool)
+            .insert(
+                &domain,
+                &tokens_c,
+                &handles[..2],
+                Some(CheckpointId(3)),
+                &mut pool,
+            )
             .expect("nested mid-page fork must insert");
         let (r, h, _t) = index.lookup_with_pages(&domain, &tokens_c, &pool, None);
         let PrefixLookupResult::Hit(hit) = r else {
@@ -2754,14 +3063,26 @@ mod tests {
 
         let tokens_a = make_tokens(PAGE_TOKENS * 2);
         index
-            .insert(&domain, &tokens_a, &handles[..2], Some(CheckpointId(1)), &mut pool)
+            .insert(
+                &domain,
+                &tokens_a,
+                &handles[..2],
+                Some(CheckpointId(1)),
+                &mut pool,
+            )
             .unwrap();
 
         // Key B: identical first page, divergent second page.
         let mut tokens_b = tokens_a[..PAGE_TOKENS].to_vec();
         tokens_b.extend(make_tokens_from(5000, PAGE_TOKENS));
         index
-            .insert(&domain, &tokens_b, &handles[2..4], Some(CheckpointId(2)), &mut pool)
+            .insert(
+                &domain,
+                &tokens_b,
+                &handles[2..4],
+                Some(CheckpointId(2)),
+                &mut pool,
+            )
             .unwrap();
 
         let (ra, _ha, _ta) = index.lookup_with_pages(&domain, &tokens_a, &pool, None);
@@ -2789,7 +3110,10 @@ mod tests {
         // Release the first ticket: the second lookup's pin still protects.
         index.release_pin(&domain, std::mem::take(&mut t1));
         let evicted = index.evict_unpinned_leaves(&mut pool, usize::MAX);
-        assert!(evicted.is_empty(), "second lookup's pin must still protect the path");
+        assert!(
+            evicted.is_empty(),
+            "second lookup's pin must still protect the path"
+        );
 
         // Release the second: now evictable.
         index.release_pin(&domain, std::mem::take(&mut t2));

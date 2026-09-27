@@ -343,7 +343,6 @@ fn sp_dummy_prefix_from_hf_json(tok: &serde_json::Value) -> bool {
         || pre_tokenizer.map(pretokenizer_prepends).unwrap_or(false)
 }
 
-
 impl Tokenizer {
     /// Load tokenizer from GGUF metadata.
     pub fn from_gguf(gguf: &GgufFile) -> Result<Self, TokenizerError> {
@@ -2562,7 +2561,6 @@ mod prompt_norm_tests {
     }
 }
 
-
 #[cfg(test)]
 mod sp_dummy_prefix_tests {
     //! Config-driven SP dummy-prefix coverage (gemma4 first-word bug,
@@ -2636,8 +2634,7 @@ mod sp_dummy_prefix_tests {
 
     #[test]
     fn gemma4_no_dummy_prefix_first_word_matches_hf() {
-        let t = Tokenizer::from_hfq_metadata(&gemma4_fixture_metadata())
-            .expect("fixture parses");
+        let t = Tokenizer::from_hfq_metadata(&gemma4_fixture_metadata()).expect("fixture parses");
         assert_eq!(t.bos_id, 2, "generation_config bos override");
         let mut ids = vec![t.bos_id];
         ids.extend(t.encode("The capital of France is"));
@@ -2646,8 +2643,7 @@ mod sp_dummy_prefix_tests {
 
     #[test]
     fn gemma4_chat_tail_thought_channel_matches_hf() {
-        let t = Tokenizer::from_hfq_metadata(&gemma4_fixture_metadata())
-            .expect("fixture parses");
+        let t = Tokenizer::from_hfq_metadata(&gemma4_fixture_metadata()).expect("fixture parses");
         assert_eq!(
             t.encode("<|channel>thought\n<channel|>The capital of France is"),
             vec![100, 45518, 107, 101, 818, 5279, 529, 7001, 563],
