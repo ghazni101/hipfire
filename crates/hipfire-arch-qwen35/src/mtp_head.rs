@@ -69,7 +69,7 @@ use hipfire_runtime::llama::{
     rotate_x_mq_for, weight_gemv, EmbeddingFormat, WeightTensor,
 };
 use rdna_compute::{DType, Gpu, GpuTensor};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 // ─── Config ──────────────────────────────────────────────────────────────
 
@@ -811,6 +811,28 @@ pub fn load_mtp_head_bundled(
     };
     let head = load_mtp_head_at_offset(path, gpu, max_seq, mtp_offset)?;
     Ok(Some(head))
+}
+
+/// Candidate `.mtp` sidecar paths for a trunk weight file, most specific
+/// first.
+///
+/// `Path::with_extension("mtp")` only replaces the last extension, so
+/// `qwen3.5-4b.mq4v2.hfq` becomes `qwen3.5-4b.mq4v2.mtp`. Product extracts
+/// sit next to the trunk as `qwen3.5-4b.mtp`. Both are probed, plus the
+/// no-`.hfq`/no-quant sibling (`qwen3.5-4b.mq4` → `qwen3.5-4b.mtp`).
+///
+/// The list itself lives in [`hipfire_runtime::sidecar`], shared with the
+/// `.vl` probe and the CLI's capability advertisement so the three cannot
+/// drift apart.
+pub fn mtp_sidecar_candidates(trunk: &Path) -> Vec<PathBuf> {
+    hipfire_runtime::sidecar::sidecar_candidates(trunk, "mtp")
+}
+
+/// First candidate that exists on disk, if any.
+pub fn find_mtp_sidecar(trunk: &Path) -> Option<PathBuf> {
+    mtp_sidecar_candidates(trunk)
+        .into_iter()
+        .find(|p| p.exists())
 }
 
 // ─── Loader ──────────────────────────────────────────────────────────────
@@ -2638,4 +2660,53 @@ pub fn mtp_head_forward_block_batched(
     )?;
 
     Ok(())
+}
+
+#[cfg(test)]
+mod sidecar_probe_tests {
+    use super::*;
+    use std::path::Path;
+
+    #[test]
+    fn mq4v2_hfq_also_probes_stem_mtp() {
+        let c = mtp_sidecar_candidates(Path::new("/models/qwen3.5-4b.mq4v2.hfq"));
+        assert!(
+            c.iter().any(|p| p.ends_with("qwen3.5-4b.mq4v2.mtp")),
+            "{c:?}"
+        );
+        assert!(
+            c.iter().any(|p| p.ends_with("qwen3.5-4b.mtp")),
+            "{c:?}"
+        );
+    }
+
+    #[test]
+    fn mq4_probes_stem_mtp() {
+        let c = mtp_sidecar_candidates(Path::new("/models/qwen3.5-4b.mq4"));
+        assert!(
+            c.iter().any(|p| p.ends_with("qwen3.5-4b.mtp")),
+            "{c:?}"
+        );
+    }
+
+    #[test]
+    fn find_mtp_sidecar_uses_stem_when_last_extension_missing() {
+        let dir = std::env::temp_dir().join(format!(
+            "hipfire-mtp-probe-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let trunk = dir.join("qwen3.5-4b.mq4v2.hfq");
+        let stem = dir.join("qwen3.5-4b.mtp");
+        std::fs::write(&trunk, b"trunk").expect("trunk");
+        std::fs::write(&stem, b"mtp").expect("stem sidecar");
+        let found = find_mtp_sidecar(&trunk).expect("stem sidecar exists");
+        assert_eq!(found, stem);
+        assert!(
+            find_mtp_sidecar(&dir.join("missing.mq4v2.hfq")).is_none(),
+            "absent sidecars must miss"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }

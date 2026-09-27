@@ -8,7 +8,7 @@
 - Compact runtime snapshots: `hipfire_runtime::config::RuntimeConfig` and
   `rdna_compute::feature_flags::FeatureFlags`
 
-**Last checked:** 2026-07-21.
+**Last checked:** 2026-09-05.
 
 Persistent stores under `~/.hipfire/`:
 
@@ -561,7 +561,7 @@ runtime PFlash module — not restated here.
 
 | Key | Default | Range |
 |---|---|---|
-| `host` | `"0.0.0.0"` | non-empty hostname/IP, no whitespace, ≤255 |
+| `host` | `"127.0.0.1"` | non-empty hostname/IP, no whitespace, ≤255. Loopback by default: the serve surface is unauthenticated, so binding a LAN address is an explicit operator choice. |
 | `port` | `11435` | int 1–65535 |
 | `idle_timeout` | `300` | int 0–86400 seconds (`0` = never unload) |
 | `default_model` | `"qwen3.5:9b"` | non-empty tag/path string |
@@ -569,6 +569,14 @@ runtime PFlash module — not restated here.
 | `max_request_bytes` | `67108864` (64 MiB) | int 4096–4GiB |
 | `serve_max_queue` | `64` | int 0–100000 (`0` = uncapped depth) |
 | `serve_queue_timeout_ms` | `30000` | int 0–3600000 (`0` = no wait timeout) |
+| `serve.max_queue_bytes` | `268435456` | int 1–1TiB (multi-slot waiting-room byte cap) |
+| `serve.max_batch_tokens` | `4096` | int 1–1048576 (global trunk-row budget) |
+| `serve.prefill_min_tokens` | `1` | int 1–1048576 (prefill quantum) |
+| `serve.prefix_cache` | `false` | bool — experimental; off until route admission |
+| `serve.prefix_cache_max_bytes` | `0` | int 0–1TiB (0 = no retained cache) |
+| `serve.structured_jump_forward` | `false` | bool — experimental |
+| `serve.stream_buffer_bytes` | `16777216` (16 MiB) | int 1–1GiB (per-request bounded pending-output bytes; a stalled consumer is stopped before this fills) |
+| `serve.stream_stall_timeout_ms` | `30000` | int 0–3600000 (stalled-consumer deadline; the request is aborted after it) |
 | `experimental_budget_alert` | `false` | bool |
 | `serve.multi_slot` | `false` | Serve concurrent requests on the multi-slot engine instead of one at a time. |
 | `serve.multi_slot_slots` | `4` | int 1–64 concurrent slots. |

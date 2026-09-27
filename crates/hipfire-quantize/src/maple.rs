@@ -46,11 +46,13 @@ pub(crate) enum MapleTensorPolicy {
 /// let a RAM decision silently change output quality.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum MapleHeadQuant {
-    /// Carry the head verbatim as BF16 (qt=16). The default: existing behaviour.
-    #[default]
+    /// Carry the head verbatim as BF16 (qt=16). NOT the default: q8 measures
+    /// identical mean KL and ~23% faster decode, but stays selectable for
+    /// reproducing pre-e8fd55750 artifacts.
     Bf16,
     /// Q8_0 / Q8F16 (qt=3), 34 B per 32 weights = 1.0625 bpw. 331 MB.
-    /// NOT FWHT-rotated — `dtype_rotation_plan(Q8_0) == None`.
+    /// NOT FWHT-rotated — `dtype_rotation_plan(Q8_0) == None`. The default.
+    #[default]
     Q8,
     /// MQ4-G256-Lloyd (qt=30), 160 B per 256 weights = 5.0 bpw. 195 MB.
     /// **FWHT-rotated**: the weights are encoded against FWHT-256-rotated

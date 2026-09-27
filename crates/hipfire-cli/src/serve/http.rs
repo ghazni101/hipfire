@@ -13,7 +13,7 @@ use crate::serve::complete::{
     openai_stream_delta_for_event, openai_stream_terminal_chunks, Completion,
 };
 use crate::serve::{is_batch_eligible_request, ServeShared};
-use crate::serve::{AdmissionError, AdmissionGuard};
+use crate::serve::{AdmissionError, AdmissionErrorKind, AdmissionGuard};
 use crate::{list_local_models, unix_timestamp};
 use anyhow::{bail, Context, Result};
 use bytes::Bytes;
@@ -29,10 +29,11 @@ use std::{
     io,
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
         Arc, Mutex,
     },
     task::{Context as TaskContext, Poll},
+    time::{Duration, Instant},
 };
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream};
@@ -75,8 +76,7 @@ fn json_response_result(
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "application/json")
-        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-        .body(boxed_full(bytes))
+                .body(boxed_full(bytes))
         .map_err(|err| format!("failed to build HTTP response: {err}"))
 }
 
@@ -86,8 +86,7 @@ fn static_server_error() -> Response<BoxBody> {
     Response::builder()
         .status(500)
         .header(header::CONTENT_TYPE, "application/json")
-        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-        .body(boxed_full(
+                .body(boxed_full(
             br#"{"error":{"message":"internal server error","type":"server_error"}}"#.to_vec(),
         ))
         // Static status, headers, and body: the builder cannot fail on these
@@ -111,7 +110,16 @@ pub(crate) fn openai_error(message: &str, status: u16) -> Response<BoxBody> {
 }
 
 pub(crate) fn admission_error_response(error: &AdmissionError) -> Response<BoxBody> {
-    let mut resp = openai_error(&error.message, 503);
+    // Spec §5.3: HTTP 429 for bounded-queue rejection (queue full or byte
+    // budget exceeded, queue timeout); HTTP 503 for unavailable/poisoned
+    // backend or cancellation.
+    let status = match error.kind() {
+        crate::serve::AdmissionErrorKind::QueueFull
+        | crate::serve::AdmissionErrorKind::QueueTimeout => 429,
+        crate::serve::AdmissionErrorKind::Cancelled
+        | crate::serve::AdmissionErrorKind::Unavailable => 503,
+    };
+    let mut resp = openai_error(&error.message, status);
     if let Ok(retry_after) = header::HeaderValue::from_str(&error.retry_after_seconds.to_string()) {
         resp.headers_mut().insert(header::RETRY_AFTER, retry_after);
     }
@@ -305,6 +313,10 @@ pub(crate) struct ChannelBody {
     tracker: FlushAcks,
     cancelled: Arc<AtomicBool>,
     failed: bool,
+    /// Shared pending-byte counter with the producer's backpressure guard;
+    /// decremented as chunks leave the channel. `None` for bodies without a
+    /// byte-bounded producer.
+    pending_bytes: Option<Arc<AtomicU64>>,
 }
 
 impl ChannelBody {
@@ -318,6 +330,25 @@ impl ChannelBody {
             tracker,
             cancelled,
             failed: false,
+            pending_bytes: None,
+        }
+    }
+
+    /// Body wired to the producer's pending-byte counter (spec §5.4): the
+    /// backpressure guard can only enforce its byte bound if consumption is
+    /// visible to it.
+    pub(crate) fn with_pending(
+        rx: tokio::sync::mpsc::Receiver<ResponseChunk>,
+        tracker: FlushAcks,
+        cancelled: Arc<AtomicBool>,
+        pending_bytes: Arc<AtomicU64>,
+    ) -> Self {
+        Self {
+            rx,
+            tracker,
+            cancelled,
+            failed: false,
+            pending_bytes: Some(pending_bytes),
         }
     }
 }
@@ -345,6 +376,18 @@ impl hyper::body::Body for ChannelBody {
 
         match Pin::new(&mut self.rx).poll_recv(cx) {
             Poll::Ready(Some(chunk)) => {
+                // The chunk left the bounded buffer: release its bytes from
+                // the producer's pending counter so backpressure can lift.
+                // Saturate at zero: accounting drift must degrade to "no
+                // bound", never wrap into a permanent false stall.
+                if let Some(pending) = &self.pending_bytes {
+                    let bytes = chunk.bytes.len() as u64;
+                    let _ = pending.fetch_update(
+                        Ordering::Relaxed,
+                        Ordering::Relaxed,
+                        |v| Some(v.saturating_sub(bytes)),
+                    );
+                }
                 if chunk.fail {
                     self.failed = true;
                     if let Some(ack) = chunk.ack {
@@ -435,7 +478,21 @@ pub(crate) async fn serve_listener_until(
         tokio::select! {
             _ = shutdown.cancelled() => return Ok(()),
             accepted = listener.accept() => {
-                let (stream, _) = accepted?;
+                // A transient accept() error (EMFILE/ENFILE under a
+                // connection flood, transient fd exhaustion) must NOT exit
+                // the loop — the process would stay alive but stop accepting
+                // connections forever. Log and keep accepting; only the
+                // shutdown token ends the listener.
+                let stream = match accepted {
+                    Ok((stream, _)) => stream,
+                    Err(err) => {
+                        eprintln!("[hipfire] accept error (listener stays up): {err:#}");
+                        // Brief yield so a hard fd-exhaustion spin does not
+                        // peg a core while the condition persists.
+                        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                        continue;
+                    }
+                };
                 let shared = Arc::clone(&shared);
                 tokio::spawn(async move {
                     // One tracker per connection so pipelined responses share FIFO
@@ -487,8 +544,10 @@ async fn handle_request(
                 "model": meta.current_model,
                 "loading_model": meta.loading_model,
                 "pid": std::process::id(),
-                "token": meta.instance_token,
                 "native": true,
+                // Route capability advertisement comes from the same resolved
+                // config the daemon slot engine reads.
+                "capabilities": shared.capabilities,
             });
             json_response(body, 200)
         }
@@ -502,6 +561,10 @@ async fn handle_request(
                 "retries_attempted": meta.retries_attempted,
                 "retries_succeeded": meta.retries_succeeded,
                 "recent_tok_s": meta.recent_tok_s,
+                "mode": shared.capabilities["mode"],
+                "multi_slot": shared.capabilities["multi_slot"],
+                "slots": shared.capabilities["multi_slot_slots"],
+                "prefix_cache": shared.capabilities["prefix_cache"],
             });
             json_response(body, 200)
         }
@@ -522,8 +585,7 @@ async fn handle_request(
                     header::CONTENT_TYPE,
                     "text/plain; version=0.0.4; charset=utf-8",
                 )
-                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                .body(boxed_full(body.into_bytes()))
+                                .body(boxed_full(body.into_bytes()))
                 .unwrap();
             resp
         }
@@ -535,27 +597,30 @@ async fn handle_request(
             };
             let body = serde_json::json!({
                 "object": "list",
-                "data": local.into_iter().map(|model| serde_json::json!({
-                    "id": model.registry_tag.unwrap_or(model.name),
-                    "object": "model",
-                    "owned_by": "hipfire",
-                })).collect::<Vec<_>>()
+                "data": local.into_iter().map(|model| {
+                    // Per-model capability projection: the route-level
+                    // multi-slot/structured-output facts plus sidecar
+                    // probes on the model file (MTP draft, vision tower).
+                    // Extra fields are ignored by OpenAI-compatible
+                    // clients; hipfire clients use them for discovery.
+                    let caps = crate::serve::model_capabilities(
+                        &shared.capabilities,
+                        &model.path,
+                    );
+                    serde_json::json!({
+                        "id": model.registry_tag.unwrap_or(model.name),
+                        "object": "model",
+                        "owned_by": "hipfire",
+                        "capabilities": caps,
+                    })
+                }).collect::<Vec<_>>()
             });
             json_response(body, 200)
         }
-        (Method::OPTIONS, _) => {
-            let mut resp = Response::builder()
-                .status(204)
-                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                .header(
-                    header::ACCESS_CONTROL_ALLOW_HEADERS,
-                    "Content-Type, Authorization",
-                )
-                .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, OPTIONS")
-                .body(boxed_empty())
-                .unwrap();
-            resp
-        }
+        (Method::OPTIONS, _) => Response::builder()
+            .status(403)
+            .body(boxed_empty())
+            .unwrap(),
         (Method::POST, "/v1/chat/completions") => {
             let max_bytes = shared.max_request_bytes;
             if req
@@ -594,22 +659,37 @@ async fn handle_request(
                     .map(|s| s.to_owned());
                 (eligible, model)
             };
-
             let mut cancel_guard = CancelOnDrop::new();
             let cancel = cancel_guard.token();
             let cancelled = cancel_guard.cancelled();
 
+            // Canonical pending-input bytes: the serialized JSON body size
+            // (spec §5.3). Charged to the aggregate queue byte budget while
+            // the request waits and released exactly once on guard drop.
+            let request_bytes = serde_json::to_vec(&body_val)
+                .map(|v| v.len() as u64)
+                .unwrap_or(0);
+
             let guard = if is_eligible {
                 match shared
                     .admission
-                    .acquire_for_async(true, model_for_lease.as_deref(), cancel.clone())
+                    .acquire_for_async_with_bytes(
+                        true,
+                        model_for_lease.as_deref(),
+                        request_bytes,
+                        cancel.clone(),
+                    )
                     .await
                 {
                     Ok(g) => g,
                     Err(e) => return admission_error_response(&e),
                 }
             } else {
-                match shared.admission.acquire_async(cancel.clone()).await {
+                match shared
+                    .admission
+                    .acquire_for_async_with_bytes(false, None, request_bytes, cancel.clone())
+                    .await
+                {
                     Ok(g) => g,
                     Err(e) => return admission_error_response(&e),
                 }
@@ -776,9 +856,15 @@ async fn handle_images_generations(
         .map(str::to_owned);
 
     // Serialize against chat traffic and cap queue depth the same way the
-    // chat path does; the daemon processes messages sequentially.
-    let guard = shared.admission.acquire().map_err(|e| e.to_string())?;
-    let _guard = guard;
+    // chat path does; the daemon processes messages sequentially. This is the
+    // ASYNC admission: the blocking condvar acquire would park the tokio
+    // reactor for up to the whole queue timeout, stalling every other request
+    // on the connection pool while one image waits.
+    let _guard = shared
+        .admission
+        .acquire_for_async_with_bytes(false, None, 0, CancellationToken::new())
+        .await
+        .map_err(|e| e.to_string())?;
 
     let (engine, loaded_model) = {
         let runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
@@ -1068,6 +1154,214 @@ fn images_error_status(message: &str) -> u16 {
 // Streaming / Non-streaming handlers
 // ---------------------------------------------------------------------------
 
+// ---------------------------------------------------------------------------
+// Stream backpressure — slow/stall consumer handling (spec §5.4/S4)
+// ---------------------------------------------------------------------------
+
+/// Error returned when a stalled stream consumer is aborted (spec §5.4).
+/// The committed state is retained; only the stalled forwarder stops.
+#[derive(Debug)]
+pub(crate) struct StreamStallError;
+
+impl std::fmt::Display for StreamStallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "stream consumer stalled beyond byte bound and timeout")
+    }
+}
+
+impl std::error::Error for StreamStallError {}
+
+/// Guard that enforces per-request stream backpressure (spec §5.4/S4).
+///
+/// Wraps the bounded `mpsc(32)` SSE channel sender. Tracks total bytes
+/// forwarded. When the consumer stalls and `stream_buffer_bytes` of pending
+/// (unconsumed) bytes accumulate, the guard stops producing. If the stall
+/// persists past `stream_stall_timeout`, the forwarder aborts with a typed
+/// terminal error — committed state is retained, only the stalled forwarder
+/// stops.
+///
+/// **Seam:** `serve_engine` (Wave 4) consumes this by checking `is_stalled()`
+/// before scheduling the next decode step for this request. When stalled,
+/// the scheduler skips the request until the consumer drains or the deadline
+/// fires. This implementation provides the guard logic in the HTTP layer;
+/// the engine-side scheduling skip is wired in Wave 3/4.
+pub(crate) struct StreamBackpressure {
+    sender: tokio::sync::mpsc::Sender<ResponseChunk>,
+    /// Real pending (unconsumed) bytes in the channel. Shared with the
+    /// body's poll loop, which subtracts each chunk's bytes as it takes them
+    /// from the channel — without this feedback the byte bound is dead
+    /// arithmetic (spec §5.4: "Stop scheduling that request before its
+    /// bounded event buffer fills").
+    pending_bytes: Arc<AtomicU64>,
+    /// Total bytes forwarded so far.
+    forwarded_bytes: u64,
+    /// Per-request pending-event byte budget (spec §5.4).
+    buffer_bytes: u64,
+    /// Maximum stalled-consumer interval (spec §5.4).
+    stall_timeout: Duration,
+    /// When the current stall started; `None` when not stalled.
+    stall_started: Option<Instant>,
+    /// Whether the consumer is currently stalled (pending bytes ≥ buffer).
+    stalled: bool,
+    /// Client-disconnect flag: a stalled send loop must wake on cancel,
+    /// not sleep to the deadline while the consumer is already gone.
+    cancelled: Option<Arc<AtomicBool>>,
+}
+
+/// How long a Full-channel retry sleeps before re-checking pending bytes.
+const STALL_RETRY_INTERVAL: Duration = Duration::from_millis(10);
+
+impl StreamBackpressure {
+    pub(crate) fn new(
+        sender: tokio::sync::mpsc::Sender<ResponseChunk>,
+        pending_bytes: Arc<AtomicU64>,
+        buffer_bytes: u64,
+        stall_timeout: Duration,
+    ) -> Self {
+        Self {
+            sender,
+            pending_bytes,
+            forwarded_bytes: 0,
+            buffer_bytes,
+            stall_timeout,
+            stall_started: None,
+            stalled: false,
+            cancelled: None,
+        }
+    }
+
+    /// Attach the request's cancellation flag so a stalled send loop
+    /// wakes on client disconnect instead of sleeping to the deadline.
+    pub(crate) fn with_cancelled(mut self, cancelled: Arc<AtomicBool>) -> Self {
+        self.cancelled = Some(cancelled);
+        self
+    }
+
+    /// Whether the consumer is currently stalled (spec §5.4). The engine
+    /// (Wave 4) checks this before scheduling the next decode step.
+    pub(crate) fn is_stalled(&self) -> bool {
+        self.stalled
+    }
+
+    /// Total bytes forwarded so far.
+    pub(crate) fn forwarded_bytes(&self) -> u64 {
+        self.forwarded_bytes
+    }
+
+    /// Send a chunk, enforcing the byte bound and stall timeout (spec §5.4).
+    ///
+    /// Behavior when the consumer is slow:
+    /// - While pending bytes stay under the bound, chunks flow (brief waits
+    ///   on full channel slots are ordinary backpressure).
+    /// - Once the bound is exceeded the producer stalls: it retries every
+    ///   [`STALL_RETRY_INTERVAL`] and aborts with [`StreamStallError`] only
+    ///   when `stall_timeout` has elapsed with no progress. Committed state
+    ///   is retained; only the forwarder stops.
+    /// - A successful send clears the stall (the consumer drained).
+    pub(crate) fn send(&mut self, chunk: ResponseChunk) -> Result<(), StreamStallError> {
+        let chunk_bytes = chunk.bytes.len() as u64;
+        let deadline = Instant::now() + self.stall_timeout;
+        // `try_send` hands the chunk back on a full channel; carry it
+        // through the retry loop in an Option.
+        let mut chunk = Some(chunk);
+
+        loop {
+            let pending = self.pending_bytes.load(Ordering::Relaxed);
+            if pending >= self.buffer_bytes {
+                // Byte bound reached: stop producing and watch the clock.
+                self.stalled = true;
+                if self.stall_started.is_none() {
+                    self.stall_started = Some(Instant::now());
+                }
+                // A cancelled request's consumer is gone: abort now rather
+                // than sleeping to the deadline.
+                if self.cancelled.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) {
+                    return Err(StreamStallError);
+                }
+                if Instant::now() >= deadline {
+                    return Err(StreamStallError);
+                }
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                std::thread::sleep(STALL_RETRY_INTERVAL.min(remaining));
+                continue;
+            }
+
+            // Charge the bytes BEFORE the chunk enters the channel: the
+            // consumer dequeues-then-subtracts, so a chunk whose bytes were
+            // not yet charged could be dequeued in between (saturating_sub
+            // clamps to 0) and the subsequent add would leak phantom bytes
+            // FOREVER — a permanently rising counter that eventually trips
+            // the stall bound on a healthy stream. Over-charging (charge
+            // first, refund on Full) only ever delays production briefly.
+            self.pending_bytes.fetch_add(chunk_bytes, Ordering::Relaxed);
+            match self.sender.try_send(chunk.take().expect("chunk present at loop top")) {
+                Ok(()) => {
+                    self.forwarded_bytes = self.forwarded_bytes.saturating_add(chunk_bytes);
+                    // Progress: leave the stall (the consumer drained).
+                    self.stalled = false;
+                    self.stall_started = None;
+                    return Ok(());
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Full(returned)) => {
+                    // Channel slots full but the byte bound is not hit yet:
+                    // ordinary backpressure. Wait for a slot within the same
+                    // stall deadline — the old code blocked unboundedly here,
+                    // which let a dead-but-connected consumer hold the
+                    // forwarder forever. Refund the pre-charged bytes: the
+                    // retry re-charges them.
+                    self.pending_bytes.fetch_sub(chunk_bytes, Ordering::Relaxed);
+                    self.stalled = true;
+                    if self.stall_started.is_none() {
+                        self.stall_started = Some(Instant::now());
+                    }
+                    if self.cancelled.as_ref().is_some_and(|c| c.load(Ordering::SeqCst)) {
+                        drop(returned);
+                        return Err(StreamStallError);
+                    }
+                    if Instant::now() >= deadline {
+                        drop(returned);
+                        return Err(StreamStallError);
+                    }
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    std::thread::sleep(STALL_RETRY_INTERVAL.min(remaining));
+                    chunk = Some(returned);
+                }
+                Err(tokio::sync::mpsc::error::TrySendError::Closed(_)) => {
+                    // Receiver dropped: consumer is gone. Refund the
+                    // pre-charged bytes for accounting hygiene.
+                    self.pending_bytes.fetch_sub(chunk_bytes, Ordering::Relaxed);
+                    self.stalled = true;
+                    return Err(StreamStallError);
+                }
+            }
+        }
+    }
+
+    /// Reset stall state after the consumer drains (spec §5.4: "retain the
+    /// committed state"). Called when the channel has capacity again.
+    pub(crate) fn clear_stall(&mut self) {
+        self.stalled = false;
+        self.stall_started = None;
+    }
+
+    /// Check if the stall timeout has elapsed without sending.
+    pub(crate) fn check_stall_timeout(&self) -> bool {
+        if let Some(started) = self.stall_started {
+            started.elapsed() >= self.stall_timeout
+        } else {
+            false
+        }
+    }
+}
+
+fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    payload
+        .downcast_ref::<&str>()
+        .map(|s| (*s).to_owned())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "non-string panic payload".to_owned())
+}
+
 async fn handle_streaming(
     shared: Arc<ServeShared>,
     body: serde_json::Value,
@@ -1089,40 +1383,89 @@ async fn handle_streaming(
         .unwrap_or("unknown")
         .to_owned();
 
-    let first = serde_json::json!({
-        "id": id,
-        "object": "chat.completion.chunk",
-        "created": created,
-        "model": model,
-        "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": null }],
-    });
-    let _ = tx.try_send(ResponseChunk::plain(sse_data(&first)));
+    // Shared pending-byte counter: the forwarder adds each chunk's bytes,
+    // the body's poll loop subtracts them as the consumer drains (spec §5.4
+    // byte bound — real bytes, not an estimate).
+    let pending_bytes = Arc::new(AtomicU64::new(0));
+    let bp_pending = Arc::clone(&pending_bytes);
+
 
     let tx_clone = tx.clone();
     let shared_clone = Arc::clone(&shared);
     let id_clone = id.clone();
     let model_clone = model.clone();
     let body_cancelled = Arc::clone(&cancelled);
+    let stream_buffer_bytes = shared.stream_buffer_bytes;
+    let stream_stall_timeout = shared.stream_stall_timeout;
     tokio::task::spawn_blocking(move || {
-        let result = complete_request_cancellable(
-            &shared_clone,
-            &body,
-            guard,
-            Some((id_clone.clone(), created)),
-            &cancelled,
-            |event| forward_sse_stream_event(&tx_clone, &id_clone, created, &model_clone, event),
-            |completion| deliver_sse_terminal_ack(&tx_clone, completion, include_usage),
-        );
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let backpressure = std::cell::RefCell::new(
+                StreamBackpressure::new(
+                    tx_clone.clone(),
+                    bp_pending,
+                    stream_buffer_bytes,
+                    stream_stall_timeout,
+                )
+                .with_cancelled(Arc::clone(&cancelled)),
+            );
+            let first = serde_json::json!({
+                "id": id_clone,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model_clone,
+                "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": null }],
+            });
+            let _ = backpressure.borrow_mut().send(ResponseChunk::plain(sse_data(&first)));
+            complete_request_cancellable(
+                &shared_clone,
+                &body,
+                guard,
+                Some((id_clone.clone(), created)),
+                &cancelled,
+                |event| {
+                    let mut bp = backpressure.borrow_mut();
+                    if bp.is_stalled() && bp.check_stall_timeout() {
+                        return Err(hipfire_client::ClientError::Cancelled);
+                    }
+                    if let Some(delta) = openai_stream_delta_for_event(event) {
+                        let chunk = serde_json::json!({
+                            "id": id_clone,
+                            "object": "chat.completion.chunk",
+                            "created": created,
+                            "model": model_clone,
+                            "choices": [{ "index": 0, "delta": delta, "finish_reason": null }],
+                        });
+                        bp.send(ResponseChunk::plain(sse_data(&chunk)))
+                            .map_err(|_| hipfire_client::ClientError::Cancelled)
+                    } else {
+                        Ok(())
+                    }
+                },
+                |completion| {
+                    let mut bp = backpressure.borrow_mut();
+                    let mut bytes = Vec::new();
+                    for chunk in openai_stream_terminal_chunks(completion, include_usage) {
+                        bytes.extend_from_slice(&sse_data(&chunk));
+                    }
+                    bytes.extend_from_slice(b"data: [DONE]\n\n");
+                    bp.send(ResponseChunk::plain(bytes))
+                        .map_err(|_| hipfire_client::ClientError::Cancelled)
+                },
+            )
+        }));
+        let result = match outcome {
+            Ok(result) => result,
+            Err(payload) => Err(anyhow::anyhow!("streaming worker panicked: {}", panic_message(payload))),
+        };
         finish_sse_stream(tx_clone, result);
     });
 
-    let body = ChannelBody::new(rx, acks, body_cancelled);
+    let body = ChannelBody::with_pending(rx, acks, body_cancelled, pending_bytes);
     let mut resp = Response::builder()
         .status(200)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
-        .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-        .body(boxed(body))
+                .body(boxed(body))
         .unwrap();
     // Ensure chunked; hyper sets it automatically for streaming bodies.
     resp
@@ -1145,6 +1488,7 @@ async fn handle_nonstreaming(
     let body_for_worker = body;
     let staged_tx_clone = Arc::clone(&staged_tx);
     let staged_tx_for_worker = Arc::clone(&staged_tx);
+    let stall_timeout = shared.stream_stall_timeout;
     tokio::task::spawn_blocking(move || {
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             let staged_for_terminal = Arc::clone(&staged_tx_for_worker);
@@ -1171,9 +1515,24 @@ async fn handle_nonstreaming(
                         return Err(hipfire_client::ClientError::Cancelled);
                     }
                 }
-                match ack_rx.recv() {
+                // The ack fires only when the CLIENT actually reads the
+                // body (socket flush) or the connection tears down. A
+                // zero-window client that never reads would otherwise pin
+                // this thread AND its admission permit forever — bound
+                // the wait by the stall deadline (the same contract the
+                // streaming terminal has had since its fix; spec §5.4/S4
+                // "abort on configured deadline").
+                match ack_rx.recv_timeout(stall_timeout) {
                     Ok(Ok(())) => Ok(()),
-                    Ok(Err(_)) | Err(_) => Err(hipfire_client::ClientError::Cancelled),
+                    Ok(Err(_)) | Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                        Err(hipfire_client::ClientError::Cancelled)
+                    }
+                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                        eprintln!(
+                            "[serve] nonstream terminal ack deadline exceeded — releasing admission permit"
+                        );
+                        Err(hipfire_client::ClientError::Cancelled)
+                    }
                 }
             };
             complete_request_cancellable(
@@ -1224,12 +1583,25 @@ async fn handle_nonstreaming(
             let resp = Response::builder()
                 .status(200)
                 .header(header::CONTENT_TYPE, "application/json")
-                .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
-                .body(boxed(body))
+                                .body(boxed(body))
                 .unwrap();
             resp
         }
-        Ok(Err(message)) => openai_error(&message, request_error_status(&message)),
+        Ok(Err(message)) => {
+            let status = request_error_status(&message);
+            let mut resp = openai_error(&message, status);
+            // Engine-side overload (queue timeout / capacity-exhausted) maps
+            // to 429 through request_error_status, but unlike the CLI
+            // admission guard's 429 it carried no Retry-After — scs_suite D3
+            // asserts every 429 has one. Emit the queue timeout as the hint.
+            if status == 429 {
+                let ra = shared.admission.retry_after_seconds();
+                if let Ok(v) = header::HeaderValue::from_str(&ra.to_string()) {
+                    resp.headers_mut().insert(header::RETRY_AFTER, v);
+                }
+            }
+            resp
+        }
         Err(_) => openai_error("generation worker disconnected", 500),
     }
 }
@@ -1239,9 +1611,50 @@ async fn handle_nonstreaming(
 // ---------------------------------------------------------------------------
 
 pub(crate) fn request_error_status(message: &str) -> u16 {
+    // Typed daemon errors carry their class in the leading bracketed prefix
+    // (`TypedDaemonError`'s Display: "[class retryable=… rolled_back=…
+    // attempt=…] message", optionally wrapped by a transport layer as
+    // "daemon error: […"). Classify by that FIRST — the daemon already
+    // classifies its validation refusals (seed, penalties, messages,
+    // top_k, capability caps) and overload rejections correctly, and the
+    // substring ladder below mis-mapped several of them to 500. Only
+    // untyped/local errors fall to the ladder.
+    // Gateway-side request validation carries an explicit class tag; check it
+    // FIRST so the wording never decides the status.
+    if message.contains(crate::serve::REQUEST_VALIDATION_TAG) {
+        return 400;
+    }
+    if let Some(class) = daemon_error_class(message) {
+        return match class {
+            // Capacity signals: bounded queue rejection / timeout /
+            // parked cancellation / page-demand rejection (spec §5.3 S3:
+            // 429, 503 reserved for a poisoned backend).
+            "overload" | "cancel" => 429,
+            // Client-fixable request errors → 400 (OpenAI uses 400 for
+            // context_length_exceeded too).
+            "validation" | "malformed" | "unsupported" | "context_length" => 400,
+            // Retryable backend condition.
+            "transient" => 503,
+            // internal / transport / adaptive_poison /
+            // deterministic_mismatch / anything unknown stays a fault.
+            _ => 500,
+        };
+    }
     let lower = message.to_ascii_lowercase();
     if lower.contains("model not found") {
         404
+    } else if lower.contains("serve queue full")
+        || lower.contains("serve queue timeout")
+        || lower.contains("queue full:")
+        || lower.contains("queue timeout:")
+        || lower.contains("cancelled while queued")
+        || lower.contains("overload")
+        || lower.contains("page demand exceeds pool")
+    {
+        // Bounded-queue rejection / queue timeout / parked cancellation are
+        // capacity signals, not faults (spec §5.3 S3: 429 for bounded queue
+        // rejection; 503 stays reserved for a poisoned/unavailable backend).
+        429
     } else if lower.contains("kv budget")
         || lower.contains("max_tokens")
         || lower.contains("invalid")
@@ -1249,10 +1662,49 @@ pub(crate) fn request_error_status(message: &str) -> u16 {
         || lower.contains("endpoint adapter")
         || lower.contains("lossy")
         || lower.contains("malformed canonical tool call")
+        || lower.contains("must be a")
+        || lower.contains("must be an")
+        || lower.contains("must be within")
+        || lower.contains("must contain at least one user message")
+        || lower.contains("must be non-negative")
+        || lower.contains("outside the supported subset")
+        || lower.contains("unsupported json schema type")
+        || lower.contains("unsatisfiable")
+        || lower.contains("contradictory schema")
+        || lower.contains("exceeds the maximum")
+        || lower.contains("exceeding serve.multi_slot_ctx")
+        || lower.contains("not supported on this serve route")
+        || lower.contains("outside the strict subset")
+        || lower.contains("does not allow this assertion")
+        || lower.contains("does not support this request")
     {
+        // Schema/refusal rejections are request errors: the client can fix
+        // them by changing the request (400), not server faults (500).
         400
     } else {
         500
+    }
+}
+
+/// Extract the daemon error class from a `TypedDaemonError`-shaped message
+/// (`"[class retryable=… ] msg"`, optionally prefixed `"daemon error: "`).
+/// `None` for local/untyped error strings.
+fn daemon_error_class(message: &str) -> Option<&str> {
+    let rest = message
+        .strip_prefix("daemon error: [")
+        .or_else(|| message.strip_prefix('['))?;
+    let end = rest.find(' ')?;
+    let class = &rest[..end];
+    // Guard against an arbitrary bracketed non-daemon string: the class
+    // vocabulary is closed (hipfire_client::error_class).
+    if class
+        .chars()
+        .all(|c| c.is_ascii_lowercase() || c == '_')
+        && !class.is_empty()
+    {
+        Some(class)
+    } else {
+        None
     }
 }
 
@@ -1330,35 +1782,71 @@ pub(crate) fn deliver_sse_terminal_ack(
 }
 
 /// Close an OpenAI SSE body after `complete_request_cancellable`.
-/// Success: terminal already delivered+acked at commit_ready — emit no post-commit bytes.
-/// Cancelled: no server_error/`[DONE]`. Post-terminal engine errors force an unclean
-/// reader failure rather than appending a success/error frame.
+/// Success already delivered its terminal chunk. A non-cancellation failure
+/// becomes an observable OpenAI-shaped error event followed by `[DONE]`.
 pub(crate) fn finish_sse_stream(
     sender: tokio::sync::mpsc::Sender<ResponseChunk>,
     result: Result<Completion>,
 ) {
-    match result {
-        Ok(_completion) => {
-            drop(sender);
-        }
-        Err(error) => {
-            let cancelled = error
-                .downcast_ref::<hipfire_client::ClientError>()
-                .is_some_and(|err| matches!(err, hipfire_client::ClientError::Cancelled));
-            if cancelled {
-                drop(sender);
-                return;
-            }
+    if let Err(error) = result {
+        let cancelled = error
+            .downcast_ref::<hipfire_client::ClientError>()
+            .is_some_and(|err| matches!(err, hipfire_client::ClientError::Cancelled));
+        if !cancelled {
             eprintln!("[hipfire] streaming completion failed: {error:#}");
-            let _ = sender.try_send(ResponseChunk::fail());
-            drop(sender);
+            let payload = serde_json::json!({
+                "error": {
+                    "message": format!("{error:#}"),
+                    "type": "server_error",
+                    "code": null
+                }
+            });
+            let mut bytes = sse_data(&payload);
+            bytes.extend_from_slice(b"data: [DONE]\n\n");
+            // try_send, not blocking_send: a stalled client at zero window
+            // leaves the channel full, and an unbounded blocking_send here
+            // would pin this spawn_blocking thread forever — repeated stalls
+            // exhaust the blocking pool and hang every request. The error
+            // frame is best-effort; a full channel means the client is gone.
+            let _ = sender.try_send(ResponseChunk::plain(bytes));
         }
     }
+    drop(sender);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Class-first error mapping: the typed daemon class drives the HTTP
+    /// status; several daemon validation refusals (negative seed, penalty
+    /// ranges, empty messages, top_k) carry no recognizable substring and
+    /// were mis-mapped to 500 by the old ladder-only logic.
+    #[test]
+    fn request_error_status_maps_typed_classes() {
+        let cases: &[(&str, u16)] = &[
+            // Typed daemon errors (TypedDaemonError Display, optionally
+            // wrapped by the transport layer).
+            ("daemon error: [validation retryable=false rolled_back=false attempt=3] seed must be non-negative, got -1", 400),
+            ("daemon error: [validation retryable=false rolled_back=false attempt=4] repeat_penalty must be within [1.0, 2.0]", 400),
+            ("daemon error: [validation retryable=false rolled_back=false attempt=5] messages must contain at least one user message", 400),
+            ("daemon error: [unsupported retryable=false rolled_back=false attempt=6] top_k must fit a non-negative 32-bit integer", 400),
+            ("daemon error: [overload retryable=false rolled_back=false attempt=7] multi_slot rejected: serve queue full: waiter cap", 429),
+            ("daemon error: [cancel retryable=false rolled_back=false attempt=8] cancelled while queued", 429),
+            ("daemon error: [internal retryable=false rolled_back=false attempt=9] engine fault", 500),
+            ("[transient retryable=true rolled_back=false attempt=10] hiccup", 503),
+            // Untyped/local errors keep the substring ladder.
+            ("model not found: nope", 404),
+            ("grammar constraint reached an unsatisfiable state", 400),
+            ("minItems (3) > maxItems (2) at $: contradictory schema", 400),
+            ("page demand exceeds pool: need 9 pages, 0 free after reclaim", 429),
+            ("generation worker panicked: boom", 500),
+        ];
+        for (msg, want) in cases {
+            assert_eq!(&request_error_status(msg), want, "message: {msg}");
+        }
+    }
+
     use hyper::body::Body;
     use std::future::poll_fn;
     use std::task::Waker;
@@ -1574,5 +2062,138 @@ mod tests {
         assert!(edits_form_to_body(vec![], vec![])
             .unwrap_err()
             .contains("required"));
+    }
+
+    // ---- Stream backpressure (spec §5.4/S4) ----
+
+    #[test]
+    fn stream_backpressure_sends_normally_under_buffer() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<ResponseChunk>(32);
+        let mut bp = StreamBackpressure::new(
+            tx,
+            Arc::new(AtomicU64::new(0)),
+            1024,
+            Duration::from_secs(30),
+        );
+        let chunk = ResponseChunk::plain(b"data: hello\n\n".to_vec());
+        assert!(bp.send(chunk).is_ok());
+        assert!(!bp.is_stalled());
+        assert_eq!(bp.forwarded_bytes(), 13);
+    }
+
+    #[test]
+    fn stream_backpressure_stalls_when_pending_bytes_exceed_bound() {
+        // Real pending-byte accounting (regression): the old estimate
+        // computed `forwarded/forwarded == 1` byte per pending slot, so the
+        // 16 MiB default bound could never trip and a stalled-but-connected
+        // consumer blocked the forwarder forever.
+        let (tx, rx) = tokio::sync::mpsc::channel::<ResponseChunk>(32);
+        let pending = Arc::new(AtomicU64::new(0));
+        let mut bp = StreamBackpressure::new(tx, Arc::clone(&pending), 10, Duration::from_millis(80));
+
+        // A 13-byte chunk against a 10-byte bound: this send is allowed
+        // (pending was 0 — a producer must always make progress on an empty
+        // buffer), but pending is now over the bound.
+        assert!(bp.send(ResponseChunk::plain(b"data: first\n\n".to_vec())).is_ok());
+        assert_eq!(pending.load(Ordering::Relaxed), 13);
+
+        // The next send stalls: bound exceeded, no drain within the window.
+        let result = bp.send(ResponseChunk::plain(b"data: second\n\n".to_vec()));
+        assert!(result.is_err(), "send should stall while pending exceeds the bound");
+        assert!(bp.is_stalled(), "should be marked stalled");
+        drop(rx);
+    }
+
+    #[test]
+    fn stream_backpressure_resumes_after_consumer_drains() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<ResponseChunk>(32);
+        let pending = Arc::new(AtomicU64::new(0));
+        let mut bp = StreamBackpressure::new(tx, Arc::clone(&pending), 10, Duration::from_millis(200));
+
+        assert!(bp.send(ResponseChunk::plain(b"data: first\n\n".to_vec())).is_ok());
+        assert!(bp.send(ResponseChunk::plain(b"data: 2nd\n\n".to_vec())).is_err());
+
+        // Consumer drains (the ChannelBody poll loop does this subtraction).
+        pending.store(0, Ordering::Relaxed);
+        assert!(
+            bp.send(ResponseChunk::plain(b"data: third\n\n".to_vec())).is_ok(),
+            "progress after drain must clear the stall"
+        );
+        assert!(!bp.is_stalled());
+        drop(rx);
+    }
+
+    #[test]
+    fn stream_backpressure_aborts_after_stall_timeout() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<ResponseChunk>(32);
+        let pending = Arc::new(AtomicU64::new(0));
+        let mut bp = StreamBackpressure::new(tx, Arc::clone(&pending), 10, Duration::from_millis(30));
+
+        // First chunk goes out (progress on an empty buffer is mandatory)
+        // and leaves pending over the 10-byte bound.
+        assert!(bp.send(ResponseChunk::plain(b"data: big\n\n".to_vec())).is_ok());
+
+        // The next send blocks through the whole stall window (retrying)
+        // and then aborts with the typed error.
+        let started = Instant::now();
+        let result = bp.send(ResponseChunk::plain(b"data: more\n\n".to_vec()));
+        assert!(result.is_err(), "send must abort once the deadline passes");
+        assert!(started.elapsed() >= Duration::from_millis(25), "the grace window must elapse before abort");
+        assert!(bp.check_stall_timeout(), "stall timeout should have elapsed");
+    }
+
+    #[test]
+    fn stream_backpressure_clear_stall_resets_state() {
+        let (tx, _rx) = tokio::sync::mpsc::channel::<ResponseChunk>(32);
+        let pending = Arc::new(AtomicU64::new(0));
+        let mut bp = StreamBackpressure::new(tx, Arc::clone(&pending), 10, Duration::from_millis(40));
+
+        // Over the bound: the second send stalls out after the window.
+        // "data: aaa\n\n" is 11 bytes > the 10-byte bound.
+        assert!(bp.send(ResponseChunk::plain(b"data: aaa\n\n".to_vec())).is_ok());
+        assert!(bp.send(ResponseChunk::plain(b"data: b\n\n".to_vec())).is_err());
+        assert!(bp.is_stalled());
+
+        // Clear the stall.
+        bp.clear_stall();
+        assert!(!bp.is_stalled());
+        assert!(!bp.check_stall_timeout());
+    }
+
+    #[test]
+    fn stream_backpressure_closed_channel_stalls() {
+        let (tx, rx) = tokio::sync::mpsc::channel::<ResponseChunk>(1);
+        drop(rx); // Close the channel immediately.
+        let mut bp = StreamBackpressure::new(
+            tx,
+            Arc::new(AtomicU64::new(0)),
+            1024,
+            Duration::from_secs(30),
+        );
+        let result = bp.send(ResponseChunk::plain(b"data: hi\n\n".to_vec()));
+        assert!(result.is_err(), "send to closed channel should stall");
+        assert!(bp.is_stalled());
+    }
+
+    #[test]
+    fn channel_body_poll_releases_pending_bytes() {
+        // The consumer side of the byte bound: chunks leaving the channel
+        // must subtract their bytes from the shared counter, or the bound
+        // would trip on stale accounting.
+        let acks = FlushAcks::new();
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let pending = Arc::new(AtomicU64::new(0));
+        let (tx, rx) = tokio::sync::mpsc::channel::<ResponseChunk>(4);
+        tx.try_send(ResponseChunk::plain(b"data: hello\n\n".to_vec())).unwrap();
+        // Simulate the producer's accounting.
+        pending.fetch_add(13, Ordering::Relaxed);
+
+        let mut body = ChannelBody::with_pending(rx, acks, cancelled, Arc::clone(&pending));
+        let mut cx = TaskContext::from_waker(std::task::Waker::noop());
+        assert!(matches!(
+            Pin::new(&mut body).poll_frame(&mut cx),
+            Poll::Ready(Some(Ok(_)))
+        ));
+        assert_eq!(pending.load(Ordering::Relaxed), 0, "consumed bytes must be released");
     }
 }

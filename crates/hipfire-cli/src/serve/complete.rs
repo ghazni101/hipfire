@@ -656,6 +656,10 @@ pub(crate) enum EndpointAdapterStatus {
 pub(crate) enum EndpointAdapterError {
     Unavailable { endpoint: &'static str },
     Lossy { endpoint: &'static str },
+    /// Tool list exceeds the grammar compiler's bounds — rejected before
+    /// admission so it is a typed 400, not a daemon-side panic.
+    TooManyTools { count: usize, max: usize },
+    ToolsTooLarge { bytes: usize, max: usize },
 }
 
 impl std::fmt::Display for EndpointAdapterError {
@@ -666,6 +670,12 @@ impl std::fmt::Display for EndpointAdapterError {
             }
             Self::Lossy { endpoint } => {
                 write!(f, "endpoint adapter lossy for tools on {endpoint}")
+            }
+            Self::TooManyTools { count, max } => {
+                write!(f, "too many tools: {count} exceeds the maximum of {max}")
+            }
+            Self::ToolsTooLarge { bytes, max } => {
+                write!(f, "tool definitions too large: {bytes} bytes exceeds the maximum of {max}")
             }
         }
     }
@@ -700,6 +710,28 @@ pub(crate) fn gate_chat_completions_tools(
         .is_some_and(|tools| !tools.is_empty());
     if !has_tools {
         return Ok(());
+    }
+    // Grammar-compiler bounds (saddle-core MAX_TOOL_SCHEMAS=256,
+    // MAX_SCHEMA_BYTES=64 KiB per schema): reject oversized tool lists
+    // BEFORE admission so they are typed 400s, not a daemon-side
+    // construction panic on the DFlash path.
+    if let Some(tools) = body.get("tools").and_then(serde_json::Value::as_array) {
+        if tools.len() > 256 {
+            return Err(EndpointAdapterError::TooManyTools {
+                count: tools.len(),
+                max: 256,
+            });
+        }
+        let total_bytes: usize = tools
+            .iter()
+            .map(|t| serde_json::to_string(t).map(|s| s.len()).unwrap_or(0))
+            .sum();
+        if total_bytes > 64 * 1024 * 4 {
+            return Err(EndpointAdapterError::ToolsTooLarge {
+                bytes: total_bytes,
+                max: 64 * 1024 * 4,
+            });
+        }
     }
     match endpoint_adapter_status(EndpointAdapterKind::OpenAiChatCompletions) {
         EndpointAdapterStatus::AvailableLossless => Ok(()),
@@ -1276,6 +1308,22 @@ pub(crate) enum RetryDecision {
     Fail,
 }
 
+/// True when `candidate` resolves to a file inside the configured model store.
+///
+/// `canonicalize` resolves symlinks on both sides, so a link dropped in the
+/// store that points elsewhere is refused too. A path that does not exist
+/// resolves to `false` — the refusal is then indistinguishable from "not
+/// found locally", which is what keeps this from being a filesystem oracle.
+fn model_path_in_local_store(paths: &Paths, candidate: &std::path::Path) -> bool {
+    let Ok(store) = paths.models.canonicalize() else {
+        return false;
+    };
+    let Ok(real) = candidate.canonicalize() else {
+        return false;
+    };
+    real.starts_with(store)
+}
+
 /// Single enforced retry-eligibility decision for the serve retry driver.
 ///
 /// Retry iff ALL hold: gate enabled; first attempt; no visible token/reasoning
@@ -1550,6 +1598,28 @@ pub(crate) struct RequestContract {
     pub conversation_messages: serde_json::Value,
     pub tool_choice_policy: ToolChoicePolicy,
     pub forwarded_tools: Option<serde_json::Value>,
+    /// Validated `response_format` (spec §7 G1). `None` when the request
+    /// carries no `response_format` or it is `json_object` (which the
+    /// non-slot path already handles via tool-call grammar). A `json_schema`
+    /// value is parsed, validated against the supported subset, and forwarded
+    /// to the daemon so the slot engine can apply pre-sampling grammar masks.
+    pub response_format: Option<ResponseFormat>,
+}
+
+/// Validated OpenAI `response_format` for structured output (spec §7 G1).
+///
+/// Only `json_schema` is supported. The `schema` field carries the JSON
+/// Schema object validated against the strict subset (primitive types,
+/// objects, arrays, enum/const). Unsupported assertion keywords are rejected
+/// here so no intermediate wire adapter drops the constraint silently.
+#[derive(Debug, Clone)]
+pub(crate) struct ResponseFormat {
+    /// The raw JSON Schema object (validated subset).
+    pub schema: serde_json::Value,
+    /// Optional name from `json_schema.name` (OpenAI field, not a JSON
+    /// Schema keyword). Forwarded for diagnostics; not semantically
+    /// significant for mask construction.
+    pub name: Option<String>,
 }
 
 /// Architectures that surface reasoning content in multi-turn message history
@@ -1580,13 +1650,105 @@ pub(crate) fn project_request_contract(
     resolved: &hipfire_config::ResolvedConfig,
     include_reasoning: bool,
 ) -> Result<RequestContract> {
-    let max_tokens = body
+    // Tag every refusal from this projection as a client-fixable request
+    // validation error: the HTTP layer keys off the tag, not the wording.
+    project_request_contract_inner(body, resolved, include_reasoning)
+        .map_err(|e| anyhow!("{}{e}", crate::serve::REQUEST_VALIDATION_TAG))
+}
+
+fn project_request_contract_inner(
+    body: &serde_json::Value,
+    resolved: &hipfire_config::ResolvedConfig,
+    include_reasoning: bool,
+) -> Result<RequestContract> {
+    // Strict typing: a PRESENT-but-malformed max_tokens (negative, float,
+    // string) must be a 400, never a silent fallback to the config default
+    // (the old `.and_then(as_u64).unwrap_or(default)` quietly re-typed it).
+    let max_tokens = match body
         .get("max_tokens")
         .or_else(|| body.get("max_completion_tokens"))
-        .and_then(serde_json::Value::as_u64)
-        .unwrap_or(config_u64(resolved, "generation.max_tokens")?);
+        .filter(|v| !v.is_null())
+    {
+        None => config_u64(resolved, "generation.max_tokens")?,
+        Some(v) => v.as_u64().ok_or_else(|| {
+            anyhow!("max_tokens must be an integer between 1 and 393216")
+        })?,
+    };
     if max_tokens == 0 || max_tokens > 393_216 {
         bail!("max_tokens must be between 1 and 393216");
+    }
+    // Unsupported OpenAI request fields must be refused, never silently
+    // dropped. The daemon's `validate_generate_caps` has typed refusals
+    // for exactly these, but this gateway builds the generate message
+    // from scratch and would strip the fields first — an `n: 2` that
+    // returns a single completion is the "silent semantic downgrade"
+    // the spec forbids (§7.1), so mirror the refusal set here.
+    if let Some(n) = body.get("n") {
+        if n.as_u64() != Some(1) {
+            bail!("n != 1 is not supported on this serve route (one completion per request)");
+        }
+    }
+    for field in ["best_of", "logit_bias", "echo", "suffix"] {
+        if let Some(v) = body.get(field) {
+            if !v.is_null() {
+                bail!("{field} is not supported on this serve route");
+            }
+        }
+    }
+    for (field, min, max) in [("temperature", 0.0, 2.0), ("top_p", 0.0, 1.0)] {
+        if let Some(value) = body.get(field).filter(|v| !v.is_null()) {
+            let number = value
+                .as_f64()
+                .filter(|v| v.is_finite())
+                .ok_or_else(|| anyhow!("{field} must be a finite number"))?;
+            if number < min || number > max || field == "top_p" && number == 0.0 {
+                bail!("{field} must be within {}", if field == "top_p" { "(0, 1]" } else { "[0, 2]" });
+            }
+        }
+    }
+    if let Some(value) = body.get("repeat_window").filter(|v| !v.is_null()) {
+        match value.as_u64() {
+            Some(v) if v <= 2048 => {}
+            _ => bail!("repeat_window must be an integer between 0 and 2048"),
+        }
+    }
+    // Token penalties + min_p + top_k: the daemon's slot sampler honors
+    // these, so a malformed value must be a typed 400 — not silently dropped
+    // to the config default (a string "abc" would otherwise forward as the
+    // default, and a non-finite number would reach the sampler).
+    for (field, min, max) in [
+        ("repeat_penalty", 1.0, 2.0),
+        ("repetition_penalty", 1.0, 2.0),
+        ("presence_penalty", 0.0, 2.0),
+        ("frequency_penalty", 0.0, 2.0),
+        ("min_p", 0.0, 1.0),
+    ] {
+        if let Some(value) = body.get(field).filter(|v| !v.is_null()) {
+            let number = value
+                .as_f64()
+                .filter(|v| v.is_finite())
+                .ok_or_else(|| anyhow!("{field} must be a finite number"))?;
+            if number < min || number > max {
+                bail!("{field} must be within [{min}, {max}]");
+            }
+        }
+    }
+    if let Some(value) = body.get("top_k").filter(|v| !v.is_null()) {
+        match value.as_u64() {
+            Some(v) if v >= 1 => {}
+            _ => bail!("top_k must be a positive integer"),
+        }
+    }
+    if let Some(messages) = body.get("messages").and_then(serde_json::Value::as_array) {
+        for message in messages {
+            let role = message
+                .get("role")
+                .and_then(serde_json::Value::as_str)
+                .ok_or_else(|| anyhow!("each message must have a string role"))?;
+            if !matches!(role, "developer" | "system" | "user" | "assistant" | "tool" | "toolResult" | "tool_result") {
+                bail!("unknown message role: {role}");
+            }
+        }
     }
     let mut messages = normalize_openai_messages(body.get("messages"), include_reasoning);
     let default_system = request_string(resolved, "prompt.system", None)?;
@@ -1594,13 +1756,316 @@ pub(crate) fn project_request_contract(
     let conversation_messages = messages.clone();
     let (tool_choice_policy, forwarded_tools) =
         project_tool_choice(body.get("tool_choice"), body.get("tools"), &mut messages)?;
+    let response_format = validate_response_format(body.get("response_format"))?;
     Ok(RequestContract {
         max_tokens,
         messages,
         conversation_messages,
         tool_choice_policy,
         forwarded_tools,
+        response_format,
     })
+}
+
+/// Validate OpenAI `response_format` for structured output (spec §7 G1).
+///
+/// Accepts:
+/// - `None` / null / absent → no constraint.
+/// - `{"type": "json_schema", "json_schema": {"schema": {...}, ...}}` →
+///   validates the schema against the supported strict subset and returns
+///   a [`ResponseFormat``.
+///
+/// Rejects (HTTP 400 via `bail!`):
+/// - `{"type": "json_object"}`: the multi-slot serve route has no
+///   json_object enforcement — silently dropping the requested constraint
+///   and returning 200 would be exactly the "silent semantic downgrade"
+///   the spec forbids (§7.1/X2). A future change may supply enforcement
+///   and re-enable it with its own oracle.
+/// - Unknown `type` values.
+/// - Missing/malformed `json_schema` wrapper or `schema` object.
+/// - Unsupported JSON Schema keywords (external refs, regex, recursion,
+///   combinators, unsupported assertions).
+/// - Contradictory/unsatisfiable schemas.
+pub(crate) fn validate_response_format(
+    value: Option<&serde_json::Value>,
+) -> Result<Option<ResponseFormat>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    if value.is_null() {
+        return Ok(None);
+    }
+    let ty = value
+        .get("type")
+        .and_then(|v| v.as_str())
+        .ok_or_else(|| anyhow!("response_format.type is required"))?;
+    match ty {
+        "json_object" => {
+            bail!(
+                "response_format type 'json_object' is not supported on this \
+                 serve route (no enforcement exists; only json_schema strict \
+                 output is supported)"
+            );
+        }
+        "json_schema" => {
+            let js = value
+                .get("json_schema")
+                .ok_or_else(|| anyhow!("response_format.json_schema is required"))?;
+            if !js.is_object() {
+                bail!("response_format.json_schema must be an object");
+            }
+            let schema = js
+                .get("schema")
+                .ok_or_else(|| anyhow!("response_format.json_schema.schema is required"))?;
+            if !schema.is_object() {
+                bail!("response_format.json_schema.schema must be an object");
+            }
+            // Validate the schema against the supported strict subset (spec
+            // §7.1 G1). Reject unsupported keywords before generation so no
+            // intermediate wire adapter drops the constraint silently.
+            validate_json_schema_subset(schema, "$")?;
+            let name = js
+                .get("name")
+                .and_then(|v| v.as_str())
+                .map(|s| s.to_owned());
+            Ok(Some(ResponseFormat {
+                schema: schema.clone(),
+                name,
+            }))
+        }
+        "text" => {
+            // OpenAI's DEFAULT response format: plain unconstrained text.
+            // An explicit `{"type": "text"}` is the same as omitting the
+            // field — accept it as "no constraint" instead of rejecting a
+            // payload shape the platform itself emits by default.
+            Ok(None)
+        }
+        other => {
+            bail!("response_format.type '{other}' is not supported");
+        }
+    }
+}
+
+/// Supported JSON Schema keywords (spec §7.1 G1 strict subset).
+const SUPPORTED_TYPE_VALUES: &[&str] = &[
+    "string", "number", "integer", "boolean", "null", "object", "array",
+];
+
+/// Assertion keywords that are NOT supported in the strict subset (spec
+/// §7.1 G1: reject unsupported assertion keywords, external references,
+/// regex assertions, recursion and combinators before generation).
+///
+/// MUST stay a superset of what the saddle-core compiler rejects
+/// (`grammar::json_schema::compile_node` default-deny): this validator is
+/// the operator-facing pre-flight, and the two layers must refuse the same
+/// schemas or a schema rejected here could compile to something else
+/// server-side (or vice versa).
+const REJECTED_ASSERTION_KEYWORDS: &[&str] = &[
+    "$ref",
+    "$id",
+    "$schema",
+    "pattern",
+    "allOf",
+    "anyOf",
+    "oneOf",
+    "not",
+    "if",
+    "then",
+    "else",
+    "additionalItems",
+    "dependentSchemas",
+    "dependentRequired",
+    "prefixItems",
+    "contains",
+    "maxContains",
+    "minContains",
+    "patternProperties",
+    "propertyNames",
+    "uniqueItems",
+    "multipleOf",
+    "minimum",
+    "maximum",
+    "exclusiveMinimum",
+    "exclusiveMaximum",
+    "minLength",
+    "maxLength",
+    "minProperties",
+    "maxProperties",
+    "contentEncoding",
+    "contentMediaType",
+    "format",
+    "unevaluatedProperties",
+    "unevaluatedItems",
+];
+
+/// Recursively validate a JSON Schema object against the strict subset
+/// (spec §7.1 G1).
+///
+/// Supported:
+/// - `type`: string, number, integer, boolean, null, object, array
+/// - `properties`, `required`, `additionalProperties` (boolean only)
+/// - `items`, `minItems`, `maxItems` (array)
+/// - `enum`, `const`
+/// - `description`, `title`, `default`, `examples`, `$comment` (annotations)
+///
+/// Rejected: external references (`$ref`), regex (`pattern`),
+/// combinators (`allOf`/`anyOf`/`oneOf`/`not`), conditional assertion
+/// (`if`/`then`/`else`), numeric/string bounds, and every other unknown
+/// keyword — the validator and the saddle-core compiler must refuse the
+/// same schemas (default-deny), or a "supported" schema would compile to
+/// different constraints server-side.
+fn validate_json_schema_subset(schema: &serde_json::Value, path: &str) -> Result<()> {
+    if !schema.is_object() {
+        bail!("schema at {path} must be an object");
+    }
+    let obj = schema.as_object().unwrap();
+
+    // Check for rejected keywords first.
+    for &kw in REJECTED_ASSERTION_KEYWORDS {
+        if obj.contains_key(kw) {
+            bail!(
+                "unsupported JSON Schema keyword '{kw}' at {path} \
+                 (strict subset does not allow this assertion)"
+            );
+        }
+    }
+
+    // DEFAULT-DENY, matching the saddle-core compiler's keyword policy:
+    // the compiler refuses any keyword outside its allowlist, so the CLI
+    // pre-flight must refuse the same set — a schema the CLI passes but
+    // the compiler rejects surfaces as a late 400 at admit instead of an
+    // up-front validation error (the drift hid `deprecated`-style keys).
+    // Annotations are permitted exactly where the compiler permits them.
+    const KNOWN_KEYWORDS: &[&str] = &[
+        "type",
+        "properties",
+        "required",
+        "additionalProperties",
+        "items",
+        "minItems",
+        "maxItems",
+        "enum",
+        "const",
+        "description",
+        "title",
+        "default",
+        "examples",
+        "$comment",
+    ];
+    for key in obj.keys() {
+        if !KNOWN_KEYWORDS.contains(&key.as_str()) {
+            bail!(
+                "unsupported JSON Schema keyword '{key}' at {path} \
+                 (strict subset default-deny: not in the compiler's allowlist)"
+            );
+        }
+    }
+
+    // Present-but-malformed keyword values are compiler typed errors
+    // (`.and_then(as_array)` here used to skip them silently, letting a
+    // pre-flighted schema die at admit). Match the compiler's refusals.
+    if let Some(v) = obj.get("enum") {
+        if !v.is_array() {
+            bail!("enum at {path} must be an array");
+        }
+    }
+    if let Some(v) = obj.get("properties") {
+        if !v.is_object() {
+            bail!("properties at {path} must be an object");
+        }
+    }
+    if let Some(v) = obj.get("required") {
+        if !v.is_array() {
+            bail!("required at {path} must be an array of strings");
+        }
+    }
+    for kw in ["minItems", "maxItems"] {
+        if let Some(v) = obj.get(kw) {
+            if v.as_u64().is_none() {
+                bail!("{kw} at {path} must be a non-negative integer");
+            }
+        }
+    }
+
+    // Validate `type` if present. A non-string, non-null `type` (the union
+    // form `["integer","null"]`) is outside the strict subset — it must be
+    // rejected, not silently skipped into the inference path (the compiler
+    // would fall through to an unconstrained Any).
+    if let Some(tv) = obj.get("type") {
+        match tv.as_str() {
+            Some(ty) => {
+                if !SUPPORTED_TYPE_VALUES.contains(&ty) {
+                    bail!(
+                        "unsupported JSON Schema type '{ty}' at {path} \
+                         (supported: {SUPPORTED_TYPE_VALUES:?})"
+                    );
+                }
+            }
+            None => bail!(
+                "unsupported JSON Schema 'type' at {path}: union/array forms \
+                 are outside the strict subset"
+            ),
+        }
+    }
+
+    // `enum` and `const` are terminal — no nested schema to recurse into.
+    // `enum` must be a non-empty array; `const` can be any value.
+    if let Some(arr) = obj.get("enum").and_then(|v| v.as_array()) {
+        if arr.is_empty() {
+            bail!("enum at {path} must be a non-empty array");
+        }
+    }
+
+    // Object type: validate `properties` and `additionalProperties`.
+    if let Some(props) = obj.get("properties").and_then(|v| v.as_object()) {
+        for (key, sub) in props {
+            validate_json_schema_subset(sub, &format!("{path}.properties.{key}"))?;
+        }
+    }
+    if let Some(ap) = obj.get("additionalProperties") {
+        // Boolean only (spec §7.1 subset). The schema form is rejected here
+        // AND in the compiler — it used to be accepted by this validator
+        // while the compiler silently flattened it to `true`.
+        if !ap.is_boolean() {
+            bail!(
+                "additionalProperties at {path} must be a boolean (schema form \
+                 is outside the strict subset)"
+            );
+        }
+    }
+    if let Some(req) = obj.get("required").and_then(|v| v.as_array()) {
+        for item in req {
+            if !item.is_string() {
+                bail!("required at {path} must be an array of strings");
+            }
+        }
+    }
+
+    // Array type: validate `items`. The saddle-core compiler only accepts
+    // a schema OBJECT for `items` — the CLI validator must refuse exactly
+    // the same set (a boolean `items` accepted here would be rejected
+    // server-side, a 400 at the wrong layer; contract drift hides bugs).
+    if let Some(items) = obj.get("items") {
+        if items.is_object() {
+            validate_json_schema_subset(items, &format!("{path}.items"))?;
+        } else {
+            bail!("items at {path} must be a schema object (boolean form is outside the supported subset)");
+        }
+    }
+    if let Some(n) = obj.get("minItems").and_then(|v| v.as_u64()) {
+        if let Some(max) = obj.get("maxItems").and_then(|v| v.as_u64()) {
+            if n > max {
+                bail!("minItems ({n}) > maxItems ({max}) at {path}: contradictory schema");
+            }
+        }
+    }
+
+    // Numeric bounds (`minimum`/`maximum`) and string bounds
+    // (`minLength`/`maxLength`) are rejected outright by the keyword
+    // policy above — the compiler enforces the same subset, so there is
+    // no bounds cross-check to perform here anymore.
+
+    Ok(())
 }
 
 /// One correlated generation attempt under the shared serve runtime lock.
@@ -1645,7 +2110,8 @@ pub(crate) fn complete_request_attempt(
         .and_then(serde_json::Value::as_str)
         .ok_or_else(|| anyhow!("model is required"))?
         .to_owned();
-    let image_base64 = request_image_base64(body.get("messages"))?;
+    let image_base64 = request_image_base64(body.get("messages"))
+        .map_err(|e| anyhow!("{}{e}", crate::serve::REQUEST_VALIDATION_TAG))?;
     // Acquire runtime, ensure model, and build the generate request while
     // holding the lock. Clone the engine handle before dropping the lock so
     // concurrent eligible requests can share the multiplexed transport.
@@ -1657,6 +2123,19 @@ pub(crate) fn complete_request_attempt(
         // Attempt id is allocated by the retry driver before any cold reset /
         // generate so reset ack, generate request, and the semantic fold share one
         // wire id.
+        // A remote client may name a registry tag, a local model name, or a
+        // path INSIDE the configured model store (the operator's own model
+        // directory). Any other filesystem path is refused: accepting one
+        // turned the `model` field into a file-existence oracle and an
+        // arbitrary-file-parse surface for anyone who could reach the port.
+        let candidate = std::path::Path::new(&model);
+        let pathish = candidate.is_absolute() || model.contains('/') || model.contains('\\');
+        if pathish && !model_path_in_local_store(&runtime.paths, candidate) {
+            bail!(
+                "HTTP model must be a registry tag, a local model name, or a path \
+                 inside the model store"
+            );
+        }
         let resolved = runtime.ensure_model(&model, &shared.meta, None)?;
         if force_reset || (!runtime.cache_capable && !runtime.continuous_batch_capable) {
             if let Err(error) = runtime.engine.reset(attempt_id) {
@@ -1682,7 +2161,23 @@ pub(crate) fn complete_request_attempt(
             include_reasoning_content(runtime.current_arch.as_deref()),
         )?;
         let max_tokens = contract.max_tokens;
-        let required_max_seq = max_tokens.saturating_add(1024);
+        // Belt alignment: in multi-slot mode the daemon applies the EXACT
+        // admission belt (tokenized prompt — including image-pad expansion —
+        // plus max_tokens vs the slot ctx) and its rejection surfaces as an
+        // HTTP 400 through this front end. The sequential path keeps the
+        // historical fixed 1024-token prompt allowance, which drives the
+        // max_seq reload; in multi-slot mode that allowance both
+        // over-admits (one image is ~1700+ pad tokens, so the CLI gate
+        // passed requests the daemon must reject late) and over-rejects
+        // (up to ~1023 tokens of usable budget refused). Here we reject up
+        // front only what the daemon belt can NEVER admit — max_tokens alone
+        // beyond the ctx (any prompt is at least one token) — and defer the
+        // rest to the exact belt.
+        let required_max_seq = if runtime.multi_slot_enabled {
+            max_tokens.saturating_add(1)
+        } else {
+            max_tokens.saturating_add(1024)
+        };
         if runtime.current_max_seq < required_max_seq {
             runtime.ensure_model(&model, &shared.meta, Some(required_max_seq))?;
         }
@@ -1690,6 +2185,7 @@ pub(crate) fn complete_request_attempt(
         let conversation_messages = contract.conversation_messages;
         let tool_choice_policy = contract.tool_choice_policy;
         let forwarded_tools = contract.forwarded_tools;
+        let response_format = contract.response_format;
         let mut generate = serde_json::json!({
             "type": "generate",
             "id": request_id(),
@@ -1715,11 +2211,29 @@ pub(crate) fn complete_request_attempt(
         }
         // Validate OpenAI logprobs contract before forwarding; reject rather
         // than silently clamping so callers notice a mismatch.
-        validate_logprobs_request(body)?;
+        validate_logprobs_request(body)
+            .map_err(|e| anyhow!("{}{e}", crate::serve::REQUEST_VALIDATION_TAG))?;
         // Project tools under tool_choice; never forward raw tool_choice (daemon
         // ignores it). none drops tools so the template/parser stay inactive.
         if let Some(tools) = forwarded_tools {
             generate["tools"] = tools;
+        }
+        // Forward validated response_format so the daemon/slot engine can
+        // apply pre-sampling grammar masks (spec §7 G1/G2). The schema was
+        // already validated against the strict subset in
+        // [`validate_response_format`]; the daemon re-checks capability
+        // before attempting mask construction.
+        if let Some(rf) = response_format {
+            let mut js = serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "schema": rf.schema,
+                }
+            });
+            if let Some(name) = rf.name {
+                js["json_schema"]["name"] = serde_json::Value::String(name);
+            }
+            generate["response_format"] = js;
         }
         for name in [
             "frequency_penalty",
@@ -1770,7 +2284,8 @@ pub(crate) fn complete_request_attempt(
             contract,
             effort_native,
             &supported_efforts,
-        )?;
+        )
+        .map_err(|e| anyhow!("{}{e}", crate::serve::REQUEST_VALIDATION_TAG))?;
         let (id, created) = identity.clone();
         generate["id"] = serde_json::Value::String(id.clone());
         generate["attempt_id"] = serde_json::json!(attempt_id);
@@ -1784,11 +2299,22 @@ pub(crate) fn complete_request_attempt(
             // choice. Carry only that typed decision across the slot wire;
             // the daemon must never reinterpret the original HTTP body.
             generate["tool_choice_policy"] = tool_choice_policy.daemon_projection();
+            // Penalty knobs are forwarded as-is: the slot sampler applies
+            // repeat/presence/frequency penalties and min_p exactly like the
+            // sequential path (repeat/presence/frequency in-kernel over a
+            // per-slot recent-token window; min_p in the top-p tail). A
+            // penalized request decodes as plain AR on the slot engine —
+            // MTP verify accept is a bare greedy argmax and cannot reproduce
+            // penalize-then-argmax — which is the same trade the sequential
+            // MTP path makes.
             // Re-check the fully projected wire request, not only the raw HTTP
-            // body: registry/config defaults may have inserted a penalty or
+            // body: registry/config defaults may have inserted a
             // reasoning control the slot sampler cannot honor.
             if let Err(reason) = multi_slot_request_supported(&generate) {
-                bail!("experimental multi-slot does not support this request: {reason}");
+                bail!(
+                    "{}experimental multi-slot does not support this request: {reason}",
+                    crate::serve::REQUEST_VALIDATION_TAG
+                );
             }
         }
         let engine_clone = runtime.engine.clone();
@@ -2122,86 +2648,19 @@ pub(crate) fn complete_request_attempt(
 
 /// Whether the experimental multi-slot daemon path can honour this request.
 ///
-/// Pure pre-send gate. Temperature / top_p / top_k remain supported. Rejects
-/// images, non-null stop, logprobs, non-neutral repeat/frequency/
-/// presence penalties, min_p, reasoning caps >= 2, and named thinking budgets
-/// other than `"off"`. Callers with `serve.multi_slot` enabled must surface the
-/// error — there is no ordinary-model fallback in that mode.
-pub(crate) fn multi_slot_request_supported(body: &serde_json::Value) -> Result<(), String> {
-    if multi_slot_request_has_image(body)
-        || body.get("image").is_some_and(|value| !value.is_null())
-        || body
-            .get("image_base64")
-            .is_some_and(|value| !value.is_null())
-    {
-        return Err("images are not supported".to_owned());
-    }
-    if body.get("stop").is_some_and(|value| !value.is_null()) {
-        return Err("stop sequences are not supported".to_owned());
-    }
-    if body.get("logprobs").and_then(serde_json::Value::as_bool) == Some(true)
-        || body
-            .get("top_logprobs")
-            .is_some_and(|value| !value.is_null())
-    {
-        return Err("logprobs are not supported".to_owned());
-    }
-    if let Some(value) = body
-        .get("presence_penalty")
-        .and_then(serde_json::Value::as_f64)
-    {
-        if value != 0.0 {
-            return Err("non-neutral presence_penalty is not supported".to_owned());
-        }
-    }
-    if let Some(value) = body
-        .get("frequency_penalty")
-        .and_then(serde_json::Value::as_f64)
-    {
-        if value != 0.0 {
-            return Err("non-neutral frequency_penalty is not supported".to_owned());
-        }
-    }
-    if let Some(value) = body
-        .get("repeat_penalty")
-        .and_then(serde_json::Value::as_f64)
-    {
-        if value != 1.0 {
-            return Err("non-neutral repeat_penalty is not supported".to_owned());
-        }
-    }
-    if let Some(value) = body.get("min_p").and_then(serde_json::Value::as_f64) {
-        if value != 0.0 {
-            return Err("min_p is not supported".to_owned());
-        }
-    }
-    if body
-        .get("reasoning_effort")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|value| !value.eq_ignore_ascii_case("none"))
-    {
-        return Err("reasoning_effort is not supported".to_owned());
-    }
-    // `1` is the no-thinking sentinel and `0` is uncapped; neither needs a
-    // force-close. Any other finite cap does.
-    for pointer in ["/max_think_tokens", "/reasoning/max_tokens"] {
-        if let Some(cap) = body.pointer(pointer).and_then(serde_json::Value::as_u64) {
-            if cap >= 2 {
-                return Err("finite reasoning cap is not supported".to_owned());
-            }
-        }
-    }
-    if let Some(budget) = body
-        .get("thinking_budget")
-        .and_then(serde_json::Value::as_str)
-    {
-        if !budget.eq_ignore_ascii_case("off") {
-            return Err("named thinking budget is not supported".to_owned());
-        }
-    }
-    Ok(())
-}
-
+/// Pure pre-send gate. Temperature / top_p / top_k remain supported, and
+/// token penalties (repeat/frequency/presence, min_p) are FORWARDED — the
+/// slot engine honours them via its penalize-then-argmax prepass (penalized
+/// requests decode AR; MTP stays off). Images are supported when the loaded
+/// model has a vision encoder (the daemon slot backend gates on is_vl).
+/// `response_format` (json_schema) is forwarded — the daemon slot backend
+/// validates grammar-compiler availability and refuses with a typed error
+/// when the compiled artifact or lossless token-byte table is unavailable
+/// (spec §7 G1/G2). Images and tools are each supported but not together —
+/// the VL prompt path cannot render a tool contract. Rejects non-null stop,
+/// logprobs, reasoning caps >= 2, and named thinking budgets other than
+/// `"off"`. Callers with `serve.multi_slot` enabled must surface the error —
+/// there is no ordinary-model fallback in that mode.
 fn multi_slot_request_has_image(body: &serde_json::Value) -> bool {
     let Some(messages) = body.get("messages").and_then(serde_json::Value::as_array) else {
         return false;
@@ -2220,6 +2679,74 @@ fn multi_slot_request_has_image(body: &serde_json::Value) -> bool {
     false
 }
 
+pub(crate) fn multi_slot_request_supported(body: &serde_json::Value) -> Result<(), String> {
+    let has_image = multi_slot_request_has_image(body)
+        || body.get("image").is_some_and(|value| !value.is_null())
+        || body
+            .get("image_base64")
+            .is_some_and(|value| !value.is_null());
+    let has_tools = body
+        .get("tools")
+        .and_then(serde_json::Value::as_array)
+        .is_some_and(|tools| !tools.is_empty())
+        || body
+            .get("messages")
+            .and_then(serde_json::Value::as_array)
+            .is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message.get("role").and_then(serde_json::Value::as_str) == Some("tool")
+                })
+            });
+    if has_image && has_tools {
+        return Err(
+            "images and tools together are not supported in experimental multi-slot".to_owned(),
+        );
+    }
+    if body.get("stop").is_some_and(|value| !value.is_null()) {
+        return Err("stop sequences are not supported".to_owned());
+    }
+    if body.get("logprobs").and_then(serde_json::Value::as_bool) == Some(true)
+        || body
+            .get("top_logprobs")
+            .is_some_and(|value| !value.is_null())
+    {
+        return Err("logprobs are not supported".to_owned());
+    }
+    // Penalties are supported end-to-end on the slot engine (in-kernel
+    // repeat/presence/frequency over a per-slot recent-token window, min_p in
+    // the top-p tail), so non-neutral values are forwarded, not refused or
+    // ignored. A penalized request decodes as plain AR (no MTP verify), see
+    // the multi-slot projection above.
+    if let Some(value) = body.get("min_p").and_then(serde_json::Value::as_f64) {
+        if !(0.0..=1.0).contains(&value) {
+            return Err("min_p must be within [0, 1]".to_owned());
+        }
+    }
+    if body
+        .get("reasoning_effort")
+        .and_then(serde_json::Value::as_str)
+        .is_some_and(|value| !value.eq_ignore_ascii_case("none"))
+    {
+        return Err("reasoning_effort is not supported".to_owned());
+    }
+    // Finite caps (>= 2) are ENFORCED end-to-end on the multi-slot route
+    // (the grammar cursor force-closes the span at the budget —
+    // vLLM thinking_token_budget parity), so they are forwarded, not
+    // refused. `0` means UNCAPPED and `1` is the no-thinking sentinel
+    // (SERVE.md), so neither is a refusal here — the daemon owns the
+    // interpretation of the forwarded value.
+    if let Some(budget) = body
+        .get("thinking_budget")
+        .and_then(serde_json::Value::as_str)
+    {
+        if !budget.eq_ignore_ascii_case("off") {
+            return Err("named thinking budget is not supported".to_owned());
+        }
+    }
+    Ok(())
+}
+
+
 /// Server-owned retry driver with cooperative cancellation.
 ///
 /// Daemon requests use [`hipfire_client::Engine::generate_cancellable`].
@@ -2236,6 +2763,22 @@ pub(crate) fn complete_request_cancellable(
     mut terminal_callback: impl FnMut(&Completion) -> Result<(), hipfire_client::ClientError>,
 ) -> Result<Completion> {
     let identity = request_identity.unwrap_or_else(|| (request_id(), unix_timestamp()));
+    // Retry must re-enter admission with the SAME eligibility the original
+    // request used: re-acquiring ineligible would park the retry until every
+    // eligible slot drains, and a multi-slot engine reset under concurrency
+    // is refused — either one made the single allowed retry a 500.
+    let retry_eligible = guard.is_eligible();
+    let retry_model = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+    let multi_slot_route = {
+        let runtime = shared
+            .runtime
+            .lock()
+            .unwrap_or_else(|error| error.into_inner());
+        runtime.multi_slot_enabled
+    };
 
     // Experimental multi-slot: fail closed on shapes the daemon slot engine
     // cannot honour. Do not fall through to ordinary LoadedModel generate.
@@ -2246,7 +2789,10 @@ pub(crate) fn complete_request_cancellable(
             .unwrap_or_else(|error| error.into_inner());
         if runtime.multi_slot_enabled {
             if let Err(reason) = multi_slot_request_supported(body) {
-                bail!("experimental multi-slot does not support this request: {reason}");
+                bail!(
+                    "{}experimental multi-slot does not support this request: {reason}",
+                    crate::serve::REQUEST_VALIDATION_TAG
+                );
             }
         }
     }
@@ -2265,7 +2811,7 @@ pub(crate) fn complete_request_cancellable(
             guard,
             &identity,
             attempt_id,
-            attempt_index > 1,
+            attempt_index > 1 && !multi_slot_route,
             &latches,
             Some(cancelled),
             &mut event_callback,
@@ -2334,7 +2880,11 @@ pub(crate) fn complete_request_cancellable(
                 if cancelled.load(Ordering::Relaxed) {
                     return Err(anyhow::Error::new(ClientError::Cancelled));
                 }
-                guard = match shared.admission.acquire() {
+                guard = match shared.admission.acquire_for_with_bytes(
+                    retry_eligible,
+                    retry_model.as_deref(),
+                    0,
+                ) {
                     Ok(guard) => guard,
                     Err(_) => {
                         return Err(error.context("retry aborted: admission re-acquire failed"));
@@ -6626,6 +7176,68 @@ mod tests {
     }
 
     #[test]
+    fn project_request_contract_rejects_malformed_sampling_and_roles() {
+        let resolved = contract_resolved_with_system("");
+        let user = serde_json::json!({ "role": "user", "content": "hi" });
+        let cases: &[(&str, serde_json::Value, &str)] = &[
+            (
+                "temperature type",
+                serde_json::json!({ "temperature": [] }),
+                "temperature must be a finite number",
+            ),
+            (
+                "temperature range",
+                serde_json::json!({ "temperature": 100.0 }),
+                "temperature must be within",
+            ),
+            (
+                "top_p range",
+                serde_json::json!({ "top_p": -5.0 }),
+                "top_p must be within",
+            ),
+            (
+                "top_p type",
+                serde_json::json!({ "top_p": "0.9" }),
+                "top_p must be a finite number",
+            ),
+            (
+                "repeat_window",
+                serde_json::json!({ "repeat_window": -1 }),
+                "repeat_window must be an integer between 0 and 2048",
+            ),
+        ];
+        for (label, extra, expected) in cases {
+            let mut body = serde_json::json!({
+                "max_tokens": 16,
+                "messages": [user],
+            });
+            for (key, value) in extra.as_object().unwrap() {
+                body[key] = value.clone();
+            }
+            let err = project_request_contract(&body, &resolved, false)
+                .expect_err(&format!("{label} must be refused"));
+            assert!(err.to_string().contains(expected), "{label}: {err}");
+        }
+        let body = serde_json::json!({
+            "max_tokens": 16,
+            "messages": [{ "role": "wizard", "content": "hi" }],
+        });
+        let err = project_request_contract(&body, &resolved, false)
+            .expect_err("unknown role must be refused");
+        assert!(err.to_string().contains("unknown message role"), "{err}");
+
+        // In-range values still pass.
+        let body = serde_json::json!({
+            "max_tokens": 16,
+            "temperature": 0.7,
+            "top_p": 0.9,
+            "repeat_window": 64,
+            "messages": [user],
+        });
+        project_request_contract(&body, &resolved, false).expect("valid sampling accepted");
+    }
+
+    #[test]
     fn project_request_contract_rejects_max_tokens_bounds() {
         let resolved = contract_resolved_with_system("");
         for bad in [0u64, 393_217] {
@@ -6650,6 +7262,72 @@ mod tests {
                 .unwrap_or_else(|e| panic!("expected ok for {ok}: {e}"));
             assert_eq!(contract.max_tokens, ok);
         }
+    }
+
+    /// A PRESENT-but-malformed max_tokens must be a typed 400, never a
+    /// silent fallback to the config default (the gateway used to
+    /// `.and_then(as_u64).unwrap_or(default)`, quietly re-typing -5 / 1.5 /
+    /// "100" into the default budget).
+    #[test]
+    fn project_request_contract_rejects_malformed_max_tokens() {
+        let resolved = contract_resolved_with_system("");
+        for bad in [serde_json::json!(-5), serde_json::json!(1.5), serde_json::json!("100")] {
+            let body = serde_json::json!({
+                "max_tokens": bad,
+                "messages": [{ "role": "user", "content": "hi" }]
+            });
+            let err = project_request_contract(&body, &resolved, false)
+                .expect_err("malformed max_tokens must be rejected");
+            assert!(
+                err.to_string().contains("max_tokens must be an integer"),
+                "unexpected error for {bad}: {err}"
+            );
+        }
+    }
+
+    /// Unsupported OpenAI request fields must be refused here — the daemon
+    /// has typed refusals for them, but this gateway builds the generate
+    /// message from scratch and would strip the fields first (silent
+    /// semantic downgrade: `n: 2` returning one completion).
+    #[test]
+    fn project_request_contract_refuses_unsupported_fields() {
+        let resolved = contract_resolved_with_system("");
+        let cases = [
+            serde_json::json!({"n": 2}),
+            serde_json::json!({"best_of": 2}),
+            serde_json::json!({"logit_bias": {"5": 10}}),
+            serde_json::json!({"echo": true}),
+            serde_json::json!({"suffix": "tail"}),
+        ];
+        for extra in cases {
+            let mut body = serde_json::json!({
+                "max_tokens": 16,
+                "messages": [{ "role": "user", "content": "hi" }]
+            });
+            let (k, v) = extra.as_object().unwrap().iter().next().unwrap();
+            body[k] = v.clone();
+            let err = project_request_contract(&body, &resolved, false)
+                .expect_err("unsupported field must be refused");
+            assert!(
+                err.to_string().contains("not supported on this serve route"),
+                "unexpected error for {k}: {err}"
+            );
+        }
+        // n=1 is the only legal arity and must pass.
+        let body = serde_json::json!({
+            "max_tokens": 16, "n": 1,
+            "messages": [{ "role": "user", "content": "hi" }]
+        });
+        assert!(project_request_contract(&body, &resolved, false).is_ok());
+    }
+
+    /// `response_format: {"type": "text"}` is OpenAI's DEFAULT format —
+    /// accept it as unconstrained instead of erroring.
+    #[test]
+    fn response_format_text_is_accepted_as_unconstrained() {
+        let value = serde_json::json!({"type": "text"});
+        let got = validate_response_format(Some(&value)).unwrap();
+        assert!(got.is_none(), "text must be accepted as unconstrained");
     }
 
     #[test]
@@ -6747,7 +7425,10 @@ mod tests {
 
     /// Experimental multi-slot accepts sampling that the daemon slot engine
     /// implements (temperature/top_p/top_k) and rejects every other listed
-    /// capability before the generate is sent.
+    /// capability before the generate is sent. Penalty knobs
+    /// (repeat/frequency/presence, min_p) are forwarded and honoured by the
+    /// slot sampler's penalize-then-argmax prepass — penalized requests
+    /// decode AR with MTP off.
     #[test]
     fn multi_slot_request_supported_accepts_sampling_rejects_unsupported() {
         let ok = |v: serde_json::Value| multi_slot_request_supported(&v).is_ok();
@@ -6776,43 +7457,212 @@ mod tests {
             "messages": [{"role":"tool","tool_call_id":"call_x","content":"ok"}]
         })));
 
+        // Images are supported in multi-slot when the model has a vision
+        // encoder. The daemon slot backend gates on is_vl() and returns a
+        // validation error if the model lacks one; the CLI gate no longer
+        // rejects them upfront.
+        assert!(ok(serde_json::json!({
+            "messages": [{
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "hi"},
+                    {"type": "image_url", "image_url": {"url": "data:image/png;base64,aa"}}
+                ]
+            }]
+        })));
+        // Images + tools together are still refused — the VL prompt path
+        // cannot render a tool contract.
         err_contains(
             serde_json::json!({
-                "messages": [{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": "hi"},
-                        {"type": "image_url", "image_url": {"url": "data:image/png;base64,aa"}}
-                    ]
-                }]
+                "image_base64": "aa",
+                "tools": [{"type": "function", "function": {"name": "x"}}]
             }),
-            "images",
+            "images and tools",
         );
         err_contains(serde_json::json!({ "stop": ["\n\n"] }), "stop");
         err_contains(serde_json::json!({ "stop": "END" }), "stop");
         err_contains(serde_json::json!({ "logprobs": true }), "logprobs");
         err_contains(serde_json::json!({ "top_logprobs": 5 }), "logprobs");
-        err_contains(
-            serde_json::json!({ "presence_penalty": 0.5 }),
-            "presence_penalty",
-        );
-        err_contains(
-            serde_json::json!({ "frequency_penalty": 0.1 }),
-            "frequency_penalty",
-        );
-        err_contains(
-            serde_json::json!({ "repeat_penalty": 1.05 }),
-            "repeat_penalty",
-        );
-        err_contains(serde_json::json!({ "min_p": 0.05 }), "min_p");
-        err_contains(
-            serde_json::json!({ "max_think_tokens": 2 }),
-            "reasoning cap",
-        );
-        err_contains(
-            serde_json::json!({ "reasoning": { "max_tokens": 2048 } }),
-            "reasoning cap",
-        );
+        // Non-neutral penalties are supported end-to-end on the slot engine
+        // (in-kernel repeat/presence/frequency over a per-slot recent-token
+        // window), so they are forwarded — no error here.
+        assert!(ok(serde_json::json!({ "presence_penalty": 0.5 })));
+        assert!(ok(serde_json::json!({ "frequency_penalty": 0.1 })));
+        assert!(ok(serde_json::json!({ "repeat_penalty": 1.05 })));
+        assert!(ok(serde_json::json!({ "min_p": 0.05 })));
+        err_contains(serde_json::json!({ "min_p": 1.5 }), "min_p");
+        // Finite caps are ACCEPTED and ENFORCED (the grammar cursor
+        // force-closes the span at the budget), so `max_think_tokens >= 2`
+        // and the nested `reasoning.max_tokens` alias are inputs, not
+        // refusals. `0` = uncapped and `1` = no-thinking sentinel.
+        assert!(ok(serde_json::json!({ "max_think_tokens": 2 })));
+        assert!(ok(serde_json::json!({ "reasoning": { "max_tokens": 2048 } })));
         err_contains(serde_json::json!({ "thinking_budget": "high" }), "budget");
+    }
+
+    /// `response_format` validation: accepts valid json_schema, rejects
+    /// malformed/unsupported types and unsupported JSON Schema keywords
+    /// (spec §7.1 G1, A15).
+    #[test]
+    fn response_format_validation_accepts_and_rejects() {
+        // Absent / null → None (no constraint).
+        assert!(validate_response_format(None).unwrap().is_none());
+        assert!(
+            validate_response_format(Some(&serde_json::Value::Null))
+                .unwrap()
+                .is_none()
+        );
+
+        // json_object → REJECTED (typed error). This serve route has no
+        // json_object enforcement; silently dropping the requested
+        // constraint and returning success would be the "silent semantic
+        // downgrade" the spec forbids (§7.1/X2). It used to pass through as
+        // None — an unconstrained 200.
+        assert!(validate_response_format(Some(&serde_json::json!({"type": "json_object"})))
+            .is_err());
+
+        // Valid json_schema with a simple object schema.
+        let rf = validate_response_format(Some(&serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "name": "test",
+                "schema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string"},
+                        "age": {"type": "integer"}
+                    },
+                    "required": ["name"],
+                    "additionalProperties": false
+                }
+            }
+        })))
+        .unwrap()
+        .expect("valid json_schema should produce ResponseFormat");
+        assert_eq!(rf.name.as_deref(), Some("test"));
+        assert_eq!(
+            rf.schema.get("type").and_then(|v| v.as_str()),
+            Some("object")
+        );
+
+        // Valid array schema with enum.
+        let rf = validate_response_format(Some(&serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "schema": {
+                    "type": "array",
+                    "items": {"type": "string", "enum": ["a", "b", "c"]},
+                    "minItems": 1,
+                    "maxItems": 10
+                }
+            }
+        })))
+        .unwrap()
+        .expect("valid array schema");
+        assert!(rf.name.is_none());
+
+        // Accepted: `text` is OpenAI's DEFAULT response format — plain
+        // unconstrained output, same as omitting the field.
+        let rf = validate_response_format(Some(&serde_json::json!({
+            "type": "text"
+        })))
+        .unwrap();
+        assert!(rf.is_none(), "text is the platform default: no constraint");
+
+        // Rejected: genuinely unknown type.
+        let err = validate_response_format(Some(&serde_json::json!({
+            "type": "yaml"
+        })))
+        .unwrap_err();
+        assert!(err.to_string().contains("not supported"));
+
+        // Rejected: missing json_schema wrapper.
+        let err = validate_response_format(Some(&serde_json::json!({
+            "type": "json_schema"
+        })))
+        .unwrap_err();
+        assert!(err.to_string().contains("json_schema is required"));
+
+        // Rejected: missing schema object.
+        let err = validate_response_format(Some(&serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {}
+        })))
+        .unwrap_err();
+        assert!(err.to_string().contains("schema is required"));
+
+        // Rejected: $ref (external reference).
+        let err = validate_response_format(Some(&serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "schema": {"$ref": "#/definitions/foo"}
+            }
+        })))
+        .unwrap_err();
+        assert!(err.to_string().contains("$ref"));
+
+        // Rejected: pattern (regex assertion).
+        let err = validate_response_format(Some(&serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "schema": {"type": "string", "pattern": "^[a-z]+$"}
+            }
+        })))
+        .unwrap_err();
+        assert!(err.to_string().contains("pattern"));
+
+        // Rejected: allOf combinator.
+        let err = validate_response_format(Some(&serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "schema": {"allOf": [{"type": "string"}]}
+            }
+        })))
+        .unwrap_err();
+        assert!(err.to_string().contains("allOf"));
+
+        // Rejected: contradictory minItems > maxItems.
+        let err = validate_response_format(Some(&serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "schema": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 5,
+                    "maxItems": 3
+                }
+            }
+        })))
+        .unwrap_err();
+        assert!(err.to_string().contains("contradictory"));
+
+        // Rejected: unsupported type value.
+        let err = validate_response_format(Some(&serde_json::json!({
+            "type": "json_schema",
+            "json_schema": {
+                "schema": {"type": "custom"}
+            }
+        })))
+        .unwrap_err();
+        assert!(err.to_string().contains("custom"));
+    }
+
+    /// `response_format` is forwarded into the generate payload and passes
+    /// the multi-slot gate (the daemon handles typed refusal).
+    #[test]
+    fn response_format_passes_multi_slot_gate() {
+        // A generate payload with response_format should pass
+        // multi_slot_request_supported — the daemon handles the typed
+        // refusal when the grammar compiler is unavailable.
+        let body = serde_json::json!({
+            "max_tokens": 16,
+            "response_format": {
+                "type": "json_schema",
+                "json_schema": {
+                    "schema": {"type": "object", "properties": {"x": {"type": "string"}}}
+                }
+            }
+        });
+        assert!(multi_slot_request_supported(&body).is_ok());
     }
 }

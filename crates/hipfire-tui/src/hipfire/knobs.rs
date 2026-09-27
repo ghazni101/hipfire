@@ -330,9 +330,12 @@ pub const KNOBS: &[KnobInfo] = &[
         key: "host",
         title: "Serve endpoint",
         summary: "The bind address (and port) of the OpenAI-compatible serve API.",
-        effect: "0.0.0.0 listens on all interfaces; 127.0.0.1 is local-only. Chat and API clients connect here.",
-        default: "0.0.0.0",
-        when: "Use 127.0.0.1 to keep serve private to this machine; 0.0.0.0 to expose it on the network.",
+        effect: "127.0.0.1 is local-only (the default); 0.0.0.0 listens on all interfaces. Chat and API clients connect here.",
+        // Must match `serve.host`'s config default — the serve surface is
+        // unauthenticated, so a LAN bind is an explicit operator choice.
+        // `defaults_match_config_defaults` pins this equality.
+        default: "127.0.0.1",
+        when: "Set 0.0.0.0 to expose serve on the network; the default keeps it private to this machine.",
         note: Some("Paired with port (default 11435). Changes take effect on the next serve/restart."),
         options: &[],
     },

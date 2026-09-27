@@ -18,6 +18,29 @@
 
 use std::sync::mpsc::Sender;
 
+/// Visual payload for a VL request.
+///
+/// Image decode is CPU-side (daemon). `vision_forward` runs on the slot
+/// engine thread, which exclusively owns the GPU and VisionWeights.
+/// The engine splices the resulting embeddings at `<|image_pad|>` positions
+/// during a per-token prefill that uses `forward_scratch_embed_mrope`.
+///
+/// `mrope_positions` carries the 3D (t, h, w) position for every prompt token,
+/// already offset by `base` so values are absolute rope phases. `rope_delta`
+/// is added to the running sequence length for decode-step positions.
+pub struct VisualData {
+    /// Vision-tower patch tensor from `extract_patches` (CPU).
+    pub patches: Vec<f32>,
+    pub grid_h: usize,
+    pub grid_w: usize,
+    /// Number of post-merge visual tokens to splice at image_pad positions.
+    pub n_visual_tokens: usize,
+    /// 3D M-RoPE positions for every prompt token, offset by base.
+    pub mrope_positions: Vec<[i32; 3]>,
+    /// rope_delta for decode positions past the prompt.
+    pub rope_delta: i32,
+}
+
 /// One request handed to the engine.
 ///
 /// `reply` is the client's own channel: the engine streams this request's
@@ -37,6 +60,52 @@ pub struct SubmitRequest {
     /// 0 disables top-k.
     pub top_k: i32,
     pub seed: u32,
+    /// Recency window in recent tokens for the penalties below. 0 disables
+    /// token penalties regardless of the penalty values.
+    pub repeat_window: usize,
+    /// Multiplicative recency-weighted repeat penalty; 1.0 = off.
+    pub repeat_penalty: f32,
+    /// OpenAI flat presence penalty; 0.0 = off. This is the mechanism that
+    /// suppresses block-level repetition loops on long generations.
+    pub presence_penalty: f32,
+    /// OpenAI frequency penalty (scaled by in-window count); 0.0 = off.
+    pub frequency_penalty: f32,
+    /// min-p cutoff; 0.0 = off.
+    pub min_p: f32,
+    /// Visual embeddings + M-RoPE for VL requests. None for text-only.
+    pub visual_data: Option<VisualData>,
+    /// JSON Schema for structured output (spec §7 G1/G2). When present, the
+    /// engine compiles it into a `SchemaMatcher` and applies a pre-sampling
+    /// token mask so every emitted token conforms to the schema. None for
+    /// unconstrained requests. The schema object is CLI-validated and
+    /// compiled at `validate_generate_caps` before submit; the engine
+    /// recompiles on admit to build the per-request cursor.
+    pub json_schema: Option<serde_json::Value>,
+    /// Whether the assistant turn opened inside a `<think>` span (spec §7.2
+    /// framing-aware grammar cursor). When true and `json_schema` is set,
+    /// the grammar mask is deferred until `</think>` is emitted — the think
+    /// preamble is not JSON and must not be masked by the schema.
+    pub started_in_think: bool,
+    /// Enforced thinking budget in think tokens (vLLM
+    /// `thinking_token_budget` parity): once the cursor consumes this many
+    /// think tokens, the mask allows ONLY the think close, forcing the span
+    /// to end through the normal commit path. `usize::MAX` = uncapped.
+    ///
+    /// Scope: enforcement rides the grammar cursor, so it engages on
+    /// grammar-constrained requests (the case where an over-long think
+    /// span was fatal — burn-to-max then unsatisfiable). Unconstrained
+    /// requests keep OpenAI-style semantics: an over-long think span ends
+    /// at max_tokens with finish=length.
+    pub think_budget: usize,
+    /// (spec §5.3). The unified permit carries this from HTTP through daemon
+    /// to slots so bytes are charged once and released exactly once. Zero
+    /// when the request did not pass through the byte-bounded queue.
+    pub queue_bytes: u64,
+    /// Submitter-chosen cancellation identity (spec §4.6 C6): a queued
+    /// request has no session id yet, so `EngineCommand::CancelWaiting`
+    /// matches parked work by this tag. Idempotent — an unmatched tag is a
+    /// no-op. 0 means "no cancellation identity".
+    pub request_tag: u64,
     pub reply: Sender<Event>,
 }
 
@@ -83,6 +152,14 @@ pub enum DoneReason {
     ClientGone,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RejectClass {
+    Overload,
+    Validation,
+    Internal,
+    Cancel,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Event {
     /// `reused` — prompt tokens served from the session's existing KV;
@@ -103,6 +180,7 @@ pub enum Event {
         generated: usize,
     },
     Rejected {
+        class: RejectClass,
         reason: String,
     },
 }
@@ -127,6 +205,15 @@ pub struct EngineStats {
     /// from `restores`: a hit on a still-resident session restores nothing, and
     /// conflating the two makes a gate that never restores look like it did.
     pub prefix_hits: usize,
+    /// Total tokens served from the cross-session prefix cache (spec §4.5).
+    /// Distinct from `prefix_hits` (session-local continuation) and
+    /// `restores` (swap-in): these are tokens skipped because a prior
+    /// session published the same prefix to the radix index.
+    pub reused_tokens: usize,
+    /// Free physical KV pages at the last completed step (A20 soak
+    /// telemetry). A monotonic decline across identical request cycles is
+    /// the page-level leak signature the oracle asserts against.
+    pub pool_free_pages: usize,
 }
 
 impl EngineStats {
@@ -142,8 +229,15 @@ impl EngineStats {
     pub fn note_restore(&mut self) {
         self.restores += 1;
     }
+
+    pub fn note_reused_tokens(&mut self, n: usize) {
+        self.reused_tokens += n;
+    }
     pub fn note_prefix_hit(&mut self) {
         self.prefix_hits += 1;
+    }
+    pub fn note_pool_free_pages(&mut self, n: usize) {
+        self.pool_free_pages = n;
     }
 }
 

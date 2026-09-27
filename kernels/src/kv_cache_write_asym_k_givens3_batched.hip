@@ -11,6 +11,7 @@
 #include <hip/hip_runtime.h>
 #include "turbo_common.h"
 #include "givens_common.h"
+#include "kv_slot_desc.h"
 
 extern "C" __global__ void kv_cache_write_asym_k_givens3_batched(
     unsigned char* __restrict__ k_dst,
@@ -20,13 +21,27 @@ extern "C" __global__ void kv_cache_write_asym_k_givens3_batched(
     const float* __restrict__ sin_theta,
     int n_kv_heads,
     int head_dim,
-    int batch_size
+    int batch_size,
+    // Multi-slot addressing: when non-null, `row_slot[bid]` selects the
+    // KvSlotDesc whose `legacy_k_base`/block table translates this row's
+    // destination position. Nulls = legacy single-arena mode, byte-identical
+    // to the pre-port kernel.
+    const KvSlotDesc* __restrict__ slot_descs, // [n_slots] or nullptr = legacy
+    const int* __restrict__ row_slot           // [batch_size] or nullptr = legacy
 ) {
     const int h = blockIdx.x;
     const int bid = blockIdx.y;
     if (h >= n_kv_heads || bid >= batch_size) return;
     const int tid = threadIdx.x;
     const int pos = positions[bid];
+
+    // One code path for both modes: in legacy mode we synthesise a zero-base
+    // descriptor, so the address arithmetic below is unchanged and the
+    // output is bitwise identical to the pre-port kernel.
+    const int slot = (row_slot != nullptr) ? row_slot[bid] : 0;
+    const KvSlotDesc desc = (slot_descs != nullptr)
+        ? slot_descs[slot]
+        : kv_slot_legacy(0, 0);
 
     const int kv_dim = n_kv_heads * head_dim;
     const int bytes_per_head = 4 + (head_dim * 3) / 8;
@@ -93,7 +108,8 @@ extern "C" __global__ void kv_cache_write_asym_k_givens3_batched(
     float recon_norm = sqrtf(scratch[0]);
     float cnorm = (recon_norm > 1e-10f) ? orig_norm / recon_norm : orig_norm;
 
-    unsigned char* out = k_dst + (size_t)pos * bytes_per_pos + h * bytes_per_head;
+    unsigned char* out =
+        k_dst + kv_offset_for_k(desc, pos, bytes_per_pos) + h * bytes_per_head;
     if (tid == 0) *(float*)out = cnorm;
 
     unsigned int packed = 0;

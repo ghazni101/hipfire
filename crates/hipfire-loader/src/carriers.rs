@@ -43,6 +43,16 @@ struct SourceMeta {
     arch_id: u32,
 }
 
+/// Discover a `.vl` sidecar file for the given trunk model path.
+///
+/// Same resolution the daemon uses (they are one implementation now, in
+/// [`hipfire_runtime::sidecar`]): `HIPFIRE_VL_FILE` env, then the
+/// `<stem>.vl` sibling candidates (`<stem>` also strips `.hfq` and a quant
+/// suffix, so `model.mq4v2.hfq` finds `model.vl`).
+fn discover_vl_path(model_path: &str) -> Option<std::path::PathBuf> {
+    hipfire_runtime::sidecar::resolve_vl_sidecar(model_path)
+}
+
 fn resolve_source_meta(src: &ModelSource, path: &str) -> Result<SourceMeta, String> {
     match src {
         ModelSource::Hfq(hfq) => Ok(SourceMeta {
@@ -565,10 +575,84 @@ impl Carrier for Qwen35Carrier {
                 let (vision_config, vision_weights) = {
                     use hipfire_arch_qwen35_vl::Qwen35Vl;
                     use hipfire_runtime::arch::Architecture;
-                    let has_vision = hfq_file
+
+                    // Vision tower sidecar resolution: an explicit
+                    // `--vision-path` (or HIPFIRE_VL_FILE) must never be
+                    // shadowed by a co-located `<stem>.vl` sibling — the
+                    // operator's tower wins, and sibling discovery is only
+                    // the fallback.
+                    let vl_path = ctx
+                        .vision_path
+                        .as_ref()
+                        .map(std::path::PathBuf::from)
+                        // `vision_mode=off` suppresses sibling discovery too —
+                        // a co-located `<stem>.vl` must not load the tower
+                        // under the documented text-only default (the daemon
+                        // gates the explicit sidecar; this gates the probe).
+                        .or_else(|| {
+                            if ctx.vision_mode == "off" {
+                                None
+                            } else {
+                                discover_vl_path(ctx.path)
+                            }
+                        });
+                    let has_inline_vision = hfq_file
                         .tensor_data("model.visual.patch_embed.proj.weight")
                         .is_some();
-                    if has_vision {
+
+                    if let Some(vl) = &vl_path {
+                        eprintln!("  loading vision weights from .vl sidecar: {}", vl.display());
+                        let mut vl_hfq = hipfire_runtime::hfq::HfqFile::open(vl)
+                            .map_err(|e| format!("open .vl file {}: {e}", vl.display()))?;
+                        let vc = Qwen35Vl::config_from_hfq(&vl_hfq)
+                            .map_err(|e| format!(".vl vision_config: {e}"))?;
+                        // Identity: the tower's projector writes the trunk's
+                        // text hidden width. A sidecar paired with a different
+                        // trunk (a sibling `foo.vl` next to `bar.mq4`) would
+                        // load "successfully" and then misalign every image
+                        // embedding — refuse the mismatch at load time.
+                        // Probe the trunk's final norm under its real HFQ
+                        // names (`output_norm.weight` is GGUF-only and never
+                        // resolves here, which would skip the check entirely).
+                        let trunk_dim = [
+                            "model.language_model.norm.weight",
+                            "model.norm.weight",
+                            "norm.weight",
+                        ]
+                        .iter()
+                        .find_map(|n| hfq_file.find_tensor_info(n))
+                        .and_then(|t| t.shape.first().copied())
+                        .map(|d| d as usize);
+                        if let Some(trunk_dim) = trunk_dim {
+                            if vc.out_hidden_size != trunk_dim {
+                                return Err(format!(
+                                    "vision sidecar {} does not match trunk {}: projector \
+                                     output {} != trunk hidden {}",
+                                    vl.display(),
+                                    ctx.path,
+                                    vc.out_hidden_size,
+                                    trunk_dim
+                                ));
+                            }
+                        }
+
+                        // Fail the load, loudly: swallowing the error here
+                        // used to yield (Some(config), None) — a model whose
+                        // daemon-side image gate stays open (has_vision keys
+                        // off the config) but whose vision weights are gone.
+                        // The sequential path then panics on the unwrap and
+                        // the slots path rejects image requests with a
+                        // misleading "no vision encoder" message. A corrupt
+                        // or truncated .vl must be a load-time error the
+                        // operator can see.
+                        let vw = Qwen35Vl::load_weights(&mut vl_hfq, &vc, ctx.gpu)
+                            .map_err(|e| format!("VL weight load from .vl: {e:?}"))?;
+                        eprintln!(
+                            "  VL model: vision encoder (hidden={}, layers={})",
+                            vc.hidden_size, vc.num_layers
+                        );
+                        (Some(vc), Some(vw))
+                    } else if has_inline_vision {
                         let vc = Qwen35Vl::config_from_hfq(&hfq_file).ok();
                         match vc {
                             Some(vc) => {

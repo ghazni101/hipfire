@@ -5,7 +5,7 @@
 //! Qwen-family sites use [`parse_qwen_k_name`] / [`resolve_kv_pair`] (shared
 //! name table, hard errors, arch-aware `auto`). Non-Qwen sites keep [`resolve`].
 
-pub use saddle_core::kv::{KvMode, VMode};
+pub use saddle_core::kv::{KvMode, SlotKvTierPlan, VMode};
 
 /// Per-site alias table + accepted set + default. One const per load site.
 #[derive(Clone, Copy)]
@@ -403,6 +403,25 @@ pub const MAPLE_POLICY: KvModePolicy = KvModePolicy {
     default: Bf16,
 };
 
+/// Site 8 — the multi-slot serve engine (qwen35). The slots engine ran
+/// Q8_0-only for its whole life; the full static ladder is now wired
+/// end-to-end (descriptor-aware K writers + flash tile kernels, legacy and
+/// paged pools), so every rotated tier the sequential path accepts is
+/// accepted here too — EXCEPT the native fp8/bf16 tiers, which have no
+/// slot-reader support and must stay refused (fail closed) on this site.
+/// The DEFAULT stays q8 — deliberately NOT the sequential site's fwht3:
+/// the slots q8 path has production mileage on every fixture, and an
+/// operator who wants a rotated tier on the slots engine says so
+/// explicitly (`HIPFIRE_KV_MODE=fwht3` / config). "auto" therefore means
+/// q8 HERE (mirroring the qwen35-pp site's convention, not the hfq site's).
+/// Names come from the shared Qwen table: `asymN`/`turboN` → FwhtN,
+/// `legacy-asymN` → AsymN.
+pub const QWEN35_SLOTS_POLICY: KvModePolicy = KvModePolicy {
+    site: "qwen35-slots",
+    normalize_alias: normalize_qwen,
+    accepted: &[Q8, Asym2, Asym3, Asym4, Fwht2, Fwht3, Fwht4],
+    default: Q8,
+};
 /// Pure: `&str + &'static policy → ResolveResult`. No GPU, no env read.
 /// Non-Qwen / Maple / legacy single-string path. Qwen pair sites prefer
 /// [`resolve_kv_pair`].
@@ -429,7 +448,17 @@ pub fn resolve(raw: &str, policy: &KvModePolicy) -> ResolveResult {
             let warning = if raw.is_empty() {
                 None
             } else {
-                Some("unrecognized or unsupported HIPFIRE_KV_MODE; using site default")
+                // Once-per-load diagnostic: leak the formatted string to
+                // satisfy the `&'static str` warning type.
+                let leaked: &'static str = Box::leak(
+                    format!(
+                        "unrecognized or unsupported kv mode {raw:?} for site {}; \
+                         using site default {:?}",
+                        policy.site, policy.default
+                    )
+                    .into_boxed_str(),
+                );
+                Some(leaked)
             };
             (policy.default, warning)
         }
@@ -755,6 +784,55 @@ mod tests {
         }
         let garbage = resolve("garbage", p);
         assert_eq!(garbage.mode, KvMode::Bf16);
+        assert!(garbage.warning.is_some());
+    }
+
+    #[test]
+    fn truth_table_qwen35_slots_default_is_q8() {
+        let p = &QWEN35_SLOTS_POLICY;
+        // Unset and "auto" both mean q8, SILENTLY — q8 is the slots
+        // engine's shipped default and its longest-validated path.
+        assert_eq!(resolve("", p).mode, KvMode::Q8);
+        assert!(resolve("", p).warning.is_none());
+        assert_eq!(resolve("auto", p).mode, KvMode::Q8);
+        assert!(resolve("auto", p).warning.is_none());
+        assert_eq!(resolve("q8", p).mode, KvMode::Q8);
+        assert!(resolve("q8", p).warning.is_none());
+        // Every rotated tier is HONORED (the ladder is fully wired) and
+        // must not warn — an explicit tier is an intentional choice.
+        // Names use the shared Qwen table: asymN/turboN → FwhtN,
+        // legacy-asymN → AsymN.
+        for (raw, mode) in [
+            ("asym2", KvMode::Fwht2),
+            ("asym3", KvMode::Fwht3),
+            ("turbo", KvMode::Fwht3),
+            ("asym4", KvMode::Fwht4),
+            ("fwht2", KvMode::Fwht2),
+            ("fwht3", KvMode::Fwht3),
+            ("fwht4", KvMode::Fwht4),
+            ("legacy-asym2", KvMode::Asym2),
+            ("legacy-asym3", KvMode::Asym3),
+            ("legacy-asym4", KvMode::Asym4),
+        ] {
+            let r = resolve(raw, p);
+            assert_eq!(r.mode, mode, "{raw} must be honored on the slots site");
+            assert!(r.warning.is_none(), "{raw} must not warn");
+        }
+        // fp8/bf16 are not allocatable on the slots site (no slot readers):
+        // the single-string path refuses to the default WITH a warning
+        // (never a silent downgrade), and the pair path hard-errors instead
+        // of selecting an indivisible native tier.
+        for raw in ["fp8", "bf16"] {
+            let r = resolve(raw, p);
+            assert_eq!(r.mode, KvMode::Q8, "{raw} must not resolve to a native tier");
+            assert!(r.warning.is_some(), "{raw} must warn, not silently downgrade");
+            assert!(
+                resolve_kv_pair(raw, None, None, p, "gfx1201", true).is_err(),
+                "{raw} must error on the slots pair path"
+            );
+        }
+        let garbage = resolve("garbage", p);
+        assert_eq!(garbage.mode, KvMode::Q8);
         assert!(garbage.warning.is_some());
     }
 

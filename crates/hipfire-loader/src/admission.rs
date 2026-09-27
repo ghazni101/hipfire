@@ -110,6 +110,11 @@ pub struct SourceAdmission {
     /// tower probe tensor; the single/pp route threads it into `LoadCtx`.
     /// `None` = trunk-only (or explicit opt-out via empty string).
     pub vision_path: Option<std::path::PathBuf>,
+    /// The resolved `vision.mode` ladder value (`off`/`auto`/`on`). The
+    /// carrier needs it to gate `<stem>.vl` sibling discovery: `vision_path`
+    /// alone cannot distinguish "off" (never probe a sibling) from "auto with
+    /// no explicit sidecar" (probe allowed). `off` suppresses discovery.
+    pub vision_mode: String,
 }
 /// The physical VMM reservation equals `max_seq` without eviction; with
 /// CASK eviction it is `min(max_seq, eviction_window)`. Only the former must
@@ -603,6 +608,9 @@ pub fn admit_source(
     draft_path: Option<&str>,
     gpu_arch: &str,
     vision: Option<&str>,
+    // Resolved `vision.mode` (`off`/`auto`/`on`) — gates `.vl` sibling
+    // discovery in the carrier. `off` = never probe a sibling.
+    vision_mode: &str,
     head: Option<&str>,
     max_seq: usize,
     hints: KvBackendHints<'_>,
@@ -941,6 +949,7 @@ pub fn admit_source(
         qwen_default_q8: hints.qwen_default_q8,
         carrier,
         vision_path,
+        vision_mode: vision_mode.to_string(),
     })
 }
 
@@ -949,11 +958,11 @@ mod tests {
     use super::*;
     fn admit_source(
         path: &str, tp: usize, pp: usize, raw: Option<&str>, draft: Option<&str>,
-        arch: &str, vision: Option<&str>, head: Option<&str>, max_seq: usize,
+        arch: &str, vision: Option<&str>, vision_mode: &str, head: Option<&str>, max_seq: usize,
     ) -> Result<SourceAdmission, String> {
         super::admit_source(
             path, tp, pp, KvBackendRequest::from_override(raw)?, draft, arch,
-            vision, head, max_seq, KvBackendHints::without_device(),
+            vision, vision_mode, head, max_seq, KvBackendHints::without_device(),
         )
     }
 
@@ -1177,6 +1186,7 @@ mod tests {
                 None,
                 "gfx1100",
                 Some(sidecar.to_str().unwrap()),
+                "auto",
                 None,
                 4096,
             )
@@ -1204,6 +1214,7 @@ mod tests {
                 None,
                 "gfx1100",
                 Some(sidecar.to_str().unwrap()),
+                "auto",
                 None,
                 4096,
             )
@@ -1227,6 +1238,7 @@ mod tests {
                 None,
                 "gfx1100",
                 Some(sidecar.to_str().unwrap()),
+                "auto",
                 None,
                 4096,
             )
@@ -1252,7 +1264,7 @@ mod tests {
                 free_vram_bytes: None,
             };
             let admit = |request, arch| super::super::admit_source(
-                path, 1, 1, request, None, arch, None, None, 4096, hints,
+                path, 1, 1, request, None, arch, None, "auto", None, 4096, hints,
             );
             let auto = admit(KvBackendRequest::Automatic, "gfx1201").unwrap();
             assert_eq!(auto.kv_backend, KvBackend::Vmm);
@@ -1293,14 +1305,14 @@ mod tests {
             };
             let omitted = super::super::admit_source(
                 path.to_str().unwrap(), 1, 1, KvBackendRequest::Automatic,
-                None, "gfx1100", None, None, 0, hints,
+                None, "gfx1100", None, "auto", None, 0, hints,
             ).expect("MoE omission should not require dense PBS accounting");
             assert_eq!(omitted.max_seq, 32768);
             assert_eq!(omitted.kv_backend, KvBackend::Vmm);
             assert!(omitted.sequence_reason.is_some());
             let explicit = super::super::admit_source(
                 path.to_str().unwrap(), 1, 1, KvBackendRequest::Automatic,
-                None, "gfx1100", None, None, 50000, hints,
+                None, "gfx1100", None, "auto", None, 50000, hints,
             ).expect("explicit MoE max_seq must remain authoritative");
             assert_eq!(explicit.max_seq, 50000);
             assert!(explicit.sequence_reason.is_none());
@@ -1386,6 +1398,7 @@ mod tests {
                 None,
                 "gfx1151",
                 None,
+                "auto",
                 Some(head.to_str().unwrap()),
                 4096,
             )
@@ -1414,6 +1427,7 @@ mod tests {
                 None,
                 "gfx1151",
                 None,
+                "auto",
                 Some(""),
                 4096,
             )
@@ -1446,6 +1460,7 @@ mod tests {
                 None,
                 "gfx1151",
                 None,
+                "auto",
                 Some(head.to_str().unwrap()),
                 4096,
             )
@@ -1523,6 +1538,7 @@ mod tests {
                 None,
                 "gfx1151",
                 None,
+                "auto",
                 Some(head.to_str().unwrap()),
                 4096,
             )
@@ -1549,6 +1565,7 @@ mod tests {
                 None,
                 "gfx1151",
                 None,
+                "auto",
                 Some(head.to_str().unwrap()),
                 4096,
             )
@@ -1578,6 +1595,7 @@ mod tests {
                 None,
                 "gfx1151",
                 None,
+                "auto",
                 Some(head.to_str().unwrap()),
                 4096,
             )

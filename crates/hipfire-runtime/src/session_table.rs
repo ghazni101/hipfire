@@ -52,6 +52,42 @@ pub struct Session {
     /// message. Matching on the user turns and then replaying our own tokens
     /// keeps the prompt aligned with the KV we actually hold.
     pub convo: Vec<u64>,
+    /// M-RoPE phase offset carried by this conversation's KV, set by the
+    /// image turn that produced it (`VisualData::rope_delta`; 0 for
+    /// text-only conversations).
+    ///
+    /// A text follow-up to an image turn must keep addressing KV rows by
+    /// token index (that is what block tables and `positions[]` use) while
+    /// taking its rope phases from `pos + rope_delta` — the image turn's
+    /// stored keys carry compressed-grid phases, and after a merged image
+    /// grid the phase space trails the token index by exactly this delta.
+    /// Dropping it re-rotates every follow-up query against every image-turn
+    /// key by `|rope_delta|` positions and degrades cross-turn attention to
+    /// near-garbage (the "image follow-up echoes the previous answer"
+    /// symptom). Lives on the session, not the slot: it must survive
+    /// eviction/restore and apply wherever the session is resumed.
+    pub rope_delta: i32,
+    /// True once any turn of this conversation carried an image
+    /// (`req.visual_data.is_some()`). Sticky: a text continuation of an
+    /// image conversation keeps it set.
+    ///
+    /// This is the publish/lookup gate for the cross-session prefix cache —
+    /// NOT `rope_delta != 0`. `rope_delta` is `max(lh,lw) − lh·lw` for the
+    /// merged grid, which is 0 for any single-row/single-column image
+    /// (min(lh,lw) == 1), so a thin-image turn would publish its image-row
+    /// KV to the radix and a later text request could restore it — silent
+    /// wrong output (spec §6 X2). `has_image` is the positive marker.
+    pub has_image: bool,
+    /// Highest page-aligned token boundary of this session's KV that has
+    /// been published to the cross-session prefix cache (spec §4.6 C6).
+    ///
+    /// Lives on the session, not the slot: a continuation turn must resume
+    /// publication from here, or it re-takes cache refs on pages the radix
+    /// already owns (each orphaned ref strands the page away from the free
+    /// list — a monotonic pool drain across turns). Reset to 0 whenever the
+    /// session's physical pages are lost (swap/cold), because the radix's
+    /// handles no longer describe the restored pages.
+    pub published_boundary: usize,
     /// Monotonic stamp for LRU. Bumped by `touch`.
     pub last_used: u64,
 }
@@ -76,18 +112,21 @@ impl SessionTable {
         adm: &mut AdmissionController,
         requested_ctx: usize,
     ) -> Result<SessionId, AdmitError> {
-        let granted_ctx = adm.admit(requested_ctx)?;
+        // Mint the id first so the admission grant is keyed by it — two
+        // sessions with identical context sizes must never release each
+        // other's budget.
+        let id = self.next_id;
+        let granted_ctx = adm.admit(id, requested_ctx)?;
         let slot = match pool.acquire() {
             Some(slot) => slot,
             None => {
-                adm.release(granted_ctx);
+                adm.release(id);
                 return Err(AdmitError::PoolFull);
             }
         };
         // Monotonically increasing, never reused: a stale id from a closed
         // session must resolve to `None`, never silently address whoever now
         // holds that slot.
-        let id = self.next_id;
         self.next_id += 1;
         self.sessions.insert(
             id,
@@ -98,6 +137,9 @@ impl SessionTable {
                 next_pos: 0,
                 residency: Residency::Resident,
                 convo: Vec::new(),
+                rope_delta: 0,
+                has_image: false,
+                published_boundary: 0,
                 last_used: {
                     self.clock += 1;
                     self.clock
@@ -113,7 +155,7 @@ impl SessionTable {
             if let Some(slot) = session.slot {
                 pool.release(slot);
             }
-            adm.release(session.granted_ctx);
+            adm.release(id.0);
         }
     }
 
@@ -244,6 +286,23 @@ impl SessionTable {
             .map(|(id, _)| SessionId(*id))
     }
 
+    /// The LRU non-busy session REGARDLESS of residency — including Cold and
+    /// Swapped entries that hold no slot. The caller must CLOSE (not park)
+    /// such victims: a Cold/Swapped entry has no slot to free, and parking
+    /// it again would loop forever. This is the admission-budget recovery
+    /// path: a swapped-out session still holds its admission grant, and a
+    /// grant only a resident-only victim search can never reach starves
+    /// every newer request until the process restarts. Cold/Swapped
+    /// transcripts were also the unbounded host-memory growth: nothing but
+    /// an explicit client Close removed them.
+    pub fn lru_reclaimable_victim(&self, busy: &[SessionId]) -> Option<SessionId> {
+        self.sessions
+            .iter()
+            .filter(|(id, s)| !busy.iter().any(|b| b.0 == **id))
+            .min_by_key(|(_, s)| s.last_used)
+            .map(|(id, _)| SessionId(*id))
+    }
+
     /// Give up the slot, keeping the session restorable from its snapshot.
     pub fn mark_swapped(&mut self, pool: &mut SlotPool, id: SessionId) {
         if let Some(s) = self.sessions.get_mut(&id.0) {
@@ -251,6 +310,10 @@ impl SessionTable {
                 pool.release(slot);
             }
             s.residency = Residency::Swapped;
+            // The snapshot restore allocates FRESH pages; the radix's
+            // handles no longer describe this session's table, so the next
+            // published turn must start its publication accounting over.
+            s.published_boundary = 0;
         }
     }
 
@@ -263,6 +326,7 @@ impl SessionTable {
             }
             s.residency = Residency::Cold;
             s.next_pos = 0;
+            s.published_boundary = 0;
         }
     }
 

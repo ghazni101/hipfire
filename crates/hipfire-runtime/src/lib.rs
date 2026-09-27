@@ -54,11 +54,16 @@ pub mod model_source;
 pub mod multi_gpu;
 pub mod paro;
 pub mod prefix;
+pub mod prefix_index;
 pub mod reset_core;
 pub mod safetensors_source;
 pub mod sampler;
 pub mod sealed_moe;
 pub mod serve;
+pub mod serve_contract;
+pub mod serve_fairness;
+pub mod serve_wait;
+pub mod sidecar;
 pub mod spec;
 
 pub mod ngram_mod;
@@ -83,4 +88,10 @@ pub mod calibration;
 pub mod tool_call;
 pub mod weight_backend;
 
+pub use crate::serve_contract::{
+    ArchPolicy, CacheDomain, CanonicalError, CheckpointId, CommitBoundary, DeviceTopology,
+    DrafterDecision, KvLayout, LastTokenHandling, MissReason, PrefixLookup, PrefixLookupResult,
+    PublishLease, ReleaseDisposition, ReservationError, ResumeBundle, ResumePlan, ResumePlanError,
+    SharingNamespace, StepNeeds, StepReservation, StepTicket, TemplateIdentity, TokenizerIdentity,
+};
 pub use crate::arch::{maybe_screen_mmq, screen_weight_tensor, MmqScreenable};

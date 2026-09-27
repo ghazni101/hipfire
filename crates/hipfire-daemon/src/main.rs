@@ -83,6 +83,8 @@ use hipfire_generate::redline::{
     RedlineQwenSnapshot, RedlineSnapshot,
 };
 mod slots;
+mod vision_ladder;
+use vision_ladder::{apply_vision_mode_gate, resolve_vision_ladder};
 
 #[cfg(test)]
 pub(crate) static TERMINAL_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
@@ -752,21 +754,6 @@ fn ep_deferred_handoff_error_message(prior_err: &str, rollback_err: Option<&str>
 /// occupies `model` — that path tears down after successful new load.
 fn ep_deferred_needs_vmm_preflight(load_tp: usize, model_present: bool) -> bool {
     load_tp > 1 && !model_present
-}
-
-/// Daemon-side `vision_mode` gate for the tower sidecar path.
-///
-/// `off` (the default) is a hard override that drops even an explicit
-/// sidecar, mirroring the `dflash_mode=off` draft guard at the load site.
-/// Any other mode passes the `HIPFIRE_VISION_SIDECAR` / `params.vision`
-/// ladder result through untouched. Pure string plumbing — no arch or
-/// tensor knowledge; admission still validates the surviving path.
-fn apply_vision_mode_gate(vision_mode: &str, raw_vision: Option<String>) -> Option<String> {
-    if vision_mode == "off" {
-        None
-    } else {
-        raw_vision
-    }
 }
 
 /// Print a friendly, user-actionable message when Gpu::init fails. Matches
@@ -1467,37 +1454,37 @@ fn main() {
                         .and_then(|p| p.get("experimental_multi_slot_prefill_chunk"))
                         .and_then(|v| v.as_u64())
                         .unwrap_or(1024) as usize;
-                    // Effective KV selection for the slot engine. The capability
-                    // gate above already refused anything but q8/legacy;
-                    // these ride into EngineConfig so Rig::build fails closed.
-                    let slot_kv_mode = msg
-                        .get("params")
-                        .and_then(|p| p.get("kv_mode"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("q8");
-                    let slot_kv_backend = msg
-                        .get("params")
-                        .and_then(|p| p.get("kv_backend"))
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("legacy");
+                    let slot_params = slots::SlotLoadParams::from_load_msg(&msg);
+                    // Vision tower: the SAME ladder the ordinary arm applies
+                    // (`vision_mode=off` is a hard override). The slot engine
+                    // discovers the `.vl` sibling itself, so it has to be told
+                    // the mode — otherwise the documented text-only default
+                    // still pays the tower's ~1 GB on this route.
+                    let (slot_vision_mode, slot_vision, _) = resolve_vision_ladder(&msg);
                     match slots::SlotBackend::load(
                         path,
                         n_slots,
                         cap_tokens,
                         prefill_chunk,
-                        slot_kv_mode,
-                        slot_kv_backend,
+                        slot_params.mtp_k,
+                        &slot_params.kv_mode_raw,
+                        &slot_params.kv_backend,
+                        slot_params.dflash_draft,
+                        slot_params.dflash_required,
+                        &slot_vision_mode,
+                        slot_vision,
                     ) {
                         Ok(backend) => {
                             let arch = backend.arch_str().to_string();
                             let dim = backend.dim();
                             let layers = backend.layers();
                             let vocab = backend.vocab();
+                            let vl = backend.is_vl();
                             // Ensure ordinary model stays None — exactly one weight copy.
                             model = None;
                             slot_backend = Some(std::sync::Arc::new(backend));
                             resident_kv = Some(ResidentKvDiag {
-                                mode: Some("q8".to_owned()),
+                                mode: Some(slot_params.kv_mode_resolved.to_owned()),
                                 ..slot_kv_diag.clone()
                             });
                             // Per contract: continuous_batch_capable false, cache_capable true, reasoning_contract qwen_jinja, plus experimental flag.
@@ -1507,7 +1494,7 @@ fn main() {
                                 "dim": dim,
                                 "layers": layers,
                                 "vocab": vocab,
-                                "vl": false,
+                                "vl": vl,
                                 "reasoning_contract": "qwen_jinja",
                                 "reasoning_effort_native": false,
                                 "reasoning_efforts": [],
@@ -1520,7 +1507,7 @@ fn main() {
                                 "kv_backend_reason": slot_kv_diag.reason,
                                 "kv_backend_legacy": slot_kv_diag.legacy,
                                 "kv_backend_warning": slot_kv_diag.warning,
-                                "kv_mode": "q8",
+                                "kv_mode": slot_params.kv_mode_resolved,
                             });
                             let _ = writeln!(stdout, "{ack}");
                             let _ = stdout.flush();
@@ -1654,32 +1641,11 @@ fn main() {
                 // sidecar is skipped, so a default load never pays the +~1 GB
                 // tower VRAM. CLI-side gating is the primary path; this guard
                 // makes the flag durable for non-hipfire-CLI clients.
-                let vision_mode = msg
-                    .get("params")
-                    .and_then(|p| p.get("vision_mode"))
-                    .and_then(|v| v.as_str())
-                    .unwrap_or("off");
-                let env_vision = developer_var("HIPFIRE_VISION_SIDECAR").ok();
-                let raw_vision: Option<String> = match env_vision.as_deref() {
-                    Some("") => None,
-                    Some(p) => Some(p.to_string()),
-                    None => msg
-                        .get("params")
-                        .and_then(|p| p.get("vision"))
-                        .and_then(|v| v.as_str())
-                        .filter(|s| !s.is_empty())
-                        .map(|s| s.to_string()),
-                };
-                vision_gated_off = None;
-                if vision_mode == "off" {
-                    if let Some(v) = raw_vision.as_deref() {
-                        eprintln!(
-                            "[hipfire-daemon] vision_mode=off — skipping tower sidecar load ({v})"
-                        );
-                        vision_gated_off = Some(v.to_string());
-                    }
-                }
-                let vision_path: Option<String> = apply_vision_mode_gate(vision_mode, raw_vision);
+                //
+                // One implementation for both load arms: `resolve_vision_ladder`
+                // (next to `apply_vision_mode_gate`).
+                let (vision_mode, vision_path, gated_off) = resolve_vision_ladder(&msg);
+                vision_gated_off = gated_off;
                 // Gemma 4 EAGLE drafter (arch-22 `gemma4_unified_assistant`).
                 // Deliberately a SEPARATE param from `params.draft` (the
                 // qwen3.5 DFlash knob) so a DFlash .hfq can never be routed
@@ -2150,7 +2116,8 @@ fn main() {
                 };
                 let admission = match hipfire_loader::admission::admit_source(
                     path, tp, pp, backend_request, draft_path.as_deref(),
-                    gpu.arch.as_str(), vision_path.as_deref(), head_path.as_deref(), max_seq,
+                    gpu.arch.as_str(), vision_path.as_deref(), &vision_mode,
+                    head_path.as_deref(), max_seq,
                     hipfire_loader::admission::KvBackendHints {
                         kv_mode: kv_mode_override.as_deref(),
                         kv_k: kv_k_override.as_deref(),
@@ -2816,11 +2783,32 @@ fn main() {
                 // mode owns exactly one SlotEngine/weight set with no ordinary-model fallback.
                 // Spawn a bounded request worker so the main loop continues accepting independent generates.
                 if let Some(slot) = slot_backend.clone() {
+                    // Bound thread creation BEFORE spawning (spec §5.3:
+                    // "a guard acquired inside an already spawned thread
+                    // does not bound thread creation"). The worker's own
+                    // acquire_guard remains the hard atomic bound; this
+                    // pre-check keeps an arrival burst from spawning a
+                    // thread per rejected request.
+                    if slot.active_count() >= 32 {
+                        hipfire_engine::emit::emit_active_attempt_error(
+                            &mut stdout,
+                            Some(id),
+                            "too many concurrent slot requests (bounded worker limit hit)",
+                            // Overload, not validation: slot saturation is a
+                            // transient capacity condition → 429 + Retry-After.
+                            "overload",
+                            true,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        batch_clear_terminal(id, gen_attempt_id);
+                        continue;
+                    }
                     let msg_clone = msg.clone();
                     let id_owned = id.to_string();
                     let slot_clone = slot.clone();
                     let admission = admission;
-                    // Bounded: refuse if too many active? The backend's active counter bounds concurrency;
+                    // Bounded: the backend's active counter bounds concurrency;
                     // engine itself is the only GPU worker, so workers serialize on engine submit.
                     std::thread::spawn(move || {
                         // Each worker uses its own stdout handle; every event is one serde JSON line.

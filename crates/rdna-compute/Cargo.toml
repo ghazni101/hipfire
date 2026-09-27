@@ -809,3 +809,15 @@ required-features = ["lab"]
 [[example]]
 name = "tmp_scratch_leak_probe"
 required-features = ["lab"]
+
+[[example]]
+name = "test_kv_slot_desc_ports"
+required-features = ["lab"]
+
+[[example]]
+name = "vit_qtiled_parity_probe"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_vit_attention_shapes"
+required-features = ["lab"]

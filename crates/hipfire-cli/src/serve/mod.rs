@@ -121,6 +121,135 @@ pub(crate) struct ServeShared {
     /// Prometheus counters and histograms for `/metrics`. Lock-free, so a
     /// scrape never contends with a request.
     pub(crate) metrics: metrics::Metrics,
+    /// Per-request bounded pending-event budget (spec §5.4
+    /// `serve.stream_buffer_bytes`). A stalled consumer is stopped before
+    /// its event buffer fills past this bound.
+    pub(crate) stream_buffer_bytes: u64,
+    /// Maximum stalled-consumer interval (spec §5.4
+    /// `serve.stream_stall_timeout_ms`). The request is aborted after this
+    /// deadline on the multi-slot route.
+    pub(crate) stream_stall_timeout: Duration,
+    /// Route capability advertisement (spec §9.1 observability; OpenAI
+    /// discovery). Built ONCE at startup from the same resolved config the
+    /// daemon reads, so what `/health` advertises is what the slot engine
+    /// was built with — never a separate source of truth. Immutable:
+    /// route capabilities are configuration, not live state.
+    pub(crate) capabilities: serde_json::Value,
+}
+
+/// MTP sidecar probe for the capability advertisement — the same candidate
+/// list the loader/daemon use ([`hipfire_runtime::sidecar`]), so this
+/// cannot advertise `mtp_sidecar: false` for a head the load path finds.
+pub(crate) fn mtp_sidecar_exists(trunk: &std::path::Path) -> bool {
+    hipfire_runtime::sidecar::sidecar_candidates(trunk, "mtp")
+        .into_iter()
+        .any(|p| p.exists())
+}
+
+/// Vision sidecar probe for the capability advertisement.
+///
+/// Uses the SAME resolution the daemon's load path uses
+/// ([`hipfire_runtime::sidecar::resolve_vl_sidecar`]): `HIPFIRE_VL_FILE`
+/// then the `<stem>.vl` sibling candidates, with `.hfq`/quant suffixes
+/// stripped. A probe with its own narrower rule advertised
+/// `vision_sidecar: false` for a trunk whose tower the daemon would have
+/// loaded (`model.mq4v2.hfq` + `model.vl`).
+pub(crate) fn vision_sidecar_exists(trunk: &std::path::Path) -> bool {
+    hipfire_runtime::sidecar::resolve_vl_sidecar(&trunk.to_string_lossy()).is_some()
+}
+
+/// Build the route capability advertisement from the resolved serve
+/// configuration (spec §9.1). Pure so tests can pin the payload shape.
+/// Values come from the SAME config resolution the daemon's slot engine
+/// reads, so this never drifts from what the engine was built with.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn route_capabilities(
+    multi_slot: bool,
+    multi_slot_slots: u64,
+    multi_slot_ctx: u64,
+    multi_slot_prefill_chunk: u64,
+    prefix_cache: bool,
+    prefix_cache_max_bytes: u64,
+    structured_jump_forward: bool,
+    max_batch_tokens: u64,
+    prefill_min_tokens: u64,
+    max_queue: u64,
+    max_queue_bytes: u64,
+    queue_timeout_ms: u64,
+    stream_buffer_bytes: u64,
+    stream_stall_timeout_ms: u64,
+    max_request_bytes: u64,
+) -> serde_json::Value {
+    // Structured output is a property of the multi-slot route (the strict
+    // json_schema subset + framing-aware cursor live in the slot engine);
+    // the standard route refuses response_format rather than enforcing it.
+    let structured_output = multi_slot;
+    serde_json::json!({
+        "openai_compatible": true,
+        "mode": if multi_slot { "multi-slot" } else { "standard" },
+        "streaming": true,
+        "multi_slot": multi_slot,
+        "multi_slot_slots": multi_slot_slots,
+        "multi_slot_ctx": multi_slot_ctx,
+        "multi_slot_prefill_chunk": multi_slot_prefill_chunk,
+        "prefix_cache": prefix_cache,
+        "prefix_cache_max_bytes": prefix_cache_max_bytes,
+        "structured_output": structured_output,
+        "structured_output_subset": if structured_output {
+            serde_json::json!("json-schema-strict-v1")
+        } else {
+            serde_json::Value::Null
+        },
+        "structured_jump_forward": structured_jump_forward,
+        "max_batch_tokens": max_batch_tokens,
+        "prefill_min_tokens": prefill_min_tokens,
+        "max_queue": max_queue,
+        "max_queue_bytes": max_queue_bytes,
+        "queue_timeout_ms": queue_timeout_ms,
+        "stream_buffer_bytes": stream_buffer_bytes,
+        "stream_stall_timeout_ms": stream_stall_timeout_ms,
+        "max_request_bytes": max_request_bytes,
+        // Honest refusal list: fields this route rejects BEFORE generation
+        // (typed 400s). Mirrors `multi_slot_request_supported` (gateway) +
+        // `validate_generate_caps` (daemon), which together refuse every
+        // entry below — a client that only reads the advertisement must not
+        // be surprised by a 400 for a field it was never told about.
+        // `images+tools` is a rejected COMBINATION, not a field, so it is
+        // spelled out separately.
+        "refused_request_fields": if multi_slot {
+            serde_json::json!([
+                "stop",
+                "logprobs",
+                "top_logprobs",
+                "n",
+                "best_of",
+                "logit_bias",
+                "echo",
+                "suffix",
+                "reasoning_effort",
+                "response_format:json_object",
+                "tools+image",
+            ])
+        } else {
+            serde_json::json!(["response_format"])
+        },
+    })
+}
+
+/// Per-model capability projection for `/v1/models`: the ROUTE-level
+/// multi-slot/structured-output facts plus model-file facts (sidecar
+/// presence) probed from the trunk path.
+pub(crate) fn model_capabilities(
+    route: &serde_json::Value,
+    trunk: &std::path::Path,
+) -> serde_json::Value {
+    serde_json::json!({
+        "multi_slot": route["multi_slot"],
+        "structured_output": route["structured_output"],
+        "prefix_cache": route["prefix_cache"],
+        "mtp_sidecar": mtp_sidecar_exists(trunk),
+        "vision_sidecar": vision_sidecar_exists(trunk),
+    })
 }
 
 #[derive(Debug, Default)]
@@ -131,7 +260,28 @@ pub(crate) struct AdmissionState {
     /// A batch-ineligible request holds the backend exclusively.
     ineligible_busy: bool,
     queued: usize,
+    /// Total canonical pending-input bytes held by queued requests (spec §5.3).
+    /// A queue count alone is insufficient; this bounds total bytes so a few
+    /// large prompts cannot exhaust memory while staying under `max_queue`.
+    queued_bytes: u64,
     batch_model: Option<String>,
+}
+
+/// Typed overload classification for admission rejection (spec §5.3/S3).
+///
+/// HTTP 429 = bounded-queue rejection (queue full or byte budget exceeded);
+/// HTTP 503 = unavailable/poisoned backend or cancellation. The HTTP layer
+/// maps this to the correct status code.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum AdmissionErrorKind {
+    /// Queue depth or byte budget exceeded → HTTP 429.
+    QueueFull,
+    /// Queue wait timed out → HTTP 429.
+    QueueTimeout,
+    /// Request cancelled before admission → HTTP 503.
+    Cancelled,
+    /// Backend unavailable or poisoned → HTTP 503.
+    Unavailable,
 }
 
 pub(crate) struct Admission {
@@ -140,6 +290,11 @@ pub(crate) struct Admission {
     notify: Notify,
     max_queue: usize,
     timeout: Duration,
+    /// Aggregate canonical pending-input byte budget (spec §5.3
+    /// `serve.max_queue_bytes`). Zero disables the byte cap (only valid when
+    /// multi-slot is off; the startup guard rejects `max_queue==0` for
+    /// multi-slot, and this field is positive from config validation).
+    max_queue_bytes: u64,
     /// How many batch-eligible requests may be in flight at once. One for the
     /// single-daemon backend -- this gate is what protects it -- and the slot
     /// count when the multi-slot engine is active, which has its own admission
@@ -153,6 +308,7 @@ impl std::fmt::Debug for Admission {
         f.debug_struct("Admission")
             .field("state", &*state)
             .field("max_queue", &self.max_queue)
+            .field("max_queue_bytes", &self.max_queue_bytes)
             .field("timeout", &self.timeout)
             .field("capacity", &self.capacity)
             .finish()
@@ -163,6 +319,18 @@ impl std::fmt::Debug for Admission {
 pub(crate) struct AdmissionError {
     message: String,
     retry_after_seconds: u64,
+    kind: AdmissionErrorKind,
+}
+
+impl AdmissionError {
+    pub(crate) fn kind(&self) -> AdmissionErrorKind {
+        self.kind
+    }
+
+    /// True when the error is a client-side cancellation (spec §5.3).
+    pub(crate) fn is_cancelled(&self) -> bool {
+        self.kind == AdmissionErrorKind::Cancelled
+    }
 }
 
 impl std::fmt::Display for AdmissionError {
@@ -178,11 +346,31 @@ pub(crate) struct AdmissionGuard {
     admission: Arc<Admission>,
     is_eligible: bool,
     model: Option<String>,
+    /// Canonical pending-input bytes this request charged to the queue
+    /// (spec §5.3). Released exactly once at ACQUIRE time (the queued
+    /// byte charge converts to the in-flight charge) across
+    /// cancel/timeout/normal paths. Zero when the request was admitted
+    /// immediately (never queued).
+    queue_bytes: u64,
+}
+
+impl AdmissionGuard {
+    /// Canonical pending-input bytes carried by this permit (spec §5.3).
+    /// The daemon submit path reads this to propagate the unified permit.
+    pub(crate) fn queue_bytes(&self) -> u64 {
+        self.queue_bytes
+    }
+
+    pub(crate) fn is_eligible(&self) -> bool {
+        self.is_eligible
+    }
 }
 
 struct AdmissionWaiter {
     admission: Arc<Admission>,
     active: bool,
+    /// Bytes this waiter charged to `queued_bytes`; released on drop if active.
+    bytes: u64,
 }
 
 impl AdmissionWaiter {
@@ -202,6 +390,7 @@ impl Drop for AdmissionWaiter {
             .lock()
             .unwrap_or_else(|error| error.into_inner());
         state.queued = state.queued.saturating_sub(1);
+        state.queued_bytes = state.queued_bytes.saturating_sub(self.bytes);
         drop(state);
         self.admission.available.notify_all();
         self.admission.notify.notify_waiters();
@@ -210,15 +399,32 @@ impl Drop for AdmissionWaiter {
 
 impl Admission {
     pub(crate) fn new(max_queue: usize, timeout: Duration) -> Self {
-        Self::new_with_capacity(max_queue, timeout, 1)
+        Self::new_with_capacity_and_bytes(max_queue, timeout, 1, 0)
     }
-    pub(crate) fn new_with_capacity(max_queue: usize, timeout: Duration, capacity: usize) -> Self {
+    pub(crate) fn new_with_capacity(
+        max_queue: usize,
+        timeout: Duration,
+        capacity: usize,
+    ) -> Self {
+        Self::new_with_capacity_and_bytes(max_queue, timeout, capacity, 0)
+    }
+
+    /// Construct with an aggregate queue byte budget (spec §5.3
+    /// `serve.max_queue_bytes`). `max_queue_bytes == 0` disables the byte
+    /// cap (only valid when multi-slot is off).
+    pub(crate) fn new_with_capacity_and_bytes(
+        max_queue: usize,
+        timeout: Duration,
+        capacity: usize,
+        max_queue_bytes: u64,
+    ) -> Self {
         Self {
             state: Mutex::new(AdmissionState::default()),
             available: Condvar::new(),
             notify: Notify::new(),
             max_queue,
             timeout,
+            max_queue_bytes,
             capacity: capacity.max(1),
         }
     }
@@ -235,6 +441,39 @@ impl Admission {
         self.capacity
     }
 
+    /// Total canonical pending-input bytes currently held by queued
+    /// requests (spec §5.3).
+    pub(crate) fn queued_bytes(&self) -> u64 {
+        self.state
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .queued_bytes
+    }
+
+    pub(crate) fn max_queue_bytes(&self) -> u64 {
+        self.max_queue_bytes
+    }
+
+    /// Check the aggregate byte budget before queuing (spec §5.3).
+    /// Returns `Ok(())` if the bytes fit, or a typed `QueueFull` error.
+    fn check_byte_budget(&self, state: &AdmissionState, bytes: u64) -> Result<(), AdmissionError> {
+        if self.max_queue_bytes == 0 {
+            return Ok(());
+        }
+        let new_total = state.queued_bytes.saturating_add(bytes);
+        if new_total > self.max_queue_bytes {
+            return Err(AdmissionError {
+                message: format!(
+                    "serve queue byte budget exceeded ({}+{} > {})",
+                    state.queued_bytes, bytes, self.max_queue_bytes
+                ),
+                retry_after_seconds: self.retry_after_seconds(),
+                kind: AdmissionErrorKind::QueueFull,
+            });
+        }
+        Ok(())
+    }
+
     pub(crate) fn acquire(self: &Arc<Self>) -> std::result::Result<AdmissionGuard, AdmissionError> {
         self.acquire_for(false, None)
     }
@@ -243,6 +482,18 @@ impl Admission {
         self: &Arc<Self>,
         is_eligible: bool,
         model: Option<&str>,
+    ) -> std::result::Result<AdmissionGuard, AdmissionError> {
+        self.acquire_for_with_bytes(is_eligible, model, 0)
+    }
+
+    /// Synchronous acquire with a canonical pending-input byte charge
+    /// (spec §5.3). `request_bytes` is charged to the aggregate queue byte
+    /// budget while waiting and released on the guard's Drop.
+    pub(crate) fn acquire_for_with_bytes(
+        self: &Arc<Self>,
+        is_eligible: bool,
+        model: Option<&str>,
+        request_bytes: u64,
     ) -> std::result::Result<AdmissionGuard, AdmissionError> {
         let model_owned = model.map(|s| s.to_owned());
         let mut state = self.state.lock().unwrap_or_else(|error| error.into_inner());
@@ -261,6 +512,7 @@ impl Admission {
                     admission: Arc::clone(self),
                     is_eligible: true,
                     model: model_owned,
+                    queue_bytes: 0,
                 });
             }
         } else if state.eligible == 0 && !state.ineligible_busy && state.queued == 0 {
@@ -269,6 +521,7 @@ impl Admission {
                 admission: Arc::clone(self),
                 is_eligible: false,
                 model: None,
+                queue_bytes: 0,
             });
         }
         if self.max_queue != 0 && state.queued >= self.max_queue {
@@ -278,9 +531,12 @@ impl Admission {
                     state.queued, self.max_queue
                 ),
                 retry_after_seconds: self.retry_after_seconds(),
+                kind: AdmissionErrorKind::QueueFull,
             });
         }
+        self.check_byte_budget(&state, request_bytes)?;
         state.queued = state.queued.saturating_add(1);
+        state.queued_bytes = state.queued_bytes.saturating_add(request_bytes);
         let started = Instant::now();
         loop {
             if self.timeout.is_zero() {
@@ -292,12 +548,14 @@ impl Admission {
                 let remaining = self.timeout.saturating_sub(started.elapsed());
                 if remaining.is_zero() {
                     state.queued = state.queued.saturating_sub(1);
+                    state.queued_bytes = state.queued_bytes.saturating_sub(request_bytes);
                     return Err(AdmissionError {
                         message: format!(
                             "serve queue wait exceeded {}ms",
                             self.timeout.as_millis()
                         ),
                         retry_after_seconds: self.retry_after_seconds(),
+                        kind: AdmissionErrorKind::QueueTimeout,
                     });
                 }
                 let (next, wait) = self
@@ -315,12 +573,15 @@ impl Admission {
                     };
                     if !can_acquire {
                         state.queued = state.queued.saturating_sub(1);
+                        state.queued_bytes =
+                            state.queued_bytes.saturating_sub(request_bytes);
                         return Err(AdmissionError {
                             message: format!(
                                 "serve queue wait exceeded {}ms",
                                 self.timeout.as_millis()
                             ),
                             retry_after_seconds: self.retry_after_seconds(),
+                            kind: AdmissionErrorKind::QueueTimeout,
                         });
                     }
                 }
@@ -334,6 +595,7 @@ impl Admission {
             };
             if can_acquire {
                 state.queued = state.queued.saturating_sub(1);
+                state.queued_bytes = state.queued_bytes.saturating_sub(request_bytes);
                 if is_eligible {
                     state.eligible += 1;
                     if state.batch_model.is_none() {
@@ -343,6 +605,7 @@ impl Admission {
                         admission: Arc::clone(self),
                         is_eligible: true,
                         model: model_owned.clone(),
+                        queue_bytes: request_bytes,
                     });
                 } else {
                     state.ineligible_busy = true;
@@ -350,6 +613,7 @@ impl Admission {
                         admission: Arc::clone(self),
                         is_eligible: false,
                         model: None,
+                        queue_bytes: request_bytes,
                     });
                 }
             }
@@ -381,11 +645,28 @@ impl Admission {
         model: Option<&str>,
         cancel: CancellationToken,
     ) -> std::result::Result<AdmissionGuard, AdmissionError> {
+        self.acquire_for_async_with_bytes(is_eligible, model, 0, cancel)
+            .await
+    }
+
+    /// Async acquire with a canonical pending-input byte charge (spec §5.3).
+    /// `request_bytes` is charged to the aggregate queue byte budget while
+    /// waiting and released exactly once — on `AdmissionWaiter::drop` if the
+    /// wait is cancelled/timed-out, or on `AdmissionGuard::drop` after
+    /// successful admission.
+    pub(crate) async fn acquire_for_async_with_bytes(
+        self: &Arc<Self>,
+        is_eligible: bool,
+        model: Option<&str>,
+        request_bytes: u64,
+        cancel: CancellationToken,
+    ) -> std::result::Result<AdmissionGuard, AdmissionError> {
         let model_owned = model.map(str::to_owned);
         if cancel.is_cancelled() {
             return Err(AdmissionError {
                 message: "cancelled".to_string(),
                 retry_after_seconds: self.retry_after_seconds(),
+                kind: AdmissionErrorKind::Cancelled,
             });
         }
         {
@@ -408,6 +689,7 @@ impl Admission {
                         admission: Arc::clone(self),
                         is_eligible: true,
                         model: model_owned,
+                        queue_bytes: 0,
                     });
                 }
                 state.ineligible_busy = true;
@@ -415,6 +697,7 @@ impl Admission {
                     admission: Arc::clone(self),
                     is_eligible: false,
                     model: None,
+                    queue_bytes: 0,
                 });
             }
             if self.max_queue != 0 && state.queued >= self.max_queue {
@@ -424,13 +707,17 @@ impl Admission {
                         state.queued, self.max_queue
                     ),
                     retry_after_seconds: self.retry_after_seconds(),
+                    kind: AdmissionErrorKind::QueueFull,
                 });
             }
+            self.check_byte_budget(&state, request_bytes)?;
             state.queued = state.queued.saturating_add(1);
+            state.queued_bytes = state.queued_bytes.saturating_add(request_bytes);
         }
         let mut queued = AdmissionWaiter {
             admission: Arc::clone(self),
             active: true,
+            bytes: request_bytes,
         };
 
         let started = Instant::now();
@@ -442,6 +729,7 @@ impl Admission {
                 return Err(AdmissionError {
                     message: "cancelled".to_string(),
                     retry_after_seconds: self.retry_after_seconds(),
+                    kind: AdmissionErrorKind::Cancelled,
                 });
             }
             {
@@ -455,6 +743,8 @@ impl Admission {
                 };
                 if can_acquire {
                     state.queued = state.queued.saturating_sub(1);
+                    state.queued_bytes =
+                        state.queued_bytes.saturating_sub(request_bytes);
                     queued.disarm();
                     if is_eligible {
                         state.eligible += 1;
@@ -465,6 +755,7 @@ impl Admission {
                             admission: Arc::clone(self),
                             is_eligible: true,
                             model: model_owned.clone(),
+                            queue_bytes: request_bytes,
                         });
                     }
                     state.ineligible_busy = true;
@@ -472,6 +763,7 @@ impl Admission {
                         admission: Arc::clone(self),
                         is_eligible: false,
                         model: None,
+                        queue_bytes: request_bytes,
                     });
                 }
             }
@@ -481,6 +773,7 @@ impl Admission {
                 return Err(AdmissionError {
                     message: format!("serve queue wait exceeded {}ms", self.timeout.as_millis()),
                     retry_after_seconds: self.retry_after_seconds(),
+                    kind: AdmissionErrorKind::QueueTimeout,
                 });
             }
             if self.timeout.is_zero() {
@@ -877,9 +1170,37 @@ pub(crate) fn serve_foreground(
     let multi_slot_ctx = config_u64(&global, "serve.multi_slot_ctx").unwrap_or(8192);
     let multi_slot_prefill_chunk =
         config_u64(&global, "serve.multi_slot_prefill_chunk").unwrap_or(1024);
+    // Serving cache/scheduler contract keys (spec §9.1). Read here for
+    // startup validation only; the runtime does not yet consume them.
+    let max_batch_tokens = config_u64(&global, "serve.max_batch_tokens")?;
+    let prefill_min_tokens = config_u64(&global, "serve.prefill_min_tokens")?;
+    // Aggregate queue byte budget and stream backpressure bounds (spec §5.3,
+    // §5.4). Read here and threaded into ServeShared/Admission so the HTTP
+    // layer enforces them; the runtime does not yet consume them directly.
+    let max_queue_bytes = config_u64(&global, "serve.max_queue_bytes")?;
+    let stream_buffer_bytes = config_u64(&global, "serve.stream_buffer_bytes")?;
+    let stream_stall_timeout =
+        Duration::from_millis(config_u64(&global, "serve.stream_stall_timeout_ms")?);
+    // Cache/scheduler route flags (spec §9.1). Read with the SAME config
+    // resolution the daemon applies so /health advertises the engine's
+    // actual build options.
+    let prefix_cache = config_bool(&global, "serve.prefix_cache")?;
+    let prefix_cache_max_bytes = config_u64(&global, "serve.prefix_cache_max_bytes")?;
+    let structured_jump_forward = config_bool(&global, "serve.structured_jump_forward")?;
     // Multi-slot is an alternate daemon-owned Qwen35 mode, not continuous batching.
-    // Combining them is rejected until a future integration lands.
-    if let Err(message) = validate_multi_slot_startup(multi_slot_enabled, continuous_batch_size) {
+    // Combining them is rejected until a future integration lands. The robust
+    // multi-slot mode also rejects an uncapped queue (serve.max_queue=0) rather
+    // than reinterpreting zero (spec §5.3), and the global trunk-row budget must
+    // be at least the minimum prefill quantum (spec §5.2, §5.3).
+    if let Err(message) = validate_multi_slot_startup(
+        multi_slot_enabled,
+        continuous_batch_size,
+        max_queue as u64,
+        max_batch_tokens,
+        prefill_min_tokens,
+        multi_slot_prefill_chunk,
+        multi_slot_slots,
+    ) {
         bail!("{message}");
     }
     let retry_enabled = config_bool(&global, "serve.retry_enabled")?;
@@ -907,7 +1228,27 @@ pub(crate) fn serve_foreground(
             multi_slot_slots, multi_slot_ctx
         );
     }
+    // Capability advertisement snapshot (see `route_capabilities`): built
+    // once here, after startup validation, from the resolved values below.
+    let capabilities = route_capabilities(
+        multi_slot_enabled,
+        multi_slot_slots,
+        multi_slot_ctx,
+        multi_slot_prefill_chunk,
+        prefix_cache,
+        prefix_cache_max_bytes,
+        structured_jump_forward,
+        max_batch_tokens,
+        prefill_min_tokens,
+        max_queue as u64,
+        max_queue_bytes,
+        queue_timeout.as_millis() as u64,
+        stream_buffer_bytes,
+        stream_stall_timeout.as_millis() as u64,
+        max_request_bytes,
+    );
     let shared = Arc::new(ServeShared {
+        capabilities,
         metrics: metrics::Metrics::default(),
         runtime: Mutex::new(ServeRuntime {
             engine,
@@ -945,15 +1286,18 @@ pub(crate) fn serve_foreground(
             last_activity: Instant::now(),
         }),
         max_request_bytes,
-        admission: Arc::new(Admission::new_with_capacity(
+        admission: Arc::new(Admission::new_with_capacity_and_bytes(
             max_queue,
             queue_timeout,
             slot_concurrency.max(continuous_batch_size as usize),
+            max_queue_bytes,
         )),
         idle_timeout,
         retry_enabled,
         retry_backoff,
         backoff_hook: Mutex::new(None),
+        stream_buffer_bytes,
+        stream_stall_timeout,
     });
     let bind = format_bind(host, port);
     let runtime = tokio::runtime::Builder::new_multi_thread()
@@ -1013,9 +1357,6 @@ pub(crate) fn serve_foreground(
         let shared = Arc::clone(&shared);
         thread::spawn(move || loop {
             thread::sleep(Duration::from_secs(1));
-            if shared.admission.inflight() != 0 {
-                continue;
-            }
             let expired = {
                 let meta = shared
                     .meta
@@ -1031,6 +1372,15 @@ pub(crate) fn serve_foreground(
                     .runtime
                     .lock()
                     .unwrap_or_else(|error| error.into_inner());
+                // Inflight check INSIDE the runtime lock (TOCTOU): the old
+                // check-then-lock window let a request acquire its permit
+                // between the check and the unload — unloading the model
+                // out from under a live request. Under the lock, a request
+                // either has its permit (inflight != 0 → skip) or has not
+                // started (unload precedes it).
+                if shared.admission.inflight() != 0 {
+                    continue;
+                }
                 if runtime.current_path.is_some() {
                     let result = runtime.engine.unload();
                     if result.is_ok() {
@@ -1261,24 +1611,82 @@ impl ServeRuntime {
     }
 }
 
-/// Reject experimental multi-slot combined with continuous batching.
+/// Startup validation for the serving admission path (spec §5.2, §5.3, §9.1).
 ///
-/// Multi-slot is an alternate daemon-owned Qwen35 mode with one weight copy.
-/// Continuous batch integration is deferred; enabling both would imply a
-/// capability the daemon does not implement yet.
+/// Rejects: (1) `serve.max_batch_tokens < serve.prefill_min_tokens` so a
+/// nonzero prefill quantum always fits the global trunk-row budget; (2)
+/// experimental multi-slot combined with `continuous_batch_size > 1`; (3)
+/// `serve.max_queue == 0` when multi-slot is enabled — an uncapped queue is
+/// rejected rather than reinterpreted in robust multi-slot mode.
 pub(crate) fn validate_multi_slot_startup(
     multi_slot_enabled: bool,
     continuous_batch_size: u64,
+    max_queue: u64,
+    max_batch_tokens: u64,
+    prefill_min_tokens: u64,
+    prefill_chunk: u64,
+    n_slots: u64,
 ) -> Result<(), String> {
-    if multi_slot_enabled && continuous_batch_size > 1 {
-        return Err(
-            "serve.multi_slot cannot be combined with continuous_batch_size > 1; \
-             continuous batching integration is deferred"
-                .to_owned(),
-        );
+    if prefill_min_tokens == 0 {
+        return Err("serve.prefill_min_tokens must be at least 1".to_owned());
+    }
+    // The global trunk-row budget must be at least the minimum prefill quantum
+    // so a nonzero prefill service quantum can always be allocated (spec §5.2,
+    // §5.3). This holds regardless of multi-slot mode.
+    if max_batch_tokens < prefill_min_tokens {
+        return Err(format!(
+            "serve.max_batch_tokens ({max_batch_tokens}) must be >= \
+             serve.prefill_min_tokens ({prefill_min_tokens}); the global trunk-row \
+             budget cannot be smaller than the minimum prefill quantum"
+        ));
+    }
+    if multi_slot_enabled && prefill_min_tokens > prefill_chunk {
+        return Err(format!(
+            "serve.prefill_min_tokens ({prefill_min_tokens}) must be <= serve.multi_slot_prefill_chunk ({prefill_chunk}); otherwise one decode row plus the minimum prefill quantum exceeds the slot scratch"
+        ));
+    }
+    if multi_slot_enabled {
+        let scratch_rows = prefill_chunk
+            .checked_mul(n_slots)
+            .ok_or_else(|| "multi-slot scratch row capacity overflow".to_owned())?;
+        if max_batch_tokens > scratch_rows {
+            return Err(format!(
+                "serve.max_batch_tokens ({max_batch_tokens}) must be <= multi-slot scratch capacity ({scratch_rows} = {n_slots} slots x {prefill_chunk} rows)"
+            ));
+        }
+    }
+    if multi_slot_enabled {
+        if continuous_batch_size > 1 {
+            return Err(
+                "serve.multi_slot cannot be combined with continuous_batch_size > 1; \
+                 continuous batching integration is deferred"
+                    .to_owned(),
+            );
+        }
+        // The robust multi-slot mode rejects an uncapped queue rather than
+        // reinterpreting zero or silently inheriting an unbounded queue (spec
+        // §5.3). serve.max_queue=0 historically means uncapped; that is no
+        // longer acceptable when multi-slot admission can overlap work.
+        if max_queue == 0 {
+            return Err(
+                "serve.max_queue must be non-zero when serve.multi_slot is enabled; \
+                 an uncapped queue is rejected rather than reinterpreted in robust \
+                 multi-slot mode (spec §5.3)"
+                    .to_owned(),
+            );
+        }
     }
     Ok(())
 }
+
+/// Machine-readable prefix for gateway-side request-validation failures.
+///
+/// Mirrors the daemon's typed error prefix so the HTTP layer classifies by
+/// CLASS rather than by wording: any message carrying this tag is a
+/// client-fixable 400, whatever English it happens to contain. New
+/// validation text is therefore safe to reword without changing status
+/// semantics.
+pub(crate) const REQUEST_VALIDATION_TAG: &str = "[request validation] ";
 
 pub(crate) fn serve_instance_token() -> String {
     let now = std::time::SystemTime::now()
@@ -1371,19 +1779,10 @@ pub(crate) fn validate_serve_pid(
             record.pid
         );
     }
-    let health_matches = record.token.as_deref().is_some_and(|expected| {
-        http_get_json(host, port, "/health").is_some_and(|health| {
-            health.get("pid").and_then(serde_json::Value::as_u64) == Some(record.pid as u64)
-                && health.get("token").and_then(serde_json::Value::as_str) == Some(expected)
-        })
-    });
-    if owns_port == Some(true) || health_matches || record.legacy && owns_port.is_none() {
+    if owns_port == Some(true) || record.legacy && owns_port.is_none() {
         Ok(())
     } else {
-        bail!(
-            "could not prove ownership of PID {} with port or health token",
-            record.pid
-        )
+        bail!("could not prove PID {} owns the tracked serve port", record.pid)
     }
 }
 
@@ -2150,13 +2549,384 @@ mod tests {
 
     #[test]
     fn multi_slot_startup_rejects_continuous_batch_gt_one() {
-        assert!(validate_multi_slot_startup(false, 1).is_ok());
-        assert!(validate_multi_slot_startup(false, 8).is_ok());
-        assert!(validate_multi_slot_startup(true, 1).is_ok());
-        let err = validate_multi_slot_startup(true, 2).unwrap_err();
+        // Args: (multi_slot, continuous_batch_size, max_queue, max_batch_tokens, prefill_min_tokens)
+        assert!(validate_multi_slot_startup(false, 1, 64, 4096, 1, 1024, 4).is_ok());
+        assert!(validate_multi_slot_startup(false, 8, 64, 4096, 1, 1024, 4).is_ok());
+        assert!(validate_multi_slot_startup(true, 1, 64, 4096, 1, 1024, 4).is_ok());
+        let err = validate_multi_slot_startup(true, 2, 64, 4096, 1, 1024, 4).unwrap_err();
         assert!(err.contains("continuous_batch_size > 1"), "{err}");
         assert!(err.contains("deferred"), "{err}");
-        let err = validate_multi_slot_startup(true, 16).unwrap_err();
+        let err = validate_multi_slot_startup(true, 16, 64, 4096, 1, 1024, 4).unwrap_err();
         assert!(err.contains("serve.multi_slot"), "{err}");
+    }
+
+    #[test]
+    fn multi_slot_startup_rejects_uncapped_queue() {
+        // serve.max_queue=0 is uncapped historically; robust multi-slot rejects it.
+        let err = validate_multi_slot_startup(true, 1, 0, 4096, 1, 1024, 4).unwrap_err();
+        assert!(err.contains("serve.max_queue"), "{err}");
+        assert!(err.contains("non-zero"), "{err}");
+        // Off multi-slot, an uncapped queue is still accepted (old behavior preserved).
+        assert!(validate_multi_slot_startup(false, 1, 0, 4096, 1, 1024, 4).is_ok());
+    }
+
+    #[test]
+    fn multi_slot_startup_rejects_budget_below_prefill_min() {
+        // max_batch_tokens < prefill_min_tokens is rejected regardless of multi-slot.
+        let err = validate_multi_slot_startup(false, 1, 64, 0, 1, 1024, 4).unwrap_err();
+        assert!(err.contains("serve.max_batch_tokens"), "{err}");
+        assert!(err.contains("serve.prefill_min_tokens"), "{err}");
+        let err = validate_multi_slot_startup(true, 1, 64, 1, 2, 1024, 4).unwrap_err();
+        assert!(err.contains("serve.max_batch_tokens"), "{err}");
+        // Equal values are accepted.
+        assert!(validate_multi_slot_startup(true, 1, 64, 4, 4, 1024, 4).is_ok());
+    }
+
+    #[test]
+    fn multi_slot_startup_rejects_prefill_min_above_chunk() {
+        let err = validate_multi_slot_startup(true, 1, 64, 2048, 2048, 1024, 2).unwrap_err();
+        assert!(err.contains("must be <= serve.multi_slot_prefill_chunk"), "{err}");
+    }
+
+    #[test]
+    fn multi_slot_startup_rejects_budget_above_scratch_rows() {
+        let err = validate_multi_slot_startup(true, 1, 64, 2049, 1, 1024, 2).unwrap_err();
+        assert!(err.contains("scratch capacity (2048"), "{err}");
+    }
+
+    #[test]
+    fn multi_slot_startup_rejects_zero_prefill_minimum() {
+        let err = validate_multi_slot_startup(true, 1, 64, 2048, 0, 1024, 2).unwrap_err();
+        assert!(err.contains("at least 1"), "{err}");
+    }
+
+    // ---- Queue byte budget (spec §5.3) ----
+
+    #[test]
+    fn queue_byte_budget_rejects_with_typed_429_error() {
+        // max_queue_bytes = 100; a request with 60 bytes fits, but two don't.
+        let admission = Arc::new(Admission::new_with_capacity_and_bytes(
+            10,
+            Duration::from_secs(5),
+            1,
+            100,
+        ));
+        let _holder = admission.acquire().unwrap();
+        // Second request with 60 bytes queues (0 + 60 ≤ 100).
+        let adm2 = Arc::clone(&admission);
+        let handle = thread::spawn(move || {
+            adm2.acquire_for_with_bytes(true, Some("m"), 60).unwrap()
+        });
+        // Wait for it to queue.
+        for _ in 0..100 {
+            if admission.queued_bytes() > 0 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        assert_eq!(admission.queued_bytes(), 60);
+        // Now a third request with 60 bytes: 60 + 60 = 120 > 100 → reject.
+        let err = admission
+            .acquire_for_with_bytes(true, Some("m"), 60)
+            .unwrap_err();
+        assert_eq!(err.kind(), AdmissionErrorKind::QueueFull);
+        assert!(err.message.contains("byte budget"));
+        drop(_holder);
+        drop(handle.join().unwrap());
+    }
+
+    #[test]
+    fn queue_byte_budget_zero_disables_byte_cap() {
+        // max_queue_bytes = 0 means no byte cap (old behavior preserved
+        // when multi-slot is off).
+        let admission = Arc::new(Admission::new_with_capacity_and_bytes(
+            2,
+            Duration::from_millis(10),
+            1,
+            0,
+        ));
+        let _holder = admission.acquire().unwrap();
+        // Large bytes should not be rejected by the byte budget.
+        let err = admission.acquire_for_with_bytes(true, Some("m"), 999_999_999).unwrap_err();
+        // Should be a timeout (queue wait), not a QueueFull byte error.
+        assert_eq!(err.kind(), AdmissionErrorKind::QueueTimeout);
+    }
+
+    // ---- Permit released exactly once (spec §5.3) ----
+
+    #[test]
+    fn permit_released_exactly_once_on_normal_path() {
+        let admission = Arc::new(Admission::new_with_capacity_and_bytes(
+            4,
+            Duration::from_secs(5),
+            2,
+            1024,
+        ));
+        let guard = admission.acquire_for_with_bytes(true, Some("m"), 100).unwrap();
+        assert_eq!(admission.inflight(), 1);
+        assert_eq!(admission.queued_bytes(), 0); // bytes released from queue on admit
+        drop(guard);
+        assert_eq!(admission.inflight(), 0);
+    }
+
+    #[test]
+    fn permit_released_exactly_once_on_cancel_path() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let admission = Arc::new(Admission::new_with_capacity_and_bytes(
+                4,
+                Duration::from_secs(5),
+                1,
+                1024,
+            ));
+            let _holder = admission.acquire().unwrap();
+            let cancel = CancellationToken::new();
+            let adm = Arc::clone(&admission);
+            let waiter_cancel = cancel.clone();
+            let waiter = tokio::spawn(async move {
+                adm.acquire_for_async_with_bytes(true, Some("m"), 200, waiter_cancel)
+                    .await
+            });
+            // Wait for the waiter to queue.
+            for _ in 0..100 {
+                if admission.queued_bytes() == 200 {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(admission.queued_bytes(), 200);
+            cancel.cancel();
+            let err = tokio::time::timeout(Duration::from_millis(500), waiter)
+                .await
+                .expect("cancelled waiter completes")
+                .expect("waiter task")
+                .expect_err("cancelled admission fails");
+            assert!(err.is_cancelled());
+            // Queued bytes must be released by AdmissionWaiter::drop.
+            assert_eq!(admission.queued_bytes(), 0);
+            assert_eq!(admission.inflight(), 1); // only the holder
+        });
+    }
+
+    #[test]
+    fn permit_released_exactly_once_on_timeout_path() {
+        let admission = Arc::new(Admission::new_with_capacity_and_bytes(
+            4,
+            Duration::from_millis(10),
+            1,
+            1024,
+        ));
+        let _holder = admission.acquire().unwrap();
+        let err = admission
+            .acquire_for_with_bytes(true, Some("m"), 300)
+            .unwrap_err();
+        assert_eq!(err.kind(), AdmissionErrorKind::QueueTimeout);
+        // Queued bytes must be released on timeout.
+        assert_eq!(admission.queued_bytes(), 0);
+        assert_eq!(admission.inflight(), 1);
+    }
+
+    #[test]
+    fn admission_guard_carries_queue_bytes() {
+        let admission = Arc::new(Admission::new_with_capacity_and_bytes(
+            4,
+            Duration::from_secs(5),
+            1,
+            1024,
+        ));
+        // Fast path: no queueing, queue_bytes = 0.
+        let guard = admission.acquire_for_with_bytes(true, Some("m"), 500).unwrap();
+        assert_eq!(guard.queue_bytes(), 0);
+        assert!(guard.is_eligible());
+        drop(guard);
+
+        // Queued path: queue_bytes = charged bytes.
+        let holder = admission.acquire_for_with_bytes(true, Some("m"), 0).unwrap();
+        let adm2 = Arc::clone(&admission);
+        let handle = thread::spawn(move || {
+            adm2.acquire_for_with_bytes(true, Some("m"), 400).unwrap()
+        });
+        // Wait for queue, then release holder so the waiter acquires.
+        for _ in 0..100 {
+            if admission.queued_bytes() == 400 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        drop(holder);
+        let guard2 = handle.join().unwrap();
+        assert_eq!(guard2.queue_bytes(), 400);
+        drop(guard2);
+        assert_eq!(admission.queued_bytes(), 0);
+    }
+
+    // ---- Typed error taxonomy (spec §5.3: 429 vs 503) ----
+
+    #[test]
+    fn queue_full_error_is_typed_429() {
+        // max_queue=1: one holder + one queued = full. Third gets QueueFull.
+        let admission = Arc::new(Admission::new_with_capacity_and_bytes(
+            1,
+            Duration::from_secs(5),
+            1,
+            0,
+        ));
+        let _holder = admission.acquire().unwrap();
+        // Spawn a waiter that fills the queue slot.
+        let adm2 = Arc::clone(&admission);
+        let handle = thread::spawn(move || {
+            let _g = adm2.acquire().unwrap();
+        });
+        // Wait for the waiter to queue.
+        for _ in 0..100 {
+            if admission.inflight() == 2 {
+                break;
+            }
+            thread::sleep(Duration::from_millis(1));
+        }
+        // Now the queue is full (1 holder + 1 queued). Third gets QueueFull.
+        let err = admission.acquire().unwrap_err();
+        assert_eq!(err.kind(), AdmissionErrorKind::QueueFull);
+        drop(_holder);
+        let _ = handle.join();
+    }
+
+    #[test]
+    fn queue_timeout_error_is_typed_429() {
+        let admission = Arc::new(Admission::new_with_capacity_and_bytes(
+            1,
+            Duration::from_millis(5),
+            1,
+            0,
+        ));
+        let _holder = admission.acquire().unwrap();
+        let err = admission.acquire().unwrap_err();
+        assert_eq!(err.kind(), AdmissionErrorKind::QueueTimeout);
+    }
+
+    #[test]
+    fn cancelled_error_is_typed_503() {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_time()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let admission = Arc::new(Admission::new(1, Duration::from_secs(5)));
+            let _holder = admission.acquire().unwrap();
+            let cancel = CancellationToken::new();
+            cancel.cancel();
+            let err = admission.acquire_async(cancel).await.unwrap_err();
+            assert_eq!(err.kind(), AdmissionErrorKind::Cancelled);
+            assert!(err.is_cancelled());
+        });
+    }
+}
+
+#[cfg(test)]
+mod capabilities_tests {
+    use super::*;
+
+    fn route() -> serde_json::Value {
+        route_capabilities(
+            /*multi_slot*/ true,
+            2,
+            50000,
+            1024,
+            /*prefix_cache*/ true,
+            536870912,
+            /*jump_forward*/ true,
+            8192,
+            1,
+            64,
+            268435456,
+            30000,
+            4 << 20,
+            30_000,
+            64 << 20,
+        )
+    }
+
+    /// The multi-slot route advertises every capability a client needs to
+    /// discover before using it (spec §9.1): slots, cache, structured
+    /// output subset, queue bounds, and the honest refusal list.
+    #[test]
+    fn multi_slot_route_advertises_capabilities() {
+        let caps = route();
+        assert_eq!(caps["mode"], "multi-slot");
+        assert_eq!(caps["multi_slot"], true);
+        assert_eq!(caps["multi_slot_slots"], 2);
+        assert_eq!(caps["multi_slot_ctx"], 50000);
+        assert_eq!(caps["prefix_cache"], true);
+        assert_eq!(caps["prefix_cache_max_bytes"], 536870912);
+        assert_eq!(caps["structured_output"], true);
+        assert_eq!(caps["structured_output_subset"], "json-schema-strict-v1");
+        assert_eq!(caps["structured_jump_forward"], true);
+        assert_eq!(caps["max_batch_tokens"], 8192);
+        assert_eq!(caps["max_queue"], 64);
+        assert_eq!(caps["queue_timeout_ms"], 30000);
+        assert_eq!(caps["openai_compatible"], true);
+        let refused = caps["refused_request_fields"].as_array().unwrap();
+        assert!(!refused.iter().any(|v| v == "tools"), "tools are supported");
+        for field in [
+            "stop",
+            "logprobs",
+            "top_logprobs",
+            "n",
+            "best_of",
+            "logit_bias",
+            "echo",
+            "suffix",
+            "reasoning_effort",
+            "response_format:json_object",
+            "tools+image",
+        ] {
+            assert!(
+                refused.iter().any(|v| v == field),
+                "refusal list must contain {field}"
+            );
+        }
+    }
+
+    /// The standard route must NOT advertise multi-slot/structured-output
+    /// capabilities it does not have — advertisement is honest, not
+    /// aspirational (spec §6 X2: no silent capability inflation).
+    #[test]
+    fn standard_route_advertises_honest_absence() {
+        let caps = route_capabilities(
+            false, 4, 8192, 1024, false, 0, false, 4096, 1, 64, 268435456, 30000,
+            4 << 20, 30_000, 64 << 20,
+        );
+        assert_eq!(caps["mode"], "standard");
+        assert_eq!(caps["multi_slot"], false);
+        assert_eq!(caps["structured_output"], false);
+        assert!(caps["structured_output_subset"].is_null());
+        assert_eq!(caps["prefix_cache"], false);
+        let refused = caps["refused_request_fields"].as_array().unwrap();
+        assert!(refused.iter().any(|v| v == "response_format"));
+    }
+
+    /// Per-model projection: sidecar probes hit the filesystem, so use the
+    /// cargo manifest as a trunk that certainly has no sidecars.
+    #[test]
+    fn model_capabilities_probe_sidecars() {
+        let caps = model_capabilities(&route(), std::path::Path::new("Cargo.toml"));
+        assert_eq!(caps["multi_slot"], true);
+        assert_eq!(caps["structured_output"], true);
+        assert_eq!(caps["mtp_sidecar"], false);
+        assert_eq!(caps["vision_sidecar"], false);
+
+        // A trunk whose stripped-quant sibling exists: mirror of the
+        // qwen35 convention (`model.mq4v2.hfq` → `model.mtp`).
+        let dir = std::env::temp_dir().join(format!("hipfire-caps-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let trunk = dir.join("model.mq4v2.hfq");
+        std::fs::write(&trunk, b"x").unwrap();
+        std::fs::write(dir.join("model.mtp"), b"x").unwrap();
+        let caps = model_capabilities(&route(), &trunk);
+        assert_eq!(caps["mtp_sidecar"], true, "quant-stripped .mtp sibling found");
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

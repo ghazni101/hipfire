@@ -85,6 +85,11 @@ pub struct LoadCtx<'a> {
     /// loads against the trunk's `vision_config_from_hfq`. `None` = trunk-only
     /// (or text-only when the trunk has no tower either).
     pub vision_path: Option<PathBuf>,
+    /// Resolved `vision.mode` (`off`/`auto`/`on`). Gates `<stem>.vl` sibling
+    /// discovery in the carrier — `vision_path` alone cannot distinguish
+    /// "off" (never probe) from "auto with no explicit sidecar" (probe).
+    /// `off` suppresses discovery; `auto`/`on` allow it.
+    pub vision_mode: String,
     pub kv_mode_override: Option<&'a str>,
     /// Authored Qwen-only K and V overrides. None preserves the selected whole-cache mode.
     pub kv_k_override: Option<&'a str>,

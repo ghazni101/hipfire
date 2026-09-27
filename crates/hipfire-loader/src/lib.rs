@@ -2102,7 +2102,9 @@ fn finish_qwen35_load(
     };
     // ── qwen35 MTP head (single resolver: bundled .mq4-mtp trailer then sibling .mtp sidecar) ──
     // Precedence: DSpark > DFlash > MTP > n-gram. Gate: only arch 5/6, no adaptive/eviction,
-    // and typed mtp != off. Bundled first then sidecar `.mtp`; physical_cap is the KV
+    // and typed mtp != off. Bundled first, then `find_mtp_sidecar` (last-extension
+    // replacement *and* stem after stripping `.hfq`/quant suffixes, so
+    // `qwen3.5-4b.mq4v2.hfq` finds `qwen3.5-4b.mtp`). physical_cap is the KV
     // window. On missing/failure errors when forced on (mtp=on), auto logs/falls back.
     let mtp: Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead> = if adaptive_blocks_generic_spec
         || eviction.is_some()
@@ -2129,8 +2131,7 @@ fn finish_qwen35_load(
                 head_opt = Some(h);
             }
             Ok(None) => {
-                let sidecar = trunk_path.with_extension("mtp");
-                if sidecar.exists() {
+                if let Some(sidecar) = hipfire_arch_qwen35::mtp_head::find_mtp_sidecar(trunk_path) {
                     match hipfire_arch_qwen35::mtp_head::load_mtp_head(
                         &sidecar,
                         ctx.gpu,
@@ -2154,8 +2155,7 @@ fn finish_qwen35_load(
             }
             Err(e) => {
                 load_err = Some(format!("bundled trailer load failed: {e}"));
-                let sidecar = trunk_path.with_extension("mtp");
-                if sidecar.exists() {
+                if let Some(sidecar) = hipfire_arch_qwen35::mtp_head::find_mtp_sidecar(trunk_path) {
                     match hipfire_arch_qwen35::mtp_head::load_mtp_head(
                         &sidecar,
                         ctx.gpu,
@@ -2184,9 +2184,17 @@ fn finish_qwen35_load(
                 return Err(rollback_unfinished_qwen35(
                     format!(
                         "MTP head required (mtp=on) but not found: {}",
-                        load_err.unwrap_or_else(
-                            || "no bundled trailer or .mtp sidecar found".to_string()
-                        )
+                        load_err.unwrap_or_else(|| {
+                            let probed: Vec<String> =
+                                hipfire_arch_qwen35::mtp_head::mtp_sidecar_candidates(trunk_path)
+                                    .into_iter()
+                                    .map(|p| p.display().to_string())
+                                    .collect();
+                            format!(
+                                "no bundled trailer or .mtp sidecar found (probed {})",
+                                probed.join(" or ")
+                            )
+                        })
                     ),
                     bundle,
                     vision_weights,
@@ -2368,6 +2376,9 @@ pub fn load_model_with_gemma4_drafter(
         draft_path,
         gpu.arch.as_str(),
         None,
+        // No per-request vision_mode on this entry point — preserve the
+        // sibling probe (auto).
+        "auto",
         head_path,
         max_seq,
         crate::admission::KvBackendHints {
@@ -2445,6 +2456,7 @@ pub fn load_admitted_with_gemma4_drafter(
         sequence,
         carrier,
         vision_path,
+        vision_mode,
         ..
     } = admission;
     let carrier =
@@ -2466,6 +2478,7 @@ pub fn load_admitted_with_gemma4_drafter(
         deepseek4_experts_per_token,
         draft_path,
         vision_path,
+        vision_mode,
         kv_mode_override,
         kv_k_override,
         kv_v_override,
@@ -3089,7 +3102,7 @@ pub fn load_model_ep_with_kv_mode(
     });
     let admission = crate::admission::admit_source(
         path, tp, 1, crate::admission::KvBackendRequest::from_override(kv_backend)?,
-        None, &gpu_arch, None, None, max_seq,
+        None, &gpu_arch, None, "auto", None, max_seq,
         crate::admission::KvBackendHints {
             kv_mode, kv_k: None, kv_v: None,
             qwen_default_q8: crate::admission::qwen_default_q8_enabled(),
@@ -4470,6 +4483,7 @@ mod ep_admission_tests {
             None,
             arch,
             None,
+            "auto",
             None,
             4096,
             admission::KvBackendHints::without_device(),
@@ -5546,6 +5560,25 @@ mod registry_tests {
             cap.supported,
             vec!["low", "medium", "xhigh"],
             "supported rungs must be exactly the Qwen3.8 contract"
+        );
+    }
+}
+
+#[cfg(all(test, feature = "arch-qwen35"))]
+mod mtp_sidecar_probe_tests {
+    use std::path::Path;
+
+    #[test]
+    fn loader_probe_includes_stem_sidecar_for_mq4v2_hfq() {
+        // finish_qwen35_load uses find_mtp_sidecar; pin the product spelling
+        // `qwen3.5-4b.mq4v2.hfq` → `qwen3.5-4b.mtp` so a last-extension-only
+        // probe cannot silently return.
+        let c = hipfire_arch_qwen35::mtp_head::mtp_sidecar_candidates(Path::new(
+            "/models/qwen3.5-4b.mq4v2.hfq",
+        ));
+        assert!(
+            c.iter().any(|p| p.ends_with("qwen3.5-4b.mtp")),
+            "{c:?}"
         );
     }
 }
