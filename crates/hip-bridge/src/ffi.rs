@@ -133,7 +133,7 @@ static HIP_FAULT_SYNC: AtomicUsize = AtomicUsize::new(HIP_FAULT_UNSET);
 /// [`arm_hip_fault`] instead of `set_var`.
 fn fault_spec() -> &'static Option<String> {
     static SPEC: std::sync::LazyLock<Option<String>> =
-        std::sync::LazyLock::new(|| std::env::var("HIPFIRE_FAULT_HIP").ok());
+        std::sync::LazyLock::new(|| hipfire_config::developer_var("HIPFIRE_FAULT_HIP").ok());
     &SPEC
 }
 

@@ -634,16 +634,16 @@ fn main() {
     );
 
     // ── A10 forced full-reject (τ=1 repair + cache visibility) ──────────
-    // HIPFIRE_FAULT_MTP_FULL_REJECT=1 makes every verify cycle reject all
+    // `arm_mtp_full_reject` makes every verify cycle reject all
     // candidates, so the generation advances one trunk-argmax token per
     // cycle — the same greedy sequence the accepting path produces, just
     // slower. Asserting equality against toks_l1 proves the full-reject
     // repair path (zero-length accepted prefix, DN rollback + replay) is
     // exact; the warm replay equality proves rejected candidate rows never
     // became cache-visible (spec §4.6.2, A10 "full reject").
-    std::env::set_var("HIPFIRE_FAULT_MTP_FULL_REJECT", "1");
+    hipfire_arch_qwen35::mtp_spec::arm_mtp_full_reject(true);
     let (reused_fr, toks_fr) = run(&engine, italy.clone(), &long_greedy);
-    std::env::remove_var("HIPFIRE_FAULT_MTP_FULL_REJECT");
+    hipfire_arch_qwen35::mtp_spec::arm_mtp_full_reject(false);
     println!(
         "  A10 full-reject cold: reused={reused_fr} generated={}",
         toks_fr.len()

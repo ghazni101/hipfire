@@ -82,7 +82,7 @@ pub fn find_vl_sidecar(trunk: &Path) -> Option<PathBuf> {
 /// `HIPFIRE_VL_FILE` first (an explicit override that does not exist is a
 /// typo and is reported), then the `<stem>.vl` sibling candidates.
 pub fn resolve_vl_sidecar(model_path: &str) -> Option<PathBuf> {
-    if let Ok(v) = std::env::var("HIPFIRE_VL_FILE") {
+    if let Ok(v) = hipfire_config::developer_var("HIPFIRE_VL_FILE") {
         let p = PathBuf::from(&v);
         if p.exists() {
             return Some(p);

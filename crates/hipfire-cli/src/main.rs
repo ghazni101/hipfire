@@ -5146,14 +5146,14 @@ fn open_bench_engine(
     if let Some(tp) = args.tp.filter(|&tp| tp > 1) {
         params["tp"] = serde_json::json!(tp);
     }
-    if std::env::var("HIPFIRE_BENCH_MULTI_SLOT").is_ok() {
+    if hipfire_config::developer_var("HIPFIRE_BENCH_MULTI_SLOT").is_ok() {
         params["experimental_multi_slot"] = serde_json::json!(true);
-        if let Ok(n) = std::env::var("HIPFIRE_BENCH_MULTI_SLOT_SLOTS") {
+        if let Ok(n) = hipfire_config::developer_var("HIPFIRE_BENCH_MULTI_SLOT_SLOTS") {
             if let Ok(n) = n.parse::<u64>() {
                 params["experimental_multi_slot_slots"] = serde_json::json!(n);
             }
         }
-        if let Ok(n) = std::env::var("HIPFIRE_BENCH_MULTI_SLOT_CTX") {
+        if let Ok(n) = hipfire_config::developer_var("HIPFIRE_BENCH_MULTI_SLOT_CTX") {
             if let Ok(n) = n.parse::<u64>() {
                 params["experimental_multi_slot_ctx"] = serde_json::json!(n);
             }

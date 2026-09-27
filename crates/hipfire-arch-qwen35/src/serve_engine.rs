@@ -720,7 +720,7 @@ impl Rig {
         // default `evict_page_cache=true` drops the mmap in prepare(), and
         // post-weight tensor reads (e.g. vision weights) panic on None.
         hfq.set_evict_page_cache(
-            std::env::var("HIPFIRE_PAGE_EVICTION")
+            hipfire_config::developer_var("HIPFIRE_PAGE_EVICTION")
                 .ok()
                 .map(|v| v != "0")
                 .unwrap_or_else(|| gpu.is_uma()),
@@ -2689,7 +2689,7 @@ fn inject_publish_fault() -> bool {
     static CHECKED: AtomicBool = AtomicBool::new(false);
     if !CHECKED.load(Ordering::Relaxed) {
         CHECKED.store(true, Ordering::Relaxed);
-        if std::env::var("HIPFIRE_FAULT_PREFIX_PUBLISH").as_deref() != Ok("1") {
+        if hipfire_config::developer_var("HIPFIRE_FAULT_PREFIX_PUBLISH").as_deref() != Ok("1") {
             ARMED.store(false, Ordering::Relaxed);
         }
     }
@@ -3351,7 +3351,7 @@ fn run_loop(
     // Debug-only per-step pool invariant check (spec §9.2): catches page
     // accounting drift at the step it happens rather than at the next OOM.
     let check_pool_invariants =
-        std::env::var("HIPFIRE_DEBUG_POOL_INVARIANTS").as_deref() == Ok("1");
+        hipfire_config::developer_var("HIPFIRE_DEBUG_POOL_INVARIANTS").as_deref() == Ok("1");
     'serve: loop {
         let idle = slots.iter().all(|s| s.is_none());
         if idle && rig.wait_queue.queued_count() == 0 {

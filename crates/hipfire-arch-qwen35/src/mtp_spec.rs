@@ -46,6 +46,17 @@ pub(crate) fn mtp_trace_enabled() -> bool {
             .unwrap_or(false)
     })
 }
+
+/// A10 fault seam (oracle only): while armed, every MTP verify cycle
+/// rejects all candidates, so each cycle advances exactly one trunk token
+/// (the τ=1 full-reject path). Armed through [`arm_mtp_full_reject`], not the
+/// environment, so the oracle can toggle it between requests on a live engine.
+static MTP_FULL_REJECT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Arm or disarm the forced full-reject fault seam. Test-facing only.
+pub fn arm_mtp_full_reject(on: bool) {
+    MTP_FULL_REJECT.store(on, std::sync::atomic::Ordering::Release);
+}
 use crate::speculative::{apply_topp_trunc, sample_categorical, sample_residual};
 use crate::speculative::{DeltaNetSnapshot, GdnTape, ModelSlot};
 use hipfire_runtime::llama::KvCache;
@@ -2058,14 +2069,12 @@ pub fn mtp_batched_verify_accept_from_batch(
             argmax_per_pos
         );
     }
-    // A19/A10 fault seam (oracle only): HIPFIRE_FAULT_MTP_FULL_REJECT=1
-    // forces every candidate to reject, so each cycle advances exactly one
-    // trunk token — the τ=1 full-reject path. The committed token is the
-    // trunk's own argmax, so greedy output must equal the accepting MTP /
-    // AR sequence; the cell proves rejected draft rows never become
-    // cache-visible (spec §4.6.2) and the repair path handles a zero-length
-    // accepted prefix.
-    let fault_full_reject = std::env::var("HIPFIRE_FAULT_MTP_FULL_REJECT").as_deref() == Ok("1");
+    // A10 fault seam (oracle only, see `arm_mtp_full_reject`): the committed
+    // token is the trunk's own argmax, so greedy output must equal the
+    // accepting MTP / AR sequence; the cell proves rejected draft rows never
+    // become cache-visible (spec §4.6.2) and the repair path handles a
+    // zero-length accepted prefix.
+    let fault_full_reject = MTP_FULL_REJECT.load(std::sync::atomic::Ordering::Acquire);
     let accepted = if fault_full_reject {
         greedy_trunk_spine_accept(&[], &argmax_per_pos[..1], eos_token_id)
     } else {
