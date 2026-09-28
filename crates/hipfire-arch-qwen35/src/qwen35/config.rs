@@ -891,6 +891,19 @@ fn from_config_value(config: &serde_json::Value) -> Result<Qwen35Config, String>
         .or_else(|| rope.and_then(|r| r.partial_rotary_factor))
         .unwrap_or(0.25) as f32;
     let mrope_interleaved = rope.and_then(|r| r.mrope_interleaved).unwrap_or(false);
+    // Fail closed: every mrope kernel implements HF's *interleaved* band
+    // ([THWTHW...]). A checkpoint declaring mrope_interleaved=false needs
+    // the chunked [TTT...HHH...WWW] mapping — no kernel variant exists, and
+    // running the interleaved band would silently rotate every image token
+    // against the wrong axes. Refuse at config parse instead of serving
+    // plausible-but-wrong output.
+    if is_vl_text && !mrope_interleaved {
+        return Err(
+            "qwen35-vl: rope_parameters.mrope_interleaved=false is unsupported — \
+             only the interleaved M-RoPE band has a kernel implementation"
+                .to_string(),
+        );
+    }
     let mut mrope_section = [11usize, 11usize, 10usize];
     if let Some(arr) = rope.and_then(|r| r.mrope_section.as_ref()) {
         for (dst, src) in mrope_section.iter_mut().zip(arr.iter().take(3)) {
@@ -1284,7 +1297,10 @@ mod tests {
                 "hidden_size": 2048,
                 "num_hidden_layers": 2,
                 "num_attention_heads": 16,
-                "vocab_size": 151936
+                "vocab_size": 151936,
+                // VL text configs declare the interleaved band — absent or
+                // false is refused at parse (no chunked kernel exists).
+                "rope_parameters": { "mrope_interleaved": true }
             }
         });
         let cfg = from_config_value(&outer).expect("vl parse");

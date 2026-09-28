@@ -211,6 +211,15 @@ pub fn decode_and_tile(
     path: &Path,
     cfg: &crate::vision::TaichuVisionConfig,
 ) -> Result<TiledImage, String> {
+    // Same decompression-bomb cap as the bytes variant: a request's `image`
+    // field is a client-controlled path, so probe dimensions before decode
+    // (a 65535×65535 PNG header would otherwise allocate ~13 GB RGB8).
+    let (w, h) = hipfire_runtime::imagedec::probe_dimensions_path(path)?;
+    if (w as usize) * (h as usize) > 50_000_000 {
+        return Err(format!(
+            "image dimensions ({w}x{h}) exceed maximum (50 MP)"
+        ));
+    }
     let img = hipfire_runtime::imagedec::decode_dynamic_path(path)?;
     Ok(tile_dynamic_image(img, cfg))
 }

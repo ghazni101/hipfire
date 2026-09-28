@@ -1124,20 +1124,39 @@ fn main() {
                         .and_then(|p| p.get("experimental_multi_slot_prefill_chunk"))
                         .and_then(|v| v.as_u64())
                         .unwrap_or(1024) as usize;
-                    // MTP: parse mtp_mode and mtp_k from load params.
-                    // mtp_mode "on"/"auto" enables MTP; mtp_k sets depth (default 4).
+                    // MTP: parse mtp_mode and mtp_k from load params, falling
+                    // back to the typed config/env like the sequential arm —
+                    // a bare "off" default silently disabled MTP for config-
+                    // opted operators on this backend only.
                     let mtp_mode = msg
                         .get("params")
                         .and_then(|p| p.get("mtp_mode"))
                         .and_then(|v| v.as_str())
-                        .unwrap_or("off");
+                        .unwrap_or(&hipfire_runtime::config::get().mtp_mode);
                     let mtp_k = if mtp_mode.is_empty() || mtp_mode == "off" {
                         0
                     } else {
-                        msg.get("params")
+                        let k = msg
+                            .get("params")
                             .and_then(|p| p.get("mtp_k"))
                             .and_then(|v| v.as_u64())
-                            .unwrap_or(4) as usize
+                            .map(|v| v as usize)
+                            .unwrap_or(hipfire_runtime::config::get().mtp_k);
+                        // Unbounded wire values overflow `mtp_k + 1` at
+                        // spec_rows sizing and drive absurd allocations.
+                        if k == 0 || k > 16 {
+                            emit_uncorrelated_error(
+                                &mut stdout,
+                                None,
+                                &format!("load: mtp_k {k} out of range (1..=16)"),
+                                "validation",
+                                false,
+                                false,
+                            );
+                            let _ = stdout.flush();
+                            continue;
+                        }
+                        k
                     };
                     // mtp_mode=on is a REQUIRED assertion: the load fails when
                     // no head is found (sequential parity — loader_api

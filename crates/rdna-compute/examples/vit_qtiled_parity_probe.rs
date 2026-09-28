@@ -92,14 +92,14 @@ fn main() {
         let qkv = gpu.upload_f32(&qkv_h, &[n * stride]).expect("upload");
 
         let out_n = gpu.alloc_tensor(&[n * HIDDEN], DType::F32).expect("alloc");
-        gpu.vit_attention_f32(&qkv, &out_n, n, HIDDEN, HEADS, HEAD_DIM)
+        gpu.vit_attention_f32(&qkv, &out_n, n, HIDDEN, HEADS, HEAD_DIM, n)
             .expect("naive launch");
         let naive_out = gpu.download_f32(&out_n).expect("download");
 
         // Fresh zeroed buffer, qtiled runs alone into it.
         let out_q_h = vec![0.0f32; n * HIDDEN];
         let out_q = gpu.upload_f32(&out_q_h, &[n * HIDDEN]).expect("alloc");
-        gpu.vit_attention_qtiled_f32(&qkv, &out_q, n, HIDDEN, HEADS, HEAD_DIM)
+        gpu.vit_attention_qtiled_f32(&qkv, &out_q, n, HIDDEN, HEADS, HEAD_DIM, n)
             .expect("qtiled launch");
         let q_out = gpu.download_f32(&out_q).expect("download");
 

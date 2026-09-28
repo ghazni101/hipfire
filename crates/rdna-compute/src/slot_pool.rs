@@ -451,11 +451,10 @@ impl SlotPool {
             .page_pool
             .as_mut()
             .ok_or_else(|| "share_prefix: pool is not in paged mode".to_string())?;
-        pool.share_prefix(&src_snap, dst_bt, n_pages)?;
-        // Complete the fork here instead of leaving it to the caller: a
-        // table with shared pages but live_tokens == 0 would upload fine and
-        // then silently attend to nothing until the next write-frontier
-        // provision happened to fix it.
+        // Validate BEFORE mutating: share_prefix pushes pages and bumps
+        // table_refs, so an Err after that call would leave a half-installed
+        // share (non-empty table at live_tokens=0 → retry-refusal + orphaned
+        // refs). Compute and check the capacity first, then delegate.
         let live = n_pages * PAGE_TOKENS;
         if live > self.cap_tokens {
             return Err(format!(
@@ -463,6 +462,16 @@ impl SlotPool {
                 self.cap_tokens
             ));
         }
+        if live > i32::MAX as usize {
+            return Err(format!(
+                "share_prefix: {live} tokens exceeds the i32 descriptor ABI"
+            ));
+        }
+        pool.share_prefix(&src_snap, dst_bt, n_pages)?;
+        // Complete the fork here instead of leaving it to the caller: a
+        // table with shared pages but live_tokens == 0 would upload fine and
+        // then silently attend to nothing until the next write-frontier
+        // provision happened to fix it.
         dst_bt.set_live_tokens(live);
         self.descs[dst.0].seq_len = live as i32;
         self.block_tables_dirty[dst.0] = true;
@@ -509,10 +518,8 @@ impl SlotPool {
                 bt.num_pages()
             ));
         }
-        for &phys in phys_pages {
-            pool.refcount_inc(phys)?;
-            bt.push_page(phys);
-        }
+        // Same validate-before-mutate rule as share_prefix: refcount_inc is
+        // fallible, so a mid-loop Err must not leave a partial install.
         let live = phys_pages.len() * PAGE_TOKENS;
         if live > self.cap_tokens {
             return Err(format!(
@@ -521,8 +528,32 @@ impl SlotPool {
                 self.cap_tokens
             ));
         }
+        if live > i32::MAX as usize {
+            return Err(format!(
+                "share_published_pages: {live} tokens exceeds the i32 descriptor ABI"
+            ));
+        }
+        for &phys in phys_pages {
+            let st = pool.page_state(phys);
+            if !matches!(st, crate::page_pool::PageState::Sealed | crate::page_pool::PageState::CacheOnly) {
+                return Err(format!(
+                    "share_published_pages: phys {phys} is {st:?} — published handles \
+                     must be sealed/cache-resident"
+                ));
+            }
+        }
+        for &phys in phys_pages {
+            if let Err(e) = pool.refcount_inc(phys) {
+                // Pages already pushed hold elevated table_refs — roll them
+                // back so a failed share never leaves a partial install
+                // (the dst table is still live; a stray shared page would
+                // ride the next cold prefill's COW barrier).
+                let _ = pool.release_table(bt);
+                return Err(e);
+            }
+            bt.push_page(phys);
+        }
         bt.set_live_tokens(live);
-        self.descs[dst.0].seq_len = live as i32;
         self.block_tables_dirty[dst.0] = true;
         self.dirty = true;
         Ok(())

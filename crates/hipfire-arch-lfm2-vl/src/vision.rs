@@ -1016,7 +1016,7 @@ fn tower_and_project_sub_image_inner(
             gpu.alloc_tensor(&[n * h], DType::F32)
                 .map_err(ehip("alloc attn"))?,
         );
-        gpu.vit_attention_f32(scratch.t(qkv)?, scratch.t(attn_out)?, n, h, heads, head_dim)
+        gpu.vit_attention_f32(scratch.t(qkv)?, scratch.t(attn_out)?, n, h, heads, head_dim, n)
             .map_err(ehip("vit_attention"))?;
         scratch.release(gpu, qkv)?;
 

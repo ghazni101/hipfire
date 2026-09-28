@@ -1440,6 +1440,25 @@ pub fn generate_vl(
         _ => unreachable!("tower/prepped variant mismatch"),
     };
 
+    // Release-mode fail-closed length check (same class as the lfm2 twin's
+    // spec §2.3 guard): a short/mis-shaped tower output would otherwise
+    // panic mid-prefill on the `visual_tokens[visual_idx*dim..]` slice
+    // below — and the sequential generate thread has no catch_unwind, so
+    // the worker dies with KV partially committed and no error event.
+    if visual_tokens.len() != n_visual_tokens * config.dim {
+        write_error(
+            stdout,
+            id,
+            &format!(
+                "vision tower row mismatch: {} floats for {} tokens × {} dims",
+                visual_tokens.len(),
+                n_visual_tokens,
+                config.dim
+            ),
+        );
+        return;
+    }
+
  let im_end_token = if im_end.len() == 1 {
         Some(im_end[0])
     } else {

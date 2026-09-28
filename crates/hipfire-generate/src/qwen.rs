@@ -5471,10 +5471,25 @@ pub fn generate_multi(
         Vec::new()
     };
     let grammar_active = !tool_schemas_qwen.is_empty();
-    let mut grammar_matcher = hipfire_arch_qwen35::grammar::Matcher::with_config(
+    // Fallible compile (not Matcher::with_config — its .expect panics on
+    // bound violations reachable from wire-supplied tools).
+    let mut grammar_matcher = match saddle_core::grammar::json::CompiledGrammar::with_config(
         tool_schemas_qwen,
         hipfire_arch_qwen35::grammar_config::resolve_qwen35_grammar_config(),
-    );
+    ) {
+        Ok(g) => hipfire_arch_qwen35::grammar::Matcher::from_compiled(std::sync::Arc::new(g)),
+        Err(e) => {
+            emit_active_attempt_error(
+                stdout,
+                Some(id),
+                &format!("tool grammar compile failed: {e}"),
+                "validation",
+                false,
+                false,
+            );
+            return;
+        }
+    };
     let grammar_vocab: Vec<String> = if grammar_active {
         let n = tokenizer.vocab_size();
         (0..n).map(|id| tokenizer.decode(&[id as u32])).collect()

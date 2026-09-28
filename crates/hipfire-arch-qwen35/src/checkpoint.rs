@@ -70,12 +70,21 @@ impl CheckpointBlob for DeltaNetSnapshot {
 // Pool entry
 // ───────────────────────────────────────────────────────────────────────────
 
-/// Key for a checkpoint: `(domain, boundary_p)`.
+/// Secondary index key: `(domain, boundary_p)`.
+///
+/// WARNING: `(domain, boundary)` is NOT a unique identity — two different
+/// token prefixes in one domain can each hold a checkpoint at the same
+/// boundary count (page-alignment makes that the common case, not the edge
+/// case). The pool's PRIMARY key is [`CheckpointId`]; this index exists only
+/// for dedup-on-capture and eviction bookkeeping. Lookups that drive a
+/// restore must resolve through `by_id` using the id the radix index
+/// recorded on the matching token path, never through this map alone.
 type CheckpointKey = (CacheDomain, u64);
 
 #[derive(Debug)]
 struct CheckpointEntry<B> {
-    id: CheckpointId,
+    /// `(domain, boundary)` this entry was captured under (secondary index).
+    key: CheckpointKey,
     blob: B,
     pinned: bool,
     /// Monotonic LRU access stamp; smaller = older.
@@ -89,8 +98,8 @@ struct CheckpointEntry<B> {
 /// Byte-bounded LRU pool of immutable Qwen3.5 hybrid-state checkpoint
 /// bundles (spec §4.5 C5).
 ///
-/// Keyed by `(CacheDomain, boundary_p)`. Entries are captured only at
-/// page-aligned boundaries. When the pool exceeds `max_bytes`, the oldest
+/// Keyed by [`CheckpointId`]. Entries are captured only at page-aligned
+/// boundaries. When the pool exceeds `max_bytes`, the oldest
 /// **unpinned** checkpoint is evicted until the pool fits. Pinned
 /// checkpoints survive eviction.
 ///
@@ -98,7 +107,10 @@ struct CheckpointEntry<B> {
 /// test double without GPU device buffers. The GPU-backed capture and
 /// restore paths use `B = DeltaNetSnapshot`.
 pub struct QwenCheckpointPool<B: CheckpointBlob> {
-    entries: HashMap<CheckpointKey, CheckpointEntry<B>>,
+    entries: HashMap<CheckpointId, CheckpointEntry<B>>,
+    /// `(domain, boundary) -> id` of the NEWEST capture at that key.
+    /// Secondary index only — see the [`CheckpointKey`] warning.
+    by_boundary: HashMap<CheckpointKey, CheckpointId>,
     /// Keys that were explicitly evicted (for distinguishing
     /// [`MissReason::Evicted`] from [`MissReason::NoCheckpoint`]).
     evicted: HashSet<CheckpointKey>,
@@ -113,6 +125,7 @@ impl<B: CheckpointBlob> QwenCheckpointPool<B> {
     pub fn new(max_bytes: u64) -> Self {
         Self {
             entries: HashMap::new(),
+            by_boundary: HashMap::new(),
             evicted: HashSet::new(),
             total_bytes: 0,
             max_bytes,
@@ -120,6 +133,7 @@ impl<B: CheckpointBlob> QwenCheckpointPool<B> {
             lru_clock: 0,
         }
     }
+
 
     /// Maximum byte capacity.
     pub fn max_bytes(&self) -> u64 {
@@ -142,19 +156,21 @@ impl<B: CheckpointBlob> QwenCheckpointPool<B> {
     }
 
     /// Whether a blob of `bytes` could be inserted without exceeding the
-    /// ceiling — accounting for the entry it would replace at `key` and for
+    /// ceiling — accounting for the entry it would displace at `(domain, p)`
+    /// (the newest unpinned capture under that boundary key) and for
     /// evicting every unpinned entry. Lets `capture_checkpoint` refuse
     /// BEFORE paying for the GPU allocation and device-to-device copy.
-    pub fn can_afford(&self, key: &CheckpointKey, bytes: u64) -> bool {
-        let replaced = self
-            .entries
-            .get(key)
+    pub fn can_afford(&self, domain: &CacheDomain, p: u64, bytes: u64) -> bool {
+        let replaced_id = self.by_boundary.get(&(domain.clone(), p)).copied();
+        let replaced = replaced_id
+            .and_then(|id| self.entries.get(&id))
+            .filter(|e| !e.pinned)
             .map(|e| e.blob.bytes_len())
             .unwrap_or(0);
         let unpinned_bytes: u64 = self
             .entries
             .iter()
-            .filter(|(k, e)| !e.pinned && **k != *key)
+            .filter(|(id, e)| !e.pinned && Some(**id) != replaced_id)
             .map(|(_, e)| e.blob.bytes_len())
             .sum();
         let floor = self.total_bytes.saturating_sub(replaced + unpinned_bytes);
@@ -167,12 +183,23 @@ impl<B: CheckpointBlob> QwenCheckpointPool<B> {
         p == 0 || p % PAGE_TOKENS as u64 == 0
     }
 
-    /// Insert (or replace) a captured checkpoint blob at `(domain, p)`.
+    /// Insert a captured checkpoint blob for `domain` at boundary `p`.
     ///
     /// `p` must be page-aligned (`p % 128 == 0` or `p == 0`); otherwise the
     /// entry is **not** inserted and [`CheckpointId::NONE`] is returned
     /// (spec §4.5: "a state at the end of a chunk cannot be relabelled as
     /// an earlier state").
+    ///
+    /// Every insert mints a FRESH [`CheckpointId`]. If an unpinned entry
+    /// already exists at `(domain, p)` — a re-capture of the same prefix,
+    /// or a DIFFERENT prefix colliding on the same boundary count — it is
+    /// evicted and `by_boundary` repoints at the new id; the radix only
+    /// keeps an id for the prefix that actually re-captured (its record is
+    /// upserted on insert), so the displaced entry's old references simply
+    /// stop matching and fall back to an earlier boundary or cold prefill.
+    /// A pinned same-boundary entry is left in place (a restore may be
+    /// mid-flight on it) — `by_boundary` still repoints, and the stale
+    /// entry ages out through the normal LRU once unpinned.
     ///
     /// If the pool cannot afford the new capture, the oldest **unpinned**
     /// checkpoint is evicted repeatedly until the pool fits. If every
@@ -185,8 +212,8 @@ impl<B: CheckpointBlob> QwenCheckpointPool<B> {
     /// Returns the minted [`CheckpointId`] for the radix index to store, or
     /// [`CheckpointId::NONE`] when the capture was refused.
     ///
-    /// GPU memory discipline: every blob this call displaces (the replaced
-    /// entry at the same key, LRU evictions, and a refused capture itself)
+    /// GPU memory discipline: every blob this call displaces (a displaced
+    /// same-boundary entry, LRU evictions, and a refused capture itself)
     /// is RETURNED to the caller. `DeviceBuffer` has no freeing `Drop`, so
     /// a blob dropped here would leak its device memory permanently while
     /// `total_bytes` is decremented as if freed. The caller routes each
@@ -201,24 +228,34 @@ impl<B: CheckpointBlob> QwenCheckpointPool<B> {
         let bytes = blob.bytes_len();
         let key = (domain, p);
 
-        // If an entry already exists at this key, replace it and KEEP its
-        // id: radix nodes store the CheckpointId from the first capture, so
-        // minting a fresh id on re-capture would strand those references.
-        let mut reuse_id = None;
-        if let Some(old) = self.entries.remove(&key) {
-            self.total_bytes = self.total_bytes.saturating_sub(old.blob.bytes_len());
-            reuse_id = Some(old.id);
-            displaced.push(old.blob);
-        }
-
-        // Clear any prior eviction record for this key.
-        self.evicted.remove(&key);
-
-        // Evict oldest unpinned until we can afford the new blob.
-        while self.total_bytes + bytes > self.max_bytes {
-            match self.find_oldest_unpinned_key() {
-                Some(evict_key) => {
-                    if let Some(blob) = self.evict_internal(evict_key) {
+        // Capacity is judged against the POST-displacement floor: an
+        // unpinned same-boundary occupant is doomed by this insert
+        // regardless of how much room is needed, so evicting OTHER entries
+        // to cover its bytes would be a spurious LRU eviction (the
+        // pre-fix order did exactly that, then displaced anyway).
+        // A pinned occupant stays resident — it does NOT credit the floor.
+        // The floor is recomputed every iteration: each eviction shrinks
+        // total_bytes, and the doomed occupant may itself be the victim the
+        // loop evicts (its credit then drops to zero honestly).
+        //
+        // Fit FIRST: evict before touching the same-boundary occupant.
+        // (The pre-fix order destroyed the occupant when the capture was
+        // later refused — losing a good checkpoint to a failed insert.)
+        loop {
+            let doomed_bytes = self
+                .by_boundary
+                .get(&key)
+                .and_then(|id| self.entries.get(id))
+                .filter(|e| !e.pinned)
+                .map(|e| e.blob.bytes_len())
+                .unwrap_or(0);
+            let floor = self.total_bytes.saturating_sub(doomed_bytes);
+            if floor + bytes <= self.max_bytes {
+                break;
+            }
+            match self.find_oldest_unpinned_id() {
+                Some(evict_id) => {
+                    if let Some(blob) = self.evict_internal(evict_id) {
                         displaced.push(blob);
                     }
                 }
@@ -232,17 +269,28 @@ impl<B: CheckpointBlob> QwenCheckpointPool<B> {
             }
         }
 
-        let id = reuse_id.unwrap_or_else(|| {
-            let id = CheckpointId(self.next_id);
-            self.next_id += 1;
-            id
-        });
+        // Displace the previous occupant of this boundary key — UNLESS it
+        // is pinned (a plan is mid-restore on it). Either way the boundary
+        // repoints at the new capture; the radix records the new id only
+        // for the prefix that produced it.
+        if let Some(old_id) = self.by_boundary.get(&key).copied() {
+            if self.entries.get(&old_id).is_some_and(|e| !e.pinned) {
+                if let Some(blob) = self.evict_internal(old_id) {
+                    displaced.push(blob);
+                }
+            }
+        }
+        self.evicted.remove(&key);
+
+        let id = CheckpointId(self.next_id);
+        self.next_id += 1;
         self.lru_clock += 1;
         self.total_bytes += bytes;
+        self.by_boundary.insert(key.clone(), id);
         self.entries.insert(
-            key,
+            id,
             CheckpointEntry {
-                id,
+                key,
                 blob,
                 pinned: false,
                 lru_stamp: self.lru_clock,
@@ -252,49 +300,62 @@ impl<B: CheckpointBlob> QwenCheckpointPool<B> {
         (id, displaced)
     }
 
-    /// Find the key of the oldest (smallest `lru_stamp`) unpinned entry.
-    fn find_oldest_unpinned_key(&self) -> Option<CheckpointKey> {
+    /// Find the id of the oldest (smallest `lru_stamp`) unpinned entry.
+    fn find_oldest_unpinned_id(&self) -> Option<CheckpointId> {
         self.entries
             .iter()
             .filter(|(_, e)| !e.pinned)
             .min_by_key(|(_, e)| e.lru_stamp)
-            .map(|(k, _)| k.clone())
+            .map(|(k, _)| *k)
     }
 
-    /// Remove an entry by key, accounting bytes and recording eviction.
-    /// Returns the removed blob for the caller to free on the GPU — never
-    /// dropped here (see [`Self::insert`] for the no-`Drop` rationale).
-    fn evict_internal(&mut self, key: CheckpointKey) -> Option<B> {
-        self.entries.remove(&key).map(|entry| {
+    /// Remove an entry by id, accounting bytes and recording its boundary
+    /// key as evicted. Returns the removed blob for the caller to free on
+    /// the GPU — never dropped here (see [`Self::insert`] for the no-`Drop`
+    /// rationale).
+    fn evict_internal(&mut self, id: CheckpointId) -> Option<B> {
+        self.entries.remove(&id).map(|entry| {
             self.total_bytes = self.total_bytes.saturating_sub(entry.blob.bytes_len());
-            self.evicted.insert(key);
+            if self.by_boundary.get(&entry.key) == Some(&id) {
+                self.by_boundary.remove(&entry.key);
+            }
+            self.evicted.insert(entry.key);
             entry.blob
         })
     }
 
-    /// Explicitly evict the checkpoint at `(domain, p)`.
+    /// Explicitly evict the checkpoint `id`.
     ///
     /// Returns the removed blob (for the caller to `free_gpu`), or `None`
     /// when no entry existed.
-    pub fn evict(&mut self, domain: &CacheDomain, p: u64) -> Option<B> {
-        let key = (domain.clone(), p);
-        self.evict_internal(key)
+    pub fn evict(&mut self, id: CheckpointId) -> Option<B> {
+        self.evict_internal(id)
     }
 
-    /// Check whether a checkpoint exists at `(domain, p)`.
+    /// Check whether checkpoint `id` exists. THE identity-preserving check —
+    /// a hit means the blob captured by THIS prefix is still resident.
+    pub fn contains_id(&self, id: CheckpointId) -> bool {
+        self.entries.contains_key(&id)
+    }
+
+    /// Check whether ANY checkpoint exists at `(domain, p)` — boundary-keyed
+    /// bookkeeping for metrics/policy, NOT a restore-path identity check.
     pub fn contains(&self, domain: &CacheDomain, p: u64) -> bool {
-        self.entries.contains_key(&(domain.clone(), p))
+        self.by_boundary
+            .get(&(domain.clone(), p))
+            .is_some_and(|id| self.entries.contains_key(id))
     }
 
-    /// Get the [`CheckpointId`] for `(domain, p)`, if present.
+    /// Get the [`CheckpointId`] currently registered at `(domain, p)`, if
+    /// present. This is the NEWEST capture under that key — callers that
+    /// need identity (restore) must use the id the radix recorded instead.
     pub fn id_of(&self, domain: &CacheDomain, p: u64) -> Option<CheckpointId> {
-        self.entries.get(&(domain.clone(), p)).map(|e| e.id)
+        self.by_boundary.get(&(domain.clone(), p)).copied()
     }
 
-    /// Borrow the blob at `(domain, p)`, refreshing its LRU stamp.
-    pub fn get(&mut self, domain: &CacheDomain, p: u64) -> Option<&B> {
-        let key = (domain.clone(), p);
-        if let Some(entry) = self.entries.get_mut(&key) {
+    /// Borrow the blob `id`, refreshing its LRU stamp.
+    pub fn get(&mut self, id: CheckpointId) -> Option<&B> {
+        if let Some(entry) = self.entries.get_mut(&id) {
             self.lru_clock += 1;
             entry.lru_stamp = self.lru_clock;
             Some(&entry.blob)
@@ -303,17 +364,16 @@ impl<B: CheckpointBlob> QwenCheckpointPool<B> {
         }
     }
 
-    /// Borrow the blob at `(domain, p)` without refreshing LRU (read-only).
-    pub fn peek(&self, domain: &CacheDomain, p: u64) -> Option<&B> {
-        self.entries.get(&(domain.clone(), p)).map(|e| &e.blob)
+    /// Borrow the blob `id` without refreshing LRU (read-only).
+    pub fn peek(&self, id: CheckpointId) -> Option<&B> {
+        self.entries.get(&id).map(|e| &e.blob)
     }
 
-    /// Pin the checkpoint at `(domain, p)` so it survives LRU eviction.
+    /// Pin checkpoint `id` so it survives LRU eviction.
     ///
     /// Returns `true` if the entry was found and pinned.
-    pub fn pin(&mut self, domain: &CacheDomain, p: u64) -> bool {
-        let key = (domain.clone(), p);
-        if let Some(entry) = self.entries.get_mut(&key) {
+    pub fn pin(&mut self, id: CheckpointId) -> bool {
+        if let Some(entry) = self.entries.get_mut(&id) {
             entry.pinned = true;
             true
         } else {
@@ -321,13 +381,11 @@ impl<B: CheckpointBlob> QwenCheckpointPool<B> {
         }
     }
 
-    /// Unpin the checkpoint at `(domain, p)`, making it eligible for LRU
-    /// eviction again.
+    /// Unpin checkpoint `id`, making it eligible for LRU eviction again.
     ///
     /// Returns `true` if the entry was found and unpinned.
-    pub fn unpin(&mut self, domain: &CacheDomain, p: u64) -> bool {
-        let key = (domain.clone(), p);
-        if let Some(entry) = self.entries.get_mut(&key) {
+    pub fn unpin(&mut self, id: CheckpointId) -> bool {
+        if let Some(entry) = self.entries.get_mut(&id) {
             entry.pinned = false;
             true
         } else {
@@ -335,12 +393,9 @@ impl<B: CheckpointBlob> QwenCheckpointPool<B> {
         }
     }
 
-    /// Whether the checkpoint at `(domain, p)` is pinned.
-    pub fn is_pinned(&self, domain: &CacheDomain, p: u64) -> bool {
-        self.entries
-            .get(&(domain.clone(), p))
-            .map(|e| e.pinned)
-            .unwrap_or(false)
+    /// Whether checkpoint `id` is pinned.
+    pub fn is_pinned(&self, id: CheckpointId) -> bool {
+        self.entries.get(&id).map(|e| e.pinned).unwrap_or(false)
     }
 
     /// Drain and return all stored blobs, clearing the pool. Used by the
@@ -349,6 +404,7 @@ impl<B: CheckpointBlob> QwenCheckpointPool<B> {
     /// touches the GPU).
     pub fn drain_blobs(&mut self) -> Vec<B> {
         self.total_bytes = 0;
+        self.by_boundary.clear();
         self.entries.drain().map(|(_, e)| e.blob).collect()
     }
 
@@ -382,46 +438,44 @@ fn complete_bundle(drafter: DrafterDecision) -> ResumeBundle {
     }
 }
 
-/// Find the largest page-aligned checkpoint boundary `p > 0` with
-/// `p <= max_p` in the pool for `domain`.
+/// The largest `(boundary, checkpoint)` among the lookup's recorded
+/// candidates whose pool entry is still resident, with `boundary > 0` and
+/// `boundary <= max_p`.
+///
+/// Candidates are radix-recorded `(boundary, id)` pairs ON THE MATCHED
+/// TOKEN PATH — selecting by boundary alone would be unsound: different
+/// prefixes legitimately collide on the same page-aligned boundary count,
+/// and `by_boundary` would then resolve to whatever prefix captured last.
+/// Ids for evicted pool entries are skipped here (a stale radix record is
+/// expected after pool eviction — `plan_resume` falls through to the next
+/// valid candidate rather than declaring a miss).
 ///
 /// Does NOT return `p = 0` — the initial state does not require a
 /// checkpoint and is handled separately by the caller.
-fn find_largest_pool_checkpoint<B: CheckpointBlob>(
+fn find_largest_checkpoint<B: CheckpointBlob>(
     pool: &QwenCheckpointPool<B>,
-    domain: &CacheDomain,
+    candidates: &[(u64, CheckpointId)],
     max_p: u64,
-) -> Option<u64> {
-    let page = PAGE_TOKENS as u64;
-    let mut p = (max_p / page) * page;
-    while p > 0 {
-        if pool.contains(domain, p) {
-            return Some(p);
-        }
-        p -= page;
-    }
-    None
+) -> Option<(u64, CheckpointId)> {
+    candidates
+        .iter()
+        .filter(|(p, id)| *p > 0 && *p <= max_p && pool.contains_id(*id))
+        .max_by_key(|(p, _)| *p)
+        .copied()
 }
 
-/// Find the largest page-aligned checkpoint boundary `p > 0` with
-/// `p < below_p` in the pool for `domain`.
-fn find_largest_pool_checkpoint_below<B: CheckpointBlob>(
+/// The largest resident candidate with `boundary < below_p` (strict) — the
+/// exact-match fallback that must never restore `S_prompt_len`.
+fn find_largest_checkpoint_below<B: CheckpointBlob>(
     pool: &QwenCheckpointPool<B>,
-    domain: &CacheDomain,
+    candidates: &[(u64, CheckpointId)],
     below_p: u64,
-) -> Option<u64> {
-    let page = PAGE_TOKENS as u64;
-    if below_p <= page {
-        return None;
-    }
-    let mut p = below_p - page;
-    while p > 0 {
-        if pool.contains(domain, p) {
-            return Some(p);
-        }
-        p -= page;
-    }
-    None
+) -> Option<(u64, CheckpointId)> {
+    candidates
+        .iter()
+        .filter(|(p, id)| *p > 0 && *p < below_p && pool.contains_id(*id))
+        .max_by_key(|(p, _)| *p)
+        .copied()
 }
 
 /// Plan a resume from the checkpoint pool (spec §4.5 C5).
@@ -468,11 +522,11 @@ pub fn plan_resume<B: CheckpointBlob>(
     drafter: DrafterDecision,
 ) -> Result<ResumePlan, MissReason> {
     let plan = plan_resume_inner(pool, domain, prompt_len, lookup, drafter)?;
-    // Pin the chosen boundary so an unrelated capture cannot evict the
-    // checkpoint between this plan and the caller's restore. p == 0 is the
-    // initial state — no entry exists to pin.
-    if plan.boundary > 0 {
-        pool.pin(domain, plan.boundary);
+    // Pin the chosen checkpoint so an unrelated capture cannot evict it
+    // between this plan and the caller's restore. p == 0 is the initial
+    // state — no entry exists to pin.
+    if plan.checkpoint != CheckpointId::NONE {
+        pool.pin(plan.checkpoint);
     }
     Ok(plan)
 }
@@ -486,32 +540,33 @@ fn plan_resume_inner<B: CheckpointBlob>(
 ) -> Result<ResumePlan, MissReason> {
     let resumable = lookup.resumable_tokens;
 
-    // Find the largest page-aligned checkpoint p > 0, p <= resumable.
-    let best_p = find_largest_pool_checkpoint(pool, domain, resumable);
+    // Find the largest radix-recorded checkpoint candidate whose pool
+    // entry is still resident, p <= resumable.
+    let best = find_largest_checkpoint(pool, &lookup.checkpoint_candidates, resumable);
 
-    match best_p {
-        Some(p) if prompt_len == p && prompt_len > 0 => {
+    match best {
+        Some((p, _)) if prompt_len == p && prompt_len > 0 => {
             // Exact match: select an earlier boundary, never restore S_prompt_len.
             // Prefer an earlier checkpoint; fall back to the initial state p=0.
-            let earlier = find_largest_pool_checkpoint_below(pool, domain, p);
-            let ep = earlier.unwrap_or(0);
-            let byte_cost = if ep == 0 {
+            let earlier = find_largest_checkpoint_below(pool, &lookup.checkpoint_candidates, p);
+            let (ep, eid) = earlier.unwrap_or((0, CheckpointId::NONE));
+            let byte_cost = if eid == CheckpointId::NONE {
                 0
             } else {
-                pool.peek(domain, ep).map(|b| b.bytes_len()).unwrap_or(0)
+                pool.peek(eid).map(|b| b.bytes_len()).unwrap_or(0)
             };
             let bundle = complete_bundle(drafter);
-            ResumePlan::new(ep, bundle, byte_cost, LastTokenHandling::EarlierBoundary)
+            ResumePlan::new(ep, eid, bundle, byte_cost, LastTokenHandling::EarlierBoundary)
                 .map_err(|e| match e {
                     ResumePlanError::MissingComponent(_) => MissReason::NoCheckpoint,
                 })
         }
-        Some(p) => {
+        Some((p, id)) => {
             // Normal: p < prompt_len (or prompt_len == 0 with p > 0 — shouldn't
             // normally happen, but SuffixRecompute is still safe).
-            let byte_cost = pool.peek(domain, p).map(|b| b.bytes_len()).unwrap_or(0);
+            let byte_cost = pool.peek(id).map(|b| b.bytes_len()).unwrap_or(0);
             let bundle = complete_bundle(drafter);
-            ResumePlan::new(p, bundle, byte_cost, LastTokenHandling::SuffixRecompute)
+            ResumePlan::new(p, id, bundle, byte_cost, LastTokenHandling::SuffixRecompute)
                 .map_err(|e| match e {
                     ResumePlanError::MissingComponent(_) => MissReason::NoCheckpoint,
                 })
@@ -521,7 +576,7 @@ fn plan_resume_inner<B: CheckpointBlob>(
             if resumable == 0 && prompt_len == 0 {
                 // Empty prompt: p=0, no underflow (spec §4.5).
                 let bundle = complete_bundle(drafter);
-                ResumePlan::new(0, bundle, 0, LastTokenHandling::SuffixRecompute)
+                ResumePlan::new(0, CheckpointId::NONE, bundle, 0, LastTokenHandling::SuffixRecompute)
                     .map_err(|e| match e {
                         ResumePlanError::MissingComponent(_) => MissReason::NoCheckpoint,
                     })
@@ -573,7 +628,7 @@ pub fn capture_checkpoint(
     // soft refusal, indistinguishable from a hard failure only after the
     // work is already spent.
     let bytes = DeltaNetSnapshot::bytes_for(state);
-    if !pool.can_afford(&(domain.clone(), p), bytes) {
+    if !pool.can_afford(domain, p, bytes) {
         return Ok(CheckpointId::NONE);
     }
 
@@ -604,12 +659,11 @@ pub fn capture_checkpoint(
 pub fn restore_private(
     gpu: &mut Gpu,
     pool: &mut QwenCheckpointPool<DeltaNetSnapshot>,
-    domain: &CacheDomain,
-    p: u64,
+    id: CheckpointId,
     dst: &mut DeltaNetSnapshot,
 ) -> HipResult<()> {
     let src = pool
-        .peek(domain, p)
+        .peek(id)
         .ok_or_else(|| HipError::new(0, "restore_private: checkpoint not found"))?;
     src.copy_to(dst, gpu)
 }
@@ -673,12 +727,16 @@ mod tests {
         }
     }
 
-    /// Build a `PrefixLookup` with the given `resumable_tokens`.
-    fn lookup(resumable: u64) -> PrefixLookup {
+    /// Build a `PrefixLookup` with the given `resumable_tokens` and the
+    /// checkpoint candidates the radix would have recorded for the path —
+    /// each `(boundary, id)` must use the id `pool.insert` minted, never a
+    /// re-derived `(domain, boundary)` guess.
+    fn lookup(resumable: u64, candidates: &[(u64, CheckpointId)]) -> PrefixLookup {
         PrefixLookup {
             matched_tokens: resumable,
             resident_kv_tokens: resumable,
             resumable_tokens: resumable,
+            checkpoint_candidates: candidates.to_vec(),
         }
     }
 
@@ -700,7 +758,7 @@ mod tests {
             &mut pool,
             &dom,
             200,
-            &lookup(128),
+            &lookup(128, &[(128, id)]),
             DrafterDecision::Ar,
         )
         .expect("resume should succeed");
@@ -722,7 +780,7 @@ mod tests {
         let dom = test_domain("a7-exact");
 
         // Capture at p=128 only.
-        pool.insert(dom.clone(), 128, HostBlob { bytes: 4096 });
+        let (id128, _) = pool.insert(dom.clone(), 128, HostBlob { bytes: 4096 });
 
         // Prompt of exactly 128 tokens: must NOT resume at p=128.
         // Should select p=0 (initial state) with EarlierBoundary.
@@ -730,7 +788,7 @@ mod tests {
             &mut pool,
             &dom,
             128,
-            &lookup(128),
+            &lookup(128, &[(128, id128)]),
             DrafterDecision::Ar,
         )
         .expect("resume should succeed");
@@ -751,15 +809,15 @@ mod tests {
         let dom = test_domain("a7-prior");
 
         // Capture at p=128 and p=256.
-        pool.insert(dom.clone(), 128, HostBlob { bytes: 4096 });
-        pool.insert(dom.clone(), 256, HostBlob { bytes: 4096 });
+        let (id128, _) = pool.insert(dom.clone(), 128, HostBlob { bytes: 4096 });
+        let (id256, _) = pool.insert(dom.clone(), 256, HostBlob { bytes: 4096 });
 
         // Prompt of exactly 256 tokens: should select p=128, not p=256.
         let plan = plan_resume(
             &mut pool,
             &dom,
             256,
-            &lookup(256),
+            &lookup(256, &[(128, id128), (256, id256)]),
             DrafterDecision::Ar,
         )
         .expect("resume should succeed");
@@ -780,7 +838,7 @@ mod tests {
             &mut pool,
             &dom,
             0,
-            &lookup(0),
+            &lookup(0, &[]),
             DrafterDecision::Ar,
         )
         .expect("empty prompt should not underflow");
@@ -801,7 +859,7 @@ mod tests {
             &mut pool,
             &dom,
             200,
-            &lookup(128),
+            &lookup(128, &[]),
             DrafterDecision::Ar,
         )
         .expect_err("should be a miss");
@@ -817,15 +875,15 @@ mod tests {
         let dom = test_domain("a8-evicted");
 
         // Insert at p=128, then evict it.
-        pool.insert(dom.clone(), 128, HostBlob { bytes: 4096 });
-        assert!(pool.evict(&dom, 128).is_some());
+        let (id, _) = pool.insert(dom.clone(), 128, HostBlob { bytes: 4096 });
+        assert!(pool.evict(id).is_some());
 
         // Lookup still claims 128 resumable, but checkpoint was evicted.
         let err = plan_resume(
             &mut pool,
             &dom,
             200,
-            &lookup(128),
+            &lookup(128, &[(128, id)]),
             DrafterDecision::Ar,
         )
         .expect_err("should be a miss");
@@ -845,7 +903,7 @@ mod tests {
             &mut pool,
             &dom,
             200,
-            &lookup(64),
+            &lookup(64, &[]),
             DrafterDecision::Ar,
         );
 
@@ -860,14 +918,14 @@ mod tests {
         let dom = test_domain("a9");
 
         // Capture at p=128.
-        pool.insert(dom.clone(), 128, HostBlob { bytes: 4096 });
+        let (id, _) = pool.insert(dom.clone(), 128, HostBlob { bytes: 4096 });
 
         // Plan for 200-token prompt.
         let plan = plan_resume(
             &mut pool,
             &dom,
             200,
-            &lookup(128),
+            &lookup(128, &[(128, id)]),
             DrafterDecision::Ar,
         )
         .unwrap();
@@ -890,14 +948,14 @@ mod tests {
         let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
         let dom = test_domain("a9-exact");
 
-        pool.insert(dom.clone(), 128, HostBlob { bytes: 4096 });
-        pool.insert(dom.clone(), 256, HostBlob { bytes: 4096 });
+        let (id128, _) = pool.insert(dom.clone(), 128, HostBlob { bytes: 4096 });
+        let (id256, _) = pool.insert(dom.clone(), 256, HostBlob { bytes: 4096 });
 
         let plan = plan_resume(
             &mut pool,
             &dom,
             256, // exact match
-            &lookup(256),
+            &lookup(256, &[(128, id128), (256, id256)]),
             DrafterDecision::Ar,
         )
         .unwrap();
@@ -944,21 +1002,21 @@ mod tests {
 
         // LRU eviction returns the evicted blob.
         let _ = pool.insert(dom.clone(), 0, HostBlob { bytes: 4096 });
-        let _ = pool.insert(dom.clone(), 128, HostBlob { bytes: 4096 });
-        let (_, displaced) = pool.insert(dom.clone(), 256, HostBlob { bytes: 4096 });
+        let (id128, _) = pool.insert(dom.clone(), 128, HostBlob { bytes: 4096 });
+        let (_id256, displaced) = pool.insert(dom.clone(), 256, HostBlob { bytes: 4096 });
         assert_eq!(displaced.len(), 1, "evicted blob must be handed back");
         assert_eq!(displaced[0].bytes, 4096);
         assert!(!pool.contains(&dom, 0), "p=0 was the one evicted");
 
         // Same-key replacement returns the replaced blob.
-        let (_, displaced) = pool.insert(dom.clone(), 256, HostBlob { bytes: 2048 });
+        let (id256, _) = pool.insert(dom.clone(), 256, HostBlob { bytes: 2048 });
         assert_eq!(displaced.len(), 1, "replaced blob must be handed back");
         assert_eq!(displaced[0].bytes, 4096);
         assert_eq!(pool.total_bytes(), 4096 + 2048);
 
         // Ceiling refusal with everything pinned returns the refused blob.
-        pool.pin(&dom, 128);
-        pool.pin(&dom, 256);
+        pool.pin(id128);
+        pool.pin(id256);
         let (id, displaced) = pool.insert(dom.clone(), 384, HostBlob { bytes: 8192 });
         assert_eq!(id, CheckpointId::NONE, "refused capture reports NONE");
         assert_eq!(
@@ -981,12 +1039,12 @@ mod tests {
         let mut pool = QwenCheckpointPool::<HostBlob>::new(8192);
         let dom = test_domain("lru-pinned");
 
-        pool.insert(dom.clone(), 0, HostBlob { bytes: 4096 });
-        pool.insert(dom.clone(), 128, HostBlob { bytes: 4096 });
+        let (id0, _) = pool.insert(dom.clone(), 0, HostBlob { bytes: 4096 });
+        let _ = pool.insert(dom.clone(), 128, HostBlob { bytes: 4096 });
 
         // Pin the oldest (p=0).
-        assert!(pool.pin(&dom, 0));
-        assert!(pool.is_pinned(&dom, 0));
+        assert!(pool.pin(id0));
+        assert!(pool.is_pinned(id0));
 
         // Insert a third — p=128 (unpinned, newer) should be evicted,
         // NOT p=0 (pinned, older).
@@ -1004,11 +1062,11 @@ mod tests {
         let mut pool = QwenCheckpointPool::<HostBlob>::new(8192);
         let dom = test_domain("lru-recency");
 
-        pool.insert(dom.clone(), 0, HostBlob { bytes: 4096 });
+        let (id0, _) = pool.insert(dom.clone(), 0, HostBlob { bytes: 4096 });
         pool.insert(dom.clone(), 128, HostBlob { bytes: 4096 });
 
         // Access p=0 to make it more recent than p=128.
-        let _ = pool.get(&dom, 0);
+        let _ = pool.get(id0);
 
         // Insert a third — p=128 (now oldest) should be evicted.
         pool.insert(dom.clone(), 256, HostBlob { bytes: 4096 });
@@ -1025,7 +1083,7 @@ mod tests {
         let dom_a = test_domain("isolation-a");
         let dom_b = test_domain("isolation-b");
 
-        pool.insert(dom_a.clone(), 128, HostBlob { bytes: 4096 });
+        let (id_a, _) = pool.insert(dom_a.clone(), 128, HostBlob { bytes: 4096 });
 
         // dom_b has no checkpoint at p=128.
         assert!(!pool.contains(&dom_b, 128));
@@ -1036,7 +1094,7 @@ mod tests {
             &mut pool,
             &dom_b,
             200,
-            &lookup(128),
+            &lookup(128, &[]),
             DrafterDecision::Ar,
         )
         .expect_err("different domain should miss");
@@ -1048,7 +1106,7 @@ mod tests {
             &mut pool,
             &dom_a,
             200,
-            &lookup(128),
+            &lookup(128, &[(128, id_a)]),
             DrafterDecision::Ar,
         )
         .expect("same domain should hit");
@@ -1122,13 +1180,13 @@ mod tests {
         let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
         let dom = test_domain("bytes");
 
-        pool.insert(dom.clone(), 0, HostBlob { bytes: 1000 });
+        let (id0, _) = pool.insert(dom.clone(), 0, HostBlob { bytes: 1000 });
         assert_eq!(pool.total_bytes(), 1000);
 
         pool.insert(dom.clone(), 128, HostBlob { bytes: 2000 });
         assert_eq!(pool.total_bytes(), 3000);
 
-        let _ = pool.evict(&dom, 0);
+        let _ = pool.evict(id0);
         assert_eq!(pool.total_bytes(), 2000);
     }
 
@@ -1139,14 +1197,14 @@ mod tests {
         let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
         let dom = test_domain("drafter");
 
-        pool.insert(dom.clone(), 128, HostBlob { bytes: 4096 });
+        let (id, _) = pool.insert(dom.clone(), 128, HostBlob { bytes: 4096 });
 
         // Default Ar.
         let plan_ar = plan_resume(
             &mut pool,
             &dom,
             200,
-            &lookup(128),
+            &lookup(128, &[(128, id)]),
             DrafterDecision::Ar,
         )
         .unwrap();
@@ -1157,7 +1215,7 @@ mod tests {
             &mut pool,
             &dom,
             200,
-            &lookup(128),
+            &lookup(128, &[(128, id)]),
             DrafterDecision::Checkpoint,
         )
         .unwrap();
@@ -1168,7 +1226,7 @@ mod tests {
             &mut pool,
             &dom,
             200,
-            &lookup(128),
+            &lookup(128, &[(128, id)]),
             DrafterDecision::Reseed,
         )
         .unwrap();
@@ -1186,7 +1244,7 @@ mod tests {
             ef_residual: true,
             drafter: DrafterDecision::Ar,
         };
-        let err = ResumePlan::new(128, incomplete, 4096, LastTokenHandling::SuffixRecompute);
+        let err = ResumePlan::new(128, CheckpointId::NONE, incomplete, 4096, LastTokenHandling::SuffixRecompute);
         assert!(err.is_err());
     }
 
@@ -1207,7 +1265,7 @@ mod tests {
             &mut pool,
             &dom,
             128,
-            &lookup(128),
+            &lookup(128, &[]),
             DrafterDecision::Ar,
         )
         .expect_err("no checkpoint at 128");
@@ -1223,18 +1281,97 @@ mod tests {
         let dom = test_domain("round");
 
         // Checkpoint at p=128 only.
-        pool.insert(dom.clone(), 128, HostBlob { bytes: 4096 });
+        let (id, _) = pool.insert(dom.clone(), 128, HostBlob { bytes: 4096 });
 
         // Lookup says 200 resumable (not page-aligned). Should find p=128.
         let plan = plan_resume(
             &mut pool,
             &dom,
             300,
-            &lookup(200),
+            &lookup(200, &[(128, id)]),
             DrafterDecision::Ar,
         )
         .unwrap();
 
         assert_eq!(plan.boundary, 128);
+
+    // ── Boundary collision across prefixes: id-keyed restore is safe ────
+
+    #[test]
+    fn same_boundary_collision_never_crosses_conversations() {
+        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let dom = test_domain("collision");
+
+        // Prefix A checkpoints at 128; a DIFFERENT prefix B in the same
+        // domain later captures at the same boundary count. Under the old
+        // `(domain, boundary)` keying, B's insert overwrote A's entry while
+        // the radix still mapped A's path to (dom, 128) — a lookup for A's
+        // prompt then restored B's recurrent state: cross-conversation
+        // corruption.
+        let (id_a, _) = pool.insert(dom.clone(), 128, HostBlob { bytes: 4096 });
+        let (id_b, displaced) = pool.insert(dom.clone(), 128, HostBlob { bytes: 4096 });
+        assert_ne!(id_a, id_b, "every capture mints a fresh id");
+        assert_eq!(displaced.len(), 1, "the displaced A blob is handed back to free");
+
+        // A's radix record points at id_a — the entry is gone, so the plan
+        // must miss honestly, never fall through to B's blob at the same
+        // boundary.
+        let err = plan_resume(
+            &mut pool,
+            &dom,
+            200,
+            &lookup(128, &[(128, id_a)]),
+            DrafterDecision::Ar,
+        )
+        .expect_err("A's evicted checkpoint must not resolve to B's");
+        assert_eq!(err, MissReason::Evicted);
+
+        // B's radix record resolves to its own checkpoint.
+        let plan = plan_resume(
+            &mut pool,
+            &dom,
+            200,
+            &lookup(128, &[(128, id_b)]),
+            DrafterDecision::Ar,
+        )
+        .expect("B's checkpoint is resident");
+        assert_eq!(plan.boundary, 128);
+        assert_eq!(plan.checkpoint, id_b);
+
+        // Boundary bookkeeping still reports a checkpoint at (dom, 128).
+        assert!(pool.contains(&dom, 128));
+        assert_eq!(pool.id_of(&dom, 128), Some(id_b));
+    }
+
+    // ── Pinned same-boundary entry survives; boundary repoints fresh ────
+
+    #[test]
+    fn pinned_same_boundary_entry_coexists_with_fresh_capture() {
+        let mut pool = QwenCheckpointPool::<HostBlob>::new(1 << 20);
+        let dom = test_domain("pinned-collision");
+
+        let (id_a, _) = pool.insert(dom.clone(), 128, HostBlob { bytes: 4096 });
+        assert!(pool.pin(id_a), "pin A (a plan is mid-restore on it)");
+
+        // Re-capture at the same boundary while A is pinned: A stays
+        // resident, by_boundary repoints at the fresh id.
+        let (id_b, displaced) = pool.insert(dom.clone(), 128, HostBlob { bytes: 2048 });
+        assert!(displaced.is_empty(), "pinned A is not displaced");
+        assert!(pool.contains_id(id_a), "pinned A survives the collision");
+        assert!(pool.contains_id(id_b));
+        assert_eq!(pool.id_of(&dom, 128), Some(id_b));
+        assert_eq!(pool.total_bytes(), 4096 + 2048);
+
+        // A's plan still restores A's blob by id.
+        let plan = plan_resume(
+            &mut pool,
+            &dom,
+            200,
+            &lookup(128, &[(128, id_a)]),
+            DrafterDecision::Ar,
+        )
+        .expect("pinned A remains restorable by id");
+        assert_eq!(plan.checkpoint, id_a);
+    }
     }
 }

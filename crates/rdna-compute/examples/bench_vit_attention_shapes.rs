@@ -106,24 +106,24 @@ fn main() {
 
         let trials = if n > 700 { 3 } else { 10 };
         let t_naive = time_kernel(&mut gpu, |g| {
-            g.vit_attention_f32(&qkv, &out, n, HIDDEN, HEADS, HEAD_DIM)
+            g.vit_attention_f32(&qkv, &out, n, HIDDEN, HEADS, HEAD_DIM, n)
         }, 2, trials);
         let t_opt = time_kernel(&mut gpu, |g| {
             g.vit_attention_opt(&qkv, &out, n, HIDDEN, HEADS, HEAD_DIM)
         }, 2, trials);
         let t_qtiled = time_kernel(&mut gpu, |g| {
-            g.vit_attention_qtiled_f32(&qkv, &out, n, HIDDEN, HEADS, HEAD_DIM)
+            g.vit_attention_qtiled_f32(&qkv, &out, n, HIDDEN, HEADS, HEAD_DIM, n)
         }, 2, trials);
 
         let (err_naive, err_opt, err_qtiled) = if n <= 676 {
             let host_ref = cpu_reference(&qkv_h, n);
-            gpu.vit_attention_f32(&qkv, &out, n, HIDDEN, HEADS, HEAD_DIM)
+            gpu.vit_attention_f32(&qkv, &out, n, HIDDEN, HEADS, HEAD_DIM, n)
                 .expect("naive");
             let naive_out = gpu.download_f32(&out).expect("download");
             gpu.vit_attention_opt(&qkv, &out, n, HIDDEN, HEADS, HEAD_DIM)
                 .expect("opt");
             let opt_out = gpu.download_f32(&out).expect("download");
-            gpu.vit_attention_qtiled_f32(&qkv, &out, n, HIDDEN, HEADS, HEAD_DIM)
+            gpu.vit_attention_qtiled_f32(&qkv, &out, n, HIDDEN, HEADS, HEAD_DIM, n)
                 .expect("qtiled");
             let qtiled_out = gpu.download_f32(&out).expect("download");
             (
@@ -132,13 +132,13 @@ fn main() {
                 max_abs_err(&qtiled_out, &host_ref),
             )
         } else {
-            gpu.vit_attention_f32(&qkv, &out, n, HIDDEN, HEADS, HEAD_DIM)
+            gpu.vit_attention_f32(&qkv, &out, n, HIDDEN, HEADS, HEAD_DIM, n)
                 .expect("naive");
             let naive_out = gpu.download_f32(&out).expect("download");
             gpu.vit_attention_opt(&qkv, &out, n, HIDDEN, HEADS, HEAD_DIM)
                 .expect("opt");
             let opt_out = gpu.download_f32(&out).expect("download");
-            gpu.vit_attention_qtiled_f32(&qkv, &out, n, HIDDEN, HEADS, HEAD_DIM)
+            gpu.vit_attention_qtiled_f32(&qkv, &out, n, HIDDEN, HEADS, HEAD_DIM, n)
                 .expect("qtiled");
             let qtiled_out = gpu.download_f32(&out).expect("download");
             (

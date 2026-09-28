@@ -606,6 +606,17 @@ impl Rig {
         // without the spec term let a small `prefill_chunk` (operator knob)
         // overflow `pbs.max_batch` on the first verify step — an
         // engine-thread panic, the serve-hang failure class.
+        // quota_of() lets one slot take max(prefill_chunk, prefill_min_tokens)
+        // rows — a prefill_min_tokens larger than prefill_chunk overflows
+        // pbs.max_batch on the first step (engine-thread panic → poisoned
+        // serve). Same class of build-time bound as the FairQueue check.
+        if cfg.prefill_min_tokens > prefill_chunk {
+            return Err(format!(
+                "prefill_min_tokens ({}) exceeds prefill_chunk ({prefill_chunk}) — \
+                 the scheduler would emit more rows per slot than pbs.max_batch allows",
+                cfg.prefill_min_tokens
+            ));
+        }
         let max_batch = prefill_chunk.max(spec_rows) * cfg.n_slots;
 
         // ── Paged KV opt-in ────────────────────────────────────────────────
@@ -1991,6 +2002,20 @@ fn vision_tower_step(
         }
     }
     .map_err(|e| format!("vision_forward: {e}"))?;
+
+    // The scatter kernel dereferences row_ptr + ext_index*config.dim with
+    // no bounds check: a short/mis-shaped tower output would read past the
+    // matrix and embed garbage silently. Fail the request instead.
+    let expected = vl.n_visual_tokens * config.dim;
+    if emb.len() != expected {
+        return Err(format!(
+            "vision tower returned {} floats; expected {} ({} visual tokens x dim {})",
+            emb.len(),
+            expected,
+            vl.n_visual_tokens,
+            config.dim
+        ));
+    }
     let dev = gpu
         .zeros(&[emb.len()], DType::F32)
         .map_err(|e| format!("vl ext alloc: {e}"))?;
@@ -3248,6 +3273,27 @@ impl GrammarConstraint {
             }
             return Err(GrammarMaskError::EmptyAllowedSet);
         }
+        // Cache miss → publish the packed bitset for the next visit to this
+        // signature (spec §9.2). Bounded at MASK_CACHE_CAP; oldest-first
+        // eviction keeps the per-request key space ordered.
+        let words = vocab_size.div_ceil(64);
+        let mut bits = vec![0u64; words];
+        for (id, &allowed) in self.mask_buf.iter().enumerate() {
+            if allowed {
+                bits[id / 64] |= 1u64 << (id % 64);
+            }
+        }
+        if !self.mask_cache.contains_key(&sig) {
+            self.mask_cache_order.push_back(sig);
+        }
+        self.mask_cache.insert(sig, bits);
+        while self.mask_cache.len() > MASK_CACHE_CAP {
+            if let Some(evict) = self.mask_cache_order.pop_front() {
+                self.mask_cache.remove(&evict);
+            } else {
+                break;
+            }
+        }
         Ok(&self.mask_buf)
     }
 
@@ -3893,50 +3939,6 @@ fn run_loop(
         if batch.is_empty() {
             continue;
         }
-        // VL rows: refresh the per-row vision-matrix base pointers the
-        // scatter kernel dereferences. Engine-side upload, every step
-        // (including graph replays), so the captured kernel always reads
-        // current pointers. Rows with a negative index never dereference.
-        if batch.ext_emb.len() == batch.positions.len()
-            && batch.ext_emb.iter().any(|&e| e >= 0)
-        {
-            let ptrs: Vec<u64> = batch
-                .row_slot
-                .iter()
-                .map(|&sl| {
-                    rig.vl_ext_devs[sl as usize]
-                        .as_ref()
-                        .map(|t| t.buf.as_ptr() as u64)
-                        .unwrap_or(0)
-                })
-                .collect();
-            let bytes: Vec<u8> = ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
-            // Bound-check here, not in memcpy_htod: its overflow path is an
-            // assert, and a panic in this thread kills the engine loop while
-            // the HTTP front end keeps accepting — the serve-hang failure
-            // mode. This upload runs before forward_batch_slots' own
-            // n <= pbs.max_batch assert, so an oversized batch would only
-            // surface here.
-            if bytes.len() > rig.pbs.ext_emb_row_ptr.buf.size() {
-                let reason = format!(
-                    "vl ext ptr upload of {} bytes exceeds staging capacity {} \
-                     (batch of {} rows vs max_batch {})",
-                    bytes.len(),
-                    rig.pbs.ext_emb_row_ptr.buf.size(),
-                    batch.total_rows(),
-                    rig.pbs.max_batch
-                );
-                fail_all_active(&mut rig, &mut slots, &mut work, reason.clone());
-                poison = Some(reason);
-                break 'serve;
-            }
-            if let Err(e) = rig.gpu.hip.memcpy_htod(&rig.pbs.ext_emb_row_ptr.buf, &bytes) {
-                let reason = format!("vl ext ptr upload failed: {e:?}");
-                fail_all_active(&mut rig, &mut slots, &mut work, reason.clone());
-                poison = Some(reason);
-                break 'serve;
-            }
-        }
         // ── COW write barrier (spec §4.3) ────────────────────────────────
         // Before KV write kernels: plan copy-on-write for each active slot's
         // block table over the write interval, execute the copies, and
@@ -4014,11 +4016,11 @@ fn run_loop(
                 if let Some((_, p)) = cow_plans.get_mut(s).and_then(|o| o.take()) {
                     rig.pool.abort_cow_for_slot(p);
                 }
-                // Zero the slot's batch rows so the forward does not write
-                // through a slot whose COW plan failed.
-                let m = batch.m_per_slot[s];
-                batch.m_per_slot[s] = 0;
-                let _ = m; // rows are dropped from the flat arrays below
+                // Rows are dropped from the flat arrays by the rebuild
+                // below — do NOT zero m_per_slot here: the rebuild walks
+                // m_per_slot to advance its flat-array offset, so a pre-
+                // zeroed entry would pack the failed slot's rows into the
+                // NEXT surviving slot (row_slot mismatch → forward panic).
                 if let Some(mut f) = slots[s].take() {
                     let reason = "COW reservation failed for this slot".to_string();
                     let _ = send_event(&f.reply, Event::Rejected { reason });
@@ -4086,6 +4088,53 @@ fn run_loop(
             rebuild_batch_excluding_failed(&mut batch, &failed_commits);
             if batch.is_empty() {
                 continue;
+            }
+        }
+        // VL rows: refresh the per-row vision-matrix base pointers the
+        // scatter kernel dereferences. Engine-side upload, every step
+        // (including graph replays), so the captured kernel always reads
+        // current pointers. Rows with a negative index never dereference.
+        // MUST run after BOTH rebuild_batch_excluding_failed calls above:
+        // they compact the flat arrays, so a pre-rebuild upload would map
+        // surviving rows to a failed slot's (freed) vl_ext_devs matrix.
+        if batch.ext_emb.len() == batch.positions.len()
+            && batch.ext_emb.iter().any(|&e| e >= 0)
+        {
+            let ptrs: Vec<u64> = batch
+                .row_slot
+                .iter()
+                .map(|&sl| {
+                    rig.vl_ext_devs[sl as usize]
+                        .as_ref()
+                        .map(|t| t.buf.as_ptr() as u64)
+                        .unwrap_or(0)
+                })
+                .collect();
+            let bytes: Vec<u8> = ptrs.iter().flat_map(|p| p.to_ne_bytes()).collect();
+            // Bound-check here, not in memcpy_htod: its overflow path is an
+            // assert, and a panic in this thread kills the engine loop while
+            // the HTTP front end keeps accepting — the serve-hang failure
+            // mode. This upload runs before forward_batch_slots' own
+            // n <= pbs.max_batch assert, so an oversized batch would only
+            // surface here.
+            if bytes.len() > rig.pbs.ext_emb_row_ptr.buf.size() {
+                let reason = format!(
+                    "vl ext ptr upload of {} bytes exceeds staging capacity {} \
+                     (batch of {} rows vs max_batch {})",
+                    bytes.len(),
+                    rig.pbs.ext_emb_row_ptr.buf.size(),
+                    batch.total_rows(),
+                    rig.pbs.max_batch
+                );
+                fail_all_active(&mut rig, &mut slots, &mut work, reason.clone());
+                poison = Some(reason);
+                break 'serve;
+            }
+            if let Err(e) = rig.gpu.hip.memcpy_htod(&rig.pbs.ext_emb_row_ptr.buf, &bytes) {
+                let reason = format!("vl ext ptr upload failed: {e:?}");
+                fail_all_active(&mut rig, &mut slots, &mut work, reason.clone());
+                poison = Some(reason);
+                break 'serve;
             }
         }
 
@@ -4220,7 +4269,8 @@ fn run_loop(
                 let tokens: Vec<u32> = rig
                     .sessions
                     .get(session)
-                    .map(|sess| sess.tokens[..new_boundary].to_vec())
+                    .and_then(|sess| sess.tokens.get(..new_boundary))
+                    .map(|t| t.to_vec())
                     .unwrap_or_default();
                 if tokens.len() == new_boundary {
                     let domain = rig.cache_domain.as_ref().unwrap();
@@ -5981,17 +6031,18 @@ fn admit(
                             // corrupts the suffix. On failure we fall back
                             // to the cold path below (begin_turn resets the
                             // table; the DN state is still the reset one).
-                            let restore_ok = ckpt_pool
-                                .peek(domain, boundary as u64)
-                                .map(|snapshot| {
-                                    snapshot
-                                        .restore_to(
-                                            &mut rig.dn_states[slot.0],
-                                            &mut rig.gpu,
-                                        )
-                                        .is_ok()
-                                })
-                                .unwrap_or(false);
+                            let restore_ok = plan.checkpoint != CheckpointId::NONE
+                                && ckpt_pool
+                                    .peek(plan.checkpoint)
+                                    .map(|snapshot| {
+                                        snapshot
+                                            .restore_to(
+                                                &mut rig.dn_states[slot.0],
+                                                &mut rig.gpu,
+                                            )
+                                            .is_ok()
+                                    })
+                                    .unwrap_or(false);
                             let shared_ok = restore_ok
                                 && rig.pool.share_published_pages(slot, &phys_pages).is_ok();
                             if shared_ok {
@@ -6022,11 +6073,11 @@ fn admit(
                             }
                         }
                     }
-                    // The plan pinned this boundary against eviction; the
+                    // The plan pinned this checkpoint against eviction; the
                     // restore attempt is over (or was skipped) either way,
                     // so release it on every Ok(plan) exit path.
-                    if plan.boundary > 0 {
-                        ckpt_pool.unpin(domain, plan.boundary);
+                    if plan.checkpoint != CheckpointId::NONE {
+                        ckpt_pool.unpin(plan.checkpoint);
                     }
                 }
                 Err(_) => {} // No checkpoint at any boundary: cold prefill

@@ -32,7 +32,7 @@ fn main() {
     use hipfire_arch_qwen35::qwen35::{
         self, DeltaNetState, LayerType, PrefillBatchScratch, Qwen35Scratch, Qwen35Weights,
     };
-    use hipfire_arch_qwen35::scheduler::{PendingWork, Scheduler};
+    use hipfire_arch_qwen35::scheduler::{PendingWork, Scheduler, SpecKind};
     use hipfire_runtime::admission::{AdmissionController, ModelFootprint};
     use hipfire_runtime::hfq::HfqFile;
     use hipfire_runtime::session_table::SessionTable;
@@ -232,10 +232,10 @@ fn main() {
                 next_pos: start_pos,
                 decoding: false,
                 vl_prefill: None,
-                mtp_active: false,
-                mtp_committed: 0,
-                mtp_cycles: 0,
-                mtp_retire_fails: 0,
+                spec: SpecKind::None,
+                spec_cycles: 0,
+                spec_committed: 0,
+                spec_retire_fails: 0,
                 pos3_delta: 0,
             }];
             let mut produced = Vec::new();

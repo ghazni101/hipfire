@@ -175,7 +175,9 @@ impl AdmissionController {
         if new_kv > old_kv {
             let delta = new_kv - old_kv;
             let available = self.budget_bytes.saturating_sub(self.used_bytes());
-            if delta >= available {
+            // `>` not `>=`: a grant that consumes exactly the remaining
+            // budget fits — only exceeding it is a refusal.
+            if delta > available {
                 return Err(AdmitError::WouldExceedBudget {
                     need: delta,
                     available,

@@ -333,6 +333,11 @@ struct WalkResult {
     matched_tokens: u64,
     resident_kv_tokens: u64,
     resumable_tokens: u64,
+    /// `(boundary, checkpoint)` recorded on THIS token path at every
+    /// resumable boundary (ascending order). The id binds each boundary to
+    /// the prefix that produced it — resume planning fetches by id because
+    /// `(domain, boundary)` alone collides across different prefixes.
+    checkpoint_candidates: Vec<(u64, CheckpointId)>,
     /// Path of node ids from root to the deepest matched node (inclusive).
     path: Vec<NodeId>,
     /// Whether the walk consumed all query tokens.
@@ -485,6 +490,7 @@ impl PrefixIndex {
                 matched_tokens: walk.matched_tokens,
                 resident_kv_tokens: walk.resident_kv_tokens,
                 resumable_tokens: walk.resumable_tokens,
+                checkpoint_candidates: walk.checkpoint_candidates,
             }),
             handles,
             ticket,
@@ -518,6 +524,7 @@ impl PrefixIndex {
                     matched_tokens: 0,
                     resident_kv_tokens: 0,
                     resumable_tokens: 0,
+                    checkpoint_candidates: Vec::new(),
                     path: Vec::new(),
                     exhausted_query: false,
                     pages: Vec::new(),
@@ -537,6 +544,7 @@ impl PrefixIndex {
         // only when every required state component exists at it).
         let mut contiguous_resident_tokens: u64 = 0;
         let mut resumable_tokens: u64 = 0;
+        let mut checkpoint_candidates: Vec<(u64, CheckpointId)> = Vec::new();
         let mut pages: Vec<Handle> = Vec::new();
 
         loop {
@@ -610,6 +618,7 @@ impl PrefixIndex {
                     let boundary = child_base + cb.token_offset;
                     if boundary <= contiguous_resident_tokens {
                         resumable_tokens = resumable_tokens.max(boundary);
+                        checkpoint_candidates.push((boundary, cb.checkpoint));
                     }
                 }
             }
@@ -629,6 +638,7 @@ impl PrefixIndex {
             matched_tokens,
             resident_kv_tokens,
             resumable_tokens,
+            checkpoint_candidates,
             path,
             exhausted_query: query_pos >= tokens.len(),
             pages,
@@ -1069,7 +1079,16 @@ fn insert_into_tree(
                     } else {
                         node.edge_tokens.len() as u64
                     };
-                    if !node.checkpoints.iter().any(|cb| cb.token_offset == token_offset) {
+                    // Upsert: a re-capture at an occupied offset carries the
+                    // NEW pool id — keeping the old one would strand the
+                    // lookup on an entry the pool replaced or evicted.
+                    if let Some(cb) = node
+                        .checkpoints
+                        .iter_mut()
+                        .find(|cb| cb.token_offset == token_offset)
+                    {
+                        cb.checkpoint = ckpt;
+                    } else {
                         node.checkpoints.push(CheckpointBoundary {
                             token_offset,
                             checkpoint: ckpt,
@@ -1149,7 +1168,14 @@ fn insert_into_tree(
                     if ckpt.is_some() {
                         let split_node = tree.nodes.get_mut(&split_node_id).unwrap();
                         let token_offset = split_node.edge_tokens.len() as u64;
-                        if !split_node.checkpoints.iter().any(|cb| cb.token_offset == token_offset) {
+                        // Upsert — see the walk-site comment below.
+                        if let Some(cb) = split_node
+                            .checkpoints
+                            .iter_mut()
+                            .find(|cb| cb.token_offset == token_offset)
+                        {
+                            cb.checkpoint = ckpt;
+                        } else {
                             split_node.checkpoints.push(CheckpointBoundary {
                                 token_offset,
                                 checkpoint: ckpt,

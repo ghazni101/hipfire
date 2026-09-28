@@ -572,17 +572,56 @@ impl Carrier for Qwen35Carrier {
                 // blob). Admission already refused tower-less / wrong-arch
                 // sidecars, so a sidecar failure here fails the load closed —
                 // an explicitly requested tower must never silently serve text.
+                // ZDTaichu trunks carry their own C-RADIO tower inline; it is
+                // mutually exclusive with the SigLIP .vl sidecar below.
+                let is_taichu =
+                    hipfire_arch_taichu_vl::vision::is_taichu_vision_hfq(&hfq_file);
                 let (vision_config, vision_weights) = {
                     use hipfire_arch_qwen35_vl::Qwen35Vl;
                     use hipfire_runtime::arch::Architecture;
 
+                    // A <stem>.vl sibling is a DIFFERENT tower (SigLIP) that
+                    // would load dead weight and could fail the whole load
+                    // on an irrelevant file — skip discovery for taichu.
                     // .vl sidecar discovery: HIPFIRE_VL_FILE env, then <stem>.vl sibling.
-                    let vl_path = discover_vl_path(ctx.path);
+                    let vl_path = if is_taichu {
+                        None
+                    } else {
+                        discover_vl_path(ctx.path)
+                    };
                     let has_inline_vision = hfq_file
                         .tensor_data("model.visual.patch_embed.proj.weight")
                         .is_some();
 
-                    if let Some(vl) = &vl_path {
+                    // Precedence (CLI contract): an explicit operator-selected
+                    // sidecar (params["vision"] / --vision / vision_mode) wins
+                    // over auto-discovered siblings and inline tensors.
+                    if let Some(p) = ctx.vision_path.as_ref() {
+                        let mut sidecar =
+                            hipfire_runtime::hfq::HfqFile::open(std::path::Path::new(p)).map_err(
+                                |e| format!("vision sidecar '{}': open failed: {e}", p.display()),
+                            )?;
+                        let vc = Qwen35Vl::config_from_hfq(&hfq_file)
+                            .ok()
+                            .or_else(|| Qwen35Vl::config_from_hfq(&sidecar).ok())
+                            .ok_or_else(|| {
+                                "qwen35-vl: vision tower requested but no vision_config in \
+                                 trunk or sidecar metadata — requantize the trunk or pack \
+                                 the sidecar with --include-vision"
+                                    .to_string()
+                            })?;
+                        let vw =
+                            Qwen35Vl::load_weights(&mut sidecar, &vc, ctx.gpu).map_err(|e| {
+                                format!("vision sidecar '{}': tower load failed: {e}", p.display())
+                            })?;
+                        eprintln!(
+                            "  VL model (sidecar {}): vision encoder (hidden={}, layers={})",
+                            p.display(),
+                            vc.hidden_size,
+                            vc.num_layers
+                        );
+                        (Some(vc), Some(vw))
+                    } else if let Some(vl) = &vl_path {
                         eprintln!("  loading vision weights from .vl sidecar: {}", vl.display());
                         let mut vl_hfq = hipfire_runtime::hfq::HfqFile::open(vl)
                             .map_err(|e| format!("open .vl file {}: {e}", vl.display()))?;
@@ -619,31 +658,6 @@ impl Carrier for Qwen35Carrier {
                             }
                             _ => (None, None),
                         }
-                    } else if let Some(p) = ctx.vision_path.as_ref() {
-                        let mut sidecar =
-                            hipfire_runtime::hfq::HfqFile::open(std::path::Path::new(p)).map_err(
-                                |e| format!("vision sidecar '{}': open failed: {e}", p.display()),
-                            )?;
-                        let vc = Qwen35Vl::config_from_hfq(&hfq_file)
-                            .ok()
-                            .or_else(|| Qwen35Vl::config_from_hfq(&sidecar).ok())
-                            .ok_or_else(|| {
-                                "qwen35-vl: vision tower requested but no vision_config in \
-                                 trunk or sidecar metadata — requantize the trunk or pack \
-                                 the sidecar with --include-vision"
-                                    .to_string()
-                            })?;
-                        let vw =
-                            Qwen35Vl::load_weights(&mut sidecar, &vc, ctx.gpu).map_err(|e| {
-                                format!("vision sidecar '{}': tower load failed: {e}", p.display())
-                            })?;
-                        eprintln!(
-                            "  VL model (sidecar {}): vision encoder (hidden={}, layers={})",
-                            p.display(),
-                            vc.hidden_size,
-                            vc.num_layers
-                        );
-                        (Some(vc), Some(vw))
                     } else {
                         (None, None)
                     }
@@ -653,31 +667,40 @@ impl Carrier for Qwen35Carrier {
                 // `vision_model.radio_model.*` tensors (arch_id stays 5 —
                 // the text path is the same qwen3.5 loader). Mutually
                 // exclusive with the SigLIP sidecar path above.
-                let (taichu_vision_config, taichu_vision_weights) =
-                    if hipfire_arch_taichu_vl::vision::is_taichu_vision_hfq(&hfq_file) {
-                        let tc = hipfire_arch_taichu_vl::vision::taichu_vision_config_from_hfq(
-                            &hfq_file,
-                        );
-                        match tc {
-                            Some(tc) => {
-                                let tw = hipfire_arch_taichu_vl::vision::load_taichu_vision_weights(
-                                    &mut hfq_file,
-                                    &tc,
-                                    ctx.gpu,
-                                )
-                                .map_err(|e| eprintln!("  taichu vision weight load failed: {e}"))
-                                .ok();
-                                eprintln!(
-                                    "  ZDTaichu VL model: C-RADIO vision encoder (hidden={}, layers={}, tile={})",
-                                    tc.hidden_size, tc.num_layers, tc.image_size
-                                );
-                                (Some(tc), tw)
-                            }
-                            _ => (None, None),
+                let (taichu_vision_config, taichu_vision_weights) = if is_taichu {
+                    let tc = hipfire_arch_taichu_vl::vision::taichu_vision_config_from_hfq(
+                        &hfq_file,
+                    );
+                    match tc {
+                        Some(tc) => {
+                            // Same fail-closed rule as the .vl arm: a corrupt
+                            // pack must fail the load, not produce
+                            // (Some(config), None) — the daemon image gate
+                            // keys off the config, and the sequential path
+                            // unwraps the weights.
+                            let tw = hipfire_arch_taichu_vl::vision::load_taichu_vision_weights(
+                                &mut hfq_file,
+                                &tc,
+                                ctx.gpu,
+                            )
+                            .map_err(|e| format!("taichu vision weight load failed: {e}"))?;
+                            eprintln!(
+                                "  ZDTaichu VL model: C-RADIO vision encoder (hidden={}, layers={}, tile={})",
+                                tc.hidden_size, tc.num_layers, tc.image_size
+                            );
+                            (Some(tc), Some(tw))
                         }
-                    } else {
-                        (None, None)
-                    };
+                        None => {
+                            eprintln!(
+                                "  taichu vision tensors present but vision_config parse \
+                                 failed (model_type/pack mismatch) — serving text-only"
+                            );
+                            (None, None)
+                        }
+                    }
+                } else {
+                    (None, None)
+                };
 
                 // Trunk bundle after optional VL upload. On bundle failure, reclaim
                 // any vision weights already on-device (HFQ is single-pass: VL must

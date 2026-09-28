@@ -438,6 +438,15 @@ pub struct PrefixLookup {
     pub resident_kv_tokens: u64,
     /// Largest boundary for which every required state component exists.
     pub resumable_tokens: u64,
+    /// `(boundary, checkpoint)` pairs the index recorded on THIS token
+    /// path, in ascending boundary order — every entry satisfies
+    /// `boundary <= resumable_tokens` and is page-aligned. The checkpoint
+    /// id binds the boundary to the prefix that produced it; resume
+    /// planning must fetch by id, never by `(domain, boundary)` — two
+    /// different prefixes can legitimately hold checkpoints at the same
+    /// boundary count, and a boundary-only lookup would restore the wrong
+    /// conversation's recurrent state.
+    pub checkpoint_candidates: Vec<(u64, CheckpointId)>,
 }
 
 /// Result of the prefix-lookup operation (spec §3 operation table: "identity
@@ -535,6 +544,12 @@ impl std::error::Error for ResumePlanError {}
 pub struct ResumePlan {
     /// Boundary `p`: tokens `[0, p)` have been processed by the target.
     pub boundary: u64,
+    /// The checkpoint id backing `boundary` (`CheckpointId::NONE` when
+    /// `boundary == 0` — the initial state needs no snapshot). Fetches and
+    /// pins must use this id, which is bound to the token prefix that
+    /// produced the checkpoint; `(domain, boundary)` keys are ambiguous
+    /// across different prefixes.
+    pub checkpoint: CheckpointId,
     /// Required state bundle flags (all must be present to construct).
     pub bundle: ResumeBundle,
     /// Byte cost of restoring the bundle into private mutable buffers.
@@ -552,6 +567,7 @@ impl ResumePlan {
     /// component otherwise.
     pub fn new(
         boundary: u64,
+        checkpoint: CheckpointId,
         bundle: ResumeBundle,
         byte_cost: u64,
         last_token: LastTokenHandling,
@@ -570,6 +586,7 @@ impl ResumePlan {
         }
         Ok(Self {
             boundary,
+            checkpoint,
             bundle,
             byte_cost,
             last_token,
@@ -862,6 +879,7 @@ mod tests {
     fn resume_plan_accepts_complete_bundle() {
         let plan = ResumePlan::new(
             128,
+            CheckpointId(1),
             complete_bundle(),
             4096,
             LastTokenHandling::SuffixRecompute,
@@ -876,28 +894,28 @@ mod tests {
         // Missing attention pages.
         let mut b = complete_bundle();
         b.attention_pages = false;
-        let err = ResumePlan::new(128, b, 4096, LastTokenHandling::SuffixRecompute)
+        let err = ResumePlan::new(128, CheckpointId(1), b, 4096, LastTokenHandling::SuffixRecompute)
             .unwrap_err();
         assert!(matches!(err, ResumePlanError::MissingComponent("attention_pages")));
 
         // Missing DeltaNet matrices/scales.
         let mut b = complete_bundle();
         b.dn_matrices_scales = false;
-        let err = ResumePlan::new(128, b, 4096, LastTokenHandling::SuffixRecompute)
+        let err = ResumePlan::new(128, CheckpointId(1), b, 4096, LastTokenHandling::SuffixRecompute)
             .unwrap_err();
         assert!(matches!(err, ResumePlanError::MissingComponent("dn_matrices_scales")));
 
         // Missing conv rings.
         let mut b = complete_bundle();
         b.conv_rings = false;
-        let err = ResumePlan::new(128, b, 4096, LastTokenHandling::EarlierBoundary)
+        let err = ResumePlan::new(128, CheckpointId(1), b, 4096, LastTokenHandling::EarlierBoundary)
             .unwrap_err();
         assert!(matches!(err, ResumePlanError::MissingComponent("conv_rings")));
 
         // Missing EF residual.
         let mut b = complete_bundle();
         b.ef_residual = false;
-        let err = ResumePlan::new(128, b, 4096, LastTokenHandling::SuffixRecompute)
+        let err = ResumePlan::new(128, CheckpointId(1), b, 4096, LastTokenHandling::SuffixRecompute)
             .unwrap_err();
         assert!(matches!(err, ResumePlanError::MissingComponent("ef_residual")));
     }
@@ -963,6 +981,7 @@ mod tests {
             matched_tokens: 512,
             resident_kv_tokens: 384,
             resumable_tokens: 256,
+            checkpoint_candidates: Vec::new(),
         };
         assert!(lk.matched_tokens > lk.resident_kv_tokens);
         assert!(lk.resident_kv_tokens > lk.resumable_tokens);

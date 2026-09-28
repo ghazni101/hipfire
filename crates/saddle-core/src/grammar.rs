@@ -346,8 +346,21 @@ pub struct Matcher {
     args_in_string: bool,
     /// True if the previous byte in the args body was a backslash
     /// inside a string. The next byte is then escaped (skip its
-    /// special meaning, e.g. `\"` does NOT close the string).
     args_string_escape: bool,
+    /// Required-field names of `current_tool` already observed in the
+    /// args body. `ngram_history` is a rolling window that scrolls
+    /// early field evidence out on large args (> ngram_window bytes),
+    /// which would re-block the `</tool_call>` close on a legitimately
+    /// complete body — this set is the permanent record, reset with
+    /// `current_tool` on every firm close.
+    required_seen: std::collections::HashSet<String>,
+    /// Per-byte in-string flags for `partial_buf` while in
+    /// [`State::InArgs`]: flag[i] = `args_in_string` BEFORE byte i. The
+    /// InArgs `</tool_call>` transition is otherwise string-blind — a
+    /// literal `</tool_call>` inside a JSON string value (tool args can
+    /// carry arbitrary text) fired the close transition mid-body and
+    /// desynced the matcher. Empty outside InArgs.
+    partial_buf_in_string: Vec<bool>,
 }
 
 impl Matcher {
@@ -383,6 +396,8 @@ impl Matcher {
             partial_buf: String::new(),
             grammar,
             ngram_history: String::new(),
+            required_seen: std::collections::HashSet::new(),
+            partial_buf_in_string: Vec::new(),
             attractor_buf: String::new(),
             attractor_detected: false,
             current_tool: None,
@@ -458,9 +473,15 @@ impl Matcher {
         if schema.required.is_empty() {
             return true;
         }
+        // Permanent seen-set (populated by update_ngram_history): the
+        // rolling ngram_history window scrolls early field names out on
+        // large args bodies — a window-only check would re-block the
+        // close on a legitimately complete call.
         for name in &schema.required {
             let needle = format!("\"{}\"", name);
-            if !self.ngram_history.contains(&needle) {
+            if !self.required_seen.contains(&needle)
+                && !self.ngram_history.contains(&needle)
+            {
                 return false;
             }
         }
@@ -680,6 +701,22 @@ impl Matcher {
         // Full args text → required-field substring buffer only. Attractor
         // detection runs on structural bytes in `push_attractor_byte`.
         self.ngram_history.push_str(text);
+        // Persist any required-field name present in the buffer into
+        // `required_seen` BEFORE the window drains — the history scrolls
+        // early evidence out on large args, but a satisfied field must
+        // stay satisfied for the whole tool body.
+        if let Some(idx) = self.current_tool {
+            if let Some(schema) = self.grammar.tools.get(idx) {
+                for name in &schema.required {
+                    let needle = format!("\"{}\"", name);
+                    if !self.required_seen.contains(&needle)
+                        && self.ngram_history.contains(&needle)
+                    {
+                        self.required_seen.insert(needle);
+                    }
+                }
+            }
+        }
         if self.ngram_history.len() > self.grammar.config.ngram_window {
             // Drop at a UTF-8 char boundary — string values may hold multibyte
             // content, so this buffer is not guaranteed ASCII.
@@ -1007,10 +1044,17 @@ impl Matcher {
             // *structural* (out-of-string) bytes into `attractor_buf`, so
             // structural loops (the JSON skeleton itself repeating) are still
             // caught.
+            // Per-byte in-string flags for the incoming text (flag[i] =
+            // in-string state at the position byte i lands in
+            // `partial_buf`). Keeps the close-marker search string-aware.
+            let flags = Self::string_flags(text, self.args_in_string, self.args_string_escape);
             self.update_ngram_history(text);
             self.update_args_brace_state(text);
+            self.partial_buf.push_str(text);
+            self.partial_buf_in_string.extend(flags);
+        } else {
+            self.partial_buf.push_str(text);
         }
-        self.partial_buf.push_str(text);
 
         loop {
             match self.transition_once() {
@@ -1018,6 +1062,60 @@ impl Matcher {
                 Transition::Advanced => continue,
             }
         }
+    }
+
+    /// Per-byte in-string flags for `text` starting from the given
+    /// string/escape cursor — flag[i] is the in-string state BEFORE
+    /// byte i. Mirrors the string tracking in `update_args_brace_state`;
+    /// used to keep `partial_buf_in_string` aligned with `partial_buf`.
+    fn string_flags(text: &str, mut in_string: bool, mut escape: bool) -> Vec<bool> {
+        let mut flags = Vec::with_capacity(text.len());
+        for byte in text.bytes() {
+            flags.push(in_string);
+            if escape {
+                escape = false;
+                continue;
+            }
+            if in_string {
+                match byte {
+                    b'\\' => escape = true,
+                    b'"' => in_string = false,
+                    _ => {}
+                }
+            } else if byte == b'"' {
+                in_string = true;
+            }
+        }
+        flags
+    }
+
+    /// Drain `n` bytes from `partial_buf` AND its in-string mirror.
+    /// The mirror is only meaningful in [`State::InArgs`]; in every other
+    /// state it stays empty and this is a plain `drain`.
+    fn drain_partial(&mut self, n: usize) {
+        self.partial_buf.drain(..n);
+        if !self.partial_buf_in_string.is_empty() {
+            self.partial_buf_in_string.drain(..n);
+        }
+    }
+
+    /// Find `</tool_call>` in `partial_buf` at a position OUTSIDE a JSON
+    /// string value. `partial_buf_in_string` (maintained for the whole
+    /// retained window in InArgs) carries the pre-byte string state, so a
+    /// literal `</tool_call>` inside `"…"` args content is invisible here.
+    fn find_close_outside_string(&self) -> Option<usize> {
+        const CLOSE: &[u8] = b"</tool_call>";
+        let hay = self.partial_buf.as_bytes();
+        let flags = &self.partial_buf_in_string;
+        debug_assert_eq!(hay.len(), flags.len());
+        let mut i = 0;
+        while i + CLOSE.len() <= hay.len() {
+            if hay[i..].starts_with(CLOSE) && !flags.get(i).copied().unwrap_or(false) {
+                return Some(i);
+            }
+            i += 1;
+        }
+        None
     }
 
     /// Inner step: examine `partial_buf` against the current state's
@@ -1040,7 +1138,7 @@ impl Matcher {
                 if self.partial_buf.len() > max_keep {
                     let drop =
                         Self::drain_boundary(&self.partial_buf, self.partial_buf.len() - max_keep);
-                    self.partial_buf.drain(..drop);
+                    self.drain_partial(drop);
                 }
                 Transition::Stay
             }
@@ -1055,6 +1153,10 @@ impl Matcher {
                     if let Some(rest) = self.partial_buf.strip_prefix(cont.as_str()) {
                         let rest_owned = rest.to_string();
                         self.partial_buf = rest_owned.clone();
+                        // Args body starts outside any string — recompute
+                        // the mirror for the fragment already in the buf.
+                        self.partial_buf_in_string =
+                            Self::string_flags(&rest_owned, false, false);
                         self.state = State::InArgs;
                         self.current_tool = Some(idx);
                         self.args_brace_depth = 0;
@@ -1083,9 +1185,12 @@ impl Matcher {
                 Transition::Stay
             }
             State::InArgs => {
-                // Look for `</tool_call>` anywhere in the buffer.
-                if let Some(idx) = self.partial_buf.find("</tool_call>") {
-                    self.partial_buf.drain(..idx + "</tool_call>".len());
+                // Look for `</tool_call>` at a non-string position — a
+                // literal close marker inside a JSON string VALUE is args
+                // content, not the transition. String-blind find() fired
+                // the close mid-body and desynced the matcher.
+                if let Some(idx) = self.find_close_outside_string() {
+                    self.drain_partial(idx + "</tool_call>".len());
                     self.state = State::Out;
                     // Returning to Out — reset the n-gram guard's
                     // bookkeeping so a subsequent tool_call body starts
@@ -1097,7 +1202,8 @@ impl Matcher {
                     self.attractor_buf.clear();
                     self.attractor_detected = false;
                     self.current_tool = None;
-                    self.args_brace_depth = 0;
+                    self.required_seen.clear();
+                    self.partial_buf_in_string.clear();
                     self.args_in_string = false;
                     self.args_string_escape = false;
                     return Transition::Advanced;
@@ -1106,7 +1212,7 @@ impl Matcher {
                 if self.partial_buf.len() > max_keep {
                     let drop =
                         Self::drain_boundary(&self.partial_buf, self.partial_buf.len() - max_keep);
-                    self.partial_buf.drain(..drop);
+                    self.drain_partial(drop);
                 }
                 Transition::Stay
             }
@@ -1705,20 +1811,17 @@ mod tests {
     #[test]
     fn close_marker_in_args_body_string_does_not_close() {
         // The args body is a JSON value; it can contain `</tool_call>`
-        // as a STRING literal. Our current grammar doesn't parse JSON
-        // string boundaries — it sees the literal substring as a
-        // close marker. Document this as a known limitation: the
-        // grammar will prematurely transition. (Real models don't
-        // typically emit `</tool_call>` inside arg strings; if this
-        // surfaces in production, layer in a JSON-aware string-state
-        // tracker.)
+        // as a STRING literal. The close-marker search is string-aware
+        // (`partial_buf_in_string` mirrors brace-state tracking), so a
+        // marker inside `"…"` is args content, not the transition.
         let mut m = Matcher::new(schemas(&["bash"]));
         m.advance("<tool_call>\n{\"name\": \"bash\", \"arguments\": ");
         assert!(matches!(m.state(), State::InArgs));
-        // Args content includes a string literal containing the close
-        // marker. Our grammar treats it as the close (limitation).
+        // The literal close inside a string must NOT fire the transition.
         m.advance("{\"command\": \"echo </tool_call>\"}");
-        // Document the actual behavior — this is what we observe today.
+        assert!(matches!(m.state(), State::InArgs));
+        // A real close outside a string still fires.
+        m.advance("}\n</tool_call>");
         assert!(matches!(m.state(), State::Out));
     }
 
@@ -4876,12 +4979,18 @@ pub mod json_schema {
                 // string carries interior content the in-string filters
                 // never see and the simulation cannot judge. Decode the
                 // post-quote remainder against the member/key list.
-                let first_non_ws = bytes
+                let first_non_ws_idx = bytes
                     .iter()
-                    .find(|&&b| !matches!(b, b' ' | b'\n' | b'\t' | b'\r'));
-                if first_non_ws == Some(&b'"') {
+                    .position(|&b| !matches!(b, b' ' | b'\n' | b'\t' | b'\r'));
+                if first_non_ws_idx.is_some_and(|i| bytes[i] == b'"') {
+                    // Slice AFTER the quote — NOT bytes[1..]: a whitespace-
+                    // leading token (` "Par`) puts the quote at index >0,
+                    // and slicing from 1 feeds the quote itself to the
+                    // decoder, which reads it as an immediate string close
+                    // (decoded = "") and refuses a perfectly valid token.
+                    let after_quote = &bytes[first_non_ws_idx.unwrap() + 1..];
                     if let Some(members) = &self.scan.value_start_filter {
-                        match decode_string_fragment(false, &bytes[1..]) {
+                        match decode_string_fragment(false, after_quote) {
                             Some((decoded, false, _rest)) => {
                                 return members.iter().any(|m| {
                                     let mb = m.as_bytes();
@@ -4915,7 +5024,7 @@ pub mod json_schema {
                         }
                     }
                     if let Some(known) = &self.scan.key_start_filter {
-                        match decode_string_fragment(false, &bytes[1..]) {
+                        match decode_string_fragment(false, after_quote) {
                             Some((decoded, false, _rest)) => {
                                 return known.iter().any(|k| {
                                     let kb = k.as_bytes();
@@ -5303,6 +5412,17 @@ pub mod json_schema {
                         {
                             self.errored = true;
                             return;
+                        }
+                        // An open trailing number that no longer parses as
+                        // a COMPLETE number is not accepting: `1` accepts,
+                        // `1e` / `1e+` / `1.` must not — EOS is gated on
+                        // `is_accepting()` (spec §7.2 G2) and would
+                        // otherwise emit `1e`, which is not RFC-8259 JSON.
+                        // `number_open` stays set so digits/exponent bytes
+                        // remain legal; a completion (`1e3`) re-accepts in
+                        // the Ok arm above.
+                        if self.number_open {
+                            self.accepted = false;
                         }
                         // A dangling fraction point can never complete to
                         // an integer — "4." under `{"type":"integer"}` is
@@ -5951,6 +6071,69 @@ pub mod json_schema {
             m.advance(b" ");
             assert!(m.is_accepting());
             assert!(!m.is_token_allowed(b"7"), "a terminated number cannot grow");
+        }
+
+        #[test]
+        fn open_number_incomplete_literal_is_not_accepting() {
+            // `1` accepts (EOS legal, number still open). Extending with
+            // `e` / `e+` / `.` produces an RFC-8259-INCOMPLETE literal —
+            // EOS is gated on is_accepting (spec §7.2 G2), so emitting it
+            // there would commit invalid JSON (`1e`). The pre-fix matcher
+            // latched `accepted` at `1` and never cleared it.
+            for ext in ["e", "e+", "e-", "."] {
+                let compiled = CompiledSchema::compile(&json!({"type": "number"})).unwrap();
+                let mut m = compiled.matcher();
+                m.advance(b"1");
+                assert!(m.is_accepting(), "baseline `1` accepts");
+                m.advance(ext.as_bytes());
+                assert!(
+                    !m.is_accepting(),
+                    "`1{ext}` is an incomplete number literal — EOS must be masked"
+                );
+                assert!(!m.is_errored(), "`1{ext}` is a live prefix, not an error");
+            }
+        }
+
+        #[test]
+        fn open_number_recovers_acceptance_on_completion() {
+            // `1e` drops acceptance; completing to `1e3` restores it and a
+            // whitespace terminator keeps it (the number can no longer grow).
+            let compiled = CompiledSchema::compile(&json!({"type": "number"})).unwrap();
+            let mut m = compiled.matcher();
+            m.advance(b"1");
+            m.advance(b"e");
+            assert!(!m.is_accepting());
+            assert!(m.is_token_allowed(b"3"), "a digit must rescue the open literal");
+            m.advance(b"3");
+            assert!(m.is_accepting(), "`1e3` is a complete conforming number");
+        }
+
+        #[test]
+        fn ws_prefixed_opening_quote_token_allowed_under_value_enum() {
+            // A token that OPENS a constrained string may carry leading
+            // whitespace (` "Par`): the opening-quote filter must slice
+            // past the quote's actual index, not assume bytes[0]. The
+            // pre-fix code fed the quote itself to the decoder, read it as
+            // an immediate string close, and refused a legal token —
+            // shrinking the allowed set to a wedge at every `{"k": ` step.
+            let compiled = CompiledSchema::compile(&json!({
+                "type": "object",
+                "properties": {"k": {"enum": ["Paris", "London"]}},
+                "required": ["k"],
+                "additionalProperties": false
+            }))
+            .unwrap();
+            let mut m = compiled.matcher();
+            m.advance(b"{\"k\":");
+            assert!(m.is_token_allowed(b"\""), "bare quote opens the string");
+            assert!(
+                m.is_token_allowed(b" \""),
+                "whitespace + quote must also open the string"
+            );
+            assert!(
+                m.is_token_allowed(b" \"Par"),
+                "ws + quote + member prefix must be allowed"
+            );
         }
 
         #[test]

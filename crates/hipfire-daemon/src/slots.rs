@@ -986,11 +986,22 @@ impl SlotBackend {
             messages.clone()
         };
         let convo = build_convo_from_messages(&conversation_messages);
-        let last_user = messages
+        let Some(last_user) = messages
             .iter()
             .rev()
             .find(|message| message.role == Role::User)
-            .expect("projection requires a user message");
+        else {
+            hipfire_engine::emit::emit_active_attempt_error(
+                stdout,
+                Some(id),
+                "projection accepted messages with no user turn",
+                "validation",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            return Ok(());
+        };
 
         let slot_image = match extract_slot_image(msg) {
             Ok(image) => image,
@@ -1096,7 +1107,21 @@ impl SlotBackend {
                 let _ = stdout.flush();
                 return Ok(());
             }
-            let (system, turns, _) = project_messages(msg).expect("validated projection");
+            let (system, turns, _) = match project_messages(msg) {
+                Ok(p) => p,
+                Err(e) => {
+                    hipfire_engine::emit::emit_active_attempt_error(
+                        stdout,
+                        Some(id),
+                        &format!("projection failed: {e}"),
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    return Ok(());
+                }
+            };
             let history: Vec<(Role, &str)> = turns
                 .iter()
                 .map(|(role, text)| (*role, text.as_str()))
@@ -1238,7 +1263,10 @@ impl SlotBackend {
             let mut h = std::collections::hash_map::DefaultHasher::new();
             id.hash(&mut h);
             attempt_id.hash(&mut h);
-            h.finish()
+            // `0` is the wire sentinel for "no cancellation identity" — a
+            // zero hash would silently disable CancelWaiting for this
+            // request, so clamp to nonzero.
+            h.finish().max(1)
         };
         let req = SubmitRequest {
             prompt_tokens,
@@ -1940,9 +1968,28 @@ pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
                         .and_then(|v| v.as_array())
                         .is_some_and(|parts| {
                             parts.iter().any(|part| {
-                                part.get("type").and_then(|v| v.as_str()) == Some("image_url")
+                                part.get("type").and_then(|v| v.as_str())
+                                    == Some("image_url")
+                                    || part.get("type").and_then(|v| v.as_str())
+                                        == Some("image")
                             })
                         })
+                })
+            });
+    // Alternate image wire shape: a message-level `image` field, or an
+    // image-bearing part that uses `source`/`data` keys rather than
+    // `type=image_url` (Anthropic-style and Ollama-style payloads).
+    let has_image = has_image
+        || msg
+            .get("messages")
+            .and_then(|v| v.as_array())
+            .is_some_and(|messages| {
+                messages.iter().any(|message| {
+                    message.get("image").is_some_and(|v| !v.is_null())
+                        || message
+                            .get("images")
+                            .and_then(|v| v.as_array())
+                            .is_some_and(|a| !a.is_empty())
                 })
             });
     if has_image

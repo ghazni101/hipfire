@@ -381,12 +381,12 @@ mod tests {
         let p = &QWEN35_SLOTS_POLICY;
         // Unset and "auto" both mean q8, SILENTLY — q8 is the slots
         // engine's shipped default and its longest-validated path.
-        assert_eq!(resolve("", p, 256).mode, KvMode::Q8);
-        assert!(resolve("", p, 256).warning.is_none());
-        assert_eq!(resolve("auto", p, 256).mode, KvMode::Q8);
-        assert!(resolve("auto", p, 256).warning.is_none());
-        assert_eq!(resolve("q8", p, 256).mode, KvMode::Q8);
-        assert!(resolve("q8", p, 256).warning.is_none());
+        assert_eq!(resolve("", p).mode, KvMode::Q8);
+        assert!(resolve("", p).warning.is_none());
+        assert_eq!(resolve("auto", p).mode, KvMode::Q8);
+        assert!(resolve("auto", p).warning.is_none());
+        assert_eq!(resolve("q8", p).mode, KvMode::Q8);
+        assert!(resolve("q8", p).warning.is_none());
         // Every rotated tier is HONORED (the ladder is fully wired) and
         // must not warn — an explicit tier is an intentional choice.
         for (raw, mode) in [
@@ -398,16 +398,16 @@ mod tests {
             ("fwht3", KvMode::Fwht3),
             ("fwht4", KvMode::Fwht4),
         ] {
-            let r = resolve(raw, p, 256);
+            let r = resolve(raw, p);
             assert_eq!(r.mode, mode, "{raw} must be honored on the slots site");
             assert!(r.warning.is_none(), "{raw} must not warn");
         }
         // bf16 is not allocatable on this site: refuse to the default WITH
         // a warning (never a silent downgrade).
-        let r = resolve("bf16", p, 256);
+        let r = resolve("bf16", p);
         assert_eq!(r.mode, KvMode::Q8);
         assert!(r.warning.is_some());
-        let garbage = resolve("garbage", p, 256);
+        let garbage = resolve("garbage", p);
         assert_eq!(garbage.mode, KvMode::Q8);
         assert!(garbage.warning.is_some());
     }

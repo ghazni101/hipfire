@@ -9126,7 +9126,7 @@ mod tests {
             "precondition: EF dirty"
         );
 
-        state.reset(&mut gpu);
+        state.reset(&mut gpu).expect("reset");
         let after = read_f16_as_f32(&gpu, &state.s_ef_residual[0]);
         for (i, &v) in after.iter().enumerate() {
             assert!(v.abs() < 1e-3, "EF[{i}] must be zero after reset, got {v}");

@@ -17,6 +17,7 @@
 #include <hip/hip_runtime.h>
 #include "turbo_common.h"
 #include "givens_common.h"
+#include "kv_slot_desc.h"
 
 __device__ __forceinline__ void givens_rot_inplace_hd512_batched(
     float& a, float& b,
@@ -33,7 +34,9 @@ extern "C" __global__ void kv_cache_write_asym_k_givens3_hd512_batched(
     const int* __restrict__ positions,    // [batch_size] i32
     const float* __restrict__ cos_theta,
     const float* __restrict__ sin_theta,
-    int n_kv_heads, int head_dim, int batch_size
+    int n_kv_heads, int head_dim, int batch_size,
+    const KvSlotDesc* __restrict__ slot_descs, // [n_slots] or nullptr = legacy
+    const int* __restrict__ row_slot           // [batch_size] or nullptr = legacy
 ) {
     if (head_dim != 512) return;
 
@@ -45,6 +48,14 @@ extern "C" __global__ void kv_cache_write_asym_k_givens3_hd512_batched(
     const int nthreads = blockDim.x;
     const int pos = positions[b];
 
+    // Descriptor contract identical to kv_cache_write_asym_k_givens3_batched:
+    // legacy mode synthesises a zero-base descriptor, so the offset math is
+    // byte-identical to the pre-port kernel.
+    const int slot = (row_slot != nullptr) ? row_slot[b] : 0;
+    const KvSlotDesc desc = (slot_descs != nullptr)
+        ? slot_descs[slot]
+        : kv_slot_legacy(0, 0);
+
     const int bytes_per_head = 4 + (head_dim * 3) / 8;        // 196 for hd=512
     const int bytes_per_pos  = n_kv_heads * bytes_per_head;
     const int k_chunk_bytes  = (256 * 3) / 8;                 // 96
@@ -55,7 +66,7 @@ extern "C" __global__ void kv_cache_write_asym_k_givens3_hd512_batched(
 
     // Per-batch input base: row b in the [batch × n_kv_heads × head_dim] src.
     const float* src = k_src + ((long long)b * n_kv_heads + h) * head_dim;
-    unsigned char* out = k_dst + (size_t)pos * bytes_per_pos + h * bytes_per_head;
+    unsigned char* out = k_dst + kv_offset_for_k(desc, pos, bytes_per_pos) + h * bytes_per_head;
 
     for (int d = tid; d < head_dim; d += nthreads) x[d] = src[d];
     __syncthreads();

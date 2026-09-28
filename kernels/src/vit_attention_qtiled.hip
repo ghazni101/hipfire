@@ -18,8 +18,11 @@
 // 30 KB, which lets two blocks share a CU.
 //
 // Computes: out[qi, head] = softmax(Q[qi] @ K^T / sqrt(d)) @ V   (no mask)
+// over INDEPENDENT row-segments: `seg_len` bounds each softmax to the rows
+// [s*seg_len, (s+1)*seg_len) of segment s (one InternVL tile per segment;
+// seg_len <= 0 degenerates to N = flat attention for single-image towers).
 //
-// Grid:  [num_heads, ceil(N / QB)]
+// Grid:  [num_heads, ceil(seg_len / QB), N/seg_len]
 // Block: [256]           — QB * LANES threads; each 16-lane subgroup owns
 //                        — one query for the whole tile.
 // LDS (QB=16, K_TILE=64, hd=64): k_tile 16 KB + q_tile 4 KB + s_tile 4 KB
@@ -33,18 +36,21 @@
 extern "C" __global__ __launch_bounds__(256, 2) void vit_attention_qtiled_f32(
     const float* __restrict__ qkv,   // [N, 3*hidden] row-major, interleaved Q/K/V
     float* __restrict__ out,         // [N, hidden] row-major
-    int N, int hidden, int num_heads, int head_dim, float scale)
+    int N, int hidden, int num_heads, int head_dim, float scale,
+    int seg_len)
 {
     const int head = blockIdx.x;
     const int q0 = blockIdx.y * QB;
     const int tid = threadIdx.x;
     const int nthreads = blockDim.x;
-    if (head >= num_heads || q0 >= N) return;
+    const int n_seg = (seg_len > 0) ? seg_len : N;   // rows per segment
+    const int seg_base = blockIdx.z * n_seg;         // first row of this segment
+    if (head >= num_heads || q0 >= n_seg) return;
 
     const int qid = tid / LANES;      // which query this subgroup owns
     const int lane = tid % LANES;
-    const int qi = q0 + qid;
-    const int nq = min(QB, N - q0);   // queries live in this block
+    const int qi = seg_base + q0 + qid;              // global query row
+    const int nq = min(QB, n_seg - q0);   // queries live in this block
     const bool alive = qid < nq;
 
     const int stride = 3 * hidden;
@@ -62,10 +68,10 @@ extern "C" __global__ __launch_bounds__(256, 2) void vit_attention_qtiled_f32(
     float* m_l     = ws_sum + QB * LANES;        // [QB * 2] running (max, sum)
     float* out_run = m_l + QB * 2;               // [QB * head_dim]
 
-    // Load this block's Q rows once.
+    // Load this block's Q rows once (segment-relative K/V loop below).
     for (int i = tid; i < nq * head_dim; i += nthreads) {
         int q = i / head_dim, d = i % head_dim;
-        q_tile[q * head_dim + d] = qkv[(q0 + q) * stride + q_off + d];
+        q_tile[q * head_dim + d] = qkv[(seg_base + q0 + q) * stride + q_off + d];
     }
     if (alive && lane == 0) {
         m_l[qid * 2 + 0] = -INFINITY;
@@ -76,13 +82,13 @@ extern "C" __global__ __launch_bounds__(256, 2) void vit_attention_qtiled_f32(
 
     float s_reg[A_MAX];  // this lane's scores/p for the current tile
 
-    for (int t0 = 0; t0 < N; t0 += K_TILE) {
-        const int tlen = min(K_TILE, N - t0);
+    for (int t0 = 0; t0 < n_seg; t0 += K_TILE) {
+        const int tlen = min(K_TILE, n_seg - t0);
 
-        // Cooperative K tile load.
+        // Cooperative K tile load — keys of THIS segment only.
         for (int i = tid; i < tlen * head_dim; i += nthreads) {
             int j = i / head_dim, d = i % head_dim;
-            k_tile[j * head_dim + d] = qkv[(t0 + j) * stride + k_off + d];
+            k_tile[j * head_dim + d] = qkv[(seg_base + t0 + j) * stride + k_off + d];
         }
         __syncthreads();
 
@@ -144,13 +150,14 @@ extern "C" __global__ __launch_bounds__(256, 2) void vit_attention_qtiled_f32(
             // V comes straight from global: each (j, d) is touched by
             // exactly one lane of this block.
             const float* vrow_base = qkv + v_off;
+            const int vseg = seg_base * stride;
             for (int a = 0; a < A; a++) {
                 int d = lane + a * LANES;
                 float acc = out_run[qid * head_dim + d] * r;
                 const float* prow = s_tile + qid * K_TILE;
                 #pragma unroll 8
                 for (int j = 0; j < tlen; j++)
-                    acc += prow[j] * vrow_base[(t0 + j) * stride + d];
+                    acc += prow[j] * vrow_base[vseg + (t0 + j) * stride + d];
                 out_run[qid * head_dim + d] = acc;
             }
             if (lane == 0) {

@@ -105,6 +105,9 @@ pub fn taichu_vision_config_from_hfq(hfq: &HfqFile) -> Option<TaichuVisionConfig
         .get("force_image_size")
         .and_then(|v| v.as_u64())
         .unwrap_or(512) as usize;
+    if patch_size == 0 || image_size == 0 {
+        return None; // malformed pack — treated as no tower
+    }
     let downsample_ratio = config
         .get("downsample_ratio")
         .and_then(|v| v.as_f64())
@@ -230,10 +233,10 @@ impl TaichuVisionWeights {
 
 // ─── Weight loading ─────────────────────────────────────────────────────────
 
-fn load_f32_cpu(hfq: &HfqFile, name: &str, n: usize) -> Vec<f32> {
-    let (info, data) = hfq
-        .tensor_data(name)
-        .unwrap_or_else(|| panic!("taichu vision tensor not found: {name}"));
+fn load_f32_cpu(hfq: &HfqFile, name: &str, n: usize) -> HipResult<Vec<f32>> {
+    let (info, data) = hfq.tensor_data(name).ok_or_else(|| {
+        HipError::new(1, &format!("taichu vision tensor not found: {name}"))
+    })?;
     let mut vals: Vec<f32> = match info.quant_type {
         1 => data
             .chunks_exact(2)
@@ -243,13 +246,24 @@ fn load_f32_cpu(hfq: &HfqFile, name: &str, n: usize) -> Vec<f32> {
             .chunks_exact(4)
             .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
             .collect(),
-        _ => panic!(
-            "expected F16/F32 for {name}, got qt={}",
-            info.quant_type
-        ),
+        other => {
+            return Err(HipError::new(
+                1,
+                &format!("expected F16/F32 for {name}, got qt={other}"),
+            ))
+        }
     };
+    if vals.len() < n {
+        return Err(HipError::new(
+            1,
+            &format!(
+                "taichu vision tensor {name} truncated: {} elems < expected {n}",
+                vals.len()
+            ),
+        ));
+    }
     vals.truncate(n);
-    vals
+    Ok(vals)
 }
 
 const F16_FINITE_MAX: f32 = 65504.0;
@@ -275,9 +289,9 @@ fn checked_f32_to_f16(value: f32, tensor: &str, index: usize) -> HipResult<u16> 
 }
 
 fn load_f16_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> HipResult<GpuTensor> {
-    let (info, data) = hfq
-        .tensor_data(name)
-        .unwrap_or_else(|| panic!("taichu vision tensor not found: {name}"));
+    let (info, data) = hfq.tensor_data(name).ok_or_else(|| {
+        HipError::new(1, &format!("taichu vision tensor not found: {name}"))
+    })?;
     let n: usize = info.shape.iter().map(|&s| s as usize).product();
     match info.quant_type {
         1 => gpu.upload_raw(data, &[n]),
@@ -290,12 +304,15 @@ fn load_f16_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str) -> HipResult<GpuTensor
             }
             gpu.upload_raw(&f16_bytes, &[n])
         }
-        other => panic!("{name}: unsupported vision quant_type={other} (expected F16=1, F32=2)"),
+        other => Err(HipError::new(
+            1,
+            &format!("{name}: unsupported vision quant_type={other} (expected F16=1, F32=2)"),
+        )),
     }
 }
 
 fn load_f32_gpu(hfq: &HfqFile, gpu: &mut Gpu, name: &str, n: usize) -> HipResult<GpuTensor> {
-    let vals = load_f32_cpu(hfq, name, n);
+    let vals = load_f32_cpu(hfq, name, n)?;
     gpu.upload_f32(&vals, &[n])
 }
 
@@ -311,6 +328,40 @@ pub fn load_taichu_vision_weights(
     gpu: &mut Gpu,
 ) -> HipResult<TaichuVisionWeights> {
     let h = config.hidden_size;
+    // Divisor/shape preconditions the tower math relies on. A pack that
+    // violates them would panic mid-load (div-by-zero) or mid-forward
+    // (slice OOB) — refuse it here, at load time.
+    if config.patch_size == 0
+        || config.image_size == 0
+        || config.image_size % config.patch_size != 0
+        || config.downsample_ratio <= 0.0
+        || h == 0
+        || config.pos_table_side == 0
+    {
+        return Err(HipError::new(
+            1,
+            &format!(
+                "taichu vision config invalid: patch_size={} image_size={} \
+                 downsample_ratio={} hidden={h} pos_table_side={}",
+                config.patch_size,
+                config.image_size,
+                config.downsample_ratio,
+                config.pos_table_side
+            ),
+        ));
+    }
+    // pixel_shuffle_v2 and the mlp1.1 fan-in are hard-coded to the 0.5
+    // downsample (2×2 groups, 4h input) — a different ratio must fail loud.
+    if (config.downsample_ratio - 0.5).abs() > 1e-6 {
+        return Err(HipError::new(
+            1,
+            &format!(
+                "taichu downsample_ratio={} unsupported: only 0.5 is wired \
+                 (pixel_shuffle_v2 + mlp1 shapes are hard-coded to it)",
+                config.downsample_ratio
+            ),
+        ));
+    }
     let tower = "vision_model.radio_model.model";
 
     let patch_embed_w = load_f16_gpu(
@@ -330,14 +381,14 @@ pub fn load_taichu_vision_weights(
         hfq,
         &format!("{tower}.patch_generator.cls_token.token"),
         n_prefix * h,
-    );
+    )?;
 
     let pos_table = config.pos_table_side * config.pos_table_side;
     let pos_embed = load_f32_cpu(
         hfq,
         &format!("{tower}.patch_generator.pos_embed"),
         pos_table * h,
-    );
+    )?;
 
     let mut layers = Vec::with_capacity(config.num_layers);
     for l in 0..config.num_layers {
@@ -548,14 +599,20 @@ impl TaichuTowerJob {
 
         // Patch embed on GPU: [n_patches, patch_dim] → [n_patches, h].
         let x_patches = gpu.upload_f32(patches, &[n_patches * patch_dim])?;
-        let emb = linear_f16_nobias(
+        let emb = match linear_f16_nobias(
             gpu,
             &weights.patch_embed_w,
             &x_patches,
             h,
             patch_dim,
             n_patches,
-        )?;
+        ) {
+            Ok(t) => t,
+            Err(e) => {
+                let _ = gpu.free_tensor(x_patches);
+                return Err(e);
+            }
+        };
         gpu.free_tensor(x_patches)?;
 
         // Pos-embed add + cls/register prepend: assembled on host (one
@@ -624,42 +681,49 @@ impl TaichuTowerJob {
         let h = config.hidden_size;
         let n = self.n;
         let lw = &weights.layers[self.next_layer];
+        // Every tensor local to this step is freed before an error escapes —
+        // an `Err` without the frees would strand VRAM on the rig for the
+        // life of the model.
+        macro_rules! step {
+            ($e:expr, $($t:expr),+ $(,)?) => {
+                match $e {
+                    Ok(v) => v,
+                    Err(e) => { $(let _ = gpu.free_tensor($t);)+ return Err(e); }
+                }
+            };
+        }
 
         // LN1 → fused QKV (no positional encoding inside the blocks).
         let tmp = gpu.alloc_tensor(&[n * h], DType::F32)?;
-        gpu.layernorm_batched(&self.x, &lw.norm1_w, &lw.norm1_b, &tmp, n, h, config.norm_eps)?;
-        let qkv = linear_f16(gpu, &lw.qkv_w, &tmp, &lw.qkv_b, 3 * h, h, n)?;
+        step!(gpu.layernorm_batched(&self.x, &lw.norm1_w, &lw.norm1_b, &tmp, n, h, config.norm_eps), tmp);
+        let qkv = step!(linear_f16(gpu, &lw.qkv_w, &tmp, &lw.qkv_b, 3 * h, h, n), tmp);
         gpu.free_tensor(tmp)?;
 
         let attn_out = gpu.alloc_tensor(&[n * h], DType::F32)?;
+        // Each tile is an independent batch element (the per-tile duplicated
+        // cls/register prefix exists for exactly that reason): the softmax
+        // must NOT cross tile boundaries, so segment at rows_per_tile.
         if self.attn_naive {
-            gpu.vit_attention_f32(&qkv, &attn_out, n, h, config.num_heads, config.head_dim)?;
+            step!(gpu.vit_attention_f32(&qkv, &attn_out, n, h, config.num_heads, config.head_dim, self.rows_per_tile), qkv, attn_out);
         } else {
-            gpu.vit_attention_qtiled_f32(
-                &qkv,
-                &attn_out,
-                n,
-                h,
-                config.num_heads,
-                config.head_dim,
-            )?;
+            step!(gpu.vit_attention_qtiled_f32(&qkv, &attn_out, n, h, config.num_heads, config.head_dim, self.rows_per_tile), qkv, attn_out);
         }
         gpu.free_tensor(qkv)?;
 
-        let proj = linear_f16(gpu, &lw.proj_w, &attn_out, &lw.proj_b, h, h, n)?;
+        let proj = step!(linear_f16(gpu, &lw.proj_w, &attn_out, &lw.proj_b, h, h, n), attn_out);
         gpu.free_tensor(attn_out)?;
-        gpu.add_inplace_f32(&self.x, &proj)?;
+        step!(gpu.add_inplace_f32(&self.x, &proj), proj);
         gpu.free_tensor(proj)?;
 
         // LN2 → fc1 → exact-erf GELU → fc2 → residual.
         let tmp2 = gpu.alloc_tensor(&[n * h], DType::F32)?;
-        gpu.layernorm_batched(&self.x, &lw.norm2_w, &lw.norm2_b, &tmp2, n, h, config.norm_eps)?;
-        let fc1 = linear_f16(gpu, &lw.fc1_w, &tmp2, &lw.fc1_b, config.mlp_dim, h, n)?;
+        step!(gpu.layernorm_batched(&self.x, &lw.norm2_w, &lw.norm2_b, &tmp2, n, h, config.norm_eps), tmp2);
+        let fc1 = step!(linear_f16(gpu, &lw.fc1_w, &tmp2, &lw.fc1_b, config.mlp_dim, h, n), tmp2);
         gpu.free_tensor(tmp2)?;
-        gpu.gelu_erf_f32(&fc1, &fc1, n * config.mlp_dim)?;
-        let fc2 = linear_f16(gpu, &lw.fc2_w, &fc1, &lw.fc2_b, h, config.mlp_dim, n)?;
+        step!(gpu.gelu_erf_f32(&fc1, &fc1, n * config.mlp_dim), fc1);
+        let fc2 = step!(linear_f16(gpu, &lw.fc2_w, &fc1, &lw.fc2_b, h, config.mlp_dim, n), fc1);
         gpu.free_tensor(fc1)?;
-        gpu.add_inplace_f32(&self.x, &fc2)?;
+        step!(gpu.add_inplace_f32(&self.x, &fc2), fc2);
         gpu.free_tensor(fc2)?;
 
         self.next_layer += 1;
@@ -685,9 +749,17 @@ impl TaichuTowerJob {
             ..
         } = self;
         let h = config.hidden_size;
-        gpu.hip.device_synchronize()?;
+        macro_rules! step {
+            ($e:expr, $($t:expr),+ $(,)?) => {
+                match $e {
+                    Ok(v) => v,
+                    Err(e) => { $(let _ = gpu.free_tensor($t);)+ return Err(e); }
+                }
+            };
+        }
+        step!(gpu.hip.device_synchronize(), x);
 
-        let x_host = gpu.download_f32(&x)?;
+        let x_host = step!(gpu.download_f32(&x), x);
         gpu.free_tensor(x)?;
         let n_prefix = rows_per_tile - config.tile_patches_per_side().pow(2);
         let p_side = config.tile_patches_per_side();
@@ -711,31 +783,37 @@ impl TaichuTowerJob {
         // RMSNorm (raw weight — no +1 bias convention here; it was written
         // as an F32 oracle so elements pass through unmodified).
         let normed = gpu.alloc_tensor(&[n_out * ps_dim], DType::F32)?;
-        gpu.rmsnorm_batched(&merged, &weights.proj_norm_w, &normed, n_out, ps_dim, 1e-5)?;
+        step!(gpu.rmsnorm_batched(&merged, &weights.proj_norm_w, &normed, n_out, ps_dim, 1e-5), merged, normed);
         gpu.free_tensor(merged)?;
 
-        let h1 = linear_f16_nobias(
-            gpu,
-            &weights.proj_fc1_w,
-            &normed,
-            config.projector_hidden,
-            ps_dim,
-            n_out,
-        )?;
+        let h1 = step!(
+            linear_f16_nobias(
+                gpu,
+                &weights.proj_fc1_w,
+                &normed,
+                config.projector_hidden,
+                ps_dim,
+                n_out,
+            ),
+            normed
+        );
         gpu.free_tensor(normed)?;
         // SquaredReLU: relu(x)² elementwise (NOT plain x²).
-        gpu.squared_relu_f32(&h1, &h1, n_out * config.projector_hidden)?;
-        let out = linear_f16_nobias(
-            gpu,
-            &weights.proj_fc2_w,
-            &h1,
-            config.out_hidden_size,
-            config.projector_hidden,
-            n_out,
-        )?;
+        step!(gpu.squared_relu_f32(&h1, &h1, n_out * config.projector_hidden), h1);
+        let out = step!(
+            linear_f16_nobias(
+                gpu,
+                &weights.proj_fc2_w,
+                &h1,
+                config.out_hidden_size,
+                config.projector_hidden,
+                n_out,
+            ),
+            h1
+        );
         gpu.free_tensor(h1)?;
 
-        let result = gpu.download_f32(&out)?;
+        let result = step!(gpu.download_f32(&out), out);
         gpu.free_tensor(out)?;
         eprintln!(
             "  taichu vision done: {n_out} tokens × {} dims ({:.2}s)",

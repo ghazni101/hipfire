@@ -955,7 +955,19 @@ fn spec_tape_layer_rows(
     qkv_dim: usize,
     n_v_heads: usize,
 ) -> HipResult<()> {
-    debug_assert!(m <= cap.stride, "verify rows {m} exceed tape stride {}", cap.stride);
+    // Hard bound, not debug-only: a verify window wider than the tape
+    // stride would write past this slot's tape slice into the NEXT slot's
+    // rows in release builds (debug_assert disappears) — silent DN repair
+    // corruption.
+    if m > cap.stride {
+        return Err(hip_bridge::HipError::new(
+            0,
+            &format!(
+                "verify rows {m} exceed tape stride {} — draft window wider than spec_rows",
+                cap.stride
+            ),
+        ));
+    }
     let tape_off = slot * cap.stride;
     let tape = &mut *cap.tape;
     gpu.memcpy_dtod_at_auto(
@@ -3131,6 +3143,7 @@ fn decode_graph_m_hash(
     lm_head_skip: &[bool],
     vl_mrope: bool,
     vl_ext: bool,
+    tape_active: bool,
 ) -> u64 {
     let mut h: u64 = 0xcbf29ce484222325;
     for &m in m_per_slot {
@@ -3144,6 +3157,13 @@ fn decode_graph_m_hash(
     h ^= vl_mrope as u64;
     h = h.wrapping_mul(0x100000001b3);
     h ^= vl_ext as u64;
+    h = h.wrapping_mul(0x100000001b3);
+    // Whether the captured body launches the tape/hidden-scatter writes.
+    // `verify_slots` is already hashed via lm_head_skip, but the capture
+    // PRESENCE is not — a graph baked without tape ops would otherwise
+    // replay over a step that expected taped verify rows (silent: the
+    // post-accept DN repair then replays an empty tape).
+    h ^= tape_active as u64;
     h = h.wrapping_mul(0x100000001b3);
     h
 }
@@ -3330,6 +3350,7 @@ pub fn forward_batch_slots_graphed_opts(
             batch.pos3.len() == batch.positions.len() && !batch.pos3.is_empty(),
             batch.ext_emb.len() == batch.positions.len()
                 && batch.ext_emb.iter().any(|&e| e >= 0),
+            spec_capture.is_some(),
         ),
     };
 
@@ -4179,38 +4200,44 @@ mod tests {
     fn decode_graph_m_hash_separates_patterns() {
         // Same total rows, different patterns → different graphs.
         assert_ne!(
-            decode_graph_m_hash(&[4, 1], &[true, false], false, false),
-            decode_graph_m_hash(&[1, 4], &[false, true], false, false)
+            decode_graph_m_hash(&[4, 1], &[true, false], false, false, false),
+            decode_graph_m_hash(&[1, 4], &[false, true], false, false, false)
         );
         // The lm_head-skip mask participates: same m-pattern with different
         // skips must not share a captured graph (the recorded GEMV set
         // differs).
         assert_ne!(
-            decode_graph_m_hash(&[4, 1], &[true, false], false, false),
-            decode_graph_m_hash(&[4, 1], &[false, false], false, false)
+            decode_graph_m_hash(&[4, 1], &[true, false], false, false, false),
+            decode_graph_m_hash(&[4, 1], &[false, false], false, false, false)
         );
         // Stable across calls.
         assert_eq!(
-            decode_graph_m_hash(&[4, 1, 0], &[true, false, false], false, false),
-            decode_graph_m_hash(&[4, 1, 0], &[true, false, false], false, false)
+            decode_graph_m_hash(&[4, 1, 0], &[true, false, false], false, false, false),
+            decode_graph_m_hash(&[4, 1, 0], &[true, false, false], false, false, false)
         );
         // An absent mask and an all-false mask hash differently. That is
         // acceptable, not a defect: at worst it costs one extra capture when
         // the engine toggles between MTP-on and MTP-off batches — a key
         // mismatch can never alias a wrong graph.
         assert_ne!(
-            decode_graph_m_hash(&[1, 1], &[], false, false),
-            decode_graph_m_hash(&[1, 1], &[false, false], false, false)
+            decode_graph_m_hash(&[1, 1], &[], false, false, false),
+            decode_graph_m_hash(&[1, 1], &[false, false], false, false, false)
         );
         // The VL step flags participate: an M-RoPE or external-embedding
         // step captures its own graph (different rope/scatter kernel set).
         assert_ne!(
-            decode_graph_m_hash(&[1, 1], &[false, false], true, false),
-            decode_graph_m_hash(&[1, 1], &[false, false], false, false)
+            decode_graph_m_hash(&[1, 1], &[false, false], true, false, false),
+            decode_graph_m_hash(&[1, 1], &[false, false], false, false, false)
         );
         assert_ne!(
-            decode_graph_m_hash(&[1, 1], &[false, false], false, true),
-            decode_graph_m_hash(&[1, 1], &[false, false], false, false)
+            decode_graph_m_hash(&[1, 1], &[false, false], false, true, false),
+            decode_graph_m_hash(&[1, 1], &[false, false], false, false, false)
+        );
+        // Tape-capture participation: a step that tapes verify rows must
+        // not replay a graph captured without the tape writes.
+        assert_ne!(
+            decode_graph_m_hash(&[1, 1], &[false, false], false, false, true),
+            decode_graph_m_hash(&[1, 1], &[false, false], false, false, false)
         );
     }
 }

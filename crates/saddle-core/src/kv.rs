@@ -357,7 +357,8 @@ pub struct SlotKvTierPlan {
     pub v_bytes_per_pos: usize,
     /// Givens cos/sin table length (asym tiers): `head_dim / 2`.
     pub givens_len: Option<usize>,
-    /// FWHT sign-vector length (fwht tiers): 128 (Q8-V sign width).
+    /// FWHT sign-vector length (fwht tiers): 128 for fwht2/fwht4 (Q8-V sign
+    /// width), 256 for fwht3 (`fwht_shfl_forward_256` reads the full span).
     pub fwht_len: Option<usize>,
 }
 
@@ -462,8 +463,16 @@ impl SlotKvTierPlan {
             v_bytes_per_pos,
             givens_len: matches!(mode, KvMode::Asym2 | KvMode::Asym3 | KvMode::Asym4)
                 .then_some(head_dim / 2),
-            fwht_len: matches!(mode, KvMode::Fwht2 | KvMode::Fwht3 | KvMode::Fwht4)
-                .then_some(128),
+            // fwht3's write/attend kernels run fwht_shfl_forward_256 which
+            // reads signs[0..256) — a 128-wide table is an out-of-bounds
+            // device read. fwht2/fwht4 use the 128-wide Q8-V signs (the
+            // multi-slot ladder's V is always Q8_0, matching the VMM
+            // v_mode=Q8 branch of rotation_table_len).
+            fwht_len: match mode {
+                KvMode::Fwht3 => Some(256),
+                KvMode::Fwht2 | KvMode::Fwht4 => Some(128),
+                _ => None,
+            },
         })
     }
 
@@ -5156,10 +5165,16 @@ mod slot_kv_plan_tests {
             assert_eq!(p.givens_len, Some(128), "{m:?}: head_dim/2 givens angles");
             assert!(p.fwht_len.is_none(), "{m:?} must not carry fwht signs");
         }
-        for m in [KvMode::Fwht2, KvMode::Fwht3, KvMode::Fwht4] {
+        for m in [KvMode::Fwht2, KvMode::Fwht4] {
             let p = SlotKvTierPlan::resolve(m, 2, 256).unwrap();
             assert_eq!(p.fwht_len, Some(128), "{m:?}: 128-wide sign vectors");
             assert!(p.givens_len.is_none(), "{m:?} must not carry givens angles");
+        }
+        {
+            // fwht3 kernels run fwht_shfl_forward_256 — signs[0..256).
+            let p = SlotKvTierPlan::resolve(KvMode::Fwht3, 2, 256).unwrap();
+            assert_eq!(p.fwht_len, Some(256), "Fwht3: 256-wide sign vectors");
+            assert!(p.givens_len.is_none(), "Fwht3 must not carry givens angles");
         }
     }
 

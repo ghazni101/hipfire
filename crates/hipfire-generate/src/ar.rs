@@ -4047,12 +4047,28 @@ pub fn generate(
             Vec::new()
         };
         let grammar_active = !tool_schemas_qwen.is_empty();
-        let mut grammar_matcher = saddle_core::grammar::json::Matcher::with_config(
+        // Fallible compile (not Matcher::with_config — its .expect panics
+        // on bound violations reachable from wire-supplied tools: a >64KiB
+        // name/required payload passes the 256KiB serialized-JSON gate).
+        let mut grammar_matcher = match saddle_core::grammar::json::CompiledGrammar::with_config(
             tool_schemas_qwen,
             hipfire_loader::carrier_for(m.arch_id)
                 .map(|c| c.grammar_config())
                 .unwrap_or_default(),
-        );
+        ) {
+            Ok(g) => saddle_core::grammar::json::Matcher::from_compiled(std::sync::Arc::new(g)),
+            Err(e) => {
+                crate::dense::emit_active_attempt_error(
+                    stdout,
+                    Some(id),
+                    &format!("tool grammar compile failed: {e}"),
+                    "validation",
+                    false,
+                    false,
+                );
+                return;
+            }
+        };
         // One-time vocab decode for token mask construction. Reuses the
         // model-level cache so subsequent requests on the same model skip
         // the ~150k-entry decode.

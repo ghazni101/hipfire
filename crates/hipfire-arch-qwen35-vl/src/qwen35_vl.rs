@@ -1053,11 +1053,24 @@ impl VisionTowerJob {
             vl_dump_slice(d, "pixel_values", patches, &[n, patch_dim]);
         }
 
+        // Free-on-Err discipline (mirror of `step!` in step_layer): every
+        // tensor local to the prologue is released before an error escapes
+        // — an `Err` without the frees strands VRAM on the rig for the
+        // life of the model.
+        macro_rules! prologue {
+            ($e:expr, $($t:expr),* $(,)?) => {
+                match $e {
+                    Ok(v) => v,
+                    Err(e) => { $(let _ = gpu.free_tensor($t);)* return Err(e); }
+                }
+            };
+        }
+
         // Upload patches [n, patch_dim]
         let x_patches = gpu.upload_f32(patches, &[n * patch_dim])?;
 
         // Patch embedding: linear_f16 → [n, h]
-        let x = linear_f16(
+        let x = prologue!(linear_f16(
             gpu,
             &weights.patch_embed_w,
             &x_patches,
@@ -1065,7 +1078,7 @@ impl VisionTowerJob {
             h,
             patch_dim,
             n,
-        )?;
+        ), x_patches);
         gpu.free_tensor(x_patches)?;
         vl_dump_tensor(gpu, dd, "patch_embed", &x, &[n, h])?;
 
@@ -1091,8 +1104,8 @@ impl VisionTowerJob {
             num_grid_per_side,
             config.spatial_merge_size,
         );
-        let pos_embed_gpu = gpu.upload_f32(&pos_embed_interp, &[n * h])?;
-        gpu.add_inplace_f32(&x, &pos_embed_gpu)?;
+        let pos_embed_gpu = prologue!(gpu.upload_f32(&pos_embed_interp, &[n * h]), x);
+        prologue!(gpu.add_inplace_f32(&x, &pos_embed_gpu), x, pos_embed_gpu);
         gpu.free_tensor(pos_embed_gpu)?;
         vl_dump_tensor(gpu, dd, "post_pos_embed", &x, &[n, h])?;
         if let Some(d) = dd {
@@ -1111,8 +1124,8 @@ impl VisionTowerJob {
             config.spatial_merge_size,
             config.rope_theta,
         );
-        let rope_cos_gpu = gpu.upload_f32(&rope_cos, &[n * rot_dim_half])?;
-        let rope_sin_gpu = gpu.upload_f32(&rope_sin, &[n * rot_dim_half])?;
+        let rope_cos_gpu = prologue!(gpu.upload_f32(&rope_cos, &[n * rot_dim_half]), x);
+        let rope_sin_gpu = prologue!(gpu.upload_f32(&rope_sin, &[n * rot_dim_half]), x, rope_cos_gpu);
 
         // Attention dispatch: the Q-tiled kernel is the production path (the
         // per-(head, query) kernel was 1.02 s/layer at a 68x68 grid on gfx1101
@@ -1181,6 +1194,17 @@ impl VisionTowerJob {
             }
         }
 
+        // Free-on-Err discipline: mirror of `new`'s `prologue!` — every
+        // tensor local to the prologue is released before an error escapes.
+        macro_rules! prologue {
+            ($e:expr, $($t:expr),* $(,)?) => {
+                match $e {
+                    Ok(v) => v,
+                    Err(e) => { $(let _ = gpu.free_tensor($t);)* return Err(e); }
+                }
+            };
+        }
+
         // Patch embedding: linear_f16 → [n, h]. Last use of the owned input:
         // release it here — not at tower end — on both success and failure.
         let x = match linear_f16(
@@ -1221,8 +1245,8 @@ impl VisionTowerJob {
             num_grid_per_side,
             config.spatial_merge_size,
         );
-        let pos_embed_gpu = gpu.upload_f32(&pos_embed_interp, &[n * h])?;
-        gpu.add_inplace_f32(&x, &pos_embed_gpu)?;
+        let pos_embed_gpu = prologue!(gpu.upload_f32(&pos_embed_interp, &[n * h]), x);
+        prologue!(gpu.add_inplace_f32(&x, &pos_embed_gpu), x, pos_embed_gpu);
         gpu.free_tensor(pos_embed_gpu)?;
         vl_dump_tensor(gpu, dd, "post_pos_embed", &x, &[n, h])?;
         if let Some(d) = dd {
@@ -1237,8 +1261,8 @@ impl VisionTowerJob {
             config.spatial_merge_size,
             config.rope_theta,
         );
-        let rope_cos_gpu = gpu.upload_f32(&rope_cos, &[n * rot_dim_half])?;
-        let rope_sin_gpu = gpu.upload_f32(&rope_sin, &[n * rot_dim_half])?;
+        let rope_cos_gpu = prologue!(gpu.upload_f32(&rope_cos, &[n * rot_dim_half]), x);
+        let rope_sin_gpu = prologue!(gpu.upload_f32(&rope_sin, &[n * rot_dim_half]), x, rope_cos_gpu);
 
         let attn_naive = matches!(
             hipfire_config::developer_var("HIPFIRE_VIT_ATTN").as_deref(),
@@ -1279,16 +1303,28 @@ impl VisionTowerJob {
         let dd = self.dump_dir.as_deref();
         let lw = &weights.layers[li];
 
+        // Every tensor local to this layer step is freed before an error
+        // escapes — an `Err` without the frees strands VRAM on the rig for
+        // the life of the model (mirror of the taichu `step!` discipline).
+        macro_rules! step {
+            ($e:expr, $($t:expr),* $(,)?) => {
+                match $e {
+                    Ok(v) => v,
+                    Err(e) => { $(let _ = gpu.free_tensor($t);)* return Err(e); }
+                }
+            };
+        }
+
         // LayerNorm1 → tmp
         let tmp = gpu.alloc_tensor(&[n * h], DType::F32)?;
-        gpu.layernorm_batched(&self.x, &lw.norm1_w, &lw.norm1_b, &tmp, n, h, config.norm_eps)?;
+        step!(gpu.layernorm_batched(&self.x, &lw.norm1_w, &lw.norm1_b, &tmp, n, h, config.norm_eps), tmp);
 
         // QKV projection → [n, 3h]
-        let qkv = linear_f16(gpu, &lw.qkv_w, &tmp, &lw.qkv_b, 3 * h, h, n)?;
+        let qkv = step!(linear_f16(gpu, &lw.qkv_w, &tmp, &lw.qkv_b, 3 * h, h, n), tmp);
         gpu.free_tensor(tmp)?;
 
         // 2D rotary on Q and K
-        gpu.apply_rope_2d_vision_f32(
+        step!(gpu.apply_rope_2d_vision_f32(
             &qkv,
             &self.rope_cos_gpu,
             &self.rope_sin_gpu,
@@ -1296,45 +1332,46 @@ impl VisionTowerJob {
             h,
             config.num_heads,
             config.head_dim,
-        )?;
+        ), qkv);
 
         // Self-attention
-        let attn_out = gpu.alloc_tensor(&[n * h], DType::F32)?;
+        let attn_out = step!(gpu.alloc_tensor(&[n * h], DType::F32), qkv);
         if self.attn_naive {
-            gpu.vit_attention_f32(&qkv, &attn_out, n, h, config.num_heads, config.head_dim)?;
+            step!(gpu.vit_attention_f32(&qkv, &attn_out, n, h, config.num_heads, config.head_dim, n), qkv, attn_out);
         } else {
-            gpu.vit_attention_qtiled_f32(
+            step!(gpu.vit_attention_qtiled_f32(
                 &qkv,
                 &attn_out,
                 n,
                 h,
                 config.num_heads,
                 config.head_dim,
-            )?;
+                n, // one image = one attention segment
+            ), qkv, attn_out);
         }
         gpu.free_tensor(qkv)?;
 
         // Output projection + residual
-        let proj = linear_f16(gpu, &lw.proj_w, &attn_out, &lw.proj_b, h, h, n)?;
+        let proj = step!(linear_f16(gpu, &lw.proj_w, &attn_out, &lw.proj_b, h, h, n), attn_out);
         gpu.free_tensor(attn_out)?;
 
         // Residual: x += proj
-        gpu.add_inplace_f32(&self.x, &proj)?;
+        step!(gpu.add_inplace_f32(&self.x, &proj), proj);
         gpu.free_tensor(proj)?;
 
         // LayerNorm2 → tmp
         let tmp2 = gpu.alloc_tensor(&[n * h], DType::F32)?;
-        gpu.layernorm_batched(&self.x, &lw.norm2_w, &lw.norm2_b, &tmp2, n, h, config.norm_eps)?;
+        step!(gpu.layernorm_batched(&self.x, &lw.norm2_w, &lw.norm2_b, &tmp2, n, h, config.norm_eps), tmp2);
 
         // MLP: fc1 → GELU → fc2 + residual
-        let fc1 = linear_f16(gpu, &lw.fc1_w, &tmp2, &lw.fc1_b, config.mlp_dim, h, n)?;
+        let fc1 = step!(linear_f16(gpu, &lw.fc1_w, &tmp2, &lw.fc1_b, config.mlp_dim, h, n), tmp2);
         gpu.free_tensor(tmp2)?;
-        gpu.gelu_tanh_f32(&fc1, &fc1, n * config.mlp_dim)?;
-        let fc2 = linear_f16(gpu, &lw.fc2_w, &fc1, &lw.fc2_b, h, config.mlp_dim, n)?;
+        step!(gpu.gelu_tanh_f32(&fc1, &fc1, n * config.mlp_dim), fc1);
+        let fc2 = step!(linear_f16(gpu, &lw.fc2_w, &fc1, &lw.fc2_b, h, config.mlp_dim, n), fc1);
         gpu.free_tensor(fc1)?;
 
         // Residual: x += fc2
-        gpu.add_inplace_f32(&self.x, &fc2)?;
+        step!(gpu.add_inplace_f32(&self.x, &fc2), fc2);
         gpu.free_tensor(fc2)?;
 
         vl_dump_tensor(gpu, dd, &format!("block_{li:02}"), &self.x, &[n, h])?;
@@ -1367,10 +1404,24 @@ impl VisionTowerJob {
         } = self;
         let h = config.hidden_size;
 
+        // Free-on-Err discipline: the job is consumed by `finish`, so every
+        // buffer it still owns plus every epilogue-local tensor must be
+        // released before an error escapes — there is no Drop that frees
+        // device memory.
+        macro_rules! step {
+            ($e:expr, $($t:expr),* $(,)?) => {
+                match $e {
+                    Ok(v) => v,
+                    Err(e) => { $(let _ = gpu.free_tensor($t);)* return Err(e); }
+                }
+            };
+        }
+
         // Single sync at end of all layers (avoids per-layer sync overhead)
-        gpu.hip.device_synchronize()?;
-        gpu.free_tensor(rope_cos_gpu)?;
-        gpu.free_tensor(rope_sin_gpu)?;
+        step!(gpu.hip.device_synchronize(), x, rope_cos_gpu, rope_sin_gpu);
+        // Best-effort frees: rope tables are dead after the last layer.
+        let _ = gpu.free_tensor(rope_cos_gpu);
+        let _ = gpu.free_tensor(rope_sin_gpu);
         eprintln!(
             "  vision forward complete ({:.2}s)",
             t0.elapsed().as_secs_f32()
@@ -1384,8 +1435,8 @@ impl VisionTowerJob {
         let merge_dim = h * sms * sms;
 
         // LayerNorm all patches
-        let normed = gpu.alloc_tensor(&[n * h], DType::F32)?;
-        gpu.layernorm_batched(
+        let normed = step!(gpu.alloc_tensor(&[n * h], DType::F32), x);
+        step!(gpu.layernorm_batched(
             &x,
             &weights.merger_norm_w,
             &weights.merger_norm_b,
@@ -1393,11 +1444,11 @@ impl VisionTowerJob {
             n,
             h,
             config.norm_eps,
-        )?;
+        ), x, normed);
         gpu.free_tensor(x)?;
 
         // Download for 2x2 rearrange (only ~3.6MB, one-time cost)
-        let normed_data = gpu.download_f32(&normed)?;
+        let normed_data = step!(gpu.download_f32(&normed), normed);
         gpu.free_tensor(normed)?;
 
         // Patches in `normed_data` are stored in 2x2-block-grouped order (see
@@ -1417,7 +1468,7 @@ impl VisionTowerJob {
 
         // Merger MLP on GPU
         let merged_gpu = gpu.upload_f32(&merged, &[n_merged * merge_dim])?;
-        let m1 = linear_f16(
+        let m1 = step!(linear_f16(
             gpu,
             &weights.merger_fc1_w,
             &merged_gpu,
@@ -1425,11 +1476,11 @@ impl VisionTowerJob {
             merge_dim,
             merge_dim,
             n_merged,
-        )?;
+        ), merged_gpu);
         gpu.free_tensor(merged_gpu)?;
-        gpu.gelu_tanh_f32(&m1, &m1, n_merged * merge_dim)?;
+        step!(gpu.gelu_tanh_f32(&m1, &m1, n_merged * merge_dim), m1);
 
-        let m2 = linear_f16(
+        let m2 = step!(linear_f16(
             gpu,
             &weights.merger_fc2_w,
             &m1,
@@ -1437,10 +1488,10 @@ impl VisionTowerJob {
             config.out_hidden_size,
             merge_dim,
             n_merged,
-        )?;
+        ), m1);
         gpu.free_tensor(m1)?;
 
-        let result = gpu.download_f32(&m2)?;
+        let result = step!(gpu.download_f32(&m2), m2);
         gpu.free_tensor(m2)?;
 
         if let Some(d) = dump_dir.as_deref() {
@@ -1502,7 +1553,15 @@ pub fn vision_forward(
     let mut job = VisionTowerJob::new(gpu, weights, config, patches, grid_h, grid_w)?;
     let mut done = false;
     while !done {
-        done = job.step_layer(gpu, weights, config)?;
+        match job.step_layer(gpu, weights, config) {
+            Ok(d) => done = d,
+            // The job's persistent buffers (x + rope tables) are not
+            // pool-tracked — dropping it on the error path leaks them.
+            Err(e) => {
+                let _ = job.free(gpu);
+                return Err(e);
+            }
+        }
     }
     job.finish(gpu, weights, config)
 }
@@ -1525,7 +1584,13 @@ pub fn vision_forward_patches(
     let mut job = VisionTowerJob::new_patches(gpu, weights, config, x_patches, grid_h, grid_w)?;
     let mut done = false;
     while !done {
-        done = job.step_layer(gpu, weights, config)?;
+        match job.step_layer(gpu, weights, config) {
+            Ok(d) => done = d,
+            Err(e) => {
+                let _ = job.free(gpu);
+                return Err(e);
+            }
+        }
     }
     job.finish(gpu, weights, config)
 }

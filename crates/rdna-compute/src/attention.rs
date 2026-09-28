@@ -8096,8 +8096,16 @@ impl Gpu {
                 slot_descs,
                 row_slot,
             )?;
-            return self.kv_cache_write_q8_0_batched(
-                v_dst, v_src, positions, n_kv_heads, head_dim, batch_size,
+            return self.kv_cache_write_q8_0_batched_slots(
+                v_dst,
+                v_src,
+                positions,
+                n_kv_heads,
+                head_dim,
+                batch_size,
+                slot_descs,
+                row_slot,
+                /*use_v_base=*/ true,
             );
         }
         // K: batched 3-bit rotated write.
@@ -10440,6 +10448,11 @@ impl Gpu {
     }
 
     /// Fused ViT self-attention: reads QKV [N, 3*hidden], writes out [N, hidden].
+    /// `seg_len` bounds each softmax to a contiguous row-segment of that
+    /// length (one InternVL tile per segment); pass `n` for the classic
+    /// flat-attention towers. `seg_len` must divide `n` evenly; a
+    /// non-conforming value falls back to flat (whole-N) attention with a
+    /// warning rather than an engine-thread panic.
     pub fn vit_attention_f32(
         &mut self,
         qkv: &GpuTensor,
@@ -10448,6 +10461,7 @@ impl Gpu {
         hidden: usize,
         num_heads: usize,
         head_dim: usize,
+        seg_len: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
@@ -10464,6 +10478,16 @@ impl Gpu {
         let mut nh = num_heads as i32;
         let mut hd = head_dim as i32;
         let mut sc = scale;
+        let seg_len = if seg_len == 0 || seg_len > n || n % seg_len != 0 {
+            eprintln!(
+                "vit_attention_f32: seg_len={seg_len} does not evenly divide \
+                 N={n}; falling back to flat attention"
+            );
+            n
+        } else {
+            seg_len
+        };
+        let mut sl = seg_len as i32;
         let mut params: Vec<*mut c_void> = vec![
             &mut qp as *mut _ as *mut c_void,
             &mut op as *mut _ as *mut c_void,
@@ -10472,15 +10496,16 @@ impl Gpu {
             &mut nh as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
             &mut sc as *mut _ as *mut c_void,
+            &mut sl as *mut _ as *mut c_void,
         ];
-        let block_size = std::cmp::min(256, std::cmp::max(n, head_dim)) as u32;
+        let block_size = std::cmp::min(256, std::cmp::max(seg_len, head_dim)) as u32;
         let block_size = block_size.next_power_of_two();
-        // Shared memory: scores[N] + workspace[block_size]
-        let shared_mem = ((n + block_size as usize) * 4) as u32;
+        // Shared memory: scores[seg_len] + workspace[block_size]
+        let shared_mem = ((seg_len + block_size as usize) * 4) as u32;
         unsafe {
             self.hip.launch_kernel(
                 func,
-                [num_heads as u32, n as u32, 1],
+                [num_heads as u32, seg_len as u32, (n / seg_len) as u32],
                 [block_size, 1, 1],
                 shared_mem,
                 self.stream_ref(),
@@ -10614,6 +10639,7 @@ impl Gpu {
         hidden: usize,
         num_heads: usize,
         head_dim: usize,
+        seg_len: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
         // Shapes outside the Q-tiled contract (per-lane accumulators are
@@ -10627,7 +10653,7 @@ impl Gpu {
                  Q-tiled contract (multiple of 16, <= 128); falling back to \
                  vit_attention_f32"
             );
-            return self.vit_attention_f32(qkv, out, n, hidden, num_heads, head_dim);
+            return self.vit_attention_f32(qkv, out, n, hidden, num_heads, head_dim, seg_len);
         }
         self.ensure_kernel(
             "vit_attention_qtiled_f32",
@@ -10643,6 +10669,16 @@ impl Gpu {
         let mut nh = num_heads as i32;
         let mut hd = head_dim as i32;
         let mut sc = scale;
+        let seg_len = if seg_len == 0 || seg_len > n || n % seg_len != 0 {
+            eprintln!(
+                "vit_attention_qtiled_f32: seg_len={seg_len} does not evenly \
+                 divide N={n}; falling back to flat attention"
+            );
+            n
+        } else {
+            seg_len
+        };
+        let mut sl = seg_len as i32;
         let mut params: Vec<*mut c_void> = vec![
             &mut qp as *mut _ as *mut c_void,
             &mut op as *mut _ as *mut c_void,
@@ -10651,6 +10687,7 @@ impl Gpu {
             &mut nh as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,
             &mut sc as *mut _ as *mut c_void,
+            &mut sl as *mut _ as *mut c_void,
         ];
         // Layout must mirror the kernel's smem carve-up (QB=16, K_TILE=64):
         // k_tile + q_tile + s_tile + ws_max + ws_sum + m_l + out_run. (V is
@@ -10667,7 +10704,11 @@ impl Gpu {
         unsafe {
             self.hip.launch_kernel(
                 func,
-                [num_heads as u32, (n as u32).div_ceil(QB as u32), 1],
+                [
+                    num_heads as u32,
+                    (seg_len as u32).div_ceil(QB as u32),
+                    (n / seg_len) as u32,
+                ],
                 [256, 1, 1],
                 shared_mem,
                 self.stream_ref(),
