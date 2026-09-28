@@ -396,6 +396,14 @@ impl ProductTier {
 /// flat-routing on a quantized router shifts which experts a token sees — so
 /// prefer keeping `router` in the set unless you are explicitly testing it.
 pub(crate) fn is_q8_tensor(name: &str) -> bool {
+    is_q8_tensor_in(name, hipfire_config::developer_var("HIPFIRE_Q8_CLASSES").ok())
+}
+
+/// `is_q8_tensor` with the `HIPFIRE_Q8_CLASSES` list supplied by the caller.
+/// `None` = the knob is absent and every class lifts. Split out so tests can
+/// exercise the class-matching logic — `developer_var` reads the process
+/// snapshot, which `std::env::set_var` cannot reach after startup.
+pub(crate) fn is_q8_tensor_in(name: &str, classes: Option<String>) -> bool {
     let Some(class) = q8_class_of(name) else {
         return false;
     };
@@ -404,8 +412,8 @@ pub(crate) fn is_q8_tensor(name: &str) -> bool {
     if fixed_tier_override_applies(name) {
         return true;
     }
-    match hipfire_config::developer_var("HIPFIRE_Q8_CLASSES") {
-        Ok(list) => {
+    match classes {
+        Some(list) => {
             // validated at startup; still handle empty list as no lift.
             // `attn_full` independently retains self-attention without linear_attn.
             list.split(',').any(|c| {
@@ -413,7 +421,7 @@ pub(crate) fn is_q8_tensor(name: &str) -> bool {
                 c == class || (c == "attn_full" && is_attn_full_tensor(name))
             })
         }
-        Err(_) => true,
+        None => true,
     }
 }
 

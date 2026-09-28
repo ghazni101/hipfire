@@ -794,8 +794,8 @@ mod tests {
     }
 
     #[test]
-    fn head_quant_parses_and_defaults_to_bf16() {
-        assert_eq!(MapleHeadQuant::default(), MapleHeadQuant::Bf16);
+    fn head_quant_parses_and_defaults_to_q8() {
+        assert_eq!(MapleHeadQuant::default(), MapleHeadQuant::Q8);
         assert_eq!(
             "bf16".parse::<MapleHeadQuant>().unwrap(),
             MapleHeadQuant::Bf16

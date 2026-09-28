@@ -2027,7 +2027,7 @@ mod hfq_block_diag {
 mod tests {
     use super::*;
     use crate::hfq::{kmap_resolve, kmap_resolve_mode, QuantLevel};
-    use crate::model_filter::{is_q8_tensor, q8_class_of, should_quantize};
+    use crate::model_filter::{is_q8_tensor, is_q8_tensor_in, q8_class_of, should_quantize};
     use crate::quant_fwht::{cpu_fwht_256, gen_fwht_signs};
 
     /// The MQ*-G256-GL codebooks are NOT stored in the `.hfq` file: the encoder
@@ -2608,18 +2608,29 @@ mod tests {
         // dense model the fixed tier is off and the K-map verdict is never
         // consulted. The K-map assertions in the sibling test passed the entire
         // time. Only a check that pins the CLASS SELECTION catches that gap.
-        //
-        // SAFETY: single-threaded test; env is restored before returning.
-        let prev = hipfire_config::developer_var("HIPFIRE_Q8_CLASSES").ok();
-        unsafe { std::env::set_var("HIPFIRE_Q8_CLASSES", "lm_head,embed") };
-
-        assert!(is_q8_tensor("lm_head.weight"), "lm_head must be Q8");
+        // `is_q8_tensor` routes the knob through the process snapshot, which
+        // std::env::set_var cannot reach post-startup — exercise the class
+        // selection directly on the pure predicate.
+        let classes = Some("lm_head,embed".to_string());
         assert!(
-            is_q8_tensor("model.language_model.embed_tokens.weight"),
+            is_q8_tensor_in("lm_head.weight", classes.clone()),
+            "lm_head must be Q8"
+        );
+        assert!(
+            is_q8_tensor_in(
+                "model.language_model.embed_tokens.weight",
+                classes.clone()
+            ),
             "embed_tokens must be Q8"
         );
-        let attn_q8 = is_q8_tensor("model.language_model.layers.0.self_attn.q_proj.weight");
-        let gate_q8 = is_q8_tensor("model.language_model.layers.0.self_attn.gate_proj.weight");
+        let attn_q8 = is_q8_tensor_in(
+            "model.language_model.layers.0.self_attn.q_proj.weight",
+            classes.clone(),
+        );
+        let gate_q8 = is_q8_tensor_in(
+            "model.language_model.layers.0.self_attn.gate_proj.weight",
+            classes,
+        );
         assert!(
             !attn_q8,
             "attention must NOT be pulled into Q8 by the glimmer default"
@@ -2628,11 +2639,6 @@ mod tests {
             !gate_q8,
             "the Glimmer attention gate is a projection and must follow --format"
         );
-
-        match prev {
-            Some(v) => unsafe { std::env::set_var("HIPFIRE_Q8_CLASSES", v) },
-            None => unsafe { std::env::remove_var("HIPFIRE_Q8_CLASSES") },
-        }
     }
 
     #[test]
