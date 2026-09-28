@@ -1492,6 +1492,23 @@ impl ServeRuntime {
             path = entry.map(|entry| self.paths.models.join(&entry.file));
         }
         let path = path.ok_or_else(|| anyhow!("model not found locally: {model}"))?;
+        // A sidecar file can still resolve here (exact on-disk spelling or a
+        // direct path). Serving it would load a draft/vision-only artifact as
+        // a trunk and fail deep in the backend with a misleading arch gate;
+        // refuse at the door with the real reason.
+        if let Some(name) = path
+            .file_name()
+            .and_then(|file| file.to_str())
+            .map(|name| name.to_ascii_lowercase())
+        {
+            if crate::is_sidecar_artifact(&name) {
+                bail!(
+                    "'{model}' resolved to sidecar artifact {name} — drafts and \
+                     vision towers are loaded by the trunk's speculation/vision \
+                     config, not served as models"
+                );
+            }
+        }
         let resolved = resolved_for_model(&self.paths, model, tag.as_deref(), entry)?;
         if let Some(minimum) = minimum_max_seq
             .filter(|minimum| self.multi_slot_enabled && *minimum > self.multi_slot_ctx)

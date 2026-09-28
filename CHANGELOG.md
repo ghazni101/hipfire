@@ -30,6 +30,15 @@
   deliberate door-policy changes (tool turns accepted since the tool-reentry
   work; `max_think_tokens` accepted since enforced thinking budgets; non-
   `json_schema` `response_format` refused since the §7.1 review pass).
+- Sidecar artifacts (`.mtp`, `-mtp.`, `-dspark.`, `-dflash`, `.vl`,
+  `-vision.hfq`, `.triattn.`) are no longer servable: `is_model_file`
+  excludes them from `/v1/models`, `hipfire list`, and name-based
+  resolution, and `ensure_model` refuses a resolved sidecar path with an
+  explicit reason instead of letting it reach the backend's arch gate
+  (previously surfaced as a misleading "multi-slot only supports arch_id
+  5|6" error when a client addressed `*-dspark.mq4`). Explicit file paths
+  to sidecars still load for `run`/`bench` dev workflows.
+
 
 
 

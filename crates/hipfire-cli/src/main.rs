@@ -6767,6 +6767,24 @@ fn find_on_path(name: &str) -> Option<PathBuf> {
 fn is_model_file(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     MODEL_SUFFIXES.iter().any(|suffix| lower.ends_with(suffix))
+        && !is_sidecar_artifact(&lower)
+}
+
+/// Sidecar files carry draft/spec/vision state, never a servable trunk, so
+/// they are not listable or requestable models even when their name ends in
+/// a model suffix (a `-dspark.hfq` sitting beside the trunk is loadable as a
+/// draft but crashes the request path when addressed as a chat model — the
+/// slot gate then reports a misleading "arch_id" refusal). The marker set
+/// mirrors the `remove` sidecar scan plus the vision-sidecar convention
+/// (`qwen3.8-27b-vision.hfq`).
+pub(crate) fn is_sidecar_artifact(lower_name: &str) -> bool {
+    lower_name.ends_with(".mtp")
+        || lower_name.ends_with(".vl")
+        || lower_name.contains(".triattn.")
+        || lower_name.contains("-mtp.")
+        || lower_name.contains("-dspark.")
+        || lower_name.contains("-dflash")
+        || lower_name.contains("-vision.hfq")
 }
 
 fn source_label(source: &ConfigSource) -> String {
@@ -6946,6 +6964,14 @@ mod tests {
         assert!(is_model_file("draft.hfq"));
         assert!(!is_model_file("model.triattn.bin"));
         assert!(!is_model_file("README.md"));
+        // Draft / vision sidecars live beside trunks with model-looking
+        // suffixes — they must NOT be servable.
+        assert!(!is_model_file("zdtaichu5-9b.mq4-dspark.hfq"));
+        assert!(!is_model_file("qwen35-9b-dflash-mq4.hfq"));
+        assert!(!is_model_file("qwen3.8-27b-vision.hfq"));
+        assert!(!is_model_file("qwen3.5-4b.mtp"));
+        assert!(!is_model_file("qwen3.5-9b.vl"));
+        assert!(!is_model_file("model.mq4-mtp.hfq"));
     }
 
     /// The Ornith artifacts shipped briefly as `ornith1.5-*` before being
