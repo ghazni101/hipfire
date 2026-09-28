@@ -2093,11 +2093,16 @@ impl PrefillBatchScratch {
             .unwrap_or(16);
         let partials_size = batch_mult * config.n_heads * max_tiles * (2 + config.head_dim);
 
+        // `positions` must hold up to `kv_max_seq` rows: the DSpark body path
+        // uploads compact KV-slot positions for the full [ctx ++ block] span
+        // (kv_max_seq = max_ctx_len + block_size), which exceeds max_batch
+        // whenever a non-trivial context window is configured.
+        let pos_cap = max_batch.max(kv_max_seq);
         Ok(Self {
             max_batch,
             x_batch: gpu.alloc_tensor(&[max_batch * dim], DType::F32)?,
             x_rot_batch: gpu.alloc_tensor(&[max_batch * dim], DType::F32)?,
-            positions: gpu.alloc_tensor(&[max_batch], DType::F32)?,
+            positions: gpu.alloc_tensor(&[pos_cap], DType::F32)?,
             tokens: gpu.alloc_tensor(&[max_batch], DType::F32)?,
             fa_q_batch: gpu.alloc_tensor(&[max_batch * q_dim], DType::F32)?,
             fa_k_batch: gpu.alloc_tensor(&[max_batch * kv_dim], DType::F32)?,

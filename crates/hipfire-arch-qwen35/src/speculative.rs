@@ -249,10 +249,14 @@ fn dflash_moe_draft_ffn_graph_eligible(
 /// `dc105ea64` newly admitted MQ2/3/4/5/6G256V2 to gfx1100 batched WMMA, and
 /// `verify_graph_ok` shares that eligibility via `prefill_batch_pbs_eligible`.
 /// Graph-off direct and forced-blob direct full-model V2 fixtures pass on
-/// gfx1100, but two graph-on V2 campaigns lost the endpoint. Default-off graph
+/// gfx1100, but two graph-on V2 campaigns lost the endpoint. gfx1101 shares
+/// the gfx1100 kernel family and confirmed-hangs at the first captured-graph
+/// replay in the DSpark verify path (zdtaichu5-9b MQ4G256V2, B=3 replay spins
+/// the GPU at 100% — `HIPFIRE_VERIFY_GRAPH=0` restores it). Default-off graph
 /// quarantines (direct batched HIP/WMMA remains on):
-/// - exact gfx1100 + MQ*V2
-/// - exact gfx1100 + legacy MQ4G256 (measured direct HIP faster)
+/// - gfx1100 / gfx1101 + MQ*V2
+/// - gfx1100 / gfx1101 + legacy MQ4G256 (measured direct HIP faster on gfx1100;
+///   gfx1101 shares the same quarantined kernel family)
 /// - exact gfx1201 + legacy MQ4G256 (measured graph replay slower than direct)
 ///
 /// `HIPFIRE_VERIFY_GRAPH=1` opts back in diagnostically; `=0` force-offs
@@ -273,10 +277,11 @@ fn dflash_verify_graph_env_eligible(
             | rdna_compute::DType::MQ3G256V2
             | rdna_compute::DType::MQ2G256V2
     );
-    if arch == "gfx1100" && is_mq_v2 {
+    let is_gfx110x = matches!(arch, "gfx1100" | "gfx1101");
+    if is_gfx110x && is_mq_v2 {
         return env_value == Some("1");
     }
-    if arch == "gfx1100" && output_dtype == rdna_compute::DType::MQ4G256 {
+    if is_gfx110x && output_dtype == rdna_compute::DType::MQ4G256 {
         // Direct batched HIP is faster for the measured Qwen MQ4 workload;
         // keep graph available as an explicit diagnostic opt-in.
         return env_value == Some("1");
@@ -3082,6 +3087,22 @@ fn verify_dflash_block_inner(
         )
         && verify_scratch.prefill_batch.is_some()
         && pbs_eligible;
+    if hipfire_config::developer_var("HIPFIRE_VERIFY_GRAPH_DEBUG").ok().as_deref() == Some("1") {
+        static WARNED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+        if !WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+            eprintln!(
+                "[verify-graph] env={:?} output_dtype={:?} env_ok={} tree_ok={} embd={:?} embd_ok={} pbs_some={} pbs_eligible={}",
+                verify_graph_env,
+                target.weights.output.gpu_dtype,
+                dflash_verify_graph_env_eligible(gpu.arch.as_str(), target.weights.output.gpu_dtype, verify_graph_env.as_deref()),
+                tree_ok_for_graph,
+                target.weights.embd_format,
+                matches!(target.weights.embd_format, hipfire_runtime::llama::EmbeddingFormat::HFQ4G256 | hipfire_runtime::llama::EmbeddingFormat::Q8_0),
+                verify_scratch.prefill_batch.is_some(),
+                pbs_eligible,
+            );
+        }
+    }
 
     // Per-cycle timing for verify-graph A/B diagnostic
     // (HIPFIRE_VERIFY_GRAPH_TIMING=1). Two device-sync points bracket the

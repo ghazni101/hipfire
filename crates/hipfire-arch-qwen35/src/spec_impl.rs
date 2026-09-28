@@ -21,7 +21,7 @@ use crate::qwen35;
 use crate::speculative::{
     apply_topp_trunc, download_hidden_block, sample_categorical,
     scatter_hidden_block_to_interleaved, verify_dflash_block, xorshift_next_unit, DeltaNetSnapshot,
-    HiddenStateRingBuffer, ModelSlot, VerifyScratch,
+    GdnTape, HiddenStateRingBuffer, ModelSlot, VerifyScratch,
 };
 use hipfire_runtime::spec::{SpecAdvance, SpecScratch, SpecTarget};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -64,6 +64,14 @@ pub struct Qwen35SpecScratch {
     verify_scratch: VerifyScratch,
     hidden_rb: HiddenStateRingBuffer,
     target_snap: DeltaNetSnapshot,
+    /// Per-LA-layer (q,k,v,α,β) innovation tape. Present only when the scratch
+    /// is DSpark-armed (extract layers non-empty): the verify populates it so
+    /// `commit_prefix` rewinds via `replay_gdn` instead of re-running the
+    /// whole target forward on partial accepts.
+    gdn_tape: Option<GdnTape>,
+    /// Set true by verify when this cycle's tape was actually populated
+    /// (verify_populates_tape holds); commit_prefix consults it.
+    tape_captured: bool,
 }
 
 impl SpecScratch for Qwen35SpecScratch {
@@ -76,6 +84,8 @@ impl SpecScratch for Qwen35SpecScratch {
             verify_scratch,
             hidden_rb,
             target_snap,
+            gdn_tape,
+            tape_captured: _,
         } = *self;
         verify_scratch.free_gpu(gpu);
         // `HiddenStateRingBuffer` has no `free_gpu`; free its buffers directly
@@ -87,6 +97,9 @@ impl SpecScratch for Qwen35SpecScratch {
             let _ = gpu.free_tensor(t);
         }
         target_snap.free_gpu(gpu);
+        if let Some(tape) = gdn_tape {
+            tape.free_gpu(gpu);
+        }
     }
 }
 
@@ -122,9 +135,13 @@ impl SpecTarget for ModelSlot {
         let dim = self.config.dim;
         let vocab = self.config.vocab_size;
         let hidden_k = dim.next_power_of_two();
-        // max_n = block_size covers the largest verify block (b <= block_size).
-        let verify_scratch = VerifyScratch::new(gpu, block_size, dim, vocab, hidden_k)
-            .map_err(|e| format!("Qwen35SpecScratch VerifyScratch: {e}"))?;
+        // `with_prefill` (persistent PrefillBatchScratch) is required for the
+        // HipGraph verify path — `verify_graph_ok` gates on
+        // `prefill_batch.is_some()`. Without it every window falls to the eager
+        // forward AND re-allocates ~25 tensors/cycle (~3-5 ms measured on 27B).
+        let verify_scratch =
+            VerifyScratch::with_prefill(gpu, block_size, dim, vocab, hidden_k, &self.config)
+                .map_err(|e| format!("Qwen35SpecScratch VerifyScratch: {e}"))?;
         // num_extract = 0 (every non-DSpark path) ⇒ no hidden buffers; the forward's
         // hidden extraction is a no-op and the ring is never read (byte-identical to
         // the pre-DSpark behaviour). num_extract > 0 (a DSpark drafter configured
@@ -164,10 +181,23 @@ impl SpecTarget for ModelSlot {
         let target_snap = DeltaNetSnapshot::new_for(gpu, &self.dn_state)
             .map_err(|e| format!("Qwen35SpecScratch DeltaNetSnapshot: {e}"))?;
         // EF residual is folded into DeltaNetSnapshot (empty when EF off).
+        // DSpark-armed scratch also carries the per-LA-layer innovation tape so
+        // partial-accept commit rewinds via GdnTape::replay_gdn (the LA
+        // recurrence only) instead of the full `forward_prefill_batch` replay.
+        let gdn_tape = if num_extract > 0 {
+            Some(
+                GdnTape::new_for_config(gpu, &self.config, block_size)
+                    .map_err(|e| format!("Qwen35SpecScratch GdnTape: {e}"))?,
+            )
+        } else {
+            None
+        };
         Ok(Box::new(Qwen35SpecScratch {
             verify_scratch,
             hidden_rb,
             target_snap,
+            gdn_tape,
+            tape_captured: false,
         }))
     }
 
@@ -178,19 +208,53 @@ impl SpecTarget for ModelSlot {
         start_pos: usize,
         reset: bool,
         abort: &dyn Fn() -> bool,
-        _hidden_out: Option<&mut Vec<f32>>,
+        mut hidden_out: Option<&mut Vec<f32>>,
     ) -> Result<SpecAdvance, String> {
         // Plain target advance, chunked at PREFILL_MAX_BATCH with abort checks
-        // between chunks. No hidden extraction — only KV + recurrent state move.
+        // between chunks.
         if reset {
             self.reset_state(gpu)
                 .map_err(|e| format!("qwen35 spec_advance reset: {e}"))?;
         }
+        // DSpark prompt-hidden capture: when a sink is provided and extract
+        // layers are armed, capture post-layer residual into a ring sized to
+        // HIPFIRE_DSPARK_CTX_LEN (draft context window) so only the most
+        // recent prompt positions survive — the draft's sliding-window layers
+        // never see more than ~2048 anyway.
+        let ctx_cap: usize = hipfire_config::developer_var("HIPFIRE_DSPARK_CTX_LEN")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(512);
+        let want_capture =
+            !self.dspark_extract_layers.is_empty() && hidden_out.is_some();
+        let mut cap_ring = if want_capture {
+            let mut r = HiddenStateRingBuffer::new(
+                gpu,
+                self.config.n_layers,
+                self.dspark_extract_layers.len(),
+                self.config.dim,
+                ctx_cap.max(1),
+                qwen35::PREFILL_MAX_BATCH,
+            )
+            .map_err(|e| format!("qwen35 spec_advance capture ring: {e:?}"))?;
+            r.extract_layers = self.dspark_extract_layers.clone();
+            Some(r)
+        } else {
+            None
+        };
         let chunk_max = qwen35::PREFILL_MAX_BATCH;
         let mut off = 0usize;
         let mut pos = start_pos;
         while off < tokens.len() {
             if abort() {
+                if let Some(rb) = cap_ring.take() {
+                    for t in rb.layer_bufs {
+                        let _ = gpu.free_tensor(t);
+                    }
+                    for t in rb.staging_bufs {
+                        let _ = gpu.free_tensor(t);
+                    }
+                }
                 let _ = self.reset_state(gpu);
                 return Ok(SpecAdvance::Aborted);
             }
@@ -204,7 +268,7 @@ impl SpecTarget for ModelSlot {
                 &mut self.kv_cache,
                 &mut self.dn_state,
                 &self.scratch,
-                None,
+                cap_ring.as_mut(),
                 None,
                 None,
                 None,
@@ -212,6 +276,32 @@ impl SpecTarget for ModelSlot {
             .map_err(|e| e.to_string())?;
             pos += end - off;
             off = end;
+        }
+        // Download the ring tail (last min(written, cap) positions), transpose
+        // layer-major [ext × b × dim] → position-major [b × ext*dim], append.
+        if let (Some(rb), Some(out)) = (cap_ring.as_ref(), hidden_out.as_deref_mut()) {
+            let b = rb.written.min(rb.max_positions);
+            if b > 0 {
+                let num_extract = rb.extract_layers.len();
+                let dim = rb.hidden_dim;
+                let flat = download_hidden_block(gpu, rb, b)
+                    .map_err(|e| format!("qwen35 spec_advance hidden download: {e:?}"))?;
+                out.reserve(b * num_extract * dim);
+                for p in 0..b {
+                    for e in 0..num_extract {
+                        let src = (e * b + p) * dim;
+                        out.extend_from_slice(&flat[src..src + dim]);
+                    }
+                }
+            }
+        }
+        if let Some(rb) = cap_ring {
+            for t in rb.layer_bufs {
+                let _ = gpu.free_tensor(t);
+            }
+            for t in rb.staging_bufs {
+                let _ = gpu.free_tensor(t);
+            }
         }
         // Last-position logits (the per-token forward left last-token logits in
         // scratch.logits). Hand the host row through for temp>0 first-token draws.
@@ -358,11 +448,15 @@ impl SpecTarget for ModelSlot {
         if accept_len >= draft_len {
             return Ok(());
         }
-        // Partial: rewind recurrent + s_ef to pre-verify, then replay the
-        // committed prefix with the SAME batched forward the verify used (GDN
-        // numerics must match the accepted argmax). The stale FullAttention KV at
-        // [position+accept+1 .. position+block.len()) is overwritten by the next
-        // verify before it can be read as context.
+        // Partial: rewind recurrent + s_ef to pre-verify. When the verify
+        // populated the innovation tape (tape_captured), replay just the LA
+        // sub-pipeline for the committed prefix — conv1d + qk-norm + GDN
+        // recurrence, no attention/FFN/lm_head — instead of re-running the
+        // whole target forward. DFlash uses this as its shipping commit
+        // path: numerics match the accepted argmax because replay consumes
+        // the exact taped inputs the verify produced. The stale
+        // FullAttention KV at [position+accept+1 .. position+block.len()) is
+        // overwritten by the next verify before it can be read as context.
         let s = scratch
             .as_any_mut()
             .downcast_mut::<Qwen35SpecScratch>()
@@ -370,6 +464,25 @@ impl SpecTarget for ModelSlot {
         s.target_snap
             .restore_to(&mut self.dn_state, gpu)
             .map_err(|e| e.to_string())?;
+        let tape_ok = s.tape_captured && s.gdn_tape.is_some()
+            && hipfire_config::developer_var("HIPFIRE_DSPARK_TAPE_COMMIT").ok().as_deref() != Some("0");
+        s.tape_captured = false; // consumed exactly once per window
+        if tape_ok {
+            s.gdn_tape
+                .as_ref()
+                .unwrap()
+                .replay_gdn(
+                    gpu,
+                    &self.weights,
+                    &self.config,
+                    &mut self.dn_state,
+                    accept_len + 1,
+                )
+                .map_err(|e| e.to_string())?;
+            return Ok(());
+        }
+        // Fallback (no tape, or tape not populated this window): replay the
+        // committed prefix with the SAME batched forward the verify used.
         qwen35::forward_prefill_batch(
             gpu,
             &self.weights,
@@ -442,13 +555,33 @@ impl SpecTarget for ModelSlot {
         s.target_snap
             .save_from(&self.dn_state, gpu)
             .map_err(|e| e.to_string())?;
+        // Hand verify the innovation tape only when it will actually be
+        // populated (same predicate the forward uses to pick the batched
+        // path); commit_prefix consults tape_captured to pick rewind strategy.
+        s.tape_captured = hipfire_config::developer_var("HIPFIRE_DSPARK_TAPE")
+            .ok()
+            .as_deref()
+            != Some("0")
+            && s.gdn_tape.is_some()
+            && qwen35::prefill_batch_pbs_eligible(
+                &self.weights,
+                &self.config,
+                &self.dn_state,
+                block.len(),
+                gpu.arch.as_str(),
+                true, // dense model: no MoE router logits to gate on
+            );
         let out = verify_dflash_block(
             gpu,
             self,
             block,
             position,
             &mut s.hidden_rb,
-            None,  // gdn_tape: rewind by replay in commit_prefix, no tape
+            if s.tape_captured {
+                s.gdn_tape.as_mut()
+            } else {
+                None
+            },
             false, // greedy: GPU argmax, no full-logit D2H
             &s.verify_scratch,
         )
@@ -501,6 +634,20 @@ impl SpecTarget for ModelSlot {
         s.target_snap
             .save_from(&self.dn_state, gpu)
             .map_err(|e| e.to_string())?;
+        // Same tape gate as the greedy capture verify above.
+        s.tape_captured = hipfire_config::developer_var("HIPFIRE_DSPARK_TAPE")
+            .ok()
+            .as_deref()
+            != Some("0")
+            && s.gdn_tape.is_some()
+            && qwen35::prefill_batch_pbs_eligible(
+                &self.weights,
+                &self.config,
+                &self.dn_state,
+                block.len(),
+                gpu.arch.as_str(),
+                true,
+            );
         // Sampled verify: leave the per-position logits on-GPU in
         // verify_scratch.logits (want_full_logits=false), softmax+nucleus on-device,
         // then draw categorically on the host — mirroring verify_block_sampled.
@@ -510,7 +657,11 @@ impl SpecTarget for ModelSlot {
             block,
             position,
             &mut s.hidden_rb,
-            None,
+            if s.tape_captured {
+                s.gdn_tape.as_mut()
+            } else {
+                None
+            },
             false,
             &s.verify_scratch,
         )
@@ -585,6 +736,24 @@ impl SpecTarget for ModelSlot {
         position: usize,
         layers: &[usize],
     ) -> Result<Vec<f32>, String> {
+        // HF/vLLM `aux_hidden_state_layer_ids` are hidden-states TUPLE indices:
+        // index i = the stream ENTERING layer i = post-layer output of i-1.
+        // This engine captures post-layer-i residual, so tuple ids must shift
+        // -1. `HIPFIRE_DSPARK_LAYER_SHIFT=-1` tests that convention against a
+        // live sidecar without a requantization.
+        let shift: i64 = hipfire_config::developer_var("HIPFIRE_DSPARK_LAYER_SHIFT")
+            .ok()
+            .and_then(|s| s.parse().ok())
+            .unwrap_or(0);
+        let layers: Vec<usize> = if shift != 0 {
+            layers
+                .iter()
+                .map(|&l| (l as i64 + shift).max(0) as usize)
+                .collect()
+        } else {
+            layers.to_vec()
+        };
+        let layers = &layers[..];
         // Remember the extract layers so the per-window `new_spec_scratch` (called
         // AFTER this bootstrap in the initial window, and every steady-state window)
         // builds a ring that captures at exactly these ids.

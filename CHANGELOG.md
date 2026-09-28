@@ -2,6 +2,24 @@
 
 ## Unreleased
 - ZDTaichu-5.0 vision-language support (arch 5, rides the Qwen3.5 text loader): new `hipfire-arch-taichu-vl` crate implements the C-RADIOv4-H tower (ViT-H/16, 32 blocks, 1280-d) + `mlp1` projector (RMSNorm → Linear → SquaredReLU → Linear) with InternVL-style dynamic tiling, pixel_shuffle v2 (0.5), and tile-grid M-RoPE. Detected per-artifact via `vision_model.radio_model.*` tensors (`model_type zdtaichu`/`zdtaichu5_0` → arch 5 in `MODEL_TYPE_TO_ARCH_ID`); quantize picks the tower up under `--include-vision` via new `vision_model.` / `mlp1.` sidecar prefixes. `hipfire run --image` and the serve VL path accept ZDTaichu packs. Verified on gfx1101: text-only generation coherent, single-tile and 3-tile (grid+thumbnail) image descriptions accurate. Also fixes a quantizer accounting bug: a non-`tid2eid` I64 tensor (e.g. `summary_idxs`) was skipped after `total_params` was already incremented, so any model carrying one failed the closing check. DSpark sidecar support for the 248k-vocab Taichu draft: `hipfire-quantize --format qwen35-dspark-q8` now emits `enable_confidence`/`draft_vocab_size` gated on actual tensor presence (full-vocab checkpoints ship neither `confidence_head.proj.*` nor `d2t`), routes `embed_tokens` to HFQ4G256 and `lm_head` to Q8F16 instead of F32/F16 (7.5 GB → 3.1 GB sidecar), and the loader honours `gpu_dtype` for the draft lm_head + dispatches draft embeddings by `embd_format` instead of stamping F16 over quantized bytes (previously a guaranteed GPU fault past the buffer). The Qwen3.5 DSpark hidden ring now honours `HIPFIRE_DFLASH_CTX_CAP`. Measured on gfx1101 the Taichu draft is slower than AR (~34 vs 62.5 tok/s, τ≈0.8) — functional but not a win on this pairing.
+- DSpark on gfx1101 + prompt-time aux context. Three fixes landed together with
+  the ZDTaichu-5.0-9B DSpark sidecar work: (a) `dflash_verify_graph_env_eligible`
+  quarantine extended from `gfx1100` to `gfx110x` (gfx1100|gfx1101) for MQ*V2 and
+  legacy MQ4G256 — the first captured-verify-graph replay on gfx1101 spun the GPU
+  at 100% forever (zdtaichu5-9b MQ4G256V2, B=3), `HIPFIRE_VERIFY_GRAPH=0` restored
+  it and the gate now defaults the graph OFF there. (b) `DsparkDrafter` now keeps
+  a host-side aux-hidden history seeded from the prompt: `spec_advance` arms the
+  extract-layer ring during prefill and returns the last `HIPFIRE_DSPARK_CTX_LEN`
+  (default 512) position-major hidden rows, `mtp_step` rebuilds the draft context
+  window from that history every cycle instead of re-running
+  `capture_seed_main_hidden` per window, and committed-prefix hidden rows append
+  post-verify. (c) `PrefillBatchScratch.positions` (hipfire-runtime llama path)
+  is sized `max_batch.max(kv_max_seq)` — the DSpark draft body uploads
+  `ctx_len`-wide compact KV positions into it and panicked at ctx_len > block_size
+  (offset 0 + source 260 > device buffer 256). Verified on gfx1101 /
+  zdtaichu5-9b.mq4.hfq: `--spec dspark` produces coherent output end-to-end
+  (τ≈1.5 on prose, decode ~29 tok/s; draft-side precision only — greedy verify
+  output unchanged by construction).
 - gfx11 W4A4 iu4-direct MMQ prefill (opt-in `HIPFIRE_GFX11_MQ4V2_IU4=1`, exact gfx1100/gfx1151, `kernel.gfx11_mq4v2_iu4`; `=0`/unset keeps the X128 path byte-for-byte). Weight nibbles feed `wmma_i32_16x16x16_iu4` directly (halved A-side LDS, 31744 B) with int4 activations from the `quantize_int4_mmq_ds128` prelude (per-128 MSE-clip grid, f32 single-rounding FMA). Measured on Qwen3.8-27B XT (`qwen3.8-27b.mq4-xt`): XTX pp512 1203.6->1588.8 tok/s (+32%), pp2048 1185.4->1557.0 (+31%), pp8192 1093.9->1405.1 (+28%); Halo pp512 449.9->581.3 (+29%), pp2048 442.0->568.8 (+29%), pp8192 412.5->519.2 (+26%); decode tok/s unchanged (XTX 48.82->48.92, Halo 14.22->14.18). In-model pp512 profile: `full_set_occ3` 272x 581 us/call, `full_add_occ3` 128x 650 us/call (XTX; Halo 1721/1683 us), prelude `quantize_int4_mmq_ds128` 256x 75 us/call (was 370 us f64; Halo 153 us). Gates: int4 pre-pass bit-oracle 4/4 arms on both GPUs, GEMM parity relL2~5e-8, 0 spills on both archs, greedy HumanEval `below_zero` byte-identical off/on (md5 b84c1c19), WT2 KLD 0.057307->0.076078 (+0.0188, ship rule on<=off+0.02), serve battery 5/5 turns finish=stop with 0 runaway/empty/attractor.
 - GQA-fused FA2 prefill attention is now the default (opt-out): `HIPFIRE_GFX12_FA2_PREFILL` default ON on exact gfx1201 (`kernel.gfx12_fa2_prefill`; `=0` restores the incumbent) and `HIPFIRE_GFX11_FA2_PREFILL` default ON on gfx1100/gfx1151 (`kernel.gfx11_fa2_prefill`; `=0` restores the incumbent). Both cover the Qwen NH24/NKV4/HD256 prefill envelope (Q8-K and fwht3-K arms, batch 64..512 step 16, ctx 64..32768, eager only); launchers keep their exact arch/shape/eager predicates.
 

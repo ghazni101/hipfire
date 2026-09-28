@@ -1288,7 +1288,16 @@ pub fn build_qwen3_dspark_body(
     cfg: &DsparkConfig,
     gpu: &mut Gpu,
 ) -> Result<Box<dyn DsparkBody>, String> {
-    let max_ctx_len = cfg.block_size + 1;
+    // DSpark reference attends the FULL preceding aux-hidden history (sliding
+    // layers windowed at 2048, the final full-attention layer unbounded).
+    // block_size+1 is only the per-window verify width — use a real ctx cap so
+    // the draft keeps the prompt + older decode in view. W ≤ sliding_window
+    // keeps every layer's mask identical (all ctx visible).
+    let max_ctx_len = std::env::var("HIPFIRE_DSPARK_CTX_LEN")
+        .ok()
+        .and_then(|s| s.parse::<usize>().ok())
+        .unwrap_or(512)
+        .max(cfg.block_size + 1);
     let scratch = Qwen3DsparkScratch::new(gpu, &assets.config, cfg.block_size, max_ctx_len)
         .map_err(|e| format!("build_qwen3_dspark_body: scratch: {e}"))?;
     Ok(Box::new(Qwen3DsparkBody { assets, scratch }))

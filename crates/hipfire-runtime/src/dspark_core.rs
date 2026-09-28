@@ -1127,6 +1127,17 @@ pub struct DsparkDrafter {
     /// Absolute positions whose main_hidden is cached in `main_hidden_dev`.
     /// Empty ⇒ cache invalid (same condition as `main_hidden_dev.is_none()`).
     ctx_positions: Vec<usize>,
+    /// Committed-position aux-hidden history (host), newest last. Each row is
+    /// `n_targets * hidden` f32 — the same layout `draft_block` consumes.
+    /// The DSpark reference lets draft queries attend ALL positions before the
+    /// anchor (sliding layers windowed at 2048, final full-attn layer
+    /// unbounded); this ring bounds that history to `ctx_window` rows.
+    hidden_history: std::collections::VecDeque<Vec<f32>>,
+    /// Positions parallel to `hidden_history`.
+    hist_positions: std::collections::VecDeque<usize>,
+    /// History cap in rows (HIPFIRE_DSPARK_CTX_LEN, default 512 ≤ the draft's
+    /// 2048 sliding window so no sliding mask is needed).
+    ctx_window: usize,
     /// Per-window phase profiler; active only when `HIPFIRE_DSPARK_PROFILE=1`.
     profiler: DsparkProfiler,
     /// Adaptive block-size controller. `None` when `HIPFIRE_DSPARK_ADAPTIVE_BLOCK=0`
@@ -1167,6 +1178,8 @@ impl MtpDrafter for DsparkDrafter {
             }
         }
         self.ctx_positions.clear();
+        self.hidden_history.clear();
+        self.hist_positions.clear();
         if let Some(c) = self.block_controller.as_mut() {
             c.reset();
         }
@@ -1175,10 +1188,49 @@ impl MtpDrafter for DsparkDrafter {
             return Err("DsparkDrafter::mtp_prefill: fill_tokens is empty".into());
         }
 
+        // DSpark prompt context: the reference draft attends aux-hidden of ALL
+        // positions before the anchor — including the prompt. Arm extract
+        // layers and pass a capture sink through spec_advance; the target
+        // returns the tail of the prompt's per-position hidden rows
+        // (position-major [pos × n_targets × dim]), which seeds the history.
+        target.set_dflash_extract_layers(self.weights.cfg.target_layer_ids.clone());
+        let mut prompt_hidden: Vec<f32> = Vec::new();
+        let epp = self.weights.cfg.target_layer_ids.len()
+            * (self.stage_norm.shape[0] as usize);
+        let adv = target.spec_advance(
+            gpu,
+            fill_tokens,
+            start_pos,
+            false,
+            abort,
+            Some(&mut prompt_hidden),
+        )?;
+        if prompt_hidden.len() % epp.max(1) == 0 && epp > 0 {
+            let n_rows = prompt_hidden.len() / epp;
+            // spec_advance returns only the LAST n_rows positions of the
+            // consumed range (ring-capped at ctx_window), so position row i is
+            // start_pos + fill_tokens.len() - n_rows + i.
+            let base = start_pos + fill_tokens.len() - n_rows;
+            for (i, row) in prompt_hidden.chunks(epp).enumerate() {
+                self.hidden_history.push_back(row.to_vec());
+                self.hist_positions.push_back(base + i);
+            }
+            if hipfire_config::developer_var("HIPFIRE_DSPARK_DEBUG").as_deref()
+                == Ok("1")
+            {
+                eprintln!(
+                    "[dspark] prompt hidden captured: {} rows (pos {}..{})",
+                    n_rows,
+                    base,
+                    base + n_rows - 1
+                );
+            }
+        }
+
         // Run the full prefill through spec_advance (reset=false; recurrent was
         // already reset above on cache_miss). Returns argmax at the last position,
         // which is the seed for the first decode window.
-        match target.spec_advance(gpu, fill_tokens, start_pos, false, abort, None)? {
+        match adv {
             crate::spec::SpecAdvance::Ready { last_argmax, .. } => Ok(last_argmax),
             crate::spec::SpecAdvance::Aborted => {
                 Err("DsparkDrafter::mtp_prefill: spec_advance aborted".into())
@@ -1229,7 +1281,7 @@ impl MtpDrafter for DsparkDrafter {
         // STEADY-STATE: ctx_hidden_dev/ctx_positions were populated by the
         // previous window's verify; skip `capture_seed_main_hidden` entirely.
         let t_bootstrap = self.profiler.sync_start(gpu);
-        if self.ctx_positions.is_empty() {
+        if self.hidden_history.is_empty() {
             // Initial window: bootstrap with a 1-token capture-armed forward.
             let hidden_host = target.capture_seed_main_hidden(gpu, seed, position, &layers)?;
             if hipfire_config::developer_var("HIPFIRE_DSPARK_DEBUG").as_deref() == Ok("1") {
@@ -1242,42 +1294,42 @@ impl MtpDrafter for DsparkDrafter {
                     &hidden_host[..n.min(4)]
                 );
             }
-            if self.persistent_verify_context_scratch {
-                let max_context_floats = (self.block + 1) * layers.len() * hidden;
-                let needs_alloc = self
-                    .main_hidden_dev
-                    .as_ref()
-                    .is_none_or(|dev| dev.numel() < max_context_floats);
-                if needs_alloc {
-                    if let Some(old) = self.main_hidden_dev.take() {
-                        let _ = gpu.free_tensor(old);
-                    }
-                    self.main_hidden_dev = Some(
-                        gpu.alloc_tensor(&[max_context_floats], DType::F32)
-                            .map_err(|e| {
-                                format!("DsparkDrafter: alloc persistent main_hidden: {e:?}")
-                            })?,
-                    );
-                }
-                let bytes = unsafe {
-                    std::slice::from_raw_parts(
-                        hidden_host.as_ptr() as *const u8,
-                        hidden_host.len() * std::mem::size_of::<f32>(),
-                    )
-                };
-                gpu.memcpy_htod_auto(&self.main_hidden_dev.as_ref().unwrap().buf, bytes)
-                    .map_err(|e| format!("DsparkDrafter: upload persistent main_hidden: {e:?}"))?;
-            } else {
-                let dev = upload_f32(gpu, &hidden_host)?;
-                if let Some(old) = self.main_hidden_dev.take() {
-                    let _ = gpu.free_tensor(old);
-                }
-                self.main_hidden_dev = Some(dev);
+            if let Ok(path) =
+                hipfire_config::developer_var("HIPFIRE_DSPARK_DUMP_HIDDEN")
+            {
+                let bytes: Vec<u8> = hidden_host
+                    .iter()
+                    .flat_map(|v| v.to_le_bytes())
+                    .collect();
+                let _ = std::fs::write(&path, bytes);
+                eprintln!("[dspark] dumped {} f32 capture_seed hidden -> {path} (pos={position})",
+                    hidden_host.len());
             }
-            self.ctx_positions = vec![position];
+            // The seed row is the newest committed context row.
+            self.hidden_history.push_back(hidden_host);
+            self.hist_positions.push_back(position);
         }
-        // Steady-state: main_hidden_dev and ctx_positions are already set from
-        // the previous window's accepted-prefix capture.
+        // ── Rebuild ctx from the hidden-history tail (last ctx_window rows) ──
+        // The DSpark reference lets every draft query attend ALL positions
+        // before the anchor (2048-windowed on sliding layers, unbounded on the
+        // final full-attention layer). We cap at ctx_window ≤ 2048 rows so all
+        // draft layers see the full supplied context — no sliding mask needed.
+        while self.hidden_history.len() > self.ctx_window {
+            self.hidden_history.pop_front();
+            self.hist_positions.pop_front();
+        }
+        let ctx_len = self.hidden_history.len();
+        let epp = n_targets * hidden;
+        let mut flat: Vec<f32> = Vec::with_capacity(ctx_len * epp);
+        for row in self.hidden_history.iter() {
+            flat.extend_from_slice(row);
+        }
+        let dev = upload_f32(gpu, &flat)?;
+        if let Some(old) = self.main_hidden_dev.take() {
+            let _ = gpu.free_tensor(old);
+        }
+        self.main_hidden_dev = Some(dev);
+        self.ctx_positions = self.hist_positions.iter().copied().collect();
         self.profiler.sync_end(gpu, t_bootstrap, 0);
 
         // Start the FULL-window cost timer (adaptive path only). It spans draft +
@@ -1311,12 +1363,15 @@ impl MtpDrafter for DsparkDrafter {
         // ── 2–3. Draft the block (skipped on k==0 one-token path) ──────────
         // k==0: verify [seed] only and emit the single bonus — no draft_block /
         // run_heads, and no conf-threshold that would force keep≥1.
+        let dbg = hipfire_config::developer_var("HIPFIRE_DSPARK_DEBUG")
+            .as_deref() == Ok("1");
         let (mut drafts, draft_confidence): (Vec<u32>, Vec<f32>) = if block == 0 {
             (Vec::new(), Vec::new())
         } else {
             let x_head_out = gpu
                 .alloc_tensor(&[block, hidden], DType::F32)
                 .map_err(|e| format!("DsparkDrafter: alloc x_head: {e:?}"))?;
+            if dbg { eprintln!("[dspark] >> draft_block pos={position} ctx={}", ctx_positions.len()); }
             let t_draft = self.profiler.sync_start(gpu);
             self.body.draft_block(
                 gpu,
@@ -1329,7 +1384,7 @@ impl MtpDrafter for DsparkDrafter {
                 &x_head_out,
             )?;
             self.profiler.sync_end(gpu, t_draft, 1);
-
+            if dbg { eprintln!("[dspark] >> run_heads pos={position}"); }
             let t_heads = self.profiler.sync_start(gpu);
             let draft = run_heads(
                 gpu,
@@ -1426,6 +1481,7 @@ impl MtpDrafter for DsparkDrafter {
             rdna_compute::profile::start();
         }
         let t_verify = self.profiler.sync_start(gpu);
+        if dbg { eprintln!("[dspark] >> verify pos={position} n={n_verify}"); }
         // temp<=eps → greedy argmax verify (byte-identical to the pre-temp path);
         // temp>0 → distribution-preserving sampled verify (target samples the
         // token, drafts accepted iff they match). Both capture hidden GPU-resident.
@@ -1532,82 +1588,28 @@ impl MtpDrafter for DsparkDrafter {
         // (positions 0..=accepted, i.e. accepted+1 slots).
         // Each slot contributes n_targets * hidden floats (row = concat of
         // extract-layer hiddens at that position).
-        // Cap ctx_len to block+1 (the scratch `max_ctx_len` in the qwen3 body).
-        // block==0 (k==0 one-token path) still needs at least one ctx slot.
-        let new_ctx_len_raw = accept_len + 1; // seed + accepted drafts
-        let new_ctx_len = new_ctx_len_raw.min(block.max(1) + 1);
-        if captured {
-            // Slice the accepted prefix (new_ctx_len slots) out of the GPU capture
-            // buffer into the drafter-owned context buffer — all on-device, no
-            // D2H+H2D. Opted-in bodies retain that destination across windows.
-            // We take the LAST new_ctx_len slots of the accepted prefix when the
-            // full ctx_len_raw > block+1 (cap); in practice block+1 is usually
-            // ≥ accepted+1, so start_slot is 0.
-            let start_slot = new_ctx_len_raw - new_ctx_len; // 0 in normal case
-            let n_floats = new_ctx_len * expected_hidden_per_pos;
-            let src_offset = start_slot * expected_hidden_per_pos;
-            if self.persistent_verify_context_scratch {
-                let max_context_floats = (self.block + 1) * expected_hidden_per_pos;
-                let needs_alloc = self
-                    .main_hidden_dev
-                    .as_ref()
-                    .is_none_or(|dev| dev.numel() < max_context_floats);
-                if needs_alloc {
-                    if let Some(old) = self.main_hidden_dev.take() {
-                        let _ = gpu.free_tensor(old);
-                    }
-                    self.main_hidden_dev = Some(
-                        gpu.alloc_tensor(&[max_context_floats], DType::F32)
-                            .map_err(|e| {
-                                format!("DsparkDrafter: alloc persistent ctx hidden: {e:?}")
-                            })?,
-                    );
-                }
-                gpu.memcpy_dtod_at_auto(
-                    &self.main_hidden_dev.as_ref().unwrap().buf,
-                    0,
-                    &capture_buf.buf,
-                    src_offset * 4,
-                    n_floats * 4,
-                )
-                .map_err(|e| format!("DsparkDrafter: d2d persistent ctx hidden: {e:?}"))?;
-            } else {
-                let dev = gpu
-                    .alloc_tensor(&[n_floats], DType::F32)
-                    .map_err(|e| format!("DsparkDrafter: alloc ctx hidden: {e:?}"))?;
-                gpu.memcpy_dtod_at_auto(
-                    &dev.buf,
-                    0,
-                    &capture_buf.buf,
-                    src_offset * 4,
-                    n_floats * 4,
-                )
-                .map_err(|e| format!("DsparkDrafter: d2d ctx hidden: {e:?}"))?;
-                if let Some(old) = self.main_hidden_dev.take() {
-                    let _ = gpu.free_tensor(old);
-                }
-                self.main_hidden_dev = Some(dev);
+        // Append the committed-prefix rows (seed + accepted drafts →
+        // positions position..=position+accept_len) to the host-side hidden
+        // history; the NEXT window uploads the last ctx_window rows as ctx.
+        // Rows beyond accept_len describe rejected draft positions whose
+        // positions are reused — they must NOT enter the history.
+        let committed_rows = (accept_len + 1).min(n_verify);
+        if captured && committed_rows > 0 {
+            let view =
+                capture_buf.sub_offset(0, committed_rows * expected_hidden_per_pos);
+            let rows = gpu
+                .download_f32(&view)
+                .map_err(|e| format!("DsparkDrafter: ctx hidden D2H: {e:?}"))?;
+            for i in 0..committed_rows {
+                self.hidden_history.push_back(
+                    rows[i * expected_hidden_per_pos..(i + 1) * expected_hidden_per_pos]
+                        .to_vec(),
+                );
+                self.hist_positions.push_back(position + i);
             }
-            // ctx positions: position + start_slot .. position + start_slot + new_ctx_len
-            self.ctx_positions = (start_slot..start_slot + new_ctx_len)
-                .map(|s| position + s)
-                .collect();
-        } else {
-            // Hidden capture not available (n_verify < 4 on llama): clear the
-            // context so the NEXT window bootstraps via `capture_seed_main_hidden`
-            // with the bonus token as seed.  That bootstrap is KV-correct (the
-            // commit_prefix leaves KV at the committed prefix; the next
-            // `mtp_step` call receives seed=bonus, position=committed_end, so
-            // `capture_seed_main_hidden` advances the KV by exactly 1 for the
-            // bonus, which is the right thing).  This is the Stage 1 behaviour
-            // and is correct — just forfeits the multi-slot ctx for one window.
-            if !self.persistent_verify_context_scratch {
-                if let Some(old) = self.main_hidden_dev.take() {
-                    let _ = gpu.free_tensor(old);
-                }
-            }
-            self.ctx_positions.clear();
         }
+        // Invalidate the on-device ctx — rebuilt from history next window.
+        self.ctx_positions.clear();
         if let Some(capture_buf) = transient_capture {
             let _ = gpu.free_tensor(capture_buf);
         }
@@ -1647,6 +1649,8 @@ impl MtpDrafter for DsparkDrafter {
             }
         }
         self.ctx_positions.clear();
+        self.hidden_history.clear();
+        self.hist_positions.clear();
         match target.spec_advance(gpu, tokens, start_pos, false, abort, None)? {
             crate::spec::SpecAdvance::Ready { .. } => Ok(true),
             crate::spec::SpecAdvance::Aborted => Ok(true),
@@ -1661,6 +1665,8 @@ impl MtpDrafter for DsparkDrafter {
             }
         }
         self.ctx_positions.clear();
+        self.hidden_history.clear();
+        self.hist_positions.clear();
         // Body-owned draft rings / scratch (e.g. DeepSeek dspark_swa_k) must
         // not survive cold reset — otherwise retry sees prior-window KV.
         self.body.reset_for_retry(gpu);
@@ -1767,6 +1773,13 @@ pub fn build_dspark_speculator(
         verify_scratch: None,
         persistent_verify_context_scratch,
         ctx_positions: Vec::new(),
+        hidden_history: std::collections::VecDeque::new(),
+        hist_positions: std::collections::VecDeque::new(),
+        ctx_window: hipfire_config::developer_var("HIPFIRE_DSPARK_CTX_LEN")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+            .unwrap_or(512)
+            .max(block + 1),
         profiler: DsparkProfiler::new(),
         block_controller,
     }))
