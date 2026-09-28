@@ -91,6 +91,15 @@ pub struct EngineConfig {
     /// HFQ or in a separate `.vl` sidecar). Rig::build loads VisionWeights
     /// and VisionConfig when set.
     pub is_vl: bool,
+    /// True when `is_vl` refers to the ZDTaichu C-RADIO tower
+    /// (`hipfire-arch-taichu-vl`) instead of the Qwen3.5-VL SigLIP-2 tower.
+    /// Taichu weights are always inline in the trunk HFQ; `vl_path` is
+    /// ignored for taichu packs.
+    pub taichu_vision: bool,
+    /// `kv_backend=vmm` on the load request: force the paged SlotPool — the
+    /// VMM/paged allocation strategy is what the daemon-side backend knob
+    /// selects (contiguous stays the default when unset).
+    pub kv_backend_vmm: bool,
     /// Path to a standalone `.vl` file containing only vision tower tensors.
     /// When set, vision weights are loaded from this file instead of the
     /// trunk HFQ. When `None`, falls back to inline vision tensors in the
@@ -345,6 +354,11 @@ struct Rig {
     /// prefill chunk under `spec == Dflash`; reset per request.
     dflash_states: Vec<Option<crate::dflash_slot::DflashSlotState>>,
     vision_config: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionConfig>,
+    /// ZDTaichu C-RADIO tower (zdtaichu5_0 packs carry vision_model.* + mlp1.*
+    /// inline). Disjoint with `vision_weights`/`vision_config` — exactly one
+    /// tower is ever loaded.
+    taichu_vision_weights: Option<hipfire_arch_taichu_vl::vision::TaichuVisionWeights>,
+    taichu_vision_config: Option<hipfire_arch_taichu_vl::vision::TaichuVisionConfig>,
     logits_out: GpuTensor,
     out_tokens: GpuTensor,
     sample_params: Vec<SlotSampleParams>,
@@ -362,8 +376,10 @@ struct Rig {
     /// interleaves with the other slots' decode steps instead of stalling
     /// them for the whole encode. None when no encode is in flight for the
     /// slot; cleared wherever `vl_ext_devs` is.
-    vl_tower_jobs:
-        Vec<Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionTowerJob>>,
+    /// Tower-agnostic in-flight encode — both towers expose the same
+    /// new/step_layer/finish/free shape (see `VisionEncodeJob`), so the
+    /// per-slot stepper differs only in which variant it constructs.
+    vl_tower_jobs: Vec<Option<VisionEncodeJob>>,
     /// Serve VL requests on the legacy sequential per-token path instead of
     /// the batched one (HIPFIRE_VL_SEQUENTIAL=1; batched is the default and
     /// the only paged-compatible mode).
@@ -604,8 +620,11 @@ impl Rig {
         // Prefix cache requires paged KV: the radix index shares physical
         // pages across sessions via PagePool refcounting, which is only
         // available in paged mode. Force it on when prefix_cache is enabled.
+        // `kv_backend=vmm` asks for the same paged pool — the backend knob's
+        // meaning under slots is the page-table allocator.
         let prefix_cache = cfg.prefix_cache;
-        let paged_pages = if prefix_cache {
+        let force_paged = cfg.prefix_cache || cfg.kv_backend_vmm;
+        let paged_pages = if force_paged {
             let legacy_equivalent = cfg.n_slots * cfg.cap_tokens.div_ceil(PAGE_TOKENS);
             Some(
                 hipfire_config::developer_var("HIPFIRE_SLOTS_PAGED_PAGES")
@@ -647,6 +666,19 @@ impl Rig {
                 _ => None,
             }
         };
+        if cfg.kv_backend_vmm
+            && cfg.is_vl
+            && hipfire_config::developer_var("HIPFIRE_VL_SEQUENTIAL")
+                .ok()
+                .is_some_and(|v| v == "1" || v == "on" || v == "true")
+        {
+            return Err(
+                "kv_backend=vmm (paged arenas) is incompatible with \
+                 HIPFIRE_VL_SEQUENTIAL=1 — that path writes through a flat \
+                 slab view. Drop the env var or use kv_backend=contiguous."
+                    .to_string(),
+            );
+        }
 
         let weight_bytes = std::fs::metadata(&cfg.model_path)
             .map_err(|e| format!("stat model: {e}"))?
@@ -688,32 +720,44 @@ impl Rig {
         .map_err(|e| format!("load weights: {e}"))?;
 
         // ── Vision tower loading ──────────────────────────────────────────
-        // When `vl_path` is set, vision weights load from the standalone .vl
-        // sidecar (a standard HFQM container with only model.visual.* tensors
-        // and config.vision_config in its metadata). Otherwise, fall back to
-        // inline vision tensors in the trunk HFQ (backward compat).
-        let (vision_config, vision_weights) = if cfg.is_vl {
-            if let Some(vl) = &cfg.vl_path {
-                eprintln!("  loading vision weights from .vl sidecar: {}", vl.display());
-                let mut vl_hfq = HfqFile::open(vl)
-                    .map_err(|e| format!("open .vl file {}: {e}", vl.display()))?;
-                let vc = hipfire_arch_qwen35_vl::qwen35_vl::vision_config_from_hfq(&vl_hfq)
-                    .ok_or_else(|| ".vl file missing vision_config in metadata".to_string())?;
-                let vw = hipfire_arch_qwen35_vl::qwen35_vl::load_vision_weights(
-                    &mut vl_hfq, &vc, &mut gpu,
-                )
-                .map_err(|e| format!("load vision weights from .vl: {e}"))?;
-                (Some(vc), Some(vw))
+        // Taichu packs always carry the C-RADIO tower + mlp1 projector inline
+        // (no .vl sidecar flavor exists for the family). Qwen packs load from
+        // the .vl sidecar when present, else inline model.visual.* (backward
+        // compat).
+        let (vision_config, vision_weights, taichu_vision_config, taichu_vision_weights) =
+            if cfg.is_vl {
+                if cfg.taichu_vision {
+                    let tc = hipfire_arch_taichu_vl::vision::taichu_vision_config_from_hfq(&hfq)
+                        .ok_or_else(|| {
+                            "taichu model missing vision config in metadata".to_string()
+                        })?;
+                    let tw = hipfire_arch_taichu_vl::vision::load_taichu_vision_weights(
+                        &hfq, &tc, &mut gpu,
+                    )
+                    .map_err(|e| format!("load taichu vision weights: {e}"))?;
+                    (None, None, Some(tc), Some(tw))
+                } else if let Some(vl) = &cfg.vl_path {
+                    eprintln!("  loading vision weights from .vl sidecar: {}", vl.display());
+                    let mut vl_hfq = HfqFile::open(vl)
+                        .map_err(|e| format!("open .vl file {}: {e}", vl.display()))?;
+                    let vc = hipfire_arch_qwen35_vl::qwen35_vl::vision_config_from_hfq(&vl_hfq)
+                        .ok_or_else(|| ".vl file missing vision_config in metadata".to_string())?;
+                    let vw = hipfire_arch_qwen35_vl::qwen35_vl::load_vision_weights(
+                        &mut vl_hfq, &vc, &mut gpu,
+                    )
+                    .map_err(|e| format!("load vision weights from .vl: {e}"))?;
+                    (Some(vc), Some(vw), None, None)
+                } else {
+                    let vc = hipfire_arch_qwen35_vl::qwen35_vl::vision_config_from_hfq(&hfq)
+                        .ok_or_else(|| "VL model missing vision_config in metadata".to_string())?;
+                    let vw =
+                        hipfire_arch_qwen35_vl::qwen35_vl::load_vision_weights(&hfq, &vc, &mut gpu)
+                            .map_err(|e| format!("load vision weights: {e}"))?;
+                    (Some(vc), Some(vw), None, None)
+                }
             } else {
-                let vc = hipfire_arch_qwen35_vl::qwen35_vl::vision_config_from_hfq(&hfq)
-                    .ok_or_else(|| "VL model missing vision_config in metadata".to_string())?;
-                let vw = hipfire_arch_qwen35_vl::qwen35_vl::load_vision_weights(&hfq, &vc, &mut gpu)
-                    .map_err(|e| format!("load vision weights: {e}"))?;
-                (Some(vc), Some(vw))
-            }
-        } else {
-            (None, None)
-        };
+                (None, None, None, None)
+            };
 
         // ── MTP head loading ──────────────────────────────────────────────
         // Mirrors finish_qwen35_load: try bundled trailer first, then .mtp sidecar.
@@ -851,6 +895,9 @@ impl Rig {
                         }
                         if let Some(vw) = vision_weights {
                             vw.free_gpu(&mut gpu);
+                        }
+                        if let Some(tw) = taichu_vision_weights {
+                            tw.free_gpu(&mut gpu);
                         }
                         weights.free_gpu(&mut gpu);
                         return Err(format!(
@@ -1123,7 +1170,7 @@ impl Rig {
         // freed on replacement (see `admit` — dropping a GpuTensor without
         // free_tensor leaks its VRAM; it is neither pooled nor hipFree'd).
         let vl_ext_devs: Vec<Option<GpuTensor>> = (0..cfg.n_slots).map(|_| None).collect();
-        let vl_tower_jobs: Vec<Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionTowerJob>> =
+        let vl_tower_jobs: Vec<Option<VisionEncodeJob>> =
             (0..cfg.n_slots).map(|_| None).collect();
         let vl_sequential = hipfire_config::developer_var("HIPFIRE_VL_SEQUENTIAL")
             .ok()
@@ -1388,6 +1435,8 @@ impl Rig {
             scratch,
             vision_weights,
             vision_config,
+            taichu_vision_weights,
+            taichu_vision_config,
             mtp_head,
             mtp_states: (0..cfg.n_slots).map(|_| None).collect(),
             mtp_prefill_batched,
@@ -1447,6 +1496,7 @@ impl Rig {
             mut gpu,
             weights,
             vision_weights,
+            taichu_vision_weights,
             mtp_head,
             mtp_states,
             mtp_prefill_batched,
@@ -1525,6 +1575,9 @@ impl Rig {
         note_hip(gpu.free_tensor(mtp_prefill_hidden));
         if let Some(vw) = vision_weights {
             vw.free_gpu(&mut gpu);
+        }
+        if let Some(tw) = taichu_vision_weights {
+            tw.free_gpu(&mut gpu);
         }
         // Per-slot VL matrices + any tower job still mid-encode at teardown.
         for dev in vl_ext_devs.into_iter().flatten() {
@@ -1634,24 +1687,43 @@ fn vl_forward_remaining(
         .ok_or_else(|| "vl_forward_remaining: slot has no VL state".to_string())?;
     let first_step = vl.embeddings.is_empty();
     if first_step {
-        let weights = rig
-            .vision_weights
-            .as_ref()
-            .ok_or_else(|| "VL request but model has no vision encoder".to_string())?;
-        let config = rig
-            .vision_config
-            .as_ref()
-            .ok_or_else(|| "VL request but model has no vision config".to_string())?;
-        let emb = hipfire_arch_qwen35_vl::qwen35_vl::vision_forward(
-            &mut rig.gpu,
-            weights,
-            config,
-            &vl.patches,
-            vl.grid_h,
-            vl.grid_w,
-        )
-        .map_err(|e| format!("vision_forward: {e}"))?;
-        vl.embeddings = emb;
+        if vl.taichu {
+            let weights = rig
+                .taichu_vision_weights
+                .as_ref()
+                .ok_or_else(|| "VL request but model has no taichu vision encoder".to_string())?;
+            let tconfig = rig
+                .taichu_vision_config
+                .as_ref()
+                .ok_or_else(|| "VL request but model has no taichu vision config".to_string())?;
+            let emb = hipfire_arch_taichu_vl::vision::taichu_vision_forward(
+                &mut rig.gpu,
+                weights,
+                tconfig,
+                &vl.patches,
+            )
+            .map_err(|e| format!("vision_forward: {e}"))?;
+            vl.embeddings = emb;
+        } else {
+            let weights = rig
+                .vision_weights
+                .as_ref()
+                .ok_or_else(|| "VL request but model has no vision encoder".to_string())?;
+            let config = rig
+                .vision_config
+                .as_ref()
+                .ok_or_else(|| "VL request but model has no vision config".to_string())?;
+            let emb = hipfire_arch_qwen35_vl::qwen35_vl::vision_forward(
+                &mut rig.gpu,
+                weights,
+                config,
+                &vl.patches,
+                vl.grid_h,
+                vl.grid_w,
+            )
+            .map_err(|e| format!("vision_forward: {e}"))?;
+            vl.embeddings = emb;
+        }
         vl.dim = rig.config.dim;
         vl.patches.clear();
         hipfire_runtime::llama::reset_cpu_sampler_rng(rig.sample_params[slot.0].seed);
@@ -1752,10 +1824,29 @@ fn vl_forward_remaining(
     Ok(hipfire_runtime::sampler::sample_cpu(&mut logits, &[], &cfg))
 }
 
+/// Per-slot in-flight vision-tower encode. Both towers expose the same
+/// `new`/`step_layer`/`finish`/`free` shape; the enum keeps the type
+/// dispatch inside `vision_tower_step` instead of splitting the slot state.
+enum VisionEncodeJob {
+    Qwen(hipfire_arch_qwen35_vl::qwen35_vl::VisionTowerJob),
+    Taichu(hipfire_arch_taichu_vl::vision::TaichuTowerJob),
+}
+
+impl VisionEncodeJob {
+    /// Release a mid-encode job's GPU buffers (tower jobs are not
+    /// self-freeing on Drop).
+    fn free(self, gpu: &mut Gpu) -> rdna_compute::HipResult<()> {
+        match self {
+            Self::Qwen(j) => j.free(gpu),
+            Self::Taichu(j) => j.free(gpu),
+        }
+    }
+}
 /// Advance slot `s`'s batched-VL vision-tower encode by ONE layer, starting
 /// the [`VisionTowerJob`] on the first call and finishing it (merger epilogue
 /// + ext-embedding upload) on the last.
 ///
+
 /// Why one layer at a time: this engine thread is the GPU's exclusive owner,
 /// so a monolithic `vision_forward` wedges every OTHER slot's decode step for
 /// the whole tower pass — measured ~9.7 s at a 78×78 grid (6084 patches) even
@@ -1772,49 +1863,81 @@ fn vl_forward_remaining(
 fn vision_tower_step(
     rig: &mut Rig,
     s: usize,
-    job: &mut Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionTowerJob>,
+    job: &mut Option<VisionEncodeJob>,
     vl: &mut VlPrefill,
 ) -> Result<bool, String> {
     let Rig {
         gpu,
         vision_weights,
         vision_config,
+        taichu_vision_weights,
+        taichu_vision_config,
         vl_ext_devs,
         config,
         ..
     } = rig;
     if job.is_none() {
-        let weights = vision_weights
-            .as_ref()
-            .ok_or("VL request but model has no vision encoder")?;
-        let vconfig = vision_config
-            .as_ref()
-            .ok_or("VL request but model has no vision config")?;
-        let started = hipfire_arch_qwen35_vl::qwen35_vl::VisionTowerJob::new(
-            gpu,
-            weights,
-            vconfig,
-            &vl.patches,
-            vl.grid_h,
-            vl.grid_w,
-        )
-        .map_err(|e| format!("vision_forward: {e}"))?;
+        let started = if vl.taichu {
+            let weights = taichu_vision_weights
+                .as_ref()
+                .ok_or("VL request but model has no taichu vision encoder")?;
+            let tconfig = taichu_vision_config
+                .as_ref()
+                .ok_or("VL request but model has no taichu vision config")?;
+            VisionEncodeJob::Taichu(
+                hipfire_arch_taichu_vl::vision::TaichuTowerJob::new(
+                    gpu,
+                    weights,
+                    tconfig,
+                    &vl.patches,
+                )
+                .map_err(|e| format!("vision_forward: {e}"))?,
+            )
+        } else {
+            let weights = vision_weights
+                .as_ref()
+                .ok_or("VL request but model has no vision encoder")?;
+            let vconfig = vision_config
+                .as_ref()
+                .ok_or("VL request but model has no vision config")?;
+            VisionEncodeJob::Qwen(
+                hipfire_arch_qwen35_vl::qwen35_vl::VisionTowerJob::new(
+                    gpu,
+                    weights,
+                    vconfig,
+                    &vl.patches,
+                    vl.grid_h,
+                    vl.grid_w,
+                )
+                .map_err(|e| format!("vision_forward: {e}"))?,
+            )
+        };
         *job = Some(started);
         // Patches now live on-device for the rest of the encode; free the
         // host copy (~48 MB at the 2 MP budget).
         vl.patches = Vec::new();
     }
-    let weights = vision_weights
-        .as_ref()
-        .ok_or("VL request but model has no vision encoder")?;
-    let vconfig = vision_config
-        .as_ref()
-        .ok_or("VL request but model has no vision config")?;
-    let done = match job
-        .as_mut()
-        .expect("vision tower job present")
-        .step_layer(gpu, weights, vconfig)
-    {
+    let done = match job.as_mut().expect("vision tower job present") {
+        VisionEncodeJob::Qwen(j) => {
+            let weights = vision_weights
+                .as_ref()
+                .ok_or("VL request but model has no vision encoder")?;
+            let vconfig = vision_config
+                .as_ref()
+                .ok_or("VL request but model has no vision config")?;
+            j.step_layer(gpu, weights, vconfig)
+        }
+        VisionEncodeJob::Taichu(j) => {
+            let weights = taichu_vision_weights
+                .as_ref()
+                .ok_or("VL request but model has no taichu vision encoder")?;
+            let tconfig = taichu_vision_config
+                .as_ref()
+                .ok_or("VL request but model has no taichu vision config")?;
+            j.step_layer(gpu, weights, tconfig)
+        }
+    };
+    let done = match done {
         Ok(done) => done,
         Err(e) => {
             let reason = format!("vision_forward: {e}");
@@ -1827,10 +1950,27 @@ fn vision_tower_step(
     if !done {
         return Ok(false);
     }
-    let j = job.take().expect("vision tower job present");
-    let emb = j
-        .finish(gpu, weights, vconfig)
-        .map_err(|e| format!("vision_forward: {e}"))?;
+    let emb = match job.take().expect("vision tower job present") {
+        VisionEncodeJob::Qwen(j) => {
+            let weights = vision_weights
+                .as_ref()
+                .ok_or("VL request but model has no vision encoder")?;
+            let vconfig = vision_config
+                .as_ref()
+                .ok_or("VL request but model has no vision config")?;
+            j.finish(gpu, weights, vconfig)
+        }
+        VisionEncodeJob::Taichu(j) => {
+            let weights = taichu_vision_weights
+                .as_ref()
+                .ok_or("VL request but model has no taichu vision encoder")?;
+            let tconfig = taichu_vision_config
+                .as_ref()
+                .ok_or("VL request but model has no taichu vision config")?;
+            j.finish(gpu, weights, tconfig)
+        }
+    }
+    .map_err(|e| format!("vision_forward: {e}"))?;
     let dev = gpu
         .zeros(&[emb.len()], DType::F32)
         .map_err(|e| format!("vl ext alloc: {e}"))?;
@@ -5077,7 +5217,12 @@ fn admit(
             let _ = send_event(&req.reply, Event::Rejected { reason });
             lock_stats(stats).note_rejected();
         };
-        if rig.vision_weights.is_none() {
+        let encoder_missing = if vd.taichu {
+            rig.taichu_vision_weights.is_none() || rig.taichu_vision_config.is_none()
+        } else {
+            rig.vision_weights.is_none()
+        };
+        if encoder_missing {
             reject("VL request but model has no vision encoder".to_string());
             return;
         }
@@ -6097,6 +6242,7 @@ fn admit(
             mrope_positions: vd.mrope_positions,
             rope_delta: vd.rope_delta,
             base: 0,
+            taichu: vd.taichu,
         });
         work[slot.0].spec = crate::scheduler::SpecKind::None;
     } else {

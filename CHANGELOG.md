@@ -1,6 +1,38 @@
 # Changelog
 
 ## Unreleased
+- ZDTaichu VL on the experimental multi-slot engine (`serve.multi_slot`):
+  previously image requests on a zdtaichu5_0 pack were refused at the daemon
+  gate ("not supported in experimental multi-slot") because the slot path was
+  qwen35-vl-only and preflight did not recognize the `vision_model.*`/`mlp1.*`
+  layout. Preflight now detects the C-RADIO pack via
+  `taichu_vision_config_from_hfq`, `EngineConfig.taichu_vision` loads the
+  taichu tower from the trunk HFQ, `build_slot_vl_prompt` runs InternVL-style
+  `decode_and_tile` + per-tile `build_taichu_mrope_positions`, and the engine
+  dispatches `vl_tower_jobs` through a two-variant `VisionEncodeJob`
+  (Qwen|Taichu) so batched VL interleaves tower layers with other slots'
+  decode exactly like the qwen35-vl path. `VisualData`/`VlPrefill` carry a
+  `taichu` flag; admit refuses VL only when the *matching* tower is absent.
+  Verified on gfx1101 (zdtaichu5-9b.mq4.hfq, slots=2, cap=32k, fwht4 KV,
+  prefix_cache on): text + single-tile image requests produce coherent
+  output on concurrent slots; identical-repeat prompt reports 384/424
+  cached tokens. Endpoint bench (bench_endpoints.py, 2 runs): text 10/10 at
+  ~51.6 tok/s, vision 4/4 at ~48 tok/s. `reasoning.max_tokens` caps open
+  think spans so finite max_tokens requests finish normally.
+- Multi-slot `kv_backend=vmm` accepted and mapped to the paged SlotPool
+  allocator (the knob was hard-refused before; `prefix_cache` already forced
+  the same paged path). `vmm` + `HIPFIRE_VL_SEQUENTIAL=1` is refused at load
+  with an explicit message — that path writes through the flat slab view
+  that aliases every slot under paged. `hipfire-runtime` example builds are
+  repaired (`EngineConfig`/`SubmitRequest` literal fields added; they had
+  drifted off the structs).
+- Repaired three stale `slots::tests` contract tests that had drifted from
+  deliberate door-policy changes (tool turns accepted since the tool-reentry
+  work; `max_think_tokens` accepted since enforced thinking budgets; non-
+  `json_schema` `response_format` refused since the §7.1 review pass).
+
+
+
 - ZDTaichu-5.0 vision-language support (arch 5, rides the Qwen3.5 text loader): new `hipfire-arch-taichu-vl` crate implements the C-RADIOv4-H tower (ViT-H/16, 32 blocks, 1280-d) + `mlp1` projector (RMSNorm → Linear → SquaredReLU → Linear) with InternVL-style dynamic tiling, pixel_shuffle v2 (0.5), and tile-grid M-RoPE. Detected per-artifact via `vision_model.radio_model.*` tensors (`model_type zdtaichu`/`zdtaichu5_0` → arch 5 in `MODEL_TYPE_TO_ARCH_ID`); quantize picks the tower up under `--include-vision` via new `vision_model.` / `mlp1.` sidecar prefixes. `hipfire run --image` and the serve VL path accept ZDTaichu packs. Verified on gfx1101: text-only generation coherent, single-tile and 3-tile (grid+thumbnail) image descriptions accurate. Also fixes a quantizer accounting bug: a non-`tid2eid` I64 tensor (e.g. `summary_idxs`) was skipped after `total_params` was already incremented, so any model carrying one failed the closing check. DSpark sidecar support for the 248k-vocab Taichu draft: `hipfire-quantize --format qwen35-dspark-q8` now emits `enable_confidence`/`draft_vocab_size` gated on actual tensor presence (full-vocab checkpoints ship neither `confidence_head.proj.*` nor `d2t`), routes `embed_tokens` to HFQ4G256 and `lm_head` to Q8F16 instead of F32/F16 (7.5 GB → 3.1 GB sidecar), and the loader honours `gpu_dtype` for the draft lm_head + dispatches draft embeddings by `embd_format` instead of stamping F16 over quantized bytes (previously a guaranteed GPU fault past the buffer). The Qwen3.5 DSpark hidden ring now honours `HIPFIRE_DFLASH_CTX_CAP`. Measured on gfx1101 the Taichu draft is slower than AR (~34 vs 62.5 tok/s, τ≈0.8) — functional but not a win on this pairing.
 - DSpark on gfx1101 + prompt-time aux context. Three fixes landed together with
   the ZDTaichu-5.0-9B DSpark sidecar work: (a) `dflash_verify_graph_env_eligible`

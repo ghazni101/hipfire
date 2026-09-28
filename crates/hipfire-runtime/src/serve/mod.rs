@@ -39,6 +39,12 @@ pub struct VisualData {
     pub mrope_positions: Vec<[i32; 3]>,
     /// rope_delta for decode positions past the prompt.
     pub rope_delta: i32,
+    /// True when `patches` are InternVL-style tiles for the ZDTaichu C-RADIO
+    /// tower (`hipfire-arch-taichu-vl`), false for the Qwen3.5-VL tower.
+    /// The engine dispatches `vision_forward`/`vision_tower_step` on it;
+    /// `mrope_positions`/`rope_delta` are already built for the right tower
+    /// so downstream code is tower-agnostic.
+    pub taichu: bool,
 }
 
 /// One request handed to the engine.

@@ -152,6 +152,12 @@ pub struct VlPrefill {
     pub rope_delta: i32,
     /// Base sequence position for this request's prefill.
     pub base: usize,
+    /// Tower dispatch: true = ZDTaichu C-RADIO (InternVL tiles in `patches`),
+    /// false = Qwen3.5-VL SigLIP-2. `mrope_positions`/`rope_delta` already
+    /// carry the right tower's table; `patches`/`grid_h`/`grid_w` semantics
+    /// are tower-specific (taichu uses the flat tile-im2col blob and ignores
+    /// the grid fields).
+    pub taichu: bool,
 }
 
 impl VlPrefill {
@@ -560,6 +566,7 @@ mod tests {
                 .collect(),
             rope_delta: 7,
             base: 0,
+            taichu: false,
         }
     }
 

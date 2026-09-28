@@ -71,6 +71,8 @@ fn main() {
         is_vl: false,
         vl_path: None,
         mtp_k: 0,
+        taichu_vision: false,
+        kv_backend_vmm: false,
         kv_mode_raw: String::new(),
         prefix_cache: false,
         prefix_cache_max_bytes: 0,
@@ -80,6 +82,8 @@ fn main() {
         wait_max_bytes: 256 * 1024 * 1024,
         queue_timeout_ms: 30_000,
         structured_jump_forward: false,
+                    dflash_draft: None,
+                    dflash_required: false,
     })
     .expect("SlotEngine::spawn");
     println!("engine up: {N_SLOTS} slots, {n_clients} clients, {MAX_TOKENS} tokens each");
@@ -111,7 +115,8 @@ fn main() {
                 json_schema: None,
                 started_in_think: false,
         queue_bytes: 0,
-                reply: tx,
+                think_budget: 0,
+            reply: tx,
             })
             .expect("submit");
         handles.push(std::thread::spawn(move || {

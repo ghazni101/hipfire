@@ -82,10 +82,17 @@ struct EngineSpawnParams {
     prefill_chunk: usize,
     mtp_k: usize,
     is_vl: bool,
+    /// ZDTaichu C-RADIO tower present: the engine loads
+    /// `TaichuVisionWeights` from the trunk and VL requests build
+    /// InternVL-tiled VisualData instead of qwen35-vl patches.
+    taichu_vision: bool,
     vl_path: Option<PathBuf>,
     /// Raw KV-mode string from the load request (empty = resolve from env /
     /// config in the engine, via the slots policy).
     kv_mode_raw: String,
+    /// `kv_backend=vmm` → force the paged SlotPool (same page-table
+    /// mechanism prefix cache uses; contiguous is the default).
+    kv_backend_vmm: bool,
     /// Cross-session prefix cache enabled (spec §4.5–4.6). Read from
     /// `serve.prefix_cache` config key; default false.
     prefix_cache: bool,
@@ -153,9 +160,11 @@ impl AnySlotEngine {
                         host_budget_bytes: 16 * 1024 * 1024 * 1024,
                         swap_dir: std::env::temp_dir().join("hipfire-serve-swap"),
                         is_vl: p.is_vl,
+                        taichu_vision: p.taichu_vision,
                         vl_path: p.vl_path,
                         mtp_k: p.mtp_k,
                         kv_mode_raw: p.kv_mode_raw.clone(),
+                        kv_backend_vmm: p.kv_backend_vmm,
                         // Cross-session prefix cache (spec §4.5–4.6).
                         // Read from serve.prefix_cache / serve.prefix_cache_max_bytes
                         // config keys (env HIPFIRE_SERVE_PREFIX_CACHE*).
@@ -233,9 +242,12 @@ pub struct SlotBackend {
     layers: usize,
     vocab: usize,
     is_vl: bool,
-    /// ZDTaichu C-RADIO pack — image requests are refused at the
-    /// generate gate (multi-slot VL is qwen35-vl-only).
+    /// ZDTaichu C-RADIO pack — VL requests take the InternVL-tiled branch
+    /// in `build_slot_vl_prompt`; the engine loads the taichu tower.
     taichu_vision: bool,
+    /// Tower shape for the taichu branch (tile geometry, token counts).
+    taichu_vision_config:
+        Option<hipfire_arch_taichu_vl::vision::TaichuVisionConfig>,
     vision_config: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionConfig>,
     /// Per-slot context cap handed to the engine at load. Admission-side
     /// only (the engine re-enforces it per token); kept here so an
@@ -379,6 +391,10 @@ impl SlotBackend {
         prefill_chunk: usize,
         mtp_k: usize,
         kv_mode_raw: &str,
+        // `contiguous` (default) keeps fixed per-slot arenas; `vmm` asks the
+        // engine for the paged SlotPool instead — same KV format, only the
+        // allocation strategy differs.
+        kv_backend_raw: &str,
         dflash_draft: Option<PathBuf>,
         dflash_required: bool,
     ) -> Result<Self, String> {
@@ -394,6 +410,7 @@ impl SlotBackend {
         let is_vl = preflight.is_vl;
         let taichu_vision = preflight.taichu_vision;
         let vision_config = preflight.vision_config;
+        let taichu_vision_config = preflight.taichu_vision_config;
         // Read prefix cache config (spec §4.5–4.6). Keys are registered in
         // hipfire-config as serve.prefix_cache / serve.prefix_cache_max_bytes
         // with env HIPFIRE_SERVE_PREFIX_CACHE*. Default false/0.
@@ -478,8 +495,10 @@ impl SlotBackend {
                 prefill_chunk,
                 mtp_k,
                 is_vl,
+                taichu_vision,
                 vl_path,
                 kv_mode_raw: kv_mode_raw.to_string(),
+                kv_backend_vmm: kv_backend_raw == "vmm",
                 prefix_cache,
                 prefix_cache_max_bytes,
                 max_batch_tokens,
@@ -508,6 +527,7 @@ impl SlotBackend {
             tool_grammar,
             pending_tools: Mutex::new(PendingToolBroker::default()),
             taichu_vision,
+            taichu_vision_config,
         })
     }
 
@@ -984,11 +1004,7 @@ impl SlotBackend {
             hipfire_engine::emit::emit_active_attempt_error(
                 stdout,
                 Some(id),
-                if self.taichu_vision {
-                    "ZDTaichu vision input is not supported in experimental multi-slot — use the sequential daemon path"
-                } else {
-                    "model has no vision encoder"
-                },
+                "model has no vision encoder",
                 "validation",
                 false,
                 false,
@@ -1622,10 +1638,13 @@ struct Preflight {
     tokenizer: Tokenizer,
     chat_template: Option<String>,
     is_vl: bool,
-    /// C-RADIO tower present (ZDTaichu pack): the multi-slot VL path is
-    /// qwen35-vl-only, so image requests are refused with a message naming
-    /// the sequential daemon rather than "no vision encoder".
+    /// C-RADIO tower present (ZDTaichu pack): VL requests take the
+    /// InternVL-tiled branch in `build_slot_vl_prompt` and the engine's
+    /// taichu tower.
     taichu_vision: bool,
+    /// Tower shape for the taichu branch (tile geometry, token counts).
+    taichu_vision_config:
+        Option<hipfire_arch_taichu_vl::vision::TaichuVisionConfig>,
     vision_config: Option<hipfire_arch_qwen35_vl::qwen35_vl::VisionConfig>,
     /// Discovered .vl sidecar path. When set, the slot engine loads vision
     /// weights from this file instead of the trunk HFQ.
@@ -1646,12 +1665,14 @@ fn cpu_preflight(model_path: &str) -> Result<Preflight, String> {
     // tensors. If no .vl file exists, fall back to inline (backward compat).
     let vl_path = discover_vl_sidecar(model_path);
     let has_inline_vision = is_vision_hfq(&hfq);
-    let taichu_vision =
-        hipfire_arch_taichu_vl::vision::is_taichu_vision_hfq(&hfq);
-    let is_vl = vl_path.is_some() || has_inline_vision;
+    let taichu_vision_config =
+        hipfire_arch_taichu_vl::vision::taichu_vision_config_from_hfq(&hfq);
+    let taichu_vision = taichu_vision_config.is_some();
+    let is_vl = vl_path.is_some() || has_inline_vision || taichu_vision;
 
     // Read vision_config from the .vl file when present, else from the trunk.
-    let vision_config = if is_vl {
+    // Taichu packs carry TaichuVisionConfig, not VisionConfig.
+    let vision_config = if is_vl && !taichu_vision {
         if let Some(vl) = &vl_path {
             let vl_hfq = HfqFile::open(vl)
                 .map_err(|e| format!("open .vl file {}: {e}", vl.display()))?;
@@ -1701,6 +1722,7 @@ fn cpu_preflight(model_path: &str) -> Result<Preflight, String> {
         chat_template,
         is_vl,
         taichu_vision,
+        taichu_vision_config,
         vision_config,
         vl_path,
     })
@@ -1859,15 +1881,21 @@ pub fn validate_load_caps(msg: &serde_json::Value) -> Option<String> {
             ));
         }
     }
-    if params
+    // kv_backend=vmm maps to the paged SlotPool (engine-side: the load
+    // params force `paged_pages`); anything else is refused here, loudly,
+    // before any GPU work.
+    if let Some(raw) = params
         .and_then(|p| p.get("kv_backend"))
         .and_then(|v| v.as_str())
-        .is_some_and(|v| !v.is_empty() && v != "contiguous")
+        .filter(|v| !v.is_empty())
     {
-        return Some(
-            "experimental multi-slot uses fixed slot arenas and requires kv_backend=contiguous"
-                .to_string(),
-        );
+        if raw != "contiguous" && raw != "vmm" {
+            return Some(format!(
+                "experimental multi-slot does not support kv_backend='{raw}' \
+                 (accepted: contiguous|vmm; 'vmm' = paged slot arenas; \
+                 'auto'/unset = contiguous)"
+            ));
+        }
     }
     None
 }
@@ -2473,10 +2501,6 @@ fn build_slot_vl_prompt(
     prompt: &str,
     assistant_prefix: AssistantPrefix,
 ) -> Result<(Vec<u32>, VisualData), String> {
-    let vc = backend
-        .vision_config
-        .as_ref()
-        .ok_or_else(|| "VL model missing vision_config".to_string())?;
     let tokenizer = &backend.tokenizer;
     let image_pad_id = tokenizer
         .special_token_id("<|image_pad|>")
@@ -2488,6 +2512,104 @@ fn build_slot_vl_prompt(
         .special_token_id("<|vision_end|>")
         .ok_or_else(|| "VL tokenizer missing <|vision_end|>".to_string())?;
 
+    let nl = tokenizer.encode("\n");
+    let q_tokens = tokenizer.encode(prompt);
+
+    // ZDTaichu C-RADIO: InternVL dynamic tiling, one <|image_pad|> run of
+    // n_tiles × num_image_token, per-tile M-RoPE.
+    if backend.taichu_vision {
+        let tc = backend
+            .taichu_vision_config
+            .as_ref()
+            .ok_or_else(|| "taichu VL model missing taichu_vision_config".to_string())?;
+        let tiled = match image {
+            SlotImage::Path(path) => hipfire_arch_taichu_vl::image::decode_and_tile(
+                std::path::Path::new(path),
+                tc,
+            )?,
+            SlotImage::Base64(b64) => {
+                let bytes = decode_image_base64(b64)?;
+                hipfire_arch_taichu_vl::image::decode_and_tile_bytes(&bytes, tc)?
+            }
+        };
+        let n_visual_tokens = tiled.n_visual_tokens;
+        if n_visual_tokens == 0 {
+            return Err("image produced no visual tokens".to_string());
+        }
+        let user_body = splice_vl_user_body(
+            vision_start_id,
+            image_pad_id,
+            vision_end_id,
+            n_visual_tokens,
+            &nl,
+            &q_tokens,
+        );
+        let prompt_tokens = ChatFrame {
+            tokenizer,
+            system,
+            user: "",
+            assistant_prefix,
+            raw: false,
+        }
+        .build_with_user_tokens(&user_body);
+
+        // Per-tile M-RoPE — mirror build_slot_mrope's span validation.
+        let start = prompt_tokens
+            .iter()
+            .position(|&t| t == image_pad_id)
+            .ok_or_else(|| "no <|image_pad|> in the prompt despite n_visual > 0".to_string())?;
+        if start + n_visual_tokens > prompt_tokens.len() {
+            return Err("image span runs past the prompt".to_string());
+        }
+        if !prompt_tokens[start..start + n_visual_tokens]
+            .iter()
+            .all(|&t| t == image_pad_id)
+        {
+            return Err("image-pad run is not contiguous".to_string());
+        }
+        if prompt_tokens[start + n_visual_tokens..].contains(&image_pad_id) {
+            return Err(
+                "more than one image-pad run (multi-image not wired)".to_string(),
+            );
+        }
+        let spans = [hipfire_arch_taichu_vl::mrope::TaichuImageSpan {
+            start,
+            len: n_visual_tokens,
+            tile_rows: tiled.tile_rows,
+            tile_cols: tiled.tile_cols,
+            has_thumbnail: tc.use_thumbnail
+                && tiled.n_tiles > tiled.tile_rows * tiled.tile_cols,
+        }];
+        let built = hipfire_arch_taichu_vl::mrope::build_taichu_mrope_positions(
+            prompt_tokens.len(),
+            &spans,
+            tc.tile_tokens_per_side,
+        );
+        if built.positions.len() != prompt_tokens.len() {
+            return Err(format!(
+                "build_taichu_mrope_positions returned {} positions for {} tokens",
+                built.positions.len(),
+                prompt_tokens.len()
+            ));
+        }
+        return Ok((
+            prompt_tokens,
+            VisualData {
+                patches: tiled.patches,
+                grid_h: 0,
+                grid_w: 0,
+                n_visual_tokens,
+                mrope_positions: built.positions,
+                rope_delta: built.rope_delta,
+                taichu: true,
+            },
+        ));
+    }
+
+    let vc = backend
+        .vision_config
+        .as_ref()
+        .ok_or_else(|| "VL model missing vision_config".to_string())?;
     let (pixels, img_h, img_w) = match image {
         SlotImage::Path(path) => hipfire_arch_qwen35_vl::image::load_and_preprocess(
             std::path::Path::new(path),
@@ -2511,8 +2633,6 @@ fn build_slot_vl_prompt(
         return Err("image produced no visual tokens".to_string());
     }
 
-    let nl = tokenizer.encode("\n");
-    let q_tokens = tokenizer.encode(prompt);
     let user_body = splice_vl_user_body(
         vision_start_id,
         image_pad_id,
@@ -2556,6 +2676,7 @@ fn build_slot_vl_prompt(
             n_visual_tokens,
             mrope_positions,
             rope_delta,
+            taichu: false,
         },
     ))
 }
@@ -2586,11 +2707,13 @@ mod tests {
     }
 
     #[test]
-    fn generate_caps_rejects_tool_results() {
+    fn generate_caps_accepts_tool_results() {
+        // Tool turns are supported on the multi-slot path (projected_tools /
+        // tool-result reentry); the door validator must not refuse them.
         let m = json!({"messages": [{"role": "tool", "content": "result"}], "experimental_multi_slot": true});
-        assert!(validate_generate_caps(&m).is_some());
+        assert!(validate_generate_caps(&m).is_none());
         let m2 = json!({"messages": [{"role": "assistant", "tool_calls": [{"id": "1", "type": "function", "function": {"name": "f"}}]}], "experimental_multi_slot": true});
-        assert!(validate_generate_caps(&m2).is_some());
+        assert!(validate_generate_caps(&m2).is_none());
     }
 
     #[test]
@@ -2678,8 +2801,10 @@ mod tests {
         assert!(validate_generate_caps(&m2).is_some());
         let m3 = json!({"logprobs": true, "experimental_multi_slot": true});
         assert!(validate_generate_caps(&m3).is_some());
+        // max_think_tokens is accepted at any value: the engine enforces the
+        // finite budget by force-closing the think span in the grammar cursor.
         let m4 = json!({"max_think_tokens": 5, "experimental_multi_slot": true});
-        assert!(validate_generate_caps(&m4).is_some());
+        assert!(validate_generate_caps(&m4).is_none());
         let m5 = json!({"max_think_tokens": 1, "experimental_multi_slot": true});
         assert!(validate_generate_caps(&m5).is_none());
     }
@@ -2696,12 +2821,14 @@ mod tests {
             validate_generate_caps(&m).is_none(),
             "valid json_schema response_format should be accepted"
         );
-        // Non-json_schema response_format (text) is not rejected by this guard.
+        // Non-json_schema response_format types are refused at the door
+        // (spec §7.1: only json_schema is a supported type — anything else
+        // would be a silent semantic downgrade).
         let m2 = json!({
             "response_format": {"type": "text"},
             "experimental_multi_slot": true
         });
-        assert!(validate_generate_caps(&m2).is_none(), "text response_format should not be rejected here");
+        assert!(validate_generate_caps(&m2).is_some(), "non-json_schema response_format must be rejected");
         // Unsupported $ref is rejected before submit (spec §7 G1, §5.4 S4).
         let m3 = json!({
             "response_format": {"type": "json_schema", "json_schema": {"name": "test", "schema": {"$ref": "#/$defs/foo"}}},
@@ -2954,10 +3081,17 @@ mod tests {
                 "ladder tier {kv} must be accepted"
             );
         }
+        // vmm is accepted: it maps to the paged SlotPool engine-side
+        // (prefix_cache forces the same path); contiguous stays the default.
+        assert_eq!(
+            validate_load_caps(&json!({"params": {"kv_backend": "vmm"}})),
+            None,
+            "kv_backend=vmm must be accepted (paged arenas)"
+        );
         for params in [
             json!({"kv_mode": "bf16"}),
             json!({"kv_mode": "garbage"}),
-            json!({"kv_backend": "vmm"}),
+            json!({"kv_backend": "garbage"}),
             json!({"ngram_draft": true}),
             json!({"cask": true}),
             json!({"drafter": "some-drafter"}),

@@ -38,6 +38,8 @@ fn main() {
         is_vl: false,
         vl_path: None,
         mtp_k,
+        taichu_vision: false,
+        kv_backend_vmm: false,
         kv_mode_raw: String::new(),
         prefix_cache: true,
         prefix_cache_max_bytes: 256 * 1024 * 1024,
@@ -47,6 +49,8 @@ fn main() {
         wait_max_bytes: 256 * 1024 * 1024,
         queue_timeout_ms: 30_000,
         structured_jump_forward: false,
+                    dflash_draft: None,
+                    dflash_required: false,
     })
     .expect("spawn");
     println!("engine up: 2 slots, submitting {n} concurrent requests");
@@ -76,7 +80,8 @@ fn main() {
                     started_in_think: false,
                     queue_bytes: 0,
                     request_tag: 0xA13_000 + i as u64,
-                    reply: tx,
+                    think_budget: 0,
+            reply: tx,
                 })
                 .expect("submit");
             rx

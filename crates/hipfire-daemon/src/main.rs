@@ -1187,6 +1187,10 @@ fn main() {
                         prefill_chunk,
                         mtp_k,
                         &slot_kv_mode_raw,
+                        msg.get("params")
+                            .and_then(|p| p.get("kv_backend"))
+                            .and_then(|v| v.as_str())
+                            .unwrap_or(""),
                         slot_draft_path.map(std::path::PathBuf::from),
                         slot_dflash_required,
                     ) {

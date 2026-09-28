@@ -133,6 +133,8 @@ fn main() {
         is_vl: false,
         vl_path: None,
         mtp_k,
+        taichu_vision: false,
+        kv_backend_vmm: false,
         kv_mode_raw: String::new(),
         prefix_cache: true,
         prefix_cache_max_bytes: 256 * 1024 * 1024,
@@ -142,6 +144,8 @@ fn main() {
         wait_max_bytes: 256 * 1024 * 1024,
         queue_timeout_ms: 30_000,
         structured_jump_forward: false,
+                    dflash_draft: None,
+                    dflash_required: false,
     })
     .expect("SlotEngine::spawn");
     println!(
@@ -193,7 +197,8 @@ fn main() {
                 started_in_think: false,
         queue_bytes: 0,
         request_tag: 1,
-                reply: tx,
+                think_budget: 0,
+            reply: tx,
             })
             .expect("submit");
         let mut reused = 0usize;
@@ -276,7 +281,8 @@ fn main() {
                 started_in_think: false,
         queue_bytes: 0,
         request_tag: 2,
-                reply: tx,
+                think_budget: 0,
+            reply: tx,
             })
             .expect("faulted submit");
         let mut saw_rejection = false;
@@ -324,7 +330,9 @@ fn main() {
                     is_vl: false,
                     vl_path: None,
                     mtp_k,
-                    kv_mode_raw: String::new(),
+                    taichu_vision: false,
+        kv_backend_vmm: false,
+        kv_mode_raw: String::new(),
                     prefix_cache: true,
                     prefix_cache_max_bytes: 256 * 1024 * 1024,
                     max_batch_tokens: 4096,
@@ -333,6 +341,8 @@ fn main() {
                     wait_max_bytes: 256 * 1024 * 1024,
                     queue_timeout_ms: 30_000,
                     structured_jump_forward: false,
+                    dflash_draft: None,
+                    dflash_required: false,
                 })
                 .expect("fresh engine after poison");
                 let out = run(&fresh, italy.clone(), &greedy);
@@ -390,7 +400,8 @@ fn main() {
                     started_in_think: false,
                     queue_bytes: 0,
                     request_tag: 3,
-                    reply: tx,
+                    think_budget: 0,
+            reply: tx,
                 })
                 .expect("a20 submit");
             let (mut session, mut reused) = (u64::MAX, 0usize);
@@ -470,7 +481,9 @@ fn main() {
             is_vl: false,
             vl_path: None,
             mtp_k,
-            kv_mode_raw: String::new(),
+            taichu_vision: false,
+        kv_backend_vmm: false,
+        kv_mode_raw: String::new(),
             prefix_cache: true,
             prefix_cache_max_bytes: 256 * 1024 * 1024,
             max_batch_tokens: 4096,
@@ -479,6 +492,8 @@ fn main() {
             wait_max_bytes: 256 * 1024 * 1024,
             queue_timeout_ms: 30_000,
             structured_jump_forward: false,
+                    dflash_draft: None,
+                    dflash_required: false,
         };
         engine.shutdown().expect("a20 shutdown");
         for cycle in 0..2 {
@@ -695,6 +710,7 @@ fn main() {
             started_in_think: false,
         queue_bytes: 0,
         request_tag: 4,
+            think_budget: 0,
             reply: tx_long,
         })
         .expect("submit long");
@@ -808,7 +824,8 @@ fn main() {
                     started_in_think: false,
                     queue_bytes: 0,
                     request_tag: 0xA13_000 + i as u64,
-                    reply: tx,
+                    think_budget: 0,
+            reply: tx,
                 })
                 .expect("concurrent submit");
             rx
