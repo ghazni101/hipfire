@@ -1992,9 +1992,14 @@ fn finish_qwen35_load(
                                         assets.config.vocab_size
                                     };
                                     let stage_norm = assets.weights.output_norm.shallow_clone();
-                                    // upload_raw sets dtype=Raw; the data is F16.
+                                    // run_heads dispatches on GpuTensor.dtype; honour the
+                                    // WeightTensor's actual gpu_dtype (F16 for qt=1
+                                    // sidecars, HFQ4G256/Q8_0 for the quantized
+                                    // full-vocab tables the quantizer emits on
+                                    // large-vocab targets — stamping F16 over HFQ4
+                                    // bytes reads ~4× past the buffer and faults).
                                     let mut lm_head = assets.weights.output.buf.shallow_clone();
-                                    lm_head.dtype = rdna_compute::DType::F16;
+                                    lm_head.dtype = assets.weights.output.gpu_dtype;
                                     lm_head.shape = vec![vocab];
                                     let conf_threshold = hipfire_config::developer_var(
                                         "HIPFIRE_QWEN35_DSPARK_CONF_THRESHOLD",

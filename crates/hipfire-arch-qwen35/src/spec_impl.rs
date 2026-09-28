@@ -131,12 +131,26 @@ impl SpecTarget for ModelSlot {
         // `dspark_extract_layers`) ⇒ the ring captures the per-position residual
         // hidden at those layers during `verify_block_capture_gpu`.
         let num_extract = self.dspark_extract_layers.len();
+        // The hidden ring is a draft context-indexed structure (same class as
+        // DFlash's target_hidden/draft KV): honour HIPFIRE_DFLASH_CTX_CAP
+        // (default 8192, 0 = uncapped). A request that outgrows the ring
+        // capacity simply re-bootstraps draft ctx — emitted tokens are
+        // verify-exact regardless.
+        let requested_ctx = self.ctx_capacity();
+        let ring_cap = match hipfire_config::developer_var("HIPFIRE_DFLASH_CTX_CAP")
+            .ok()
+            .and_then(|s| s.parse::<usize>().ok())
+        {
+            Some(0) => requested_ctx,
+            Some(cap) => requested_ctx.min(cap),
+            None => requested_ctx.min(crate::dflash_spec::DEFAULT_DFLASH_CTX_CAP),
+        };
         let mut hidden_rb = HiddenStateRingBuffer::new(
             gpu,
             self.config.n_layers,
             num_extract,
             dim,
-            self.ctx_capacity(),
+            ring_cap,
             block_size,
         )
         .map_err(|e| format!("Qwen35SpecScratch HiddenStateRingBuffer: {e}"))?;

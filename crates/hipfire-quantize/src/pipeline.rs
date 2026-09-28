@@ -3153,6 +3153,12 @@ fn run_qwen3_dspark(args: &QuantizeArgs) {
         .and_then(|v| v.as_u64())
         .unwrap_or(151669) as u32;
     let draft_vocab_size = cfg_u64("draft_vocab_size", 0);
+    // `enable_confidence_head` is the upstream opt-in; `confidence_head_with_markov`
+    // is only a sub-flag of the head (it can be true while the head is absent).
+    let enable_confidence_cfg = config
+        .get("enable_confidence_head")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(true);
     let confidence_with_markov = config
         .get("confidence_head_with_markov")
         .and_then(|v| v.as_bool())
@@ -3183,31 +3189,6 @@ fn run_qwen3_dspark(args: &QuantizeArgs) {
          markov_rank={markov_rank} noise_token_id={noise_token_id}"
     );
 
-    // Build metadata JSON — mirrors the keys DsparkConfig::from_metadata_json reads.
-    let metadata = serde_json::json!({
-        "architecture": "qwen3",
-        "config": {
-            "dspark_block_size": block_size,
-            "dspark_target_layer_ids": target_layer_ids,
-            "dspark_num_targets": target_layer_ids.len(),
-            "dspark_markov_rank": markov_rank,
-            "dspark_noise_token_id": noise_token_id,
-            "dspark_enable_confidence": true,
-            "dspark_confidence_with_markov": confidence_with_markov,
-            "dspark_draft_vocab_size": draft_vocab_size,
-            "dspark_hidden_size": hidden_size,
-            "dspark_head_dim": head_dim,
-            "dspark_num_hidden_layers": num_hidden_layers,
-            "dspark_num_attention_heads": num_attention_heads,
-            "dspark_num_key_value_heads": num_key_value_heads,
-            "dspark_intermediate_size": intermediate_size,
-            "dspark_vocab_size": vocab_size,
-            "dspark_partial_rotary_factor": partial_rotary_factor,
-            "dspark_rope_theta": rope_theta,
-        },
-    });
-    let metadata_json = serde_json::to_string(&metadata).unwrap();
-
     // Load safetensors
     let st_paths = find_safetensors(input_dir);
     if st_paths.is_empty() {
@@ -3234,6 +3215,48 @@ fn run_qwen3_dspark(args: &QuantizeArgs) {
     all_tensors.sort_by_key(|(name, _)| name.to_string());
     eprintln!("qwen3-dspark-q8: {} tensors found", all_tensors.len());
 
+    // Confidence head is optional upstream: Taichu's DSpark checkpoint
+    // ships markov + main_proj only. Emitting `enable_confidence=true`
+    // makes the loader hard-require `confidence_head.proj.*` — gate it on
+    // actual tensor presence (qwen3-8B ships them and keeps true).
+    let has_confidence = all_tensors
+        .iter()
+        .any(|(name, _)| *name == "confidence_head.proj.weight");
+    let enable_confidence = enable_confidence_cfg && has_confidence;
+    // Reduced-vocab drafters ship d2t/t2d maps; full-vocab checkpoints
+    // (Taichu) don't — draft_vocab_size must be 0 or the loader demands
+    // `d2t` and aborts.
+    let draft_vocab_size = if all_tensors.iter().any(|(name, _)| *name == "d2t") {
+        draft_vocab_size
+    } else {
+        0
+    };
+
+    // Build metadata JSON — mirrors the keys DsparkConfig::from_metadata_json reads.
+    let metadata = serde_json::json!({
+        "architecture": "qwen3",
+        "config": {
+            "dspark_block_size": block_size,
+            "dspark_target_layer_ids": target_layer_ids,
+            "dspark_num_targets": target_layer_ids.len(),
+            "dspark_markov_rank": markov_rank,
+            "dspark_noise_token_id": noise_token_id,
+            "dspark_enable_confidence": enable_confidence,
+            "dspark_confidence_with_markov": confidence_with_markov,
+            "dspark_draft_vocab_size": draft_vocab_size,
+            "dspark_hidden_size": hidden_size,
+            "dspark_head_dim": head_dim,
+            "dspark_num_hidden_layers": num_hidden_layers,
+            "dspark_num_attention_heads": num_attention_heads,
+            "dspark_num_key_value_heads": num_key_value_heads,
+            "dspark_intermediate_size": intermediate_size,
+            "dspark_vocab_size": vocab_size,
+            "dspark_partial_rotary_factor": partial_rotary_factor,
+            "dspark_rope_theta": rope_theta,
+        },
+    });
+    let metadata_json = serde_json::to_string(&metadata).unwrap();
+
     // Determine which 2D weights get Q8F16 (attn projections + MLP projections)
     let is_dspark_matmul_weight = |name: &str| -> bool {
         // Attn projections: q/k/v/o_proj
@@ -3249,7 +3272,16 @@ fn run_qwen3_dspark(args: &QuantizeArgs) {
                 || name.ends_with("down_proj.weight"));
         is_attn || is_mlp
     };
-
+    // Full-vocab embed + lm_head dominate sidecar size on large-vocab
+    // targets (248k-vocab qwen3.5 family: 4 GB embed at F32 load + 2 GB
+    // F16 lm_head — ~7.5 GB of draft on top of a 7 GB trunk cannot fit a
+    // 12.9 GB card). Split routing: `embed_tokens` → HFQ4G256 (only
+    // `block` row lookups per window; `load_embedding` qt=6 →
+    // EmbeddingFormat::HFQ4G256), `lm_head` → Q8F16 (read every window —
+    // logits quality drives acceptance; `load_global_proj` qt=3 →
+    // DType::Q8_0, the same dtype the drafter body GEMVs already run).
+    let is_dspark_vocab_table =
+        |name: &str| -> bool { name == "embed_tokens.weight" || name == "lm_head.weight" };
     let mut hfq_tensors: Vec<HfqTensor> = Vec::new();
     let mut total_params = 0u64;
     let mut q8_params = 0u64;
@@ -3260,7 +3292,6 @@ fn run_qwen3_dspark(args: &QuantizeArgs) {
         let n_elements: usize = meta.shape.iter().product();
         total_params += n_elements as u64;
 
-        // Map source tensor name → sidecar name
         let sidecar_name = if *name == "fc.weight" {
             "main_proj.weight".to_string()
         } else if *name == "hidden_norm.weight" {
@@ -3306,7 +3337,37 @@ fn run_qwen3_dspark(args: &QuantizeArgs) {
             continue;
         }
 
-        if is_dspark_matmul_weight(name) && n_elements >= 32 {
+        if is_dspark_vocab_table(name) && n_elements >= 32 {
+            // Full-vocab tables: Q8 lm_head (read every window — logits
+            // quality drives acceptance) + HFQ4G256 embed (only `block`
+            // row lookups per window — cheapest table to squeeze).
+            // `load_embedding` qt=3→EmbeddingFormat::Q8_0 / qt=6→HFQ4G256;
+            // `load_global_proj` qt=3→DType::Q8_0 via the raw-codec table.
+            let f32_data = to_f32(raw_data, &meta.dtype);
+            let (q, qt, gs, tag) = if *name == "embed_tokens.weight" {
+                (quantize_hfq4g256(&f32_data), QuantType::HFQ4G256, 256u32, "HFQ4G256")
+            } else {
+                (quantize_q8f16(&f32_data), QuantType::Q8F16, 32u32, "Q8_F16")
+            };
+            eprintln!(
+                "  {:>8}: {} {:?} ({} elems, {:.1} KB → {:.1} KB)",
+                tag,
+                sidecar_name,
+                meta.shape,
+                n_elements,
+                raw_data.len() as f64 / 1024.0,
+                q.len() as f64 / 1024.0
+            );
+            q8_params += n_elements as u64;
+            hfq_tensors.push(HfqTensor {
+                name: sidecar_name,
+                quant_type: qt,
+                shape,
+                group_size: gs,
+                data: q,
+                spilled_len: 0,
+            });
+        } else if is_dspark_matmul_weight(name) && n_elements >= 32 {
             // 2D matmul weight → Q8F16 (body layers, trained precision preserved)
             let f32_data = to_f32(raw_data, &meta.dtype);
             let q = quantize_q8f16(&f32_data);

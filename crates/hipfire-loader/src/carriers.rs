@@ -1027,12 +1027,13 @@ impl Carrier for LlamaCarrier {
             // the speculator holds an alias that is freed before the weights on unload.
             let stage_norm = assets.weights.output_norm.shallow_clone();
 
-            // lm_head fix: assets.weights.output.buf.dtype == Raw (upload_raw always
-            // sets Raw), but the actual data layout is F16.  run_heads dispatches on
-            // GpuTensor.dtype, so we shallow_clone and fix the dtype + shape here.
-            // (The parity harness does the same at qwen3_dspark_parity.rs:215-217.)
+            // run_heads dispatches on GpuTensor.dtype; honour the WeightTensor's
+            // actual gpu_dtype (F16 for qt=1 sidecars, HFQ4G256/Q8_0 for the
+            // quantized full-vocab tables the quantizer emits on large-vocab
+            // targets — stamping F16 over HFQ4 bytes reads ~4× past the buffer
+            // and faults the GPU).
             let mut lm_head = assets.weights.output.buf.shallow_clone();
-            lm_head.dtype = rdna_compute::DType::F16;
+            lm_head.dtype = assets.weights.output.gpu_dtype;
             lm_head.shape = vec![vocab];
 
             // conf_threshold ladder: env > CLI arg > 0.1
