@@ -1139,6 +1139,10 @@ fn main() {
                             .and_then(|v| v.as_u64())
                             .unwrap_or(4) as usize
                     };
+                    // mtp_mode=on is a REQUIRED assertion: the load fails when
+                    // no head is found (sequential parity — loader_api
+                    // `spec.mtp == Some(true)` path). auto just probes.
+                    let slot_mtp_required = mtp_mode == "on";
                     // The sequential loader parses its own kv_mode_override
                     // further down this arm; the slot engine takes the same
                     // precedence (load param > env/config, resolved engine-side
@@ -1193,6 +1197,7 @@ fn main() {
                             .unwrap_or(""),
                         slot_draft_path.map(std::path::PathBuf::from),
                         slot_dflash_required,
+                        slot_mtp_required,
                     ) {
                         Ok(backend) => {
                             let arch = backend.arch_str().to_string();

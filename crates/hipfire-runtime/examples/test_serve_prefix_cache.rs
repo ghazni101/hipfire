@@ -145,7 +145,8 @@ fn main() {
         queue_timeout_ms: 30_000,
         structured_jump_forward: false,
                     dflash_draft: None,
-                    dflash_required: false,
+                    mtp_required: false,
+        dflash_required: false,
     })
     .expect("SlotEngine::spawn");
     println!(
@@ -342,7 +343,8 @@ fn main() {
                     queue_timeout_ms: 30_000,
                     structured_jump_forward: false,
                     dflash_draft: None,
-                    dflash_required: false,
+                    mtp_required: false,
+        dflash_required: false,
                 })
                 .expect("fresh engine after poison");
                 let out = run(&fresh, italy.clone(), &greedy);
@@ -493,7 +495,8 @@ fn main() {
             queue_timeout_ms: 30_000,
             structured_jump_forward: false,
                     dflash_draft: None,
-                    dflash_required: false,
+                    mtp_required: false,
+        dflash_required: false,
         };
         engine.shutdown().expect("a20 shutdown");
         for cycle in 0..2 {

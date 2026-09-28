@@ -161,9 +161,12 @@ pub struct EngineConfig {
     /// in practice — when both are armed, DFlash wins at admit (deeper
     /// speculation, same verify-exact contract).
     pub dflash_draft: Option<PathBuf>,
-    /// `dflash_mode=on`: a draft load failure fails the engine load.
     /// `auto`: warn and serve AR.
     pub dflash_required: bool,
+    /// `mtp_mode=on`: a missing/failed MTP head fails the engine load
+    /// instead of degrading to AR — sequential-loader parity (loader_api
+    /// `spec.mtp == Some(true)` fails closed too). `auto`/`off` never set.
+    pub mtp_required: bool,
 }
 
 pub struct SlotEngine {
@@ -849,13 +852,30 @@ impl Rig {
         };
         if mtp_k > 0 && mtp_head.is_none() {
             // Probe last-extension replacement *and* the stem sidecar
-            // (foo.mq4v2.hfq → foo.mq4v2.mtp and foo.mtp). A miss must
-            // not silently degrade to AR: that is the "draft pulled but
-            // DFlash off" trap.
+            // (foo.mq4v2.hfq → foo.mq4v2.mtp and foo.mtp).
             let probed: Vec<String> = crate::mtp_head::mtp_sidecar_candidates(&cfg.model_path)
                 .into_iter()
                 .map(|p| p.display().to_string())
                 .collect();
+            if cfg.mtp_required {
+                // mtp_mode=on asserts a head exists — fail the load like the
+                // sequential loader and like dflash_mode=on below, rather
+                // than silently serving AR.
+                if let Some(vw) = vision_weights {
+                    vw.free_gpu(&mut gpu);
+                }
+                if let Some(tw) = taichu_vision_weights {
+                    tw.free_gpu(&mut gpu);
+                }
+                weights.free_gpu(&mut gpu);
+                return Err(format!(
+                    "mtp_mode=on: no MTP head found — no bundled .mq4-mtp trailer \
+                     and no sidecar at {}",
+                    probed.join(" or ")
+                ));
+            }
+            // A miss under auto must not silently degrade to AR without a
+            // trace: log the probed paths.
             eprintln!(
                 "  [hipfire] MTP requested (mtp_k={mtp_k}) but no head was found: \
                  no bundled .mq4-mtp trailer and no sidecar at {} — \

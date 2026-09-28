@@ -50,7 +50,8 @@ fn main() {
         queue_timeout_ms: 30_000,
         structured_jump_forward: false,
                     dflash_draft: None,
-                    dflash_required: false,
+                    mtp_required: false,
+        dflash_required: false,
     })
     .expect("spawn");
     println!("engine up: 2 slots, submitting {n} concurrent requests");

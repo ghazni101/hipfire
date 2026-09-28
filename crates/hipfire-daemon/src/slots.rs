@@ -125,6 +125,10 @@ struct EngineSpawnParams {
     /// dflash_mode=on: a missing/failed draft load fails the engine load
     /// instead of degrading to AR.
     dflash_required: bool,
+    /// mtp_mode=on: a missing/failed MTP head fails the engine load instead
+    /// of degrading to AR — parity with the sequential loader and with
+    /// `dflash_required` (fail-closed on a knob the user asserted).
+    mtp_required: bool,
 }
 
 /// The per-arch multi-slot engine behind the four-method surface
@@ -194,6 +198,7 @@ impl AnySlotEngine {
                         // dflash_mode=off). dflash_required = mode "on".
                         dflash_draft: p.dflash_draft,
                         dflash_required: p.dflash_required,
+                        mtp_required: p.mtp_required,
                     },
                 )
                 .map_err(|e| format!("SlotEngine spawn: {e}"))?,
@@ -397,6 +402,7 @@ impl SlotBackend {
         kv_backend_raw: &str,
         dflash_draft: Option<PathBuf>,
         dflash_required: bool,
+        mtp_required: bool,
     ) -> Result<Self, String> {
         // CPU preflight: open HFQ, arch, VL, config, tokenizer.
         let preflight = cpu_preflight(model_path)?;
@@ -509,6 +515,7 @@ impl SlotBackend {
                 structured_jump_forward,
                 dflash_draft,
                 dflash_required,
+                mtp_required,
             },
         )?;
 
