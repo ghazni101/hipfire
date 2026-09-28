@@ -43,7 +43,7 @@ typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
 typedef float __attribute__((ext_vector_type(8))) float8_t;
 typedef unsigned int __attribute__((ext_vector_type(4))) uint4v_t;
 
-#if defined(__gfx1100__)
+#if defined(__gfx1100__) || defined(__gfx1101__)
 // Exact nibble integers 0..15: RTZ == RN bit-for-bit (exact in f16 and f32).
 // Packed idiom matches gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds.hip
 // (DEQUANT_A_FRAG_PK / DEQUANT_PK_H2 / pkrtz_nibble2).
@@ -167,7 +167,7 @@ extern "C" __global__ void gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage(
             // Packed RTZ + __hfma2 fragment (ksplit sibling idiom); scalar
             // fallback preserves the prior base-kernel DQ path off gfx1100.
             half16_t a_reg;
-#if defined(__gfx1100__)
+#if defined(__gfx1100__) || defined(__gfx1101__)
             DEQUANT_A_FRAG_PK(pk0, pk1, (__half)sc_h, (__half)zp_h, a_reg);
 #else
             #define DQ(i, pk, sh) a_reg[i] = sc_h * (_Float16)(float)(((pk) >> (sh)) & 0xFu) + zp_h

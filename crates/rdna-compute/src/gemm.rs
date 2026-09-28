@@ -29399,13 +29399,16 @@ impl Gpu {
             }
         }
         self.bind_thread()?;
-        // Small-N eager HIP: exact-gfx1100 RAW-slab ldsstage default-on via
+        // Small-N eager HIP: exact-gfx1100/gfx1101 RAW-slab ldsstage via
         // flags.gate_up_ldsstage (HIPFIRE_GATEUP_LDSSTAGE; =0 → historical base),
-        // 1<=N<=16, K%512==0. Capture/replay and other shapes keep base block32.
+        // 1<=N<=16, K%512==0. gfx1101 admits the same tier: identical wave32
+        // WMMA, and the kernel guards were extended to __gfx1101__. The kernel
+        // launches via launch_maybe_blob so it is capture-safe; unlike the
+        // historical gfx1100 contract it is admitted under HipGraph capture
+        // (verify windows need it captured, not eager). Only Redline tape
+        // recording keeps the base contract.
         let (kname, ksrc, block_x) = if !self.replay.is_recording()
-            && !self.graphs.capture_mode
-            && self.arch_caps.is_gfx1100()
-            && self.arch == "gfx1100"
+            && (self.arch == "gfx1100" || self.arch == "gfx1101")
             && (1..=16).contains(&batch_size)
             && k > 0
             && k % 512 == 0
@@ -29453,7 +29456,7 @@ impl Gpu {
             + batch_size * k * 2
             + batch_size * total_m * 4 * 2;
         let timer =
-            crate::profile::begin_timer(&self.hip, "gemm", "gemm_gate_up_mq4g256v2_wmma", bytes);
+            crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
         let result = self.launch_maybe_blob(
             kname,
             [row_tiles as u32, batch_tiles as u32, 1],
@@ -30106,8 +30109,8 @@ impl Gpu {
         // HIPFIRE_RESIDUAL_LDSSTAGE=0 to restore the split-K table path.
         if !self.replay.is_recording()
             && !self.flags.residual_ksplit_off
-            && self.arch_caps.is_gfx1100()
-            && self.arch == "gfx1100"
+            && self.arch_caps.is_rdna3_dgpu()
+            && (self.arch == "gfx1100" || self.arch == "gfx1101")
             && batch_size <= 16
         {
             match Self::residual_verify_tier(
@@ -30467,11 +30470,13 @@ impl Gpu {
                 ),
             ));
         }
-        if !(self.arch_caps.is_gfx1100() && self.arch == "gfx1100") {
+        if !(self.arch_caps.is_rdna3_dgpu()
+            && (self.arch == "gfx1100" || self.arch == "gfx1101"))
+        {
             return Err(hip_bridge::HipError::new(
                 1,
                 &format!(
-                    "gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds: exact gfx1100 required (got {})",
+                    "gemm_mq4g256v2_residual_wmma_gfx1100_ksplit_lds: exact gfx1100/gfx1101 required (got {})",
                     self.arch
                 ),
             ));
@@ -30580,11 +30585,13 @@ impl Gpu {
             }
             return self.gemm_mq4g256v2_residual_wmma(a_raw, x, y, m, k, batch_size);
         }
-        if !(self.arch_caps.is_gfx1100() && self.arch == "gfx1100") {
+        if !(self.arch_caps.is_rdna3_dgpu()
+            && (self.arch == "gfx1100" || self.arch == "gfx1101"))
+        {
             return Err(hip_bridge::HipError::new(
                 1,
                 &format!(
-                    "gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage: exact gfx1100 required (got {})",
+                    "gemm_mq4g256v2_residual_wmma_gfx1100_ldsstage: exact gfx1100/gfx1101 required (got {})",
                     self.arch
                 ),
             ));

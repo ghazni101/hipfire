@@ -580,8 +580,10 @@ impl FeatureFlags {
             graph_moe: value("HIPFIRE_GRAPH_MOE").ok().as_deref() != Some("0"),
             force_blob_path: value("HIPFIRE_BLOB_FORCE").ok().as_deref() == Some("1"),
             residual_ksplit_off: value("HIPFIRE_RESIDUAL_KSPLIT_OFF").ok().as_deref() == Some("1"),
-            residual_ldsstage: parse_bool("HIPFIRE_RESIDUAL_LDSSTAGE").unwrap_or(arch == "gfx1100"),
-            gate_up_ldsstage: parse_bool("HIPFIRE_GATEUP_LDSSTAGE").unwrap_or(arch == "gfx1100"),
+            residual_ldsstage: parse_bool("HIPFIRE_RESIDUAL_LDSSTAGE")
+                .unwrap_or(matches!(arch, "gfx1100" | "gfx1101")),
+            gate_up_ldsstage: parse_bool("HIPFIRE_GATEUP_LDSSTAGE")
+                .unwrap_or(matches!(arch, "gfx1100" | "gfx1101")),
             gfx12_mq4v2_fp8_gateup: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_GATEUP")
                 .unwrap_or(arch == "gfx1201"),
             gfx12_mq4v2_fp8_resid: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_RESID")

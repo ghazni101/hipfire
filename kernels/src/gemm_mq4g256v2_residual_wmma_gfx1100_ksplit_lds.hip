@@ -31,7 +31,7 @@
 
 typedef _Float16 __attribute__((ext_vector_type(16))) half16_t;
 typedef float    __attribute__((ext_vector_type(8))) float8_t;
-#if defined(__gfx1100__)
+#if defined(__gfx1100__) || defined(__gfx1101__)
 // Exact nibble integers 0..15: RTZ == RN bit-for-bit (exact in f16 and f32).
 __device__ __forceinline__ __half2 pkrtz_nibble2(float a, float b) {
     const auto v = __builtin_amdgcn_cvt_pkrtz(a, b);
