@@ -1203,6 +1203,7 @@ impl Rig {
             hipfire_runtime::kv_mode::KvMode::Fwht3 => 32,
             hipfire_runtime::kv_mode::KvMode::Fwht4 => 42,
             hipfire_runtime::kv_mode::KvMode::Bf16 => 12,
+            hipfire_runtime::kv_mode::KvMode::F16 => 13,
             hipfire_runtime::kv_mode::KvMode::Asym3Auto => {
                 return Err("Asym3Auto sentinel reached Rig::build".to_string());
             }

@@ -173,14 +173,20 @@ pub const MAPLE_POLICY: KvModePolicy = KvModePolicy {
 };
 
 /// Site 8 — the multi-slot serve engine (qwen35). The slots engine ran
-/// Q8_0-only for its whole life; the full static ladder is now wired
-/// end-to-end (descriptor-aware K writers + flash tile kernels, legacy and
-/// paged pools), so every tier the sequential path accepts is accepted here
-/// too. The DEFAULT stays q8 — deliberately NOT the sequential site's
-/// asym3: the slots q8 path has production mileage on every fixture, and
-/// an operator who wants a rotated tier on the slots engine says so
-/// explicitly (`HIPFIRE_KV_MODE=asym3` / config). "auto" therefore means
-/// q8 HERE (mirroring the qwen35-pp site's convention, not the hfq site's).
+/// Q8_0-only for its whole life; the static ladder is now wired end-to-end
+/// (descriptor-aware K writers + flash tile kernels, legacy and paged
+/// pools) — q8 through asym{2,3,4}/fwht{2,3,4} plus the flat 16-bit tiers
+/// bf16 and f16. The DEFAULT stays q8 — deliberately NOT the sequential
+/// site's asym3: the slots q8 path has production mileage on every fixture,
+/// and an operator who wants a rotated or flat tier on the slots engine
+/// says so explicitly (`HIPFIRE_KV_MODE=asym3|bf16|f16` / config). "auto"
+/// therefore means q8 HERE (mirroring the qwen35-pp site's convention, not
+/// the hfq site's).
+///
+/// bf16/f16 admit here because the slots path is contiguous-only with
+/// descriptor-driven batched write/attend kernels for both flat tiers —
+/// unlike maple they never face the sliding-window gap (qwen35's DeltaNet
+/// layers carry no KV at all; the FA layers' attention is full-causal).
 fn normalize_slots(raw: &str) -> Option<KvMode> {
     match raw {
         "q8" | "auto" | "" => Some(Q8),
@@ -190,13 +196,19 @@ fn normalize_slots(raw: &str) -> Option<KvMode> {
         "fwht2" => Some(Fwht2),
         "fwht3" => Some(Fwht3),
         "fwht4" => Some(Fwht4),
-        _ => None, // garbage → default (+warn); bf16 not allocatable here
+        // Flat 2-byte tiers: descriptor-aware write + attend kernels exist
+        // for both on the slots path. Deliberately normalized ONLY here —
+        // no other site can allocate f16, and qwen35 sequential still
+        // cannot allocate bf16 (see the normalize_full comment).
+        "bf16" => Some(Bf16),
+        "f16" => Some(F16),
+        _ => None, // garbage → default (+warn)
     }
 }
 pub const QWEN35_SLOTS_POLICY: KvModePolicy = KvModePolicy {
     site: "qwen35-slots",
     normalize_alias: normalize_slots,
-    accepted: FULL_LADDER,
+    accepted: &[Q8, Asym2, Asym3, Asym4, Fwht2, Fwht3, Fwht4, Bf16, F16],
     default: Q8,
 };
 
@@ -290,6 +302,34 @@ mod tests {
                 p.site
             );
         }
+    }
+
+    #[test]
+    fn f16_is_slots_only() {
+        // NEGATIVE CONTROL: "f16" must not leak into the other sites. The
+        // flat fp16 tier exists only on the slots engine — normalizing it
+        // elsewhere would let HIPFIRE_KV_MODE=f16 silently fall to that
+        // site's default without a warning.
+        for p in [
+            &QWEN35_HFQ_POLICY,
+            &QWEN35_PARO_POLICY,
+            &LLAMA_HFQ_POLICY,
+            &QWEN35_PP_POLICY,
+            &DIR_SAFETENSORS_POLICY,
+            &MAPLE_POLICY,
+        ] {
+            let r = resolve("f16", p);
+            assert_ne!(r.mode, KvMode::F16, "site {} must not accept f16", p.site);
+            assert!(
+                r.warning.is_some(),
+                "site {} must WARN on f16, not silently default",
+                p.site
+            );
+        }
+        // The slots site is the one place it IS honored — and bf16 now has
+        // two honored sites (maple + slots).
+        assert_eq!(resolve("f16", &QWEN35_SLOTS_POLICY).mode, KvMode::F16);
+        assert_eq!(resolve("bf16", &QWEN35_SLOTS_POLICY).mode, KvMode::Bf16);
     }
 
     #[test]
@@ -402,11 +442,13 @@ mod tests {
             assert_eq!(r.mode, mode, "{raw} must be honored on the slots site");
             assert!(r.warning.is_none(), "{raw} must not warn");
         }
-        // bf16 is not allocatable on this site: refuse to the default WITH
-        // a warning (never a silent downgrade).
-        let r = resolve("bf16", p);
-        assert_eq!(r.mode, KvMode::Q8);
-        assert!(r.warning.is_some());
+        // The flat 16-bit tiers are honored too — the slots engine has
+        // descriptor-aware write + attend kernels for both layouts.
+        for (raw, mode) in [("bf16", KvMode::Bf16), ("f16", KvMode::F16)] {
+            let r = resolve(raw, p);
+            assert_eq!(r.mode, mode, "{raw} must be honored on the slots site");
+            assert!(r.warning.is_none(), "{raw} must not warn");
+        }
         let garbage = resolve("garbage", p);
         assert_eq!(garbage.mode, KvMode::Q8);
         assert!(garbage.warning.is_some());

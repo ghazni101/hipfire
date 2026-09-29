@@ -1867,10 +1867,11 @@ pub fn validate_load_caps(msg: &serde_json::Value) -> Option<String> {
     {
         return Some("adaptive KV not supported in experimental multi-slot".to_string());
     }
-    // The slot engine resolves the full static KV ladder (q8, asym{2,3,4},
-    // fwht{2,3,4}); the per-load string must be one the slots policy accepts.
-    // Rejected here — loudly, before any GPU work — rather than silently
-    // downgraded to the q8 default by the engine-side resolve.
+    // The slot engine resolves the static KV ladder plus the flat 16-bit
+    // tiers (q8, asym{2,3,4}, fwht{2,3,4}, bf16, f16); the per-load string
+    // must be one the slots policy accepts. Rejected here — loudly, before
+    // any GPU work — rather than silently downgraded to the q8 default by
+    // the engine-side resolve.
     if let Some(raw) = params
         .and_then(|p| p.get("kv_mode"))
         .and_then(|v| v.as_str())
@@ -1883,8 +1884,8 @@ pub fn validate_load_caps(msg: &serde_json::Value) -> Option<String> {
         if resolved.warning.is_some() {
             return Some(format!(
                 "experimental multi-slot does not support kv_mode='{raw}' \
-                 (accepted: q8|asym2|asym3|asym4|fwht2|fwht3|fwht4; 'auto'/unset \
-                 = q8)"
+                 (accepted: q8|asym2|asym3|asym4|fwht2|fwht3|fwht4|bf16|f16; \
+                 'auto'/unset = q8)"
             ));
         }
     }

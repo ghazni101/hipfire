@@ -17,8 +17,14 @@ pub enum KvMode {
     /// Flat 2-byte BF16 K/V. NOT part of the quantized ladder: no rotation, no
     /// per-block scale, and no VMM / adaptive / compaction support. Only a
     /// site whose `accepted` list names it can ever resolve to it — today that
-    /// is maple alone, so every other site's behaviour is unchanged.
+    /// is the slots engine and maple, so every other site's behaviour is
+    /// unchanged.
     Bf16,
+    /// Flat 2-byte IEEE fp16 K/V — the same layout as BF16 with the true
+    /// half format (better small-magnitude precision, narrower exponent
+    /// range). Same constraints: no rotation, no scales, no VMM, no
+    /// adaptive/compaction. Slots-engine tier.
+    F16,
     Asym2,
     Asym3,
     Asym4,
@@ -405,11 +411,11 @@ impl SlotKvTierPlan {
                 }
                 (head_dim / 32) * 34
             }
-            // Bf16 is flat 2 bytes/element with no per-head blocks and no
-            // rotation table. It is allocatable by the maple site only —
-            // whether a given engine ACCEPTS the tier is its policy's call
-            // (see kv_mode.rs); this helper just describes the layout.
-            KvMode::Bf16 => {
+            // Bf16 and F16 are flat 2 bytes/element with no per-head blocks
+            // and no rotation table. Whether a given engine ACCEPTS the tier
+            // is its policy's call (see kv_mode.rs); this helper just
+            // describes the layout.
+            KvMode::Bf16 | KvMode::F16 => {
                 let kv_dim = n_kv_heads
                     .checked_mul(head_dim)
                     .ok_or_else(|| hip_bridge::HipError::new(0, "slot KV kv_dim overflowed"))?;
@@ -435,16 +441,17 @@ impl SlotKvTierPlan {
             }
         };
         let k_bytes_per_pos = match mode {
-            // bf16's stride is already per-position (kv_dim flat elements, no
-            // per-head blocks) — it must NOT be scaled by n_kv_heads again.
-            KvMode::Bf16 => k_bph,
+            // Flat 2-byte tiers: the stride is already per-position (kv_dim
+            // flat elements, no per-head blocks) — it must NOT be scaled by
+            // n_kv_heads again.
+            KvMode::Bf16 | KvMode::F16 => k_bph,
             _ => n_kv_heads
                 .checked_mul(k_bph)
                 .ok_or_else(|| hip_bridge::HipError::new(0, "slot KV K stride overflowed"))?,
         };
         let v_bytes_per_pos = match mode {
             // bf16 V is flat like its K.
-            KvMode::Bf16 => k_bytes_per_pos,
+            KvMode::Bf16 | KvMode::F16 => k_bytes_per_pos,
             _ => {
                 // Static multi-slot ladder stores V at Q8_0 — the same
                 // per-head layout the asym/fwht constructors allocate.
@@ -587,9 +594,9 @@ impl KvCache {
             // BF16 is contiguous-only. It has no growable-arena constructor, so
             // refuse here rather than compute a stride for a layout the VMM
             // path cannot actually allocate.
-            KvMode::Bf16 => Err(hip_bridge::HipError::new(
+            KvMode::Bf16 | KvMode::F16 => Err(hip_bridge::HipError::new(
                 0,
-                "VMM does not support bf16 KV (contiguous backend only)",
+                "VMM does not support flat 16-bit KV (contiguous backend only)",
             )),
             KvMode::Asym2 | KvMode::Fwht2 => head_dim
                 .checked_div(4)
@@ -673,9 +680,9 @@ impl KvCache {
                     ));
                 }
             }
-            // Fail closed: bf16 has no VMM constructor. Callers that want bf16
-            // must use the contiguous backend.
-            KvMode::Bf16 => {
+            // Fail closed: the flat 16-bit tiers have no VMM constructor.
+            // Callers that want bf16/f16 must use the contiguous backend.
+            KvMode::Bf16 | KvMode::F16 => {
                 return Err(hip_bridge::HipError::new(
                     0,
                     "VMM does not support bf16 KV (contiguous backend only)",
@@ -777,7 +784,7 @@ impl KvCache {
             // Unrotated, like Q8. Unreachable in practice — the validate above
             // rejects bf16 for VMM before this runs — but 0 is the honest
             // answer for a tier with no rotation table.
-            KvMode::Bf16 => 0,
+            KvMode::Bf16 | KvMode::F16 => 0,
             // Sentinel: unreachable — resolve() rejects Asym3Auto before any
             // VMM constructor runs.
             KvMode::Asym3Auto => 0,
@@ -958,7 +965,7 @@ impl KvCache {
             // F32 kernels, which read it at twice the stride. It can never
             // legitimately arrive: `validate_vmm_mode` rejects bf16 before any
             // VMM constructor runs. Panic loudly rather than return a lie.
-            KvMode::Bf16 => panic!(
+            KvMode::Bf16 | KvMode::F16 => panic!(
                 "vmm_mode_flags: bf16 has no VMM layout — it is contiguous-only \
                  and should have been rejected by validate_mode_with_backend"
             ),
@@ -4381,7 +4388,7 @@ mod vmm_layout_tests {
             KvMode::Asym3 | KvMode::Fwht3 => 4 + (head_dim * 3) / 8,
             KvMode::Asym4 | KvMode::Fwht4 => 4 + head_dim / 2,
 
-            KvMode::Bf16 => panic!("bf16 is not a VMM layout mode"),
+            KvMode::Bf16 | KvMode::F16 => panic!("flat 16-bit is not a VMM layout mode"),
             KvMode::Asym3Auto => panic!("Asym3Auto is not a VMM layout mode"),
         }
     }
