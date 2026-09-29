@@ -246,8 +246,9 @@ pub enum InsertError {
     },
     /// A page handle failed validation against the pool (stale/free).
     InvalidHandle(String),
-    /// A handle's token_offset is not page-aligned or handle count doesn't
-    /// match the number of full pages.
+    /// A handle's `token_offset` is not exactly its positional page start
+    /// (`i * PAGE_TOKENS`) or handle count doesn't match the number of
+    /// full pages.
     MisalignedHandle,
     /// The retained-cache byte ceiling (`max_retained_bytes`) cannot hold
     /// this publish even after evicting every unpinned leaf (spec §4.4).
@@ -274,7 +275,7 @@ impl std::fmt::Display for InsertError {
             ),
             Self::InvalidHandle(s) => write!(f, "invalid page handle: {}", s),
             Self::MisalignedHandle => {
-                write!(f, "misaligned page handle (not page-aligned or count mismatch)")
+                write!(f, "misaligned page handle (non-positional offset or count mismatch)")
             }
             Self::CacheByteBoundExceeded { retained, max } => write!(
                 f,
@@ -676,9 +677,14 @@ impl PrefixIndex {
         checkpoint: Option<CheckpointId>,
         pool: &mut PagePool,
     ) -> Result<(), InsertError> {
-        // Validate handles.
-        for h in handles {
-            if h.token_offset % PAGE_TOKENS as u64 != 0 {
+        // Validate handles. insert_into_tree publishes handles purely
+        // POSITIONALLY (handle slot i covers tokens[i*PAGE_TOKENS..]), so a
+        // handle whose declared offset is not exactly i*PAGE_TOKENS — or a
+        // reordered handle list — would silently publish a page at the
+        // wrong token position: shared KV mapped to the wrong span is
+        // cross-session corruption, so the insert is refused.
+        for (i, h) in handles.iter().enumerate() {
+            if h.token_offset != i as u64 * PAGE_TOKENS as u64 {
                 return Err(InsertError::MisalignedHandle);
             }
             pool.validate_handle(&h.handle)
@@ -1552,6 +1558,21 @@ mod tests {
         (pool, handles)
     }
 
+    /// Copy a handle slice with `token_offset` renumbered to its position
+    /// in THIS key's page list (`i * PAGE_TOKENS`) — `insert` requires
+    /// positional offsets, so a slice of a shared fixture's page table
+    /// must be rebased before publishing it under a new key.
+    fn positional(handles: &[Handle]) -> Vec<Handle> {
+        handles
+            .iter()
+            .enumerate()
+            .map(|(i, h)| Handle {
+                handle: h.handle,
+                token_offset: (i * PAGE_TOKENS) as u64,
+            })
+            .collect()
+    }
+
     fn make_tokens(n: usize) -> Vec<u32> {
         (0..n).map(|i| (i % 1000) as u32 + 1).collect()
     }
@@ -2118,7 +2139,7 @@ mod tests {
         // Insert A (root + 1 node = 2 total).
         idx.insert(&domain, &tokens_a, &handles[..1], Some(CheckpointId(1)), &mut pool).unwrap();
         // Insert B (root + 2 nodes = 3 total).
-        idx.insert(&domain, &tokens_b, &handles[1..2], Some(CheckpointId(2)), &mut pool).unwrap();
+        idx.insert(&domain, &tokens_b, &positional(&handles[1..2]), Some(CheckpointId(2)), &mut pool).unwrap();
 
         // Pin both leaves: insert-time eviction (spec §4.4) may reclaim
         // unpinned leaves to make room, so the bound only refuses when
@@ -2128,7 +2149,7 @@ mod tests {
 
         // Third insert should fail (would need 4 nodes > max 3, and no
         // leaf is evictable).
-        let result = idx.insert(&domain, &tokens_c, &handles[2..3], Some(CheckpointId(3)), &mut pool);
+        let result = idx.insert(&domain, &tokens_c, &positional(&handles[2..3]), Some(CheckpointId(3)), &mut pool);
         assert!(
             matches!(result, Err(InsertError::CpuNodeBoundExceeded { .. })),
             "third insert should fail, got {result:?}"
@@ -2148,13 +2169,13 @@ mod tests {
         let tokens_c = make_tokens_from(2000, PAGE_TOKENS);
 
         idx.insert(&domain, &tokens_a, &handles[..1], Some(CheckpointId(1)), &mut pool).unwrap();
-        idx.insert(&domain, &tokens_b, &handles[1..2], Some(CheckpointId(2)), &mut pool).unwrap();
+        idx.insert(&domain, &tokens_b, &positional(&handles[1..2]), Some(CheckpointId(2)), &mut pool).unwrap();
 
         // Evict to make room for 1 more node.
         idx.evict_for_capacity(&mut pool, 1).unwrap();
 
         // Now insert should succeed.
-        let result = idx.insert(&domain, &tokens_c, &handles[2..3], Some(CheckpointId(3)), &mut pool);
+        let result = idx.insert(&domain, &tokens_c, &positional(&handles[2..3]), Some(CheckpointId(3)), &mut pool);
         assert!(result.is_ok(), "insert after eviction should succeed, got {result:?}");
     }
 
@@ -2183,6 +2204,34 @@ mod tests {
         let tokens = make_tokens(PAGE_TOKENS * 2);
         let result = index.publish_sealed_pages(&domain, &tokens, &handles, Some(CheckpointId(1)), &mut pool);
         assert!(result.is_ok());
+    }
+
+    /// `insert` is positional: `handles[i]` covers `tokens[i*PAGE_TOKENS..]`,
+    /// so a handle whose declared `token_offset` is not `i*PAGE_TOKENS` —
+    /// page-aligned but wrong (reordered, or sliced out of a shared page
+    /// table with global offsets) — must be refused, not published at the
+    /// wrong token span.
+    #[test]
+    fn insert_refuses_non_positional_token_offsets() {
+        let (mut pool, handles) = setup_pool_and_pages(2);
+        let mut index = PrefixIndex::new(1000);
+        let domain = sample_domain(1);
+        let tokens = make_tokens(PAGE_TOKENS * 2);
+
+        // Second handle declares offset 0 — aligned, but not its position.
+        let mut bad = handles.clone();
+        bad[1].token_offset = 0;
+        let r = index.insert(&domain, &tokens, &bad, Some(CheckpointId(1)), &mut pool);
+        assert_eq!(r, Err(InsertError::MisalignedHandle));
+
+        // A slice of a shared page table carries global, not positional,
+        // offsets — same refusal.
+        let r = index.insert(&domain, &tokens, &handles[1..2].iter().chain(&handles[..1]).cloned().collect::<Vec<_>>(), Some(CheckpointId(1)), &mut pool);
+        assert_eq!(r, Err(InsertError::MisalignedHandle));
+
+        // Refusal is clean: nothing was published.
+        let (r, _h, _t) = index.lookup_with_pages(&domain, &tokens, &pool, None);
+        assert!(matches!(r, PrefixLookupResult::Miss(_)));
     }
 
     // ── inspect returns counts without pinning ────────────────────────
@@ -2310,7 +2359,7 @@ mod tests {
             .insert(
                 &domain,
                 &b,
-                &handles[1..2],
+                &positional(&handles[1..2]),
                 Some(CheckpointId(2)),
                 &mut pool,
             )
@@ -2440,14 +2489,14 @@ mod tests {
 
         // And the bound still binds: exactly one more 1-page insert fits.
         let tokens_b = make_tokens_from(1000, PAGE_TOKENS);
-        idx.insert(&domain, &tokens_b, &handles[1..2], Some(CheckpointId(2)), &mut pool)
+        idx.insert(&domain, &tokens_b, &positional(&handles[1..2]), Some(CheckpointId(2)), &mut pool)
             .unwrap();
         assert_eq!(idx.total_nodes(), 3);
         // A 4th node would exceed the bound, but B's leaf is unpinned:
         // insert-time eviction reclaims it and the insert succeeds (spec
         // §4.4: reclaim cache-only pages before rejecting work).
         let tokens_d = make_tokens_from(3000, PAGE_TOKENS);
-        idx.insert(&domain, &tokens_d, &handles[2..3], Some(CheckpointId(4)), &mut pool)
+        idx.insert(&domain, &tokens_d, &positional(&handles[2..3]), Some(CheckpointId(4)), &mut pool)
             .unwrap();
         assert_eq!(idx.total_nodes(), 3);
         // B's evicted prefix misses; A's pinned prefix still hits.
@@ -2485,7 +2534,7 @@ mod tests {
         let result = index.insert(
             &domain,
             &tokens_b,
-            &handles[1..2],
+            &positional(&handles[1..2]),
             Some(CheckpointId(2)),
             &mut pool,
         );
@@ -2515,7 +2564,7 @@ mod tests {
         // And the bound still binds: exactly one more node fits.
         let tokens_c = make_tokens_from(4000, PAGE_TOKENS);
         index
-            .insert(&domain, &tokens_c, &handles[2..3], Some(CheckpointId(3)), &mut pool)
+            .insert(&domain, &tokens_c, &positional(&handles[2..3]), Some(CheckpointId(3)), &mut pool)
             .unwrap();
         assert_eq!(index.total_nodes(), 3);
     }
@@ -2587,7 +2636,7 @@ mod tests {
         tokens_b.extend(make_tokens_from(9000, PAGE_TOKENS / 2));
         assert_eq!(tokens_b.len(), PAGE_TOKENS * 2);
         index
-            .insert(&domain, &tokens_b, &handles[2..4], Some(CheckpointId(2)), &mut pool)
+            .insert(&domain, &tokens_b, &positional(&handles[2..4]), Some(CheckpointId(2)), &mut pool)
             .unwrap();
 
         // The fork added the zero-page split marker plus B's one-page chain
@@ -2642,7 +2691,7 @@ mod tests {
         let mut tokens_b = tokens_a[..60].to_vec();
         tokens_b.extend(make_tokens_from(5000, PAGE_TOKENS * 2 - 60));
         index
-            .insert(&domain, &tokens_b, &handles[2..4], Some(CheckpointId(2)), &mut pool)
+            .insert(&domain, &tokens_b, &positional(&handles[2..4]), Some(CheckpointId(2)), &mut pool)
             .expect("mid-page fork must insert");
         assert_eq!(
             index.retained_bytes(),
@@ -2661,7 +2710,7 @@ mod tests {
             .insert(&domain, &tokens_a, &handles2[..2], None, &mut pool2)
             .unwrap();
         index2
-            .insert(&domain, &tokens_b, &handles2[2..4], None, &mut pool2)
+            .insert(&domain, &tokens_b, &positional(&handles2[2..4]), None, &mut pool2)
             .unwrap();
         index2
             .insert(&domain, &tokens_c, &handles2[..1], None, &mut pool2)
@@ -2689,7 +2738,7 @@ mod tests {
         let mut tokens_b = tokens_a[..60].to_vec();
         tokens_b.extend(make_tokens_from(5000, PAGE_TOKENS * 2 - 60));
         index
-            .insert(&domain, &tokens_b, &handles[2..4], Some(CheckpointId(2)), &mut pool)
+            .insert(&domain, &tokens_b, &positional(&handles[2..4]), Some(CheckpointId(2)), &mut pool)
             .expect("mid-page fork must insert");
 
         // A still hits fully.
@@ -2761,7 +2810,7 @@ mod tests {
         let mut tokens_b = tokens_a[..PAGE_TOKENS].to_vec();
         tokens_b.extend(make_tokens_from(5000, PAGE_TOKENS));
         index
-            .insert(&domain, &tokens_b, &handles[2..4], Some(CheckpointId(2)), &mut pool)
+            .insert(&domain, &tokens_b, &positional(&handles[2..4]), Some(CheckpointId(2)), &mut pool)
             .unwrap();
 
         let (ra, _ha, _ta) = index.lookup_with_pages(&domain, &tokens_a, &pool, None);

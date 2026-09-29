@@ -117,12 +117,12 @@ pub struct DflashSlotState {
     /// Trunk DN snapshot taken before each verify forward; restored on
     /// partial accept before the tape replay.
     pub trunk_snap: DeltaNetSnapshot,
-    /// Session this draft context belongs to (None = fresh/unseeded). A
-    /// continuation request on the same session reuses the seeded prefix;
-    /// any other occupant forces a reset.
-    pub session: Option<u64>,
     /// Rows of `target_hidden` already seeded/committed — the thlog
-    /// watermark mirror used to detect prefix reuse.
+    /// watermark mirror used to detect prefix reuse. This is the ONLY reuse
+    /// gate: the ctx K/V rings and target_hidden are position-keyed, so a
+    /// continuation hit (`seeded_through == plan.reused`) is content-identical
+    /// regardless of which session seeded it — cross-session reuse needs no
+    /// session-affinity check.
     pub seeded_through: usize,
     /// In-flight draft output between the draft step and the verify accept.
     pub draft: Option<DflashSlotDraft>,
@@ -376,22 +376,11 @@ pub fn new_dflash_slot_state(
         scratch,
         verify_scratch,
         trunk_snap,
-        session: None,
         seeded_through: 0,
         draft: None,
     })
 }
 
-/// Reset the slot's draft context for a new occupant: drop the thlog
-/// watermarks so the next prefill re-seeds `target_hidden` from row 0.
-/// The ctx K/V rings are position-keyed and get overwritten row-by-row —
-/// no explicit clear needed (same invariant the sequential path relies on).
-pub fn reset_dflash_slot(st: &mut DflashSlotState, session: u64) {
-    st.scratch.reset_upload_tracking();
-    st.session = Some(session);
-    st.seeded_through = 0;
-    st.draft = None;
-}
 
 /// `target_hidden` is interleaved `[pos % modulus][layer][h]` — one
 /// `scatter_hidden_block_to_interleaved`-style copy per extract layer.

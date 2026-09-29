@@ -62,9 +62,12 @@ pub struct SlotSnapshot {
     pub stamp: SnapshotStamp,
     pub seq_len: usize,
     pub tokens: Vec<u32>,
-    /// Per FA layer in model order: `seq_len × per_pos_bytes` of K then the
-    /// same span of V; then the DeltaNet state buffers in `DeltaNetState`'s
-    /// own order (s_matrices, s_scales, conv_states, s_ef_residual).
+    /// All K arenas first (per FA layer in model order, `seq_len ×
+    /// per_pos_bytes` each), then all V arenas (`seq_len × per_pos_v_bytes`
+    /// each) — K0..Kn,V0..Vn, NOT per-layer interleaved — then the DeltaNet
+    /// state buffers in `DeltaNetState`'s own order (s_matrices, s_scales,
+    /// conv_states, s_ef_residual). `expected_len` sums the same byte total
+    /// either way, so its arithmetic coincides for both readings.
     pub payload: Vec<u8>,
     pub checksum: u64,
 }

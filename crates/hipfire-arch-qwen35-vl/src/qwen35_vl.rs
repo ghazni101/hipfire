@@ -1049,6 +1049,166 @@ pub struct VisionTowerJob {
     t0: std::time::Instant,
 }
 
+/// Bookkeeping for the tower prologue: `GpuTensor` has no `Drop`, so every
+/// `?` between the first allocation and `Self` construction would strand the
+/// live tensors on device, monotonically shrinking usable VRAM across failed
+/// vision requests. `VisionTowerJob::new` used to leak `x_patches` on a
+/// `linear_f16` error while `new_patches` freed it on the same arm — the
+/// asymmetry is why both constructors now funnel through `vision_prologue`.
+struct PrologueTensors {
+    /// Hidden residual `[n, h]` once patch-embed has run.
+    x: Option<GpuTensor>,
+    /// Interpolated position embedding; released right after the add.
+    pos_embed: Option<GpuTensor>,
+    rope_cos: Option<GpuTensor>,
+    rope_sin: Option<GpuTensor>,
+}
+
+impl PrologueTensors {
+    /// Free every tensor still held. Nonfatal (`let _`) frees: the original
+    /// error is what the caller propagates, same convention as the
+    /// `x_patches` error arm below.
+    fn free_all(&mut self, gpu: &mut Gpu) {
+        for slot in [
+            &mut self.x,
+            &mut self.pos_embed,
+            &mut self.rope_cos,
+            &mut self.rope_sin,
+        ] {
+            if let Some(t) = slot.take() {
+                let _ = gpu.free_tensor(t);
+            }
+        }
+    }
+
+    /// Success exit: the three tensors `VisionTowerJob` owns. Presence is a
+    /// prologue invariant — the only path past the last `?` sets all three.
+    fn into_parts(self) -> (GpuTensor, GpuTensor, GpuTensor) {
+        (
+            self.x.expect("prologue sets x"),
+            self.rope_cos.expect("prologue sets rope_cos"),
+            self.rope_sin.expect("prologue sets rope_sin"),
+        )
+    }
+}
+
+/// Shared tower prologue behind [`VisionTowerJob::new`] /
+/// [`VisionTowerJob::new_patches`]: patch-embed `x_patches` (consumed either
+/// way), interpolate + add the learned position embedding, upload the 2D rope
+/// tables. `held` collects every tensor the moment it exists; on error
+/// everything allocated so far is freed before the error propagates.
+fn vision_prologue(
+    gpu: &mut Gpu,
+    weights: &VisionWeights,
+    config: &VisionConfig,
+    x_patches: GpuTensor,
+    grid_h: usize,
+    grid_w: usize,
+    n: usize,
+    patch_dim: usize,
+    dd: Option<&std::path::Path>,
+) -> HipResult<(GpuTensor, GpuTensor, GpuTensor)> {
+    let mut held = PrologueTensors {
+        x: None,
+        pos_embed: None,
+        rope_cos: None,
+        rope_sin: None,
+    };
+    let h = config.hidden_size;
+
+    let run = |gpu: &mut Gpu, held: &mut PrologueTensors| -> HipResult<()> {
+        // Patch embedding: linear_f16 → [n, h]. Last use of the owned input:
+        // release it here — not at tower end — on both success and failure.
+        let x = match linear_f16(
+            gpu,
+            &weights.patch_embed_w,
+            &x_patches,
+            &weights.patch_embed_b,
+            h,
+            patch_dim,
+            n,
+        ) {
+            Ok(x) => {
+                gpu.free_tensor(x_patches)?;
+                x
+            }
+            Err(e) => {
+                let _ = gpu.free_tensor(x_patches);
+                return Err(e);
+            }
+        };
+        held.x = Some(x);
+        vl_dump_tensor(gpu, dd, "patch_embed", held.x.as_ref().expect("set above"), &[n, h])?;
+
+        // Bilinear-interpolate the learned (K×K, h) pos_embed table down to
+        // the actual (grid_h, grid_w) and reorder into 2x2-grouped patch
+        // sequence, then add. HF's `fast_pos_embed_interpolate`.
+        let num_grid_per_side = (config.num_position_embeddings as f64).sqrt().round() as usize;
+        // Defensive re-check (never a panic): `load_vision_weights` already
+        // refused a non-square table at model load, so reaching here with one
+        // means the weights bypassed that loader. A typed error keeps the
+        // engine thread alive instead of poisoning every slot.
+        if num_grid_per_side == 0
+            || num_grid_per_side * num_grid_per_side != config.num_position_embeddings
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "num_position_embeddings ({}) must be a perfect square",
+                    config.num_position_embeddings
+                ),
+            ));
+        }
+        let pos_embed_interp = fast_pos_embed_interpolate(
+            &weights.pos_embed,
+            h,
+            grid_h,
+            grid_w,
+            num_grid_per_side,
+            config.spatial_merge_size,
+        );
+        held.pos_embed = Some(gpu.upload_f32(&pos_embed_interp, &[n * h])?);
+        gpu.add_inplace_f32(
+            held.x.as_ref().expect("set above"),
+            held.pos_embed.as_ref().expect("set above"),
+        )?;
+        gpu.free_tensor(held.pos_embed.take().expect("set above"))?;
+        vl_dump_tensor(
+            gpu,
+            dd,
+            "post_pos_embed",
+            held.x.as_ref().expect("set above"),
+            &[n, h],
+        )?;
+        if let Some(d) = dd {
+            vl_dump_slice(d, "pos_embed_interp", &pos_embed_interp, &[n, h]);
+        }
+
+        // The kernel reads `head_dim/2` floats per token for each of cos/sin
+        // (HF's `cat((rope, rope), dim=-1)` makes the two head_dim halves see
+        // the same angle, so we store the half only).
+        let rot_dim_half = config.head_dim / 2;
+        let (rope_cos, rope_sin) = compute_vision_rope_cos_sin(
+            grid_h,
+            grid_w,
+            config.head_dim,
+            config.spatial_merge_size,
+            config.rope_theta,
+        );
+        held.rope_cos = Some(gpu.upload_f32(&rope_cos, &[n * rot_dim_half])?);
+        held.rope_sin = Some(gpu.upload_f32(&rope_sin, &[n * rot_dim_half])?);
+        Ok(())
+    };
+
+    match run(gpu, &mut held) {
+        Ok(()) => Ok(held.into_parts()),
+        Err(e) => {
+            held.free_all(gpu);
+            Err(e)
+        }
+    }
+}
+
 impl VisionTowerJob {
     /// Tower prologue: upload patches, patch-embed, interpolate + add the
     /// learned position embedding, upload the 2D rope tables.
@@ -1060,7 +1220,6 @@ impl VisionTowerJob {
         grid_h: usize,
         grid_w: usize,
     ) -> HipResult<Self> {
-        let h = config.hidden_size;
         let n = grid_h * grid_w;
         let patch_dim = 3 * config.temporal_patch_size * config.patch_size * config.patch_size;
         let t0 = std::time::Instant::now();
@@ -1087,68 +1246,9 @@ impl VisionTowerJob {
         // Upload patches [n, patch_dim]
         let x_patches = gpu.upload_f32(patches, &[n * patch_dim])?;
 
-        // Patch embedding: linear_f16 → [n, h]
-        let x = linear_f16(
-            gpu,
-            &weights.patch_embed_w,
-            &x_patches,
-            &weights.patch_embed_b,
-            h,
-            patch_dim,
-            n,
+        let (x, rope_cos_gpu, rope_sin_gpu) = vision_prologue(
+            gpu, weights, config, x_patches, grid_h, grid_w, n, patch_dim, dd,
         )?;
-        gpu.free_tensor(x_patches)?;
-        vl_dump_tensor(gpu, dd, "patch_embed", &x, &[n, h])?;
-
-        // Bilinear-interpolate the learned (K×K, h) pos_embed table down to the
-        // actual (grid_h, grid_w) and reorder into 2x2-grouped patch sequence,
-        // then add. HF's `fast_pos_embed_interpolate`.
-        let num_grid_per_side = (config.num_position_embeddings as f64).sqrt().round() as usize;
-        // Defensive re-check (never a panic): `load_vision_weights` already
-        // refused a non-square table at model load, so reaching here with one
-        // means the weights bypassed that loader. A typed error keeps the
-        // engine thread alive instead of poisoning every slot.
-        if num_grid_per_side == 0
-            || num_grid_per_side * num_grid_per_side != config.num_position_embeddings
-        {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!(
-                    "num_position_embeddings ({}) must be a perfect square",
-                    config.num_position_embeddings
-                ),
-            ));
-        }
-        let pos_embed_interp = fast_pos_embed_interpolate(
-            &weights.pos_embed,
-            h,
-            grid_h,
-            grid_w,
-            num_grid_per_side,
-            config.spatial_merge_size,
-        );
-        let pos_embed_gpu = gpu.upload_f32(&pos_embed_interp, &[n * h])?;
-        gpu.add_inplace_f32(&x, &pos_embed_gpu)?;
-        gpu.free_tensor(pos_embed_gpu)?;
-        vl_dump_tensor(gpu, dd, "post_pos_embed", &x, &[n, h])?;
-        if let Some(d) = dd {
-            vl_dump_slice(d, "pos_embed_interp", &pos_embed_interp, &[n, h]);
-        }
-
-        // Compute the 2D rotary cos/sin tables once per image and upload. The
-        // kernel reads `head_dim/2` floats per token for each of cos/sin (HF's
-        // `cat((rope, rope), dim=-1)` makes the two head_dim halves see the same
-        // angle, so we store the half only).
-        let rot_dim_half = config.head_dim / 2;
-        let (rope_cos, rope_sin) = compute_vision_rope_cos_sin(
-            grid_h,
-            grid_w,
-            config.head_dim,
-            config.spatial_merge_size,
-            config.rope_theta,
-        );
-        let rope_cos_gpu = gpu.upload_f32(&rope_cos, &[n * rot_dim_half])?;
-        let rope_sin_gpu = gpu.upload_f32(&rope_sin, &[n * rot_dim_half])?;
 
         // Attention dispatch: the Q-tiled kernel is the production path (the
         // per-(head, query) kernel was 1.02 s/layer at a 68x68 grid on gfx1101
@@ -1186,7 +1286,6 @@ impl VisionTowerJob {
         grid_h: usize,
         grid_w: usize,
     ) -> HipResult<Self> {
-        let h = config.hidden_size;
         let n = grid_h * grid_w;
         let patch_dim = 3 * config.temporal_patch_size * config.patch_size * config.patch_size;
         let t0 = std::time::Instant::now();
@@ -1217,69 +1316,9 @@ impl VisionTowerJob {
             }
         }
 
-        // Patch embedding: linear_f16 → [n, h]. Last use of the owned input:
-        // release it here — not at tower end — on both success and failure.
-        let x = match linear_f16(
-            gpu,
-            &weights.patch_embed_w,
-            &x_patches,
-            &weights.patch_embed_b,
-            h,
-            patch_dim,
-            n,
-        ) {
-            Ok(x) => {
-                gpu.free_tensor(x_patches)?;
-                x
-            }
-            Err(e) => {
-                let _ = gpu.free_tensor(x_patches);
-                return Err(e);
-            }
-        };
-        vl_dump_tensor(gpu, dd, "patch_embed", &x, &[n, h])?;
-
-        // Bilinear-interpolate the learned (K×K, h) pos_embed table down to the
-        // actual (grid_h, grid_w) and reorder into 2x2-grouped patch sequence,
-        // then add. HF's `fast_pos_embed_interpolate`.
-        let num_grid_per_side = (config.num_position_embeddings as f64).sqrt().round() as usize;
-        if num_grid_per_side == 0
-            || num_grid_per_side * num_grid_per_side != config.num_position_embeddings
-        {
-            return Err(hip_bridge::HipError::new(
-                0,
-                &format!(
-                    "num_position_embeddings ({}) must be a perfect square",
-                    config.num_position_embeddings
-                ),
-            ));
-        }
-        let pos_embed_interp = fast_pos_embed_interpolate(
-            &weights.pos_embed,
-            h,
-            grid_h,
-            grid_w,
-            num_grid_per_side,
-            config.spatial_merge_size,
-        );
-        let pos_embed_gpu = gpu.upload_f32(&pos_embed_interp, &[n * h])?;
-        gpu.add_inplace_f32(&x, &pos_embed_gpu)?;
-        gpu.free_tensor(pos_embed_gpu)?;
-        vl_dump_tensor(gpu, dd, "post_pos_embed", &x, &[n, h])?;
-        if let Some(d) = dd {
-            vl_dump_slice(d, "pos_embed_interp", &pos_embed_interp, &[n, h]);
-        }
-
-        let rot_dim_half = config.head_dim / 2;
-        let (rope_cos, rope_sin) = compute_vision_rope_cos_sin(
-            grid_h,
-            grid_w,
-            config.head_dim,
-            config.spatial_merge_size,
-            config.rope_theta,
-        );
-        let rope_cos_gpu = gpu.upload_f32(&rope_cos, &[n * rot_dim_half])?;
-        let rope_sin_gpu = gpu.upload_f32(&rope_sin, &[n * rot_dim_half])?;
+        let (x, rope_cos_gpu, rope_sin_gpu) = vision_prologue(
+            gpu, weights, config, x_patches, grid_h, grid_w, n, patch_dim, dd,
+        )?;
 
         let attn_naive = matches!(
             hipfire_config::developer_var("HIPFIRE_VIT_ATTN").as_deref(),

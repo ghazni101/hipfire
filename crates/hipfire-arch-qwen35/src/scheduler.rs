@@ -269,7 +269,14 @@ impl Scheduler {
                         return 0;
                     }
                     page_align_take(
-                        self.chunk_size.min(left).max(prefill_min_tokens.min(left)),
+                        // min(chunk_size, max(min_quantum, left)): the floor
+                        // must never EXCEED the chunk cap — an oversized
+                        // `prefill_min_tokens` would let a single slot
+                        // swallow a whole step's budget, bypassing the
+                        // throttle it exists to enforce.
+                        self.chunk_size.min(left).max(
+                            prefill_min_tokens.min(self.chunk_size).min(left),
+                        ),
                         w.next_pos,
                         left,
                         prefill_min_tokens,

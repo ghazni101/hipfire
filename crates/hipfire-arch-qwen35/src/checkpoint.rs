@@ -99,6 +99,31 @@ pub fn prefix_fingerprint(tokens: &[u32]) -> u64 {
     }
     h
 }
+/// Fingerprints of `tokens[..p]` at every page-aligned boundary `p <= limit`,
+/// in one O(tokens) pass: `out[p / PAGE_TOKENS - 1] ==
+/// prefix_fingerprint(&tokens[..p])` for each covered boundary (FNV-1a is a
+/// rolling hash over the growing prefix, so no per-boundary re-hash is
+/// needed). Probing the pool per candidate boundary with
+/// `prefix_fingerprint` directly would re-hash the whole prefix each time —
+/// O(L) per probe, O(L²) per prefix-cache Hit admission on the serialized
+/// engine thread.
+fn page_fingerprints(tokens: &[u32], limit: u64) -> Vec<u64> {
+    let page = PAGE_TOKENS as usize;
+    let npages = (tokens.len() / page)
+        .min(usize::try_from(limit / page as u64).unwrap_or(usize::MAX));
+    let mut out = Vec::with_capacity(npages);
+    let mut h: u64 = 0xcbf29ce484222325;
+    for (i, &t) in tokens[..npages * page].iter().enumerate() {
+        for b in t.to_le_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x100000001b3);
+        }
+        if (i + 1) % page == 0 {
+            out.push(h);
+        }
+    }
+    out
+}
 
 #[derive(Debug)]
 struct CheckpointEntry<B> {
@@ -112,6 +137,12 @@ struct CheckpointEntry<B> {
 // ───────────────────────────────────────────────────────────────────────────
 // QwenCheckpointPool
 // ───────────────────────────────────────────────────────────────────────────
+
+/// Bound on the `evicted` diagnostic marker set. It only feeds
+/// [`MissReason::Evicted`] reporting (`was_evicted`), never correctness —
+/// without a cap it would accumulate a full `CheckpointKey` per eviction
+/// forever inside an otherwise byte-bounded pool.
+const EVICTED_MARKERS_CAP: usize = 4096;
 
 /// Byte-bounded LRU pool of immutable Qwen3.5 hybrid-state checkpoint
 /// bundles (spec §4.5 C5).
@@ -128,6 +159,7 @@ pub struct QwenCheckpointPool<B: CheckpointBlob> {
     entries: HashMap<CheckpointKey, CheckpointEntry<B>>,
     /// Keys that were explicitly evicted (for distinguishing
     /// [`MissReason::Evicted`] from [`MissReason::NoCheckpoint`]).
+    /// Capped at [`EVICTED_MARKERS_CAP`] — see `evict_internal`.
     evicted: HashSet<CheckpointKey>,
     total_bytes: u64,
     max_bytes: u64,
@@ -237,19 +269,28 @@ impl<B: CheckpointBlob> QwenCheckpointPool<B> {
         // If an entry already exists at this key, replace it and KEEP its
         // id: radix nodes store the CheckpointId from the first capture, so
         // minting a fresh id on re-capture would strand those references.
-        let mut reuse_id = None;
-        if let Some(old) = self.entries.remove(&key) {
-            self.total_bytes = self.total_bytes.saturating_sub(old.blob.bytes_len());
-            reuse_id = Some(old.id);
-            displaced.push(old.blob);
-        }
+        // The incumbent is NOT removed yet — only its bytes are credited —
+        // so the refusal path below leaves it intact: dropping it early
+        // would strand the radix's advertised checkpoint (id still
+        // recorded, entry gone, and no `evicted` marker since
+        // `evict_internal` never ran).
+        let (reuse_id, replaced_bytes) = self
+            .entries
+            .get(&key)
+            .map(|old| (Some(old.id), old.blob.bytes_len()))
+            .unwrap_or((None, 0));
 
-        // Clear any prior eviction record for this key.
-        self.evicted.remove(&key);
-
-        // Evict oldest unpinned until we can afford the new blob.
-        while self.total_bytes + bytes > self.max_bytes {
-            match self.find_oldest_unpinned_key() {
+        // Evict oldest unpinned until we can afford the new blob. The
+        // incumbent at `key` is already counted as freed and is never an
+        // eviction candidate (only insert removes it, without an `evicted`
+        // marker — it is a replacement, not an eviction).
+        while self
+            .total_bytes
+            .saturating_sub(replaced_bytes)
+            .saturating_add(bytes)
+            > self.max_bytes
+        {
+            match self.find_oldest_unpinned_key(Some(&key)) {
                 Some(evict_key) => {
                     if let Some(blob) = self.evict_internal(evict_key) {
                         displaced.push(blob);
@@ -258,12 +299,21 @@ impl<B: CheckpointBlob> QwenCheckpointPool<B> {
                 None => {
                     // Everything left is pinned and the ceiling cannot be
                     // honored. Refuse the capture (handing the blob back for
-                    // the caller to free) rather than exceeding the ceiling.
+                    // the caller to free) rather than exceeding the ceiling;
+                    // the incumbent at `key` stays resident untouched.
                     displaced.push(blob);
                     return (CheckpointId::NONE, displaced);
                 }
             }
         }
+
+        // Budget proven — now displace the incumbent (if any) and clear
+        // any prior eviction record for this key.
+        if let Some(old) = self.entries.remove(&key) {
+            self.total_bytes = self.total_bytes.saturating_sub(old.blob.bytes_len());
+            displaced.push(old.blob);
+        }
+        self.evicted.remove(&key);
 
         let id = reuse_id.unwrap_or_else(|| {
             let id = CheckpointId(self.next_id);
@@ -285,11 +335,15 @@ impl<B: CheckpointBlob> QwenCheckpointPool<B> {
         (id, displaced)
     }
 
-    /// Find the key of the oldest (smallest `lru_stamp`) unpinned entry.
-    fn find_oldest_unpinned_key(&self) -> Option<CheckpointKey> {
+    /// Find the key of the oldest (smallest `lru_stamp`) unpinned entry,
+    /// skipping `exclude` (the incumbent `insert` already counts as freed).
+    fn find_oldest_unpinned_key(
+        &self,
+        exclude: Option<&CheckpointKey>,
+    ) -> Option<CheckpointKey> {
         self.entries
             .iter()
-            .filter(|(_, e)| !e.pinned)
+            .filter(|(k, e)| !e.pinned && exclude != Some(*k))
             .min_by_key(|(_, e)| e.lru_stamp)
             .map(|(k, _)| k.clone())
     }
@@ -300,6 +354,13 @@ impl<B: CheckpointBlob> QwenCheckpointPool<B> {
     fn evict_internal(&mut self, key: CheckpointKey) -> Option<B> {
         self.entries.remove(&key).map(|entry| {
             self.total_bytes = self.total_bytes.saturating_sub(entry.blob.bytes_len());
+            // The marker set is diagnostics only; at the cap the oldest
+            // knowledge is dropped wholesale, so a stale miss degrades to
+            // MissReason::NoCheckpoint (a false NEGATIVE — never a wrong
+            // Evicted claim). This never loses a resident entry.
+            if self.evicted.len() >= EVICTED_MARKERS_CAP {
+                self.evicted.clear();
+            }
             self.evicted.insert(key);
             entry.blob
         })
@@ -431,10 +492,13 @@ fn find_largest_pool_checkpoint<B: CheckpointBlob>(
     max_p: u64,
 ) -> Option<u64> {
     let page = PAGE_TOKENS as u64;
+    // One O(tokens) sweep computes every boundary fingerprint; the while
+    // loop then only probes the pool (see `page_fingerprints`).
+    let fp_at = page_fingerprints(tokens, max_p);
     let mut p = (max_p / page) * page;
     while p > 0 {
-        if let Some(prefix) = tokens.get(..p as usize) {
-            if pool.contains(domain, p, prefix_fingerprint(prefix)) {
+        if let Some(&fp) = fp_at.get(p as usize / PAGE_TOKENS - 1) {
+            if pool.contains(domain, p, fp) {
                 return Some(p);
             }
         }
@@ -455,11 +519,16 @@ fn find_largest_pool_checkpoint_below<B: CheckpointBlob>(
     if below_p <= page {
         return None;
     }
+    let fp_at = page_fingerprints(tokens, below_p);
     let mut p = below_p - page;
     while p > 0 {
-        if let Some(prefix) = tokens.get(..p as usize) {
-            if pool.contains(domain, p, prefix_fingerprint(prefix)) {
-                return Some(p);
+        // Only page-aligned `p` can hold a checkpoint; a non-aligned
+        // `below_p` has no fingerprint slot and can never match.
+        if p % page == 0 {
+            if let Some(&fp) = fp_at.get(p as usize / PAGE_TOKENS - 1) {
+                if pool.contains(domain, p, fp) {
+                    return Some(p);
+                }
             }
         }
         p -= page;
@@ -1033,6 +1102,39 @@ mod tests {
         let (id, displaced) = pool.insert(dom.clone(), 100, fp(100), HostBlob { bytes: 4096 });
         assert_eq!(id, CheckpointId::NONE);
         assert_eq!(displaced.len(), 1);
+    }
+
+    /// A ceiling refusal on a RE-capture must leave the incumbent entry at
+    /// that key fully intact: removing it before the eviction loop proves
+    /// the new blob fits would strand the radix's advertised checkpoint —
+    /// the id stays recorded while the pool entry (and any `evicted`
+    /// marker, since `evict_internal` never ran) is gone.
+    #[test]
+    fn refused_recapture_keeps_incumbent() {
+        let mut pool = QwenCheckpointPool::<HostBlob>::new(8192);
+        let dom = test_domain("refused-recapture");
+
+        let (incumbent_id, _) =
+            pool.insert(dom.clone(), 128, fp(128), HostBlob { bytes: 4096 });
+        let _ = pool.insert(dom.clone(), 256, fp(256), HostBlob { bytes: 4096 });
+        pool.pin(&dom, 256, fp(256));
+
+        // Re-capture at the same key with a blob that cannot fit even with
+        // the incumbent's bytes credited: everything else is pinned, so no
+        // eviction can make room and the insert is refused.
+        pool.pin(&dom, 128, fp(128));
+        let (id, displaced) =
+            pool.insert(dom.clone(), 128, fp(128), HostBlob { bytes: 8192 });
+        assert_eq!(id, CheckpointId::NONE, "ceiling refusal must report NONE");
+        assert_eq!(displaced.len(), 1, "only the refused blob is handed back");
+        assert_eq!(displaced[0].bytes, 8192);
+
+        // The incumbent is still there, unchanged: same id, same bytes,
+        // same pin.
+        assert_eq!(pool.id_of(&dom, 128, fp(128)), Some(incumbent_id));
+        assert_eq!(pool.peek(&dom, 128, fp(128)).map(|b| b.bytes_len()), Some(4096));
+        assert!(pool.is_pinned(&dom, 128, fp(128)));
+        assert_eq!(pool.total_bytes(), 8192);
     }
 
     // ── LRU byte bound: pinned checkpoints survive eviction ─────────────

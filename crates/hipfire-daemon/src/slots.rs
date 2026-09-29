@@ -1083,8 +1083,22 @@ impl SlotBackend {
                     return Ok(());
                 }
             };
-            let started = rendered.trim_end().ends_with("<think>");
-            (self.tokenizer.encode(&rendered), started)
+            // Some templates (MiMo distill family) render the generation
+            // prompt as bare `assistant\n` even when thinking is enabled —
+            // they expect the model to open `<think>` itself, unlike the
+            // Qwen3.5 stock template that pre-seeds the tag. When thinking
+            // was requested but the render doesn't end inside a think span,
+            // append the tokenizer's <think> id so the expected OpenThink
+            // contract holds instead of rejecting the request.
+            let mut tokens = self.tokenizer.encode(&rendered);
+            let mut started = rendered.trim_end().ends_with("<think>");
+            if !started && expected_prefix == AssistantPrefix::OpenThink {
+                if let Some(think_id) = self.tokenizer.special_token_id("<think>") {
+                    tokens.push(think_id);
+                    started = true;
+                }
+            }
+            (tokens, started)
         } else {
             if tools.is_some()
                 || messages

@@ -318,6 +318,16 @@ struct Rig {
     /// Per-slot MTP spec state. None for slots that haven't started MTP yet
     /// or when MTP is off. Allocated lazily on first MTP prefill.
     mtp_states: Vec<Option<crate::mtp_spec::MtpSpecState>>,
+    /// Per-slot MTP head-KV coverage watermark: head KV rows `<` this are
+    /// guaranteed written for the CURRENT committed prefix. Advanced by
+    /// `mtp_head_prefill_chunk` (contiguous chunk rows) and
+    /// `mtp_verify_accept_step` (committed rows; rejected-draft rows past
+    /// the frontier are stale and overwritten in order next cycle).
+    /// NOT advanced by plain AR decode — a turn that retired to AR leaves
+    /// the watermark behind the token frontier, which is exactly what the
+    /// continuation admit gates on: re-arming MTP over a head KV that
+    /// lacks the AR tail reads garbage and collapses acceptance to ~1.
+    mtp_head_valid_through: Vec<usize>,
     /// Batched scratch (+ per-row FWHT-rot buffer) for MTP head-KV prefill
     /// from the scheduler's batched prompt chunks. None when MTP is off.
     mtp_prefill_batched: Option<(
@@ -433,13 +443,19 @@ struct Rig {
     /// Per-waiter queue timeout in milliseconds (from
     /// `EngineConfig::queue_timeout_ms`), honored against the wall clock.
     queue_timeout_ms: u64,
+    /// HIPFIRE_MTP_RETIRE developer var resolved once at build (house
+    /// convention: developer vars are read at load, never per-step):
+    /// `0`/`off`/`false` keeps spec decoding engaged even on sustained
+    /// sub-`MTP_RETIRE_MIN_ADVANCE` windows (retirement gate disabled).
+    mtp_retire_enabled: bool,
     /// One-shot admission-age handoff for wait-queue retries: the drain
     /// loop sets it to the popped waiter's original enqueue Instant right
     /// before `admit`, and admit's park path consumes it so a retried
     /// request re-parks with its ORIGINAL age instead of a fresh stamp.
     pending_repark_age: Option<std::time::Instant>,
-    /// Scheduler tick counter, advanced once per serve iteration. Used for
-    /// wait-queue enqueue timestamps and expiry deadlines.
+    /// Scheduler tick counter, advanced once per serve iteration. Drives
+    /// `pop_ready`'s deadline check; waiter enqueue stamps (and FairQueue
+    /// admission age) live in `fair_queue`'s own tick domain.
     tick: u64,
     /// Structured-output jump-forward enabled (spec §7.3 G3). Default false.
     structured_jump_forward: bool,
@@ -1385,6 +1401,17 @@ impl Rig {
         // fairness — the policy would otherwise deadlock.
         let max_batch_tokens = cfg.max_batch_tokens.max(1);
         let prefill_min_tokens = cfg.prefill_min_tokens.max(1);
+        // An operator quantum above the prefill chunk is meaningless AND
+        // would defeat the scheduler's per-slot quota — the quota clamps
+        // the floor at chunk_size, but rejecting the mismatch here fails
+        // closed on a config that can never be honored as written.
+        if prefill_min_tokens > cfg.prefill_chunk.max(1) {
+            return Err(format!(
+                "prefill_min_tokens ({prefill_min_tokens}) exceeds prefill_chunk ({}): \
+                 the quantum can never be honored inside one chunk",
+                cfg.prefill_chunk.max(1)
+            ));
+        }
         let fair_queue = FairQueue::new(
             max_batch_tokens as u64,
             cfg.n_slots as u64,
@@ -1422,6 +1449,7 @@ impl Rig {
             vision_weights,
             vision_config,
             mtp_head,
+            mtp_head_valid_through: vec![0; cfg.n_slots],
             mtp_states: (0..cfg.n_slots).map(|_| None).collect(),
             mtp_prefill_batched,
             spec_verify_tape,
@@ -1465,6 +1493,10 @@ impl Rig {
             queue_timeout_ms: cfg.queue_timeout_ms,
             pending_repark_age: None,
             tick: 0,
+            mtp_retire_enabled: hipfire_config::developer_var("HIPFIRE_MTP_RETIRE")
+                .ok()
+                .map(|v| !matches!(v.as_str(), "0" | "off" | "false"))
+                .unwrap_or(true),
             structured_jump_forward: cfg.structured_jump_forward,
             schema_cache: std::collections::HashMap::new(),
             schema_cache_order: std::collections::VecDeque::new(),
@@ -1660,6 +1692,12 @@ fn vl_forward_remaining(
     work: &mut PendingWork,
     image_pad_id: u32,
     mut grammar: Option<&mut GrammarConstraint>,
+    // `history`: the session's committed token stream (prompt + generated
+    // so far) — `sample_cpu`'s repeat/presence/frequency penalty branches
+    // iterate it, so an empty history would leave a penalized VL request's
+    // penalties silently inert (spec §6 X2). Caller clips to the configured
+    // repeat window; the sampler never reads past it.
+    history: &[u32],
 ) -> Result<u32, String> {
     let mut vl = work
         .vl_prefill
@@ -1782,7 +1820,7 @@ fn vl_forward_remaining(
         },
         min_p: (sp.min_p > 0.0).then_some(sp.min_p),
     };
-    Ok(hipfire_runtime::sampler::sample_cpu(&mut logits, &[], &cfg))
+    Ok(hipfire_runtime::sampler::sample_cpu(&mut logits, history, &cfg))
 }
 
 /// Advance slot `s`'s batched-VL vision-tower encode by ONE layer, starting
@@ -2007,6 +2045,18 @@ fn mtp_head_prefill_chunk(
             )
             .map_err(|e| format!("mtp prev_hidden capture: {e:?}"))
     });
+    // Head-KV coverage watermark: contiguous prompt rows written this chunk
+    // are valid through its last position + 1. Prefill chunks are position-
+    // contiguous, so only ever ratchet forward.
+    if hidden_outcome.is_ok() {
+        let chunk_end = chunk_positions
+            .last()
+            .copied()
+            .map(|p| (p.max(0) as usize) + 1)
+            .unwrap_or(0);
+        rig.mtp_head_valid_through[slot.0] =
+            rig.mtp_head_valid_through[slot.0].max(chunk_end);
+    }
     rig.mtp_states[slot.0] = Some(state);
     hidden_outcome
 }
@@ -2163,6 +2213,10 @@ fn mtp_verify_accept_step(
         rig.pool
             .set_seq_len(slot, new_pos)
             .map_err(|e| format!("mtp set_seq_len: {e}"))?;
+        // Head-KV watermark: the draft chain teacher-forced rows
+        // `pos..pos+advance` with the committed prefix (rejected rows past
+        // the frontier stay stale and are overwritten in order next cycle).
+        rig.mtp_head_valid_through[slot.0] = new_pos;
 
         Ok(result.committed)
     })();
@@ -2868,11 +2922,16 @@ fn commit_sampled_token(
         } else {
             let _ = send_event(&f.reply, Event::Done { reason, generated });
         }
-        // Publish generated-prefix pages at client commit (spec §4.6 C6).
+        // Publish generated-prefix pages at client commit (spec §4.6 C6) —
+        // on EVERY terminal path, ClientGone included: the pages are
+        // already allocated and written, a cancelled conversation is still
+        // valid cache content, and the AR-tail path publishes
+        // unconditionally. Skipping publish on cancels would leak page
+        // state asymmetrically, not just under-populate the cache.
         // Take the pin ticket out of `f` first: publish needs `slots`
         // mutably, which `f` borrows.
         let mut pin_ticket = std::mem::take(&mut f.pin_ticket);
-        if !matches!(reason, DoneReason::ClientGone) && rig.prefix_cache {
+        if rig.prefix_cache {
             publish_generated_prefix(rig, slots, s, work[s].next_pos);
         }
         // Release the prefix-cache lookup pin on EVERY terminal path —
@@ -2969,11 +3028,15 @@ struct InFlight {
 /// is a typed error, never an unconstrained-sampling fallback"). EOS is
 /// allowed only in an accepting grammar state.
 struct GrammarConstraint {
-    /// The per-request SchemaMatcher cursor. Advanced on accepted tokens
+    /// The per-request SchemaMatcher cursor, or `None` for a think-budget-
+    /// only constraint (`max_think_tokens` without `response_format`): the
+    /// think-span framing and budget enforcement do not need a schema, and
+    /// refusing the param when no schema is present would be a silent
+    /// semantic downgrade (spec §6 X2). Advanced on accepted tokens
     /// only (spec §7.2 G2: "per-request parser cursor advanced on accepted
     /// tokens only"). For speculative verify, a private cursor per candidate
     /// is advanced and only the accepted prefix is committed (spec §7.2 G2).
-    matcher: grammar::json_schema::SchemaMatcher,
+    matcher: Option<grammar::json_schema::SchemaMatcher>,
     /// Reusable mask buffer (vocab-sized bool array), avoiding per-step
     /// allocation.
     mask_buf: Vec<bool>,
@@ -3053,6 +3116,30 @@ impl std::fmt::Display for GrammarMaskError {
 impl std::error::Error for GrammarMaskError {}
 
 impl GrammarConstraint {
+    /// Build the constraint for one request: `matcher` carries the compiled
+    /// schema cursor (`None` for a think-budget-only request), think framing
+    /// starts from `started_in_think`, and `think_budget` is the finite cap
+    /// (`usize::MAX` = uncapped).
+    fn new(
+        matcher: Option<grammar::json_schema::SchemaMatcher>,
+        tokenizer: &Tokenizer,
+        started_in_think: bool,
+        think_budget: usize,
+    ) -> Self {
+        Self {
+            matcher,
+            mask_buf: Vec::new(),
+            in_think: started_in_think,
+            think_open_id: tokenizer.special_token_id("<think>"),
+            think_close_id: tokenizer.special_token_id("</think>"),
+            think_tail: Vec::new(),
+            think_budget,
+            think_tokens_used: 0,
+            mask_cache: std::collections::HashMap::new(),
+            mask_cache_order: std::collections::VecDeque::new(),
+        }
+    }
+
     /// Build the boolean token mask for the current parser state into
     /// `self.mask_buf` and return a reference to it (spec §7.2 G2).
     ///
@@ -3094,11 +3181,19 @@ impl GrammarConstraint {
             }
             return Ok(&self.mask_buf);
         }
+        // Schema-free constraint (think-budget only): no matcher means no
+        // schema restriction outside a think span — everything is allowed.
+        // The all-true mask lets the apply loop skip the D2H/H2D round-trip
+        // entirely for these slots.
+        let Some(matcher) = self.matcher.as_ref() else {
+            self.mask_buf.fill(true);
+            return Ok(&self.mask_buf);
+        };
         // Cache hit (XGrammar per-state token masks): the allowed set is a
         // pure function of the state signature within one schema, so a
         // recurring state replays its packed bitset instead of re-running
         // 248k matcher calls (the O(vocab × buffer) sweep — spec §9.2).
-        let sig = self.matcher.mask_state_signature();
+        let sig = matcher.mask_state_signature();
         if let Some(bits) = self.mask_cache.get(&sig) {
             self.mask_buf.clear();
             self.mask_buf.resize(vocab_size, false);
@@ -3114,7 +3209,7 @@ impl GrammarConstraint {
             }
             return Ok(&self.mask_buf);
         }
-        let accepting = self.matcher.is_accepting();
+        let accepting = matcher.is_accepting();
         for id in 0..vocab_size as u32 {
             // EOS/terminator tokens: allowed only in an accepting state
             // (spec §7.2 G2). A terminator emitted before the schema is
@@ -3137,26 +3232,47 @@ impl GrammarConstraint {
                 // cannot contribute to the JSON output.
                 continue;
             }
-            self.mask_buf[id as usize] = self.matcher.is_token_allowed(bytes);
+            self.mask_buf[id as usize] = matcher.is_token_allowed(bytes);
         }
-        if !self.mask_buf.iter().any(|&allowed| allowed) {
-            if std::env::var("GRAMMAR_TRACE").is_ok() {
-                eprintln!(
-                    "[masktrace] EMPTY SET: in_think={} matcher_errored={} accepting={} probes: quote={} ws_quote={} brace_close={}",
-                    self.in_think,
-                    self.matcher.is_errored(),
-                    self.matcher.is_accepting(),
-                    self.matcher.is_token_allowed(b"\""),
-                    self.matcher.is_token_allowed(b" \""),
-                    self.matcher.is_token_allowed(b"}"),
-                );
-                eprintln!(
-                    "[masktrace] matcher byte_len={} tail={:?}",
-                    self.matcher.buffer_len(),
-                    String::from_utf8_lossy(&self.matcher.buffer_bytes()[self.matcher.buffer_len().saturating_sub(40)..]),
-                );
+        if !self.mask_buf.iter().all(|&allowed| allowed) {
+            if !self.mask_buf.iter().any(|&allowed| allowed) {
+                if std::env::var("GRAMMAR_TRACE").is_ok() {
+                    eprintln!(
+                        "[masktrace] EMPTY SET: in_think={} matcher_errored={} accepting={} probes: quote={} ws_quote={} brace_close={}",
+                        self.in_think,
+                        matcher.is_errored(),
+                        matcher.is_accepting(),
+                        matcher.is_token_allowed(b"\""),
+                        matcher.is_token_allowed(b" \""),
+                        matcher.is_token_allowed(b"}"),
+                    );
+                    eprintln!(
+                        "[masktrace] matcher byte_len={} tail={:?}",
+                        matcher.buffer_len(),
+                        String::from_utf8_lossy(&matcher.buffer_bytes()[matcher.buffer_len().saturating_sub(40)..]),
+                    );
+                }
+                return Err(GrammarMaskError::EmptyAllowedSet);
             }
-            return Err(GrammarMaskError::EmptyAllowedSet);
+            // Populate the per-state cache on miss (spec §9.2): the
+            // signature covers every matcher field is_token_allowed reads
+            // (see `mask_state_signature`), so identical states replay the
+            // packed bitset. `accepting` and `errored` are both hashed in.
+            if !self.mask_cache.contains_key(&sig) {
+                let mut bits = vec![0u64; (vocab_size + 63) / 64];
+                for (i, &allowed) in self.mask_buf.iter().enumerate() {
+                    if allowed {
+                        bits[i / 64] |= 1u64 << (i % 64);
+                    }
+                }
+                self.mask_cache.insert(sig, bits);
+                self.mask_cache_order.push_back(sig);
+                if self.mask_cache_order.len() > MASK_CACHE_CAP {
+                    if let Some(evict) = self.mask_cache_order.pop_front() {
+                        self.mask_cache.remove(&evict);
+                    }
+                }
+            }
         }
         Ok(&self.mask_buf)
     }
@@ -3216,18 +3332,45 @@ impl GrammarConstraint {
                 let excess = self.think_tail.len() - THINK_TAIL_CAP;
                 self.think_tail.drain(..excess);
             }
-            let trimmed = &self.think_tail[..];
-            let trimmed = &trimmed[..trimmed
-                .iter()
-                .rposition(|b| !b.is_ascii_whitespace())
-                .map_or(0, |p| p + 1)];
-            if trimmed.ends_with(CLOSE) {
+            // The tag's FIRST occurrence anywhere in the tail closes the
+            // span — a `</think>` embedded mid-token ("</think>\n{") is a
+            // real close, not just a suffix match. Anything AFTER the close
+            // is schema content and must reach the matcher below, or a
+            // schema whose output starts inside that same token leaves the
+            // matcher a `{` behind the emitted text (terminal Unsatisfiable).
+            if let Some(close_at) = find_subslice(&self.think_tail, CLOSE) {
                 self.in_think = false;
+                let post_close: Vec<u8> =
+                    self.think_tail[close_at + CLOSE.len()..].to_vec();
                 self.think_tail.clear();
-            } else if trimmed.ends_with(OPEN) {
-                // A re-opened think span inside think — stay in think and
-                // restart the tail watch.
+                if let Some(m) = self.matcher.as_mut() {
+                    // A re-opened span past the close keeps the cursor in
+                    // think; scan only past the close so a `<think>`
+                    // preceding it cannot re-arm the span.
+                    if find_subslice(&post_close, OPEN).is_none() {
+                        if !post_close.is_empty() {
+                            m.advance(&post_close);
+                        }
+                        return;
+                    }
+                }
+                self.in_think = true;
+                // Resume the tail watch past the last embedded `<think>` —
+                // the next close belongs to the re-opened span.
+                if let Some(reopen_at) = rfind_subslice(&post_close, OPEN) {
+                    self.think_tail
+                        .extend_from_slice(&post_close[reopen_at + OPEN.len()..]);
+                }
+                return;
+            }
+            // Re-opened span inside think (no close in the tail): stay in
+            // think and restart the tail watch past the last `<think>` —
+            // bytes before it could already contain the previous span's
+            // close, which the next token must not re-match.
+            if let Some(open_at) = rfind_subslice(&self.think_tail, OPEN) {
+                let rest: Vec<u8> = self.think_tail[open_at + OPEN.len()..].to_vec();
                 self.think_tail.clear();
+                self.think_tail.extend_from_slice(&rest);
             }
             return; // think tokens are not schema content
         }
@@ -3239,17 +3382,30 @@ impl GrammarConstraint {
             return;
         }
         let bytes = tokenizer.token_bytes(token);
-        if !bytes.is_empty() {
-            self.matcher.advance(bytes);
+        if let (Some(m), false) = (self.matcher.as_mut(), bytes.is_empty()) {
+            m.advance(bytes);
         }
     }
 
     /// True when the full JSON value has been parsed and conforms to the
     /// schema (spec §7.2 G2). Used at terminal to distinguish a
-    /// schema-conforming done from an incomplete/invalid result.
+    /// schema-conforming done from an incomplete/invalid result. A
+    /// schema-free (think-budget-only) constraint has nothing to accept —
+    /// it is always satisfied.
     fn is_accepting(&self) -> bool {
-        self.matcher.is_accepting()
+        self.matcher.as_ref().map(|m| m.is_accepting()).unwrap_or(true)
     }
+}
+
+/// First index at which `needle` occurs inside `hay` (`None` = absent).
+/// Tail lengths are ≤ THINK_TAIL_CAP, so a naive scan is fine.
+fn find_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).position(|w| w == needle)
+}
+
+/// LAST index at which `needle` occurs inside `hay` (`None` = absent).
+fn rfind_subslice(hay: &[u8], needle: &[u8]) -> Option<usize> {
+    hay.windows(needle.len()).rposition(|w| w == needle)
 }
 
 fn run_loop(
@@ -3280,6 +3436,13 @@ fn run_loop(
     };
     let mut graph = SlotDecodeGraph::new();
     let mut poison: Option<String> = None;
+    // This step's spec drafts live OUTSIDE the catch_unwind closure: a
+    // DflashSlotDraft owns GpuTensors with no Drop, and a panic while one is
+    // live would unwind through the closure's frames and lose the buffers
+    // (~batch×vocab each). The vector is cleared-and-freed at the top of
+    // every iteration and drained once more after the loop so panic
+    // containment frees what in-loop paths did not reach.
+    let mut spec_drafts: Vec<Option<SpecDraftRows>> = (0..n).map(|_| None).collect();
 
     // Helper to fail every active request, close sessions, clear work, forget swap.
     // Used for HIP poison and shutdown drain. Returns the reason used.
@@ -3403,7 +3566,7 @@ fn run_loop(
             };
             let active_before = slots.iter().filter(|s| s.is_some()).count();
             rig.pending_repark_age = Some(parked.enqueued_at);
-            admit(&mut rig, &mut slots, &mut work, &stats, parked.req);
+            admit(&mut rig, &mut slots, &mut work, &stats, parked.req, Some(waiter.enqueue_tick));
             rig.pending_repark_age = None;
             let active_after = slots.iter().filter(|s| s.is_some()).count();
             // If admit did not place the request in a slot (it may have
@@ -3455,8 +3618,20 @@ fn run_loop(
                 continue;
             }
             let pad = image_pad_id.unwrap_or(u32::MAX);
+            // Penalty history: the session's committed token tail, clipped
+            // to the configured repeat window — the sampler never reads
+            // past it (spec §6 X2: no silent penalty downgrade).
+            let hist_window = rig.sample_params[s].repeat_window.max(0) as usize;
+            let history: Vec<u32> = slots[s]
+                .as_ref()
+                .and_then(|f| rig.sessions.get(f.session))
+                .map(|sess| {
+                    let start = sess.tokens.len().saturating_sub(hist_window);
+                    sess.tokens[start..].to_vec()
+                })
+                .unwrap_or_default();
             let grammar = slots[s].as_mut().and_then(|f| f.grammar.as_mut());
-            match vl_forward_remaining(&mut rig, SlotId(s), &mut work[s], pad, grammar) {
+            match vl_forward_remaining(&mut rig, SlotId(s), &mut work[s], pad, grammar, &history) {
                 Ok(tok) => commit_sampled_token(&mut rig, &mut slots, &mut work, s, tok),
                 Err(reason) => {
                     if let Some(mut f) = slots[s].take() {
@@ -3484,7 +3659,14 @@ fn run_loop(
         // per DFlash slot. The trunk verify is batched with regular decode
         // in the forward_batch_slots_graphed_opts call below — the
         // vLLM-style batched-verify design, graph-captured like pure decode.
-        let mut spec_drafts: Vec<Option<SpecDraftRows>> = (0..n).map(|_| None).collect();
+        // Reclaim any draft left live by an early `continue` last step (all
+        // such paths already free their own drafts, so this is a no-op guard)
+        // and reset for this step's drafting phase.
+        for d in spec_drafts.iter_mut() {
+            if let Some(d) = d.take() {
+                d.free_gpu(&mut rig.gpu);
+            }
+        }
         // The seed token each draft consumed from `remaining_prompt` (the
         // draft step takes the prompt vector to satisfy borrows, so the
         // seed is GONE from the slot while the draft lives). Any path that
@@ -3701,12 +3883,20 @@ fn run_loop(
         // backfill (only the oldest stays eligible so younger prefill/decode
         // is skipped this tick, giving the starved oldest the next budget).
         let vl_sequential = rig.vl_sequential;
-        let spec_rows = rig.spec_rows;
         for s in 0..n {
             let Some(f) = slots[s].as_ref() else { continue };
             let id = f.session.0;
             let wants_decode = is_runnable_decode(&work[s], vl_sequential);
-            let verify = if spec_drafts[s].is_some() { spec_rows as u64 } else { 0 };
+            // Verify rows are NOT reported as a queue need: they are already
+            // carved out of `remaining_for_sched` above, and
+            // `inject_spec_verify_tokens` emits them unconditionally. A
+            // reported verify need that select's phase 3 could not fit used
+            // to mark the spec slot starved; since the slot still decodes
+            // (the injected rows), the flag re-latched every tick and the
+            // starved backfill masked every other slot to zero rows
+            // indefinitely. Verify service is recorded via `note_served`
+            // below instead.
+            let verify = 0;
             let uncached = if is_runnable_prefill(&work[s], vl_sequential) {
                 work[s].remaining_prompt.len() as u64
             } else {
@@ -3714,21 +3904,27 @@ fn run_loop(
             };
             sync_fair_needs(&mut rig.fair_queue, id, wants_decode, verify, uncached);
         }
-        // Pass the FULL row budget, not `remaining_for_sched`: select's
-        // phase-3 verify pass already charges each spec slot's verify_rows
-        // against the budget it is given. Handing it the verify-subtracted
-        // budget double-charges verify — a spec slot's verify is denied
-        // whenever used > budget − 2·verify_rows even though used + verify
-        // fits, and the denied slot is then reported starved → backfill
-        // masks every other slot to 0 rows for the spec request's whole
-        // generation. The scheduler still gets `remaining_for_sched` for its
-        // decode+prefill allocation (it does not handle verify rows).
+        // Pass the FULL row budget — the queue never sees verify needs (they
+        // are serviced unconditionally), so only decode/prefill/forced grants
+        // compete inside it. The scheduler still gets `remaining_for_sched`
+        // for its decode+prefill allocation.
         let full_budget = max_batch_tokens.min(rig.pbs.max_batch) as u64;
         let sel = rig.fair_queue.select(
             n as u64,
             prefill_min_tokens as u64,
             full_budget,
         );
+        // Verify rows are injected unconditionally for every surviving draft
+        // — that IS service this tick, even though no Verify grant exists.
+        // Keep `last_served_tick` honest so `skip_round_complete` does not
+        // mis-age a spec slot (spec §5.3 S3.3).
+        for s in 0..n {
+            if spec_drafts[s].is_some() {
+                if let Some(f) = slots[s].as_ref() {
+                    rig.fair_queue.note_served(f.session.0);
+                }
+            }
+        }
         // After the admission round: mark requests not served since the last
         // round as aged (spec §5.3 S3.3). select already advanced the tick;
         // skip_round_complete sets the round boundary so the next select
@@ -4438,6 +4634,12 @@ fn run_loop(
                 }
             };
 
+            // An all-true mask (schema-free think-budget constraint outside
+            // a span) is a no-op — skip the D2H/mask/H2D round-trip.
+            if mask.iter().all(|&allowed| allowed) {
+                continue;
+            }
+
             // D2H: copy this slot's logits row to the host buffer.
             let row_offset = s * vocab;
             let logits_bytes_len = vocab * std::mem::size_of::<f32>();
@@ -4513,6 +4715,9 @@ fn run_loop(
             for s in 0..n {
                 let Some(f) = slots[s].as_ref() else { continue };
                 let Some(constraint) = f.grammar.as_ref() else { continue };
+                // Budget-only constraints carry no matcher — nothing to
+                // plan a forced run against.
+                let Some(matcher) = constraint.matcher.as_ref() else { continue };
                 // Greedy only (spec §7.3: "not sampled (greedy only)"). The
                 // gate must match the sampler's own argmax path exactly
                 // (`temperature == 0.0` in sampling.rs): a tiny nonzero
@@ -4557,7 +4762,7 @@ fn run_loop(
                     eos_ids.push(eot);
                 }
                 jump_forced[s] = Some(grammar::json_schema::forced_token_run(
-                    &constraint.matcher,
+                    matcher,
                     &token_bytes_table,
                     &eos_ids,
                     max_run,
@@ -4674,7 +4879,15 @@ fn run_loop(
                         // the rest of this request. The last committed token
                         // is already in remaining_prompt; the scheduler picks
                         // the slot up as a regular decode row next step.
-                        if slots[s].is_some() && work[s].spec.active() {
+                        // HIPFIRE_MTP_RETIRE=0 disables the retirement gate:
+                        // spec stays engaged for the whole request even on
+                        // sustained sub-2.2 windows. Resolved once at
+                        // Rig::build — developer vars are load-time config,
+                        // never re-read per step.
+                        if slots[s].is_some()
+                            && work[s].spec.active()
+                            && rig.mtp_retire_enabled
+                        {
                             work[s].spec_cycles += 1;
                             work[s].spec_committed += tokens.len();
                             if work[s].spec_cycles >= MTP_RETIRE_WINDOW {
@@ -4964,6 +5177,15 @@ fn run_loop(
         }
     }
     }));
+    // Free any drafts still live when the loop unwound (panic containment or
+    // a `break 'serve` taken between draft and accept): every in-loop drop
+    // path frees its draft itself, so what remains here is exactly what the
+    // unwind skipped. DflashSlotDraft owns GpuTensors with no Drop.
+    for d in spec_drafts.iter_mut() {
+        if let Some(d) = d.take() {
+            d.free_gpu(&mut rig.gpu);
+        }
+    }
     if let Err(payload) = serve_result {
         let msg = payload
             .downcast_ref::<&str>()
@@ -5045,7 +5267,12 @@ fn handle_command(
                 let waiter_id = rig.next_waiter_id;
                 rig.next_waiter_id += 1;
                 let bytes = req.queue_bytes.max(1);
-                match rig.wait_queue.try_enqueue(waiter_id, bytes, rig.tick) {
+                // Enqueue stamps live in the FairQueue tick domain: the
+                // waiter's `enqueue_tick` becomes the request's
+                // `admission_tick` on admit, so wait time must be measured
+                // against the same clock the queue orders by (spec §5.3 S3).
+                // `rig.tick` still drives `pop_ready`'s deadline check.
+                match rig.wait_queue.try_enqueue(waiter_id, bytes, rig.fair_queue.tick()) {
                     Ok(()) => {
                         rig.parked_requests.insert(
                             waiter_id,
@@ -5065,7 +5292,7 @@ fn handle_command(
                     }
                 }
             } else {
-                admit(rig, slots, work, stats, req);
+                admit(rig, slots, work, stats, req, None);
             }
         }
         EngineCommand::CancelWaiting { request_tag } => {
@@ -5195,6 +5422,45 @@ fn reused_tokens_from_plan(boundary: usize, prompt_len: usize) -> usize {
     }
 }
 
+/// Pages `plan_cow` will have to copy-write for the write interval
+/// `[write_start, write_end)`: every Sealed or CacheOnly page the slot's
+/// block table maps inside that span needs a private destination reserved
+/// from the free list (spec §4.3). The admit-time page budget must count
+/// these on top of the growth pages — otherwise the reclaim loop stops
+/// short and `plan_cow` fails mid-step, AFTER begin_turn already mutated
+/// session state (a late Internal rejection).
+fn cow_destination_pages(
+    rig: &Rig,
+    slot: SlotId,
+    write_start: usize,
+    write_end: usize,
+) -> usize {
+    if write_end <= write_start {
+        return 0;
+    }
+    let (Some(pp), Some(bt)) = (rig.pool.page_pool(), rig.pool.block_table(slot)) else {
+        return 0;
+    };
+    use rdna_compute::page_pool::PageState;
+    let first_lp = write_start / PAGE_TOKENS;
+    let last_lp = (write_end - 1) / PAGE_TOKENS;
+    let mut count = 0;
+    for lp in first_lp..=last_lp {
+        match bt.physical(lp) {
+            Some(phys)
+                if matches!(
+                    pp.page_state(phys),
+                    PageState::Sealed | PageState::CacheOnly
+                ) =>
+            {
+                count += 1;
+            }
+            _ => {}
+        }
+    }
+    count
+}
+
 /// Pure policy: should the admit path enqueue in the WaitQueue instead of
 /// rejecting immediately (spec §5.3 S3, replacing R-A4)?
 ///
@@ -5252,12 +5518,17 @@ fn sync_fair_needs(
 }
 
 /// Admit one request, evicting an idle session if that is what it takes.
+/// `admission_tick` is the request's original wait-room enqueue tick (in the
+/// FairQueue tick domain — waiter stamps are taken from `fair_queue.tick()`),
+/// so queue time counts toward FairQueue admission age instead of being reset
+/// on admit (spec §5.3 S3); `None` = submitted directly, stamped now.
 fn admit(
     rig: &mut Rig,
     slots: &mut [Option<InFlight>],
     work: &mut [PendingWork],
     stats: &Arc<Mutex<EngineStats>>,
     req: SubmitRequest,
+    admission_tick: Option<u64>,
 ) {
     let busy: Vec<SessionId> = slots.iter().flatten().map(|f| f.session).collect();
 
@@ -5354,6 +5625,12 @@ fn admit(
             // this session's tokens) are still exactly right. Only a
             // swap-restore loses the head KV — the swap snapshot does not
             // carry it — and must reset before the suffix re-fills.
+            // slot.is_some() alone is not sufficient: a resident session
+            // whose previous turn finished on an AR tail (retire/ctx-cap/
+            // draft-drop) holds head KV only through
+            // `mtp_head_valid_through` — rows past that were never head-
+            // written. The real gate is `head_kv_valid >= plan.reused`
+            // below; this stays as the residency fast-path.
             let mtp_head_kv_valid = slot.is_some();
             if slot.is_none() {
                 let free = rig.pool.acquire().or_else(|| {
@@ -5448,12 +5725,32 @@ fn admit(
                                 .map(|s| s.next_pos)
                                 .unwrap_or(0)
                         });
+                    // COW destinations: Sealed/CacheOnly pages inside the
+                    // prospective write interval are COPIED to private pages
+                    // by plan_cow at each step — they consume free pages the
+                    // growth count alone does not cover (spec §4.3). The
+                    // write starts at the prefix the turn reuses, which is
+                    // exactly what begin_turn's plan_turn computes below.
+                    let predicted = rig
+                        .sessions
+                        .get(existing)
+                        .map(|s| {
+                            hipfire_runtime::prefix::plan_turn(&s.tokens, held, &extended)
+                                .reused
+                        })
+                        .unwrap_or(held);
                     let needed_pages = extended
                         .len()
                         .saturating_sub(held)
                         .saturating_add(req.max_tokens.max(1))
                         .div_ceil(PAGE_TOKENS)
-                        .saturating_add(1);
+                        .saturating_add(1)
+                        .saturating_add(cow_destination_pages(
+                            rig,
+                            slot,
+                            predicted,
+                            extended.len().saturating_add(req.max_tokens.max(1)),
+                        ));
                     if let (Some(idx), Some(domain)) =
                         (rig.prefix_index.as_mut(), rig.cache_domain.as_ref())
                     {
@@ -5522,28 +5819,17 @@ fn admit(
                 // leaves the matched session untouched — the daemon
                 // pre-validates, so this only fires on drift between that
                 // gate and the engine's compiler.
-                let grammar_constraint = match req.json_schema.as_ref() {
+                let mut grammar_constraint = match req.json_schema.as_ref() {
                     Some(schema) => {
                         match cached_compile_schema(rig, schema) {
-                            Ok(compiled) => Some(GrammarConstraint {
-                                matcher:
-                                    grammar::json_schema::SchemaMatcher::from_compiled(
-                                        &compiled,
-                                    ),
-                                mask_buf: Vec::new(),
-                                in_think: req.started_in_think,
-                                think_open_id: rig
-                                    .tokenizer
-                                    .special_token_id("<think>"),
-                                think_close_id: rig
-                                    .tokenizer
-                                    .special_token_id("</think>"),
-                                think_tail: Vec::new(),
-                                think_budget: req.think_budget,
-                                think_tokens_used: 0,
-                                mask_cache: std::collections::HashMap::new(),
-                                mask_cache_order: std::collections::VecDeque::new(),
-                            }),
+                            Ok(compiled) => Some(GrammarConstraint::new(
+                                Some(grammar::json_schema::SchemaMatcher::from_compiled(
+                                    &compiled,
+                                )),
+                                &rig.tokenizer,
+                                req.started_in_think,
+                                req.think_budget,
+                            )),
                             Err(e) => {
                                 let _ = send_event(
                                     &req.reply,
@@ -5559,6 +5845,18 @@ fn admit(
                     }
                     None => None,
                 };
+                // A finite think budget needs the constraint even with no
+                // schema: the in_think span tracking and the forced-close
+                // mask are schema-free (spec §6 X2 — a parameter that is
+                // accepted but unenforced is a silent semantic downgrade).
+                if grammar_constraint.is_none() && req.think_budget != usize::MAX {
+                    grammar_constraint = Some(GrammarConstraint::new(
+                        None,
+                        &rig.tokenizer,
+                        req.started_in_think,
+                        req.think_budget,
+                    ));
+                }
                 // Resize the session's admission grant to the new turn's
                 // actual need BEFORE any mutation (spec §5.1 + §5.4 row 1:
                 // a failed grant is a pre-execution rejection, not a
@@ -5650,6 +5948,7 @@ fn admit(
                         && !request_sampled(&req)
                         && req.json_schema.is_none()
                         && mtp_head_kv_valid
+                        && rig.mtp_head_valid_through[slot.0] >= plan.reused
                         && rig.mtp_states[slot.0].is_some();
                     // DFlash2 admit: same request-shape gates as MTP (text
                     // only, greedy, no grammar). The draft's private state
@@ -5673,10 +5972,17 @@ fn admit(
                     // no such bound (its rings wrap), so the gate is Legacy-
                     // only. `+ block_size` keeps the last verify window's
                     // `advance` rows inside the buffer.
+                    // The Legacy-mode fit must bound the ABSOLUTE write
+                    // frontier: `extended` (stored conversation + new
+                    // continuation tokens) is what the suffix prefill +
+                    // decode actually scatter — `req.prompt_tokens` here is
+                    // the rendered suffix only, under-counting by the whole
+                    // stored history (runtime parity: the loop-side guard
+                    // compares `work[s].next_pos`, which is `plan.reused`
+                    // onward — the same extended domain).
                     let dflash_ctx_fits = rig.dflash.as_ref().map_or(false, |d| {
                         d.window.is_some()
-                            || req
-                                .prompt_tokens
+                            || extended
                                 .len()
                                 .saturating_add(req.max_tokens.max(1))
                                 .saturating_add(d.block_size)
@@ -5705,6 +6011,7 @@ fn admit(
                         if let Some(state) = rig.mtp_states[slot.0].as_mut() {
                             let _ = state.reset(&mut rig.gpu);
                         }
+                        rig.mtp_head_valid_through[slot.0] = 0;
                     }
                     install_sample_params(rig, slot, &req);
                     // Publication continuity (spec §4.6 C6): the session's
@@ -5750,7 +6057,12 @@ fn admit(
                     // FairQueue: admit the continued request with its
                     // remaining prefill suffix as the cache-locality weight.
                     let uncached = work[slot.0].remaining_prompt.len() as u64;
-                    let _ = rig.fair_queue.admit(existing.0, "default", uncached);
+                    let _ = rig.fair_queue.admit_at(
+                        existing.0,
+                        "default",
+                        uncached,
+                        admission_tick.unwrap_or_else(|| rig.fair_queue.tick()),
+                    );
                     let mut st = lock_stats(stats);
                     st.note_admitted();
                     st.note_prefix_hit();
@@ -5905,7 +6217,12 @@ fn admit(
                     .pending_repark_age
                     .take()
                     .unwrap_or_else(std::time::Instant::now);
-                match rig.wait_queue.try_enqueue(waiter_id, bytes, rig.tick) {
+                // Re-park keeps the ORIGINAL FairQueue-domain enqueue tick
+                // too: a fresh stamp would erase the wait-room admission age
+                // the second time around (same class as `pending_repark_age`).
+                let repark_tick =
+                    admission_tick.unwrap_or_else(|| rig.fair_queue.tick());
+                match rig.wait_queue.try_enqueue(waiter_id, bytes, repark_tick) {
                     Ok(()) => {
                         rig.parked_requests.insert(
                             waiter_id,
@@ -5949,6 +6266,10 @@ fn admit(
                 Event::Rejected { class: RejectClass::Internal, reason: "admitted session holds no slot".to_string(),
                 },
             );
+            // `sessions.open` already charged the admission grant and may
+            // hold a slot row — close it like the neighboring error arms so
+            // the grant and session row do not leak.
+            rig.sessions.close(&mut rig.pool, &mut rig.adm, id);
             lock_stats(stats).note_rejected();
             return;
         }
@@ -5969,6 +6290,7 @@ fn admit(
         lock_stats(stats).note_rejected();
         return;
     }
+    rig.mtp_head_valid_through[slot.0] = 0;
 
     // Reset MTP head KV for the new conversation (stale positions from the
     // previous occupant would poison the first draft step).
@@ -6118,10 +6440,20 @@ fn admit(
     // free list) rather than letting a mid-prefill provision fail.
     if rig.prefix_cache {
         let suffix_tokens = req.prompt_tokens.len().saturating_sub(prefix_reused);
+        // Plus COW destinations: Sealed/CacheOnly pages already mapped
+        // inside the prospective write interval [prefix_reused, prompt +
+        // max_tokens) each consume one private copy (spec §4.3) — without
+        // them the reclaim loop stops short and plan_cow fails mid-step.
         let needed_pages = suffix_tokens
             .saturating_add(req.max_tokens.max(1))
             .div_ceil(PAGE_TOKENS)
-            .saturating_add(1);
+            .saturating_add(1)
+            .saturating_add(cow_destination_pages(
+                rig,
+                slot,
+                prefix_reused,
+                req.prompt_tokens.len().saturating_add(req.max_tokens.max(1)),
+            ));
         let page_bytes = rig
             .pool
             .page_pool()
@@ -6156,10 +6488,18 @@ fn admit(
     // remains, reject at admit instead of letting the forward die.
     if rig.pool.is_paged() {
         let suffix_tokens = req.prompt_tokens.len().saturating_sub(prefix_reused);
+        // Same COW-destination surcharge as the radix-reclaim pass above:
+        // Sealed/CacheOnly pages in the write interval need private copies.
         let needed_pages = suffix_tokens
             .saturating_add(req.max_tokens.max(1))
             .div_ceil(PAGE_TOKENS)
-            .saturating_add(1);
+            .saturating_add(1)
+            .saturating_add(cow_destination_pages(
+                rig,
+                slot,
+                prefix_reused,
+                req.prompt_tokens.len().saturating_add(req.max_tokens.max(1)),
+            ));
         // The just-opened session holds a slot but is not in `busy` —
         // exclude it explicitly so it is never its own eviction victim.
         let mut exclude: Vec<SessionId> = busy.clone();
@@ -6280,18 +6620,12 @@ fn admit(
     // SchemaMatcher is request-local mutable state (spec §7.2 G2).
     let grammar_constraint = req.json_schema.as_ref().and_then(|schema| {
         match cached_compile_schema(rig, schema) {
-            Ok(compiled) => Some(GrammarConstraint {
-                matcher: grammar::json_schema::SchemaMatcher::from_compiled(&compiled),
-                mask_buf: Vec::new(),
-                in_think: req.started_in_think,
-                think_open_id: rig.tokenizer.special_token_id("<think>"),
-                think_tail: Vec::new(),
-                think_close_id: rig.tokenizer.special_token_id("</think>"),
-                think_budget: req.think_budget,
-                think_tokens_used: 0,
-                mask_cache: std::collections::HashMap::new(),
-                mask_cache_order: std::collections::VecDeque::new(),
-            }),
+            Ok(compiled) => Some(GrammarConstraint::new(
+                Some(grammar::json_schema::SchemaMatcher::from_compiled(&compiled)),
+                &rig.tokenizer,
+                req.started_in_think,
+                req.think_budget,
+            )),
             Err(e) => {
                 // Should not happen (validated at submit), but fail closed.
                 let _ = send_event(
@@ -6310,7 +6644,19 @@ fn admit(
     if req.json_schema.is_some() && grammar_constraint.is_none() {
         return;
     }
-    let grammar_constrained = grammar_constraint.is_some();
+    // A finite think budget needs the constraint even with no schema:
+    // the in_think span tracking and forced-close mask are schema-free
+    // (spec §6 X2 — accepted but unenforced is a silent semantic
+    // downgrade).
+    let grammar_constraint = grammar_constraint.or_else(|| {
+        (req.think_budget != usize::MAX).then(|| {
+            GrammarConstraint::new(None, &rig.tokenizer, req.started_in_think, req.think_budget)
+        })
+    });
+    // `grammar_constrained` tracks the SCHEMA gate specifically (spec §6
+    // X2: MTP+grammar stays AR until joint verify exists). A think-budget-
+    // only constraint carries no schema, so it must NOT disable MTP/DFlash.
+    let grammar_constrained = req.json_schema.is_some();
     if let Some(vd) = req.visual_data {
         work[slot.0].remaining_prompt = req.prompt_tokens.clone();
         work[slot.0].next_pos = 0;
@@ -6432,7 +6778,12 @@ fn admit(
     // FairQueue: admit the cold request with its prefill suffix as the
     // cache-locality weight (0 for a fully-reused prefix-cache hit).
     let uncached = work[slot.0].remaining_prompt.len() as u64;
-    let _ = rig.fair_queue.admit(id.0, "default", uncached);
+    let _ = rig.fair_queue.admit_at(
+        id.0,
+        "default",
+        uncached,
+        admission_tick.unwrap_or_else(|| rig.fair_queue.tick()),
+    );
     if prefix_hit {
         lock_stats(stats).note_reused_tokens(prefix_reused);
     }
@@ -6503,6 +6854,9 @@ fn restore(rig: &mut Rig, id: SessionId, slot: SlotId) -> bool {
             if let Some(state) = rig.mtp_states[slot.0].as_mut() {
                 let _ = state.reset(&mut rig.gpu);
             }
+            // The head KV was just zeroed — the coverage watermark must
+            // follow, or a continuation admit would read a stale frontier.
+            rig.mtp_head_valid_through[slot.0] = 0;
             // DFlash2 draft state is likewise per-generation: the restored
             // session re-seeds target_hidden from its suffix forward.
             if let Some(st) = rig.dflash_states[slot.0].take() {
@@ -6645,7 +6999,7 @@ mod tests {
             .expect("compile");
         let mk = |close_id: Option<u32>, budget: usize, used: usize| {
             GrammarConstraint {
-                matcher: grammar::json_schema::SchemaMatcher::from_compiled(&compiled),
+                matcher: Some(grammar::json_schema::SchemaMatcher::from_compiled(&compiled)),
                 mask_buf: Vec::new(),
                 in_think: true,
                 think_open_id: None,
