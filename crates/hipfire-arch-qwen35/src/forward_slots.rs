@@ -37,8 +37,8 @@
 // same policy the sequential carrier uses (`QWEN35_HFQ_POLICY`), and the
 // KV-write + attend steps dispatch per tier (`SlotKvTier`, `kv_write_slots`,
 // `tier_attend_slots`) across the full static ladder — q8, asym{2,3,4},
-// fwht{2,3,4} (bf16's descriptor-aware batched kernels are wired too; the
-// qwen35 policies simply never resolve to it). Slot addressing is a
+// fwht{2,3,4} and f16 (bf16's descriptor-aware batched kernels are wired too;
+// the qwen35 policies simply never resolve to it). Slot addressing is a
 // KV-cache-tier property, not a weight-quant property, so the rest of the
 // layer body never changes no matter what a layer's projection weights — or
 // the KV tier — are quantized to.
@@ -1897,6 +1897,31 @@ fn kv_write_slots(
             "kv_write_slots: Asym3Auto sentinel reached the slots forward — \
              resolve it at load",
         )),
+        // f16 is structurally identical to bf16 in this dispatch: a flat
+        // per-arena writer (K and V share the stride), descriptor-aware, no
+        // rotation tables. Unlike bf16 the slots policy DOES resolve to it.
+        KvMode::F16 => {
+            gpu.kv_cache_write_f16_batched(
+                k_cache,
+                k_batch,
+                positions,
+                n_kv_heads,
+                head_dim,
+                n_rows,
+                Some(descs),
+                Some(row_slot),
+            )?;
+            gpu.kv_cache_write_f16_batched(
+                v_cache,
+                v_batch,
+                positions,
+                n_kv_heads,
+                head_dim,
+                n_rows,
+                Some(descs),
+                Some(row_slot),
+            )
+        }
     }
 }
 
@@ -2093,6 +2118,26 @@ fn tier_attend_slots(
             r,
         ),
         KvMode::Q8 => unreachable!("handled by the q8 delegate above"),
+        KvMode::F16 => gpu.attention_flash_f16_batched_masked_windowed_slots(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            positions,
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            physical_cap,
+            max_ctx_len,
+            batch_size,
+            flash_partials,
+            None,
+            0,
+            0,
+            /*window=*/ 0,
+            d,
+            r,
+        ),
         KvMode::Asym3Auto => Err(HipError::new(
             0,
             "tier_attend_slots: Asym3Auto sentinel reached the slots forward — \

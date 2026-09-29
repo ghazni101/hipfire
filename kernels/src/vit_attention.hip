@@ -2,6 +2,8 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
+#include <hip/hip_runtime.h>
+
 
 // Bidirectional ViT attention over INDEPENDENT row-segments: `seg_len` is the
 // length of one segment (one InternVL tile's rows, or N for single-segment

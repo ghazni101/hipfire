@@ -730,6 +730,10 @@ pub enum KvMode {
     /// leverage tier — Asym2 is doc'd "most lossy" and 2-bit centroid quant
     /// suffers most from outliers. Opt-in via `--kv-mode fwht2`.
     Fwht2,
+    /// F16: flat IEEE fp16 K/V, 2 B/element, no rotation or scales. Sibling
+    /// of the bf16 tier, but unlike bf16 it has a `_filtered` constructor and
+    /// is VMM/paged-capable, so it is allocatable here.
+    F16,
 }
 
 impl Default for KvMode {
@@ -958,6 +962,13 @@ impl ModelSlot {
                 slot_config.max_seq,
             )?,
             KvMode::Fwht2 => KvCache::new_gpu_fwht2_filtered(
+                gpu,
+                &is_kv_layer,
+                config.n_kv_heads,
+                config.head_dim,
+                slot_config.max_seq,
+            )?,
+            KvMode::F16 => KvCache::new_gpu_f16_filtered(
                 gpu,
                 &is_kv_layer,
                 config.n_kv_heads,

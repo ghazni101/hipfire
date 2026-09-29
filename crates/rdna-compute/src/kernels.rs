@@ -5441,6 +5441,14 @@ pub const KV_CACHE_WRITE_Q8_0_SRC: &str =
 pub const KV_CACHE_WRITE_BF16_SRC: &str =
     include_str!("../../../kernels/src/kv_cache_write_bf16.hip");
 
+/// Flat F16 KV write. 2 bytes per element (IEEE fp16), no blocks and no
+/// scales — same flat `[pos][kv_head][d]` layout as the BF16 sibling, so a
+/// cache sized for BF16 holds F16 unchanged. Holds both the decode
+/// (`kv_cache_write_f16`) and batched-prefill (`kv_cache_write_f16_batched`)
+/// entry points; the batched one is KvSlotDesc-aware (VMM/paged capable).
+pub const KV_CACHE_WRITE_F16_SRC: &str =
+    include_str!("../../../kernels/src/kv_cache_write_f16.hip");
+
 /// gfx1100-only paired K/V Q8_0 cache writer. Kept in a separate translation
 /// unit so its dormant body cannot perturb portable/gfx12 writer codegen.
 pub const KV_CACHE_WRITE_Q8_0_PAIR_GFX1100_SRC: &str =
@@ -5597,6 +5605,13 @@ pub const ATTENTION_FLASH_Q8_0_TILE_SRC: &str =
 pub const ATTENTION_FLASH_BF16_TILE_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_bf16_tile.hip");
 
+/// Flat-F16 sibling of the Q8_0 flash tile. Same partials layout and same
+/// per-thread dim mapping as the BF16/Q8 siblings, so it shares
+/// `attention_flash_q8_0_reduce` unmodified — that reduce only ever touches
+/// f32 partials.
+pub const ATTENTION_FLASH_F16_TILE_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_f16_tile.hip");
+
 /// gfx1151-only ISA experiment: preserve the flash tile's reduction tree but
 /// lower cross-lane exchanges to ds_swizzle + DPP8/quad-perm operations.
 pub const ATTENTION_FLASH_Q8_0_TILE_DPP_GFX1151_SRC: &str = concat!(
@@ -5676,6 +5691,8 @@ pub const ATTENTION_FLASH_Q8_0_TILE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_q8_0_tile_batched.hip");
 pub const ATTENTION_FLASH_BF16_TILE_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_bf16_tile_batched.hip");
+pub const ATTENTION_FLASH_F16_TILE_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/attention_flash_f16_tile_batched.hip");
 pub const ATTENTION_FLASH_Q8_0_TILE_ROWS_SRC: &str =
     include_str!("../../../kernels/src/attention_flash_q8_0_tile_rows.hip");
 pub const ATTENTION_FLASH_ASYM_REDUCE_BATCHED_SRC: &str =

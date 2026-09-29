@@ -7,8 +7,9 @@
 // KV tier is not q8:
 //
 //   tile-batched attention:  attention_flash_{asym2,asym3,asym4,fwht2,fwht3,fwht4}_tile_batched
-//   batched K writers:       kv_cache_write_asym_k_{givens2,givens3,givens4,fwht2,fwht3,fwht4}_batched
-//   Q8 V writer:             kv_cache_write_q8_0_batched (use_v_base arm)
+//                            + attention_flash_f16_tile_batched (flat fp16, no rotation)
+//   batched KV writers:      kv_cache_write_asym_k_{givens2,givens3,givens4,fwht2,fwht3,fwht4}_batched
+//                            + kv_cache_write_f16_batched (separate K and V launches)
 //
 // Every check runs against the tier's own LEGACY (descriptor-free) entry
 // points, which predate the ports and have GPU coverage of their own:
@@ -53,10 +54,11 @@ const POSITIONS: [i32; BATCH] = [31, 63, 127, 200];
 const TILE: usize = 128;
 const TOL: f32 = 1e-5;
 
-const TIERS: [&str; 6] = ["asym2", "asym3", "asym4", "fwht2", "fwht3", "fwht4"];
+const TIERS: [&str; 7] = ["asym2", "asym3", "asym4", "fwht2", "fwht3", "fwht4", "f16"];
 
 fn k_bytes_per_head(tier: &str) -> usize {
     match tier {
+        "f16" => HEAD_DIM * 2,
         "asym2" | "fwht2" => 4 + HEAD_DIM / 4,
         "asym3" | "fwht3" => 4 + (HEAD_DIM * 3) / 8,
         "asym4" | "fwht4" => 4 + HEAD_DIM / 2,
@@ -68,8 +70,12 @@ fn k_bytes_per_pos(tier: &str) -> usize {
     N_KV_HEADS * k_bytes_per_head(tier)
 }
 
-fn v_bytes_per_pos() -> usize {
-    N_KV_HEADS * (HEAD_DIM / 32) * 34
+fn v_bytes_per_pos(tier: &str) -> usize {
+    match tier {
+        // Flat fp16 V slab, same formula as K.
+        "f16" => N_KV_HEADS * HEAD_DIM * 2,
+        _ => N_KV_HEADS * (HEAD_DIM / 32) * 34,
+    }
 }
 
 struct Rng(u32);
@@ -86,11 +92,68 @@ impl Rng {
     }
 }
 
+/// IEEE f32 -> f16, round-to-nearest-even — the host twin of the f16
+/// writer's `__float2half_rn`, used here only to mint FINITE slab elements
+/// (rdna-compute does not depend on the `half` crate). Inputs this file
+/// feeds it are in [-1, 1]; inf/NaN handling exists only to keep the
+/// function total.
+fn f32_to_f16_bits(x: f32) -> u16 {
+    let bits = x.to_bits();
+    let sign = ((bits >> 16) & 0x8000) as u16;
+    let exp = ((bits >> 23) & 0xFF) as i32;
+    let mant = bits & 0x007F_FFFF;
+    if exp == 255 {
+        return sign | 0x7C00 | (mant >> 13) as u16 | 1;
+    }
+    let e16 = exp - 127 + 15;
+    if e16 >= 31 {
+        return sign | 0x7C00;
+    }
+    if e16 <= 0 {
+        if e16 < -10 {
+            return sign;
+        }
+        let shift = (1 - e16) as u32;
+        let m = mant | 0x0080_0000;
+        let m16 = m >> shift;
+        let rem = m & ((1 << shift) - 1);
+        let round = (rem > (1 << (shift - 1)) || (rem == (1 << (shift - 1)) && m16 & 1 == 1)) as u16;
+        return sign | (m16 as u16 + round);
+    }
+    let m16 = mant >> 13;
+    let rem = mant & 0x1FFF;
+    let round = (rem > 0x1000 || (rem == 0x1000 && m16 & 1 == 1)) as u16;
+    sign | ((e16 as u16) << 10) | (m16 as u16 + round)
+}
+
+/// Flat fp16 slab bytes for one slot: `n_kv_heads * head_dim` fp16 elements
+/// per position (2 B/elem, no norm header, no blocks — the f16 tier is
+/// structurally identical for K and V). Non-poison elements stay in [-1, 1]:
+/// huge fp16 magnitudes could overflow the QK dot product into NaN and fail
+/// parity against the reference itself. Poison writes the 0x7E00 NaN
+/// sentinel into every element (same sentinel the q8 V slab uses).
+fn f16_slab(rng: &mut Rng, poison: bool) -> Vec<u8> {
+    let mut out = Vec::with_capacity(SLAB_TOKENS * N_KV_HEADS * HEAD_DIM * 2);
+    for _ in 0..SLAB_TOKENS * N_KV_HEADS * HEAD_DIM {
+        let bits: u16 = if poison {
+            0x7E00
+        } else {
+            f32_to_f16_bits(rng.f32_unit() * 2.0 - 1.0)
+        };
+        out.extend_from_slice(&bits.to_ne_bytes());
+    }
+    out
+}
+
 /// K slab bytes for one slot: finite, varying f32 norm headers (a NaN header
 /// read as `cnorm` poisons the whole dot-product — check 2 relies on that)
 /// over arbitrary packed bodies. Arbitrary body bytes are safe: they only
-/// ever select entries from the tiers' bounded dequant tables.
+/// ever select entries from the tiers' bounded dequant tables. The f16 tier
+/// has no header or packing — a flat fp16 slab.
 fn k_slab(tier: &str, rng: &mut Rng, poison: bool) -> Vec<u8> {
+    if tier == "f16" {
+        return f16_slab(rng, poison);
+    }
     let bph = k_bytes_per_head(tier);
     let mut out = Vec::with_capacity(SLAB_TOKENS * k_bytes_per_pos(tier));
     for _ in 0..SLAB_TOKENS {
@@ -109,10 +172,14 @@ fn k_slab(tier: &str, rng: &mut Rng, poison: bool) -> Vec<u8> {
     out
 }
 
-/// Q8_0 V slab bytes: f16 scale (finite, or the 0x7E00 NaN sentinel when
-/// poisoned) + arbitrary i8 payload.
-fn v_slab(rng: &mut Rng, poison: bool) -> Vec<u8> {
-    let mut out = Vec::with_capacity(SLAB_TOKENS * v_bytes_per_pos());
+/// V slab bytes for one slot: flat fp16 for the f16 tier, else Q8_0 —
+/// f16 scale (finite, or the 0x7E00 NaN sentinel when poisoned) + arbitrary
+/// i8 payload.
+fn v_slab(tier: &str, rng: &mut Rng, poison: bool) -> Vec<u8> {
+    if tier == "f16" {
+        return f16_slab(rng, poison);
+    }
+    let mut out = Vec::with_capacity(SLAB_TOKENS * v_bytes_per_pos(tier));
     for _ in 0..SLAB_TOKENS {
         for _ in 0..N_KV_HEADS * (HEAD_DIM / 32) {
             let scale_bits: u16 = if poison { 0x7E00 } else { 0x3800 };
@@ -255,7 +322,7 @@ fn attn_checks(gpu: &mut Gpu, tier: &str, t: &Tables, rng: &mut Rng) -> (f32, f3
 
     // ── Check 1: zero-base parity on a clean single-slab arena ──────────
     let k_clean = upload_raw(gpu, &k_slab(tier, rng, false));
-    let v_clean = upload_raw(gpu, &v_slab(rng, false));
+    let v_clean = upload_raw(gpu, &v_slab(tier, rng, false));
     // descs: both slots at base 0 (rows map to slots 0/1 alternately; both
     // resolve to the same zero-base arena, exactly the legacy contract).
     let descs_zero = slab_descs(gpu, [0; SLOTS], [0; SLOTS]);
@@ -296,6 +363,11 @@ fn attn_checks(gpu: &mut Gpu, tier: &str, t: &Tables, rng: &mut Rng) -> (f32, f3
                 N_KV_HEADS, HEAD_DIM, SLAB_TOKENS, MAX_CTX, BATCH, &partials, None, 0, 0,
                 Some(&descs_zero), Some(&rs_alt),
             ),
+            "f16" => gpu.attention_flash_f16_batched_masked_windowed_slots(
+                &q, &k_clean, &v_clean, &out_slots, &pos, N_HEADS, N_KV_HEADS, HEAD_DIM,
+                SLAB_TOKENS, MAX_CTX, BATCH, &partials, None, 0, 0, 0,
+                Some(&descs_zero), Some(&rs_alt),
+            ),
             other => panic!("unknown tier {other}"),
         }
         .expect("slots attention launch");
@@ -324,6 +396,10 @@ fn attn_checks(gpu: &mut Gpu, tier: &str, t: &Tables, rng: &mut Rng) -> (f32, f3
                 &q, &k_clean, &v_clean, &out_ref, &pos, &t.signs1, &t.signs2, N_HEADS,
                 N_KV_HEADS, HEAD_DIM, SLAB_TOKENS, MAX_CTX, BATCH, &partials, None, 0, 0, 8,
             ),
+            "f16" => gpu.attention_flash_f16_batched_masked_windowed(
+                &q, &k_clean, &v_clean, &out_ref, &pos, N_HEADS, N_KV_HEADS, HEAD_DIM,
+                SLAB_TOKENS, MAX_CTX, BATCH, &partials, None, 0, 0, 0,
+            ),
             other => panic!("unknown tier {other}"),
         }
         .expect("reference attention launch");
@@ -334,11 +410,11 @@ fn attn_checks(gpu: &mut Gpu, tier: &str, t: &Tables, rng: &mut Rng) -> (f32, f3
     // ── Check 2: non-zero-base understudy — slot 0 poisoned, slot 1 clean
     // at base = slab, ALL rows on slot 1. ─────────────────────────────────
     let slab_k = SLAB_TOKENS * k_bytes_per_pos(tier);
-    let slab_v = SLAB_TOKENS * v_bytes_per_pos();
+    let slab_v = SLAB_TOKENS * v_bytes_per_pos(tier);
     let mut k_two = k_slab(tier, rng, true);
     k_two.extend(k_slab(tier, rng, false));
-    let mut v_two = v_slab(rng, true);
-    v_two.extend(v_slab(rng, false));
+    let mut v_two = v_slab(tier, rng, true);
+    v_two.extend(v_slab(tier, rng, false));
     let k_two_dev = upload_raw(gpu, &k_two);
     let v_two_dev = upload_raw(gpu, &v_two);
     let descs_slab = slab_descs(gpu, [0, slab_k as u64], [0, slab_v as u64]);
@@ -377,6 +453,11 @@ fn attn_checks(gpu: &mut Gpu, tier: &str, t: &Tables, rng: &mut Rng) -> (f32, f3
                 N_KV_HEADS, HEAD_DIM, SLAB_TOKENS, MAX_CTX, BATCH, &partials, None, 0, 0,
                 Some(&descs_slab), Some(&rs_one),
             ),
+            "f16" => gpu.attention_flash_f16_batched_masked_windowed_slots(
+                &q, &k_two_dev, &v_two_dev, &out_two, &pos, N_HEADS, N_KV_HEADS, HEAD_DIM,
+                SLAB_TOKENS, MAX_CTX, BATCH, &partials, None, 0, 0, 0,
+                Some(&descs_slab), Some(&rs_one),
+            ),
             other => panic!("unknown tier {other}"),
         }
         .expect("understudy slots launch");
@@ -408,6 +489,10 @@ fn attn_checks(gpu: &mut Gpu, tier: &str, t: &Tables, rng: &mut Rng) -> (f32, f3
                 &q, &k_ref2, &v_ref2, &out_ref2, &pos, &t.signs1, &t.signs2, N_HEADS,
                 N_KV_HEADS, HEAD_DIM, SLAB_TOKENS, MAX_CTX, BATCH, &partials, None, 0, 0, 8,
             ),
+            "f16" => gpu.attention_flash_f16_batched_masked_windowed(
+                &q, &k_ref2, &v_ref2, &out_ref2, &pos, N_HEADS, N_KV_HEADS, HEAD_DIM,
+                SLAB_TOKENS, MAX_CTX, BATCH, &partials, None, 0, 0, 0,
+            ),
             other => panic!("unknown tier {other}"),
         }
         .expect("understudy reference launch");
@@ -431,13 +516,13 @@ fn write_check(gpu: &mut Gpu, tier: &str, t: &Tables, rng: &mut Rng) -> (usize, 
     let rs_one = row_slot_all(gpu, 1);
 
     let slab_k = SLAB_TOKENS * k_bytes_per_pos(tier);
-    let slab_v = SLAB_TOKENS * v_bytes_per_pos();
+    let slab_v = SLAB_TOKENS * v_bytes_per_pos(tier);
 
     // Candidate arenas: [poison slab][zero slab]; rows write through slot 1.
     let k_poison_snapshot = k_slab(tier, rng, true);
     let mut k_cand = k_poison_snapshot.clone();
     k_cand.extend(std::iter::repeat(0u8).take(slab_k));
-    let v_poison_snapshot = v_slab(rng, true);
+    let v_poison_snapshot = v_slab(tier, rng, true);
     let mut v_cand = v_poison_snapshot.clone();
     v_cand.extend(std::iter::repeat(0u8).take(slab_v));
     let k_cand_dev = upload_raw(gpu, &k_cand);
@@ -473,6 +558,17 @@ fn write_check(gpu: &mut Gpu, tier: &str, t: &Tables, rng: &mut Rng) -> (usize, 
             &k_cand_dev, &v_cand_dev, &k_src, &v_src, &pos, &t.signs1, &t.signs2, N_KV_HEADS,
             HEAD_DIM, BATCH, Some(&descs), Some(&rs_one),
         ),
+        "f16" => gpu
+            .kv_cache_write_f16_batched(
+                &k_cand_dev, &k_src, &pos, N_KV_HEADS, HEAD_DIM, BATCH,
+                Some(&descs), Some(&rs_one),
+            )
+            .and_then(|()| {
+                gpu.kv_cache_write_f16_batched(
+                    &v_cand_dev, &v_src, &pos, N_KV_HEADS, HEAD_DIM, BATCH,
+                    Some(&descs), Some(&rs_one),
+                )
+            }),
         other => panic!("unknown tier {other}"),
     }
     .expect("candidate composite write");
@@ -498,6 +594,15 @@ fn write_check(gpu: &mut Gpu, tier: &str, t: &Tables, rng: &mut Rng) -> (usize, 
             &k_ref, &v_ref, &k_src, &v_src, &pos, &t.signs1, &t.signs2, N_KV_HEADS, HEAD_DIM,
             BATCH, 8,
         ),
+        "f16" => gpu
+            .kv_cache_write_f16_batched(
+                &k_ref, &k_src, &pos, N_KV_HEADS, HEAD_DIM, BATCH, None, None,
+            )
+            .and_then(|()| {
+                gpu.kv_cache_write_f16_batched(
+                    &v_ref, &v_src, &pos, N_KV_HEADS, HEAD_DIM, BATCH, None, None,
+                )
+            }),
         other => panic!("unknown tier {other}"),
     }
     .expect("reference composite write");
@@ -523,12 +628,12 @@ fn q8_v_base_check(gpu: &mut Gpu, rng: &mut Rng) {
     let src = upload_f32(gpu, &rand_f32_vec(BATCH * N_KV_HEADS * HEAD_DIM, rng));
     let pos = positions_dev(gpu);
     let rs_one = row_slot_all(gpu, 1);
-    let slab = SLAB_TOKENS * v_bytes_per_pos();
+    let slab = SLAB_TOKENS * v_bytes_per_pos("q8");
     let descs = slab_descs(gpu, [0; SLOTS], [0, slab as u64]);
 
     // Candidate: V base = slab, use_v_base = true → bytes must land in
     // slot 1's slab. Two slabs: [poison][zero].
-    let cand_poison = v_slab(rng, true);
+    let cand_poison = v_slab("q8", rng, true);
     let mut cand = cand_poison.clone();
     cand.extend(std::iter::repeat(0u8).take(slab));
     let cand_dev = upload_raw(gpu, &cand);
@@ -548,7 +653,7 @@ fn q8_v_base_check(gpu: &mut Gpu, rng: &mut Rng) {
     // the K base (0) — proving the flag actually flips addressing. Two
     // slabs again, so the slot-1 half exists even though the write goes to
     // slot 0.
-    let neg_poison = v_slab(rng, true);
+    let neg_poison = v_slab("q8", rng, true);
     let mut neg = neg_poison.clone();
     neg.extend(std::iter::repeat(0u8).take(slab));
     let neg_dev = upload_raw(gpu, &neg);

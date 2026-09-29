@@ -53,6 +53,9 @@ pub fn v_bytes_per_head(v: VMode, head_dim: usize) -> usize {
     match v {
         VMode::Q8 => (head_dim / 32) * 34, // 272 @256
         VMode::Lloyd2 | VMode::Lloyd3 | VMode::Lloyd4 => 4 + (head_dim * v.bits() as usize) / 8,
+        // Flat IEEE fp16 V (pairs only with KvMode::F16): 2 bytes per element,
+        // no blocks or scales — same flat geometry as the bf16 tier's V.
+        VMode::F16 => head_dim * 2,
     }
 }
 

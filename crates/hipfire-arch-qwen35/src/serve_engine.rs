@@ -1051,7 +1051,8 @@ impl Rig {
         }
         .map_err(|e| format!("SlotPool: {e}"))?;
         if !kv_plan.kv_strides_differ() {
-            // q8/bf16: nothing else to log; the tier banner below covers it.
+            // q8/bf16/f16 (flat tiers): nothing else to log; the tier banner
+            // below covers it.
         } else {
             eprintln!(
                 "[hipfire] slot KV tier {kv_mode:?}: K {per_pos_bytes} B/pos, \
@@ -1209,8 +1210,9 @@ impl Rig {
         if vl_sequential && !matches!(kv_mode, hipfire_runtime::kv_mode::KvMode::Q8) {
             return Err(
                 "HIPFIRE_VL_SEQUENTIAL=1 writes KV through the q8-only flat slab \
-                 view; it is not supported under a rotated KV tier. Drop the knob \
-                 (the default batched VL path is tier-generic) or use q8 KV."
+                 view; it is not supported under a non-q8 KV tier (rotated or \
+                 flat — f16 included). Drop the knob (the default batched VL \
+                 path is tier-generic) or use q8 KV."
                     .to_string(),
             );
         }
@@ -1232,6 +1234,10 @@ impl Rig {
             hipfire_runtime::kv_mode::KvMode::Fwht3 => 32,
             hipfire_runtime::kv_mode::KvMode::Fwht4 => 42,
             hipfire_runtime::kv_mode::KvMode::Bf16 => 12,
+            // F16: flat 2B/elem like bf16 but with a distinct tag — a snapshot
+            // written under f16 must never restore into a bf16 rig (same byte
+            // count per position, different element encoding).
+            hipfire_runtime::kv_mode::KvMode::F16 => 13,
             hipfire_runtime::kv_mode::KvMode::Asym3Auto => {
                 return Err("Asym3Auto sentinel reached Rig::build".to_string());
             }
@@ -1690,6 +1696,7 @@ impl Rig {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_f16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,

@@ -472,6 +472,10 @@ pub enum KernelKey {
     /// so one kernel covers both of Maple's layer types and there is no
     /// second path that could drop the window.
     AttnFlashBf16Windowed,
+    /// IEEE fp16 flash with sliding-window mask (multi-slot serve engine).
+    /// Same by-construction argument as bf16: no non-windowed f16 attend
+    /// key — `window == 0` is full causal.
+    AttnFlashF16Windowed,
     AttnQ8_0Kv, // non-flash short-context Q8_0 decode (ship 3.1 B0)
     AttnGqaFused,
     // F32 GQA-flash decode family (qwen2). Selected by F32AttnPolicy::Gqa.
@@ -495,6 +499,7 @@ pub enum KernelKey {
     AttnQ8_0KvBatchedMasked,         // P-1 no-LDS-cap tiled kernel
     AttnQ8_0KvBatchedMaskedWindowed, // sliding-window batched Q8 (cohere2moe prefill)
     AttnBf16KvBatchedMaskedWindowed, // sliding-window batched BF16 (maple prefill)
+    AttnF16KvBatchedMaskedWindowed,  // sliding-window batched F16 (serve engine paged prefill)
     // TODO(3.3): F32-batched key for models with F32 KV + batchable weights
     // Full attention (no KV cache — vision / dflash cross-attention)
     AttnFullF16,       // F16 K/V, non-causal
@@ -510,6 +515,7 @@ pub enum KernelKey {
     KvWriteAsym2Fwht,
     KvWriteQ8_0,
     KvWriteBf16,  // flat 2-byte BF16 KV write (maple)
+    KvWriteF16,   // flat 2-byte IEEE fp16 KV write (VMM/paged-capable)
     KvWriteHfq4,  // HFQ4-quantized KV write (llama legacy)
     KvWriteQ4,    // Q4-quantized KV write (llama legacy)
     KvWriteInt8c, // INT8-per-column KV write (llama)
@@ -524,6 +530,7 @@ pub enum KernelKey {
     KvWriteAsym2FwhtBatched,
     KvWriteQ8_0Batched,
     KvWriteBf16Batched,
+    KvWriteF16Batched,
 }
 
 // ── Shape context for predicate evaluation ───────────

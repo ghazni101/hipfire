@@ -50,11 +50,12 @@ fn normalize_full(raw: &str) -> Option<KvMode> {
         "fwht2" => Some(Fwht2),
         "fwht3" => Some(Fwht3),
         "fwht4" => Some(Fwht4),
+        "f16" => Some(F16),
         _ => None, // "" → default (silent); unrecognized → default (+warn)
     }
 }
 
-const FULL_LADDER: &[KvMode] = &[Q8, Asym2, Asym3, Asym4, Fwht2, Fwht3, Fwht4];
+const FULL_LADDER: &[KvMode] = &[Q8, Asym2, Asym3, Asym4, Fwht2, Fwht3, Fwht4, F16];
 /// Site 1 — qwen35 HFQ in-place carrier (pp=1). carrier.rs:65. Default fwht3.
 pub const QWEN35_HFQ_POLICY: KvModePolicy = KvModePolicy {
     site: "qwen35-hfq",
@@ -70,7 +71,7 @@ pub const QWEN35_HFQ_POLICY: KvModePolicy = KvModePolicy {
 pub const QWEN35_PARO_POLICY: KvModePolicy = KvModePolicy {
     site: "qwen35-paro",
     normalize_alias: normalize_full,
-    accepted: &[Q8, Asym2, Asym4, Fwht2, Fwht3, Fwht4],
+    accepted: &[Q8, Asym2, Asym4, Fwht2, Fwht3, Fwht4, F16],
     default: Q8,
 };
 
@@ -78,37 +79,42 @@ pub const QWEN35_PARO_POLICY: KvModePolicy = KvModePolicy {
 /// carriers.rs:492. A Flat site: Fwht3 has no Flat constructor, so the
 /// auto-set (`"" | "auto" | "turbo" | "turbo3"`) resolves to plain Q8.
 /// Explicit `"asym3"` is UNCONDITIONAL (panics @128 in
-/// the constructor — current behavior, preserved).
+/// the constructor — current behavior, preserved). F16 has a Flat
+/// constructor and is accepted like bf16-free flat tiers elsewhere.
 fn normalize_dir(raw: &str) -> Option<KvMode> {
     match raw {
         "q8" => Some(Q8),
         "asym3" => Some(Asym3), // UNCONDITIONAL
         "asym4" | "turbo4" => Some(Asym4),
         "" | "auto" | "turbo" | "turbo3" => Some(Q8),
+        "f16" => Some(F16),
         _ => None, // asym2/fwht*/garbage → default
     }
 }
 pub const DIR_SAFETENSORS_POLICY: KvModePolicy = KvModePolicy {
     site: "dir-safetensors",
     normalize_alias: normalize_dir,
-    accepted: &[Q8, Asym3, Asym4],
+    accepted: &[Q8, Asym3, Asym4, F16],
     default: Q8, // recognized-but-unaccepted AND unrecognized both → plain q8
 };
 
-/// Site 4 — llama HFQ carrier. carrier.rs:21. Default q8. Accepts the three
-/// modes that have Flat KV constructors: Q8, Asym3, Asym4. Asym3/Asym4 are
+/// Site 4 — llama HFQ carrier. carrier.rs:21. Default q8. Accepts the modes
+/// that have Flat KV constructors: Q8, Asym3, Asym4, F16. Asym3/Asym4 are
 /// gated in `KvCache::from_mode` with a clean error at head_dim≠256 (most llama
 /// models are head_dim=128; only validated at 256 via Qwen 3.5). Asym2/Fwht*
 /// have no Flat constructor and silently fall to q8 (unimplemented, not broken).
 pub const LLAMA_HFQ_POLICY: KvModePolicy = KvModePolicy {
     site: "llama-hfq",
     normalize_alias: normalize_full,
-    accepted: &[Q8, Asym3, Asym4],
+    accepted: &[Q8, Asym3, Asym4, F16],
     default: Q8,
 };
 
 /// Site 5 — minimax / lfm2moe HFQ carriers. minimax.rs:799, lfm2moe.rs:963.
-/// Hardcoded q8 today (no env in scope; caller passes literal "").
+/// Hardcoded q8 today (no env in scope; caller passes literal ""). F16 is
+/// deliberately NOT added to `accepted`: nothing at this site can pass a
+/// kv_mode string, so the extra arm would be dead policy. If a caller ever
+/// wires an env here, add F16 (it has Flat constructors).
 pub const HFQ_Q8_ONLY_POLICY: KvModePolicy = KvModePolicy {
     site: "hfq-q8-only",
     normalize_alias: normalize_full,
@@ -118,37 +124,44 @@ pub const HFQ_Q8_ONLY_POLICY: KvModePolicy = KvModePolicy {
 
 /// Site 6 — qwen35 HFQ pp>1 (multi-GPU). carriers.rs:131. Default q8,
 /// `"auto" → q8` (NOT fwht3 — unlike sites 1 & 2), narrow accept
-/// {q8, asym3, fwht3, fwht2}. This is why aliases can't be globally normalized.
+/// {q8, asym3, fwht3, fwht2, f16}. This is why aliases can't be globally
+/// normalized. F16 is accepted here for name parity with the single-GPU
+/// sites: there is no `*_multi_filtered` f16 constructor yet, so a pp>1
+/// request resolves F16 and then fails closed inside `from_mode_multi`
+/// ("no multi constructor") rather than silently downgrading to q8.
 fn normalize_pp(raw: &str) -> Option<KvMode> {
     match raw {
         "q8" | "auto" | "" => Some(Q8), // "auto" means q8 HERE
         "asym3" | "turbo3" | "turbo" => Some(Asym3),
         "fwht3" => Some(Fwht3),
         "fwht2" => Some(Fwht2),
+        "f16" => Some(F16),
         _ => None, // incl. asym2/asym4 → default (+warn "for pp>1")
     }
 }
 pub const QWEN35_PP_POLICY: KvModePolicy = KvModePolicy {
     site: "qwen35-pp",
     normalize_alias: normalize_pp,
-    accepted: &[Q8, Asym3, Fwht3, Fwht2],
+    accepted: &[Q8, Asym3, Fwht3, Fwht2, F16],
     default: Q8,
 };
 
 /// Site 7 — maple (arch 15). Before this site existed, maple hardcoded
 /// `KvCache::new_gpu_q8` and `--kv-mode` was a silent no-op for arch 15.
 ///
-/// The accept set is deliberately just {Q8, Bf16}. Every other mode in the
-/// ladder is a rotated or block-quantized tier whose attention kernels have NO
-/// sliding-window variant, and Maple is 3:1 sliding(512)/global — a tier that
-/// cannot carry the window would attend the full context on the sliding layers
-/// and be silently WRONG at ctx > 512, not merely slower. Accepting them and
-/// warning is the wrong trade here; refusing to the q8 default is right.
+/// The accept set is {Q8, Bf16, F16}. The rotated / block-quantized tiers in
+/// the ladder have attention kernels with NO sliding-window variant, and Maple
+/// is 3:1 sliding(512)/global — a tier that cannot carry the window would
+/// attend the full context on the sliding layers and be silently WRONG at
+/// ctx > 512, not merely slower. Accepting them and warning is the wrong
+/// trade here; refusing to the default is right. Bf16 and F16 are both flat
+/// 2-byte tiers with windowed kernels, so both carry the window correctly.
 ///
-/// `"bf16"` is the only new name, and it is deliberately NOT added to
-/// `normalize_full`: no other site can allocate a bf16 cache, so putting it
-/// there would let `HIPFIRE_KV_MODE=bf16` on qwen35 normalize successfully and
-/// then fall to that site's default — a silent downgrade instead of a warning.
+/// `"bf16"` stays OUT of `normalize_full` (no other site can allocate a bf16
+/// cache — it is contiguous-only, no VMM layout), so `HIPFIRE_KV_MODE=bf16`
+/// on qwen35 normalizes to None and warns rather than silently downgrading.
+/// `"f16"` IS a global name: unlike bf16, f16 is VMM/paged-allocatable and
+/// every site can construct it.
 ///
 /// **The default is bf16, not q8.** Measured against a bf16 reference on 2048
 /// teacher-forced wikitext tokens, q8 KV costs 39% of the total divergence
@@ -161,6 +174,7 @@ pub const QWEN35_PP_POLICY: KvModePolicy = KvModePolicy {
 fn normalize_maple(raw: &str) -> Option<KvMode> {
     match raw {
         "bf16" | "auto" | "" => Some(Bf16),
+        "f16" => Some(F16),
         "q8" => Some(Q8),
         _ => None, // every rotated/quantized tier → default (+warn)
     }
@@ -168,7 +182,7 @@ fn normalize_maple(raw: &str) -> Option<KvMode> {
 pub const MAPLE_POLICY: KvModePolicy = KvModePolicy {
     site: "maple",
     normalize_alias: normalize_maple,
-    accepted: &[Q8, Bf16],
+    accepted: &[Q8, Bf16, F16],
     default: Bf16,
 };
 
@@ -176,7 +190,8 @@ pub const MAPLE_POLICY: KvModePolicy = KvModePolicy {
 /// Q8_0-only for its whole life; the full static ladder is now wired
 /// end-to-end (descriptor-aware K writers + flash tile kernels, legacy and
 /// paged pools), so every tier the sequential path accepts is accepted here
-/// too. The DEFAULT stays q8 — deliberately NOT the sequential site's
+/// too — including F16 (flat 2B/elem, VMM/paged-capable). The DEFAULT stays
+/// q8 — deliberately NOT the sequential site's
 /// asym3: the slots q8 path has production mileage on every fixture, and
 /// an operator who wants a rotated tier on the slots engine says so
 /// explicitly (`HIPFIRE_KV_MODE=asym3` / config). "auto" therefore means
@@ -190,6 +205,7 @@ fn normalize_slots(raw: &str) -> Option<KvMode> {
         "fwht2" => Some(Fwht2),
         "fwht3" => Some(Fwht3),
         "fwht4" => Some(Fwht4),
+        "f16" => Some(F16),
         _ => None, // garbage → default (+warn); bf16 not allocatable here
     }
 }
@@ -253,6 +269,12 @@ mod tests {
         // supported tier and an intentional memory saving, not a degradation.
         assert!(resolve("q8", p).warning.is_none());
 
+        // Explicit f16 is HONORED — flat 2B/elem with a windowed kernel, the
+        // same window-carrying property as bf16.
+        let r = resolve("f16", p);
+        assert_eq!(r.mode, KvMode::F16);
+        assert!(r.warning.is_none(), "f16 must not warn on maple");
+
         // Every ROTATED / block-quantized tier must be REFUSED and warn.
         // These have no sliding-window attention kernel, so silently accepting
         // one would make Maple's sliding layers attend the full context and be
@@ -312,6 +334,8 @@ mod tests {
         assert_eq!(resolve("fwht3", p).mode, KvMode::Fwht3);
         assert_eq!(resolve("fwht2", p).mode, KvMode::Fwht2);
         assert_eq!(resolve("fwht4", p).mode, KvMode::Fwht4);
+        assert_eq!(resolve("f16", p).mode, KvMode::F16); // flat tier, allocatable
+        assert!(resolve("f16", p).warning.is_none());
         assert_eq!(resolve("", p).mode, KvMode::Fwht3); // default, silent
         assert!(resolve("", p).warning.is_none());
         assert_eq!(resolve("garbage", p).mode, KvMode::Fwht3); // unrecognized → default
@@ -334,6 +358,8 @@ mod tests {
         assert_eq!(resolve("fwht2", p).mode, KvMode::Fwht2);
         assert_eq!(resolve("fwht3", p).mode, KvMode::Fwht3);
         assert_eq!(resolve("fwht4", p).mode, KvMode::Fwht4);
+        assert_eq!(resolve("f16", p).mode, KvMode::F16); // f16 has a filtered ctor
+        assert!(resolve("f16", p).warning.is_none());
         assert_eq!(resolve("", p).mode, KvMode::Q8); // default
     }
 
@@ -352,6 +378,9 @@ mod tests {
         // asym4
         assert_eq!(resolve("asym4", p).mode, KvMode::Asym4);
         assert_eq!(resolve("turbo4", p).mode, KvMode::Asym4);
+        // f16: flat tier, allocatable at this site — honored, no warning.
+        assert_eq!(resolve("f16", p).mode, KvMode::F16);
+        assert!(resolve("f16", p).warning.is_none());
         // recognized-but-unaccepted + unrecognized: UNCONDITIONAL q8
         assert_eq!(resolve("asym2", p).mode, KvMode::Q8);
         assert_eq!(resolve("fwht3", p).mode, KvMode::Q8);
@@ -370,6 +399,8 @@ mod tests {
         assert_eq!(resolve("turbo3", p).mode, KvMode::Asym3);
         assert_eq!(resolve("fwht2", p).mode, KvMode::Fwht2);
         assert_eq!(resolve("fwht3", p).mode, KvMode::Fwht3);
+        assert_eq!(resolve("f16", p).mode, KvMode::F16); // accepted at pp site
+        assert!(resolve("f16", p).warning.is_none());
         assert_eq!(resolve("asym2", p).mode, KvMode::Q8); // not accepted → default
         assert!(resolve("asym2", p).warning.is_some());
         assert_eq!(resolve("asym4", p).mode, KvMode::Q8); // not accepted → default
@@ -397,13 +428,15 @@ mod tests {
             ("fwht2", KvMode::Fwht2),
             ("fwht3", KvMode::Fwht3),
             ("fwht4", KvMode::Fwht4),
+            ("f16", KvMode::F16),
         ] {
             let r = resolve(raw, p);
             assert_eq!(r.mode, mode, "{raw} must be honored on the slots site");
             assert!(r.warning.is_none(), "{raw} must not warn");
         }
-        // bf16 is not allocatable on this site: refuse to the default WITH
-        // a warning (never a silent downgrade).
+        // bf16 remains non-allocatable on this site (contiguous-only, no VMM
+        // layout): refuse to the default WITH a warning (never a silent
+        // downgrade). f16 has no such limit — it is honored above.
         let r = resolve("bf16", p);
         assert_eq!(r.mode, KvMode::Q8);
         assert!(r.warning.is_some());
@@ -424,6 +457,9 @@ mod tests {
         assert!(resolve("asym3", p).warning.is_none());
         assert_eq!(resolve("asym4", p).mode, KvMode::Asym4);
         assert_eq!(resolve("turbo4", p).mode, KvMode::Asym4);
+        // f16: Flat constructor exists → honored, no warning.
+        assert_eq!(resolve("f16", p).mode, KvMode::F16);
+        assert!(resolve("f16", p).warning.is_none());
         // auto/turbo/turbo3 normalize to Fwht3, which has no Flat constructor
         // and is NOT accepted here → Q8 default WITH warning. This is the fix
         // for the qwen3:0.6b load failure (auto used to resolve Asym3 and
@@ -455,5 +491,9 @@ mod tests {
         assert!(resolve("auto", p).warning.is_some());
         assert_eq!(resolve("fwht4", p).mode, KvMode::Q8);
         assert_eq!(resolve("garbage", p).mode, KvMode::Q8);
+        // f16 normalizes via the shared table but is unaccepted at this
+        // hardcoded-q8 site → q8 default WITH warning (see policy comment).
+        assert_eq!(resolve("f16", p).mode, KvMode::Q8);
+        assert!(resolve("f16", p).warning.is_some());
     }
 }

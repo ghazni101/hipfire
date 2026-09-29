@@ -19,6 +19,12 @@ pub enum KvMode {
     /// site whose `accepted` list names it can ever resolve to it — today that
     /// is maple alone, so every other site's behaviour is unchanged.
     Bf16,
+    /// Flat 2-byte IEEE fp16 K/V — the same element layout as Bf16
+    /// (`pos * kv_dim + kv_head * head_dim + d`, no blocks/scales/rotation)
+    /// with the IEEE-754 half-precision encoding. Also outside the quantized
+    /// ladder, but unlike Bf16 it IS admitted by both the contiguous and the
+    /// VMM backends, so the multi-slot pool and prefix cache can address it.
+    F16,
     Asym2,
     Asym3,
     Asym4,
@@ -258,6 +264,9 @@ pub enum VMode {
     Lloyd2,
     Lloyd3,
     Lloyd4,
+    /// Flat IEEE fp16 V — pairs with `KvMode::F16` only (validated by
+    /// `validate_vmm_static_geometry`). Never a lloyd-style packed format.
+    F16,
 }
 
 impl VMode {
@@ -269,6 +278,9 @@ impl VMode {
             VMode::Lloyd2 => 2,
             VMode::Lloyd3 => 3,
             VMode::Lloyd4 => 4,
+            // 16 bits per flat fp16 element — matches the write/attend
+            // kernarg convention even though no packed-V codepath reads it.
+            VMode::F16 => 16,
         }
     }
 }
@@ -320,6 +332,13 @@ pub struct KvCache {
     /// every `quant_*` tier flag above; `quantized` is also set so the legacy
     /// llama/qwen35 `!quantized` branches never mistake it for plain F32.
     pub quant_bf16: bool,
+    /// True when K and V are stored as flat 2-byte IEEE fp16 — the same flat
+    /// layout as bf16 (`quant_bf16`) with the half-precision encoding. Unlike
+    /// bf16 this tier is also legal on the VMM backend, so it must be
+    /// representable in the VMM flag bundle. Mutually exclusive with every
+    /// other `quant_*` flag; `quantized` is also set so the legacy
+    /// `!quantized` branches never read the buffer as plain F32.
+    pub quant_f16: bool,
     /// V-cache quantization mode (independent of the K mode). Defaults to Q8.
     pub v_mode: VMode,
     /// Per-layer flag: true = this layer uses Q8 (boundary layer)
@@ -406,11 +425,13 @@ impl SlotKvTierPlan {
                 }
                 (head_dim / 32) * 34
             }
-            // Bf16 is flat 2 bytes/element with no per-head blocks and no
-            // rotation table. It is allocatable by the maple site only —
-            // whether a given engine ACCEPTS the tier is its policy's call
-            // (see kv_mode.rs); this helper just describes the layout.
-            KvMode::Bf16 => {
+            // Flat 2-byte K/V: bf16 is allocatable by the maple site only,
+            // f16 by both contiguous and VMM sites — whether a given engine
+            // ACCEPTS the tier is its policy's call (see kv_mode.rs); this
+            // helper just describes the layout. F16 is bit-layout-identical
+            // to Bf16 (pos*kv_dim + head*head_dim + d) with the IEEE-754
+            // half-precision encoding in place of bfloat16.
+            KvMode::Bf16 | KvMode::F16 => {
                 let kv_dim = n_kv_heads
                     .checked_mul(head_dim)
                     .ok_or_else(|| hip_bridge::HipError::new(0, "slot KV kv_dim overflowed"))?;
@@ -436,16 +457,17 @@ impl SlotKvTierPlan {
             }
         };
         let k_bytes_per_pos = match mode {
-            // bf16's stride is already per-position (kv_dim flat elements, no
-            // per-head blocks) — it must NOT be scaled by n_kv_heads again.
-            KvMode::Bf16 => k_bph,
+            // The flat 2-byte tiers' stride is already per-position (kv_dim
+            // flat elements, no per-head blocks) — it must NOT be scaled by
+            // n_kv_heads again.
+            KvMode::Bf16 | KvMode::F16 => k_bph,
             _ => n_kv_heads
                 .checked_mul(k_bph)
                 .ok_or_else(|| hip_bridge::HipError::new(0, "slot KV K stride overflowed"))?,
         };
         let v_bytes_per_pos = match mode {
-            // bf16 V is flat like its K.
-            KvMode::Bf16 => k_bytes_per_pos,
+            // Flat-tier V is stored flat like its K (bf16/f16 element).
+            KvMode::Bf16 | KvMode::F16 => k_bytes_per_pos,
             _ => {
                 // Static multi-slot ladder stores V at Q8_0 — the same
                 // per-head layout the asym/fwht constructors allocate.
@@ -504,8 +526,9 @@ pub struct KvDims {
     /// raw `ctx.max_seq`, or the allocation size changes.
     pub max_seq: usize,
     /// `Some(cap)` → request a `_capped` form. HONORED ONLY for modes that have
-    /// one (q8/asym3/fwht2/fwht3 on Mask sites; q8/asym3/asym4 on Flat sites);
-    /// silently DROPPED for asym2/asym4/fwht4 on Mask sites — faithful to today.
+    /// one (q8/asym3/fwht2/fwht3/f16 on Mask sites; q8/asym3/asym4/bf16/f16 on
+    /// Flat sites); silently DROPPED for asym2/asym4/fwht4 on Mask sites —
+    /// faithful to today.
     pub physical_cap: Option<usize>,
 }
 
@@ -591,6 +614,11 @@ impl KvCache {
                 0,
                 "VMM does not support bf16 KV (contiguous backend only)",
             )),
+            // F16 IS VMM-allocatable (unlike bf16): flat 2 bytes per element,
+            // head_dim elements per head, no block header.
+            KvMode::F16 => head_dim
+                .checked_mul(2)
+                .ok_or_else(|| hip_bridge::HipError::new(0, "VMM f16 K head stride overflowed")),
             KvMode::Asym2 | KvMode::Fwht2 => head_dim
                 .checked_div(4)
                 .and_then(|n| n.checked_add(4))
@@ -640,6 +668,9 @@ impl KvCache {
                         )
                     })
             }
+            VMode::F16 => head_dim
+                .checked_mul(2)
+                .ok_or_else(|| hip_bridge::HipError::new(0, "VMM f16 V head stride overflowed")),
         }
     }
 
@@ -680,6 +711,18 @@ impl KvCache {
                     0,
                     "VMM does not support bf16 KV (contiguous backend only)",
                 ));
+            }
+            // F16 VMM is legal (unlike bf16): the flat layout carries no
+            // blocks so it has no head_dim divisibility gate, and V must use
+            // the matching flat fp16 encoding — any packed V mode would make
+            // the K/V strides disagree with the flat f16 kernels.
+            KvMode::F16 => {
+                if !matches!(v_mode, VMode::F16) {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        "VMM f16 only supports VMode::F16 (flat V matching flat K)",
+                    ));
+                }
             }
             KvMode::Asym2 | KvMode::Asym3 | KvMode::Asym4 => {
                 let ok_hd = match mode {
@@ -738,6 +781,15 @@ impl KvCache {
                         ));
                     }
                 }
+                // Flat f16 V is the F16-K tier's pair — rejecting it on
+                // FWHT-K keeps a mismatched (rotated K, flat V) combination
+                // from allocating buffers at inconsistent strides.
+                VMode::F16 => {
+                    return Err(hip_bridge::HipError::new(
+                        0,
+                        &format!("VMM f16-V requires KvMode::F16 (got mode={mode:?})"),
+                    ));
+                }
             },
             KvMode::Asym3Auto => {
                 return Err(hip_bridge::HipError::new(
@@ -774,10 +826,11 @@ impl KvCache {
             Self::checked_vmm_product("V reserve", &[physical_cap, v_bytes_per_token])?;
         let rotation_table_len = match mode {
             KvMode::Q8 => 0,
-            // Unrotated, like Q8. Unreachable in practice — the validate above
-            // rejects bf16 for VMM before this runs — but 0 is the honest
-            // answer for a tier with no rotation table.
-            KvMode::Bf16 => 0,
+            // Unrotated, like Q8. Bf16 is unreachable in practice — the
+            // validate above rejects bf16 for VMM before this runs — but 0 is
+            // the honest answer for a tier with no rotation table. F16 IS
+            // reachable and is genuinely table-free.
+            KvMode::Bf16 | KvMode::F16 => 0,
             // Sentinel: unreachable — resolve() rejects Asym3Auto before any
             // VMM constructor runs.
             KvMode::Asym3Auto => 0,
@@ -934,30 +987,33 @@ impl KvCache {
     }
 
     /// Flag bundle applied by the unified static VMM constructor.
-    /// Returns (quant_q8, quant_asym4, quant_asym3, quant_asym2, quant_fwht).
-    /// Pure classification of a `KvMode` into its five VMM layout flags.
-    /// Public so callers one layer up can build a cache in a known layout
-    /// without duplicating the mapping.
-    pub fn vmm_mode_flags(mode: KvMode) -> (bool, bool, bool, bool, bool) {
+    /// Returns (quant_q8, quant_asym4, quant_asym3, quant_asym2, quant_fwht,
+    /// quant_f16). Pure classification of a `KvMode` into its VMM layout
+    /// flags. Public so callers one layer up can build a cache in a known
+    /// layout without duplicating the mapping.
+    pub fn vmm_mode_flags(mode: KvMode) -> (bool, bool, bool, bool, bool, bool) {
         match mode {
-            KvMode::Q8 => (true, false, false, false, false),
-            KvMode::Asym2 => (false, false, false, true, false),
+            KvMode::Q8 => (true, false, false, false, false, false),
+            KvMode::Asym2 => (false, false, false, true, false, false),
             // Sentinel: unreachable — resolve() rejects Asym3Auto before any
             // VMM constructor runs.
             KvMode::Asym3Auto => panic!(
                 "vmm_mode_flags: Asym3Auto is a sentinel, not a VMM layout mode"
             ),
-            KvMode::Asym3 => (false, false, true, false, false),
-            KvMode::Asym4 => (false, true, false, false, false),
-            KvMode::Fwht2 => (false, false, false, true, true),
-            KvMode::Fwht3 => (false, false, true, false, true),
-            KvMode::Fwht4 => (false, true, false, false, true),
+            KvMode::Asym3 => (false, false, true, false, false, false),
+            KvMode::Asym4 => (false, true, false, false, false, false),
+            KvMode::Fwht2 => (false, false, false, true, true, false),
+            KvMode::Fwht3 => (false, false, true, false, true, false),
+            KvMode::Fwht4 => (false, true, false, false, true, false),
+            // F16 is a real VMM tier: only the f16 flag — every packed /
+            // rotated flag stays false because the buffer is flat fp16.
+            KvMode::F16 => (false, false, false, false, false, true),
 
-            // Bf16 is NOT representable in this 5-flag VMM bundle — all-false
-            // here would decode as KTier::F32 and hand a bf16 buffer to the
-            // F32 kernels, which read it at twice the stride. It can never
-            // legitimately arrive: `validate_vmm_mode` rejects bf16 before any
-            // VMM constructor runs. Panic loudly rather than return a lie.
+            // Bf16 is NOT representable in this VMM bundle — all-false here
+            // would decode as KTier::F32 and hand a bf16 buffer to the F32
+            // kernels, which read it at twice the stride. It can never
+            // legitimately arrive: `validate_vmm_mode` rejects bf16 before
+            // any VMM constructor runs. Panic loudly rather than return a lie.
             KvMode::Bf16 => panic!(
                 "vmm_mode_flags: bf16 has no VMM layout — it is contiguous-only \
                  and should have been rejected by validate_mode_with_backend"
@@ -1037,11 +1093,22 @@ impl KvCache {
                     physical_cap,
                 )?;
             }
+            KvMode::F16 => {
+                // Flat fp16 K pairs only with VMode::F16 — checked inside the
+                // layout build, which also gates n_kv_heads / physical_cap.
+                Self::vmm_static_layout(
+                    mode,
+                    VMode::F16,
+                    dims.n_kv_heads,
+                    dims.head_dim,
+                    physical_cap,
+                )?;
+            }
             other => {
                 return Err(hip_bridge::HipError::new(
                     0,
                     &format!(
-                        "KV backend 'vmm' supports kv_mode=q8|asym2|asym3|asym4|fwht2|fwht3|fwht4 only (got {other:?})"
+                        "KV backend 'vmm' supports kv_mode=q8|asym2|asym3|asym4|fwht2|fwht3|fwht4|f16 only (got {other:?})"
                     ),
                 ));
             }
@@ -1164,6 +1231,7 @@ impl KvCache {
             givens_sin: None,
             quant_fwht: false,
             quant_bf16: false,
+            quant_f16: false,
             v_mode: VMode::Q8,
             layer_is_boundary: self.layer_is_boundary.clone(),
             compact_offset: 0,
@@ -1244,6 +1312,17 @@ impl KvCache {
                 mode,
                 VMode::Q8,
             ),
+            // F16 V is flat fp16 — the only V mode its K tier pairs with.
+            KvMode::F16 => Self::new_gpu_vmm_capped_filtered(
+                gpu,
+                is_kv_layer,
+                dims.n_kv_heads,
+                dims.head_dim,
+                dims.max_seq,
+                physical_cap,
+                mode,
+                VMode::F16,
+            ),
             other => unreachable!("VMM mode {other:?} validated before dispatch"),
         }
     }
@@ -1296,6 +1375,17 @@ impl KvCache {
                 Self::new_gpu_bf16_capped(gpu, *n, nh, hd, ms, cap)
             }
             (KvMode::Bf16, Flat(n), None) => Self::new_gpu_bf16(gpu, *n, nh, hd, ms),
+            // F16 has full filtered + capped coverage: unlike bf16 it is the
+            // serve engine's flat tier, so Mask sites (qwen3.5) and Flat sites
+            // both resolve here.
+            (KvMode::F16, Mask(m), Some(cap)) => {
+                Self::new_gpu_f16_capped_filtered(gpu, m, nh, hd, ms, cap)
+            }
+            (KvMode::F16, Mask(m), None) => Self::new_gpu_f16_filtered(gpu, m, nh, hd, ms),
+            (KvMode::F16, Flat(n), Some(cap)) => {
+                Self::new_gpu_f16_capped(gpu, *n, nh, hd, ms, cap)
+            }
+            (KvMode::F16, Flat(n), None) => Self::new_gpu_f16(gpu, *n, nh, hd, ms),
             // No constructor exists for this combination.
             (m, l, c) => Err(hip_bridge::HipError::new(
                 0,
@@ -1347,6 +1437,7 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_f16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -1396,6 +1487,7 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_f16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -1506,6 +1598,7 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_f16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -1595,6 +1688,7 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: true,
+            quant_f16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -1604,6 +1698,128 @@ impl KvCache {
             // read on this path — the tier decode reaches `KTier::Bf16` before
             // any v_mode branch.
             v_mode: VMode::Q8,
+        })
+    }
+
+    /// Flat IEEE fp16 KV cache. Same element layout as the bf16 tier —
+    /// `(t, kv_h, d)` lives at `t * kv_dim + kv_h * head_dim + d`, one 2-byte
+    /// half each, no blocks/scales/rotation — but unlike bf16 this tier is
+    /// also allocatable by the VMM path (`new_gpu_vmm_capped_filtered` with
+    /// `KvMode::F16`/`VMode::F16`), so the serve engine's paged pool and
+    /// prefix cache can address it.
+    pub fn new_gpu_f16(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_f16_capped(
+            gpu,
+            n_layers,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            max_seq_len,
+        )
+    }
+
+    /// Same as [`KvCache::new_gpu_f16`] with an explicit physical_cap.
+    pub fn new_gpu_f16_capped(
+        gpu: &mut Gpu,
+        n_layers: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        let is_kv_layer = vec![true; n_layers];
+        Self::new_gpu_f16_capped_filtered(
+            gpu,
+            &is_kv_layer,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            physical_cap,
+        )
+    }
+
+    /// Filtered variant of [`KvCache::new_gpu_f16`]: skips KV allocation on
+    /// layers where `is_kv_layer[i]` is false (hybrid arches where those
+    /// layers' state lives elsewhere), preserving absolute layer indices via
+    /// 1-element placeholders. See [`alloc_k_v_filtered`].
+    pub fn new_gpu_f16_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+    ) -> HipResult<Self> {
+        Self::new_gpu_f16_capped_filtered(
+            gpu,
+            is_kv_layer,
+            n_kv_heads,
+            head_dim,
+            max_seq_len,
+            max_seq_len,
+        )
+    }
+
+    /// Capped + filtered flat fp16 cache. Sizing mirrors
+    /// [`new_gpu_bf16_capped`] (2 B/element, ceil to whole F32 elements
+    /// because the allocator is typed F32) and flags mirror it too —
+    /// `quantized: true` keeps the legacy `!quantized` = "plain F32" branches
+    /// out, `quant_f16` distinguishes the tier from its bf16 sibling.
+    pub fn new_gpu_f16_capped_filtered(
+        gpu: &mut Gpu,
+        is_kv_layer: &[bool],
+        n_kv_heads: usize,
+        head_dim: usize,
+        max_seq_len: usize,
+        physical_cap: usize,
+    ) -> HipResult<Self> {
+        assert!(
+            physical_cap > 0 && physical_cap <= max_seq_len,
+            "physical_cap ({physical_cap}) must be in (0, max_seq_len={max_seq_len}]"
+        );
+        let kv_dim = n_kv_heads * head_dim;
+        let cache_bytes = physical_cap * kv_dim * 2;
+        let cache_elems = cache_bytes.div_ceil(4);
+        let (k_gpu, v_gpu) = Self::alloc_k_v_filtered(gpu, cache_elems, cache_elems, is_kv_layer)?;
+        let n_kv = is_kv_layer.iter().filter(|b| **b).count();
+        eprintln!(
+            "KV cache: f16 ({n_kv}/{} layers carry KV; flat 2B/elem, physical_cap={physical_cap} / max_seq={max_seq_len})",
+            is_kv_layer.len(),
+        );
+        Ok(Self {
+            k_gpu,
+            v_gpu,
+            k_scales: vec![],
+            v_scales: vec![],
+            kv_dim,
+            max_seq: max_seq_len,
+            physical_cap,
+            n_kv_heads,
+            head_dim,
+            quantized: true,
+            quant_q8: false,
+            quant_int8: false,
+            quant_hfq4: false,
+            quant_asym4: false,
+            quant_asym3: false,
+            quant_asym2: false,
+            quant_fwht: false,
+            quant_bf16: false,
+            quant_f16: true,
+            boundary_layers: 0,
+            givens_cos: None,
+            givens_sin: None,
+            layer_is_boundary: vec![],
+            compact_offset: 0,
+            // V is fp16 too — unlike the bf16 tier's `VMode::Q8` stand-in,
+            // this tier is VMM-legal, and VMM stride math reads `v_mode`, so
+            // the real encoding must be recorded here.
+            v_mode: VMode::F16,
         })
     }
 
@@ -1710,6 +1926,12 @@ impl KvCache {
             } else {
                 KvMode::Asym2
             });
+        }
+        // F16 has no packed/rotated flag — it is the flat-V-mode VMM tier.
+        // Bf16 stays unresolvable: it is contiguous-only, and a contiguous
+        // bf16 cache never reaches this VMM-facing query.
+        if self.quant_f16 {
+            return Ok(KvMode::F16);
         }
         Err(hip_bridge::HipError::new(
             0,
@@ -1957,6 +2179,9 @@ impl KvCache {
             VMode::Lloyd2 | VMode::Lloyd3 | VMode::Lloyd4 => {
                 n_kv_heads * (4 + (head_dim * v_mode.bits() as usize) / 8)
             }
+            // Flat fp16 V: n_kv_heads * head_dim elements at 2 bytes each —
+            // no block header, same flat stride as the f16 K side.
+            VMode::F16 => n_kv_heads * head_dim * 2,
         }
     }
 
@@ -1983,10 +2208,11 @@ impl KvCache {
         // invariant (the legacy qwen35 literals hardcoded quant_q4 = false).
         // Release classify() output is unchanged either way (asym is matched
         // before q4), so this is a true no-op for kernel selection.
-        // BF16 is a distinct flat tier (maple): it is `quantized:true` with
-        // empty `k_scales` and no other quant flag, so without `!quant_bf16`
-        // it would ALSO report quant_q4, giving two true tier flags and
-        // tripping the same debug_assert on every Maple BF16 dispatch.
+        // The flat 2-byte tiers (bf16 maple, f16 serve) are `quantized:true`
+        // with empty `k_scales` and no other quant flag, so without
+        // `!quant_bf16`/`!quant_f16` each would ALSO report quant_q4, giving
+        // two true tier flags and tripping the same debug_assert on every
+        // flat-tier dispatch.
         self.quantized
             && !self.quant_hfq4
             && !self.quant_q8
@@ -1995,6 +2221,7 @@ impl KvCache {
             && !self.quant_asym3
             && !self.quant_asym2
             && !self.quant_bf16
+            && !self.quant_f16
             && self.k_scales.is_empty()
     }
 
@@ -2013,6 +2240,11 @@ impl KvCache {
             && !self.quant_asym4
             && !self.quant_asym3
             && !self.quant_asym2
+            // Flat tiers never carry k_scales so this is belt-and-suspenders:
+            // explicit exclusion keeps exactly-one-tier-flag true even if a
+            // future f16/bf16 caller attaches scales.
+            && !self.quant_bf16
+            && !self.quant_f16
     }
 
     /// The sealed decode of this cache's storage tier. The sanctioned way to
@@ -2053,10 +2285,16 @@ impl KvCache {
     pub fn set_v_mode_realloc(&mut self, gpu: &mut Gpu, v_mode: VMode) -> HipResult<()> {
         assert!(
             ((self.quant_asym2 || self.quant_asym3 || self.quant_asym4) && self.quant_fwht)
-                || matches!(v_mode, VMode::Q8),
-            "lloyd-V is 256-wide and requires an FWHT K mode (quant_asym{{2,3,4}} && quant_fwht); got a different K mode — would corrupt the V cache"
+                || matches!(v_mode, VMode::Q8)
+                || (matches!(v_mode, VMode::F16) && self.quant_f16),
+            "lloyd-V is 256-wide and requires an FWHT K mode (quant_asym{{2,3,4}} && quant_fwht); \
+             flat VMode::F16 pairs only with flat F16 K; got an incompatible K/V pair — would \
+             corrupt the V cache"
         );
-        if !matches!(v_mode, VMode::Q8) {
+        // head_dim==256 is a lloyd-V constraint: the 256-wide sign tables only
+        // exist for the lloyd family. Flat F16 V has no rotation table at all.
+        let is_lloyd_v = !matches!(v_mode, VMode::Q8 | VMode::F16);
+        if is_lloyd_v {
             assert!(self.head_dim == 256, "lloyd-V requires head_dim == 256");
         }
         // For fwht2/4-K caches the sign tables are 128-element (the K rotation
@@ -2065,7 +2303,7 @@ impl KvCache {
         // gen_fwht_signs(seed,128), so the K path remains byte-identical after
         // realloc. Skip when signs are already 256 (fwht3) or when givens_cos
         // is None (multi-GPU cache — sign realloc deferred to Task 9).
-        if !matches!(v_mode, VMode::Q8) {
+        if is_lloyd_v {
             let need_realloc = self.givens_cos.as_ref().map_or(false, |t| t.numel() < 256);
             if need_realloc {
                 let n = 256usize;
@@ -2704,6 +2942,7 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: true,
             quant_bf16: false,
+            quant_f16: false,
             boundary_layers: 0,
             givens_cos: Some(s1),
             givens_sin: Some(s2),
@@ -2800,6 +3039,7 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_f16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -2891,7 +3131,7 @@ impl KvCache {
             }
         };
 
-        let (quant_q8, quant_asym4, quant_asym3, quant_asym2, quant_fwht) =
+        let (quant_q8, quant_asym4, quant_asym3, quant_asym2, quant_fwht, quant_f16) =
             Self::vmm_mode_flags(mode);
         let (givens_cos, givens_sin) = match rotation {
             Some((a, b)) => (Some(a), Some(b)),
@@ -2917,6 +3157,7 @@ impl KvCache {
             quant_asym2,
             quant_fwht,
             quant_bf16: false,
+            quant_f16,
             boundary_layers: 0,
             givens_cos,
             givens_sin,
@@ -2942,6 +3183,7 @@ impl KvCache {
             VMode::Lloyd2 => "lloyd2".to_string(),
             VMode::Lloyd3 => "lloyd3".to_string(),
             VMode::Lloyd4 => "lloyd4".to_string(),
+            VMode::F16 => "F16".to_string(),
         };
         eprintln!(
             "KV cache: {mode:?} vmm ({n_kv}/{} layers carry KV; K {}B/head + V {v_label} {}B/head; mapped_prefix={mapped} / physical_cap={physical_cap} / max_seq={max_seq_len})",
@@ -3012,6 +3254,7 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_f16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -3059,6 +3302,7 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_f16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -3108,6 +3352,7 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_f16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -3159,6 +3404,7 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_f16: false,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -3258,6 +3504,7 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_f16: false,
             boundary_layers: 0,
             givens_cos: Some(ct),
             givens_sin: Some(st),
@@ -3330,6 +3577,7 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: true,
             quant_bf16: false,
+            quant_f16: false,
             boundary_layers: 0,
             givens_cos: Some(s1),
             givens_sin: Some(s2),
@@ -3403,6 +3651,7 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_f16: false,
             boundary_layers: 0,
             givens_cos: Some(ct),
             givens_sin: Some(st),
@@ -3503,6 +3752,7 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: true,
             quant_bf16: false,
+            quant_f16: false,
             boundary_layers: 0,
             givens_cos: Some(s1),
             givens_sin: Some(s2),
@@ -3630,6 +3880,7 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_f16: false,
             boundary_layers: 0,
             givens_cos: Some(ct),
             givens_sin: Some(st),
@@ -3813,6 +4064,7 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: true,
             quant_bf16: false,
+            quant_f16: false,
             boundary_layers: 0,
             givens_cos: Some(s1),
             givens_sin: Some(s2),
@@ -4008,6 +4260,7 @@ impl KvCache {
             quant_asym2: false,
             quant_fwht: false,
             quant_bf16: false,
+            quant_f16: false,
             boundary_layers: 0,
             givens_cos: Some(ct),
             givens_sin: Some(st),
@@ -4092,6 +4345,7 @@ impl KvCache {
             quant_asym2: true,
             quant_fwht: false,
             quant_bf16: false,
+            quant_f16: false,
             boundary_layers: 0,
             givens_cos: Some(ct),
             givens_sin: Some(st),
@@ -4182,6 +4436,7 @@ impl KvCache {
             quant_asym2: true,
             quant_fwht: true,
             quant_bf16: false,
+            quant_f16: false,
             boundary_layers: 0,
             givens_cos: Some(s1),
             givens_sin: Some(s2),
@@ -4255,6 +4510,7 @@ impl KvCache {
             quant_asym2: true,
             quant_fwht: false,
             quant_bf16: false,
+            quant_f16: false,
             boundary_layers: 0,
             givens_cos: Some(ct),
             givens_sin: Some(st),
@@ -4380,6 +4636,7 @@ mod vmm_layout_tests {
             KvMode::Asym2 | KvMode::Fwht2 => 4 + head_dim / 4,
             KvMode::Asym3 | KvMode::Fwht3 => 4 + (head_dim * 3) / 8,
             KvMode::Asym4 | KvMode::Fwht4 => 4 + head_dim / 2,
+            KvMode::F16 => head_dim * 2,
 
             KvMode::Bf16 => panic!("bf16 is not a VMM layout mode"),
             KvMode::Asym3Auto => panic!("Asym3Auto is not a VMM layout mode"),
@@ -4392,11 +4649,12 @@ mod vmm_layout_tests {
             VMode::Lloyd2 => 4 + head_dim / 4,
             VMode::Lloyd3 => 4 + (head_dim * 3) / 8,
             VMode::Lloyd4 => 4 + head_dim / 2,
+            VMode::F16 => head_dim * 2,
         }
     }
 
     fn flag_standin(mode: KvMode, v_mode: VMode, n_kv_heads: usize, head_dim: usize) -> KvCache {
-        let (q8, a4, a3, a2, fwht) = KvCache::vmm_mode_flags(mode);
+        let (q8, a4, a3, a2, fwht, f16) = KvCache::vmm_mode_flags(mode);
         KvCache {
             k_gpu: vec![],
             v_gpu: vec![],
@@ -4416,6 +4674,7 @@ mod vmm_layout_tests {
             quant_asym2: a2,
             quant_fwht: fwht,
             quant_bf16: false,
+            quant_f16: f16,
             boundary_layers: 0,
             givens_cos: None,
             givens_sin: None,
@@ -4488,7 +4747,7 @@ mod vmm_layout_tests {
     }
 
     #[test]
-    fn validate_mode_admits_all_seven_static_vmm_modes() {
+    fn validate_mode_admits_all_static_vmm_modes() {
         let dims = vmm_mask_dims(4, 256, 4096, 1024);
         for mode in [
             KvMode::Q8,
@@ -4498,6 +4757,7 @@ mod vmm_layout_tests {
             KvMode::Fwht2,
             KvMode::Fwht3,
             KvMode::Fwht4,
+            KvMode::F16,
         ] {
             KvCache::validate_mode_with_backend(mode, KvBackend::Vmm, true, &dims)
                 .unwrap_or_else(|e| panic!("mode={mode:?}: {e}"));
@@ -4550,6 +4810,12 @@ mod vmm_layout_tests {
                 "{mode:?}"
             );
         }
+        // F16 is the only static mode whose V stride is NOT Q8_0 — its flat
+        // VMode::F16 pairs with the flat K at 2 B/element.
+        let cache = flag_standin(KvMode::F16, VMode::F16, n_kv_heads, head_dim);
+        let (k, v) = cache.vmm_bytes_per_token().unwrap();
+        assert_eq!(k, n_kv_heads * head_dim * 2, "f16 K stride");
+        assert_eq!(v, n_kv_heads * head_dim * 2, "f16 V stride");
         // FWHT-K + Lloyd-V current strides.
         for v_mode in [VMode::Lloyd2, VMode::Lloyd3, VMode::Lloyd4] {
             let cache = flag_standin(KvMode::Fwht4, v_mode, n_kv_heads, head_dim);
@@ -4599,6 +4865,19 @@ mod vmm_layout_tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("head_dim=256"), "{err}");
+        // F16-K pairs only with flat F16-V — a packed V mode would leave the
+        // K/V strides inconsistent with the flat f16 kernels.
+        for v_mode in [VMode::Q8, VMode::Lloyd2, VMode::Lloyd4] {
+            let err = KvCache::vmm_static_layout(KvMode::F16, v_mode, 4, 256, 64)
+                .unwrap_err()
+                .to_string();
+            assert!(err.contains("VMode::F16"), "v_mode={v_mode:?} err={err}");
+        }
+        // Bf16 stays contiguous-only even with a flat-V request.
+        let err = KvCache::vmm_static_layout(KvMode::Bf16, VMode::F16, 4, 256, 64)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("bf16"), "{err}");
     }
 
     #[test]
@@ -4723,6 +5002,32 @@ mod vmm_layout_tests {
     }
 
     #[test]
+    fn vmm_static_layout_f16_flat_pairs() {
+        // F16 is the flat VMM tier: K and V strides identical at
+        // head_dim*2 B/head, no rotation table, no fwht signs.
+        let n_kv_heads = 4;
+        let head_dim = 128;
+        let physical_cap = 256;
+        let layout =
+            KvCache::vmm_static_layout(KvMode::F16, VMode::F16, n_kv_heads, head_dim, physical_cap)
+                .expect("f16 VMM layout must resolve");
+        assert_eq!(layout.k_bytes_per_head, head_dim * 2);
+        assert_eq!(layout.v_bytes_per_head, head_dim * 2);
+        assert_eq!(layout.k_bytes_per_token, n_kv_heads * head_dim * 2);
+        assert_eq!(layout.v_bytes_per_token, layout.k_bytes_per_token);
+        assert_eq!(layout.k_reserve_bytes, physical_cap * layout.k_bytes_per_token);
+        assert_eq!(layout.v_reserve_bytes, physical_cap * layout.v_bytes_per_token);
+        assert_eq!(layout.kv_dim, n_kv_heads * head_dim);
+        assert_eq!(layout.rotation_table_len, 0, "flat f16 has no rotation");
+        assert!(!layout.uses_fwht_signs);
+        // No head_dim divisibility gate: a non-multiple-of-32 head_dim still
+        // resolves (the f16 kernels index flat elements).
+        let odd =
+            KvCache::vmm_static_layout(KvMode::F16, VMode::F16, 2, 96, 64).expect("odd head_dim ok");
+        assert_eq!(odd.k_bytes_per_head, 192);
+    }
+
+    #[test]
     fn vmm_static_layout_covers_fwht_k_with_lloyd_v() {
         let n_kv_heads = 4;
         let head_dim = 256;
@@ -4778,6 +5083,7 @@ mod bf16_tier_projection_tests {
         quant_asym2: bool,
         quant_fwht: bool,
         quant_bf16: bool,
+        quant_f16: bool,
         k_scales_empty: bool,
     ) -> KvCache {
         KvCache {
@@ -4808,6 +5114,7 @@ mod bf16_tier_projection_tests {
             quant_asym2,
             quant_fwht,
             quant_bf16,
+            quant_f16,
             v_mode: VMode::Q8,
             boundary_layers: 0,
             givens_cos: None,
@@ -4831,6 +5138,7 @@ mod bf16_tier_projection_tests {
             cache.quant_int8,
             cache.is_hfq8_kv(),
             cache.quant_bf16,
+            cache.quant_f16,
         ];
         flags.iter().filter(|&&b| b).count()
     }
@@ -4839,7 +5147,7 @@ mod bf16_tier_projection_tests {
     fn bf16_projection_is_exclusive_q4_false_bf16_true() {
         // Maple BF16: quantized true, empty scales, bf16 true, no other tier.
         let bf16 = stub(
-            true, false, false, false, false, false, false, false, true, true,
+            true, false, false, false, false, false, false, false, true, false, true,
         );
         assert!(
             !bf16.quant_q4_residual(),
@@ -4861,10 +5169,35 @@ mod bf16_tier_projection_tests {
     }
 
     #[test]
+    fn f16_projection_is_exclusive() {
+        // F16 flat tier: quantized true, empty scales, f16 true, no other tier
+        // — same double-flag hazard as bf16, guarded by `!quant_f16`.
+        let f16 = stub(
+            true, false, false, false, false, false, false, false, false, true, true,
+        );
+        assert!(
+            !f16.quant_q4_residual(),
+            "F16 must NOT report legacy Q4 residual"
+        );
+        assert!(f16.quant_f16, "F16 flag must be true");
+        assert!(!f16.quant_bf16, "F16 must not alias bf16");
+        assert!(!f16.is_hfq8_kv(), "F16 must not report HFQ8");
+        assert_eq!(
+            tier_count(&f16),
+            1,
+            "F16 must classify as exactly one tier (f16)"
+        );
+        debug_assert!(
+            tier_count(&f16) <= 1,
+            "at most one KV storage tier flag should be set (F16)"
+        );
+    }
+
+    #[test]
     fn q4_residual_still_reports_q4_only() {
         // LLaMA legacy Q4: quantized true, empty scales, no named tier, no bf16.
         let q4 = stub(
-            true, false, false, false, false, false, false, false, false, true,
+            true, false, false, false, false, false, false, false, false, false, true,
         );
         assert!(q4.quant_q4_residual(), "legacy Q4 must report q4 residual");
         assert!(!q4.quant_bf16);
@@ -4881,7 +5214,7 @@ mod bf16_tier_projection_tests {
     fn q8_projection_is_exclusive_q4_false() {
         // Q8: quantized true, q8 true, empty scales, no bf16. Must not also be Q4.
         let q8 = stub(
-            true, true, false, false, false, false, false, false, false, true,
+            true, true, false, false, false, false, false, false, false, false, true,
         );
         assert!(
             !q8.quant_q4_residual(),
@@ -4903,7 +5236,7 @@ mod bf16_tier_projection_tests {
         // Asym3 (qwen35 default) was the original motivator for the asym exclusion;
         // ensure the new bf16 exclusion didn't reintroduce overlap.
         let asym3 = stub(
-            true, false, false, false, false, true, false, false, false, true,
+            true, false, false, false, false, true, false, false, false, false, true,
         );
         assert!(
             !asym3.quant_q4_residual(),
@@ -4913,7 +5246,7 @@ mod bf16_tier_projection_tests {
 
         // HFQ8 has non-empty k_scales and is its own tier.
         let hfq8 = stub(
-            true, false, false, false, false, false, false, false, false, false,
+            true, false, false, false, false, false, false, false, false, false, false,
         );
         assert!(hfq8.is_hfq8_kv(), "hfq8 with scales must report hfq8");
         assert!(
@@ -4924,7 +5257,7 @@ mod bf16_tier_projection_tests {
 
         // F32: quantized false => no tier at all (KTier::F32).
         let f32_cache = stub(
-            false, false, false, false, false, false, false, false, false, true,
+            false, false, false, false, false, false, false, false, false, false, true,
         );
         assert!(!f32_cache.quant_q4_residual());
         assert!(!f32_cache.is_hfq8_kv());
@@ -5151,6 +5484,18 @@ mod slot_kv_plan_tests {
     #[test]
     fn bf16_is_flat_and_table_free() {
         let p = SlotKvTierPlan::resolve(KvMode::Bf16, 4, 256).unwrap();
+        assert_eq!(p.k_bytes_per_pos, 4 * 256 * 2);
+        assert_eq!(p.v_bytes_per_pos, p.k_bytes_per_pos);
+        assert!(!p.kv_strides_differ());
+        assert!(p.givens_len.is_none());
+        assert!(p.fwht_len.is_none());
+    }
+
+    #[test]
+    fn f16_is_flat_and_table_free() {
+        // Same flat geometry as bf16 (kv_dim * 2 per pos, K == V stride) but —
+        // unlike bf16 — this plan is what the serve pool actually allocates.
+        let p = SlotKvTierPlan::resolve(KvMode::F16, 4, 256).unwrap();
         assert_eq!(p.k_bytes_per_pos, 4 * 256 * 2);
         assert_eq!(p.v_bytes_per_pos, p.k_bytes_per_pos);
         assert!(!p.kv_strides_differ());

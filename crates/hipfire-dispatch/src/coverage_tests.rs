@@ -634,6 +634,11 @@ fn attention_keys_resolve_on_fleet_archs() {
             shape: None,
         },
         AttnKeyUse {
+            key: KernelKey::KvWriteF16,
+            archs: ALL,
+            shape: None,
+        },
+        AttnKeyUse {
             key: KernelKey::KvWriteAsym4,
             archs: ALL,
             shape: None,
@@ -745,6 +750,16 @@ fn attention_keys_resolve_on_fleet_archs() {
                 is_tree: false,
             }),
         },
+        AttnKeyUse {
+            key: KernelKey::KvWriteF16Batched,
+            archs: ALL,
+            shape: Some(ShapeInfo {
+                batch_size: 16,
+                head_dim: 128,
+                m: 0,
+                is_tree: false,
+            }),
+        },
         // Attention — single-token, Always-gated
         AttnKeyUse {
             key: KernelKey::AttnF32,
@@ -758,6 +773,11 @@ fn attention_keys_resolve_on_fleet_archs() {
         },
         AttnKeyUse {
             key: KernelKey::AttnQ8_0Kv,
+            archs: ALL,
+            shape: None,
+        },
+        AttnKeyUse {
+            key: KernelKey::AttnFlashF16Windowed,
             archs: ALL,
             shape: None,
         },
@@ -871,6 +891,16 @@ fn attention_keys_resolve_on_fleet_archs() {
         },
         AttnKeyUse {
             key: KernelKey::AttnQ8_0KvBatchedMasked,
+            archs: ALL,
+            shape: Some(ShapeInfo {
+                batch_size: 16,
+                head_dim: 128,
+                m: 0,
+                is_tree: false,
+            }),
+        },
+        AttnKeyUse {
+            key: KernelKey::AttnF16KvBatchedMaskedWindowed,
             archs: ALL,
             shape: Some(ShapeInfo {
                 batch_size: 16,

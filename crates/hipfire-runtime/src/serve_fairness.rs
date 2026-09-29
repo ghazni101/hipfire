@@ -261,13 +261,27 @@ impl FairQueue {
         domain_id: impl Into<String>,
         uncached_prefill_tokens: u64,
     ) -> Result<(), FairnessError> {
+        self.admit_at(id, domain_id, uncached_prefill_tokens, self.tick)
+    }
+
+    /// Admit with an explicit `admission_tick` — the tick-domain value the
+    /// request's wait-room enqueue carried, so time spent queued counts
+    /// toward admission age instead of being reset on admit (spec §5.3 S3).
+    /// Callers without a queued origin pass the queue's current `tick()`.
+    pub fn admit_at(
+        &mut self,
+        id: u64,
+        domain_id: impl Into<String>,
+        uncached_prefill_tokens: u64,
+        admission_tick: u64,
+    ) -> Result<(), FairnessError> {
         if self.requests.iter().any(|r| r.id == id) {
             return Err(FairnessError::DuplicateId(id));
         }
         self.requests.push(FairRequest {
             id,
             domain_id: domain_id.into(),
-            admission_tick: self.tick,
+            admission_tick,
             uncached_prefill_tokens,
             aged: false,
             last_served_tick: None,
@@ -276,6 +290,21 @@ impl FairQueue {
             forced_rows: 0,
         });
         Ok(())
+    }
+
+    /// Record service that bypassed the grant mechanism: the engine injects
+    /// MTP verify rows unconditionally (their budget is carved out of the
+    /// scheduler's row budget before `select`), so a slot that drafted this
+    /// step advanced whether or not a Verify grant landed. Called by the
+    /// serve loop after `select` for every slot holding a live draft; the
+    /// stamp uses `self.tick - 1`, the tick the just-completed select ran
+    /// under. Without it `last_served_tick` goes stale and
+    /// `skip_round_complete` mis-ages a request that is being served
+    /// (spec §5.3 S3.3).
+    pub fn note_served(&mut self, id: u64) {
+        if let Some(req) = self.requests.iter_mut().find(|r| r.id == id) {
+            req.last_served_tick = Some(self.tick.saturating_sub(1));
+        }
     }
 
     /// Update a request's per-step needs. Called before [`select`](Self::select).

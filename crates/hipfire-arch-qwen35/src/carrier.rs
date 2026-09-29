@@ -247,18 +247,33 @@ fn plan_qwen35_gpu_stages(config: &Qwen35Config, ctx: &LoadCtx) -> Result<Qwen35
         })
     } else {
         // Static path: final K mode + optional Lloyd-V known before allocation.
-        let static_v = v_mode_override.unwrap_or(llama::VMode::Q8);
+        // F16 K is a flat fp16 pair — its V is flat fp16 too, so the default
+        // V mode must follow the resolved K tier (HIPFIRE_KV_V may still
+        // override, but only to VMode::F16; anything else fails the pair
+        // check below).
+        let static_v = v_mode_override.unwrap_or(match mode {
+            hipfire_runtime::kv_mode::KvMode::F16 => llama::VMode::F16,
+            _ => llama::VMode::Q8,
+        });
         validate_cask_static_layout(ctx.cask.sidecar.is_some(), mode, static_v)?;
         if !matches!(static_v, llama::VMode::Q8) {
-            let is_fwht = matches!(
-                mode,
-                hipfire_runtime::kv_mode::KvMode::Fwht2
-                    | hipfire_runtime::kv_mode::KvMode::Fwht3
-                    | hipfire_runtime::kv_mode::KvMode::Fwht4
-            );
-            if !is_fwht {
+            let pair_ok = match static_v {
+                // Flat fp16 V pairs with flat fp16 K only.
+                llama::VMode::F16 => {
+                    matches!(mode, hipfire_runtime::kv_mode::KvMode::F16)
+                }
+                // Lloyd-V pairs with FWHT-rotated K only.
+                _ => matches!(
+                    mode,
+                    hipfire_runtime::kv_mode::KvMode::Fwht2
+                        | hipfire_runtime::kv_mode::KvMode::Fwht3
+                        | hipfire_runtime::kv_mode::KvMode::Fwht4
+                ),
+            };
+            if !pair_ok {
                 return Err(format!(
-                    "HIPFIRE_KV_V={kv_v_env} requires an FWHT K mode (fwht2/3/4); resolved mode is {mode:?}"
+                    "HIPFIRE_KV_V={kv_v_env} does not pair with resolved K mode {mode:?} \
+                     (v=f16 requires K=f16; lloyd* requires K=fwht2/3/4)"
                 ));
             }
         }
@@ -415,6 +430,15 @@ fn construct_kv_cache(
             .physical_cap
             .expect("Qwen3.5 KV plan always resolves physical_cap");
         let kv = match (ctx.kv_backend, static_v) {
+            // Flat fp16 pair: the F16 constructor already allocates V at the
+            // fp16 footprint — no realloc needed (same shape as the Q8 arm).
+            (KvBackend::Contiguous, llama::VMode::F16) => <KvCache as KvCacheExt>::from_mode_with_backend(
+                mode,
+                KvBackend::Contiguous,
+                KvTarget::Single(ctx.gpu),
+                &plan.dims,
+            )
+            .map_err(|e| format!("{e}"))?,
             (KvBackend::Vmm, vm) => {
                 // Unified VMM constructor: reserve == current; never post-alloc realloc.
                 KvCache::new_gpu_vmm_capped_filtered(
@@ -451,7 +475,9 @@ fn construct_kv_cache(
                 kv
             }
         };
-        if !matches!(static_v, llama::VMode::Q8) {
+        if matches!(static_v, llama::VMode::F16) {
+            eprintln!("[hipfire-arch-qwen35] V-cache mode → f16 (flat fp16 V matching flat fp16 K)");
+        } else if !matches!(static_v, llama::VMode::Q8) {
             eprintln!(
                 "[hipfire-arch-qwen35] V-cache mode override → {} (256-wide lloyd-V on fwht K)",
                 plan.kv_v_env

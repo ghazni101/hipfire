@@ -1896,7 +1896,7 @@ pub fn validate_load_caps(msg: &serde_json::Value) -> Option<String> {
         return Some("adaptive KV not supported in experimental multi-slot".to_string());
     }
     // The slot engine resolves the full static KV ladder (q8, asym{2,3,4},
-    // fwht{2,3,4}); the per-load string must be one the slots policy accepts.
+    // fwht{2,3,4}, f16); the per-load string must be one the slots policy
     // Rejected here — loudly, before any GPU work — rather than silently
     // downgraded to the q8 default by the engine-side resolve.
     if let Some(raw) = params
@@ -1911,7 +1911,7 @@ pub fn validate_load_caps(msg: &serde_json::Value) -> Option<String> {
         if resolved.warning.is_some() {
             return Some(format!(
                 "experimental multi-slot does not support kv_mode='{raw}' \
-                 (accepted: q8|asym2|asym3|asym4|fwht2|fwht3|fwht4; 'auto'/unset \
+                 (accepted: q8|asym2|asym3|asym4|fwht2|fwht3|fwht4|f16; 'auto'/unset \
                  = q8)"
             ));
         }
@@ -3128,6 +3128,12 @@ mod tests {
         // The full static KV ladder is accepted (engine resolves it through
         // the slots site policy); only strings the policy rejects — bf16,
         // garbage — are refused here, loudly, before any GPU work.
+        // f16 is a first-class slots tier (flat 2B/elem, VMM/paged-capable).
+        assert_eq!(
+            validate_load_caps(&json!({"params": {"kv_mode": "f16"}})),
+            None,
+            "kv_mode=f16 must be accepted"
+        );
         for kv in ["asym3", "asym2", "asym4", "fwht2", "fwht3", "fwht4", "auto"] {
             assert_eq!(
                 validate_load_caps(&json!({"params": {"kv_mode": kv}})),

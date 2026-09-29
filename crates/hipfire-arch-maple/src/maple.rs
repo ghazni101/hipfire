@@ -770,14 +770,23 @@ impl MapleState {
                 cfg.head_dim,
                 max_seq,
             ),
+            // Flat fp16 pair: same flat layout as bf16; the f16 windowed tile
+            // kernels cover both of maple's layer types (window=0 → causal).
+            KvMode::F16 => KvCache::new_gpu_f16(
+                gpu,
+                cfg.num_hidden_layers,
+                cfg.num_key_value_heads,
+                cfg.head_dim,
+                max_seq,
+            ),
             // Unreachable through the carrier: MAPLE_POLICY accepts only
-            // {Q8, Bf16} and `resolve` falls back to the site default for
+            // {Q8, Bf16, F16} and `resolve` falls back to the site default for
             // everything else. Reject loudly rather than serve a tier whose
             // windowed kernels do not exist.
             other => {
                 return Err(format!(
                     "maple: KV mode {other:?} has no sliding-window attention kernel; \
-                     arch 15 supports q8 and bf16 only"
+                     arch 15 supports q8, bf16 and f16 only"
                 ))
             }
         }
