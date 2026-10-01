@@ -4,10 +4,11 @@
 
 //! Embedded chat frontend.
 //!
-//! Concern: static asset serving only. Three compile-time-embedded files,
-//! one route matcher, security headers. The UI itself is plain
-//! HTML/CSS/JS and talks to the same `/v1/chat/completions` gateway every
-//! other client uses — no second protocol, no extra dependencies.
+//! Concern: static asset serving only. Compile-time-embedded files, one
+//! route matcher, security headers. The UI itself is plain HTML/CSS/JS and
+//! talks to the same `/v1/chat/completions` gateway every other client
+//! uses — no second protocol, no extra dependencies. Chat history is kept
+//! in the browser's IndexedDB, so serve stores nothing on its behalf.
 //!
 //! CSP is deliberately strict: model output is untrusted text rendered
 //! into the page, so inline script/style are refused outright and the UI
@@ -18,6 +19,8 @@ use hyper::{header, Response};
 
 const INDEX_HTML: &str = include_str!("../../assets/ui/index.html");
 const APP_JS: &str = include_str!("../../assets/ui/app.js");
+const DB_JS: &str = include_str!("../../assets/ui/db.js");
+const RENDER_JS: &str = include_str!("../../assets/ui/render.js");
 const STYLE_CSS: &str = include_str!("../../assets/ui/style.css");
 
 /// `script-src 'self'` + `style-src 'self'` is why the assets are separate
@@ -60,6 +63,8 @@ pub(crate) fn ui_asset(path: &str) -> Option<Response<BoxBody>> {
             Some(asset_response(INDEX_HTML, "text/html; charset=utf-8"))
         }
         "/ui/app.js" => Some(asset_response(APP_JS, "text/javascript; charset=utf-8")),
+        "/ui/db.js" => Some(asset_response(DB_JS, "text/javascript; charset=utf-8")),
+        "/ui/render.js" => Some(asset_response(RENDER_JS, "text/javascript; charset=utf-8")),
         "/ui/style.css" => Some(asset_response(STYLE_CSS, "text/css; charset=utf-8")),
         _ => None,
     }
@@ -76,7 +81,7 @@ mod tests {
             ui_asset("/ui").unwrap().headers()[header::CONTENT_TYPE],
             "text/html; charset=utf-8"
         );
-        for path in ["/ui/app.js", "/ui/style.css"] {
+        for path in ["/ui/app.js", "/ui/db.js", "/ui/render.js", "/ui/style.css"] {
             let resp = ui_asset(path).expect(path);
             assert_eq!(resp.status(), 200, "{path}");
             assert!(resp.headers().contains_key(header::CONTENT_SECURITY_POLICY));
