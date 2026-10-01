@@ -316,10 +316,10 @@ kbd {
 }
 body:not(.side-collapsed) #open-sidebar { display: none; }
 
-.model-pick { position: relative; display: inline-flex; align-items: center; min-width: 0; }
+.model-pick { position: relative; display: inline-flex; align-items: center; min-width: 0; overflow: hidden; flex: 0 1 auto; }
 #model {
   appearance: none; -webkit-appearance: none;
-  height: 36px; max-width: 38ch; padding: 0 2rem 0 .75rem;
+  width: 100%; min-width: 0; max-width: 38ch; padding: 0 2rem 0 .75rem;
   border: 0; border-radius: var(--r-sm);
   background: transparent; color: var(--text);
   font-size: .95rem; font-weight: 600;
@@ -916,7 +916,7 @@ select.effort-pill option { background: var(--surface-2); color: var(--text); }
   .suggestions { grid-template-columns: 1fr; }
   .suggestion:nth-child(n+3) { display: none; }
   .composer-hint { display: none; }
-  #scroll-bottom { bottom: 104px; }
+  /* scroll-bottom is pinned by ResizeObserver to composer height + 12px */
 }
 /* coarse pointers have no hover — keep per-row/message actions visible */
 @media (hover: none), (max-width: 860px) {
@@ -926,6 +926,12 @@ select.effort-pill option { background: var(--surface-2); color: var(--text); }
 @media (max-width: 520px) {
   .status-pill #status { display: none; }
   .status-pill { padding: 0 .55rem; }
+  /* one row: icon-only think pill + compact effort select, no wrap */
+  .composer-bar { flex-wrap: nowrap; }
+  .char-count { display: none; }
+  #think-pill { width: 32px; padding: 0; justify-content: center; gap: 0; }
+  #think-label { display: none; }
+  .effort-pill { width: 64px; padding-left: .45rem; padding-right: 1.35rem; text-overflow: ellipsis; }
   .msg.assistant, .msg.tool { grid-template-columns: minmax(0, 1fr); gap: .4rem; }
   .msg.assistant .avatar, .msg.tool .avatar { display: none; }
   #empty h1 { font-size: 1.5rem; }

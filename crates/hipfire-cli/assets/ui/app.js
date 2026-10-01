@@ -59,7 +59,7 @@ const els = {
   exportConv: $("export-conv"), showShortcuts: $("show-shortcuts"), toggleSettings: $("toggle-settings"),
   scroller: $("scroller"), greeting: $("greeting"), emptySub: $("empty-sub"), suggestions: $("suggestions"),
   log: $("log"), scrollBottom: $("scroll-bottom"),
-  composer: $("composer"), attachments: $("attachments"), input: $("input"),
+  composer: $("composer"), composerWrap: $("composer-wrap"), attachments: $("attachments"), input: $("input"),
   attach: $("attach"), file: $("file"), thinkPill: $("think-pill"), thinkLabel: $("think-label"),
   charCount: $("char-count"), send: $("send"), stopBtn: $("stop-btn"), drop: $("drop-overlay"),
   settings: $("settings"), closeSettings: $("close-settings"),
@@ -2045,6 +2045,12 @@ function wireEvents() {
     state.stick = true;
     els.scroller.scrollTo({ top: els.scroller.scrollHeight, behavior: "smooth" });
   });
+
+  // Fab rides just above whatever height the composer+stats strip currently
+  // occupies (it grows as the textarea autosizes).
+  new ResizeObserver(() => {
+    els.scrollBottom.style.bottom = (els.composerWrap.offsetHeight + 12) + "px";
+  }).observe(els.composerWrap);
 
   els.lightbox.addEventListener("click", () => els.lightbox.close());
 
