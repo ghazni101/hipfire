@@ -1,0 +1,81 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>hipfire</title>
+<link rel="stylesheet" href="/ui/style.css">
+</head>
+<body>
+<header id="topbar">
+  <span class="brand">hipfire</span>
+  <select id="model" aria-label="model"></select>
+  <span id="model-badges" class="badges"></span>
+  <span class="spacer"></span>
+  <span id="status" class="status">connecting…</span>
+  <button id="toggle-settings" type="button" aria-label="settings">⚙</button>
+</header>
+
+<aside id="settings" hidden>
+  <label class="fld">
+    <span>System prompt</span>
+    <textarea id="system" rows="3" placeholder="optional"></textarea>
+  </label>
+  <div class="row">
+    <label class="fld">
+      <span>Temperature</span>
+      <input id="temperature" type="number" min="0" max="2" step="0.05" placeholder="default">
+    </label>
+    <label class="fld">
+      <span>Top-p</span>
+      <input id="top_p" type="number" min="0" max="1" step="0.05" placeholder="default">
+    </label>
+    <label class="fld">
+      <span>Max tokens</span>
+      <input id="max_tokens" type="number" min="1" step="1" placeholder="default">
+    </label>
+  </div>
+  <div class="row">
+    <label class="fld" id="thinking-wrap">
+      <span>Thinking</span>
+      <select id="thinking"></select>
+    </label>
+    <label class="fld" id="effort-wrap" hidden>
+      <span>Reasoning effort</span>
+      <select id="effort"></select>
+    </label>
+  </div>
+  <label class="fld" id="tools-wrap">
+    <span>Tools (JSON array — OpenAI function schema)</span>
+    <textarea id="tools" rows="4" spellcheck="false"
+      placeholder='[{"type":"function","function":{"name":"...","parameters":{...}}}]'></textarea>
+  </label>
+  <div class="row" id="tool-choice-row" hidden>
+    <label class="fld">
+      <span>Tool choice</span>
+      <select id="tool_choice">
+        <option value="auto">auto</option>
+        <option value="required">required</option>
+        <option value="none">none</option>
+      </select>
+    </label>
+  </div>
+  <p class="hint" id="settings-hint"></p>
+  <button id="new-chat" type="button">New chat</button>
+</aside>
+
+<main id="log" aria-live="polite"></main>
+
+<div id="attachments"></div>
+
+<footer id="composer">
+  <button id="attach" type="button" aria-label="attach image" hidden>📎</button>
+  <input id="file" type="file" accept="image/png,image/jpeg" hidden>
+  <textarea id="input" rows="1" placeholder="Message hipfire…  (Enter to send, Shift+Enter for newline)"></textarea>
+  <button id="send" type="button">Send</button>
+  <button id="stop" type="button" hidden>Stop</button>
+</footer>
+
+<script src="/ui/app.js"></script>
+</body>
+</html>

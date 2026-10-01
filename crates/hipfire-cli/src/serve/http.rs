@@ -58,7 +58,7 @@ where
     UnsyncBoxBody::new(body)
 }
 
-fn boxed_full(bytes: Vec<u8>) -> BoxBody {
+pub(crate) fn boxed_full(bytes: Vec<u8>) -> BoxBody {
     boxed(Full::new(bytes.into()).map_err(|never: Infallible| match never {}))
 }
 
@@ -678,6 +678,13 @@ async fn handle_request(
         .unwrap_or(req.uri().path())
         .to_owned();
     let method = req.method().clone();
+    // Opt-in embedded chat UI (`serve.ui` / `--ui`). A GET on a UI path
+    // resolves embedded assets; anything else falls through to 404.
+    if shared.ui_enabled && method == Method::GET {
+        if let Some(resp) = crate::serve::ui::ui_asset(&path) {
+            return resp;
+        }
+    }
 
     match (method, path.as_str()) {
         (Method::GET, "/health") => {
@@ -687,7 +694,8 @@ async fn handle_request(
             // (prewarm at startup and request-time loads alike), so reading
             // through it would block this endpoint — the one every readiness
             // probe polls — for the duration and report serve as down
-            // (`docs/SERVE.md` § "Detached readiness").
+            // (`docs/SERVE.md` § "Detached readiness"). Reasoning capability
+            // therefore publishes through `meta.loaded` too.
             let meta = shared.meta.lock().unwrap_or_else(|e| e.into_inner());
             // 503 while the daemon is dead or being respawned, so probes and
             // service managers see that requests cannot be served.
@@ -707,6 +715,12 @@ async fn handle_request(
                 // and not the trained window. `null` while no model is resident
                 // (`n_ctx == 0`), so a client cannot read 0 as "zero context".
                 "n_ctx": (meta.n_ctx > 0).then_some(meta.n_ctx),
+                // Reasoning capability is live state, published on
+                // `meta.loaded` at the load ack (see `ensure_model`) so this
+                // endpoint never touches the runtime lock.
+                "reasoning_contract": meta.loaded.reasoning_contract,
+                "reasoning_effort_native": meta.loaded.reasoning_effort_native,
+                "reasoning_efforts": meta.loaded.reasoning_efforts,
             });
             let status = if state == crate::serve::EngineState::Up {
                 200
@@ -2194,6 +2208,9 @@ mod tests {
             vision: false,
             n_embd: 2048,
             n_vocab: 248320,
+            reasoning_contract: String::new(),
+            reasoning_effort_native: false,
+            reasoning_efforts: Vec::new(),
         };
         let resident = model_entry("qwen3.5:2b", Some(1790385975), Some((&loaded, 82944)));
         assert_eq!(resident["created"], serde_json::json!(1790385975u64));
@@ -2223,6 +2240,9 @@ mod tests {
             vision: true,
             n_embd: 5120,
             n_vocab: 248320,
+            reasoning_contract: String::new(),
+            reasoning_effort_native: false,
+            reasoning_efforts: Vec::new(),
         };
         let entry = model_entry("qwen3.8:27b", None, Some((&vision, 150000)));
         assert_eq!(
