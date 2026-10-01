@@ -82,6 +82,9 @@
     <button id="scroll-bottom" type="button" aria-label="Scroll to bottom" hidden><span data-icon="arrowDown"></span></button>
 
     <footer id="composer-wrap">
+      <div id="live-stats" hidden>
+        <span id="live-ttft"></span><span id="live-rate"></span>
+      </div>
       <form id="composer" autocomplete="off">
         <div id="attachments"></div>
         <textarea id="input" rows="1" placeholder="Message hipfire…" aria-label="Message"></textarea>
@@ -91,6 +94,7 @@
           <button id="think-pill" class="pill" type="button" hidden title="Reasoning mode — click to cycle">
             <span data-icon="bulb"></span><span id="think-label">Think: auto</span>
           </button>
+          <select id="effort" class="pill effort-pill" hidden title="Reasoning effort" aria-label="Reasoning effort"></select>
           <span class="spacer"></span>
           <span id="char-count" class="char-count" aria-live="off"></span>
           <button id="send" class="send-btn" type="submit" aria-label="Send" title="Send (Enter)" disabled><span data-icon="arrowUp"></span></button>
@@ -145,7 +149,6 @@
         <h3>Reasoning</h3>
         <div class="grid">
           <label class="fld" id="thinking-wrap"><span>Thinking</span><select id="thinking"></select></label>
-          <label class="fld" id="effort-wrap" hidden><span>Effort</span><select id="effort"></select></label>
         </div>
         <p class="hint" id="settings-hint"></p>
       </section>

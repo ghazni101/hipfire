@@ -66,7 +66,8 @@ const els = {
   resetSettings: $("reset-settings"), doneSettings: $("done-settings"),
   system: $("system"), stopSeq: $("stop_seq"), reasoningGroup: $("reasoning-group"),
   thinking: $("thinking"), thinkingWrap: $("thinking-wrap"),
-  effort: $("effort"), effortWrap: $("effort-wrap"), hint: $("settings-hint"),
+  effort: $("effort"), hint: $("settings-hint"),
+  liveStats: $("live-stats"), liveTtft: $("live-ttft"), liveRateEl: $("live-rate"),
   tools: $("tools"), toolsWrap: $("tools-wrap"),
   toolChoiceRow: $("tool-choice-row"), toolChoice: $("tool_choice"),
   responseFormat: $("response_format"),
@@ -543,6 +544,7 @@ function openConv(id, opts = {}) {
   stopSpeaking();
   renderConv();
   markActive();
+  renderLiveStats();
   if (opts.push !== false) setRoute(c?.id);
   if (isMobile()) setSidebar(false);
   if (!coarseMQ.matches) els.input.focus();
@@ -1160,6 +1162,31 @@ function liveRate() {
   return secs > 0.3 ? (s.deltas / secs).toFixed(1) : null;
 }
 
+/* Strip above the composer: TTFT + token rate. While streaming it counts
+ * client-side (first delta timestamp vs now); afterwards it pins the
+ * server's reported values for the last assistant message in view. */
+function renderLiveStats() {
+  const s = state.stream;
+  if (s) {
+    const ttft = s.firstAt ? `${fmtMs(s.firstAt - s.t0)}` : "…";
+    const r = liveRate();
+    els.liveTtft.textContent = `TTFT ${ttft}`;
+    els.liveRateEl.textContent = r ? `${r} tok/s` : "";
+    els.liveStats.hidden = false;
+    return;
+  }
+  const last = state.conv?.messages.findLast((m) => m.role === "assistant" && (m.meta?.ttft != null || m.meta?.tps));
+  if (!last) {
+    els.liveStats.hidden = true;
+    return;
+  }
+  const parts = [];
+  if (last.meta.ttft != null) parts.push(`TTFT ${fmtMs(last.meta.ttft)}`);
+  if (last.meta.tps) parts.push(`${last.meta.tps.toFixed(1)} tok/s`);
+  els.liveTtft.textContent = parts[0] || "";
+  els.liveRateEl.textContent = parts.slice(1).join(" · ");
+  els.liveStats.hidden = !parts.length;
+}
 function collectMeta(m, chunk) {
   const t = chunk.timings || {};
   const hip = chunk.hipfire || {};
@@ -1358,7 +1385,7 @@ function applyThinking(body) {
   const t = els.thinking.value;
   if (t === "on") body.enable_thinking = true;
   else if (t === "off") body.enable_thinking = false;
-  if (!els.effortWrap.hidden && els.effort.value && t !== "off") body.reasoning_effort = els.effort.value;
+  if (!els.effort.hidden && els.effort.value && t !== "off") body.reasoning_effort = els.effort.value;
 }
 
 function buildBody(history) {
@@ -1513,7 +1540,7 @@ function renderThinkingControls() {
   // The multi-slot route refuses the effort field outright regardless of
   // what the model could do, so the picker hides and nothing is sent.
   const showEffort = togglable && efforts.length > 0 && !refused.includes("reasoning_effort");
-  els.effortWrap.hidden = !showEffort;
+  els.effort.hidden = !showEffort;
   const key = efforts.join(",");
   if (showEffort && state.effortKey !== key) {
     state.effortKey = key;
@@ -1534,9 +1561,7 @@ function syncThinkPill() {
   els.thinkPill.hidden = !show;
   if (!show) return;
   const v = els.thinking.value || "auto";
-  const effort = !els.effortWrap.hidden && els.effort.value && els.effort.value !== "off" && v !== "off"
-    ? ` · ${els.effort.value}` : "";
-  els.thinkLabel.textContent = (v === "on" ? "Thinking" : v === "off" ? "No thinking" : "Think: auto") + effort;
+  els.thinkLabel.textContent = v === "on" ? "Thinking" : v === "off" ? "No thinking" : "Think: auto";
   els.thinkPill.classList.toggle("on", v === "on");
   els.thinkPill.classList.toggle("off", v === "off");
 }
@@ -1640,11 +1665,9 @@ function renderStatus() {
     text = "engine down";
   } else if (state.stream) {
     cls = "busy";
-    const r = liveRate();
-    text = r ? `generating · ${r} tok/s` : "generating…";
+    text = "generating…";
   } else {
-    text = st?.queue_depth ? `ready · ${st.queue_depth} queued`
-      : num(st?.recent_tok_s) ? `ready · last ${st.recent_tok_s.toFixed(1)} tok/s` : "ready";
+    text = st?.queue_depth ? `ready · ${st.queue_depth} queued` : "ready";
   }
   els.statusDot.className = "dot" + (cls ? " " + cls : "");
   els.status.textContent = text;
@@ -1653,6 +1676,7 @@ function renderStatus() {
     h?.n_ctx && `Context: ${h.n_ctx.toLocaleString()} tokens`,
     st?.requests_served != null && `Requests served: ${st.requests_served}`,
   ].filter(Boolean).join("\n") || "hipfire serve";
+  renderLiveStats();
 }
 
 /* ================= composer & attachments ================= */
