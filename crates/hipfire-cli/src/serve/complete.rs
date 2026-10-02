@@ -3790,7 +3790,7 @@ mod tests {
 
     #[test]
     fn poisons_session_state_only_for_mid_generation_failures() {
-        use hipfire_client::{error_class as ec, ClientError, TypedDaemonError};
+        use hipfire_client::{error_class as ec, TypedDaemonError};
         let daemon_err = |class: &str, rolled_back: bool| {
             ClientError::Daemon(TypedDaemonError {
                 message: "unsafe multi_slot terminal: open_think".into(),
