@@ -1186,9 +1186,7 @@ impl SlotBackend {
         // (OpenThink). A Plain tail with thinking on is the "model emits
         // <think> itself" template convention (MiMo) — legal.
         let prefix = tail_prefix;
-        if (enable_thinking && prefix == AssistantPrefix::ClosedThink)
-            || (!enable_thinking && prefix == AssistantPrefix::OpenThink)
-        {
+        if thinking_tail_contradicts_policy(enable_thinking, prefix) {
             hipfire_engine::emit::emit_active_attempt_error(
                 stdout,
                 Some(id),
@@ -2604,6 +2602,24 @@ fn classify_render_tail(rendered: &str) -> (bool, AssistantPrefix) {
     }
 }
 
+/// Whether a rendered assistant tail *contradicts* the request's thinking
+/// policy — the only shape the multi-slot gate rejects. Thinking ON with a
+/// `ClosedThink` tail means the template closed the span the request asked
+/// the model to reason in; thinking OFF with an `OpenThink` tail means the
+/// prompt opened a span with no think policy behind it. A `Plain` tail is
+/// legal under either policy — the "model emits `<think>` itself" template
+/// convention (MiMo) runs thinking from a Plain tail.
+///
+/// Extracted from the handler so tests exercise the exact predicate the
+/// gate calls, not a re-implementation of it.
+pub(crate) fn thinking_tail_contradicts_policy(
+    enable_thinking: bool,
+    tail: AssistantPrefix,
+) -> bool {
+    (enable_thinking && tail == AssistantPrefix::ClosedThink)
+        || (!enable_thinking && tail == AssistantPrefix::OpenThink)
+}
+
 /// Encoded base64 cap matching the sequential daemon (~40 MiB → ~30 MiB raw).
 const MAX_BASE64_ENCODED_LEN: usize = 40 * 1024 * 1024;
 
@@ -3055,21 +3071,59 @@ mod tests {
 
     #[test]
     fn reasoning_policy_vs_tail_contradiction_truth_table() {
-        // The gate: thinking=on + ClosedThink tail is contradictory (the
-        // prompt closed the span the request asked the model to reason in);
-        // thinking=off + OpenThink tail is contradictory (an unclosed think
-        // span with no think policy). Plain tails are legal for both — the
-        // "model emits <think> itself" convention under thinking=on.
-        let contradicts = |enable_thinking: bool, tail: AssistantPrefix| {
-            (enable_thinking && tail == AssistantPrefix::ClosedThink)
-                || (!enable_thinking && tail == AssistantPrefix::OpenThink)
-        };
-        assert!(!contradicts(true, AssistantPrefix::OpenThink));
-        assert!(!contradicts(true, AssistantPrefix::Plain));
-        assert!(contradicts(true, AssistantPrefix::ClosedThink));
-        assert!(contradicts(false, AssistantPrefix::OpenThink));
-        assert!(!contradicts(false, AssistantPrefix::Plain));
-        assert!(!contradicts(false, AssistantPrefix::ClosedThink));
+        // The gate's production predicate, exercised directly: thinking=on +
+        // ClosedThink tail is contradictory (the prompt closed the span the
+        // request asked the model to reason in); thinking=off + OpenThink
+        // tail is contradictory (an unclosed think span with no think
+        // policy). Plain tails are legal for both — the "model emits
+        // <think> itself" convention under thinking=on.
+        assert!(!thinking_tail_contradicts_policy(
+            true,
+            AssistantPrefix::OpenThink
+        ));
+        assert!(!thinking_tail_contradicts_policy(
+            true,
+            AssistantPrefix::Plain
+        ));
+        assert!(thinking_tail_contradicts_policy(
+            true,
+            AssistantPrefix::ClosedThink
+        ));
+        assert!(thinking_tail_contradicts_policy(
+            false,
+            AssistantPrefix::OpenThink
+        ));
+        assert!(!thinking_tail_contradicts_policy(
+            false,
+            AssistantPrefix::Plain
+        ));
+        assert!(!thinking_tail_contradicts_policy(
+            false,
+            AssistantPrefix::ClosedThink
+        ));
+
+        // End-to-end over real render shapes: classify_render_tail output
+        // fed through the same predicate the handler gates on. These are
+        // the request shapes the gate must admit (no rejection) and the
+        // two genuine contradictions it must reject.
+        let qwen_on = "...<|im_start|>assistant\n<think>"; // Qwen3.5 thinking-on
+        let qwen_off_guard = "...<|im_start|>assistant\n<think></think>"; // thinking-off guard
+        let mimo_on = "...<|im_start|>assistant\n"; // model opens the span itself
+        for (rendered, enable_thinking, rejects) in [
+            (qwen_on, true, false),   // open tail, thinking on — legal
+            (qwen_on, false, true),   // open tail, thinking off — contradiction
+            (qwen_off_guard, false, false), // closed guard, thinking off — legal
+            (qwen_off_guard, true, true),   // closed guard, thinking on — contradiction
+            (mimo_on, true, false),   // plain tail, thinking on — legal (MiMo)
+            (mimo_on, false, false),  // plain tail, thinking off — legal
+        ] {
+            let (_, tail) = classify_render_tail(rendered);
+            assert_eq!(
+                thinking_tail_contradicts_policy(enable_thinking, tail),
+                rejects,
+                "rendered={rendered:?} enable_thinking={enable_thinking}"
+            );
+        }
     }
 
     #[test]
@@ -3568,11 +3622,6 @@ mod tests {
             (
                 "submit",
                 "multi_slot submit: engine unavailable",
-                "internal",
-            ),
-            (
-                "think",
-                "think_mode mismatch with enable_thinking",
                 "internal",
             ),
             (
