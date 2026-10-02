@@ -595,6 +595,10 @@ mod imp {
 
         /// Mutable view of the BO memory. Caller must hold no other live
         /// slice of the same BO.
+        // `&self` is deliberate: BO lifetime is Arc-owned and mutation
+        // rights come from the caller's submission contract above, not from
+        // Rust borrow state — same shape as every device-mapped-buffer API.
+        #[allow(clippy::mut_from_ref)]
         pub fn as_mut_slice(&self) -> &mut [u8] {
             // SAFETY: as above; device writes only happen between submit and
             // wait, during which the caller must not touch the memory.
