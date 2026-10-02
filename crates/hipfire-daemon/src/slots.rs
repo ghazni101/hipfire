@@ -1076,7 +1076,14 @@ impl SlotBackend {
         }
 
         let mut visual_data = None;
-        let (prompt_tokens, started_in_think) = if let Some(image) = slot_image {
+        // `prefix` is the rendered prompt's ACTUAL tail state, derived per
+        // path — not the request's policy. `expected_prefix` is the policy:
+        // "thinking on" only means the model is allowed to reason, and only
+        // some templates express that as a literal `<think>` tail. MiMo's
+        // template (and any template that gates on `enable_thinking is false`)
+        // emits a bare `assistant\n` tail when thinking is ON — the model
+        // generates the opener itself — so tail state = Plain there.
+        let (prompt_tokens, started_in_think, tail_prefix) = if let Some(image) = slot_image {
             // The projected message view carries the system text; fall back to
             // the top-level `system` field for prompt-only requests.
             let system = messages
@@ -1084,12 +1091,15 @@ impl SlotBackend {
                 .find(|m| m.role == Role::System)
                 .map(|m| m.content.as_str())
                 .or_else(|| msg.get("system").and_then(|v| v.as_str()));
+            // VL prompts are scaffold-built: the emitted tail IS
+            // expected_prefix, so policy and tail state coincide.
             match build_slot_vl_prompt(self, &image, system, &last_user.content, expected_prefix) {
                 Ok((tokens, vd)) => {
                     visual_data = Some(vd);
                     (
                         tokens,
                         matches!(expected_prefix, AssistantPrefix::OpenThink),
+                        expected_prefix,
                     )
                 }
                 Err(reason) => {
@@ -1131,8 +1141,8 @@ impl SlotBackend {
                     return Ok(());
                 }
             };
-            let started = rendered.trim_end().ends_with("<think>");
-            (self.tokenizer.encode(&rendered), started)
+            let (opened, tail_prefix) = classify_render_tail(&rendered);
+            (self.tokenizer.encode(&rendered), opened, tail_prefix)
         } else {
             if tools.is_some()
                 || messages
@@ -1162,28 +1172,30 @@ impl SlotBackend {
                 assistant_prefix: expected_prefix,
                 raw: false,
             };
+            // ChatML scaffold-built tail is exactly expected_prefix.
             (
                 frame.build_multi_turn(&history),
                 matches!(expected_prefix, AssistantPrefix::OpenThink),
+                expected_prefix,
             )
         };
 
-        // Now prefix for continuation is expected_prefix but also must agree with started_in_think
-        let prefix = if started_in_think {
-            AssistantPrefix::OpenThink
-        } else if has_think {
-            AssistantPrefix::ClosedThink
-        } else {
-            AssistantPrefix::Plain
-        };
-        // Enforce that prefix matches expected_prefix and enable_thinking
-        if prefix != expected_prefix {
+        // Policy vs. tail is a contradiction only when the render actively
+        // disagrees: thinking requested but the prompt closed the think span
+        // (ClosedThink), or thinking declined but the prompt opened one
+        // (OpenThink). A Plain tail with thinking on is the "model emits
+        // <think> itself" template convention (MiMo) — legal.
+        let prefix = tail_prefix;
+        if (enable_thinking && prefix == AssistantPrefix::ClosedThink)
+            || (!enable_thinking && prefix == AssistantPrefix::OpenThink)
+        {
             hipfire_engine::emit::emit_active_attempt_error(
                 stdout,
                 Some(id),
                 &format!(
-                    "reasoning prefix mismatch: expected {:?} got {:?}",
-                    expected_prefix, prefix
+                    "reasoning prefix mismatch: thinking {} but rendered assistant tail is {:?}",
+                    if enable_thinking { "enabled" } else { "disabled" },
+                    prefix
                 ),
                 "validation",
                 false,
@@ -1359,34 +1371,14 @@ impl SlotBackend {
         let mut cached_tokens: usize = 0;
         let mut prefill_tokens: usize = prompt_len;
         let t_start = Instant::now();
-        let think_mode = if started_in_think {
+        // think_mode is policy (does the model reason this turn), not tail
+        // state — on "model emits <think> itself" templates thinking runs
+        // from a Plain prompt tail.
+        let think_mode = if enable_thinking {
             ThinkMode::Low
         } else {
             ThinkMode::NonThink
         };
-        // Validate think_mode agrees with enable_thinking
-        let expected_think_mode = if enable_thinking {
-            ThinkMode::Low
-        } else {
-            ThinkMode::NonThink
-        };
-        if think_mode != expected_think_mode {
-            emit_qwen_ar_slot_error(
-                stdout,
-                id,
-                "think_mode mismatch with enable_thinking",
-                "internal",
-                false,
-                false,
-            );
-            let _ = stdout.flush();
-            if let Some(sess) = accepted_session.take() {
-                self.close_session(sess);
-            } else if let Some(session) = claimed_session {
-                self.close_session(session);
-            }
-            return Ok(());
-        }
         let mut emitter = Qwen35Emit::from_ctx(SpecEmitCtx {
             tokenizer: &self.tokenizer,
             eos: self.tokenizer.eos_id,
@@ -2564,6 +2556,54 @@ pub fn build_convo_from_messages(messages: &[Message]) -> Vec<u64> {
     convo
 }
 
+/// Classify the rendered prompt's assistant-turn tail for the slot engine.
+///
+/// Returns `(started_in_think, tail_prefix)`:
+/// - `tail_prefix` is the *observed* generation-tail state — the shape the
+///   prompt actually ends in — NOT the requested thinking policy:
+///   `OpenThink` when the tail carries an unclosed `<think>` span (whether
+///   the render ends on the tag or on seeded think content after it),
+///   `ClosedThink` when the tail carries a think span that is already closed
+///   (the `<think></think>` / `<think>\n\n</think>` guard blocks templates
+///   emit for thinking=off), and `Plain` when the tail has no think markup
+///   at all — the convention used by templates where the model emits
+///   `<think>` itself when thinking is enabled (MiMo).
+/// - `started_in_think` is true exactly when the tail sits inside an open
+///   span; it seeds the emission router and the scheduler's think barrier.
+///
+/// Only the region after the LAST `<|im_start|>` (the live generation turn)
+/// is classified: history turns legitimately contain closed think blocks,
+/// and user content may contain literal think markup — neither is tail
+/// state. When the render has no `<|im_start|>` marker (non-ChatML
+/// template) the whole trimmed render is the tail.
+///
+/// The Jinja render is the authority on tail shape: the requested
+/// `assistant_prefix` (policy) must be checked against it, not assumed to
+/// have produced the matching literal bytes.
+fn classify_render_tail(rendered: &str) -> (bool, AssistantPrefix) {
+    // The generation tail begins at the last ChatML opener. rfind over the
+    // full render keeps closed think spans inside prior turns (and think
+    // markup in user text) out of the classification.
+    let tail = rendered
+        .rfind("<|im_start|>")
+        .map(|at| &rendered[at..])
+        .unwrap_or(rendered);
+    let last_open = tail.rfind("<think>");
+    let last_close = tail.rfind("</think>");
+    match (last_open, last_close) {
+        // The newest think marker in the tail is an unclosed opener —
+        // generation begins inside a think span. Covers both the bare
+        // `<think>` tail and templates that seed reasoning text after it.
+        (Some(o), Some(c)) if o > c => (true, AssistantPrefix::OpenThink),
+        (Some(_), None) => (true, AssistantPrefix::OpenThink),
+        // The tail contains a fully closed think span — the thinking-off
+        // guard-block shape. Generation begins outside it.
+        (Some(_), Some(_)) | (None, Some(_)) => (false, AssistantPrefix::ClosedThink),
+        // No think markup in the tail at all.
+        (None, None) => (false, AssistantPrefix::Plain),
+    }
+}
+
 /// Encoded base64 cap matching the sequential daemon (~40 MiB → ~30 MiB raw).
 const MAX_BASE64_ENCODED_LEN: usize = 40 * 1024 * 1024;
 
@@ -2941,6 +2981,95 @@ mod tests {
         let msg = json!({ "image_base64": big });
         let err = extract_slot_image(&msg).unwrap_err();
         assert!(err.contains("maximum encoded size"), "unexpected: {err}");
+    }
+
+    #[test]
+    fn classify_render_tail_distinguishes_all_three_assistant_tails() {
+        // Qwen3.5/3.6 thinking-on convention: prompt ends inside an unclosed
+        // <think> span. Opened, and the tail prefix is OpenThink.
+        assert_eq!(
+            classify_render_tail("...<|im_start|>assistant\n<think>"),
+            (true, AssistantPrefix::OpenThink)
+        );
+        // Trailing whitespace/newline must not hide the opener.
+        assert_eq!(
+            classify_render_tail("...<|im_start|>assistant\n<think>\n  "),
+            (true, AssistantPrefix::OpenThink)
+        );
+        // A template that seeds reasoning text after the opener is still an
+        // open span — ends_with('<think>') alone would miss this.
+        assert_eq!(
+            classify_render_tail("...<|im_start|>assistant\n<think>Let me think"),
+            (true, AssistantPrefix::OpenThink)
+        );
+        // Re-opened span after a close inside the SAME tail: the newest
+        // marker is the opener — generation starts inside it.
+        assert_eq!(
+            classify_render_tail("...<|im_start|>assistant\n<think>a</think><think>"),
+            (true, AssistantPrefix::OpenThink)
+        );
+        // Thinking-off guard block: literal empty think span at the tail.
+        // Both the scaffold's "<think>\n\n</think>\n\n" and MiMo's
+        // "<think></think>" spellings classify ClosedThink.
+        assert_eq!(
+            classify_render_tail("...<|im_start|>assistant\n<think>\n\n</think>\n\n"),
+            (false, AssistantPrefix::ClosedThink)
+        );
+        assert_eq!(
+            classify_render_tail("...<|im_start|>assistant\n<think></think>"),
+            (false, AssistantPrefix::ClosedThink)
+        );
+        // MiMo thinking-on convention: the template emits a bare assistant
+        // opener and the MODEL generates <think>. Tail is Plain, not opened —
+        // this is the case the previous `expected OpenThink got ClosedThink`
+        // check misclassified and rejected.
+        assert_eq!(
+            classify_render_tail("...<|im_start|>assistant\n"),
+            (false, AssistantPrefix::Plain)
+        );
+        // Think markup inside HISTORY turns is not tail state: the closed
+        // span lives before the last <|im_start|>.
+        assert_eq!(
+            classify_render_tail(
+                "...<think>reasoning</think>answer<|im_end|>\n<|im_start|>assistant\n"
+            ),
+            (false, AssistantPrefix::Plain)
+        );
+        // Literal think markup in user text likewise can't fake a tail.
+        assert_eq!(
+            classify_render_tail(
+                "...<|im_start|>user\nexplain </think><|im_end|>\n<|im_start|>assistant\n"
+            ),
+            (false, AssistantPrefix::Plain)
+        );
+        // Non-ChatML template with no <|im_start|>: whole render is the tail.
+        assert_eq!(
+            classify_render_tail("ASSISTANT: <think>"),
+            (true, AssistantPrefix::OpenThink)
+        );
+        assert_eq!(
+            classify_render_tail("ASSISTANT:"),
+            (false, AssistantPrefix::Plain)
+        );
+    }
+
+    #[test]
+    fn reasoning_policy_vs_tail_contradiction_truth_table() {
+        // The gate: thinking=on + ClosedThink tail is contradictory (the
+        // prompt closed the span the request asked the model to reason in);
+        // thinking=off + OpenThink tail is contradictory (an unclosed think
+        // span with no think policy). Plain tails are legal for both — the
+        // "model emits <think> itself" convention under thinking=on.
+        let contradicts = |enable_thinking: bool, tail: AssistantPrefix| {
+            (enable_thinking && tail == AssistantPrefix::ClosedThink)
+                || (!enable_thinking && tail == AssistantPrefix::OpenThink)
+        };
+        assert!(!contradicts(true, AssistantPrefix::OpenThink));
+        assert!(!contradicts(true, AssistantPrefix::Plain));
+        assert!(contradicts(true, AssistantPrefix::ClosedThink));
+        assert!(contradicts(false, AssistantPrefix::OpenThink));
+        assert!(!contradicts(false, AssistantPrefix::Plain));
+        assert!(!contradicts(false, AssistantPrefix::ClosedThink));
     }
 
     #[test]
