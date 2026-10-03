@@ -120,4 +120,6 @@ bypass_slack                == 0
 # recorded on the hipfire-arch-qwen35 ledger row, now carried by the SCS fold.
 # Banked 305 -> 296 with fold/flash-next: #755's sealed MoE prefill moved into
 # dispatch (qwen35 -5, cohere2moe -6), plus hipfire-arch-qwen4's 2 recorded rows.
-bypass_total                <= 296
+# RATCHET-RAISE 296 -> 300: the +4 gfx1151 A4-fusion arms recorded on the
+# hipfire-arch-qwen35 ledger row (HIPFIRE_V2B_A4_EPI, default on gfx1151 since v0.4.1).
+bypass_total                <= 300

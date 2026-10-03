@@ -296,12 +296,6 @@ pub fn arch_label(arch_id: u32) -> &'static str {
     }
 }
 
-/// Whether this arch, like every tp>1 load, is fully staged before the prior
-/// model is retired, so a failed load leaves the prior model usable.
-pub fn defers_prior_unload(arch_id: u32) -> bool {
-    arch_id == hipfire_arch_qwen4::ARCH_ID
-}
-
 /// Vision route. `None` = no vision encoder (text-only). The daemon still
 /// gates on `has_image`/`has_vl`; this route only selects the per-arch
 /// vision implementation.

@@ -635,6 +635,18 @@ fn ep_deferred_needs_vmm_preflight(load_tp: usize, model_present: bool) -> bool 
     load_tp > 1 && !model_present
 }
 
+/// Suffix for an admitted-load failure. Single-device/pp loads are
+/// unload-first, so after admission the prior model is already retired and a
+/// construction or staging failure leaves `model=None`; say so explicitly.
+/// A deferred tp>1 load keeps its prior model and gets no suffix.
+fn no_model_loaded_suffix(model_present: bool) -> &'static str {
+    if model_present {
+        ""
+    } else {
+        "; no model loaded (the prior model was unloaded before this load)"
+    }
+}
+
 /// Print a friendly, user-actionable message when Gpu::init fails. Matches
 /// the panic shape we used to emit (which dumped a Rust backtrace and the
 /// raw HipError debug-format) but turns it into a concrete next-step list.
@@ -2092,8 +2104,11 @@ fn main() {
                         continue;
                     }
                 };
-                let defer_prior_unload =
-                    load_tp > 1 || hipfire_loader::defers_prior_unload(admission.arch_id);
+                // Only tp>1 EP loads defer prior retirement. Every single-device
+                // or pp load (Qwen4/Flash-Next included) is unload-first: after
+                // admission the prior model is torn down and VMM must be clean
+                // before construction, so a later failure leaves no model.
+                let defer_prior_unload = load_tp > 1;
                 let max_seq = admission.max_seq;
                 let sequence_reason = admission.sequence_reason;
                 // Exactly one legacy warning per admitted trunk; loader admitted
@@ -2357,8 +2372,9 @@ fn main() {
                                     Err(e) => Some(e),
                                 };
                                 let mut msg = format!(
-                                    "load failed: continuous batch staging failed: {stage_err}. GPU: {} ({free_mb} MB free / {total_mb} MB total)",
-                                    gpu.arch
+                                    "load failed: continuous batch staging failed: {stage_err}. GPU: {} ({free_mb} MB free / {total_mb} MB total){}",
+                                    gpu.arch,
+                                    no_model_loaded_suffix(model.is_some())
                                 );
                                 if let Some(rb) = rollback_err {
                                     msg.push_str(&format!(
@@ -2381,7 +2397,7 @@ fn main() {
                         // the new model is fully staged — NOW retire the
                         // prior model before publishing. Single-GPU/pp models
                         // are unloaded eagerly above; this branch handles
-                        // deferred TP or Qwen4 loads. Prior PFlash drafter is
+                        // deferred tp>1 EP loads. Prior PFlash drafter is
                         // part of that prior model, so tear it down first in
                         // the same drafter-before-unload order used elsewhere.
                         //
@@ -2688,8 +2704,9 @@ fn main() {
                             &mut stdout,
                             None,
                             &format!(
-                                "load failed: {e}. GPU: {} ({free_mb} MB free / {total_mb} MB total)",
-                                gpu.arch
+                                "load failed: {e}. GPU: {} ({free_mb} MB free / {total_mb} MB total){}",
+                                gpu.arch,
+                                no_model_loaded_suffix(model.is_some())
                             ),
                             "gpu",
                             false,
@@ -5083,6 +5100,14 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn admitted_load_failure_names_missing_model_only_when_unload_first() {
+        // Unload-first (single-device/pp, incl. Qwen4): prior already retired.
+        assert!(super::no_model_loaded_suffix(false).contains("no model loaded"));
+        // Deferred tp>1: prior model survives a failed load.
+        assert_eq!(super::no_model_loaded_suffix(true), "");
+    }
+
     use super::{
         announce_generate_terminal, apply_vision_mode_gate, client_seed_or_refuse,
         emit_batch_admission_error, refuse_image_without_vision, require_wire_attempt_id,

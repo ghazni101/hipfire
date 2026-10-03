@@ -10,7 +10,7 @@
 //! shared with `hipfire-rip`'s `qsa` test; the strict whole-file comparison is
 //! kept there as `strict_whole_file_difference`.
 #![cfg(feature = "toolchain")]
-use hipfire_isa::kernels::{fp8_gemm, gdn_scan, iu4_gemm, iu4_v2b, iu4_v2c, qsa_gather, qwen4_moe_sym};
+use hipfire_isa::kernels::{fp8_gemm, gdn_scan, iu4_gemm, iu4_v2b, iu4_v2b_a4, iu4_v2c, qsa_gather, qwen4_moe_sym};
 use hipfire_isa::kernels::gemm_uk::{Chain, Iu8, MmaKind};
 use hipfire_isa::toolchain::{oracle_assemble_link_bundle, Toolchain};
 use hipfire_isa::{native, Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan, V, reg::Live};
@@ -79,6 +79,8 @@ fn corpus() -> Vec<Unit> {
         if let Ok((_, text, proof)) = iu4_v2c::module(arch, &iu4_v2c::Epi::ALL) { module(&mut units, proof.module, arch, text) }
         for epi in iu4_v2b::Epi::ALL { if let Ok(e) = iu4_v2b::emit(iu4_v2b::Spec { arch, epi }) { single(&mut units, e) } }
         if let Ok((_, text, proof)) = iu4_v2b::emit_module(arch) { module(&mut units, proof.module, arch, text) }
+        for epi in iu4_v2b_a4::Epi::ALL { if let Ok(e) = iu4_v2b_a4::emit(iu4_v2b_a4::Spec { arch, epi }) { single(&mut units, e) } }
+        if let Ok((_, text, proof)) = iu4_v2b_a4::emit_module(arch) { module(&mut units, proof.module, arch, text) }
         // Qwen4 MoE: the anchors, NT4/NT8 expert runs and the NT4 row repeats.
         for spec in qwen4_moe_sym::module_specs(arch) { if let Ok(e) = qwen4_moe_sym::emit(spec) { single(&mut units, e) } }
         if let Ok((_, text, proof)) = qwen4_moe_sym::emit_module(arch) { module(&mut units, proof.module, arch, text) }

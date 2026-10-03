@@ -130,8 +130,11 @@ def main() -> int:
         (ROOT / "target").mkdir(exist_ok=True)
         work = Path(tempfile.mkdtemp(prefix="kernel-idproof.", dir=ROOT / "target"))
     try:
+        # One cargo target per label: git-archive sources carry commit mtimes
+        # older than the other label's outputs, so a shared target can reuse
+        # stale artifacts and silently report IDENTICAL.
         built = {
-            label: build(commit, args.arch, work / label, work / "cargo-target")
+            label: build(commit, args.arch, work / label, work / f"cargo-target-{label}")
             for label, commit in (("base", base), ("new", new))
         }
     except (subprocess.CalledProcessError, OSError, tarfile.TarError) as e:

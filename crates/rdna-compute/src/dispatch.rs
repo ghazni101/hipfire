@@ -1647,6 +1647,9 @@ impl Gpu {
                 int4_mmq_x_scratch: None,
                 int4_mmq_x_scratch_bytes: 0,
                 int4_mmq_generation: 0,
+                int4_mmq_down_scratch: None,
+                int4_mmq_down_scratch_bytes: 0,
+                int4_mmq_down_generation: 0,
                 int4_mmq_slab_generation: None,
                 int8_mmq_x_scratch: None,
                 int8_mmq_x_scratch_bytes: 0,
@@ -3539,6 +3542,27 @@ impl Gpu {
         self.scratch.reserve_int4_mmq(&self.hip, k, n)
     }
 
+    /// Reserve `int4_mmq_down_scratch` for the A4-fused gate/up epilogue's
+    /// down-proj sidecar. Never aliases `int4_mmq_x_scratch`.
+    pub fn reserve_int4_mmq_down(
+        &mut self,
+        k: usize,
+        n: usize,
+    ) -> HipResult<crate::scratch::Int4MmqDownReservation> {
+        // Mirror `reserve_int4_mmq`'s validity gate: no growth on the error path.
+        if k != 0 && n != 0 && k % 256 == 0 {
+            let needed = crate::scratch::int4_mmq_reserve_needed(k, n);
+            if crate::scratch::scratch_will_grow(
+                self.scratch.int4_mmq_down_scratch_bytes,
+                self.scratch.int4_mmq_down_scratch.is_some(),
+                needed,
+            ) {
+                self.invalidate_for_scratch_growth();
+            }
+        }
+        self.scratch.reserve_int4_mmq_down(&self.hip, k, n)
+    }
+
     /// Re-quantize f32 activations for the gfx1201 A8 MMQ consumer.
     pub fn ensure_int8_mmq_x(&mut self, x: &GpuTensor, n: usize, k: usize) -> HipResult<*mut c_void> {
         let needed = crate::scratch::int8_mmq_x_needed(k, n);
@@ -3674,6 +3698,18 @@ impl Gpu {
         n: usize,
     ) -> HipResult<*mut c_void> {
         let (gen, ptr) = self.scratch.int4_mmq_live();
+        prepared.checked_ptr(gen, ptr, k, n)
+    }
+
+    /// Validate a prepared A4-fused down-sidecar handle against the live
+    /// down scratch generation.
+    pub fn int4_mmq_down_prepared_ptr(
+        &self,
+        prepared: &crate::scratch::Int4MmqDownPrepared,
+        k: usize,
+        n: usize,
+    ) -> HipResult<*mut c_void> {
+        let (gen, ptr) = self.scratch.int4_mmq_down_live();
         prepared.checked_ptr(gen, ptr, k, n)
     }
 

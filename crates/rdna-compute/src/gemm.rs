@@ -718,6 +718,13 @@ const PM_V2B_MODULE: &str = "gemm_mq4g256v2_residual_iu4_pm_v2b_gfx1151";
 const PM_V2B_SET: &str = "gemm_mq4g256v2_residual_iu4_pm_v2b_set_gfx1151";
 const PM_V2B_ADD: &str = "gemm_mq4g256v2_residual_iu4_pm_v2b_add_gfx1151";
 const PM_V2B_SILU: &str = "gemm_mq4g256v2_gate_up_silu_iu4_pm_v2b_gfx1151";
+/// A4-fusion stage-2 module (`kernels::GEMM_MQ4G256V2_GATE_UP_SILU_A4_IU4_PM_V2B_GFX1151`).
+const PM_V2B_A4_MODULE: &str = "gemm_mq4g256v2_gate_up_silu_a4_iu4_pm_v2b_gfx1151";
+/// Stage-1 retile twin of `PM_V2B_SILU` (same ABI; block 512, grid
+/// `[N/128, 2M/512]`), `HIPFIRE_V2B_A4_EPI=retile`.
+const PM_V2B_SILU_M512: &str = "gemm_mq4g256v2_gate_up_silu_iu4_pm_v2b_m512_gfx1151";
+/// Fused gate/up SiLU + down-proj A4 sidecar producer, `HIPFIRE_V2B_A4_EPI=1`.
+const PM_V2B_SILU_A4: &str = "gemm_mq4g256v2_gate_up_silu_a4_iu4_pm_v2b_gfx1151";
 /// The builder ADD touches the residual over epochs E-16..E-9, so it needs
 /// at least 16 K128 epochs.
 const PM_V2B_ADD_MIN_K: usize = 2048;
@@ -732,6 +739,42 @@ static V2B_PM_BUNDLE: LazyLock<BundleOverride> =
 #[inline]
 fn v2b_pm_image() -> HipResult<&'static [u8]> {
     g12_iu4_bundle(&V2B_PM_BUNDLE, kernels::GEMM_MQ4G256V2_RESIDUAL_IU4_PM_V2B_GFX1151)
+}
+
+/// Developer same-binary A/B of the A4-fusion bundle:
+/// `HIPFIRE_V2B_A4_PM_BUNDLE=<path>` loads it from a file instead of the
+/// embedded image. Read once; an unreadable file fails every A4 launch.
+static V2B_A4_PM_BUNDLE: LazyLock<BundleOverride> =
+    LazyLock::new(|| g12_iu4_bundle_override("HIPFIRE_V2B_A4_PM_BUNDLE"));
+
+#[inline]
+fn v2b_a4_pm_image() -> HipResult<&'static [u8]> {
+    g12_iu4_bundle(
+        &V2B_A4_PM_BUNDLE,
+        kernels::GEMM_MQ4G256V2_GATE_UP_SILU_A4_IU4_PM_V2B_GFX1151,
+    )
+}
+
+/// `HIPFIRE_V2B_A4_EPI` arm of the gfx1151 V2B gate/up SiLU launch.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum A4Mode {
+    /// `retile`: the stage-1 m512 twin replaces the V2B SiLU launch; `h`
+    /// is written exactly as before.
+    Retile,
+    /// Unset, `1` or any other value (default): the fused kernel also writes
+    /// the down-proj A4 sidecar.
+    Fused,
+}
+
+/// Current `HIPFIRE_V2B_A4_EPI` arm. Read on every call (not cached) so one
+/// process can switch arms; `0` is the opt-out (unfused V2B SiLU + hin).
+/// Only exact gfx1151 V2B shapes are admitted (`Gpu::a4_epi_admitted`).
+fn v2b_a4_mode() -> Option<A4Mode> {
+    match hipfire_config::developer_var("HIPFIRE_V2B_A4_EPI").as_deref() {
+        Ok("0") => None,
+        Ok("retile") => Some(A4Mode::Retile),
+        _ => Some(A4Mode::Fused),
+    }
 }
 
 /// Builder twin of a hipcc V2B entry (gfx1151 only: the V2B tile is), with
@@ -33946,22 +33989,30 @@ impl Gpu {
             ),
         };
         // gfx1151: the certified builder twin unless `HIPFIRE_V2B_PM=0`.
+        let a4_retile = tile == Iu4V2Tile::V2b
+            && v2b_a4_mode() == Some(A4Mode::Retile)
+            && self.a4_epi_admitted(Some(tile), gate_m, up_m, k, batch_size);
         let v2b_pm = match tile {
             Iu4V2Tile::V2b => v2b_pm_entry(kernel_name, 0, gate_m, k).map(|(name, _)| name),
             Iu4V2Tile::V2c => None,
         };
-        let kernel_name = match v2b_pm {
-            Some(name) => {
-                self.ensure_embedded_kernel(PM_V2B_MODULE, v2b_pm_image()?, name)?;
-                name
-            }
-            None if pm => {
-                self.ensure_embedded_kernel(module, gfx1100_pm_image()?, kernel_name)?;
-                kernel_name
-            }
-            None => {
-                self.ensure_kernel(module, source, kernel_name)?;
-                kernel_name
+        let kernel_name = if a4_retile {
+            self.ensure_embedded_kernel(PM_V2B_A4_MODULE, v2b_a4_pm_image()?, PM_V2B_SILU_M512)?;
+            PM_V2B_SILU_M512
+        } else {
+            match v2b_pm {
+                Some(name) => {
+                    self.ensure_embedded_kernel(PM_V2B_MODULE, v2b_pm_image()?, name)?;
+                    name
+                }
+                None if pm => {
+                    self.ensure_embedded_kernel(module, gfx1100_pm_image()?, kernel_name)?;
+                    kernel_name
+                }
+                None => {
+                    self.ensure_kernel(module, source, kernel_name)?;
+                    kernel_name
+                }
             }
         };
         let mut g_ptr = a_gate.buf.as_ptr();
@@ -33987,8 +34038,18 @@ impl Gpu {
         // Token tile on x, virtual (gate/up interleaved) row tile on y.
         let result = self.launch_maybe_blob(
             kernel_name,
-            [(batch_size / t) as u32, (2 * gate_m / t) as u32, 1],
-            if pm { [256, 1, 1] } else if v2b_pm.is_some() { [512, 1, 1] } else { [32, tile.waves(), 1] },
+            if a4_retile {
+                [(batch_size / 128) as u32, (2 * gate_m / 512) as u32, 1]
+            } else {
+                [(batch_size / t) as u32, (2 * gate_m / t) as u32, 1]
+            },
+            if pm {
+                [256, 1, 1]
+            } else if a4_retile || v2b_pm.is_some() {
+                [512, 1, 1]
+            } else {
+                [32, tile.waves(), 1]
+            },
             tile.lds_bytes(),
             &mut params,
             || {
@@ -34007,6 +34068,123 @@ impl Gpu {
             t.finish(&self.hip);
         }
         result.map(|()| true)
+    }
+
+    /// A4-fusion admission shared by the `HIPFIRE_V2B_A4_EPI` arms: exact
+    /// gfx1151, `gate_m == up_m`, the V2B tile (which already excludes Redline
+    /// recording and graph capture), `gate_m % 256 == 0`,
+    /// `batch_size % 128 == 0`, `k % 256 == 0`, and neither `HIPFIRE_F1LITE=0`
+    /// nor `HIPFIRE_V2B_PM=0`. `tile` is `self.iu4_v2_tile(gate_m, k, batch_size)`.
+    fn a4_epi_admitted(
+        &self,
+        tile: Option<Iu4V2Tile>,
+        gate_m: usize,
+        up_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> bool {
+        self.arch == "gfx1151"
+            && gate_m == up_m
+            && tile == Some(Iu4V2Tile::V2b)
+            && gate_m % 256 == 0
+            && batch_size % 128 == 0
+            && k % 256 == 0
+            && hipfire_config::developer_var("HIPFIRE_F1LITE").as_deref() != Ok("0")
+            && hipfire_config::developer_var("HIPFIRE_V2B_PM").as_deref() != Ok("0")
+    }
+
+    /// A4-fusion stage 2 (`HIPFIRE_V2B_A4_EPI`, default on; `=0` opts out): the certified
+    /// V2B gate/up + SiLU GEMM that also writes the w_down A4 sidecar. The
+    /// kernel applies the `fused_silu_hin_rotate_mq_i4_batched` producer to its
+    /// own SiLU output and stores the byte-identical 72-byte `block_i4_128`
+    /// records (`[M/128][N]`, record `(2*group+half)*N + token`) into the
+    /// dedicated `int4_mmq_down_scratch`, so `h` is never written and the
+    /// separate hin producer is skipped. `awq` is w_down's `awq_scale`
+    /// (`f32[gate_m]`). Returns `Ok(None)` without launching unless the arm is
+    /// on and the shape is admitted (see [`Self::a4_epi_admitted`]); the
+    /// caller then runs the unfused path. The returned handle feeds
+    /// [`Self::gemm_mq4g256v2_residual_wmma_iu4_down_prepared`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn gemm_gate_up_silu_a4_mq4g256v2_iu4_prepared(
+        &mut self,
+        a_gate: &GpuTensor,
+        a_up: &GpuTensor,
+        prepared: &crate::scratch::Int4MmqPrepared,
+        awq: &GpuTensor,
+        gate_m: usize,
+        up_m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<Option<crate::scratch::Int4MmqDownPrepared>> {
+        if v2b_a4_mode() != Some(A4Mode::Fused) {
+            return Ok(None);
+        }
+        let tile = self.iu4_v2_tile(gate_m, k, batch_size);
+        if !self.a4_epi_admitted(tile, gate_m, up_m, k, batch_size) {
+            return Ok(None);
+        }
+        self.bind_thread()?;
+        // Land any owed residual add a folded GEMM left before overwriting.
+        self.flush_residual_fold()?;
+        self.ensure_mq_signs()?;
+        // Reserve the down slot first: its growth may invalidate captured
+        // state, and it never touches the x sidecar `prepared` points into.
+        let res = self.reserve_int4_mmq_down(gate_m, batch_size)?;
+        let xq = self.int4_mmq_prepared_ptr(prepared, k, batch_size)?;
+        self.ensure_embedded_kernel(PM_V2B_A4_MODULE, v2b_a4_pm_image()?, PM_V2B_SILU_A4)?;
+        let mut g_ptr = a_gate.buf.as_ptr();
+        let mut u_ptr = a_up.buf.as_ptr();
+        let mut xq_ptr = xq;
+        let mut awq_ptr = awq.buf.as_ptr();
+        let mut s1_ptr = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
+        let mut s2_ptr = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
+        let mut y4_ptr = res.ptr();
+        let mut m_val = gate_m as i32;
+        let mut k_val = k as i32;
+        let mut n_val = batch_size as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut g_ptr as *mut _ as *mut c_void,
+            &mut u_ptr as *mut _ as *mut c_void,
+            &mut xq_ptr as *mut _ as *mut c_void,
+            &mut awq_ptr as *mut _ as *mut c_void,
+            &mut s1_ptr as *mut _ as *mut c_void,
+            &mut s2_ptr as *mut _ as *mut c_void,
+            &mut y4_ptr as *mut _ as *mut c_void,
+            &mut m_val as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+        ];
+        let bytes = 2 * gate_m * (k / 256) * crate::dispatch::MQ4V2_GROUP_BYTES
+            + 72 * (gate_m / 128) * batch_size;
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", PM_V2B_SILU_A4, bytes);
+        let result = self.launch_maybe_blob(
+            PM_V2B_SILU_A4,
+            [(batch_size / 128) as u32, (2 * gate_m / 512) as u32, 1],
+            [512, 1, 1],
+            65536,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                b.push_ptr(g_ptr);
+                b.push_ptr(u_ptr);
+                b.push_ptr(xq_ptr);
+                b.push_ptr(awq_ptr);
+                b.push_ptr(s1_ptr);
+                b.push_ptr(s2_ptr);
+                b.push_ptr(y4_ptr);
+                b.push_i32(m_val);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result?;
+        Ok(Some(crate::scratch::Int4MmqDownPrepared::from_reservation(
+            res,
+        )))
     }
 
     /// F1-lite on exact gfx1201: `gemm_mq4g256v2_gate_up_silu_mmq_iu4_symfold`
@@ -35779,6 +35957,24 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         let xq = self.int4_mmq_prepared_ptr(prepared, k, batch_size)?;
+        self.gemm_mq4g256v2_mmq_add_prequant_iu4(a_raw, xq, y, m, k, batch_size)
+    }
+
+    /// Down-proj residual consumer of an A4-fused gate/up sidecar
+    /// ([`Self::gemm_gate_up_silu_a4_mq4g256v2_iu4_prepared`]): same ADD
+    /// semantics (`Y += W@X`) as [`Self::gemm_mq4g256v2_residual_wmma_iu4_prepared`],
+    /// reading the dedicated down scratch (generation-checked) instead of the
+    /// shared x sidecar.
+    pub fn gemm_mq4g256v2_residual_wmma_iu4_down_prepared(
+        &mut self,
+        a_raw: &GpuTensor,
+        prepared: &crate::scratch::Int4MmqDownPrepared,
+        y: &GpuTensor,
+        m: usize,
+        k: usize,
+        batch_size: usize,
+    ) -> HipResult<()> {
+        let xq = self.int4_mmq_down_prepared_ptr(prepared, k, batch_size)?;
         self.gemm_mq4g256v2_mmq_add_prequant_iu4(a_raw, xq, y, m, k, batch_size)
     }
 

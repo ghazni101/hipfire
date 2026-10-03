@@ -314,6 +314,9 @@ fn try_iu4_silu_prepared(
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum FfnGateOutput {
     Separate,
+    /// A4 fusion (`HIPFIRE_V2B_A4_EPI`, default on gfx1151; `=0` opts out): the gate/up epilogue wrote the w_down A4
+    /// sidecar itself; `gate_ffn_batch` (h) was not written.
+    Iu4A4(rdna_compute::Int4MmqDownPrepared),
     Iu4H,
     Fp8H,
     A8H,
@@ -7427,6 +7430,24 @@ fn batch_chunk_delta_net_ffn_gate_up(
         return Ok(FfnGateOutput::A8H);
     } else if let Some(prep) = &iu4_prep {
         // F1-lite: one GEMM v2 launch emits h; else the SET pair below.
+        // A4 fusion (gfx1151 V2B only, default on; `HIPFIRE_V2B_A4_EPI=0` opts out): the epilogue
+        // also writes the w_down sidecar, so no h and no hin producer.
+        if f1lite {
+            if let Some(awq) = layer.w_down.awq_scale.as_ref() {
+                if let Some(down_prep) = gpu.gemm_gate_up_silu_a4_mq4g256v2_iu4_prepared(
+                    &layer.w_gate.buf,
+                    &layer.w_up.buf,
+                    prep,
+                    awq,
+                    layer.w_gate.m,
+                    layer.w_up.m,
+                    layer.w_gate.k,
+                    n,
+                )? {
+                    return Ok(FfnGateOutput::Iu4A4(down_prep));
+                }
+            }
+        }
         if f1lite
             && gpu.gemm_gate_up_silu_mq4g256v2_iu4_prepared(
                 &layer.w_gate.buf,
@@ -7661,8 +7682,9 @@ fn batch_chunk_delta_net_ffn_gate_up(
 /// S9-mq4v2-persistent-prologues will issue `try_mq4v2_persistent_prologue`
 /// from inside this hook after S3/S4 land.
 ///
-/// `h_source` tells whether gate/up emitted separate planes, IU4 h, or FP8 h;
-/// h is stored in `gate_ffn_batch` and needs its matching down producer.
+/// `h_source` tells whether gate/up emitted separate planes, IU4 h, FP8 h, or
+/// (`Iu4A4`) the finished w_down A4 sidecar with no h at all; h is stored in
+/// `gate_ffn_batch` and needs its matching down producer.
 fn batch_chunk_delta_net_ffn_down(
     gpu: &mut Gpu,
     layer: &DeltaNetLayerWeights,
@@ -7757,6 +7779,17 @@ fn batch_chunk_delta_net_ffn_down(
             hidden_dim,
             n,
         );
+    }
+    if let FfnGateOutput::Iu4A4(prep) = h_source {
+        gpu.gemm_mq4g256v2_residual_wmma_iu4_down_prepared(
+            &layer.w_down.buf,
+            &prep,
+            &pbs.x_batch,
+            layer.w_down.m,
+            layer.w_down.k,
+            n,
+        )?;
+        return Ok(());
     }
     let mut iu4_prep: Option<rdna_compute::Int4MmqPrepared> = None;
     let mut fp8_prep: Option<rdna_compute::Mq4v2Fp8Prepared> = None;
@@ -9656,6 +9689,24 @@ fn batch_chunk_full_attn_ffn_gate_up(
         )?;
         return Ok(FfnGateOutput::A8H);
     } else if let Some(prep) = &iu4_prep {
+        // A4 fusion (gfx1151 V2B only, default on; `HIPFIRE_V2B_A4_EPI=0` opts out): the epilogue
+        // also writes the w_down sidecar, so no h and no hin producer.
+        if f1lite {
+            if let Some(awq) = layer.w_down.awq_scale.as_ref() {
+                if let Some(down_prep) = gpu.gemm_gate_up_silu_a4_mq4g256v2_iu4_prepared(
+                    &layer.w_gate.buf,
+                    &layer.w_up.buf,
+                    prep,
+                    awq,
+                    layer.w_gate.m,
+                    layer.w_up.m,
+                    layer.w_gate.k,
+                    n,
+                )? {
+                    return Ok(FfnGateOutput::Iu4A4(down_prep));
+                }
+            }
+        }
         // F1-lite: one GEMM v2 launch emits h; else the SET pair below.
         if f1lite
             && gpu.gemm_gate_up_silu_mq4g256v2_iu4_prepared(
@@ -9891,8 +9942,9 @@ fn batch_chunk_full_attn_ffn_gate_up(
 /// S9-mq4v2-persistent-prologues will issue `try_mq4v2_persistent_prologue`
 /// from inside this hook after S3/S4 land.
 ///
-/// `h_source` tells whether gate/up emitted separate planes, IU4 h, or FP8 h;
-/// h is stored in `gate_ffn_batch` and needs its matching down producer.
+/// `h_source` tells whether gate/up emitted separate planes, IU4 h, FP8 h, or
+/// (`Iu4A4`) the finished w_down A4 sidecar with no h at all; h is stored in
+/// `gate_ffn_batch` and needs its matching down producer.
 fn batch_chunk_full_attn_ffn_down(
     gpu: &mut Gpu,
     layer: &FullAttnLayerWeights,
@@ -9981,6 +10033,17 @@ fn batch_chunk_full_attn_ffn_down(
             hidden_dim,
             n,
         );
+    }
+    if let FfnGateOutput::Iu4A4(prep) = h_source {
+        gpu.gemm_mq4g256v2_residual_wmma_iu4_down_prepared(
+            &layer.w_down.buf,
+            &prep,
+            &pbs.x_batch,
+            layer.w_down.m,
+            layer.w_down.k,
+            n,
+        )?;
+        return Ok(());
     }
     let mut iu4_prep: Option<rdna_compute::Int4MmqPrepared> = None;
     let mut fp8_prep: Option<rdna_compute::Mq4v2Fp8Prepared> = None;

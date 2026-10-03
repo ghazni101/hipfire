@@ -133,6 +133,106 @@ impl Int4MmqPrepared {
     }
 }
 
+/// Opaque reservation of the dedicated `int4_mmq_down_scratch` buffer for the
+/// A4-fused gate/up SiLU epilogue, which writes the w_down `block_i4_128`
+/// sidecar directly. Never aliases `int4_mmq_x_scratch`. Obtained from
+/// [`ScratchState::reserve_int4_mmq_down`] / [`crate::Gpu::reserve_int4_mmq_down`].
+/// Converted to [`Int4MmqDownPrepared`] only after a successful launch.
+#[derive(Debug)]
+pub struct Int4MmqDownReservation {
+    ptr: *mut c_void,
+    k: usize,
+    n: usize,
+    generation: u64,
+}
+
+impl Int4MmqDownReservation {
+    #[inline]
+    pub fn ptr(&self) -> *mut c_void {
+        self.ptr
+    }
+
+    #[inline]
+    pub fn k(&self) -> usize {
+        self.k
+    }
+
+    #[inline]
+    pub fn n(&self) -> usize {
+        self.n
+    }
+
+    #[inline]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
+/// Frozen handle to a down-proj sidecar written by the A4-fused gate/up
+/// epilogue. Fields are private so consumers cannot forge a handle or bypass
+/// the generation check. Valid only until the next `reserve_int4_mmq_down`
+/// on the same Gpu or teardown.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Int4MmqDownPrepared {
+    ptr: *mut c_void,
+    k: usize,
+    n: usize,
+    generation: u64,
+}
+
+impl Int4MmqDownPrepared {
+    /// Seal a reservation after the fused producer was launched. Host only —
+    /// no device work.
+    pub fn from_reservation(res: Int4MmqDownReservation) -> Self {
+        Self {
+            ptr: res.ptr,
+            k: res.k,
+            n: res.n,
+            generation: res.generation,
+        }
+    }
+
+    /// Validate generation / (k,n) / pointer against the live down scratch and
+    /// return the device pointer for the IU4 consumer. Fails closed on any
+    /// mismatch.
+    pub fn checked_ptr(
+        &self,
+        live_generation: u64,
+        live_ptr: *mut c_void,
+        k: usize,
+        n: usize,
+    ) -> HipResult<*mut c_void> {
+        if self.ptr.is_null()
+            || live_ptr.is_null()
+            || self.ptr != live_ptr
+            || self.generation != live_generation
+            || self.k != k
+            || self.n != n
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "Int4MmqDownPrepared: stale or mismatched IU4 down-sidecar handle",
+            ));
+        }
+        Ok(self.ptr)
+    }
+
+    #[inline]
+    pub fn k(&self) -> usize {
+        self.k
+    }
+
+    #[inline]
+    pub fn n(&self) -> usize {
+        self.n
+    }
+
+    #[inline]
+    pub fn generation(&self) -> u64 {
+        self.generation
+    }
+}
+
 /// Reservation for one producer-emitted `block_i8_128` sidecar.
 #[derive(Debug)]
 pub struct Int8MmqReservation {
@@ -234,6 +334,13 @@ pub struct ScratchState {
     /// never writes, so aliasing would corrupt both routes.
     pub int4_mmq_x_scratch: Option<DeviceBuffer>,
     pub int4_mmq_x_scratch_bytes: usize,
+    /// Dedicated down-proj `block_i4_128` sidecar written by the A4-fused
+    /// gate/up SiLU epilogue (`HIPFIRE_V2B_A4_EPI=1`). Never aliases
+    /// `int4_mmq_x_scratch` and never bumps `int4_mmq_generation`.
+    pub int4_mmq_down_scratch: Option<DeviceBuffer>,
+    pub int4_mmq_down_scratch_bytes: usize,
+    /// Generation bumped on every `reserve_int4_mmq_down`.
+    pub int4_mmq_down_generation: u64,
     /// Generation bumped on every `reserve_int4_mmq` so a prepared handle
     /// cannot outlive a later re-reservation of the same scratch slot.
     pub int4_mmq_generation: u64,
@@ -1778,6 +1885,39 @@ impl ScratchState {
         })
     }
 
+    /// Grow `int4_mmq_down_scratch` for the A4-fused gate/up epilogue's
+    /// down-proj sidecar (`[k/128, n]` 72 B records) and bump its generation.
+    /// Same validity gate as [`Self::reserve_int4_mmq`]; never touches
+    /// `int4_mmq_x_scratch` or its generation.
+    pub fn reserve_int4_mmq_down(
+        &mut self,
+        hip: &HipRuntime,
+        k: usize,
+        n: usize,
+    ) -> HipResult<Int4MmqDownReservation> {
+        if k == 0 || n == 0 || k % 256 != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "reserve_int4_mmq_down: need k%256==0 and n>0",
+            ));
+        }
+        let needed = int4_mmq_reserve_needed(k, n);
+        grow_scratch_buffer(
+            hip,
+            &mut self.int4_mmq_down_scratch,
+            &mut self.int4_mmq_down_scratch_bytes,
+            needed,
+        )?;
+        self.int4_mmq_down_generation = self.int4_mmq_down_generation.wrapping_add(1);
+        let ptr = self.int4_mmq_down_scratch.as_ref().unwrap().as_ptr();
+        Ok(Int4MmqDownReservation {
+            ptr,
+            k,
+            n,
+            generation: self.int4_mmq_down_generation,
+        })
+    }
+
     /// Grow the Qwen4 symmetric IU4 MoE grouping scratch to hold the layout
     /// of `max_slots` routed slots over `experts` experts (every smaller
     /// slot count fits). Callers reserve the forward's maximum before graph
@@ -1971,6 +2111,17 @@ impl ScratchState {
             .map(|b| b.as_ptr())
             .unwrap_or(std::ptr::null_mut());
         (self.int4_mmq_generation, ptr)
+    }
+
+    /// Live generation + pointer for [`Int4MmqDownPrepared::checked_ptr`].
+    #[inline]
+    pub fn int4_mmq_down_live(&self) -> (u64, *mut c_void) {
+        let ptr = self
+            .int4_mmq_down_scratch
+            .as_ref()
+            .map(|b| b.as_ptr())
+            .unwrap_or(std::ptr::null_mut());
+        (self.int4_mmq_down_generation, ptr)
     }
 
     /// Record that a slab producer twin wrote the live generation sealed

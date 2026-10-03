@@ -133,6 +133,7 @@ fn step(w: &mut Wave, name: &str, ops: &[&str]) {
         "v_mov_b32_e32" => a(1),
         "v_and_b32_e32" => bin(|x, y| x & y),
         "v_or_b32_e32" => bin(|x, y| x | y),
+        "v_xor_b32_e32" => bin(|x, y| x ^ y),
         "v_add_nc_u32_e32" => bin(|x, y| x.wrapping_add(y)),
         "v_sub_nc_u32_e32" => bin(|x, y| x.wrapping_sub(y)),
         "v_lshrrev_b32_e32" => bin(|s, x| x >> (s & 31)),

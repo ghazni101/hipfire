@@ -36,6 +36,15 @@
 #error "IU4_A4_CANDIDATES must be 1, 2, 4, or 8"
 #endif
 
+// The one-pass {5,7} emit below serves every gfx1201 C2 build and, opt-in by
+// `#define HIPFIRE_IU4_ONEPASS` ahead of this fragment, the gfx1151 C2
+// producers (`_gfx1151` symbols). Its DPP row_xmask reductions and rcp/Newton
+// codes are gfx11-legal; the bits equal the remap + `_wave<true>` search.
+#if IU4_A4_CANDIDATES == 2 && (defined(__gfx1201__) \
+    || (defined(HIPFIRE_IU4_ONEPASS) && defined(__gfx1151__)))
+#define HIPFIRE_IU4_C2_ONEPASS 1
+#endif
+
 // int4 activation block: one 128-K group for one token (column).
 // qs: 64 B, even K low nibble / odd K high nibble, two's complement.
 // d: per-128 scale (MSE-clip grid argmin). s: exact int sum of the 128 x_q.
@@ -200,9 +209,10 @@ __device__ __forceinline__ void quantize_block_i4_128_wave(
     }
 }
 
-#if defined(__gfx1201__) && IU4_A4_CANDIDATES == 2
-// gfx1201 one-pass 2-candidate emit (`HIPFIRE_G12_A4C2`, which compiles the
-// gfx1201 JIT with -DIU4_A4_CANDIDATES=2). Bit-identical to the remap below
+#if defined(HIPFIRE_IU4_C2_ONEPASS)
+// One-pass 2-candidate emit (gfx1201 `HIPFIRE_G12_A4C2`, which compiles the
+// gfx1201 JIT with -DIU4_A4_CANDIDATES=2; gfx1151 `HIPFIRE_IU4_ONEPASS`
+// producers). Bit-identical to the remap below
 // plus `quantize_block_i4_128_wave<true>`'s {5,7} search, without the
 // remap, the LDS permutes, or (on the common path) any per-element divide.
 //
@@ -381,12 +391,12 @@ __device__ __forceinline__ void emit_iu4_sidecar_from_producer8(
     int N,
     int lane
 ) {
-#if defined(__gfx1201__) && IU4_A4_CANDIDATES == 2
+#if defined(HIPFIRE_IU4_C2_ONEPASS)
     const float x[8] = {f0, f1, f2, f3, f4, f5, f6, f7};
     emit_iu4_sidecar_c2_gfx12(x, Y, group, token, N, lane);
 #else
 #if defined(HIPFIRE_IU4_SLAB) && defined(__HIP_DEVICE_COMPILE__)
-#error "HIPFIRE_IU4_SLAB is emitted only by the gfx1201 IU4_A4_CANDIDATES=2 path"
+#error "HIPFIRE_IU4_SLAB is emitted only by the one-pass IU4_A4_CANDIDATES=2 path"
 #endif
     #pragma unroll
     for (int h = 0; h < 2; ++h) {

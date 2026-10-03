@@ -162,6 +162,14 @@ respawn), after which serve exits 1 so a service manager can restart it.
 model switch; `loading_model` names an asynchronous pre-warm or post-restart
 reload.
 
+Model switch lifecycle: a load request is first admitted read-only; a refused
+admission leaves the prior model (and its drafter) loaded. Once admitted, a
+single-device or pipeline-parallel load (Flash-Next/Qwen4 included) unloads
+the prior model and requires clean VMM state before constructing the new
+one, so a failure after admission leaves no model loaded and the error says
+`no model loaded`. Only tp>1 expert-parallel loads stage the new model before
+retiring the prior one.
+
 ```bash
 # Loopback example (safe default for local smoke):
 curl -s http://127.0.0.1:11435/health

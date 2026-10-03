@@ -1064,6 +1064,14 @@ fn parse_extra(row: &OpRow, text: &str) -> Result<Operand, ParseError> {
         if group > 32 || !group.is_power_of_two() || lane >= group { return Err(bad_operand(row.name, text, "invalid broadcast group or lane")); }
         return Ok(Operand::Imm(ImmField::DsOffset((32 - group) | lane << 5)));
     }
+    if let Some(inner) = text.strip_prefix("offset:swizzle(SWAP,").and_then(|s| s.strip_suffix(')')) {
+        // BITMASK_PERM with and_mask 0x1F, or_mask 0, xor_mask = group size:
+        // lane l reads lane l ^ size (llvm-objdump's spelling of 0x1F | size << 10).
+        if row.name != "ds_swizzle_b32" { return Err(bad_operand(row.name, text, "swizzle on non-swizzle opcode")); }
+        let size: u16 = inner.parse().map_err(|_| bad_operand(row.name, text, "bad swap group size"))?;
+        if size == 0 || size > 16 || !size.is_power_of_two() { return Err(bad_operand(row.name, text, "invalid swap group size")); }
+        return Ok(Operand::Imm(ImmField::DsOffset(0x1f | size << 10)));
+    }
     if let Some((kind, value)) = text.split_once(':') {
         // VMEM offsets are signed 24-bit (`offset:-48` occurs in hipcc's
         // own `.s`); DS offsets are unsigned.

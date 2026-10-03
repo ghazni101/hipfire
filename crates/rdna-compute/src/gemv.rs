@@ -3416,10 +3416,11 @@ impl Gpu {
     }
 
     /// gfx1100 IU4 RMSNorm producers run their `_b8` batched-Phase-1a twins
-    /// (bit-identical; see `FUSED_RMSNORM_MQ_ROTATE_I4_B8_SRC`). gfx1151 and
-    /// `HIPFIRE_RMSNORM_P1A_BATCHED=0` keep the single-outstanding incumbents.
-    fn gfx1100_rmsnorm_p1a_b8(&self) -> bool {
-        self.arch_caps.is_gfx1100() && rmsnorm_p1a_batched()
+    /// (bit-identical; see `FUSED_RMSNORM_MQ_ROTATE_I4_B8_SRC`); gfx1151 runs
+    /// the `_b8_gfx1151` one-pass-emit twins and the `_fold_b8` folds.
+    /// `HIPFIRE_RMSNORM_P1A_BATCHED=0` keeps the single-outstanding incumbents.
+    fn gfx11_rmsnorm_p1a_b8(&self) -> bool {
+        (self.arch_caps.is_gfx1100() || self.arch_caps.is_gfx1151()) && rmsnorm_p1a_batched()
     }
 
     /// C2 IU4 producer: RMSNorm/FWHT + in-register `block_i4_128` sidecar.
@@ -3456,26 +3457,38 @@ impl Gpu {
             self.flush_residual_fold()?;
         }
         self.ensure_mq_signs()?;
-        let (module, source, kernel) = match (awq.is_some(), self.gfx1100_rmsnorm_p1a_b8()) {
-            (true, false) => (
+        let b8 = self.gfx11_rmsnorm_p1a_b8();
+        let gfx1151 = self.arch_caps.is_gfx1151();
+        let (module, source, kernel) = match (awq.is_some(), b8, gfx1151) {
+            (true, false, _) => (
                 "fused_rmsnorm_mq_rotate_awq_i4",
                 kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_SRC,
                 "fused_rmsnorm_mq_rotate_awq_i4",
             ),
-            (false, false) => (
+            (false, false, _) => (
                 "fused_rmsnorm_mq_rotate_i4",
                 kernels::FUSED_RMSNORM_MQ_ROTATE_I4_SRC,
                 "fused_rmsnorm_mq_rotate_i4",
             ),
-            (true, true) => (
+            (true, true, false) => (
                 "fused_rmsnorm_mq_rotate_awq_i4_b8",
                 kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_B8_SRC,
                 "fused_rmsnorm_mq_rotate_awq_i4_b8",
             ),
-            (false, true) => (
+            (false, true, false) => (
                 "fused_rmsnorm_mq_rotate_i4_b8",
                 kernels::FUSED_RMSNORM_MQ_ROTATE_I4_B8_SRC,
                 "fused_rmsnorm_mq_rotate_i4_b8",
+            ),
+            (true, true, true) => (
+                "fused_rmsnorm_mq_rotate_awq_i4_b8_gfx1151",
+                kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_B8_GFX1151_SRC,
+                "fused_rmsnorm_mq_rotate_awq_i4_b8_gfx1151",
+            ),
+            (false, true, true) => (
+                "fused_rmsnorm_mq_rotate_i4_b8_gfx1151",
+                kernels::FUSED_RMSNORM_MQ_ROTATE_I4_B8_GFX1151_SRC,
+                "fused_rmsnorm_mq_rotate_i4_b8_gfx1151",
             ),
         };
         self.ensure_kernel(module, source, kernel)?;
@@ -3590,14 +3603,23 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<crate::scratch::Int4MmqPrepared> {
         self.ensure_mq_signs()?;
-        let (source, kernel) = match awq {
-            Some(_) => (
+        let b8 = self.arch_caps.is_gfx1151() && rmsnorm_p1a_batched();
+        let (source, kernel) = match (awq.is_some(), b8) {
+            (true, false) => (
                 kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_FOLD_SRC,
                 "fused_rmsnorm_mq_rotate_awq_i4_fold",
             ),
-            None => (
+            (false, false) => (
                 kernels::FUSED_RMSNORM_MQ_ROTATE_I4_FOLD_SRC,
                 "fused_rmsnorm_mq_rotate_i4_fold",
+            ),
+            (true, true) => (
+                kernels::FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_FOLD_B8_SRC,
+                "fused_rmsnorm_mq_rotate_awq_i4_fold_b8",
+            ),
+            (false, true) => (
+                kernels::FUSED_RMSNORM_MQ_ROTATE_I4_FOLD_B8_SRC,
+                "fused_rmsnorm_mq_rotate_i4_fold_b8",
             ),
         };
         self.ensure_kernel(kernel, source, kernel)?;
@@ -5411,16 +5433,25 @@ impl Gpu {
             ));
         }
         self.ensure_mq_signs()?;
-        let v2 = self.arch_caps.is_gfx1100()
-            && hipfire_config::developer_bool("HIPFIRE_GFX1100_GATED_NORM_V2", true);
-        let (module, source) = match (awq.is_some(), v2) {
-            (true, false) => ("gated_norm_mq_rotate_awq_i4_gfx11", kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX11_SRC),
-            (false, false) => ("gated_norm_mq_rotate_i4_gfx11", kernels::GATED_NORM_MQ_ROTATE_I4_GFX11_SRC),
-            (true, true) => (
+        // gfx1100 `_gfx1100_v2` (opt-out `HIPFIRE_GFX1100_GATED_NORM_V2=0`);
+        // gfx1151 `_gfx1151_v2` (same body + one-pass emit, same launch).
+        let gfx1151 = self.arch_caps.is_gfx1151();
+        let v2 = gfx1151
+            || (self.arch_caps.is_gfx1100()
+                && hipfire_config::developer_bool("HIPFIRE_GFX1100_GATED_NORM_V2", true));
+        let (module, source) = match (awq.is_some(), v2, gfx1151) {
+            (true, false, _) => ("gated_norm_mq_rotate_awq_i4_gfx11", kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX11_SRC),
+            (false, false, _) => ("gated_norm_mq_rotate_i4_gfx11", kernels::GATED_NORM_MQ_ROTATE_I4_GFX11_SRC),
+            (true, true, false) => (
                 "gated_norm_mq_rotate_awq_i4_gfx1100_v2",
                 kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX1100_V2_SRC,
             ),
-            (false, true) => ("gated_norm_mq_rotate_i4_gfx1100_v2", kernels::GATED_NORM_MQ_ROTATE_I4_GFX1100_V2_SRC),
+            (false, true, false) => ("gated_norm_mq_rotate_i4_gfx1100_v2", kernels::GATED_NORM_MQ_ROTATE_I4_GFX1100_V2_SRC),
+            (true, true, true) => (
+                "gated_norm_mq_rotate_awq_i4_gfx1151_v2",
+                kernels::GATED_NORM_MQ_ROTATE_AWQ_I4_GFX1151_V2_SRC,
+            ),
+            (false, true, true) => ("gated_norm_mq_rotate_i4_gfx1151_v2", kernels::GATED_NORM_MQ_ROTATE_I4_GFX1151_V2_SRC),
         };
         let kernel = module;
         // v2: two 256-groups (one per wave) per 64-thread workgroup.

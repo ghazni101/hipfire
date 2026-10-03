@@ -481,6 +481,8 @@ const PINNED_EDGES: &[Pinned] = &[
     ("ds_swizzle_b32 v1, v2 offset:swizzle(BROADCAST,16,8)", &[0xd8d40110, 0x01000002], &[0xd8d40110, 0x01000002], &[0xd8d40110, 0x01000002]),
     ("ds_swizzle_b32 v1, v2 offset:swizzle(BROADCAST,2,1)", &[0xd8d4003e, 0x01000002], &[0xd8d4003e, 0x01000002], &[0xd8d4003e, 0x01000002]),
     ("ds_swizzle_b32 v1, v2 offset:swizzle(BROADCAST,32,31)", &[0xd8d403e0, 0x01000002], &[0xd8d403e0, 0x01000002], &[0xd8d403e0, 0x01000002]),
+    ("ds_swizzle_b32 v1, v2 offset:swizzle(SWAP,1)", &[0xd8d4041f, 0x01000002], &[0xd8d4041f, 0x01000002], &[0xd8d4041f, 0x01000002]),
+    ("ds_swizzle_b32 v1, v2 offset:swizzle(SWAP,16)", &[0xd8d4401f, 0x01000002], &[0xd8d4401f, 0x01000002], &[0xd8d4401f, 0x01000002]),
     ("buffer_load_b32 v1, v2, s[4:7], s8 offen offset:16", &[0xe0500010, 0x08410102], &[0xe0500010, 0x08410102], &[0xc4050008, 0x40800801, 0x00001002]),
     ("buffer_load_b32 v1, off, s[4:7], s8 offset:16", &[0xe0500010, 0x08010100], &[0xe0500010, 0x08010100], &[0xc4050008, 0x00800801, 0x00001000]),
 ];

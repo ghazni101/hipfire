@@ -48,7 +48,10 @@ pub mod replay;
 pub mod sampling;
 pub mod scratch;
 pub mod select_regrid;
-pub use scratch::{Int4MmqPrepared, Int4MmqReservation, Int8MmqPrepared, Int8MmqReservation, Mq4v2Fp8Prepared};
+pub use scratch::{
+    Int4MmqDownPrepared, Int4MmqDownReservation, Int4MmqPrepared, Int4MmqReservation, Int8MmqPrepared,
+    Int8MmqReservation, Mq4v2Fp8Prepared,
+};
 pub use gemm::F2GdnTargets;
 pub mod slot_pool;
 pub mod tensor_ops;
