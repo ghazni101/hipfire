@@ -976,29 +976,11 @@ impl SlotBackend {
         // Additional contradiction: if max_think==1 but thinking_enabled true? Already handled as authority wins, but spec says reject contradictions. If fallback path derived enabled true but max_think==1 would have been false, but since thinking_enabled absent we use max_think, so not contradictory.
         // If has_think false, ensure plain regardless.
 
-        // The effort rung handed to the Jinja template, suppressed exactly as
-        // `qwen_jinja_reasoning` suppresses it: an explicit thinking-off, an
-        // explicit disable rung, or the immediate-close sentinel. `auto` and
-        // an absent field leave the variable undefined so the template's own
-        // default applies. Spelled with the sequential route's exact
-        // case-sensitivity so the two cannot drift.
-        //
-        // Deliberately NOT gated on `enable_thinking`: that flag describes the
-        // `<think>`-token ChatML framing this route derives, and templates
-        // that express reasoning through a different opener (e.g.
-        // `<ifm|think>`, which sets `has_think` false) never enable it —
-        // gating there would silence the dial on exactly the models that
-        // consume it.
-        let effort_disable_rung =
-            matches!(raw_reasoning_effort, Some("none") | Some("off") | Some("chat"));
-        let jinja_effort = if thinking_enabled_opt == Some(false)
-            || max_think_tokens == Some(1)
-            || effort_disable_rung
-        {
-            None
-        } else {
-            raw_reasoning_effort.filter(|s| *s != "auto")
-        };
+        // The effort rung handed to the Jinja template; see
+        // `slot_jinja_effort` for the suppression rule and why it is not keyed
+        // on this route's `enable_thinking`.
+        let jinja_effort =
+            slot_jinja_effort(thinking_enabled_opt, raw_reasoning_effort, max_think_tokens);
 
         // Consume only the gateway-projected tool contract. Raw OpenAI
         // tool_choice never reaches this owner.
@@ -2017,6 +1999,32 @@ pub(crate) fn resolve_slot_sampling(
     Ok((temperature, top_p, max_tokens, fit))
 }
 
+/// The `reasoning_effort` rung handed to the Jinja template on this route.
+///
+/// Suppression mirrors `hipfire_engine::prompt::qwen_jinja_reasoning`: an
+/// explicit `thinking_enabled = false`, a disable rung, or the immediate-close
+/// sentinel (`max_think_tokens = 1`) leave the variable undefined so the
+/// template's own default applies. `auto` is the client's "no preference"
+/// spelling and is left undefined too. The rung itself is passed verbatim —
+/// the template is the authority on which values it accepts, and a rejected
+/// one fails the render as validation.
+///
+/// Deliberately NOT keyed on the route's `enable_thinking`: that flag
+/// describes the `<think>`-token ChatML framing, and a template that opens
+/// reasoning through a different token (e.g. `<ifm|think>`) keeps it false —
+/// keying on it would silence the dial on exactly the models that use it.
+fn slot_jinja_effort<'a>(
+    thinking_enabled: Option<bool>,
+    raw_effort: Option<&'a str>,
+    max_think_tokens: Option<u64>,
+) -> Option<&'a str> {
+    let disable_rung = matches!(raw_effort, Some("none") | Some("off") | Some("chat"));
+    if thinking_enabled == Some(false) || max_think_tokens == Some(1) || disable_rung {
+        return None;
+    }
+    raw_effort.filter(|rung| *rung != "auto")
+}
+
 pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
     // Optional numeric controls must not silently fall back to defaults when
     // present with the wrong JSON type. The parsing path uses as_f64/as_u64;
@@ -2944,6 +2952,32 @@ mod tests {
         let msg = json!({ "image_base64": big });
         let err = extract_slot_image(&msg).unwrap_err();
         assert!(err.contains("maximum encoded size"), "unexpected: {err}");
+    }
+
+    /// The effort dial reaches the template only when the client actually
+    /// asked for reasoning. Keyed on the request, not on the route's
+    /// `<think>`-token framing: a template that opens reasoning with another
+    /// token keeps that framing false and must still get the rung.
+    #[test]
+    fn slot_effort_reaches_the_template_except_when_reasoning_is_off() {
+        // A rung is passed through verbatim, including ones the template may
+        // reject (that failure belongs to the render, as validation).
+        assert_eq!(slot_jinja_effort(None, Some("high"), None), Some("high"));
+        assert_eq!(slot_jinja_effort(None, Some("xhigh"), None), Some("xhigh"));
+        assert_eq!(slot_jinja_effort(Some(true), Some("low"), None), Some("low"));
+        // `auto` and absent mean "no preference": leave it undefined so the
+        // template's own default applies.
+        assert_eq!(slot_jinja_effort(None, Some("auto"), None), None);
+        assert_eq!(slot_jinja_effort(None, None, None), None);
+        // Reasoning off — explicitly, by a disable rung, or by the
+        // immediate-close sentinel — suppresses the dial entirely.
+        assert_eq!(slot_jinja_effort(Some(false), Some("high"), None), None);
+        assert_eq!(slot_jinja_effort(None, Some("none"), None), None);
+        assert_eq!(slot_jinja_effort(None, Some("off"), None), None);
+        assert_eq!(slot_jinja_effort(None, Some("chat"), None), None);
+        assert_eq!(slot_jinja_effort(Some(true), Some("high"), Some(1)), None);
+        // A finite budget is not a disable: the rung survives it.
+        assert_eq!(slot_jinja_effort(Some(true), Some("high"), Some(64)), Some("high"));
     }
 
     #[test]
