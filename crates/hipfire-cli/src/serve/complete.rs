@@ -2863,13 +2863,12 @@ pub(crate) fn multi_slot_request_supported(body: &serde_json::Value) -> Result<(
             return Err("min_p must be within [0, 1]".to_owned());
         }
     }
-    if body
-        .get("reasoning_effort")
-        .and_then(serde_json::Value::as_str)
-        .is_some_and(|value| !value.eq_ignore_ascii_case("none"))
-    {
-        return Err("reasoning_effort is not supported".to_owned());
-    }
+    // `reasoning_effort` is not refused here: `apply_http_reasoning_request`
+    // already owns the field end-to-end — it normalises qwen_jinja's
+    // vocabulary (low|medium|xhigh), maps the OpenAI spellings onto it, drops
+    // the dial with a warning when the loaded template does not natively
+    // honour it, and drops it when thinking is off. Refusing it here rejected
+    // requests the sequential route accepts, and pre-empted that logic.
     // Finite caps (>= 2) are ENFORCED end-to-end on the multi-slot route
     // (the grammar cursor force-closes the span at the budget —
     // vLLM thinking_token_budget parity), so they are forwarded, not
