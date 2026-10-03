@@ -81,7 +81,7 @@ const els = {
 const state = {
   convs: new Map(),      // id → conversation record, mirrors IndexedDB
   conv: null,            // open conversation; null = fresh, unsaved chat
-  stream: null,          // in-flight generation
+  streams: new Map(),   // conversation id → in-flight generation (parallel chats)
   models: [],            // /v1/models entries
   health: null,          // last /health payload
   stats: null,           // last /stats payload
@@ -98,6 +98,10 @@ const state = {
   unread: false,
   menuAnchor: null,
 };
+
+const streamOf = (conv) => (conv ? state.streams.get(conv.id) : undefined);
+const curStream = () => streamOf(state.conv);
+const anyStreaming = () => state.streams.size > 0;
 
 const bc = "BroadcastChannel" in window ? new BroadcastChannel("hipfire-chat") : null;
 
@@ -171,13 +175,13 @@ async function saveConv(conv) {
   }
 }
 
-let saveTimer = 0;
+const pendingSaves = new Map();  // conv id → timer; parallel streams each save independently
 function saveSoon(conv) {
-  if (saveTimer) return;
-  saveTimer = setTimeout(() => {
-    saveTimer = 0;
+  if (pendingSaves.has(conv.id)) return;
+  pendingSaves.set(conv.id, setTimeout(() => {
+    pendingSaves.delete(conv.id);
     if (state.convs.has(conv.id)) saveConv(conv);
-  }, 1500);
+  }, 1500));
 }
 
 function touch(conv) {
@@ -256,7 +260,7 @@ function updateStorageInfo() {
 bc?.addEventListener("message", async ({ data }) => {
   if (!data || !state.dbOk) return;
   if (data.type === "put") {
-    if (state.stream?.conv.id === data.id) return;
+    if (state.streams.has(data.id)) return;
     const c = await ChatDB.get(data.id).catch(() => null);
     if (!c) return;
     state.convs.set(c.id, c);
@@ -265,9 +269,11 @@ bc?.addEventListener("message", async ({ data }) => {
       renderConv({ keepScroll: true });
     }
   } else if (data.type === "del") {
+    state.streams.get(data.id)?.abort.abort();
     state.convs.delete(data.id);
     if (state.conv?.id === data.id) openConv(null);
   } else if (data.type === "reload") {
+    for (const s of state.streams.values()) s.abort.abort();
     state.convs.clear();
     for (const c of await ChatDB.all().catch(() => [])) state.convs.set(c.id, c);
     if (state.conv && !state.convs.has(state.conv.id)) openConv(null);
@@ -389,7 +395,7 @@ function convItem(c, q, hit) {
   link.addEventListener("click", () => openConv(c.id));
   link.addEventListener("dblclick", () => startRename(c, name));
   item.append(link);
-  if (state.stream?.conv.id === c.id) item.append(el("span", "conv-streaming"));
+  if (state.streams.has(c.id)) item.append(el("span", "conv-streaming"));
   const more = el("button", "icon-btn conv-more");
   more.type = "button";
   more.title = "Chat options";
@@ -496,7 +502,7 @@ function startRename(c, anchor) {
 }
 
 function deleteConv(c) {
-  if (state.stream?.conv === c) state.stream.abort.abort();
+  state.streams.get(c.id)?.abort.abort();
   state.convs.delete(c.id);
   if (state.dbOk) ChatDB.remove(c.id).catch(reportSaveError);
   bc?.postMessage({ type: "del", id: c.id });
@@ -517,7 +523,7 @@ async function clearAll() {
     ok: "Delete all",
   });
   if (!ok) return;
-  state.stream?.abort.abort();
+  for (const s of state.streams.values()) s.abort.abort();
   state.convs.clear();
   if (state.dbOk) await ChatDB.clear().catch(reportSaveError);
   bc?.postMessage({ type: "reload" });
@@ -540,6 +546,8 @@ function newChat() {
 function openConv(id, opts = {}) {
   const c = id ? state.convs.get(id) || null : null;
   state.drafts.set(state.conv?.id || "", els.input.value);
+  const leaving = curStream();
+  if (leaving) leaving.view = null;   // stop view updates on the conversation we leave
   state.conv = c;
   state.errorCard = null;
   els.input.value = state.drafts.get(c?.id || "") || "";
@@ -564,7 +572,7 @@ function renderTopbar() {
 
 function updateDocTitle() {
   const base = state.conv ? `${state.conv.title} · hipfire` : "hipfire";
-  document.title = state.stream && document.hidden ? `● Generating… · ${base}`
+  document.title = anyStreaming() && document.hidden ? `● Generating… · ${base}`
     : state.unread ? `✓ Response ready · ${base}` : base;
 }
 
@@ -608,7 +616,7 @@ function renderSuggestions() {
 function renderConv(opts = {}) {
   const c = state.conv;
   const prevTop = els.scroller.scrollTop;
-  if (state.stream) state.stream.view = null;
+  if (state.conv) { const s = curStream(); if (s) s.view = null; }
   const frag = document.createDocumentFragment();
   if (c) for (const m of c.messages) {
     const n = renderMessage(c, m);
@@ -653,7 +661,7 @@ function renderMessage(conv, m) {
   if (m.role === "user") return userNode(conv, m);
   if (m.role === "assistant") {
     const v = assistantView(conv, m);
-    if (state.stream?.msg === m) state.stream.view = v;
+    if (streamOf(conv)?.msg === m) streamOf(conv).view = v;
     return v.node;
   }
   if (m.role === "tool") return toolNode(m);
@@ -810,7 +818,7 @@ function assistantView(conv, m) {
   }
 
   function update() {
-    const live = state.stream?.msg === m;
+    const live = streamOf(conv)?.msg === m;
     node.classList.toggle("live", live);
 
     if (m.reasoning) {
@@ -893,7 +901,7 @@ function toolCallNode(conv, m, tc) {
   const idx = conv.messages.indexOf(m);
   const after = conv.messages.slice(idx + 1);
   const answered = after.some((x) => x.role === "tool" && tc.id && x.tool_call_id === tc.id);
-  if (answered || !after.every((x) => x.role === "tool") || state.stream) return box;
+  if (answered || !after.every((x) => x.role === "tool") || streamOf(conv)) return box;
 
   const reply = el("div", "tc-reply");
   const ta = el("textarea");
@@ -908,7 +916,7 @@ function toolCallNode(conv, m, tc) {
 
   const submit = () => {
     if (!ta.value.trim()) { ta.focus(); return; }
-    if (state.stream) { busyToast(); return; }
+    if (streamOf(conv)) { busyToast(); return; }
     conv.messages.push({
       id: uid(), role: "tool", tool_call_id: tc.id || undefined,
       name: tc.function?.name, content: ta.value, ts: Date.now(),
@@ -1002,7 +1010,7 @@ function variantNav(parent, conv, m) {
 }
 
 function switchVariant(conv, m, vi) {
-  if (state.stream) { busyToast(); return; }
+  if (streamOf(conv)) { busyToast(); return; }
   const idx = conv.messages.indexOf(m);
   if (idx < 0 || vi < 0 || vi >= m.variants.length || vi === m.vi) return;
   selectVariant(conv, idx, vi);
@@ -1013,7 +1021,7 @@ function switchVariant(conv, m, vi) {
 /* ================= chat actions ================= */
 
 function busyToast() {
-  toast("Wait for the current response to finish, or press Esc to stop it.");
+  toast("This chat is still generating — press Esc to stop it, or keep working in another chat.");
 }
 
 function canGenerate(conv, extraImage) {
@@ -1029,7 +1037,7 @@ function canGenerate(conv, extraImage) {
 function send() {
   const text = els.input.value.trim();
   if (!text) return;
-  if (state.stream) { busyToast(); return; }
+  if (streamOf(state.conv)) { busyToast(); return; }
   if (!canGenerate(state.conv, state.attachment)) return;
   let c = state.conv;
   if (!c) {
@@ -1060,7 +1068,7 @@ function startAssistant(conv) {
 }
 
 function regenerate(conv, m) {
-  if (state.stream) { busyToast(); return; }
+  if (streamOf(conv)) { busyToast(); return; }
   if (!canGenerate(conv)) return;
   const idx = conv.messages.indexOf(m);
   if (idx < 0) return;
@@ -1071,14 +1079,14 @@ function regenerate(conv, m) {
 
 function retryAfterError(conv) {
   state.errorCard = null;
-  if (state.stream) { busyToast(); return; }
+  if (streamOf(conv)) { busyToast(); return; }
   const last = conv.messages[conv.messages.length - 1];
   if (last?.role === "assistant") regenerate(conv, last);
   else if (canGenerate(conv)) startAssistant(conv);
 }
 
 function startEdit(conv, m, node, bubble, acts) {
-  if (state.stream) { busyToast(); return; }
+  if (streamOf(conv)) { busyToast(); return; }
   const box = el("div", "edit-box");
   const ta = el("textarea");
   ta.value = m.content;
@@ -1106,7 +1114,7 @@ function startEdit(conv, m, node, bubble, acts) {
   const commit = () => {
     const text = ta.value.trim();
     if (!text) return;
-    if (state.stream) { busyToast(); return; }
+    if (streamOf(conv)) { busyToast(); return; }
     if (!canGenerate(conv)) return;
     const idx = conv.messages.indexOf(m);
     if (idx < 0) return;
@@ -1156,9 +1164,11 @@ function scheduleView(s) {
   s.pending = true;
   const run = () => {
     s.pending = false;
-    if (state.stream !== s) return;
-    s.view?.update();
-    followBottom();
+    if (state.streams.get(s.conv.id) !== s) return;
+    if (state.conv === s.conv) {
+      s.view?.update();
+      followBottom();
+    }
     if (performance.now() - s.statusAt > 500) {
       s.statusAt = performance.now();
       renderStatus();
@@ -1169,7 +1179,7 @@ function scheduleView(s) {
 }
 
 function liveRate() {
-  const s = state.stream;
+  const s = curStream();
   if (!s?.firstAt || s.deltas < 4) return null;
   const secs = (performance.now() - s.firstAt) / 1000;
   return secs > 0.3 ? (s.deltas / secs).toFixed(1) : null;
@@ -1179,7 +1189,7 @@ function liveRate() {
  * client-side (first delta timestamp vs now); afterwards it pins the
  * server's reported values for the last assistant message in view. */
 function renderLiveStats() {
-  const s = state.stream;
+  const s = curStream();
   if (s) {
     const ttft = s.firstAt ? `${fmtMs(s.firstAt - s.t0)}` : "…";
     const r = liveRate();
@@ -1261,11 +1271,12 @@ async function generate(conv, m) {
   m.model = body?.model || "";
   m.ts = Date.now();
   if (m.model) conv.model = m.model;
-  const s = state.stream = {
+  const s = {
     conv, msg: m, abort: new AbortController(), view: null,
     t0: performance.now(), firstAt: 0, thinkAt: 0, deltas: 0, pending: false, statusAt: 0,
   };
-  state.stick = true;
+  state.streams.set(conv.id, s);
+  if (state.conv === conv) state.stick = true;
   setBusy();
   if (state.conv === conv) renderConv();
   renderConvList();
@@ -1386,9 +1397,9 @@ async function generate(conv, m) {
     }
   }
 
-  state.stream = null;
-  clearTimeout(saveTimer);
-  saveTimer = 0;
+  if (state.streams.get(conv.id) === s) state.streams.delete(conv.id);
+  clearTimeout(pendingSaves.get(conv.id));
+  pendingSaves.delete(conv.id);
   if (state.convs.has(conv.id)) {
     touch(conv);
     await saveConv(conv);
@@ -1736,7 +1747,7 @@ function renderStatus() {
   } else if (h.status === "unhealthy") {
     cls = "err";
     text = "engine down";
-  } else if (state.stream) {
+  } else if (anyStreaming()) {
     cls = "busy";
     text = "generating…";
   } else {
@@ -1763,8 +1774,8 @@ function autosize() {
 function updateComposer() {
   const len = els.input.value.length;
   els.send.disabled = !els.input.value.trim();
-  els.send.hidden = !!state.stream;
-  els.stopBtn.hidden = !state.stream;
+  els.send.hidden = !!curStream();
+  els.stopBtn.hidden = !curStream();
   els.charCount.textContent = len > 400 ? `≈${Math.ceil(len / 4).toLocaleString()} tokens` : "";
 }
 
@@ -2056,7 +2067,7 @@ function wireEvents() {
     if (e.key === "Enter" && !e.shiftKey && !e.isComposing && !coarseMQ.matches) {
       e.preventDefault();
       send();
-    } else if (e.key === "ArrowUp" && !els.input.value && state.conv && !state.stream) {
+    } else if (e.key === "ArrowUp" && !els.input.value && state.conv && !curStream()) {
       const last = state.conv.messages.findLast((m) => m.role === "user");
       const btn = last && els.log.querySelector(`.msg[data-id="${CSS.escape(last.id)}"] [aria-label="Edit message"]`);
       if (btn) {
@@ -2072,7 +2083,7 @@ function wireEvents() {
       attachFile(f);
     }
   });
-  els.stopBtn.addEventListener("click", () => state.stream?.abort.abort());
+  els.stopBtn.addEventListener("click", () => curStream()?.abort.abort());
   els.attach.addEventListener("click", () => els.file.click());
   els.file.addEventListener("change", () => {
     const f = els.file.files[0];
@@ -2149,8 +2160,8 @@ function wireEvents() {
     pollStatus();
   });
   window.addEventListener("beforeunload", (e) => {
-    if (!state.stream) return;
-    saveConv(state.stream.conv);
+    if (!anyStreaming()) return;
+    for (const s of state.streams.values()) saveConv(s.conv);
     e.preventDefault();
     e.returnValue = "";
   });
@@ -2167,7 +2178,7 @@ function onGlobalKey(e) {
     if (!els.menu.hidden) closeMenu();
     else if (els.settings.classList.contains("open")) closeSettings();
     else if (isMobile() && document.body.classList.contains("side-open")) setSidebar(false);
-    else if (state.stream) state.stream.abort.abort();
+    else if (curStream()) curStream().abort.abort();
     else return;
     e.preventDefault();
     return;
