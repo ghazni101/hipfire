@@ -1342,34 +1342,17 @@ impl SlotBackend {
         let mut cached_tokens: usize = 0;
         let mut prefill_tokens: usize = prompt_len;
         let t_start = Instant::now();
+        // The parser's initial think state follows the prompt's framing, not
+        // the request's `enable_thinking`. `enable_thinking` is a Jinja input:
+        // a thinking-on Qwen3-family render frames no opener and the model
+        // emits `<think>` itself, so the parser must start outside the
+        // reasoning span and open it on that token. Equating the two rejected
+        // every thinking-on request.
         let think_mode = if started_in_think {
             ThinkMode::Low
         } else {
             ThinkMode::NonThink
         };
-        // Validate think_mode agrees with enable_thinking
-        let expected_think_mode = if enable_thinking {
-            ThinkMode::Low
-        } else {
-            ThinkMode::NonThink
-        };
-        if think_mode != expected_think_mode {
-            emit_qwen_ar_slot_error(
-                stdout,
-                id,
-                "think_mode mismatch with enable_thinking",
-                "internal",
-                false,
-                false,
-            );
-            let _ = stdout.flush();
-            if let Some(sess) = accepted_session.take() {
-                self.close_session(sess);
-            } else if let Some(session) = claimed_session {
-                self.close_session(session);
-            }
-            return Ok(());
-        }
         let mut emitter = Qwen35Emit::from_ctx(SpecEmitCtx {
             tokenizer: &self.tokenizer,
             eos: self.tokenizer.eos_id,
@@ -3422,11 +3405,6 @@ mod tests {
             (
                 "submit",
                 "multi_slot submit: engine unavailable",
-                "internal",
-            ),
-            (
-                "think",
-                "think_mode mismatch with enable_thinking",
                 "internal",
             ),
             (
