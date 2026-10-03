@@ -386,7 +386,6 @@ pub(crate) fn route_capabilities(
                 "logit_bias",
                 "echo",
                 "suffix",
-                "reasoning_effort",
                 "response_format:json_object",
                 "tools+image",
             ])
@@ -3443,7 +3442,6 @@ mod capabilities_tests {
             "logit_bias",
             "echo",
             "suffix",
-            "reasoning_effort",
             "response_format:json_object",
             "tools+image",
         ] {
@@ -3452,6 +3450,10 @@ mod capabilities_tests {
                 "refusal list must contain {field}"
             );
         }
+        assert!(
+            !refused.iter().any(|v| v == "reasoning_effort"),
+            "the effort dial reaches the template on the multi-slot route"
+        );
     }
 
     /// The standard route must NOT advertise multi-slot/structured-output

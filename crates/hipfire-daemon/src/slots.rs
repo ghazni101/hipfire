@@ -833,6 +833,16 @@ impl SlotBackend {
         let has_think = self.tokenizer.special_token_id("<think>").is_some();
         let thinking_enabled_opt = msg.get("thinking_enabled").and_then(|v| v.as_bool());
         let assistant_prefix_opt = msg.get("assistant_prefix").and_then(|v| v.as_str());
+        // Raw effort rung, spelled exactly as the sequential route consumes it
+        // (`reasoning_effort`, with the project-custom `thinking_mode` alias).
+        // Kept verbatim — no lowercasing and no rung validation here — so the
+        // template stays the authority on which rungs it accepts. A rejected
+        // rung surfaces as a render error (validation), never a silent
+        // downgrade.
+        let raw_reasoning_effort = msg
+            .get("reasoning_effort")
+            .or_else(|| msg.get("thinking_mode"))
+            .and_then(|v| v.as_str());
         if max_think_tokens == Some(1)
             && (thinking_enabled_opt == Some(true) || assistant_prefix_opt == Some("open_think"))
         {
@@ -941,8 +951,19 @@ impl SlotBackend {
                 // max_think is fallback only, so when assistant_prefix present we ignore it, but if max_think==1 vs open_think contradiction we still prefer authority and ignore fallback.
                 (enabled, actual)
             } else {
-                // Fallback to max_think_tokens compatibility
-                let enabled = has_think && max_think_tokens != Some(1);
+                // Fallback: `thinking_enabled` and `assistant_prefix` are both
+                // absent, so defer to the shared sequential derivation — an
+                // explicit disable rung (`none`/`off`/`chat`) turns thinking
+                // off, and the immediate-close sentinel (1) does too. Same
+                // result as before, plus the disable rungs the sequential and
+                // batch routes already honour; still gated on this model
+                // actually carrying a `<think>` token.
+                let (enabled, _) = hipfire_engine::prompt::qwen_jinja_reasoning(
+                    None,
+                    raw_reasoning_effort,
+                    max_think_tokens.unwrap_or(0) as usize,
+                );
+                let enabled = enabled && has_think;
                 let exp = if enabled {
                     AssistantPrefix::OpenThink
                 } else if has_think {
@@ -954,6 +975,30 @@ impl SlotBackend {
             };
         // Additional contradiction: if max_think==1 but thinking_enabled true? Already handled as authority wins, but spec says reject contradictions. If fallback path derived enabled true but max_think==1 would have been false, but since thinking_enabled absent we use max_think, so not contradictory.
         // If has_think false, ensure plain regardless.
+
+        // The effort rung handed to the Jinja template, suppressed exactly as
+        // `qwen_jinja_reasoning` suppresses it: an explicit thinking-off, an
+        // explicit disable rung, or the immediate-close sentinel. `auto` and
+        // an absent field leave the variable undefined so the template's own
+        // default applies. Spelled with the sequential route's exact
+        // case-sensitivity so the two cannot drift.
+        //
+        // Deliberately NOT gated on `enable_thinking`: that flag describes the
+        // `<think>`-token ChatML framing this route derives, and templates
+        // that express reasoning through a different opener (e.g.
+        // `<ifm|think>`, which sets `has_think` false) never enable it —
+        // gating there would silence the dial on exactly the models that
+        // consume it.
+        let effort_disable_rung =
+            matches!(raw_reasoning_effort, Some("none") | Some("off") | Some("chat"));
+        let jinja_effort = if thinking_enabled_opt == Some(false)
+            || max_think_tokens == Some(1)
+            || effort_disable_rung
+        {
+            None
+        } else {
+            raw_reasoning_effort.filter(|s| *s != "auto")
+        };
 
         // Consume only the gateway-projected tool contract. Raw OpenAI
         // tool_choice never reaches this owner.
@@ -1109,7 +1154,7 @@ impl SlotBackend {
                 enable_thinking,
                 bos_token: None,
                 reasoning_strength: None,
-                reasoning_effort: None,
+                reasoning_effort: jinja_effort,
             };
             let rendered = match frame.render_messages(&messages, tools, None) {
                 Ok(rendered) => rendered,
@@ -2127,13 +2172,10 @@ pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
             return Some("top_p must be within (0, 1]".to_string());
         }
     }
-    if msg
-        .get("reasoning_effort")
-        .and_then(|v| v.as_str())
-        .is_some_and(|v| !v.eq_ignore_ascii_case("none"))
-    {
-        return Some("reasoning_effort is not supported in experimental multi-slot".to_string());
-    }
+    // `reasoning_effort` is ACCEPTED: it is plumbed to the Jinja template (and
+    // used to derive the enable/disable pair) exactly as on the sequential and
+    // batch routes. A rung the model's template rejects surfaces as a render
+    // error, which is validation — not a silent downgrade.
     // max_think_tokens >= 2 is ACCEPTED here (was refused): the engine now
     // enforces finite think budgets — the grammar cursor force-closes the
     // span at the budget (vLLM thinking_token_budget parity). Enforced
@@ -3296,6 +3338,11 @@ mod tests {
             json!({"repeat_penalty": 1.05}),
             json!({"presence_penalty": 1.5}),
             json!({"min_p": 0.05}),
+            // The effort dial is honoured on this route: it reaches the Jinja
+            // template, so it is accepted at the door (a rung the template
+            // rejects fails the render instead).
+            json!({"reasoning_effort": "high"}),
+            json!({"reasoning_effort": "xhigh"}),
         ] {
             assert!(
                 validate_generate_caps(&request).is_none(),
@@ -3306,7 +3353,6 @@ mod tests {
             json!({"repeat_penalty": 2.5}),
             json!({"presence_penalty": -0.1}),
             json!({"min_p": 1.5}),
-            json!({"reasoning_effort": "high"}),
         ] {
             assert!(
                 validate_generate_caps(&request).is_some(),

@@ -1628,9 +1628,16 @@ function renderThinkingControls() {
     els.thinking.value = state.saved.thinking || "auto";
   }
 
-  // The multi-slot route refuses the effort field outright regardless of
-  // what the model could do, so the picker hides and nothing is sent.
-  const showEffort = togglable && efforts.length > 0 && !refused.includes("reasoning_effort");
+  // Showable only when the model's template actually reads the variable.
+  // `reasoning_effort_native` is the daemon's render probe: it is true only
+  // when setting `reasoning_effort` CHANGES the rendered prompt. Advertising
+  // rungs is not enough — a template can accept the rung and ignore its
+  // value, which would offer a control that changes nothing. The route-level
+  // refusal is still honoured, so a route that drops the field hides the
+  // picker again.
+  const effortNative = h.reasoning_effort_native === true;
+  const showEffort = togglable && effortNative && efforts.length > 0
+    && !refused.includes("reasoning_effort");
   els.effort.hidden = !showEffort;
   const key = efforts.join(",");
   if (showEffort && state.effortKey !== key) {
