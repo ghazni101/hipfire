@@ -1887,9 +1887,9 @@ pub(crate) fn validate_response_format(
             if !js.is_object() {
                 bail_invalid!("response_format.json_schema must be an object");
             }
-            let schema = js
-                .get("schema")
-                .ok_or_else(|| invalid_request!("response_format.json_schema.schema is required"))?;
+            let schema = js.get("schema").ok_or_else(|| {
+                invalid_request!("response_format.json_schema.schema is required")
+            })?;
             if !schema.is_object() {
                 bail_invalid!("response_format.json_schema.schema must be an object");
             }
@@ -3088,9 +3088,13 @@ pub(crate) fn request_image_base64(messages: Option<&serde_json::Value>) -> Resu
                 .find_map(|prefix| url.strip_prefix(prefix))
                 .ok_or_else(|| {
                     if url.starts_with("data:") {
-                        invalid_request!("only base64 PNG and JPEG image_url data URIs are supported")
+                        invalid_request!(
+                            "only base64 PNG and JPEG image_url data URIs are supported"
+                        )
                     } else {
-                        invalid_request!("remote image_url values are unsupported; send a base64 data URI")
+                        invalid_request!(
+                            "remote image_url values are unsupported; send a base64 data URI"
+                        )
                     }
                 })?;
             if payload.is_empty() {
@@ -3822,7 +3826,9 @@ mod tests {
             assert!(!poisons_session_state(&daemon_err(class, false)), "{class}");
         }
         // Non-daemon errors (build/IO) are not session poisoning.
-        assert!(!poisons_session_state(&ClientError::Io(std::io::Error::other("boom"))));
+        assert!(!poisons_session_state(&ClientError::Io(
+            std::io::Error::other("boom")
+        )));
     }
 
     #[test]
@@ -7714,9 +7720,7 @@ mod tests {
             (request_error_status(&error), error.to_string())
         };
         let tools = serde_json::json!([{"type": "function", "function": {"name": "f"}}]);
-        let image = |url: &str| {
-            serde_json::json!({"type": "image_url", "image_url": {"url": url}})
-        };
+        let image = |url: &str| serde_json::json!({"type": "image_url", "image_url": {"url": url}});
         let reasoning = |body: serde_json::Value| -> Result<()> {
             apply_http_reasoning_request(
                 &body,
@@ -7777,7 +7781,10 @@ mod tests {
                 "max_tokens must be between",
                 contract(serde_json::json!({"max_tokens": 0})),
             ),
-            ("n != 1", contract(serde_json::json!({"max_tokens": 8, "n": 2}))),
+            (
+                "n != 1",
+                contract(serde_json::json!({"max_tokens": 8, "n": 2})),
+            ),
             (
                 "temperature must be within",
                 contract(serde_json::json!({"max_tokens": 8, "temperature": 3.0})),

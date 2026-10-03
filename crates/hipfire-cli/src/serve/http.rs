@@ -665,8 +665,7 @@ fn model_entry(
                 "output_modalities": ["text"],
             });
             if !loaded.reasoning_contract.is_empty() {
-                architecture["reasoning_contract"] =
-                    serde_json::json!(loaded.reasoning_contract);
+                architecture["reasoning_contract"] = serde_json::json!(loaded.reasoning_contract);
                 architecture["reasoning_effort_native"] =
                     serde_json::json!(loaded.reasoning_effort_native);
                 architecture["reasoning_efforts"] = serde_json::json!(loaded.reasoning_efforts);
@@ -1651,9 +1650,15 @@ pub(crate) fn request_error_status(error: &anyhow::Error) -> u16 {
             _ => 500,
         };
     }
-    if error.chain().any(|cause| cause.is::<crate::serve::InvalidRequest>()) {
+    if error
+        .chain()
+        .any(|cause| cause.is::<crate::serve::InvalidRequest>())
+    {
         400
-    } else if error.chain().any(|cause| cause.is::<crate::serve::ModelNotFound>()) {
+    } else if error
+        .chain()
+        .any(|cause| cause.is::<crate::serve::ModelNotFound>())
+    {
         404
     } else {
         500
@@ -2204,7 +2209,11 @@ mod tests {
             "model not found: x",
             "invalid state: required",
         ] {
-            assert_eq!(request_error_status(&anyhow!("{message}")), 500, "{message}");
+            assert_eq!(
+                request_error_status(&anyhow!("{message}")),
+                500,
+                "{message}"
+            );
         }
         assert_eq!(
             request_error_status(&anyhow::Error::new(hipfire_client::ClientError::Protocol(

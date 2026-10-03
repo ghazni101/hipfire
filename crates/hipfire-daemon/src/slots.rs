@@ -74,7 +74,6 @@ fn emit_qwen_ar_slot_error<W: std::io::Write>(
     );
 }
 
-
 /// The per-arch multi-slot engine behind the four-method surface
 /// `handle_generate` drives (`submit` / `close` / `reset` / `shutdown`).
 ///
@@ -106,16 +105,13 @@ type AnySlotEngine = Box<dyn hipfire_runtime::serve::SlotEngineHandle>;
 /// family-neutral `SlotEngineConfig` carries every serve.* knob; the carrier
 /// maps it onto its own engine config. `Err` names the arch when no carrier
 /// provides a slot engine.
-fn spawn_slot_engine(
-    arch_id: u32,
-    cfg: SlotEngineConfig,
-) -> Result<AnySlotEngine, String> {
+fn spawn_slot_engine(arch_id: u32, cfg: SlotEngineConfig) -> Result<AnySlotEngine, String> {
     let carrier = hipfire_loader::carrier_for(arch_id).ok_or_else(|| {
         format!("no carrier claims arch_id {arch_id} — slot mode cannot dispatch")
     })?;
-    carrier.spawn_slot_engine(cfg).map_err(|e| {
-        format!("no multi-slot engine for arch_id {arch_id}: {e}")
-    })
+    carrier
+        .spawn_slot_engine(cfg)
+        .map_err(|e| format!("no multi-slot engine for arch_id {arch_id}: {e}"))
 }
 
 /// Slot-engine load parameters parsed from a `load` message. The daemon's
@@ -2088,8 +2084,7 @@ pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
                     );
                 }
             };
-            if let Err(e) =
-                saddle_core::grammar::json::json_schema::CompiledSchema::compile(schema)
+            if let Err(e) = saddle_core::grammar::json::json_schema::CompiledSchema::compile(schema)
             {
                 return Some(format!("response_format json_schema: {e}"));
             }

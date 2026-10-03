@@ -59,9 +59,7 @@ pub fn render_tail_opens_think(rendered: &str) -> bool {
 /// think block: the standard Qwen3-family template emits no opener when
 /// thinking is enabled and lets the model generate `<think>` itself, while
 /// `enable_thinking=false` emits a closed `<think>\n\n</think>\n\n` block.
-pub fn render_assistant_prefix(
-    rendered: &str,
-) -> hipfire_runtime::prompt_frame::AssistantPrefix {
+pub fn render_assistant_prefix(rendered: &str) -> hipfire_runtime::prompt_frame::AssistantPrefix {
     use hipfire_runtime::prompt_frame::AssistantPrefix;
     let tail = rendered.trim_end();
     if tail.ends_with("</think>") {

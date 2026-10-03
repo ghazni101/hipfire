@@ -49,8 +49,8 @@ use std::{
 };
 
 mod bench_concurrency;
-mod serve;
 mod kernel_pack;
+mod serve;
 mod setup;
 use crate::serve::complete::next_attempt_id;
 use crate::serve::http::request_id;
@@ -2385,8 +2385,12 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         anyhow!("daemon binary not found; build `cargo build --release -p hipfire-daemon`")
     })?;
     let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
-    let mut engine =
-        Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config, Some(&model_path))?;
+    let mut engine = Engine::spawn_configured(
+        &daemon,
+        &BTreeMap::new(),
+        &process_config,
+        Some(&model_path),
+    )?;
     engine.ping()?;
     let mut params = load_params(
         &resolved,
@@ -2686,8 +2690,12 @@ fn img_command(paths: &Paths, args: ImgArgs) -> Result<()> {
         anyhow!("daemon binary not found; build `cargo build --release -p hipfire-daemon`")
     })?;
     let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
-    let engine =
-        Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config, Some(&model_path))?;
+    let engine = Engine::spawn_configured(
+        &daemon,
+        &BTreeMap::new(),
+        &process_config,
+        Some(&model_path),
+    )?;
     engine.ping()?;
     let _loaded = engine.load(&model_path, serde_json::json!({}))?;
     let mut request = serde_json::json!({
@@ -4892,7 +4900,8 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     if args.exp {
         return bench_experimental(paths, &args);
     }
-    let (mut engine, loaded, pre_diag, post_diag) = open_bench_engine(paths, &args, None, &BenchLoadOpts::default())?;
+    let (mut engine, loaded, pre_diag, post_diag) =
+        open_bench_engine(paths, &args, None, &BenchLoadOpts::default())?;
     let prompt = resolve_bench_prompt(&args)?;
     let prompt_md5 = bench_prompt_md5(&prompt);
     let prompt_chars = prompt.chars().count() as u64;
@@ -5097,7 +5106,8 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
         preflight_headroom_for_model(paths, &args.model)?;
         let mut seq_args = args.clone();
         seq_args.concurrency = None;
-        let (engine, _, _, _) = open_bench_engine(paths, &seq_args, None, &BenchLoadOpts::default())?;
+        let (engine, _, _, _) =
+            open_bench_engine(paths, &seq_args, None, &BenchLoadOpts::default())?;
         let mut d = SequentialDriver::start(engine, max_k)?;
         eprintln!("  noslots backend up (sequential daemon path)");
         let r = sweep_backend(
@@ -5666,7 +5676,8 @@ fn bench_matrix(
 fn bench_experimental(paths: &Paths, args: &BenchArgs) -> Result<()> {
     let mut rows = Vec::new();
     for variant in 1..=5 {
-        let (mut engine, _, _, diag) = open_bench_engine(paths, args, Some(variant), &BenchLoadOpts::default())?;
+        let (mut engine, _, _, diag) =
+            open_bench_engine(paths, args, Some(variant), &BenchLoadOpts::default())?;
         let arch = diag
             .get("arch")
             .and_then(serde_json::Value::as_str)
@@ -5737,7 +5748,8 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             prompt: Vec::new(),
             prompt_file: None,
         };
-        let (mut engine, _, _, _) = open_bench_engine(paths, &bench, None, &BenchLoadOpts::default())?;
+        let (mut engine, _, _, _) =
+            open_bench_engine(paths, &bench, None, &BenchLoadOpts::default())?;
         let _ = bench_generate(&mut engine, "Hello", 1)?;
         engine
     } else {
@@ -6847,7 +6859,9 @@ fn quantize_command(paths: &Paths, mut args: QuantizeArgs) -> Result<()> {
 
 // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
 fn sidecar_command(paths: &Paths, args: SidecarArgs) -> Result<()> {
-    eprintln!("warning: CASK is deprecated and will be removed in 0.5.0; not supported (sidecar-gen)");
+    eprintln!(
+        "warning: CASK is deprecated and will be removed in 0.5.0; not supported (sidecar-gen)"
+    );
     if !(1..=1_000_000).contains(&args.max_tokens) {
         bail!("--max-tokens must be between 1 and 1000000");
     }
@@ -11935,7 +11949,11 @@ mod tests {
         assert_eq!(status, 200, "{text}");
         let health = serve_health(h.port()).1;
         assert_eq!(health["model"], serde_json::json!(h.model()));
-        assert_eq!(health["n_ctx"], serde_json::json!(4096), "the load ack's max_seq");
+        assert_eq!(
+            health["n_ctx"],
+            serde_json::json!(4096),
+            "the load ack's max_seq"
+        );
 
         fs::write(h.paths.models.join("t20-load-fail.hfq"), b"x").unwrap();
         let mut bad = h.base_body("t11-stop-text", false);
@@ -11944,12 +11962,18 @@ mod tests {
         assert_ne!(status, 200, "{text}");
         let health = serve_health(h.port()).1;
         assert!(health["model"].is_null());
-        assert!(health["n_ctx"].is_null(), "no context is advertised with nothing resident");
+        assert!(
+            health["n_ctx"].is_null(),
+            "no context is advertised with nothing resident"
+        );
 
         let (status, _, text) = post_status(h.port(), &h.base_body("t11-stop-text", false));
         assert_eq!(status, 200, "{text}");
         let loads = Task11HttpHarness::ops_of_type(&h.read_requests_log(), "load").len();
-        assert_eq!(loads, 3, "initial load, failed switch, reload of the old model");
+        assert_eq!(
+            loads, 3,
+            "initial load, failed switch, reload of the old model"
+        );
     }
 
     /// A daemon that exits (crash, or a sticky GPU fault after which it exits
@@ -11978,7 +12002,10 @@ mod tests {
     #[test]
     fn serve_health_is_unhealthy_until_the_daemon_is_back() {
         let h = Task11HttpHarness::spawn("respawn-health");
-        assert_eq!(post_status(h.port(), &h.base_body("t11-stop-text", false)).0, 200);
+        assert_eq!(
+            post_status(h.port(), &h.base_body("t11-stop-text", false)).0,
+            200
+        );
         let daemon = {
             let mut runtime = h.shared.runtime.lock().unwrap();
             std::mem::replace(
@@ -12000,7 +12027,10 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(health["status"], "ok");
         assert_eq!(health["model"], serde_json::json!(h.model()));
-        assert_eq!(post_status(h.port(), &h.base_body("t11-stop-text", false)).0, 200);
+        assert_eq!(
+            post_status(h.port(), &h.base_body("t11-stop-text", false)).0,
+            200
+        );
         // The supervisor reloaded the model; the request did not load again.
         let loads = Task11HttpHarness::ops_of_type(&h.read_requests_log(), "load").len();
         assert_eq!(loads, 2);
@@ -12094,8 +12124,7 @@ mod tests {
         let choice = &json["choices"][0];
         assert_eq!(choice["finish_reason"], "tool_calls", "{text}");
         assert_eq!(
-            choice["message"]["tool_calls"][0]["function"]["name"],
-            "read_file",
+            choice["message"]["tool_calls"][0]["function"]["name"], "read_file",
             "{text}"
         );
     }

@@ -524,8 +524,23 @@ const KV_V_NAMES: &[&str] = &["", "q8", "lloyd2", "lloyd3", "lloyd4"];
 // (on Qwen it names the same legacy K as `--kv-k legacy-asym3`).
 const KV_MODES: &[&str] = &[
     // lifecycle: deprecated since 0.4.0, removal 0.5.0 — Givens asym KV and the asymN/turboN aliases are superseded by fwht3 (asymN / turbo*)
-    "auto", "f32", "f16", "bf16", "q8", "asym4", "asym3", "asym2", "fwht4", "fwht3", "fwht2",
-    "turbo", "turbo4", "turbo3", "turbo2", "fp8", "legacy-asym3",
+    "auto",
+    "f32",
+    "f16",
+    "bf16",
+    "q8",
+    "asym4",
+    "asym3",
+    "asym2",
+    "fwht4",
+    "fwht3",
+    "fwht2",
+    "turbo",
+    "turbo4",
+    "turbo3",
+    "turbo2",
+    "fp8",
+    "legacy-asym3",
 ];
 const AUTO_ON_OFF: &[&str] = &["auto", "on", "off"];
 /// VL image decode path: `cpu` (default) / `vcn` / `auto` (VCN when probed).
@@ -3772,7 +3787,10 @@ fn legacy_table(config: &ProcessConfig) -> HashMap<String, String> {
         let Some(name) = developer_env_for_key(key) else {
             continue;
         };
-        if FIELDS.iter().any(|schema| schema.env_compat == Some(name.as_str())) {
+        if FIELDS
+            .iter()
+            .any(|schema| schema.env_compat == Some(name.as_str()))
+        {
             continue;
         }
         if let Some(value) = render_compat_value(value) {
@@ -5306,7 +5324,10 @@ mod tests {
             values,
         };
         let table = legacy_table(&config);
-        let mut names: Vec<&str> = FIELDS.iter().filter_map(|schema| schema.env_compat).collect();
+        let mut names: Vec<&str> = FIELDS
+            .iter()
+            .filter_map(|schema| schema.env_compat)
+            .collect();
         names.extend([
             "HIPFIRE_DSPARK_Q8_WMMA",
             "HIPFIRE_NGRAM_WINDOW",
@@ -5881,7 +5902,10 @@ mod tests {
         .unwrap();
         let process = ProcessConfig::from_resolved(&resolved).unwrap();
 
-        assert_eq!(process.legacy_value("HIPFIRE_DETERMINISTIC").as_deref(), Some("1"));
+        assert_eq!(
+            process.legacy_value("HIPFIRE_DETERMINISTIC").as_deref(),
+            Some("1")
+        );
         assert_eq!(
             process.legacy_value("HIPFIRE_FLASH_ATTN_CK_LIB").as_deref(),
             Some("/opt/hipfire/ck.so")
