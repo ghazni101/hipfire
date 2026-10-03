@@ -54,7 +54,7 @@ const els = {
   sidebarNew: $("sidebar-new"), convSearch: $("conv-search"), convList: $("conv-list"),
   storageText: $("storage-text"), importChats: $("import-chats"), importFile: $("import-file"),
   exportAll: $("export-all"), clearAll: $("clear-all"),
-  model: $("model"), badges: $("model-badges"), convTitle: $("conv-title"),
+  model: $("model"), badges: $("model-badges"),
   statusPill: $("status-pill"), statusDot: $("status-dot"), status: $("status"),
   exportConv: $("export-conv"), showShortcuts: $("show-shortcuts"), toggleSettings: $("toggle-settings"),
   scroller: $("scroller"), greeting: $("greeting"), emptySub: $("empty-sub"), suggestions: $("suggestions"),
@@ -396,6 +396,16 @@ function convItem(c, q, hit) {
   link.addEventListener("dblclick", () => startRename(c, name));
   item.append(link);
   if (state.streams.has(c.id)) item.append(el("span", "conv-streaming"));
+  const del = el("button", "icon-btn conv-del");
+  del.type = "button";
+  del.title = "Delete chat";
+  del.setAttribute("aria-label", "Delete chat");
+  del.append(icon("trash"));
+  del.addEventListener("click", (e) => {
+    e.stopPropagation();
+    deleteConv(c);
+  });
+  item.append(del);
   const more = el("button", "icon-btn conv-more");
   more.type = "button";
   more.title = "Chat options";
@@ -453,8 +463,9 @@ function convMenuItems(c) {
   return [
     { icon: "pencil", label: "Rename", fn: () => {
       const n = els.convList.querySelector(`.conv-item[data-id="${CSS.escape(c.id)}"] .conv-name`);
-      if (n && sidebarOpen()) startRename(c, n);
-      else if (state.conv === c) startRename(c, els.convTitle);
+      if (!n) return;
+      if (!sidebarOpen()) setSidebar(true);
+      startRename(c, n);
     } },
     { icon: "pin", label: c.pinned ? "Unpin" : "Pin to top", fn: () => {
       c.pinned = !c.pinned;
@@ -469,9 +480,8 @@ function convMenuItems(c) {
 }
 
 function startRename(c, anchor) {
-  const inTopbar = anchor === els.convTitle;
-  const target = inTopbar ? els.convTitle : anchor.closest(".conv-link");
-  const input = el("input", inTopbar ? "conv-title-input" : "conv-rename");
+  const target = anchor.closest(".conv-link");
+  const input = el("input", "conv-rename");
   input.value = c.title;
   input.maxLength = 120;
   input.setAttribute("aria-label", "Chat title");
@@ -563,10 +573,7 @@ function openConv(id, opts = {}) {
 }
 
 function renderTopbar() {
-  const c = state.conv;
-  els.convTitle.hidden = !c;
-  if (c) els.convTitle.textContent = c.title;
-  els.exportConv.hidden = !c;
+  els.exportConv.hidden = !state.conv;
   updateDocTitle();
 }
 
@@ -2045,7 +2052,6 @@ function wireEvents() {
     lsSet(LS.model, els.model.value);
     renderEmpty();
   });
-  els.convTitle.addEventListener("click", () => state.conv && startRename(state.conv, els.convTitle));
   els.exportConv.addEventListener("click", () => state.conv && exportMarkdown(state.conv));
   els.showShortcuts.addEventListener("click", showShortcuts);
   els.toggleSettings.addEventListener("click", toggleSettings);
