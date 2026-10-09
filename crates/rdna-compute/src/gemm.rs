@@ -888,6 +888,30 @@ pub(crate) enum ResidualVerifyTier {
     Base,
 }
 
+/// Default MQ3-Lloyd mb4 (4x batch-tile) admission — the `HIPFIRE_MQ3_MB4`
+/// override dominates. Pure so CPU tests can pin the table.
+///
+/// gfx1100 bands measured 2026-10-09 on RX 7900 XTX, `qwen3.5-4b.mq3`
+/// (product bench, fresh-process interleaved arms): the 4x fanout loses
+/// below batch 64 (pp32 -12.3% forced), wins +17.1% at pp64 on the
+/// rows >= 4096 projections, and the residual kernel (rows 2560 < 4096)
+/// wins +7.4% forced at batch 128, is neutral at 256 (-0.9%) and loses at
+/// >= 512 (-8.8%). Other RDNA3 parts keep the historical
+/// batch >= 128 && rows >= 4096 floor pending their own measurement; the
+/// HFQ3-G256 (non-Lloyd) family keeps it too for the same reason.
+fn mq3_lloyd_mb4_default(arch: &str, arch_supports: bool, batch_size: usize, rows: usize) -> bool {
+    if !arch_supports {
+        return false;
+    }
+    if arch == "gfx1100" {
+        if rows >= 4096 {
+            return batch_size >= 64;
+        }
+        return (128..=191).contains(&batch_size);
+    }
+    batch_size >= 128 && rows >= 4096
+}
+
 fn mqv2_gfx11_bt_admitted(arch: &str, bits: u8) -> bool {
     match arch {
         "gfx1151" => matches!(bits, 2 | 3 | 5 | 6),
@@ -2262,7 +2286,7 @@ impl Gpu {
         let arch_supports_mb4 = self.arch_caps.supports_mq3_lloyd_mb4();
         let use_mb4 = match self.flags.mq3_mb4 {
             Some(_) => arch_supports_mb4,
-            None => arch_supports_mb4 && batch_size >= 128 && m >= 4096,
+            None => mq3_lloyd_mb4_default(self.arch.as_str(), arch_supports_mb4, batch_size, m),
         };
         if use_mb4 {
             return self.gemm_mq3g256_lloyd_residual_wmma_mb4(a_raw, x, y, m, k, batch_size);
@@ -2413,8 +2437,8 @@ impl Gpu {
         let total_m = qkv_m + z_m + beta_m + alpha_m;
         let arch_supports_mb4 = self.arch_caps.supports_mq3_lloyd_mb4();
         let use_mb4 = match self.flags.mq3_mb4 {
-            None => arch_supports_mb4 && n >= 128 && total_m >= 4096,
             Some(_) => arch_supports_mb4,
+            None => mq3_lloyd_mb4_default(self.arch.as_str(), arch_supports_mb4, n, total_m),
         };
         if use_mb4 {
             return self.gemm_qkvza_mq3g256_lloyd_wmma_mb4(
@@ -2620,8 +2644,8 @@ impl Gpu {
         let total_m = q_m + k_m + v_m;
         let arch_supports_mb4 = self.arch_caps.supports_mq3_lloyd_mb4();
         let use_mb4 = match self.flags.mq3_mb4 {
-            None => arch_supports_mb4 && n >= 128 && total_m >= 4096,
             Some(_) => arch_supports_mb4,
+            None => mq3_lloyd_mb4_default(self.arch.as_str(), arch_supports_mb4, n, total_m),
         };
         if use_mb4 {
             return self.gemm_qkv_mq3g256_lloyd_wmma_mb4(
@@ -2802,8 +2826,8 @@ impl Gpu {
         let total_m = gate_m + up_m;
         let arch_supports_mb4 = self.arch_caps.supports_mq3_lloyd_mb4();
         let use_mb4 = match self.flags.mq3_mb4 {
-            None => arch_supports_mb4 && n >= 128 && total_m >= 4096,
             Some(_) => arch_supports_mb4,
+            None => mq3_lloyd_mb4_default(self.arch.as_str(), arch_supports_mb4, n, total_m),
         };
         if use_mb4 {
             return self.gemm_gate_up_mq3g256_lloyd_wmma_mb4(
