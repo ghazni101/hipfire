@@ -180,12 +180,67 @@ schedules are correct as written).
   trailer in a commit message **and** the PR carries the `ratchet-raise`
   label. (The branch's prose "Traded:" note does not match the trailer the
   gate greps for.)
-- `scripts/speed-gate.sh --fast` on the branch tip — **FAIL**:
-  `4b_mq4_pp32_prefill_tok_s` committed floor 1843.5, observed **1663.4**
-  (−9.8%). Master observes 1601.0 on the same image — i.e. **the branch is
-  +3.9% over master and not regressed**; the committed floor is simply
-  unreproducible outside the capture environment. The pre-commit hook runs
-  this gate, so it blocks local commits on prefill/decode changes. Floor
-  disposition is left to the maintainer (recommended: re-capture on the
-  reference machine, or revert the pp32 raise, which the commit itself
-  flags as conflated with master-side work).
+- `scripts/speed-gate.sh --fast` on the branch tip — **withdrawn floor**: the
+  campaign committed `4b_mq4_pp32_prefill_tok_s=1843.5`, which a clean ROCm
+  7.15 container cannot reach (branch 1663.4, master 1601.0 — the branch is
+  +3.9% over master, not regressed), so the gate and the pre-commit hook that
+  runs it failed on the branch itself. This PR restores the merge-base 4B rows,
+  after which the gate passes (observed 1796.6 pp32 / 198.0 gen). Re-capture on
+  the reference machine if the tighter floor is wanted.
+
+## Quant-class sweep: do the gains survive the Magnum V2 class?
+
+The 2026-08 campaign was measured on the *legacy* quant family
+(`HFQ4G256` / `MQ4G256`). The current model class is **Magnum V2**:
+`MQ4G256V2` (qt44), `MQ4G256V2Lloyd` (qt52), `MQ4CG256` (qt45), `MQ6G256V2`
+(qt47), `MQ5G256V2` (qt48), `MQ3G256V2` (qt49), `MQ4G128V2` (qt53) — with
+`pro` / `xt` / `xts` recipe tiers layered on the same dtype families. Swept on
+gfx1100, product path, `--kv-mode q8 --spec off`, 3 interleaved windows ×
+5 runs per arm (single window for the 27B tiers):
+
+### Which kernels engage (prefill profile, branch)
+
+| artifact | dense prefill GEMMs | BT2 present? |
+|---|---|---|
+| `qwen3.5-4b.mq4` (legacy) | `gemm_{gate_up,qkvza,qkv}_hfq4g256_wmma_bt2`, `gemm_hfq4g256_residual_wmma_ksplit_det_bt2` | **yes** |
+| `qwen3.8-27b.mq4-xt` (V2 XT) | `gemm_{gate_up,qkvza,qkv}_mq4g256v2_wmma`, `gemm_mq4g256v2_residual_wmma` | no |
+| `qwen3.8-27b.mq4` (V2 base) | `gemm_*_mq4g256v2_wmma` | no |
+| `qwen3.8-27b.mq4-pro` (V2 PRO) | `gemm_*_mq4g256v2_wmma`, `gemm_q8_0_residual_wmma` | no |
+
+The BT2 kernels are `..._hfq4g256_...` — they are only reachable from the
+legacy HFQ4/MQ4-G256 GEMM family, so **no V2 quant can engage them**.
+
+### Measured deltas, branch vs master (4B geometry, decode @ctx64)
+
+| artifact | master | branch | Δ | BT2 kill switch | conv-prep off | gated-norm off |
+|---|---|---|---|---|---|---|
+| `qwen3.5-4b.mq4` (legacy) | 200.20 | 212.76 | **+6.3%** | −17.8% pp64 | −0.9% | −1.2% |
+| `qwen3.5-4b.mq3` (V2) | 208.32 | 214.98 | **+3.2%** | −0.7% (inert) | −2.0% | −0.7% |
+| `qwen3.5-4b.mq6` (V2) | 158.04 | 162.04 | **+2.5%** | +0.2% (inert) | −1.5% | +0.1% |
+
+Every window of the branch is above every window of master in all three rows
+(per-window spreads ≤0.2% within an arm). The opt-in lm_head requant — which
+keys off the model's Q8_0 head, not the body quant — also generalises:
+**+9.8% / +11.0% / +7.8%** on legacy mq4 / mq3 / mq6.
+
+### Reading
+
+- **Decode gains hold across the new class, but attenuate by ~half.** The
+  survivors are the dtype-agnostic fusions (conv scalar-prep, `fa_prep`,
+  `fa_epilogue` — all arch+shape gated, no dtype term). The piece that drops
+  out is `gated_norm_mq_rotate`, whose dtype list is
+  `MQ4G256 | MQ4G256V2 | MQ4CG256`: it fires on the mq4 tiers but not on
+  `MQ3G256V2` / `MQ5G256V2` / `MQ6G256V2` (nor on `MQ4G256V2Lloyd`). The
+  kill-switch columns show exactly that: −1.2% on legacy mq4, ~0 on mq6.
+- **The BT2 prefill win does not carry over at all.** `+22.3%` pp64 is a
+  legacy-HFQ4/MQ4-G256-only result; on mq3/mq6 it is inside noise and the kill
+  switch is inert, and it is flat on every 27B V2 tier (base/XT/PRO).
+- **The 27B tiers gain ~nothing from this branch** — `pro`/`xt`/`xts` all
+  resolve to the same `MQ4G256V2` GEMM family, where the branch's new levers
+  either do not apply (BT2, fusednorm oracles: MQ4G256/HFQ4G256-only) or were
+  already present at that shape on master (the four fusions). Measured:
+  `mq4-xt` +0.3%, `mq4` (legacy bytes) flat, `mq4-pro` +0.3% decode.
+- **Opt-in levers**: `FA_KVWRITE_FOLD` is arch+shape gated, so it applies to
+  any dtype at 16Q/4K; the fusednorm oracles require
+  `MQ4G256 | HFQ4G256` and therefore do not apply to V2.
+
