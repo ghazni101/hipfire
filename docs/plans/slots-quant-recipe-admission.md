@@ -179,12 +179,17 @@ marked untested-hw in code; on gfx1101 behavior is byte-identical to before
       reference's shared gate. A3B golden coverage of a MoE checkpoint via
       the serve harness remains open (the golden harness needs a MoE
       fixture whose step shapes it supports).
-- [ ] D2: serve-side thinking/sampling fix cherry-picks
-      (`fix/multislot-thinking-tail-state` 5ec35b1be+d7464f8b3,
-      `fix/slots-thinking-on-framing` 72be60767+db637b76f,
-      `fix/slots-max-tokens-fit` 84a206030) — each branch exists locally,
-      none is an ancestor of this branch; all fork at a89ed0a8e. Evaluate
-      on the beta rebase, not here.
+- [x] D2: serve-side thinking/sampling fix cherry-picks — **satisfied by the
+      beta rebase (2026-10-09)**: all four landed on `beta` before
+      `740818f37` in their ingested forms (`#801`→superseded by `#808`/`#811`
+      commits `02e657c79`/`8c6daf00a`/`419bc8d07`/`9c9d25094`/`0d8be43fa`,
+      `#805`→`84a206030`, `#807`→`0961a3464`; the fork branches named here
+      were deleted after ingest). Validated on the rebased tree, gfx1101
+      multi-slot: thinking-low battery routes think/answer correctly on
+      completing turns; length-cap think-span runaways under the registry
+      recipe (presence_penalty 1.5) reproduce identically with the
+      pre-rebase serve build — sampling/model-side, not the thinking-on
+      400s this item tracked.
 - [x] D3: this doc + QUANTIZE.md slots-admissibility section + CHANGELOG.
 - [x] V-core: tier-pro requant (6074.9 MB, census above) + golden 20/20.
 - [x] V-serve (2026-10-04, gfx1101): `serve_harness.py --mode battery
@@ -193,8 +198,14 @@ marked untested-hw in code; on gfx1101 behavior is byte-identical to before
       (code/reason/factual/prose/instruct), runaway=0 empty=0 attractor=0
       retrieval_miss=0, coherent decoded text eyeballed on every genre,
       avg decode 35.0 tok/s, kv_backend=legacy (fixed q8 slot arena).
-      daemon md5 075ad68ed1ef40867db9c640bda86143; prompt/request md5s in
-      the harness output; report /tmp/serve-tierpro-slots.json.
+      Re-validated 2026-10-09 on the beta rebase (`94a9987c1`): fresh
+      local requant `qwen3.5-4b-tierpro.mq4v2` (202×MQ4G256V2 + 49×Q8F16 +
+      22×MQ6G256V2/qt47 + 153×F16) — golden 40/40 @ 0.000× across
+      q8/fwht2/fwht3/fwht4 with correct negative controls, serve battery
+      5/5 clean at avg 62.1 tok/s, daemon md5 `6d2168da…`
+      (note: `hipfire-pr806:gate` bakes `HIPFIRE_DAEMON_BIN=/hipfire/...`;
+      pin it to the tree's `target/release/daemon` or the harness serves
+      the image's stale daemon).
 
 ## 8 · Risks / invariants (updated)
 
@@ -233,5 +244,7 @@ marked untested-hw in code; on gfx1101 behavior is byte-identical to before
    against the slots arm.
 3. gfx1201 host validation of fp8 slots (untested-hw markers in code).
 4. Sequential fwht3 decode IMA bisect (§5 open item).
-5. D2 serve-fix cherry-picks (on the beta rebase).
+5. ~~D2 serve-fix cherry-picks~~ — **done 2026-10-09**: satisfied by the
+   beta rebase (all four landed upstream pre-`740818f37`); thinking-low
+   multi-slot battery validates the serve thinking path on gfx1101 (§7 D2).
 6. Load-time preflight promotion of the per-site plans (A3 follow-up).
