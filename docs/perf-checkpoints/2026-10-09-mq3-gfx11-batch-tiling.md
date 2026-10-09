@@ -96,6 +96,31 @@ Greedy parity (serve, temp 0, thinking off, 64 tokens, `qwen3.5-4b.mq3`):
 restarts). The mb4 kernels are shipped production code above the old floor; the
 newly-admitted ranges produce token-identical output.
 
+## Band validation (post-change, master vs policy branch, 4B mq3)
+
+The policy is banded, so "does the gain carry?" decomposes into per-band
+predictions, each now measured (5-run medians, fresh interleaved processes):
+
+| batch | master | branch | Δ | why |
+|---|---|---|---|---|
+| 48 | 2650.4 | 2650.4 | **+0.0%** | below the 64 floor on both: identical path |
+| 64 | 2989.1 | 3667.2 | **+22.7%** | band 1 (rows ≥ 4096 → mb4) |
+| 96 | 3125.2 | **3575.1** | **+14.4%** | band 1, interpolated point confirmed |
+| 128 | 3860.9 | 4168.2 | **+8.0%** | band 1 + residual band |
+| 160 | 3810.6 | **4130.3** | **+8.4%** | residual band, interpolated point confirmed |
+| 192 | 3887.3 | 3903.0 | +0.4% | **identity by construction** — bands end at 191 |
+| 224 | 3804.0 | 3814.6 | +0.3% | identity by construction |
+| 4096 | 3561.1 | 3556.8 | −0.1% | large prefill chunk: identical path |
+
+Non-uniformity is the intended shape, not a defect: the 4× fanout is a
+tile-geometry lever. It wins where the batch fills the 64-wide tile grid with
+enough rows to amortize (64–191), loses where the tile is half-empty (32) and
+where the fat residual kernel already ran better plain (≥ 256 — which is why
+upstream's own MQ4V2 BT policy is likewise banded per projection). Outside the
+bands the binary is behaviorally identical to master, and the identity rows
+(48/192/224) plus 4096 verify that directly. Decode at ctx2048 (+3.1%) is the
+branch's decode fusions; mb4 never engages at batch 1.
+
 ## What this does not change
 
 - MQ3G256V2 gfx1100 production quarantine (kept; see Measurement 1).
