@@ -5,7 +5,7 @@ use crate::kernels;
 use hip_bridge::HipResult;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{LazyLock, OnceLock};
+use std::sync::LazyLock;
 
 /// Rows of an AWQ scale tensor that carries the gfx1201 A4 RMSNorm producer's
 /// reciprocal planes: `[a 0..K-1][R K..2K-1][Rlo 2K..3K-1]` under shape
@@ -10825,85 +10825,12 @@ impl Gpu {
         // Both defects invalidate the 2026-08 amendment 2k measurements and
         // its "BITEXACT" claim (see
         // docs/perf-checkpoints/2026-10-09-gfx1100-campaign-reverify.md).
-        static RESIDUAL_LUT: OnceLock<bool> = OnceLock::new();
-        let residual_lut = self.arch_caps.is_gfx1100()
-            && k % 256 == 0
-            && *RESIDUAL_LUT.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_RESIDUAL_LUT").as_deref() == Ok("1")
-            });
-        if residual_lut {
-            self.ensure_kernel(
-                "gemv_hfq4g256_residual_lut",
-                kernels::GEMV_HFQ4G256_RESIDUAL_LUT_GFX1100_SRC,
-                "gemv_hfq4g256_residual_lut",
-            )?;
-            let mut blob = hip_bridge::KernargBlob::new();
-            blob.push_ptr(a_raw.buf.as_ptr());
-            blob.push_ptr(x.buf.as_ptr());
-            blob.push_ptr(y.buf.as_ptr());
-            blob.push_i32(m as i32);
-            blob.push_i32(k as i32);
-            let bytes = m * (k / 256) * 136 + k * 4;
-            let timer =
-                crate::profile::begin_timer(&self.hip, "gemv", "gemv_hfq4g256_residual_lut", bytes);
-            let r = self.launch_kernel_blob(
-                "gemv_hfq4g256_residual_lut",
-                [m as u32, 1, 1],
-                [32, 1, 1],
-                0,
-                blob.as_mut_slice(),
-            );
-            if let Some(t) = timer {
-                t.finish(&self.hip);
-            }
-            return r;
-        }
-        static RESIDUAL_PERSIST_R2: OnceLock<bool> = OnceLock::new();
-        let persist_r2 = self.arch_caps.is_gfx1100()
-            && k % 256 == 0
-            && *RESIDUAL_PERSIST_R2.get_or_init(|| {
-                hipfire_config::developer_var("HIPFIRE_RESIDUAL_PERSIST_R2").as_deref() == Ok("1")
-            })
-            // shape gating: value "1" = K4096-only (wo-class); "all" = every shape
-            && match hipfire_config::developer_var("HIPFIRE_RESIDUAL_PERSIST_SCOPE").as_deref() {
-                Ok("all") => true,
-                _ => k == 4096,
-            };
-        if persist_r2 {
-            self.ensure_kernel(
-                "gemv_hfq4g256_residual_persist_r2",
-                kernels::GEMV_HFQ4G256_RESIDUAL_PERSIST_R2_GFX1100_SRC,
-                "gemv_hfq4g256_residual_persist_r2",
-            )?;
-            let ap = a_raw.buf.as_ptr();
-            let xp = x.buf.as_ptr();
-            let yp = y.buf.as_ptr();
-            let mut blob = hip_bridge::KernargBlob::new();
-            blob.push_ptr(ap);
-            blob.push_ptr(xp);
-            blob.push_ptr(yp);
-            blob.push_i32(m as i32);
-            blob.push_i32(k as i32);
-            let grid = ((m + 1) / 2) as u32;
-            let bytes = m * (k / 256) * 136 + k * 4;
-            let timer = crate::profile::begin_timer(
-                &self.hip,
-                "gemv",
-                "gemv_hfq4g256_residual_persist_r2",
-                bytes,
-            );
-            let r = self.launch_kernel_blob(
-                "gemv_hfq4g256_residual_persist_r2",
-                [grid, 1, 1],
-                [32, 1, 1],
-                0,
-                blob.as_mut_slice(),
-            );
-            if let Some(t) = timer {
-                t.finish(&self.hip);
-            }
-            return r;
-        }
+        //
+        // The residual-family negative oracles that used to sit here
+        // (per-group dequant LUT, persistent dual-row, dual-row selector) were
+        // removed 2026-10-09 with the rest of the v1-only surface: they only
+        // ever applied to the legacy `gemv_hfq4g256_residual` path, and Magnum
+        // V2 dtypes take their own dedicated residual kernels.
         let use_k2048 = self.arch_caps.is_gfx1100()
             && self.flags.rdna3_hfq4_residual_stage_x32
             && self.flags.rdna3_hfq4_residual_k2048
@@ -10929,17 +10856,7 @@ impl Gpu {
         } else {
             None
         };
-        static RESIDUAL_DUALROW: std::sync::LazyLock<bool> = std::sync::LazyLock::new(|| {
-            hipfire_config::developer_var("HIPFIRE_RESIDUAL_DUALROW").as_deref() == Ok("1")
-        });
-        let use_dualrow = self.arch_caps.is_gfx1100() && *RESIDUAL_DUALROW;
-        let (src, module, func_name) = if use_dualrow {
-            (
-                kernels::GEMV_HFQ4G256_RESIDUAL_DUALROW_GFX1100_SRC,
-                "gemv_hfq4g256_residual_dualrow_gfx1100",
-                "gemv_hfq4g256_residual_dualrow_gfx1100",
-            )
-        } else if gfx1151_k4096 {
+        let (src, module, func_name) = if gfx1151_k4096 {
             (
                 kernels::GEMV_HFQ4G256_RESIDUAL_K4096_GFX1151_SRC,
                 "gemv_hfq4g256_residual_k4096_gfx1151",

@@ -7,7 +7,7 @@ prefill, p<0.01).
 
 ## Overview
 
-Three scripts in `scripts/`, plus a state file and JSONL ledger under
+One script in `scripts/`, plus a state file and JSONL ledger under
 `.codeinsight+research/kernel-tune/`. The pipeline encodes the
 hipfire-kernel-tuning skill methodology (profile → root-cause → one
 lever → implement → correctness → fresh-process measure → decide/log)
@@ -15,8 +15,6 @@ as shell commands an agent drives between kernel edits.
 
 ```
 kernel-tune-loop.sh      Core 6-phase loop driver (baseline → profile → validate → measure → decide)
-deep_ab_bt2.sh           Rigorous statistical A/B validation (100 samples/arm, Welch t-test)
-deep_ab_isolation.sh     Per-kernel marginal contribution (4 arms, incremental enablement)
 ```
 
 ## 1. `kernel-tune-loop.sh` — core loop driver
@@ -66,47 +64,6 @@ After `profile` shows the hot kernels:
 | `HIPFIRE_BENCH_WORKLOAD` | `stateless` | Bench workload |
 | `HIPFIRE_PROMPT_FILE` | `benchmarks/prompts/bare_factual.txt` | Prompt file |
 
-## 2. `deep_ab_bt2.sh` — rigorous statistical A/B
-
-Used after the loop identifies a winning lever and you need publishable
-evidence. Not part of the per-iteration loop — it is the final
-validation step before a PR.
-
-### Methodology
-
-- **100 samples per arm** (5 sessions × 20 prefill runs)
-- **Alternating A/B/A/B** session order to control for thermal/DPM drift
-- **Same binary, env-var toggle**: `HIPFIRE_BT2_DISABLE=1` (baseline) vs
-  `0` (bt2) — no recompilation between arms
-- **Noise controls**: `HIPFIRE_VERIFY_GRAPH=0` (tighter stdev),
-  `HIPFIRE_DPM_WARMUP_SECS=20` (full thermal settlement), 20 warmup runs
-  discarded
-- **Records all individual samples** to JSON, not just medians
-- **Built-in statistical analysis**: Welch's t-test (manual computation
-  with Welch-Satterthwaite df), Cohen's d effect size, 95% CI for the
-  delta, significance classification (p<0.01 / p<0.05 / p<0.10 / n.s.)
-
-### Usage
-
-```bash
-bash scripts/deep_ab_bt2.sh <model_path> <output_json>
-```
-
-## 3. `deep_ab_isolation.sh` — per-kernel marginal contribution
-
-Measures how much each kernel variant contributes independently. Uses 4
-arms instead of 2:
-
-| Arm | Configuration |
-|---|---|
-| A | All plain WMMA (`HIPFIRE_BT2_DISABLE=1`) |
-| B | gate_up bt2 only (`HIPFIRE_BT2_DISABLE=1 HIPFIRE_GATE_UP_VARIANT=bt2`) |
-| C | gate_up + qkvza bt2 (`+ HIPFIRE_QKVZA_BT2_FORCE=1`) |
-| D | All bt2 (`HIPFIRE_BT2_DISABLE=0`) |
-
-Alternating A/B/A/C/A/D order, 3 sessions × 20 runs = 60 samples per
-arm. Reports the incremental delta at each step with significance.
-
 ## Artifacts
 
 ```
@@ -129,9 +86,9 @@ arm. Reports the incremental delta at each step with significance.
 │       ├── dispatch.json        # Dispatch provenance
 │       ├── bench_candidate.json # Fresh-process measurement
 │       └── test_kernels_candidate.log
-├── deep_ab_results.json         # 4B deep A/B (100 samples/arm)
-├── deep_ab_isolation.json       # 4B per-kernel isolation (60 samples/arm)
-└── deep_ab_qwen38_27b.json      # 27B deep A/B (80+60 samples)
+└── (any A/B result JSONs you keep: the harness scripts that wrote this
+    campaign's `deep_ab_*.json` files were removed 2026-10-09 with the
+    legacy-only lever family they measured)
 ```
 
 ## How to run a new campaign
@@ -176,18 +133,10 @@ cargo build --release --features deltanet --example bench_qwen35_mq4 -p hipfire-
 
 ### Final validation before a PR
 
-```bash
-# Deep A/B (100 samples, Welch t-test, Cohen's d, 95% CI)
-bash scripts/deep_ab_bt2.sh ~/.hipfire/models/qwen3.5-4b.mq4 \
-    .codeinsight+research/kernel-tune/deep_ab_results.json
-
-# Per-kernel isolation (which kernel contributed what)
-bash scripts/deep_ab_isolation.sh
-
-# Cross-model validation (does the gain hold on a larger model?)
-bash scripts/deep_ab_bt2.sh ~/models/hipfire/Qwen/Qwen3.8-27B-MQ4/qwen3.8-27b.mq4 \
-    .codeinsight+research/kernel-tune/deep_ab_qwen38_27b.json
-```
+The statistical A/B and per-kernel isolation harnesses this section used to
+name were removed 2026-10-09 with the legacy-only lever family they measured.
+For a PR, use the claim-scoped routes in [`docs/VALIDATION.md`](VALIDATION.md)
+plus `hipfire bench` / `serve_harness.py` as described there.
 
 ## Design notes for future agents
 
@@ -195,9 +144,10 @@ bash scripts/deep_ab_bt2.sh ~/models/hipfire/Qwen/Qwen3.8-27B-MQ4/qwen3.8-27b.mq
    `.mq4` model. The 27B validation used the same script with a
    different path.
 
-2. **The deep A/B harness requires a kill-switch env var** —
-   `HIPFIRE_BT2_DISABLE` is specific to this campaign's bt2 variants.
-   For a different optimization, add a corresponding env var to
+2. **Fresh-process A/B needs a kill-switch env var** for whatever lever you
+   are measuring; the loop's `measure` phase assumes a single env-var toggle
+   that selects the candidate path. For a different optimization, add a
+   corresponding env var to
    `FeatureFlags` and the dispatch sites, then update the harness to
    toggle it. The pattern: same binary, env-var flip, no recompilation
    between arms.
@@ -213,7 +163,7 @@ bash scripts/deep_ab_bt2.sh ~/models/hipfire/Qwen/Qwen3.8-27B-MQ4/qwen3.8-27b.mq
 
 5. **`bench_qwen35_mq4` is the per-kernel profiling tool** — `hipfire
    bench` uses batch_size=1 (single-sequence), while `bench_qwen35_mq4
-   --prefill 32` uses batch_size=32 where batched kernels like bt2 are
+   --prefill 32` uses batch_size=32 where the batch-tiled kernels are
    active. Use the right tool for the path you are optimizing.
 
 6. **Noise discipline** — always run in a fresh process, record model
@@ -223,7 +173,7 @@ bash scripts/deep_ab_bt2.sh ~/models/hipfire/Qwen/Qwen3.8-27B-MQ4/qwen3.8-27b.mq
 
 ## Provenance
 
-- **Built**: 2026-08-20 during the gfx1100 bt2 WMMA campaign
+- **Built**: 2026-08-20 during the gfx1100 WMMA prefill campaign
 - **Campaign result**: +14% prefill on 4B, +29% on 27B, p<0.01, zero
   decode regression
 - **PR**: [warpfront/hipfire#611](https://github.com/warpfront/hipfire/pull/611)

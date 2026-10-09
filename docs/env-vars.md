@@ -411,7 +411,7 @@ registry-authorized.
 ### gfx1100 decode-campaign levers (developer, default off)
 
 Evidence and certification for everything in this table:
-[`docs/kernel-tune-decode-campaign-2026-08.md`](kernel-tune-decode-campaign-2026-08.md)
+[`docs/perf-checkpoints/2026-10-09-gfx1100-campaign-reverify.md`](perf-checkpoints/2026-10-09-gfx1100-campaign-reverify.md)
 and the 2026-08-22/23 perf-checkpoint chain. Unless noted, each lever is an
 explicit `=1` opt-in, off by default, and certified bit-exact on the stated
 shapes before measurement.
@@ -419,16 +419,11 @@ shapes before measurement.
 | Variable | Notes |
 |---|---|
 | `HIPFIRE_FA_KVWRITE_FOLD=1` | Fold the single-token Q8_0 K/V cache write into the FA-prep epilogue (16Q/4K, head_dim 256, non-compact decode). Bit-exact (probe + greedy e2e). Decode: +0.5-1% (gfx1100 fixture record); +0.19% paired, 10/15 wins (gfx1101, 2026-10-09 verify). |
-| `HIPFIRE_QKVZA_FUSEDNORM=1` | **Negative oracle.** rmsnorm+AWQ+FWHT folded into the qkvza GEMV prologue; bit-exact but measured −26% decode on gfx1100 (2026-08 record) and −24% on gfx1101 (perf-checkpoints/2026-10-09-qkvza-fusednorm-oracle-gfx1101.md). gfx1100 by default; gfx1101 additionally under the experimental campaign gate below. Kept wired for A/B proof, never enable. |
-| `HIPFIRE_QKV_FUSEDNORM=1` / `HIPFIRE_GATE_UP_FUSEDNORM=1` | **Negative oracles** (FA-layer qkv / FFN gate_up twins of the above), measured strongly negative on gfx1100; gfx1100-gated, opt-in research only. |
+| *(removed 2026-10-09)* | The v1-only levers were discarded with the legacy quant family: the BT2 prefill family (`HIPFIRE_BT2_DISABLE` + the per-GEMM ``*_BT2_FORCE``/``KS2`` arms), the qkvza/qkv/gate_up fusednorm negative oracles, and the residual-family oracles (`RESIDUAL_PERSIST_R2`/`_SCOPE`, `RESIDUAL_LUT`, `RESIDUAL_DUALROW`). They were reachable only from the legacy HFQ4G256/MQ4G256 GEMM and residual kernels; Magnum V2 dtypes take their own GEMM/GEMV families (several with batch-tiled arms that already ship upstream). The measurements, retractions and removal rationale are recorded in [`docs/perf-checkpoints/2026-10-09-gfx1100-campaign-reverify.md`](perf-checkpoints/2026-10-09-gfx1100-campaign-reverify.md). |
 | `HIPFIRE_LM_HEAD_HFQ4=1` / `HIPFIRE_LM_HEAD_HFQ3=1` / `HIPFIRE_LM_HEAD_HFQ2=1` | Research-only load-time requant of a Q8_0 output projection to HFQ{4,3,2}G256 (disk file untouched). Lossy: output diverges from the Q8_0 head's tokens. HFQ3 decode: +~10% (gfx1100 record); +13.5% (gfx1101, 2026-10-09 verify). Excluded from campaign headline numbers by scope ruling. |
-| `HIPFIRE_BT2_DISABLE=1` | Kill switch for the batch-tiled B=2 WMMA prefill GEMMs (default **on** for batch ≥ 32 on gfx1100/1101/1102). Prefill: +29% pp32 on 27B/gfx1100 (2026-08 deep A/B record — fixture `qwen3.8-27b.mq4` md5 `2fb2edc2…`); +35.3% pp64 on 4B/gfx1101 with the kill switch collapsing it to master (2026-10-09 verify). **Scope from the 2026-10-09 re-verify:** the BT2 kernels are HFQ4-G256-only and are *inert* on the MQ4V2 `qwen3.8-27b.mq4-xt` default artifact (branch ≡ `BT2_DISABLE` ≡ master there), and the `+29%` does not reproduce on today's `qwen3.8-27b.mq4` bytes (HF re-uploaded that file; the recorded md5 is stale) — master and branch both read ~460 tok/s pp32. On the 4B the lever reproduces: +22% pp64, +0 at pp2048. |
-| `HIPFIRE_QKVZA_BT2_FORCE=1` / `HIPFIRE_QKV_BT2_FORCE=1` / `HIPFIRE_QKV_BT2_DISABLE=1` / `HIPFIRE_KSPLIT_DET_BT2_FORCE=1` / `HIPFIRE_KSPLIT_DET_BT2_KS2=1` | Per-GEMM BT2 force/disable arms for kernel probing. |
-| `HIPFIRE_RESIDUAL_PERSIST_R2=1` / `HIPFIRE_RESIDUAL_PERSIST_SCOPE` / `HIPFIRE_RESIDUAL_LUT=1` | **Negative oracles** on the residual GEMV family (persistent dual-row, per-group dequant LUT). Both measured flat-to-negative in-engine (rocprof-verified identical kernel durations for persist_r2; LUT −1%); kept as wired falsification evidence. |
-| `HIPFIRE_RESIDUAL_DUALROW=1` | Selects the generic dual-row residual kernel (`gemv_hfq4g256_residual*.hip`, two rows per wave32 block) in place of the default `stage_x32` schedule, keeping that kernel's legacy M-sized launch. Opt-in oracle only; measured negative. Not a default path. |
 | ~~`HIPFIRE_XLDS_R`~~ | **Removed 2026-10-09.** The LDS-staged activation residual probe was invalid: its kernel paired nibbles 4..7 of each lane's word with x offsets 0..3 (it needed a second `float4` at +4), so it never computed the GEMV it claimed, and its launch requested 0 bytes of dynamic LDS for a kernel that stages `k` floats in `extern __shared__`. The 2026-08 amendment-2k `-16%..-37%` table and its "BITEXACT" claim are void; see [`docs/perf-checkpoints/2026-10-09-gfx1100-campaign-reverify.md`](perf-checkpoints/2026-10-09-gfx1100-campaign-reverify.md). |
 | `HIPFIRE_AWQ_NORM_WAVEGRID=1` | Exact-tree multi-CU AWQ norm (null result, token-exact; infrastructure kept). |
-| `HIPFIRE_GFX1101_GFX1100_CAMPAIGN=1` | **Experimental**: admit the gfx1100-certified campaign fusions — and the qkvza fusednorm negative oracle for diagnostic A/B — on gfx1101 (same RDNA3 ISA). Diagnostic only, not a certified path; `probe_fa_prep` shows 1-ulp rope-branch diffs on gfx1101. |
+| `HIPFIRE_GFX1101_GFX1100_CAMPAIGN=1` | **Experimental**: admit the gfx1100-certified fusions (conv scalar-prep, `fa_prep`, `fa_epilogue`, FA kvwrite fold) on gfx1101 (same RDNA3 ISA). Diagnostic only, not a certified path; `probe_fa_prep` shows 1-ulp rope-branch diffs on gfx1101. |
 | `HIPFIRE_SLOW_TOKEN_LOG=1` | bench_qwen35_mq4 prints any decode token slower than 50 ms (environmental-contention detector). |
 
 ---
@@ -560,7 +555,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1467
+**Count:** 1454
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -634,7 +629,6 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_BQ1G128_XBATCH_MAX` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_BQ1_MODEL` | benchmarks/quality-baselines/harness/spe_ablation.sh | harness |
 | `HIPFIRE_BRANCH` | scripts/mi300x_bootstrap.sh | harness |
-| `HIPFIRE_BT2_DISABLE` | crates/rdna-compute/src/feature_flags.rs, scripts/deep_ab_bt2.sh | developer |
 | `HIPFIRE_BUILDER_GIT_SHA` | crates/hipfire-isa/src/lib.rs | developer |
 | `HIPFIRE_BUILD_COMMIT` | crates/hipfire-cli/build.rs, crates/hipfire-cli/src/main.rs | developer |
 | `HIPFIRE_BUILD_COMMIT_OVERRIDE` | crates/hipfire-cli/build.rs | harness |
@@ -1042,7 +1036,6 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_GATEUP_LDSSTAGE` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_GATE_MODEL` | scripts/gates.sh | harness |
 | `HIPFIRE_GATE_UP_BT` | crates/rdna-compute/src/gemm.rs | developer |
-| `HIPFIRE_GATE_UP_FUSEDNORM` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_GATE_UP_NOSYNC` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/examples/bench_gate_up_nosync.rs | experimental |
 | `HIPFIRE_GATE_UP_PAIR2` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_GATE_UP_VARIANT` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |
@@ -1352,8 +1345,6 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_KERNEL_CACHE` | benchmarks/scripts/mq4v2_k5120_abba.sh, crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_KLD_NGL` | crates/hipfire-runtime/examples/build_kld_ref.rs, crates/hipfire-runtime/examples/eval_gguf.rs | harness |
 | `HIPFIRE_KLD_TEACHER` | benchmarks/quality-baselines/harness/spe_ablation.sh | harness |
-| `HIPFIRE_KSPLIT_DET_BT2_FORCE` | crates/rdna-compute/src/gemm.rs | developer |
-| `HIPFIRE_KSPLIT_DET_BT2_KS2` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_KV` | crates/saddle-lab/examples/oracle_xcheck.rs | harness |
 | `HIPFIRE_KV_ADAPTIVE` | crates/hipfire-arch-qwen35/src/carrier.rs, crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_KV_BACKEND` | crates/hipfire-loader/src/admission.rs, scripts/guard_gfx1201_baseline.py | developer |
@@ -1624,17 +1615,12 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QA_KV_MODES` | crates/saddle-lab/examples/test_inferenceQA.rs | harness |
 | `HIPFIRE_QCAL_BREAKDOWN` | crates/hipfire-runtime/tests/hf_tokenizer_encode_bench.rs | harness |
 | `HIPFIRE_QKVZA_BLOCK_SIZE` | crates/rdna-compute/src/kernels.rs | developer |
-| `HIPFIRE_QKVZA_BT2_FORCE` | crates/rdna-compute/src/gemm.rs, scripts/deep_ab_isolation.sh | developer |
 | `HIPFIRE_QKVZA_CPOL` | crates/rdna-compute/src/gemm.rs | developer |
-| `HIPFIRE_QKVZA_FUSEDNORM` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs, crates/hipfire-runtime/examples/probe_qkvza_fusednorm.rs | developer |
 | `HIPFIRE_QKVZA_KERNEL_NAME` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_QKVZA_MIN_BLOCKS_PER_CU` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_QKVZA_SCALAR_PREP` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_QKVZA_SPLIT_TAIL` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |
 | `HIPFIRE_QKVZA_WAVES_PER_BLOCK` | crates/rdna-compute/src/kernels.rs | developer |
-| `HIPFIRE_QKV_BT2_DISABLE` | crates/rdna-compute/src/gemm.rs | developer |
-| `HIPFIRE_QKV_BT2_FORCE` | crates/rdna-compute/src/gemm.rs | developer |
-| `HIPFIRE_QKV_FUSEDNORM` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_QKV_KERNEL_NAME` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_QKV_WITH_BIAS` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_QUANTIZE` | scripts/stage_models.sh | harness |
@@ -1808,16 +1794,12 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_REQUIRE_REAP_OVERLAY` | scripts/reap/run_deepseek4_e8_layer_screen.sh, scripts/reap/run_deepseek4_e8_phase_quality.sh | harness |
 | `HIPFIRE_RESET_ROUNDS` | crates/hipfire-generate/tests/qwen35_reset_hw.rs | harness |
 | `HIPFIRE_RESIDUAL_CPOL` | crates/rdna-compute/src/gemv.rs | developer |
-| `HIPFIRE_RESIDUAL_DUALROW` | crates/rdna-compute/src/gemv.rs | developer |
 | `HIPFIRE_RESIDUAL_KERNEL` | crates/rdna-compute/examples/bench_vgpr_cap_sweep.rs, crates/rdna-compute/examples/mq4c_parity.rs | developer |
 | `HIPFIRE_RESIDUAL_KSPLIT_OFF` | crates/rdna-compute/examples/test_mq4v2_residual_ksplit_gfx1100.rs, crates/rdna-compute/src/dflash_draft_fusion.rs | developer |
 | `HIPFIRE_RESIDUAL_LDSSTAGE` | crates/rdna-compute/src/dflash_draft_fusion.rs, crates/rdna-compute/src/feature_flags.rs | developer |
-| `HIPFIRE_RESIDUAL_LUT` | crates/rdna-compute/src/gemv.rs | developer |
 | `HIPFIRE_RESIDUAL_MULTIROW_R2_KERNEL` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_RESIDUAL_MULTIROW_R4_KERNEL` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_RESIDUAL_MULTIROW_R8_KERNEL` | crates/rdna-compute/src/kernels.rs | developer |
-| `HIPFIRE_RESIDUAL_PERSIST_R2` | crates/rdna-compute/src/gemv.rs | developer |
-| `HIPFIRE_RESIDUAL_PERSIST_SCOPE` | crates/rdna-compute/src/gemv.rs | developer |
 | `HIPFIRE_RESULT_JSON` | docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-profile-feed.py, docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-run-profile-direct.sh | harness |
 | `HIPFIRE_RMSNORM_AWQ` | crates/rdna-compute/src/gemv.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_RMSNORM_AWQ_RCP` | crates/rdna-compute/src/kernels.rs | developer |

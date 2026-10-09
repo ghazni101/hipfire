@@ -39,14 +39,15 @@ B3: identical to B1 within noise (115.06 vs 115.12) — see verdict 5.
 1. **Default-path decode neutrality: CONFIRMED.** B0 vs M: −0.14% @64,
    −0.06% @2048 (noise). The branch adds no default-on decode-path lever on
    gfx1101; every decode lever is opt-in or gfx1100-gated.
-2. **BT2 prefill (default-on, batch ≥ 32, RDNA3 dGPU): CONFIRMED, and
-   causally isolated.** B0 vs M = **+35.3% pp64**; the kill switch collapses
-   it (B0D 1551.4 ≈ M 1539.2), so 100% of the default-path prefill delta is
-   the BT2 arms on top of the same plain-WMMA selection master makes. Flat at
-   pp2048 (+0.07%): BT2's N-grid halving only pays at short/medium batch.
-   Together with the 27B/gfx1100 deep A/B (+29.0% median,
-   [2026-10-09-bt2-prefill-wmma-gfx1100-27b.md](2026-10-09-bt2-prefill-wmma-gfx1100-27b.md))
-   the lever is verified on two models and two RDNA3 dGPUs.
+2. **BT2 prefill: WITHDRAWN 2026-10-09.** The measurement below was taken
+   before the v1-only prune; the BT2 family has since been removed because its
+   kernels are HFQ4-G256-only (no Magnum V2 dtype can reach them) and the
+   surviving V2 GEMM families already ship their own batch-tiled arms. Kept
+   here as the dated record of what was seen at the time:
+   B0 vs M = **+35.3% pp64**; the kill switch collapsed it (B0D 1551.4 ≈ M
+   1539.2); flat at pp2048 (+0.07%). The 4B/gfx1100 counterpart and the
+   removal rationale are in
+   [2026-10-09-gfx1100-campaign-reverify.md](2026-10-09-gfx1100-campaign-reverify.md).
 3. **Four gfx1100 fusions, +5.7% decode (gfx1100 fixture): direction and
    magnitude hold on gfx1101 via the experimental gate.** B1 vs B0 = +4.91%
    @64, +4.92% @2048 (process medians 115.08–115.43, tight). NOT a
@@ -59,11 +60,11 @@ B3: identical to B1 within noise (115.06 vs 115.12) — see verdict 5.
    rounds: r1 +0.70%, r2 −0.41%, r3 +0.27%; pooled n=15 mean +0.19%,
    10/15 wins, both contexts. `probe_fa_kvwrite` PASS (fold outputs + both
    cache rows bitwise identical) on gfx1101.
-5. **qkvza fusednorm negative oracle (−26% on gfx1100): not measurable here
-   by design — flag correctly inert off-gfx1100.** B3 ≡ B1 (the gate is
-   `is_gfx1100()`-only), which doubles as evidence the oracle cannot engage
-   accidentally on other archs. `probe_qkvza_fusednorm` BITEXACT on gfx1101
-   (numerics portable; the −26% is a perf property measured on gfx1100).
+5. **qkvza fusednorm negative oracle: REMOVED 2026-10-09.** Measured −26%
+   on gfx1100 and inert off-gfx1100 by design (the gate was `is_gfx1100()`-only).
+   The oracle and its probe were discarded with the rest of the v1-only
+   surface, because the gate also required `MQ4G256 | HFQ4G256` and is
+   therefore unreachable from any Magnum V2 dtype.
 6. **lm_head HFQ3 (research-only): +13.5% decode on gfx1101** (larger than
    gfx1100's ~+10% — the 7700 XT is more bandwidth-starved), pp2048 +1.3%.
    Output is lossy-divergent as documented: greedy factual/code/poem outputs

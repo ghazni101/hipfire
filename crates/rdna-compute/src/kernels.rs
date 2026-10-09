@@ -1115,20 +1115,6 @@ pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_G12DEC_SRC: &str = concat!(
 /// on one workgroup.
 pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_WAVEGRID_GFX1100_SRC: &str =
     include_str!("../../../kernels/src/fused_rmsnorm_mq_rotate_awq_wavegrid.gfx1100.hip");
-pub const FUSED_QKVZA_HFQ4G256_FUSEDNORM_GFX1100_SRC: &str =
-    // Consumer-fold lever (HIPFIRE_QKVZA_FUSEDNORM=1): qkvza GEMV with inline
-    // rmsnorm+AWQ+FWHT prologue, bit-exact vs the direct producer.
-    include_str!("../../../kernels/src/fused_qkvza_hfq4g256_fusednorm.gfx1100.hip");
-pub const FUSED_GATE_UP_HFQ4G256_FUSEDNORM_GFX1100_SRC: &str =
-    // Consumer-fold lever (HIPFIRE_GATE_UP_FUSEDNORM=1): gate_up GEMV with
-    // inline rmsnorm+AWQ+FWHT prologue; see the qkvza fusednorm kernel.
-    include_str!("../../../kernels/src/fused_gate_up_hfq4g256_fusednorm.gfx1100.hip");
-
-pub const FUSED_QKV_HFQ4G256_FUSEDNORM_GFX1100_SRC: &str =
-    // Consumer-fold lever (HIPFIRE_QKV_FUSEDNORM=1): qkv GEMV with inline
-    // rmsnorm+AWQ+FWHT prologue; see the qkvza fusednorm kernel.
-    include_str!("../../../kernels/src/fused_qkv_hfq4g256_fusednorm.gfx1100.hip");
-
 /// C2 IU4 producer sidecar: RMSNorm/FWHT + in-register `block_i4_128` emit.
 /// Prepends the shared quant recipe; old plain/AWQ symbols stay untouched.
 pub const BLOCK_I4_128_QUANT_SRC: &str =
@@ -2736,26 +2722,6 @@ pub const GEMV_HFQ4G256_RESIDUAL_GFX1100_SRC: &str = concat!(
     "#define HIPFIRE_WEIGHT_CACHE_FLAT_GEMV 1\n",
     include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
     include_str!("../../../kernels/src/gemv_hfq4g256_residual.gfx1100.hip")
-);
-pub const GEMV_HFQ4G256_RESIDUAL_PERSIST_R2_GFX1100_SRC: &str = concat!(
-    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
-    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-    include_str!("../../../kernels/src/gemv_hfq4g256_residual_persist.gfx1100.hip")
-);
-pub const GEMV_HFQ4G256_RESIDUAL_LUT_GFX1100_SRC: &str = concat!(
-    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
-    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-    include_str!("../../../kernels/src/gemv_hfq4g256_residual_lut.gfx1100.hip")
-);
-/// Dual-row R36c1 residual GEMV for gfx1100: processes 2 rows per block,
-/// reusing the activation vector across both rows. Separates weight memory
-/// phase from FMA phase (8 headers loaded sequentially, then 8 DOG FMAs).
-/// Uses buffer loads with cache policy 0 (same as STAGE_X32 single-row).
-pub const GEMV_HFQ4G256_RESIDUAL_DUALROW_GFX1100_SRC: &str = concat!(
-    "#define HIPFIRE_GFX12_WEIGHT_CACHE_ELIGIBLE 1\n",
-    "#define HIPFIRE_RESIDUAL_KERNEL gemv_hfq4g256_residual_dualrow_gfx1100\n",
-    include_str!("../../../kernels/src/gfx12_weight_cache_policy.inc"),
-    include_str!("../../../kernels/src/gemv_hfq4g256_residual.hip")
 );
 pub const GEMV_HFQ4G256_RESIDUAL_STAGE_X32_GFX1100_SRC: &str = concat!(
     "#define HIPFIRE_RDNA3_RESIDUAL_STAGE_X32 1\n",
@@ -4401,14 +4367,8 @@ pub const GEMM_HFQ4G256_RESIDUAL_WMMA_KSPLIT_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_ksplit.hip");
 pub const GEMM_HFQ4G256_RESIDUAL_WMMA_KSPLIT_DET_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_ksplit_det.hip");
-pub const GEMM_HFQ4G256_RESIDUAL_WMMA_KSPLIT_DET_BT2_SRC: &str =
-    include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_ksplit_det_bt2.hip");
 pub const GEMM_KSPLIT_DET_FINALIZE_SRC: &str =
     include_str!("../../../kernels/src/gemm_ksplit_det_finalize.hip");
-pub const GEMM_HFQ4G256_RESIDUAL_WMMA_KSPLIT_DET_BT2_KS2_SRC: &str =
-    include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma_ksplit_det_bt2_ks2.hip");
-pub const GEMM_KSPLIT_DET_FINALIZE_KS2_SRC: &str =
-    include_str!("../../../kernels/src/gemm_ksplit_det_finalize_ks2.hip");
 // gfx12 (RDNA4) sister of GEMM_HFQ4G256_RESIDUAL_WMMA_K2_SRC. Same recipe
 // as the qkv / qkvza / gate_up gfx12 ports (PR #56): `_w32_gfx12` builtin,
 // half8_t operands, K-split via tid>>4, contiguous C-row mapping. Closes
@@ -4970,11 +4930,6 @@ pub const GEMM_GATE_UP_HFQ4G256_WMMA_LDSCOOP_NOSYNC_SRC: &str =
 // Opt-in via HIPFIRE_GATE_UP_VARIANT=2tile.
 pub const GEMM_GATE_UP_HFQ4G256_WMMA_2TILE_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma_2tile.hip");
-// Batch-tiled variant: B independent acc chains reuse weights across B
-// batch tiles per block. Grid halves in N-dim. Opt-in via
-// HIPFIRE_GATE_UP_VARIANT=bt2 or bt4.
-pub const GEMM_GATE_UP_HFQ4G256_WMMA_BT_SRC: &str =
-    include_str!("../../../kernels/src/gemm_gate_up_hfq4g256_wmma_bt.hip");
 // gfx12 (RDNA4) sister of GEMM_GATE_UP_HFQ4G256_WMMA_SRC. Same recipe as
 // the QKV gfx12 scaffold (validated on R9700): _w32_gfx12 builtin,
 // half8_t operands, K-split via tid>>4, contiguous C-row mapping.
@@ -5415,10 +5370,6 @@ pub const GEMM_GATE_UP_MQ4CG256_WMMA_GFX12_BT_SRC: &str =
     include_str!("../../../kernels/src/gemm_gate_up_mq4cg256_wmma_gfx12_bt.hip");
 pub const GEMM_QKVZA_HFQ4G256_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_wmma.hip");
-// Batch-tiled gfx11 variant: B independent acc chains reuse weights
-// across B batch tiles per block. Opt-in via batch_size >= 32 dispatch.
-pub const GEMM_QKVZA_HFQ4G256_WMMA_BT_SRC: &str =
-    include_str!("../../../kernels/src/gemm_qkvza_hfq4g256_wmma_bt.hip");
 // gfx12 (RDNA4) sister: gfx12 hfq4 recipe + 4-output qkv/z/beta/alpha
 // routing for the DeltaNet LinearAttention preamble.
 pub const GEMM_QKVZA_HFQ4G256_WMMA_GFX12_SRC: &str =
@@ -5505,8 +5456,6 @@ pub const GEMM_HFQ3G256_RESIDUAL_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq3g256_residual_wmma.gfx12.hip");
 pub const GEMM_QKV_HFQ4G256_WMMA_SRC: &str =
     include_str!("../../../kernels/src/gemm_qkv_hfq4g256_wmma.hip");
-pub const GEMM_QKV_HFQ4G256_WMMA_BT2_SRC: &str =
-    include_str!("../../../kernels/src/gemm_qkv_hfq4g256_wmma_bt2.hip");
 // gfx12 (RDNA4) sister of GEMM_QKV_HFQ4G256_WMMA_SRC. Uses
 // `__builtin_amdgcn_wmma_f32_16x16x16_f16_w32_gfx12` (vs the gfx11 `_w32`)
 // and half8_t operands (vs half16_t). C-output mapping

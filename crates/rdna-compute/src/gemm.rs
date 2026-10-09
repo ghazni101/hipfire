@@ -4374,329 +4374,6 @@ impl Gpu {
         }
         result
     }
-
-    /// Consumer-fold lever (HIPFIRE_QKVZA_FUSEDNORM=1): fused_qkvza_hfq4g256
-    /// with the RMSNorm + AWQ divide + FWHT rotation computed inline in the
-    /// GEMV prologue, replacing a standalone fused_rmsnorm_mq_rotate_awq
-    /// launch. gfx1100 only, K % 256 == 0.
-    #[allow(clippy::too_many_arguments)]
-    pub fn fused_qkvza_hfq4g256_fusednorm(
-        &mut self,
-        a_qkv: &GpuTensor,
-        a_z: &GpuTensor,
-        a_beta: &GpuTensor,
-        a_alpha: &GpuTensor,
-        x_raw: &GpuTensor,
-        gamma: &GpuTensor,
-        awq_scale: &GpuTensor,
-        y_qkv: &GpuTensor,
-        y_z: &GpuTensor,
-        y_beta: &GpuTensor,
-        y_alpha: &GpuTensor,
-        qkv_m: usize,
-        z_m: usize,
-        beta_m: usize,
-        alpha_m: usize,
-        k: usize,
-        eps: f32,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        self.ensure_mq_signs()?;
-        self.ensure_kernel(
-            "fused_qkvza_hfq4g256_fusednorm",
-            kernels::FUSED_QKVZA_HFQ4G256_FUSEDNORM_GFX1100_SRC,
-            "fused_qkvza_hfq4g256_fusednorm",
-        )?;
-        let aq = a_qkv.buf.as_ptr();
-        let az = a_z.buf.as_ptr();
-        let ab = a_beta.buf.as_ptr();
-        let aa = a_alpha.buf.as_ptr();
-        let xp = x_raw.buf.as_ptr();
-        let gp = gamma.buf.as_ptr();
-        let ap = awq_scale.buf.as_ptr();
-        let s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
-        let s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
-        let yq = y_qkv.buf.as_ptr();
-        let yz = y_z.buf.as_ptr();
-        let yb = y_beta.buf.as_ptr();
-        let ya = y_alpha.buf.as_ptr();
-        let q_m_i = qkv_m as i32;
-        let z_m_i = z_m as i32;
-        let b_m_i = beta_m as i32;
-        let a_m_i = alpha_m as i32;
-        let k_i = k as i32;
-
-        let total_m = (qkv_m + z_m + beta_m + alpha_m) as u32;
-        let grid = [total_m, 1, 1];
-        let block = [32u32, 1, 1];
-
-        let bytes = crate::profile::gemv_hfq4g256_bytes(qkv_m, k)
-            + crate::profile::gemv_hfq4g256_bytes(z_m, k)
-            + crate::profile::gemv_hfq4g256_bytes(beta_m, k)
-            + crate::profile::gemv_hfq4g256_bytes(alpha_m, k);
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "fused",
-            "fused_qkvza_hfq4g256_fusednorm",
-            bytes,
-        );
-
-        let mut params: Vec<*mut c_void> = vec![
-            &aq as *const _ as *mut c_void,
-            &az as *const _ as *mut c_void,
-            &ab as *const _ as *mut c_void,
-            &aa as *const _ as *mut c_void,
-            &xp as *const _ as *mut c_void,
-            &gp as *const _ as *mut c_void,
-            &ap as *const _ as *mut c_void,
-            &s1 as *const _ as *mut c_void,
-            &s2 as *const _ as *mut c_void,
-            &yq as *const _ as *mut c_void,
-            &yz as *const _ as *mut c_void,
-            &yb as *const _ as *mut c_void,
-            &ya as *const _ as *mut c_void,
-            &q_m_i as *const _ as *mut c_void,
-            &z_m_i as *const _ as *mut c_void,
-            &b_m_i as *const _ as *mut c_void,
-            &a_m_i as *const _ as *mut c_void,
-            &k_i as *const _ as *mut c_void,
-            &eps as *const _ as *mut c_void,
-        ];
-        let result = self.launch_maybe_blob(
-            "fused_qkvza_hfq4g256_fusednorm",
-            grid,
-            block,
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(aq);
-                b.push_ptr(az);
-                b.push_ptr(ab);
-                b.push_ptr(aa);
-                b.push_ptr(xp);
-                b.push_ptr(gp);
-                b.push_ptr(ap);
-                b.push_ptr(s1);
-                b.push_ptr(s2);
-                b.push_ptr(yq);
-                b.push_ptr(yz);
-                b.push_ptr(yb);
-                b.push_ptr(ya);
-                b.push_i32(q_m_i);
-                b.push_i32(z_m_i);
-                b.push_i32(b_m_i);
-                b.push_i32(a_m_i);
-                b.push_i32(k_i);
-                b.push_f32(eps);
-                b
-            },
-        );
-        if let Some(t) = timer {
-            t.finish(&self.hip);
-        }
-        result
-    }
-
-    /// Consumer-fold lever (HIPFIRE_QKVZA_FUSEDNORM=1): gate_up variant of
-    /// the fusednorm prologue; see fused_qkvza_hfq4g256_fusednorm.
-    #[allow(clippy::too_many_arguments)]
-    pub fn fused_gate_up_hfq4g256_fusednorm(
-        &mut self,
-        a_gate: &GpuTensor,
-        a_up: &GpuTensor,
-        x_raw: &GpuTensor,
-        gamma: &GpuTensor,
-        awq_scale: &GpuTensor,
-        y_gate: &GpuTensor,
-        y_up: &GpuTensor,
-        gate_m: usize,
-        up_m: usize,
-        k: usize,
-        eps: f32,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        self.ensure_mq_signs()?;
-        self.ensure_kernel(
-            "fused_gate_up_hfq4g256_fusednorm",
-            kernels::FUSED_GATE_UP_HFQ4G256_FUSEDNORM_GFX1100_SRC,
-            "fused_gate_up_hfq4g256_fusednorm",
-        )?;
-        let ag = a_gate.buf.as_ptr();
-        let au = a_up.buf.as_ptr();
-        let xp = x_raw.buf.as_ptr();
-        let gp = gamma.buf.as_ptr();
-        let ap = awq_scale.buf.as_ptr();
-        let s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
-        let s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
-        let yg = y_gate.buf.as_ptr();
-        let yu = y_up.buf.as_ptr();
-        let g_m_i = gate_m as i32;
-        let u_m_i = up_m as i32;
-        let k_i = k as i32;
-
-        let total_m = (gate_m + up_m) as u32;
-        let grid = [total_m, 1, 1];
-        let block = [32u32, 1, 1];
-
-        let bytes = crate::profile::gemv_hfq4g256_bytes(gate_m, k)
-            + crate::profile::gemv_hfq4g256_bytes(up_m, k);
-        let timer = crate::profile::begin_timer(
-            &self.hip,
-            "fused",
-            "fused_gate_up_hfq4g256_fusednorm",
-            bytes,
-        );
-
-        let mut params: Vec<*mut c_void> = vec![
-            &ag as *const _ as *mut c_void,
-            &au as *const _ as *mut c_void,
-            &xp as *const _ as *mut c_void,
-            &gp as *const _ as *mut c_void,
-            &ap as *const _ as *mut c_void,
-            &s1 as *const _ as *mut c_void,
-            &s2 as *const _ as *mut c_void,
-            &yg as *const _ as *mut c_void,
-            &yu as *const _ as *mut c_void,
-            &g_m_i as *const _ as *mut c_void,
-            &u_m_i as *const _ as *mut c_void,
-            &k_i as *const _ as *mut c_void,
-            &eps as *const _ as *mut c_void,
-        ];
-        let result = self.launch_maybe_blob(
-            "fused_gate_up_hfq4g256_fusednorm",
-            grid,
-            block,
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(ag);
-                b.push_ptr(au);
-                b.push_ptr(xp);
-                b.push_ptr(gp);
-                b.push_ptr(ap);
-                b.push_ptr(s1);
-                b.push_ptr(s2);
-                b.push_ptr(yg);
-                b.push_ptr(yu);
-                b.push_i32(g_m_i);
-                b.push_i32(u_m_i);
-                b.push_i32(k_i);
-                b.push_f32(eps);
-                b
-            },
-        );
-        if let Some(t) = timer {
-            t.finish(&self.hip);
-        }
-        result
-    }
-
-    /// Consumer-fold lever (HIPFIRE_QKVZA_FUSEDNORM=1): qkv variant of the
-    /// fusednorm prologue; see fused_qkvza_hfq4g256_fusednorm.
-    #[allow(clippy::too_many_arguments)]
-    pub fn fused_qkv_hfq4g256_fusednorm(
-        &mut self,
-        a_q: &GpuTensor,
-        a_k: &GpuTensor,
-        a_v: &GpuTensor,
-        x_raw: &GpuTensor,
-        gamma: &GpuTensor,
-        awq_scale: &GpuTensor,
-        y_q: &GpuTensor,
-        y_k: &GpuTensor,
-        y_v: &GpuTensor,
-        q_m: usize,
-        k_m: usize,
-        v_m: usize,
-        k: usize,
-        eps: f32,
-    ) -> HipResult<()> {
-        self.bind_thread()?;
-        self.ensure_mq_signs()?;
-        self.ensure_kernel(
-            "fused_qkv_hfq4g256_fusednorm",
-            kernels::FUSED_QKV_HFQ4G256_FUSEDNORM_GFX1100_SRC,
-            "fused_qkv_hfq4g256_fusednorm",
-        )?;
-        let aqp = a_q.buf.as_ptr();
-        let akp = a_k.buf.as_ptr();
-        let avp = a_v.buf.as_ptr();
-        let xp = x_raw.buf.as_ptr();
-        let gp = gamma.buf.as_ptr();
-        let ap = awq_scale.buf.as_ptr();
-        let s1 = self.scratch.mq_signs1.as_ref().unwrap().buf.as_ptr();
-        let s2 = self.scratch.mq_signs2.as_ref().unwrap().buf.as_ptr();
-        let yqp = y_q.buf.as_ptr();
-        let ykp = y_k.buf.as_ptr();
-        let yvp = y_v.buf.as_ptr();
-        let q_m_i = q_m as i32;
-        let k_m_i = k_m as i32;
-        let v_m_i = v_m as i32;
-        let k_i = k as i32;
-
-        let total_m = (q_m + k_m + v_m) as u32;
-        let grid = [total_m, 1, 1];
-        let block = [32u32, 1, 1];
-
-        let bytes = crate::profile::gemv_hfq4g256_bytes(q_m, k)
-            + crate::profile::gemv_hfq4g256_bytes(k_m, k)
-            + crate::profile::gemv_hfq4g256_bytes(v_m, k);
-        let timer =
-            crate::profile::begin_timer(&self.hip, "fused", "fused_qkv_hfq4g256_fusednorm", bytes);
-
-        let mut params: Vec<*mut c_void> = vec![
-            &aqp as *const _ as *mut c_void,
-            &akp as *const _ as *mut c_void,
-            &avp as *const _ as *mut c_void,
-            &xp as *const _ as *mut c_void,
-            &gp as *const _ as *mut c_void,
-            &ap as *const _ as *mut c_void,
-            &s1 as *const _ as *mut c_void,
-            &s2 as *const _ as *mut c_void,
-            &yqp as *const _ as *mut c_void,
-            &ykp as *const _ as *mut c_void,
-            &yvp as *const _ as *mut c_void,
-            &q_m_i as *const _ as *mut c_void,
-            &k_m_i as *const _ as *mut c_void,
-            &v_m_i as *const _ as *mut c_void,
-            &k_i as *const _ as *mut c_void,
-            &eps as *const _ as *mut c_void,
-        ];
-        let result = self.launch_maybe_blob(
-            "fused_qkv_hfq4g256_fusednorm",
-            grid,
-            block,
-            0,
-            &mut params,
-            || {
-                let mut b = hip_bridge::KernargBlob::new();
-                b.push_ptr(aqp);
-                b.push_ptr(akp);
-                b.push_ptr(avp);
-                b.push_ptr(xp);
-                b.push_ptr(gp);
-                b.push_ptr(ap);
-                b.push_ptr(s1);
-                b.push_ptr(s2);
-                b.push_ptr(yqp);
-                b.push_ptr(ykp);
-                b.push_ptr(yvp);
-                b.push_i32(q_m_i);
-                b.push_i32(k_m_i);
-                b.push_i32(v_m_i);
-                b.push_i32(k_i);
-                b.push_f32(eps);
-                b
-            },
-        );
-        if let Some(t) = timer {
-            t.finish(&self.hip);
-        }
-        result
-    }
-
     /// gfx1100/K=2048 QKVZA experiment that also prepares the DeltaNet beta
     /// and alpha scalars. The projection FMAs and reduction are identical to
     /// `fused_qkvza_hfq4g256`; only the two tiny output tails absorb the
@@ -9425,28 +9102,11 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        // Batch-tiled B=2 variant for prefill (batch_size >= 32) on RDNA3 dGPU:
-        // 2 independent acc chains reuse weights across 2 N-tiles, halving the
-        // N-grid. +22% per-kernel on gate_up (same structure); qkvza is smaller
-        // (13.8% of prefill) so end-to-end impact is proportionally less.
-        // For decode (batch_size < 32), the plain 1-acc WMMA is better.
-        let qkvza_bt2_force = std::env::var("HIPFIRE_QKVZA_BT2_FORCE").as_deref() == Ok("1");
-        let use_bt2 = qkvza_bt2_force
-            || (batch_size >= 32 && self.arch_caps.is_rdna3_dgpu() && !self.flags.bt2_disable);
-        let (kname, ksrc, n_tile) = if use_bt2 {
-            (
-                "gemm_qkvza_hfq4g256_wmma_bt2",
-                kernels::GEMM_QKVZA_HFQ4G256_WMMA_BT_SRC,
-                32,
-            )
-        } else {
-            (
-                "gemm_qkvza_hfq4g256_wmma",
-                kernels::GEMM_QKVZA_HFQ4G256_WMMA_SRC,
-                16,
-            )
-        };
-        self.ensure_kernel(kname, ksrc, kname)?;
+        self.ensure_kernel(
+            "gemm_qkvza_hfq4g256_wmma",
+            kernels::GEMM_QKVZA_HFQ4G256_WMMA_SRC,
+            "gemm_qkvza_hfq4g256_wmma",
+        )?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
         let mut aq = a_qkv.buf.as_ptr();
@@ -9485,7 +9145,7 @@ impl Gpu {
 
         let total_m = qkv_m + z_m + beta_m + alpha_m;
         let row_tiles = (total_m + 15) / 16;
-        let batch_tiles = (batch_size + n_tile - 1) / n_tile;
+        let batch_tiles = (batch_size + 15) / 16;
 
         let bytes = crate::profile::gemv_hfq4g256_bytes(qkv_m, k)
             + crate::profile::gemv_hfq4g256_bytes(z_m, k)
@@ -9493,9 +9153,10 @@ impl Gpu {
             + crate::profile::gemv_hfq4g256_bytes(alpha_m, k)
             + batch_size * k * 2
             + batch_size * total_m * 4 * 2;
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
+        let timer =
+            crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkvza_hfq4g256_wmma", bytes);
         let result = self.launch_maybe_blob(
-            kname,
+            "gemm_qkvza_hfq4g256_wmma",
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,
@@ -11653,25 +11314,12 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
-        let qkv_bt2_force = std::env::var("HIPFIRE_QKV_BT2_FORCE").as_deref() == Ok("1");
-        let qkv_bt2_disable = std::env::var("HIPFIRE_QKV_BT2_DISABLE").as_deref() == Ok("1");
-        let use_bt2 = !qkv_bt2_disable
-            && (qkv_bt2_force
-                || (batch_size >= 32 && self.arch_caps.is_rdna3_dgpu() && !self.flags.bt2_disable));
-        let (kname, ksrc, n_tile) = if use_bt2 {
-            (
-                "gemm_qkv_hfq4g256_wmma_bt2",
-                kernels::GEMM_QKV_HFQ4G256_WMMA_BT2_SRC,
-                32,
-            )
-        } else {
-            (
-                "gemm_qkv_hfq4g256_wmma",
-                kernels::GEMM_QKV_HFQ4G256_WMMA_SRC,
-                16,
-            )
-        };
-        self.ensure_kernel(kname, ksrc, kname)?;
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "gemm_qkv_hfq4g256_wmma",
+            kernels::GEMM_QKV_HFQ4G256_WMMA_SRC,
+            "gemm_qkv_hfq4g256_wmma",
+        )?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
 
         let mut aq = a_q.buf.as_ptr();
@@ -11704,16 +11352,16 @@ impl Gpu {
 
         let total_m = q_m + k_m + v_m;
         let row_tiles = (total_m + 15) / 16;
-        let batch_tiles = (batch_size + n_tile - 1) / n_tile;
+        let batch_tiles = (batch_size + 15) / 16;
 
         let bytes = crate::profile::gemv_hfq4g256_bytes(q_m, k)
             + crate::profile::gemv_hfq4g256_bytes(k_m, k)
             + crate::profile::gemv_hfq4g256_bytes(v_m, k)
             + batch_size * k * 2
             + batch_size * total_m * 4 * 2;
-        let timer = crate::profile::begin_timer(&self.hip, "gemm", kname, bytes);
+        let timer = crate::profile::begin_timer(&self.hip, "gemm", "gemm_qkv_hfq4g256_wmma", bytes);
         let result = self.launch_maybe_blob(
-            kname,
+            "gemm_qkv_hfq4g256_wmma",
             [row_tiles as u32, batch_tiles as u32, 1],
             [32, 1, 1],
             0,
@@ -12833,22 +12481,6 @@ impl Gpu {
                     64,
                     16,
                 ),
-                // bt2/bt4 = batch-tiled: B independent acc chains reuse weights
-                // across B batch tiles per block. Halves/quarters grid in N.
-                Some("bt2") => (
-                    "gemm_gate_up_hfq4g256_wmma_bt2",
-                    kernels::GEMM_GATE_UP_HFQ4G256_WMMA_BT_SRC,
-                    16,
-                    32,
-                    32,
-                ),
-                Some("bt4") => (
-                    "gemm_gate_up_hfq4g256_wmma_bt4",
-                    kernels::GEMM_GATE_UP_HFQ4G256_WMMA_BT_SRC,
-                    16,
-                    32,
-                    64,
-                ),
                 _ => {
                     let def = if self.arch_caps.is_rdna3p5() {
                         // RDNA3.5 iGPU (gfx1150/1151/1152): narrow-BW LPDDR5; the
@@ -12865,31 +12497,25 @@ impl Gpu {
                             16,
                         )
                     } else if self.arch_caps.is_rdna3_dgpu() {
-                        // gfx1100/1101/1102 (RDNA3 dGPU): batch-tiled B=2 variant
-                        // for prefill (batch_size >= 32): 2 independent acc chains
-                        // reuse weights across 2 N-tiles, halving the N-grid and
-                        // +22% per-kernel / +5.6% end-to-end prefill (2026-08-20,
-                        // 2 fresh-process A/B runs, qwen3.5-4b mq4 q8 KV).
-                        // For decode (batch_size < 32), the plain 1-acc WMMA is
-                        // better — bt2 would waste VGPRs on a dormant 2nd chain.
-                        // ldscoop was previously falsified here (303d69e9).
-                        if batch_size >= 32 && !self.flags.bt2_disable {
-                            (
-                                "gemm_gate_up_hfq4g256_wmma_bt2",
-                                kernels::GEMM_GATE_UP_HFQ4G256_WMMA_BT_SRC,
-                                16,
-                                32,
-                                32,
-                            )
-                        } else {
-                            (
-                                "gemm_gate_up_hfq4g256_wmma",
-                                kernels::GEMM_GATE_UP_HFQ4G256_WMMA_SRC,
-                                16,
-                                32,
-                                16,
-                            )
-                        }
+                        // gfx1100/1101/1102 (RDNA3 dGPU): ldscoop's LDS weight-staging
+                        // overhead exceeds its coalescing gain here. Falsified in
+                        // 303d69e9 ("ldscoop variant FALSIFIED — LDS overhead exceeds
+                        // coalescing gains") and re-confirmed by rocprofv3 2026-06-12:
+                        // on the 27B DFlash batched-verify gate_up the ldscoop variant
+                        // ran 0.343 ms/launch vs the plain WMMA 0.232 (+48%), the bulk
+                        // of a ~14% DFlash decode regression vs the ca30ca21 baseline.
+                        // e3232034 ("ldscoop on others") tuned the default for gfx1151
+                        // (nosync) but dumped RDNA3 dGPUs into the falsified ldscoop.
+                        // Restore the plain WMMA variant that ca30ca21 (dense-DFlash
+                        // perfmaxx) shipped. RDNA4 (else arm) is left on ldscoop pending
+                        // its own measurement on hiptrx/gfx1201.
+                        (
+                            "gemm_gate_up_hfq4g256_wmma",
+                            kernels::GEMM_GATE_UP_HFQ4G256_WMMA_SRC,
+                            16,
+                            32,
+                            16,
+                        )
                     } else {
                         (
                             "gemm_gate_up_hfq4g256_wmma_ldscoop",
@@ -22149,38 +21775,19 @@ impl Gpu {
         batch_size: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        let ksplit_bt2_ks2 = std::env::var("HIPFIRE_KSPLIT_DET_BT2_KS2").as_deref() == Ok("1");
-        let ksplit_bt2_force = std::env::var("HIPFIRE_KSPLIT_DET_BT2_FORCE").as_deref() == Ok("1");
-        let use_bt2 = ksplit_bt2_force
-            || (batch_size >= 32 && self.arch_caps.is_rdna3_dgpu() && !self.flags.bt2_disable);
-        let (kname, ksrc, n_tile, k_splits, fin_name, fin_src) = if use_bt2 && ksplit_bt2_ks2 {
-            (
-                "gemm_hfq4g256_residual_wmma_ksplit_det_bt2_ks2",
-                kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_KSPLIT_DET_BT2_KS2_SRC,
-                32,
-                2u32,
-                "gemm_ksplit_det_finalize_ks2",
-                kernels::GEMM_KSPLIT_DET_FINALIZE_KS2_SRC,
-            )
-        } else if use_bt2 {
-            (
-                "gemm_hfq4g256_residual_wmma_ksplit_det_bt2",
-                kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_KSPLIT_DET_BT2_SRC,
-                32,
-                4u32,
-                "gemm_ksplit_det_finalize",
-                kernels::GEMM_KSPLIT_DET_FINALIZE_SRC,
-            )
-        } else {
-            (
-                "gemm_hfq4g256_residual_wmma_ksplit_det",
-                kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_KSPLIT_DET_SRC,
-                16,
-                4u32,
-                "gemm_ksplit_det_finalize",
-                kernels::GEMM_KSPLIT_DET_FINALIZE_SRC,
-            )
-        };
+        // (The batch-tiled B=2 / 2-split variants that used to be selected here
+        // were removed 2026-10-09 with the rest of the v1-only surface: their
+        // kernels are HFQ4-G256-only, and Magnum V2 dtypes take the
+        // `gemm_mq4g256v2_residual_wmma` family, which already ships its own
+        // batch-tiled arms upstream.)
+        let (kname, ksrc, n_tile, k_splits, fin_name, fin_src) = (
+            "gemm_hfq4g256_residual_wmma_ksplit_det",
+            kernels::GEMM_HFQ4G256_RESIDUAL_WMMA_KSPLIT_DET_SRC,
+            16,
+            4u32,
+            "gemm_ksplit_det_finalize",
+            kernels::GEMM_KSPLIT_DET_FINALIZE_SRC,
+        );
         self.ensure_kernel(kname, ksrc, kname)?;
         self.ensure_kernel(fin_name, fin_src, fin_name)?;
         let x_f16_ptr = self.ensure_fp16_x(x, batch_size * k)?;
@@ -26948,53 +26555,48 @@ impl Gpu {
         // Host-gated identity; reuses fused_gate_up_hfq4g256 arithmetic template.
         let glimmer_gate_up_k6656_gfx1100 =
             self.arch_caps.is_gfx1100() && gate_m == 19_968 && up_m == 19_968 && k == 6_656;
-        // NOTE: the 4B FFN shape (9216/9216/2560) admission is EXPLICIT OPT-IN ONLY.
-        // The stage_x32 schedule HANGS on that shape (GPU pegged at 100% on an
-        // unfinished kernel; observed twice on gfx1100 2026-08-23). Do not make it
-        // default-on for the 4B shape without fixing the underlying kernel first.
         let dense_gate_up_stage_x32_gfx1100 = self.arch_caps.is_gfx1100()
-            && ((gate_m == 17_408
-                && up_m == 17_408
-                && k == 5_120
-                && *DISPATCH_GFX1100_DENSE_GATE_UP_STAGE_X32)
-                || (gate_m == 9_216
-                    && up_m == 9_216
-                    && k == 2_560
-                    && hipfire_config::developer_bool(
-                        "HIPFIRE_GFX1100_DENSE_GATE_UP_STAGE_X32",
-                        false,
-                    )));
+            && gate_m == 17_408
+            && up_m == 17_408
+            && k == 5_120
+            && *DISPATCH_GFX1100_DENSE_GATE_UP_STAGE_X32;
         let dense_gate_up_pair_gfx1100 = self.arch_caps.is_gfx1100()
-            && ((gate_m == 17_408 && up_m == 17_408 && k == 5_120)
-                || (gate_m == 9_216 && up_m == 9_216 && k == 2_560))
+            && gate_m == 17_408
+            && up_m == 17_408
+            && k == 5_120
             && *DISPATCH_GFX1100_DENSE_GATE_UP_PAIR;
         let dense_gate_up_pair2_gfx1100 = self.arch_caps.is_gfx1100()
-            && ((gate_m == 17_408 && up_m == 17_408 && k == 5_120)
-                || (gate_m == 9_216 && up_m == 9_216 && k == 2_560))
+            && gate_m == 17_408
+            && up_m == 17_408
+            && k == 5_120
             && *DISPATCH_GFX1100_DENSE_GATE_UP_PAIR2;
         // Qwen3.6-27B MQ4, W7900/gfx1100: two fresh-process alternating
         // campaigns measured +0.42% and +0.49% decode throughput. Keep this
         // explicit because the algebraic rewrite changes FP association even
         // though the screened 65-token greedy trace remained byte-exact.
         let dense_gate_up_dot_reform_gfx1100 = self.arch_caps.is_gfx1100()
-            && ((gate_m == 17_408 && up_m == 17_408 && k == 5_120)
-                || (gate_m == 9_216 && up_m == 9_216 && k == 2_560))
+            && gate_m == 17_408
+            && up_m == 17_408
+            && k == 5_120
             && *DISPATCH_GFX1100_DENSE_GATE_UP_DOT_REFORM;
         // Qwen3.6-27B MQ4, W7900/gfx1100: a fresh-process 128-token
         // A/B/B/A measured +0.42% throughput and -0.42% p50 latency. Keep
         // opt-in: 92 VGPR remains spill-free, but the gain is too small to
         // promote without broader hardware evidence.
         let dense_gate_up_quad_prefetch_gfx1100 = self.arch_caps.is_gfx1100()
-            && ((gate_m == 17_408 && up_m == 17_408 && k == 5_120)
-                || (gate_m == 9_216 && up_m == 9_216 && k == 2_560))
+            && gate_m == 17_408
+            && up_m == 17_408
+            && k == 5_120
             && *DISPATCH_GFX1100_DENSE_GATE_UP_QUAD_PREFETCH;
         let dense_gate_up_setprio_gfx1100 = self.arch_caps.is_gfx1100()
-            && ((gate_m == 17_408 && up_m == 17_408 && k == 5_120)
-                || (gate_m == 9_216 && up_m == 9_216 && k == 2_560))
+            && gate_m == 17_408
+            && up_m == 17_408
+            && k == 5_120
             && *DISPATCH_GFX1100_DENSE_GATE_UP_SETPRIO;
         let dense_gate_up_lane0_headers_gfx1100 = self.arch_caps.is_gfx1100()
-            && ((gate_m == 17_408 && up_m == 17_408 && k == 5_120)
-                || (gate_m == 9_216 && up_m == 9_216 && k == 2_560))
+            && gate_m == 17_408
+            && up_m == 17_408
+            && k == 5_120
             && *DISPATCH_GFX1100_DENSE_GATE_UP_LANE0_HEADERS;
         let dense_gate_up_dot_prefetch_gfx1100 =
             dense_gate_up_dot_reform_gfx1100 && dense_gate_up_quad_prefetch_gfx1100;

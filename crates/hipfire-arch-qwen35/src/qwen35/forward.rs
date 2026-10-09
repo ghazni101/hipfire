@@ -2812,26 +2812,6 @@ fn paro_to_givens(p: &ParoRotation) -> GivensRef<'_> {
 /// dispatch (including ParoQ4G128 which does individual Givens-rotated GEMV calls).
 /// Replaces rmsnorm_rotate_dispatch + fused_qkvza_dispatch.
 #[allow(clippy::too_many_arguments)]
-/// Opt-in gate for the qkvza consumer-fold: gfx1100, G256 MQ/HFQ dtype with
-/// AWQ scales, K aligned to the 256-value rotation group.
-///
-/// MEASURED STRONGLY NEGATIVE on gfx1100 (amendment 3 of the 2026-08-23
-/// campaign checkpoint: −26% decode when engaged); kept wired only as a
-/// negative oracle. gfx1101 admission exists under the experimental
-/// `HIPFIRE_GFX1101_GFX1100_CAMPAIGN` gate for diagnostic A/B on the same
-/// ISA: the fold's numerics are arch-portable (probe bit-exact on gfx1101),
-/// but the perf verdict is fixture-bound and must be re-measured per part.
-fn qkvza_fusednorm_fold_enabled(gpu: &Gpu, wqkv: &WeightTensor) -> bool {
-    static FUSEDNORM_QKVZA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    (gpu.arch_caps.is_gfx1100() || gfx1101_campaign_gates_enabled(gpu))
-        && wqkv.k % 256 == 0
-        && matches!(wqkv.gpu_dtype, DType::MQ4G256 | DType::HFQ4G256)
-        && wqkv.awq_scale.is_some()
-        && *FUSEDNORM_QKVZA.get_or_init(|| {
-            hipfire_config::developer_var("HIPFIRE_QKVZA_FUSEDNORM").as_deref() == Ok("1")
-        })
-}
-
 fn qkvza_via_execute_steps(
     gpu: &mut Gpu,
     ctx: &DispatchCtx,
@@ -3041,31 +3021,6 @@ fn qkv_via_execute_steps(
     fa_v: &GpuTensor,
     eps: f32,
 ) -> HipResult<()> {
-    // Consumer-fold lever (HIPFIRE_QKVZA_FUSEDNORM=1): same bit-exact fold as
-    // qkvza_via_execute_steps, applied to the FA-layer qkv projection.
-    // NOTE: measured negative on Qwen3.5-4B (94us/call vs 39us producer+consumer
-    // pair) - kept behind its OWN opt-in flag, deliberately NOT covered by
-    // HIPFIRE_QKVZA_FUSEDNORM. See perf-checkpoints/2026-08-22 campaign doc.
-    static FUSEDNORM_QKV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let fusednorm_qkv = *FUSEDNORM_QKV.get_or_init(|| {
-        hipfire_config::developer_var("HIPFIRE_QKV_FUSEDNORM")
-            .ok()
-            .as_deref()
-            == Some("1")
-    });
-    if fusednorm_qkv
-        && gpu.arch_caps.is_gfx1100()
-        && wq.k % 256 == 0
-        && matches!(wq.gpu_dtype, DType::MQ4G256 | DType::HFQ4G256)
-    {
-        if let Some(awq) = wq.awq_scale.as_ref() {
-            return gpu.fused_qkv_hfq4g256_fusednorm(
-                &wq.buf, &wk.buf, &wv.buf, x, attn_norm, awq, fa_q, fa_k, fa_v, wq.m, wk.m, wv.m,
-                wq.k, eps,
-            );
-        }
-    }
-
     let rotation = dtype_rotation_plan(wq.gpu_dtype);
     if rotation == RotationPlan::Givens {
         let wrq = WeightRef {
@@ -3216,40 +3171,6 @@ fn gate_up_via_execute_steps(
     up_out: &GpuTensor,
     eps: f32,
 ) -> HipResult<()> {
-    // Consumer-fold lever (HIPFIRE_QKVZA_FUSEDNORM=1): FFN gate_up variant.
-    // NOTE: measured strongly negative on Qwen3.5-4B (156us/call vs ~27us
-    // producer+consumer pair; 13824-row grid makes pass-A redundancy overwhelm
-    // L2) - kept behind its OWN opt-in flag, deliberately NOT covered by
-    // HIPFIRE_QKVZA_FUSEDNORM. See perf-checkpoints/2026-08-22 campaign doc.
-    static FUSEDNORM_GU: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let fusednorm_gu = *FUSEDNORM_GU.get_or_init(|| {
-        hipfire_config::developer_var("HIPFIRE_GATE_UP_FUSEDNORM")
-            .ok()
-            .as_deref()
-            == Some("1")
-    });
-    if fusednorm_gu
-        && gpu.arch_caps.is_gfx1100()
-        && w_gate.k % 256 == 0
-        && matches!(w_gate.gpu_dtype, DType::MQ4G256 | DType::HFQ4G256)
-    {
-        if let Some(awq) = w_gate.awq_scale.as_ref() {
-            return gpu.fused_gate_up_hfq4g256_fusednorm(
-                &w_gate.buf,
-                &w_up.buf,
-                x,
-                ffn_norm,
-                awq,
-                gate_out,
-                up_out,
-                w_gate.m,
-                w_up.m,
-                w_gate.k,
-                eps,
-            );
-        }
-    }
-
     let rotation = dtype_rotation_plan(w_gate.gpu_dtype);
     if rotation == RotationPlan::Givens {
         let wrg = WeightRef {
@@ -6306,35 +6227,6 @@ impl<'a> ForwardBindings for Qwen35Bindings<'a> {
                         &s.dn_z,
                         &s.dn_beta,
                         &s.dn_alpha,
-                    )
-                } else if qkvza_fusednorm_fold_enabled(gpu, wqkv) {
-                    // Consumer-fold lever (HIPFIRE_QKVZA_FUSEDNORM=1): fold
-                    // rmsnorm+AWQ+FWHT into the fused_qkvza GEMV prologue.
-                    // Bit-exact (descending-tree shuffle reduction; probe
-                    // BITEXACT + byte-identical greedy output). MEASURED
-                    // STRONGLY NEGATIVE e2e on qwen3.5-4b (gen 68-150 vs
-                    // OFF 197-199 tok/s): prologue redundancy across the
-                    // ~12k-row grid overwhelms the saved producer launch -
-                    // same failure mode as the gate_up fold. Default OFF;
-                    // kept as a wired negative oracle.
-                    gpu.fused_qkvza_hfq4g256_fusednorm(
-                        &wqkv.buf,
-                        &wz.buf,
-                        &w_beta.buf,
-                        &w_alpha.buf,
-                        &s.x,
-                        attn_norm,
-                        wqkv.awq_scale.as_ref().expect("awq checked by gate"),
-                        &s.dn_qkv,
-                        &s.dn_z,
-                        &s.dn_beta,
-                        &s.dn_alpha,
-                        wqkv.m,
-                        wz.m,
-                        w_beta.m,
-                        w_alpha.m,
-                        wqkv.k,
-                        config.norm_eps,
                     )
                 } else if qkvza_scalar_prep_enabled(
                     gpu,

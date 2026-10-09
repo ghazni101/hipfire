@@ -177,10 +177,6 @@ name = "probe_fa_kvwrite"
 required-features = ["deltanet"]
 
 [[example]]
-name = "probe_qkvza_fusednorm"
-required-features = ["deltanet"]
-
-[[example]]
 name = "dflash_spec_demo"
 required-features = []
 
