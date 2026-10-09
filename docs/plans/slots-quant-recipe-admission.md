@@ -232,19 +232,32 @@ marked untested-hw in code; on gfx1101 behavior is byte-identical to before
 
 ## 9 · What remains (follow-ups, in priority order)
 
-1. V-serve (§7) — the claim-scoped serve route for the mixed-recipe
-   admission change.
-2. bf16 end-to-end parity root-cause: kernel-level parity is bit-exact
-   (`test_bf16_slots_parity.rs`) yet full-model logits diverge ~6x the
-   golden tolerance on one element, unchanged by switching the slots attend
-   arm to `attention_bf16_kv_batched_slots`. Next instrument: layer-level
-   bisect (`hipfire-runtime/examples/bisect_forward_slots.rs` pattern) on
-   the bf16 tier, then compare the sequential reference's actual attend
-   key per call (`bf16_attend_key` heuristic: flash_mode/capture-dependent)
-   against the slots arm.
+1. ~~V-serve (§7)~~ — **re-validated 2026-10-09** on the beta rebase with a
+   fresh local tierpro requant (§7 V-serve): golden 40/40, serve battery
+   5/5 clean.
+2. bf16 end-to-end parity root-cause — **localized 2026-10-09 by layer
+   bisect** (`bisect_forward_slots <model> bf16`, gfx1101,
+   qwen3.5-4b.mq4, 5-token prefill): divergence is EXACTLY zero through
+   the pre-KV DeltaNet layers (L2, L3: 0.0000), first appears at L4 —
+   the first KV-carrying (FullAttention) layer — at ~8.5e-4 abs, grows
+   ~1.5x per FA layer through the GDN recurrence, and materializes at
+   L20 (FullAttention, rel 0.021 vs 0.0001-0.0003 for L4-L19) when a
+   compounded difference flips an attention selection. So the seed is a
+   small prefill-shape difference in the bf16 KV write/attend path at
+   the FIRST KV layer, not a layer-20 bug. Sharpened next step:
+   `test_bf16_slots_parity.rs` covers descriptor-plumbing parity of the
+   batched kernel at decode-shaped calls; extend it (or a sibling) to
+   the M>1 prefill attend shape vs the sequential single-sequence
+   selection (`AttnBf16Kv` scalar — pos<2048, flash off, no capture) to
+   catch the seed directly.
 3. gfx1201 host validation of fp8 slots (untested-hw markers in code).
 4. Sequential fwht3 decode IMA bisect (§5 open item).
 5. ~~D2 serve-fix cherry-picks~~ — **done 2026-10-09**: satisfied by the
    beta rebase (all four landed upstream pre-`740818f37`); thinking-low
    multi-slot battery validates the serve thinking path on gfx1101 (§7 D2).
-6. Load-time preflight promotion of the per-site plans (A3 follow-up).
+6. Load-time preflight promotion of the per-site plans (A3 follow-up) —
+   quantified 2026-10-09: `plan_proj_group_dtypes` is a pure match chain
+   over ≤5 (dtype, has_awq) members, ~5µs/step total across ~100
+   group sites (32 layers x ~3 groups) against a ~10ms GPU step
+   (<0.05%). Recommend NOT memoizing unless a host-bound profile ever
+   shows it; a global cache is unmeasurable complexity for this win.
