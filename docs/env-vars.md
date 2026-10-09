@@ -418,15 +418,15 @@ shapes before measurement.
 
 | Variable | Notes |
 |---|---|
-| `HIPFIRE_FA_KVWRITE_FOLD=1` | Fold the single-token Q8_0 K/V cache write into the gfx1100 FA-prep epilogue (16Q/4K, head_dim 256, non-compact decode). +0.5-1% decode. |
-| `HIPFIRE_QKVZA_FUSEDNORM=1` | **Negative oracle.** rmsnorm+AWQ+FWHT folded into the qkvza GEMV prologue; bit-exact but measured −26% decode on qwen3.5-4b. Kept wired for A/B proof, never enable. |
-| `HIPFIRE_QKV_FUSEDNORM=1` / `HIPFIRE_GATE_UP_FUSEDNORM=1` | **Negative oracles** (FA-layer qkv / FFN gate_up twins of the above), measured strongly negative; opt-in research only. |
-| `HIPFIRE_LM_HEAD_HFQ4=1` / `HIPFIRE_LM_HEAD_HFQ3=1` / `HIPFIRE_LM_HEAD_HFQ2=1` | Research-only load-time requant of a Q8_0 output projection to HFQ{4,3,2}G256 (disk file untouched). HFQ3 measured best (+~9-10% decode, lossy). Excluded from campaign headline numbers by scope ruling. |
-| `HIPFIRE_BT2_DISABLE=1` | Kill switch for the batch-tiled B=2 WMMA prefill GEMMs (default **on** for batch ≥ 32 on gfx1100/1101/1102; +29% 27B pp32 prefill, see perf-checkpoints/2026-10-09-bt2-prefill-wmma-gfx1100-27b.md). |
+| `HIPFIRE_FA_KVWRITE_FOLD=1` | Fold the single-token Q8_0 K/V cache write into the FA-prep epilogue (16Q/4K, head_dim 256, non-compact decode). Bit-exact (probe + greedy e2e). Decode: +0.5-1% (gfx1100 fixture record); +0.19% paired, 10/15 wins (gfx1101, 2026-10-09 verify). |
+| `HIPFIRE_QKVZA_FUSEDNORM=1` | **Negative oracle.** rmsnorm+AWQ+FWHT folded into the qkvza GEMV prologue; bit-exact but measured −26% decode on gfx1100 (2026-08 record) and −24% on gfx1101 (perf-checkpoints/2026-10-09-qkvza-fusednorm-oracle-gfx1101.md). gfx1100 by default; gfx1101 additionally under the experimental campaign gate below. Kept wired for A/B proof, never enable. |
+| `HIPFIRE_QKV_FUSEDNORM=1` / `HIPFIRE_GATE_UP_FUSEDNORM=1` | **Negative oracles** (FA-layer qkv / FFN gate_up twins of the above), measured strongly negative on gfx1100; gfx1100-gated, opt-in research only. |
+| `HIPFIRE_LM_HEAD_HFQ4=1` / `HIPFIRE_LM_HEAD_HFQ3=1` / `HIPFIRE_LM_HEAD_HFQ2=1` | Research-only load-time requant of a Q8_0 output projection to HFQ{4,3,2}G256 (disk file untouched). Lossy: output diverges from the Q8_0 head's tokens. HFQ3 decode: +~10% (gfx1100 record); +13.5% (gfx1101, 2026-10-09 verify). Excluded from campaign headline numbers by scope ruling. |
+| `HIPFIRE_BT2_DISABLE=1` | Kill switch for the batch-tiled B=2 WMMA prefill GEMMs (default **on** for batch ≥ 32 on gfx1100/1101/1102). Prefill: +29% pp32 on 27B/gfx1100 (2026-08 deep A/B record); +35.3% pp64 on 4B/gfx1101 with the kill switch collapsing it to master (2026-10-09 verify). Flat at pp2048 on both. |
 | `HIPFIRE_QKVZA_BT2_FORCE=1` / `HIPFIRE_QKV_BT2_FORCE=1` / `HIPFIRE_QKV_BT2_DISABLE=1` / `HIPFIRE_KSPLIT_DET_BT2_FORCE=1` / `HIPFIRE_KSPLIT_DET_BT2_KS2=1` | Per-GEMM BT2 force/disable arms for kernel probing. |
 | `HIPFIRE_RESIDUAL_PERSIST_R2=1` / `HIPFIRE_RESIDUAL_PERSIST_SCOPE` / `HIPFIRE_RESIDUAL_LUT=1` / `HIPFIRE_RESIDUAL_DUALROW=1` / `HIPFIRE_XLDS_R` | **Negative oracles** on the residual GEMV family (persist dual-row, per-group dequant LUT, dualrow schedule, LDS-staged activation sharing). All measured flat-to-negative in-engine; kept as wired falsification evidence. |
 | `HIPFIRE_AWQ_NORM_WAVEGRID=1` | Exact-tree multi-CU AWQ norm (null result, token-exact; infrastructure kept). |
-| `HIPFIRE_GFX1101_GFX1100_CAMPAIGN=1` | **Experimental**: admit the gfx1100-certified campaign fusions on gfx1101 (same RDNA3 ISA). Diagnostic A/B only, not a certified path. |
+| `HIPFIRE_GFX1101_GFX1100_CAMPAIGN=1` | **Experimental**: admit the gfx1100-certified campaign fusions — and the qkvza fusednorm negative oracle for diagnostic A/B — on gfx1101 (same RDNA3 ISA). Diagnostic only, not a certified path; `probe_fa_prep` shows 1-ulp rope-branch diffs on gfx1101. |
 | `HIPFIRE_SLOW_TOKEN_LOG=1` | bench_qwen35_mq4 prints any decode token slower than 50 ms (environmental-contention detector). |
 
 ---

@@ -2814,9 +2814,16 @@ fn paro_to_givens(p: &ParoRotation) -> GivensRef<'_> {
 #[allow(clippy::too_many_arguments)]
 /// Opt-in gate for the qkvza consumer-fold: gfx1100, G256 MQ/HFQ dtype with
 /// AWQ scales, K aligned to the 256-value rotation group.
+///
+/// MEASURED STRONGLY NEGATIVE on gfx1100 (amendment 3 of the 2026-08-23
+/// campaign checkpoint: −26% decode when engaged); kept wired only as a
+/// negative oracle. gfx1101 admission exists under the experimental
+/// `HIPFIRE_GFX1101_GFX1100_CAMPAIGN` gate for diagnostic A/B on the same
+/// ISA: the fold's numerics are arch-portable (probe bit-exact on gfx1101),
+/// but the perf verdict is fixture-bound and must be re-measured per part.
 fn qkvza_fusednorm_fold_enabled(gpu: &Gpu, wqkv: &WeightTensor) -> bool {
     static FUSEDNORM_QKVZA: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    gpu.arch_caps.is_gfx1100()
+    (gpu.arch_caps.is_gfx1100() || gfx1101_campaign_gates_enabled(gpu))
         && wqkv.k % 256 == 0
         && matches!(wqkv.gpu_dtype, DType::MQ4G256 | DType::HFQ4G256)
         && wqkv.awq_scale.is_some()
