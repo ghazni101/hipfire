@@ -45,7 +45,6 @@ use hipfire_runtime::model_load::load_weights as rt_load_weights;
 use hipfire_runtime::model_load::load_weights_with_fault as rt_load_weights_with_fault;
 use hipfire_runtime::model_load::LoadedWeights;
 pub use hipfire_runtime::model_load::StagedLoadFault;
-use hipfire_runtime::model_load::LoadedWeights;
 use hipfire_runtime::model_load::WeightSource;
 use hipfire_runtime::model_source::ModelSource;
 use hipfire_runtime::paro::paro_load_norm;
