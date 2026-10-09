@@ -422,9 +422,11 @@ shapes before measurement.
 | `HIPFIRE_QKVZA_FUSEDNORM=1` | **Negative oracle.** rmsnorm+AWQ+FWHT folded into the qkvza GEMV prologue; bit-exact but measured −26% decode on gfx1100 (2026-08 record) and −24% on gfx1101 (perf-checkpoints/2026-10-09-qkvza-fusednorm-oracle-gfx1101.md). gfx1100 by default; gfx1101 additionally under the experimental campaign gate below. Kept wired for A/B proof, never enable. |
 | `HIPFIRE_QKV_FUSEDNORM=1` / `HIPFIRE_GATE_UP_FUSEDNORM=1` | **Negative oracles** (FA-layer qkv / FFN gate_up twins of the above), measured strongly negative on gfx1100; gfx1100-gated, opt-in research only. |
 | `HIPFIRE_LM_HEAD_HFQ4=1` / `HIPFIRE_LM_HEAD_HFQ3=1` / `HIPFIRE_LM_HEAD_HFQ2=1` | Research-only load-time requant of a Q8_0 output projection to HFQ{4,3,2}G256 (disk file untouched). Lossy: output diverges from the Q8_0 head's tokens. HFQ3 decode: +~10% (gfx1100 record); +13.5% (gfx1101, 2026-10-09 verify). Excluded from campaign headline numbers by scope ruling. |
-| `HIPFIRE_BT2_DISABLE=1` | Kill switch for the batch-tiled B=2 WMMA prefill GEMMs (default **on** for batch ≥ 32 on gfx1100/1101/1102). Prefill: +29% pp32 on 27B/gfx1100 (2026-08 deep A/B record); +35.3% pp64 on 4B/gfx1101 with the kill switch collapsing it to master (2026-10-09 verify). Flat at pp2048 on both. |
+| `HIPFIRE_BT2_DISABLE=1` | Kill switch for the batch-tiled B=2 WMMA prefill GEMMs (default **on** for batch ≥ 32 on gfx1100/1101/1102). Prefill: +29% pp32 on 27B/gfx1100 (2026-08 deep A/B record — fixture `qwen3.8-27b.mq4` md5 `2fb2edc2…`); +35.3% pp64 on 4B/gfx1101 with the kill switch collapsing it to master (2026-10-09 verify). **Scope from the 2026-10-09 re-verify:** the BT2 kernels are HFQ4-G256-only and are *inert* on the MQ4V2 `qwen3.8-27b.mq4-xt` default artifact (branch ≡ `BT2_DISABLE` ≡ master there), and the `+29%` does not reproduce on today's `qwen3.8-27b.mq4` bytes (HF re-uploaded that file; the recorded md5 is stale) — master and branch both read ~460 tok/s pp32. On the 4B the lever reproduces: +22% pp64, +0 at pp2048. |
 | `HIPFIRE_QKVZA_BT2_FORCE=1` / `HIPFIRE_QKV_BT2_FORCE=1` / `HIPFIRE_QKV_BT2_DISABLE=1` / `HIPFIRE_KSPLIT_DET_BT2_FORCE=1` / `HIPFIRE_KSPLIT_DET_BT2_KS2=1` | Per-GEMM BT2 force/disable arms for kernel probing. |
-| `HIPFIRE_RESIDUAL_PERSIST_R2=1` / `HIPFIRE_RESIDUAL_PERSIST_SCOPE` / `HIPFIRE_RESIDUAL_LUT=1` / `HIPFIRE_RESIDUAL_DUALROW=1` / `HIPFIRE_XLDS_R` | **Negative oracles** on the residual GEMV family (persist dual-row, per-group dequant LUT, dualrow schedule, LDS-staged activation sharing). All measured flat-to-negative in-engine; kept as wired falsification evidence. |
+| `HIPFIRE_RESIDUAL_PERSIST_R2=1` / `HIPFIRE_RESIDUAL_PERSIST_SCOPE` / `HIPFIRE_RESIDUAL_LUT=1` | **Negative oracles** on the residual GEMV family (persistent dual-row, per-group dequant LUT). Both measured flat-to-negative in-engine (rocprof-verified identical kernel durations for persist_r2; LUT −1%); kept as wired falsification evidence. |
+| `HIPFIRE_RESIDUAL_DUALROW=1` | Selects the generic dual-row residual kernel (`gemv_hfq4g256_residual*.hip`, two rows per wave32 block) in place of the default `stage_x32` schedule, keeping that kernel's legacy M-sized launch. Opt-in oracle only; measured negative. Not a default path. |
+| ~~`HIPFIRE_XLDS_R`~~ | **Removed 2026-10-09.** The LDS-staged activation residual probe was invalid: its kernel paired nibbles 4..7 of each lane's word with x offsets 0..3 (it needed a second `float4` at +4), so it never computed the GEMV it claimed, and its launch requested 0 bytes of dynamic LDS for a kernel that stages `k` floats in `extern __shared__`. The 2026-08 amendment-2k `-16%..-37%` table and its "BITEXACT" claim are void; see [`docs/perf-checkpoints/2026-10-09-gfx1100-campaign-reverify.md`](perf-checkpoints/2026-10-09-gfx1100-campaign-reverify.md). |
 | `HIPFIRE_AWQ_NORM_WAVEGRID=1` | Exact-tree multi-CU AWQ norm (null result, token-exact; infrastructure kept). |
 | `HIPFIRE_GFX1101_GFX1100_CAMPAIGN=1` | **Experimental**: admit the gfx1100-certified campaign fusions — and the qkvza fusednorm negative oracle for diagnostic A/B — on gfx1101 (same RDNA3 ISA). Diagnostic only, not a certified path; `probe_fa_prep` shows 1-ulp rope-branch diffs on gfx1101. |
 | `HIPFIRE_SLOW_TOKEN_LOG=1` | bench_qwen35_mq4 prints any decode token slower than 50 ms (environmental-contention detector). |
@@ -558,7 +560,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1468
+**Count:** 1467
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -2029,7 +2031,6 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_XDNA_INSTS` | crates/hipfire-xdna/src/lib.rs | developer |
 | `HIPFIRE_XDNA_MKN` | crates/hipfire-xdna/src/lib.rs | developer |
 | `HIPFIRE_XDNA_PDI` | crates/hipfire-xdna/src/lib.rs | developer |
-| `HIPFIRE_XLDS_R` | crates/rdna-compute/src/gemv.rs | developer |
 
 <!-- env-inventory:end -->
 
