@@ -1462,7 +1462,11 @@ impl Gpu {
                 "fused FA prep + KV fold requires the certified 16Q/4K shape",
             ));
         }
-        if !self.arch_caps.is_gfx1100() {
+        if !(self.arch_caps.is_gfx1100()
+            || (self.arch_caps.is_gfx1101()
+                && hipfire_config::developer_var("HIPFIRE_GFX1101_GFX1100_CAMPAIGN").as_deref()
+                    == Ok("1")))
+        {
             return Err(hip_bridge::HipError::new(
                 1,
                 "fused FA prep + KV fold is certified only on gfx1100",
@@ -5089,7 +5093,11 @@ impl Gpu {
         n_v_heads: usize,
     ) -> HipResult<()> {
         self.bind_thread()?;
-        if !self.arch_caps.is_gfx1100() || head_dim != 128 || n_v_heads > 256 {
+        let gfx1100_route = self.arch_caps.is_gfx1100()
+            || (self.arch_caps.is_gfx1101()
+                && hipfire_config::developer_var("HIPFIRE_GFX1101_GFX1100_CAMPAIGN").as_deref()
+                    == Ok("1"));
+        if !gfx1100_route || head_dim != 128 || n_v_heads > 256 {
             return Err(hip_bridge::HipError::new(
                 0,
                 "conv scalar-prep fusion requires gfx1100, head_dim=128, n_v_heads<=256",
