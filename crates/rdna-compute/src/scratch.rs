@@ -295,8 +295,8 @@ pub struct ScratchState {
     /// Zeroed head-pair arrival counters of the fused GDN step's rotation
     /// epilogue (each launch leaves them zero).
     pub gdn_pair_counters: Option<DeviceBuffer>,
-    /// Persistent gfx1100 AWQ RMSNorm wavegrid state: 32 f32 group partials,
-    /// one f32 RMS, three u32 epoch counters, padded to 256 bytes.
+    /// Persistent gfx1100 AWQ RMSNorm wavegrid state: 256 f32 per-thread
+    /// partials, one f32 RMS, three u32 epoch counters, padded to 2048 bytes.
     pub mq_rmsnorm_awq_wavegrid_scratch: Option<DeviceBuffer>,
     /// Dedicated F32 temporary for the unfused GEMV-residual alias fallback.
     /// Lazily allocated and grown on demand; no other scratch path uses it.

@@ -3053,7 +3053,11 @@ fn qkv_via_execute_steps(
             .as_deref()
             == Some("1")
     });
-    if fusednorm_qkv && gpu.arch_caps.is_gfx1100() && wq.k % 256 == 0 {
+    if fusednorm_qkv
+        && gpu.arch_caps.is_gfx1100()
+        && wq.k % 256 == 0
+        && matches!(wq.gpu_dtype, DType::MQ4G256 | DType::HFQ4G256)
+    {
         if let Some(awq) = wq.awq_scale.as_ref() {
             return gpu.fused_qkv_hfq4g256_fusednorm(
                 &wq.buf, &wk.buf, &wv.buf, x, attn_norm, awq, fa_q, fa_k, fa_v, wq.m, wk.m, wv.m,
@@ -3224,7 +3228,11 @@ fn gate_up_via_execute_steps(
             .as_deref()
             == Some("1")
     });
-    if fusednorm_gu && gpu.arch_caps.is_gfx1100() && w_gate.k % 256 == 0 {
+    if fusednorm_gu
+        && gpu.arch_caps.is_gfx1100()
+        && w_gate.k % 256 == 0
+        && matches!(w_gate.gpu_dtype, DType::MQ4G256 | DType::HFQ4G256)
+    {
         if let Some(awq) = w_gate.awq_scale.as_ref() {
             return gpu.fused_gate_up_hfq4g256_fusednorm(
                 &w_gate.buf,
