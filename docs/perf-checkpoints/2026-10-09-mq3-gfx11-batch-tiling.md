@@ -121,6 +121,39 @@ bands the binary is behaviorally identical to master, and the identity rows
 (48/192/224) plus 4096 verify that directly. Decode at ctx2048 (+3.1%) is the
 branch's decode fusions; mb4 never engages at batch 1.
 
+## Depth validation — 20k / 40k context (master `0f999cb4dc` vs branch)
+
+Does any of it hold at depth? Yes, with the expected shape (product bench,
+fresh interleaved processes, 5-run medians, `--pp/--ctx 64,20480,40960`):
+
+4B `qwen3.5-4b.mq3`:
+
+| point | master | branch | Δ |
+|---|---|---|---|
+| decode @ctx64 | 198.93 | 206.13 | +3.6% |
+| decode @ctx20480 | 166.77 | 171.81 | **+3.0%** |
+| decode @ctx40960 | 140.67 | 144.37 | **+2.6%** |
+| pp64 prefill | 2942.8 | 3602.1 | +22.4% (the mb4 policy) |
+| pp20480 prefill | 2424.9 | 2415.6 | −0.4% (policy identical at 512-chunks) |
+| pp40960 prefill | 1729.3 | 1726.8 | −0.1% (") |
+
+4B `qwen3.5-4b.mq4` (the decode-fusion artifact):
+
+| point | master | branch | Δ |
+|---|---|---|---|
+| decode @ctx64 | 192.73 | 203.76 | +5.7% |
+| decode @ctx20480 | 162.96 | 171.13 | **+5.0%** |
+| decode @ctx40960 | 138.16 | 144.52 | **+4.6%** |
+| pp20480 / pp40960 prefill | — | — | +0.2% / +0.1% (flat) |
+
+Reading: the decode gains survive deep KV with mild attenuation
+(+5.7 → +4.6% and +3.6 → +2.6% from ctx 64 to 41k) — the per-token attention
+cost grows in both arms equally (mq4 decode drops 193 → 138 tok/s absolute),
+and the branch's fusions shave the same fixed per-token work. Long prefill at
+depth is flat for both artifacts: prefill GEMMs run in 512-token chunks where
+the two binaries dispatch identically by construction, and attention — which
+grows with depth — is untouched shared code. Nothing regresses at depth.
+
 ## What this does not change
 
 - MQ3G256V2 gfx1100 production quarantine (kept; see Measurement 1).
