@@ -75,11 +75,12 @@ test artifact was gone; a fresh one was quantized for verification (§7 B1).
 
 ## 5 · KV ladder — measured matrix (C1)
 
-Line-number corrigenda vs the pre-2026-10-04 draft: `kv_write_slots` =
-forward_slots.rs:~1796 (fp8 Err at ~L1981), `tier_attend_slots` = ~L1995
-(fp8 Err at ~L2215); `QWEN35_SLOTS_POLICY` = hipfire-runtime/src/kv_mode.rs:463.
+Line-number corrigenda vs the pre-2026-10-04 draft, re-anchored to the
+post-beta-rebase tree (6e0a92590): `kv_write_slots` =
+forward_slots.rs:~1850 (fp8 arm at ~L2041), `tier_attend_slots` = ~L2077
+(fp8 arm at ~L2313); `QWEN35_SLOTS_POLICY` = hipfire-runtime/src/kv_mode.rs:495.
 The qwen35 fp8 arch gates live at kv_mode.rs:30 (`qwen35_native_eligible`)
-and :236 (`qwen_auto_default_pair`); `resolve_qwen4` (kv_mode.rs:495) is the
+and :226 (`qwen_auto_default_pair`); `resolve_qwen4` (kv_mode.rs) is the
 qwen4 site, not qwen35.
 
 Instrument: `crates/saddle-lab/examples/test_forward_slots_golden.rs`,

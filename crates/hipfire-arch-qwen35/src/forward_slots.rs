@@ -649,6 +649,64 @@ fn plan_proj_group(
         .map_err(|why| HipError::new(0, &format!("forward_batch_slots: {group} {why}")))
 }
 
+/// Layer-level admission preflight over the per-site machinery: every fused
+/// group of the layer must plan (uniform OR mixed) and every residual role
+/// must be admitted — exactly the checks the slot runners perform per step,
+/// hoisted so load-time callers (the VMM executor's preflight) can refuse
+/// before any GPU work. The Q8 WMMA fold is admission-neutral (it only
+/// converts an admitted Uniform(Q8_0) into an admitted Mixed) and is
+/// therefore not applied here.
+pub(crate) fn require_batchable_deltanet_layer(
+    layer: &DeltaNetLayerWeights,
+    arch: &str,
+) -> HipResult<()> {
+    plan_proj_group(
+        &[&layer.wqkv, &layer.wz, &layer.w_beta, &layer.w_alpha],
+        "DeltaNet qkvza",
+        arch,
+    )
+    .map(|_| ())?;
+    slots_check_residual_weight(&layer.wo, "DeltaNet wo", arch)?;
+    plan_proj_group(&[&layer.w_gate, &layer.w_up], "dense FFN gate_up", arch).map(|_| ())?;
+    slots_check_residual_weight(&layer.w_down, "dense FFN w_down", arch)
+}
+
+/// FullAttention twin of [`require_batchable_deltanet_layer`].
+pub(crate) fn require_batchable_fullattn_layer(
+    layer: &FullAttnLayerWeights,
+    arch: &str,
+) -> HipResult<()> {
+    plan_proj_group(&[&layer.wq, &layer.wk, &layer.wv], "FullAttn qkv", arch).map(|_| ())?;
+    slots_check_residual_weight(&layer.wo, "FullAttn wo", arch)?;
+    plan_proj_group(&[&layer.w_gate, &layer.w_up], "dense FFN gate_up", arch).map(|_| ())?;
+    slots_check_residual_weight(&layer.w_down, "dense FFN w_down", arch)
+}
+
+/// MoE DeltaNet attention-side preflight (the MoE FFN has its own shared
+/// gate, `require_batchable_moe_ffn`, which callers chain). Takes `arch`
+/// unlike the pre-per-site version: the planners consult `is_batchable_la`.
+pub(crate) fn require_batchable_deltanet_moe_layer(
+    layer: &DeltaNetMoeLayerWeights,
+    arch: &str,
+) -> HipResult<()> {
+    plan_proj_group(
+        &[&layer.wqkv, &layer.wz, &layer.w_beta, &layer.w_alpha],
+        "DeltaNetMoE qkvza",
+        arch,
+    )
+    .map(|_| ())?;
+    slots_check_residual_weight(&layer.wo, "DeltaNetMoE wo", arch)
+}
+
+/// MoE FullAttention twin of [`require_batchable_deltanet_moe_layer`].
+pub(crate) fn require_batchable_fullattn_moe_layer(
+    layer: &FullAttnMoeLayerWeights,
+    arch: &str,
+) -> HipResult<()> {
+    plan_proj_group(&[&layer.wq, &layer.wk, &layer.wv], "FullAttnMoE qkv", arch).map(|_| ())?;
+    slots_check_residual_weight(&layer.wo, "FullAttnMoE wo", arch)
+}
+
 /// Post-process a fused-group plan for the Q8 WMMA fork: a uniform Q8_0
 /// group on a non-WMMA arch (or with `HIPFIRE_Q8_PREFILL_WMMA=0`, which
 /// `q8_prefill_wmma_enabled` folds into `q8_wmma_arch`) must NOT take the
@@ -2843,7 +2901,6 @@ fn run_fullattn_moe_layer_slots(
         plan_proj_group(&[&layer.wq, &layer.wk, &layer.wv], "FullAttnMoE qkv", arch)?,
         q8_wmma_arch,
     );
-    slots_check_residual_weight(&layer.wo, "FullAttnMoE wo", arch)?;
     slots_check_residual_weight(&layer.wo, "FullAttnMoE wo", arch)?;
     require_batchable_moe_ffn(gpu, &layer.ffn)?;
 
