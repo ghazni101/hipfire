@@ -5,7 +5,7 @@ use crate::kernels;
 use hip_bridge::HipResult;
 use std::ffi::c_void;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::LazyLock;
+use std::sync::{LazyLock, OnceLock};
 
 /// Rows of an AWQ scale tensor that carries the gfx1201 A4 RMSNorm producer's
 /// reciprocal planes: `[a 0..K-1][R K..2K-1][Rlo 2K..3K-1]` under shape
