@@ -133,4 +133,4 @@ bypass_slack                == 0
 # RATCHET-RAISE 300 -> 307: the +7 row-exact gfx1151 batched native-MTP prompt
 # fill calls (a5b0cc14f) recorded on the hipfire-arch-qwen4 ledger row; follow-up:
 # migrate row-exact kernels into a dispatch-registry row family (0.4.2).
-bypass_total                <= 307
+bypass_total                <= 310

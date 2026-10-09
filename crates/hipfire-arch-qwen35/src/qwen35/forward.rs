@@ -4606,7 +4606,15 @@ fn dense_tp_attention_partial(
         config.rope_theta,
     )?;
     let fused_epilogue = kv_cache_attention_dispatch(
-        &ctx, gpu, kv_cache, s, config, &layer.wo, kv_layer_idx, pos, false,
+        &ctx,
+        gpu,
+        kv_cache,
+        s,
+        config,
+        &layer.wo,
+        kv_layer_idx,
+        pos,
+        false,
     )?;
     if !fused_epilogue {
         gpu.sigmoid_mul_f32(&s.fa_attn_out, &s.fa_gate)?;

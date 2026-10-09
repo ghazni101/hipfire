@@ -1281,7 +1281,6 @@ pub const FUSED_RMSNORM_MQ_ROTATE_I4_GFX12_V2_SRC: &str = concat!(
 );
 pub const FUSED_RMSNORM_MQ_ROTATE_AWQ_I4_GFX12_V2_SRC: &str = concat!(
     "#define HIPFIRE_BLOCK_I4_128_QUANT_NO_STANDALONE 1\n",
-    include_str!("../../../kernels/src/block_i4_128_quant.hip"),
     "#define HIPFIRE_IU4_RTN_RCP 1\n",
     include_str!("../../../kernels/src/block_i4_128_quant.hip"),
     "#define HIPFIRE_IU4_SIDECAR 1\n",
@@ -1413,7 +1412,7 @@ pub const FUSED_SILU_MUL_MQ_ROTATE_FP8_INREG_GFX12_SRC: &str = concat!(
 );
 pub const FUSED_SILU_MUL_MQ_ROTATE_AWQ_FP8_INREG_GFX12_SRC: &str = concat!(
     include_str!("../../../kernels/src/mq4v2_fp8_producer_pack.hip"),
-    "#define HIPFIRE_FP8_PROD_INREG 1\n#define HIPFIRE_RMSNORM_AWQ 1\n",
+    "#define HIPFIRE_FP8_PROD_INREG 1\n#define HIPFIRE_SILU_FP8_AWQ 1\n",
     "#define HIPFIRE_SILU_FP8_KERNEL fused_silu_mul_mq_rotate_awq_mq4v2_fp8_inreg_gfx12\n",
     include_str!("../../../kernels/src/fused_silu_mul_mq_rotate_fp8.gfx12.hip")
 );
@@ -1620,7 +1619,6 @@ pub const SIGMOID_MUL_MQ_ROTATE_X_AWQ_I4_GIL_GFX12_SLAB_SRC: &str = concat!(
     "#define HIPFIRE_ROTATE_KERNEL sigmoid_mul_rotate_x_mq_awq_i4_gil_gfx12_slab\n",
     include_str!("../../../kernels/src/mq_rotate_x_i4.hip")
 );
-
 
 pub const RMSNORM_REDUCE_GFX942_SRC: &str =
     include_str!("../../../kernels/src/rmsnorm_reduce.gfx942.hip");

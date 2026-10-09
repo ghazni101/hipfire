@@ -2970,21 +2970,21 @@ impl WeightSource for HfqSource<'_> {
                 {
                     Some("hfq2")
                 } else if hipfire_config::developer_var("HIPFIRE_LM_HEAD_HFQ3")
-                .ok()
-                .as_deref()
-                == Some("1")
-            {
-                Some("hfq3")
-            } else if hipfire_config::developer_var("HIPFIRE_LM_HEAD_HFQ4")
-                .ok()
-                .as_deref()
-                == Some("1")
-            {
-                Some("hfq4")
-            } else {
-                None
-            }
-        });
+                    .ok()
+                    .as_deref()
+                    == Some("1")
+                {
+                    Some("hfq3")
+                } else if hipfire_config::developer_var("HIPFIRE_LM_HEAD_HFQ4")
+                    .ok()
+                    .as_deref()
+                    == Some("1")
+                {
+                    Some("hfq4")
+                } else {
+                    None
+                }
+            });
         let lm_head_hfq_mode = *LM_HEAD_HFQ;
         if output.gpu_dtype == DType::Q8_0 {
             match lm_head_hfq_mode {

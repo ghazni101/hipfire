@@ -122,7 +122,6 @@ static DISPATCH_GFX1100_DENSE_GATE_UP_STAGE_X32: LazyLock<bool> = LazyLock::new(
     hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_STAGE_X32", true)
 });
 
-
 static DISPATCH_GFX1100_DENSE_GATE_UP_PAIR: LazyLock<bool> = LazyLock::new(|| {
     hipfire_config::developer_bool("HIPFIRE_GFX1100_DENSE_GATE_UP_PAIR", false)
 });
@@ -26954,9 +26953,13 @@ impl Gpu {
         // unfinished kernel; observed twice on gfx1100 2026-08-23). Do not make it
         // default-on for the 4B shape without fixing the underlying kernel first.
         let dense_gate_up_stage_x32_gfx1100 = self.arch_caps.is_gfx1100()
-            && ((gate_m == 17_408 && up_m == 17_408 && k == 5_120
+            && ((gate_m == 17_408
+                && up_m == 17_408
+                && k == 5_120
                 && *DISPATCH_GFX1100_DENSE_GATE_UP_STAGE_X32)
-                || (gate_m == 9_216 && up_m == 9_216 && k == 2_560
+                || (gate_m == 9_216
+                    && up_m == 9_216
+                    && k == 2_560
                     && hipfire_config::developer_bool(
                         "HIPFIRE_GFX1100_DENSE_GATE_UP_STAGE_X32",
                         false,

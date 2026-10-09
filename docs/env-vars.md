@@ -408,6 +408,27 @@ Kernel-selector and arch-specific `HIPFIRE_GFX*` / `HIPFIRE_RDNA*` /
 `diagnostic.kernel`; defaults and safety remain source-defined and none are
 registry-authorized.
 
+### gfx1100 decode-campaign levers (developer, default off)
+
+Evidence and certification for everything in this table:
+[`docs/kernel-tune-decode-campaign-2026-08.md`](kernel-tune-decode-campaign-2026-08.md)
+and the 2026-08-22/23 perf-checkpoint chain. Unless noted, each lever is an
+explicit `=1` opt-in, off by default, and certified bit-exact on the stated
+shapes before measurement.
+
+| Variable | Notes |
+|---|---|
+| `HIPFIRE_FA_KVWRITE_FOLD=1` | Fold the single-token Q8_0 K/V cache write into the gfx1100 FA-prep epilogue (16Q/4K, head_dim 256, non-compact decode). +0.5-1% decode. |
+| `HIPFIRE_QKVZA_FUSEDNORM=1` | **Negative oracle.** rmsnorm+AWQ+FWHT folded into the qkvza GEMV prologue; bit-exact but measured −26% decode on qwen3.5-4b. Kept wired for A/B proof, never enable. |
+| `HIPFIRE_QKV_FUSEDNORM=1` / `HIPFIRE_GATE_UP_FUSEDNORM=1` | **Negative oracles** (FA-layer qkv / FFN gate_up twins of the above), measured strongly negative; opt-in research only. |
+| `HIPFIRE_LM_HEAD_HFQ4=1` / `HIPFIRE_LM_HEAD_HFQ3=1` / `HIPFIRE_LM_HEAD_HFQ2=1` | Research-only load-time requant of a Q8_0 output projection to HFQ{4,3,2}G256 (disk file untouched). HFQ3 measured best (+~9-10% decode, lossy). Excluded from campaign headline numbers by scope ruling. |
+| `HIPFIRE_BT2_DISABLE=1` | Kill switch for the batch-tiled B=2 WMMA prefill GEMMs (default **on** for batch ≥ 32 on gfx1100/1101/1102; +29% 27B pp32 prefill, see perf-checkpoints/2026-10-09-bt2-prefill-wmma-gfx1100-27b.md). |
+| `HIPFIRE_QKVZA_BT2_FORCE=1` / `HIPFIRE_QKV_BT2_FORCE=1` / `HIPFIRE_QKV_BT2_DISABLE=1` / `HIPFIRE_KSPLIT_DET_BT2_FORCE=1` / `HIPFIRE_KSPLIT_DET_BT2_KS2=1` | Per-GEMM BT2 force/disable arms for kernel probing. |
+| `HIPFIRE_RESIDUAL_PERSIST_R2=1` / `HIPFIRE_RESIDUAL_PERSIST_SCOPE` / `HIPFIRE_RESIDUAL_LUT=1` / `HIPFIRE_RESIDUAL_DUALROW=1` / `HIPFIRE_XLDS_R` | **Negative oracles** on the residual GEMV family (persist dual-row, per-group dequant LUT, dualrow schedule, LDS-staged activation sharing). All measured flat-to-negative in-engine; kept as wired falsification evidence. |
+| `HIPFIRE_AWQ_NORM_WAVEGRID=1` | Exact-tree multi-CU AWQ norm (null result, token-exact; infrastructure kept). |
+| `HIPFIRE_GFX1101_GFX1100_CAMPAIGN=1` | **Experimental**: admit the gfx1100-certified campaign fusions on gfx1101 (same RDNA3 ISA). Diagnostic A/B only, not a certified path. |
+| `HIPFIRE_SLOW_TOKEN_LOG=1` | bench_qwen35_mq4 prints any decode token slower than 50 ms (environmental-contention detector). |
+
 ---
 
 ## Manual — tokenizer differential test (dev-only, not runtime)
@@ -537,7 +558,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1441
+**Count:** 1468
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -567,6 +588,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_ALLOW_MQ4_LLOYD` | crates/hipfire-quantize/src/pipeline.rs | developer |
 | `HIPFIRE_ALLOW_UNIT_IMATRIX` | crates/hipfire-quantize/src/pipeline.rs | developer |
 | `HIPFIRE_API_KEY` | scripts/lmx_continuous_batch.py | harness |
+| `HIPFIRE_ARCH` | scripts/kernel-tune-loop.sh | harness |
 | `HIPFIRE_AR_GRAPH` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |
 | `HIPFIRE_AR_GRAPH_TRACE` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs, scripts/vmm_kv_matrix.py | developer |
 | `HIPFIRE_ATTENTION_REDUCE_GATED_MQ_AWQ` | crates/rdna-compute/src/kernels.rs | developer |
@@ -577,6 +599,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_ATTN_TILE_SIZE` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs, crates/hipfire-runtime/src/llama.rs | developer |
 | `HIPFIRE_AWQ_EXPERTS` | crates/hipfire-quantize/src/pipeline.rs | developer |
 | `HIPFIRE_AWQ_F1_ONLY` | crates/hipfire-quantize/src/calibration.rs, scripts/awq_alpha_sweep.sh | developer |
+| `HIPFIRE_AWQ_NORM_WAVEGRID` | crates/hipfire-runtime/examples/probe_awq_wavegrid.rs, crates/rdna-compute/src/gemv.rs | developer |
 | `HIPFIRE_A_OUT` | scripts/ab-dispatch-validation.sh | harness |
 | `HIPFIRE_A_REF` | scripts/ab-dispatch-validation.sh | harness |
 | `HIPFIRE_BASELINE_ARCH` | crates/hipfire-runtime/examples/coherence_probe.rs, scripts/kernel_atlas.py | harness |
@@ -591,9 +614,13 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_BASELINE_WIDE_MARGIN` | scripts/baseline_quant_smoke.sh | harness |
 | `HIPFIRE_BATCHED_PREFILL` | crates/hipfire-arch-gemma4/examples/prefill_parity_gemma4.rs, crates/hipfire-arch-gemma4/src/lowered.rs | developer |
 | `HIPFIRE_BENCH_AB` | benchmarks/scripts/bench_dflash_27b_gfx906.sh | harness |
+| `HIPFIRE_BENCH_BACKEND` | scripts/kernel-tune-loop.sh | harness |
 | `HIPFIRE_BENCH_MAX` | scripts/adaptive_b_bench.sh, scripts/qwen36_bench.sh | harness |
+| `HIPFIRE_BENCH_MAX_TOKENS` | scripts/kernel-tune-loop.sh | harness |
 | `HIPFIRE_BENCH_N` | crates/rdna-compute/examples/bench_indexed_moe_keystone.rs | harness |
 | `HIPFIRE_BENCH_RUNS` | scripts/adaptive_b_bench.sh, scripts/bench_qwen36_ar_dflash.sh | harness |
+| `HIPFIRE_BENCH_WARMUPS` | scripts/kernel-tune-loop.sh | harness |
+| `HIPFIRE_BENCH_WORKLOAD` | scripts/kernel-tune-loop.sh | harness |
 | `HIPFIRE_BF16_H_A4` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_BF16_H_FP8` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_BIN` | scripts/calibrate_multigpu.sh, scripts/install.sh | harness |
@@ -605,6 +632,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_BQ1G128_XBATCH_MAX` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_BQ1_MODEL` | benchmarks/quality-baselines/harness/spe_ablation.sh | harness |
 | `HIPFIRE_BRANCH` | scripts/mi300x_bootstrap.sh | harness |
+| `HIPFIRE_BT2_DISABLE` | crates/rdna-compute/src/feature_flags.rs, scripts/deep_ab_bt2.sh | developer |
 | `HIPFIRE_BUILDER_GIT_SHA` | crates/hipfire-isa/src/lib.rs | developer |
 | `HIPFIRE_BUILD_COMMIT` | crates/hipfire-cli/build.rs, crates/hipfire-cli/src/main.rs | developer |
 | `HIPFIRE_BUILD_COMMIT_OVERRIDE` | crates/hipfire-cli/build.rs | harness |
@@ -925,6 +953,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_FAULT_MTP_FULL_REJECT` | crates/hipfire-runtime/examples/test_serve_prefix_cache.rs | harness |
 | `HIPFIRE_FAULT_PREFIX_PUBLISH` | crates/hipfire-arch-qwen35/src/serve_engine.rs, crates/hipfire-runtime/examples/test_serve_prefix_cache.rs | developer |
 | `HIPFIRE_FA_BATCH_FUSE_OFF` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/rdna-compute/src/feature_flags.rs | developer |
+| `HIPFIRE_FA_KVWRITE_FOLD` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs | developer |
 | `HIPFIRE_FA_PERTOKEN_MIN_CTX` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/railgun-cert/src/recording.rs | developer |
 | `HIPFIRE_FIXED_TIER` | crates/hipfire-quantize/src/model_filter.rs, crates/hipfire-quantize/src/pipeline.rs | developer |
 | `HIPFIRE_FLASH_ATTN_CK_LIB` | crates/hipfire-config/src/lib.rs, crates/railgun-cert/src/recording.rs | experimental |
@@ -1011,6 +1040,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_GATEUP_LDSSTAGE` | crates/rdna-compute/src/feature_flags.rs, crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_GATE_MODEL` | scripts/gates.sh | harness |
 | `HIPFIRE_GATE_UP_BT` | crates/rdna-compute/src/gemm.rs | developer |
+| `HIPFIRE_GATE_UP_FUSEDNORM` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_GATE_UP_NOSYNC` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/examples/bench_gate_up_nosync.rs | experimental |
 | `HIPFIRE_GATE_UP_PAIR2` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_GATE_UP_VARIANT` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |
@@ -1091,6 +1121,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_GFX1100_PM_BUNDLE` | crates/rdna-compute/src/gemm.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_GFX1100_PM_GEMM` | crates/rdna-compute/src/gemm.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_GFX1100_ROUTER_W64` | crates/hipfire-dispatch/src/pipeline/moe_program.rs | developer |
+| `HIPFIRE_GFX1101_GFX1100_CAMPAIGN` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs, crates/rdna-compute/src/norm.rs | developer |
 | `HIPFIRE_GFX1151_ATTENTION_TILE_DPP` | crates/rdna-compute/src/attention.rs | developer |
 | `HIPFIRE_GFX1151_ATTENTION_TILE_DPP_REDUCE` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_GFX1151_ATTN_SCOREGRID_LARGE_SERIAL` | crates/rdna-compute/src/kernels.rs | developer |
@@ -1291,7 +1322,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_HIPCC` | crates/hipfire-cli/src/main.rs, crates/hipfire-cli/src/setup.rs | developer |
 | `HIPFIRE_HIPCC_EXTRA_FLAGS` | .agents/skills/hipfire-autoheal/triage.sh, crates/hipfire-config/src/lib.rs | experimental |
 | `HIPFIRE_HIP_WAIT` | crates/rdna-compute/src/dispatch.rs | developer |
-| `HIPFIRE_HOME` | crates/hipfire-config/src/lib.rs, crates/hipfire-registry/src/lib.rs | stable |
+| `HIPFIRE_HOME` | crates/hipfire-cli/tests/run_stats.rs, crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_HOST` | crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_HOST_TIMING` | crates/hipfire-generate/src/qwen.rs, crates/hipfire-runtime/examples/dflash_spec_demo.rs | developer |
 | `HIPFIRE_IDLE_TIMEOUT` | crates/hipfire-config/src/lib.rs | stable |
@@ -1319,6 +1350,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_KERNEL_CACHE` | benchmarks/scripts/mq4v2_k5120_abba.sh, crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_KLD_NGL` | crates/hipfire-runtime/examples/build_kld_ref.rs, crates/hipfire-runtime/examples/eval_gguf.rs | harness |
 | `HIPFIRE_KLD_TEACHER` | benchmarks/quality-baselines/harness/spe_ablation.sh | harness |
+| `HIPFIRE_KSPLIT_DET_BT2_FORCE` | crates/rdna-compute/src/gemm.rs | developer |
+| `HIPFIRE_KSPLIT_DET_BT2_KS2` | crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_KV` | crates/saddle-lab/examples/oracle_xcheck.rs | harness |
 | `HIPFIRE_KV_ADAPTIVE` | crates/hipfire-arch-qwen35/src/carrier.rs, crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_KV_BACKEND` | crates/hipfire-loader/src/admission.rs, scripts/guard_gfx1201_baseline.py | developer |
@@ -1338,6 +1371,9 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_LLOYD_MB4` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/examples/test_gemm_mq4g256_lloyd_residual_wmma.rs | experimental |
 | `HIPFIRE_LLOYD_MMQ_OFF` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs, crates/rdna-compute/src/gemm.rs | developer |
 | `HIPFIRE_LM_HEAD_F16` | crates/hipfire-cli/src/serve/complete.rs, crates/hipfire-config/src/lib.rs | stable |
+| `HIPFIRE_LM_HEAD_HFQ2` | crates/hipfire-arch-qwen35/src/qwen35/load.rs, crates/hipfire-runtime/src/weight_backend.rs | developer |
+| `HIPFIRE_LM_HEAD_HFQ3` | crates/hipfire-arch-qwen35/src/qwen35/load.rs, crates/hipfire-runtime/src/weight_backend.rs | developer |
+| `HIPFIRE_LM_HEAD_HFQ4` | crates/hipfire-arch-qwen35/src/qwen35/load.rs, crates/hipfire-runtime/src/weight_backend.rs | developer |
 | `HIPFIRE_LM_HEAD_OVERWRITE` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |
 | `HIPFIRE_LM_HEAD_WMMA` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | stable |
 | `HIPFIRE_LOAD_TIMEOUT` | docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-profile-feed.py, docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-run-profile-direct.sh | harness |
@@ -1517,7 +1553,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_NORMALIZE_PROMPT` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/examples/build_kld_ref_native_gemma4.rs | stable |
 | `HIPFIRE_NO_DEVICE_COMPILER` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/compiler.rs | experimental |
 | `HIPFIRE_NO_Q8_ROUTER` | crates/hipfire-quantize/src/pipeline.rs | developer |
-| `HIPFIRE_NO_REGISTRY_FETCH` | crates/hipfire-config/src/lib.rs, crates/hipfire-registry/src/lib.rs | stable |
+| `HIPFIRE_NO_REGISTRY_FETCH` | crates/hipfire-cli/tests/run_stats.rs, crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_NO_SPILL` | crates/hipfire-quantize/src/pipeline.rs | developer |
 | `HIPFIRE_NPU_SPILLOVER` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/config.rs | experimental |
 | `HIPFIRE_OFFLOAD_DEBUG` | crates/hipfire-arch-qwen35/src/qwen35/load.rs, crates/rdna-compute/src/dispatch.rs | developer |
@@ -1568,13 +1604,14 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_PROBE_READS` | crates/hipfire-runtime/src/hfq.rs | developer |
 | `HIPFIRE_PROFILE` | crates/hipfire-arch-diffusion/examples/gpu_flux_forward.rs, crates/hipfire-arch-diffusion/src/flux_gpu.rs | developer |
 | `HIPFIRE_PROFILE_CYCLES` | crates/hipfire-runtime/examples/dflash_spec_demo.rs, crates/saddle-lab/examples/mtp_only_demo.rs | harness |
-| `HIPFIRE_PROFILE_DECODE` | crates/hipfire-runtime/examples/bench_qwen35_mq4.rs, scripts/kernel_atlas.py | harness |
+| `HIPFIRE_PROFILE_DECODE` | crates/hipfire-runtime/examples/bench_qwen35_mq4.rs, scripts/kernel-tune-loop.sh | harness |
 | `HIPFIRE_PROFILE_MAX` | scripts/ddtree_verify_profile.sh | harness |
 | `HIPFIRE_PROFILE_RUNS` | scripts/ddtree_verify_profile.sh | harness |
 | `HIPFIRE_PROFILE_SELF` | docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-profile-feed.py | harness |
 | `HIPFIRE_PROMPT` | docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-profile-feed.py, docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-run-profile-direct.sh | harness |
 | `HIPFIRE_PROMPT_CACHE_CAP` | crates/hipfire-config/src/lib.rs, crates/hipfire-loader/src/lib.rs | stable |
 | `HIPFIRE_PROMPT_CACHE_UNBOUNDED` | crates/hipfire-config/src/lib.rs, crates/hipfire-loader/src/lib.rs | experimental |
+| `HIPFIRE_PROMPT_FILE` | scripts/kernel-tune-loop.sh | harness |
 | `HIPFIRE_PROMPT_HEAT_JSON` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/config.rs | experimental |
 | `HIPFIRE_PROMPT_HEAT_LIMIT` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/config.rs | experimental |
 | `HIPFIRE_PROMPT_TOKEN_HEAT` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/config.rs | experimental |
@@ -1585,12 +1622,17 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_QA_KV_MODES` | crates/saddle-lab/examples/test_inferenceQA.rs | harness |
 | `HIPFIRE_QCAL_BREAKDOWN` | crates/hipfire-runtime/tests/hf_tokenizer_encode_bench.rs | harness |
 | `HIPFIRE_QKVZA_BLOCK_SIZE` | crates/rdna-compute/src/kernels.rs | developer |
+| `HIPFIRE_QKVZA_BT2_FORCE` | crates/rdna-compute/src/gemm.rs, scripts/deep_ab_isolation.sh | developer |
 | `HIPFIRE_QKVZA_CPOL` | crates/rdna-compute/src/gemm.rs | developer |
+| `HIPFIRE_QKVZA_FUSEDNORM` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs, crates/hipfire-runtime/examples/probe_qkvza_fusednorm.rs | developer |
 | `HIPFIRE_QKVZA_KERNEL_NAME` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_QKVZA_MIN_BLOCKS_PER_CU` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_QKVZA_SCALAR_PREP` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_QKVZA_SPLIT_TAIL` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |
 | `HIPFIRE_QKVZA_WAVES_PER_BLOCK` | crates/rdna-compute/src/kernels.rs | developer |
+| `HIPFIRE_QKV_BT2_DISABLE` | crates/rdna-compute/src/gemm.rs | developer |
+| `HIPFIRE_QKV_BT2_FORCE` | crates/rdna-compute/src/gemm.rs | developer |
+| `HIPFIRE_QKV_FUSEDNORM` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_QKV_KERNEL_NAME` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_QKV_WITH_BIAS` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_QUANTIZE` | scripts/stage_models.sh | harness |
@@ -1764,12 +1806,16 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_REQUIRE_REAP_OVERLAY` | scripts/reap/run_deepseek4_e8_layer_screen.sh, scripts/reap/run_deepseek4_e8_phase_quality.sh | harness |
 | `HIPFIRE_RESET_ROUNDS` | crates/hipfire-generate/tests/qwen35_reset_hw.rs | harness |
 | `HIPFIRE_RESIDUAL_CPOL` | crates/rdna-compute/src/gemv.rs | developer |
+| `HIPFIRE_RESIDUAL_DUALROW` | crates/rdna-compute/src/gemv.rs | developer |
 | `HIPFIRE_RESIDUAL_KERNEL` | crates/rdna-compute/examples/bench_vgpr_cap_sweep.rs, crates/rdna-compute/examples/mq4c_parity.rs | developer |
 | `HIPFIRE_RESIDUAL_KSPLIT_OFF` | crates/rdna-compute/examples/test_mq4v2_residual_ksplit_gfx1100.rs, crates/rdna-compute/src/dflash_draft_fusion.rs | developer |
 | `HIPFIRE_RESIDUAL_LDSSTAGE` | crates/rdna-compute/src/dflash_draft_fusion.rs, crates/rdna-compute/src/feature_flags.rs | developer |
+| `HIPFIRE_RESIDUAL_LUT` | crates/rdna-compute/src/gemv.rs | developer |
 | `HIPFIRE_RESIDUAL_MULTIROW_R2_KERNEL` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_RESIDUAL_MULTIROW_R4_KERNEL` | crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_RESIDUAL_MULTIROW_R8_KERNEL` | crates/rdna-compute/src/kernels.rs | developer |
+| `HIPFIRE_RESIDUAL_PERSIST_R2` | crates/rdna-compute/src/gemv.rs | developer |
+| `HIPFIRE_RESIDUAL_PERSIST_SCOPE` | crates/rdna-compute/src/gemv.rs | developer |
 | `HIPFIRE_RESULT_JSON` | docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-profile-feed.py, docs/investigations/evidence/ds4-mi300x-cdna-test-fail/raw/a1-m0/04-run-profile-direct.sh | harness |
 | `HIPFIRE_RMSNORM_AWQ` | crates/rdna-compute/src/gemv.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_RMSNORM_AWQ_RCP` | crates/rdna-compute/src/kernels.rs | developer |
@@ -1871,6 +1917,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_SLOTS_PAGED` | crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
 | `HIPFIRE_SLOTS_PAGED_PAGES` | crates/hipfire-arch-qwen35/src/serve_engine.rs | developer |
 | `HIPFIRE_SLOT_TRACE` | crates/rdna-compute/src/feature_flags.rs, scripts/serve_concurrency_gate.sh | developer |
+| `HIPFIRE_SLOW_TOKEN_LOG` | crates/hipfire-runtime/examples/bench_qwen35_mq4.rs | harness |
 | `HIPFIRE_SMOKE_KV` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs, crates/saddle-lab/examples/a3b_smoke_forward.rs | developer |
 | `HIPFIRE_SMOKE_KV_SEQ` | crates/saddle-lab/examples/a3b_smoke_forward.rs | harness |
 | `HIPFIRE_SMOKE_MODE` | crates/hipfire-arch-qwen35/src/qwen35/forward.rs, crates/saddle-lab/examples/a3b_smoke_forward.rs | developer |
@@ -1982,6 +2029,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_XDNA_INSTS` | crates/hipfire-xdna/src/lib.rs | developer |
 | `HIPFIRE_XDNA_MKN` | crates/hipfire-xdna/src/lib.rs | developer |
 | `HIPFIRE_XDNA_PDI` | crates/hipfire-xdna/src/lib.rs | developer |
+| `HIPFIRE_XLDS_R` | crates/rdna-compute/src/gemv.rs | developer |
 
 <!-- env-inventory:end -->
 
