@@ -323,6 +323,9 @@ pub fn requantize_weight_q8_0_to_hfq4g256(
         row_stride: 0,
         paro: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     })
 }
 
@@ -401,6 +404,9 @@ pub fn requantize_weight_q8_0_to_hfq3g256(
         row_stride: 0,
         paro: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     })
 }
 
@@ -473,6 +479,9 @@ pub fn requantize_weight_q8_0_to_hfq2g256(
         row_stride: 0,
         paro: None,
         awq_scale: None,
+        lloyd_lut_e4m3: None,
+        lloyd_lut_f16: None,
+        lloyd_lut_c16: None,
     })
 }
 
