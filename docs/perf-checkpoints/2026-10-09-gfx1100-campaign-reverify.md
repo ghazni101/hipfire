@@ -27,7 +27,7 @@
 |---|---|---|
 | `qwen3.5-4b.mq4` (2,588,006,400 B) | md5 `712b69f8cf1016081cfa507c4d50e33d` | matches the campaign's fixture exactly |
 | `qwen3.5-4b.mq3` / `-mq6` | HF `hipfire-models/qwen3.5-4b` | Magnum V2 family, 4B geometry |
-| `qwen3.8-27b.mq4-xt` (14,987,185,152 B) | sha256 `80e7c624424fd1d363ba86681d3dc1e5ac5534e0e064306a32be204c4843d0f3` | **the AGENTS.md §5 pin (`9f91556f…` / 14,980,361,216 B) is stale** — HF re-uploaded the file; our download byte-matches the live HF object |
+| `qwen3.8-27b.mq4-xt` (14,987,185,152 B) | sha256 `80e7c624424fd1d363ba86681d3dc1e5ac5534e0e064306a32be204c4843d0f3` | byte-matches the live HF object AND the AGENTS.md §5 historical entry (the 2026-09-15 re-issue with AWQ sidecars). The campaign-era records' `9f91556f…` / 14,980,361,216 B pin is the documented pre-reissue upload — a superseded artifact, not stale documentation |
 | `qwen3.8-27b.mq4` (15,662,615,552 B) | md5 `d1292b4d5bd6046693604201a6ca8074`, sha256 `5bb556a6…e507` | same size as the campaign's `2fb2edc2…` fixture, different bytes: HF re-uploaded this one too |
 | `qwen3.8-27b.mq4-pro` | HF `hipfire-models/qwen3.8-27b` | "pro" tier, MQ4G256V2 |
 
