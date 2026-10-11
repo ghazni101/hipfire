@@ -96,73 +96,103 @@ pub struct EmbedWeights {
 
 // ─── dtype decode ───────────────────────────────────────────────────────────
 
-/// Decode one tensor's raw bytes to host f32. Accepts the safetensors dtype
-/// strings of the release (F32) plus BF16/F16 re-saves; quantized HFQ
-/// payloads are refused with a pointing error (quantize this arch with a
-/// raw-dtype format instead).
-fn decode_f32(info: &TensorInfo, bytes: &[u8], name: &str) -> Result<Vec<f32>, String> {
-    let n = info.shape.iter().product::<usize>();
+// ─── dtype decode ───────────────────────────────────────────────────────────
+//
+// Two source conventions meet here. A safetensors dir carries
+// `quant_type == 0xFF` (dtype-driven) with F32/BF16/F16 dtypes; an `.hfq`
+// carries a quant-type byte where 1 = raw F16 and 2 = raw F32 (the formats
+// `hipfire-arch-qwen35`'s loader reads norms and conv weights with). Anything
+// else is a compressed quant format this encoder does not decode.
+
+enum Storage {
+    F32,
+    F16,
+    Bf16,
+}
+
+fn storage_of(info: &TensorInfo, name: &str) -> Result<Storage, String> {
     if info.quant_type != 0xFF {
-        return Err(format!(
-            "tensor `{name}` has HFQ quant_type {} — qwen35-embed loads raw \
-             f32/bf16/f16 weights only (re-quantize with a raw dtype)",
-            info.quant_type
-        ));
+        return match info.quant_type {
+            1 => Ok(Storage::F16),
+            2 => Ok(Storage::F32),
+            other => Err(format!(
+                "tensor `{name}` has HFQ quant_type {other} — qwen35-embed loads \
+                 raw f32/f16 weights only. The quantizer keeps norms, the Dense \
+                 head and the vision tower raw automatically; a compressed trunk \
+                 tier is not supported by this encoder."
+            )),
+        };
     }
     match info.dtype.as_str() {
-        "F32" => {
-            let expect = n * 4;
-            if bytes.len() < expect {
-                return Err(format!("tensor `{name}`: {} bytes < {expect}", bytes.len()));
-            }
-            Ok(bytes[..expect]
-                .chunks_exact(4)
-                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-                .collect())
-        }
-        "BF16" => Ok(bytes[..n * 2]
-            .chunks_exact(2)
-            .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect()),
-        "F16" => Ok(bytes[..n * 2]
-            .chunks_exact(2)
-            .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
-            .collect()),
+        "F32" => Ok(Storage::F32),
+        "F16" => Ok(Storage::F16),
+        "BF16" => Ok(Storage::Bf16),
         other => Err(format!(
             "tensor `{name}` has dtype {other} — expected F32/BF16/F16"
         )),
     }
 }
 
+fn read_f32(store: &Storage, bytes: &[u8], n: usize, name: &str) -> Result<Vec<f32>, String> {
+    let width = match store {
+        Storage::F32 => 4,
+        _ => 2,
+    };
+    let expect = n * width;
+    if bytes.len() < expect {
+        return Err(format!("tensor `{name}`: {} bytes < {expect}", bytes.len()));
+    }
+    Ok(match store {
+        Storage::F32 => bytes[..expect]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect(),
+        Storage::F16 => bytes[..expect]
+            .chunks_exact(2)
+            .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect(),
+        Storage::Bf16 => bytes[..expect]
+            .chunks_exact(2)
+            .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+            .collect(),
+    })
+}
+
+fn read_f16_words(store: &Storage, bytes: &[u8], n: usize, name: &str) -> Result<Vec<u16>, String> {
+    let width = match store {
+        Storage::F32 => 4,
+        _ => 2,
+    };
+    let expect = n * width;
+    if bytes.len() < expect {
+        return Err(format!("tensor `{name}`: {} bytes < {expect}", bytes.len()));
+    }
+    Ok(match store {
+        Storage::F32 => bytes[..expect]
+            .chunks_exact(4)
+            .map(|c| f16::from_f32(f32::from_le_bytes([c[0], c[1], c[2], c[3]])).to_bits())
+            .collect(),
+        Storage::F16 => bytes[..expect]
+            .chunks_exact(2)
+            .map(|c| u16::from_le_bytes([c[0], c[1]]))
+            .collect(),
+        Storage::Bf16 => bytes[..expect]
+            .chunks_exact(2)
+            .map(|c| f16::from_f32(bf16_to_f32(u16::from_le_bytes([c[0], c[1]]))).to_bits())
+            .collect(),
+    })
+}
+
+/// Decode one tensor's raw bytes to host f32.
+fn decode_f32(info: &TensorInfo, bytes: &[u8], name: &str) -> Result<Vec<f32>, String> {
+    let n = info.shape.iter().product::<usize>();
+    read_f32(&storage_of(info, name)?, bytes, n, name)
+}
+
 /// Decode to f16 words for the GEMM operand (RNE via `half`).
 fn decode_f16(info: &TensorInfo, bytes: &[u8], name: &str) -> Result<Vec<u16>, String> {
     let n = info.shape.iter().product::<usize>();
-    if info.quant_type != 0xFF {
-        return Err(format!(
-            "tensor `{name}` has HFQ quant_type {} — qwen35-embed loads raw \
-             f32/bf16/f16 weights only",
-            info.quant_type
-        ));
-    }
-    match info.dtype.as_str() {
-        "F32" => Ok(bytes[..n * 4]
-            .chunks_exact(4)
-            .map(|c| f16::from_f32(f32::from_le_bytes([c[0], c[1], c[2], c[3]])))
-            .map(|v| v.to_bits())
-            .collect()),
-        "F16" => Ok(bytes[..n * 2]
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect()),
-        "BF16" => Ok(bytes[..n * 2]
-            .chunks_exact(2)
-            .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .map(|v| f16::from_f32(v).to_bits())
-            .collect()),
-        other => Err(format!(
-            "tensor `{name}` has dtype {other} — expected F32/BF16/F16"
-        )),
-    }
+    read_f16_words(&storage_of(info, name)?, bytes, n, name)
 }
 
 // ─── upload helpers ─────────────────────────────────────────────────────────

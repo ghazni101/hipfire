@@ -137,6 +137,16 @@ fn parse_layer_types(text: &serde_json::Value, num_layers: usize) -> Result<Vec<
         .collect()
 }
 
+/// Unwrap a checkpoint-metadata blob to the composite config object.
+///
+/// Both source kinds wrap the checkpoint config under a `"config"` key
+/// (`SafetensorsSource::build_metadata_json` and the quantizer's HFQ
+/// metadata); a raw `config.json` value is unwrapped. Returning a reference
+/// into the input keeps this allocation-free on the load path.
+pub fn config_from_metadata(meta: &serde_json::Value) -> &serde_json::Value {
+    meta.get("config").unwrap_or(meta)
+}
+
 /// Parse the composite `config.json` (a `serde_json::Value` of its contents).
 pub fn parse_config(config: &serde_json::Value) -> Result<EmbedConfig, String> {
     let text = config
@@ -492,6 +502,18 @@ mod tests {
             serde_json::from_str(r#"{"in_features":1024,"out_features":128}"#).unwrap();
         cfg.apply_dense_config(&dense);
         assert_eq!(cfg.dense_out_features, 128);
+    }
+
+
+    #[test]
+    fn config_from_metadata_unwraps_both_shapes() {
+        let v: serde_json::Value = serde_json::from_str(PPLX_CONFIG).unwrap();
+        let wrapped = serde_json::json!({ "architecture": "qwen3_5", "config": v.clone() });
+        let cfg = parse_config(config_from_metadata(&wrapped)).unwrap();
+        assert_eq!(cfg.hidden_size, 1024);
+        // A raw config.json (no wrapper) still parses.
+        let cfg2 = parse_config(config_from_metadata(&v)).unwrap();
+        assert_eq!(cfg2.num_layers, 12);
     }
 
     #[test]

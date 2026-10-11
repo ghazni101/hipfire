@@ -112,6 +112,7 @@ weights and `=1` applies the overlay on any architecture.
 |---|---|
 | `hipfire run <model> [flags] [prompt...]` | One-shot generate. Model = registry tag, alias, or path. Uses a healthy `serve` over HTTP when present; otherwise spawns a one-shot daemon. Forces local spawn when `HIPFIRE_LOCAL=1` or a load-time override such as `--kv-mode`/`--image` cannot safely reuse the resident model. Recognized missing registry tags auto-pull. |
 | `hipfire img <model> [flags] <prompt...>` | One-shot txt2img on a diffusion checkpoint (arch 40 FLUX.1, arch 45 FLUX.2 Klein). Model = an HFQ trunk pack (`<base>-transformer.hfq`, sidecars next to it) or a registry tag that resolves to one (`flux.schnell:1`); build packs with `hipfire-quantize --flux-pipe` below. Writes `<model>-<WxH>-<seed>.png`. |
+| `hipfire embed <model> [flags] [text...]` | Encode text and/or an image with an embedding checkpoint (arch 17, the Qwen3.5 multi-vector encoder — e.g. `pplx-embed-v2-late-0.6b`). Prints tokens×dims; `--query`/`--doc` score the pair by late-interaction MaxSim; `--json` emits the token-embedding matrix. See [`hipfire embed` flags](#hipfire-embed-flags). |
 | `hipfire chat <model> [--no-color]` | Interactive multi-turn TUI. See [CHAT.md](CHAT.md). |
 | `hipfire serve [model] [host] [port] [flags]` | OpenAI-compatible HTTP server. See [SERVE.md](SERVE.md). |
 | `hipfire restart [serve flags...]` | `stop --force` semantics then start with the same flags. |
@@ -216,6 +217,41 @@ Model resolution accepts an HFQ **component pack** (trunk file) — the
 `t5`/`clip`/`vae` sidecar packs are discovered next to it by sibling name
 (`<stem>-t5.hfq` etc., or shared `t5-xxl.hfq` / `clip-l.hfq` / `vae.hfq`).
 `hipfire pull flux.schnell:1` fetches the trunk + all three sidecars at once.
+
+### `hipfire embed` flags
+
+Runs in a fresh daemon process. The production target is an embedding
+checkpoint loaded as an **HF safetensors directory** (e.g. a
+`pplx-embed-v2-late-0.6b` snapshot), or a raw-dtype `.hfq` built from one
+with `hipfire-quantize` (the quantizer keeps the norms, the 128-d Dense head
+and the vision tower raw, folds `1_Dense/model.safetensors` into the trunk,
+and auto-includes the tower).
+
+| Flag | Purpose |
+|---|---|
+| `--query <text>` | Query-side text (its marker is `"[Q] "`). |
+| `--doc <text>` | Document-side text (marker `"[D] "`); with `--query`, prints the MaxSim score. |
+| `--kind <query\|document>` | Side for the positional text; default `document`. Sets the marker and truncation limit. |
+| `--image <path>` | Encode an image (PNG/JPEG) with the checkpoint's vision tower; text and image may be combined. |
+| `-j, --json` | Print the full JSON result — the `tokens×dims` matrix for a single encode, or `{score, query_tokens, doc_tokens, dim}` for a pair. |
+
+Token limits are per side (`query_length` 1024, `document_length` 4096 on the
+0.6B); text is truncated from the end with the marker always kept. The
+document side drops punctuation token vectors (the ColBERT skiplist); the
+query side keeps them. Scores are late interaction (`Σ max dot`), so they are
+not cosine similarities and are only meaningfully comparable between the same
+query across documents.
+
+```bash
+hipfire embed ~/.hipfire/models/pplx-embed-v2-late-0.6b \
+  --query "what is the capital of France" --doc "Paris is the capital of France"
+hipfire embed <model> "encode this document" --kind document --json
+hipfire embed <model> --image chart.png "the caption" --json
+```
+
+The same surface is exposed over HTTP as `POST /v1/embeddings` (OpenAI-shaped;
+the `embedding` array is the flat `n_tokens × dim` matrix and each data object
+carries `n_tokens`, with an optional `"kind": "query" | "document"`).
 
 ## Configuration
 
