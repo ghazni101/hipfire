@@ -103,9 +103,14 @@ pub fn load_qwen35_embed_bundle(
         None => Tokenizer::from_hfq_metadata(st.metadata_json())
             .map_err(|e| format!("qwen35-embed: tokenizer from metadata: {e}"))?,
     };
-    if tokenizer.vocab_size() < config.vocab_size {
+    // The embedding table may be LARGER than the tokenizer's vocab (reserved
+    // / padded rows): the config `vocab_size` (248,320 on the 0.6B) exceeds
+    // the tokenizer.json entry count (248,144), and that is normal. The
+    // direction that matters is the other one — a tokenizer that can emit an
+    // id past the embedding table would read out of range, so refuse that.
+    if tokenizer.vocab_size() > config.vocab_size {
         return Err(format!(
-            "qwen35-embed: tokenizer vocab {} < config vocab {}",
+            "qwen35-embed: tokenizer vocab {} exceeds config vocab {} — some token              ids would have no embedding row",
             tokenizer.vocab_size(),
             config.vocab_size
         ));
