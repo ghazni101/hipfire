@@ -242,6 +242,7 @@ Read only by the Qwen4 carrier and its kernels; no other model reads them.
 | Variable | Default / sense | Notes |
 |---|---|---|
 | `HIPFIRE_EMBED_VISION_OFFLOAD` | `1`/`on`/`true` forces the qwen3.5 embedding model's SigLIP tower into host RAM (GPU-addressable, read over PCIe); `0`/`off`/`false` forces it device-resident; unset auto-decides | The tower is ~250 MB of the arch's ~740 MB and is only touched by an image request, so it is the component to spill when the card is busy. **Auto (the default)** keeps it resident only when it fits in the VRAM free at load plus a 64 MB margin, and spills otherwise — a machine whose desktop already holds most of the card then loads the model and serves text instead of OOMing, at the cost of PCIe reads on image requests. Same tradeoff `HIPFIRE_OFFLOAD_EXEC=pcie` makes for spilled text layers; applied per-model here because the embedding arch can offload the tower whole. Read via `developer_var` in `hipfire-arch-qwen35-embed`. |
+| `HIPFIRE_EMBED_ATTN` | `naive` selects the reference per-(query, head) attention kernel | Rollback/A-B switch for the Q-tiled bidirectional kernel (`attention_encoder_qtiled_f32`, `kernels/src/attention_encoder_qtiled.hip`). The reference (`attention_t5_bias_f32`) is correct for any shape but re-reads all of K and V once per query row, which was 82% of the encode at 4096 tokens (486 ms/layer on gfx1101); the tiled kernel shares K across `QB` query rows and is 3.0x faster on that kernel, 2.1x on the encode. Ignored for shapes outside the tiled contract. Read once via `developer_var` in `hipfire-arch-qwen35-embed`. |
 | `HIPFIRE_EMBED_DEBUG` | `1` traces the embedding encoder | Prints a per-layer finite-value trace of the residual stream (absmax + non-finite count) and the VRAM free/total after load. Downloads one tensor per call, so it is strictly a debugging path — it is what localized a weight-format bug that NaN'd the last rows of every projection. |
 
 ### Graph / MMQ / prefill
@@ -596,7 +597,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1505
+**Count:** 1506
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -963,8 +964,9 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_E8_ROW_GATE` | crates/saddle-lab/examples/collect_e8_hessian_native.rs | harness |
 | `HIPFIRE_E8_SOA_EXPERTS` | crates/hipfire-arch-qwen35/src/qwen35/load.rs, crates/rdna-compute/src/gemv.rs | developer |
 | `HIPFIRE_E8_STRIP` | crates/rdna-compute/src/gemv.rs, crates/rdna-compute/src/kernels.rs | developer |
+| `HIPFIRE_EMBED_ATTN` | crates/hipfire-arch-qwen35-embed/src/forward.rs | developer |
 | `HIPFIRE_EMBED_DEBUG` | crates/hipfire-arch-qwen35-embed/src/carrier.rs, crates/hipfire-arch-qwen35-embed/src/forward.rs | developer |
-| `HIPFIRE_EMBED_VISION_OFFLOAD` | crates/hipfire-arch-qwen35-embed/src/vision.rs | developer |
+| `HIPFIRE_EMBED_VISION_OFFLOAD` | crates/hipfire-arch-qwen35-embed/src/lib.rs, crates/hipfire-arch-qwen35-embed/src/vision.rs | developer |
 | `HIPFIRE_EMIT_TOKEN_IDS` | autoresearch/ar/certify/serve_runner.py, crates/hipfire-arch-cohere2moe/src/spec_emit.rs | developer |
 | `HIPFIRE_EMULATE_GPUS` | crates/hipfire-arch-qwen35/tests/route_oracle_mesh.rs, crates/hipfire-runtime/src/config.rs | developer |
 | `HIPFIRE_EMU_BF16_H` | crates/rdna-compute/src/gemv.rs | developer |

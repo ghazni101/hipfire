@@ -9051,6 +9051,12 @@ pub const VIT_ATTENTION_SRC: &str = include_str!("../../../kernels/src/vit_atten
 pub const VIT_ATTENTION_QTILED_SRC: &str =
     include_str!("../../../kernels/src/vit_attention_qtiled.hip");
 
+/// Q-tiled bidirectional attention for the qwen3.5 embedding encoder
+/// (arch 17): flash-style online softmax, no mask, GQA, head_dim up to 256.
+/// Separate Q/K/V buffers. See `kernels/src/attention_encoder_qtiled.hip`.
+pub const ATTENTION_ENCODER_QTILED_SRC: &str =
+    include_str!("../../../kernels/src/attention_encoder_qtiled.hip");
+
 /// 2D rotary positional embedding for the Qwen3.5-VL vision tower. Rotates Q
 /// and K halves of the packed QKV buffer in-place using per-token cos/sin of
 /// size `head_dim/2`. See `kernels/src/apply_rope_2d_vision.hip`.
