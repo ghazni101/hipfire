@@ -8744,6 +8744,12 @@ pub const EMBEDDING_F16_BATCHED_SRC: &str =
 pub const EMBEDDING_BF16_BATCHED_SRC: &str =
     include_str!("../../../kernels/src/embedding_bf16_batched.hip");
 
+/// Batched F32 embedding gather: copies N rows of an F32 table into
+/// `[N × dim]` F32, reading token ids from a device buffer so the call is
+/// safe under graph capture (a host D2D memcpy would bake stale offsets).
+pub const EMBEDDING_F32_BATCHED_SRC: &str =
+    include_str!("../../../kernels/src/embedding_f32_batched.hip");
+
 /// Batched Qwen4 MQv2 embedding decoder. Packed qt44/qt53 rows are decoded
 /// into the rotated basis; the owner applies the matching inverse FWHT.
 pub const EMBEDDING_MQ4V2_BATCHED_SRC: &str =
