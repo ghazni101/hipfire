@@ -48,6 +48,7 @@ hipfire-arch-cohere2moe = { path = "../hipfire-arch-cohere2moe" }
 hipfire-arch-maple = { path = "../hipfire-arch-maple" }
 hipfire-arch-gemma4 = { path = "../hipfire-arch-gemma4" }
 hipfire-arch-muse-glimmer = { path = "../hipfire-arch-muse-glimmer" }
+hipfire-arch-qwen35-embed = { path = "../hipfire-arch-qwen35-embed" }
 base64 = "0.22"
 serde_json = { workspace = true, features = ["preserve_order"] }
 tracing = "0.1"

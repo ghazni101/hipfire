@@ -1,0 +1,23 @@
+# SPDX-License-Identifier: Apache-2.0
+# Copyright (c) 2026 Kaden Schutt
+[package]
+name = "hipfire-arch-qwen35-embed"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Qwen3.5 multi-vector embedding architecture (bidirectional full attention + causal GatedDeltaNet hybrid, SigLIP-2 tower, 128-d late-interaction head) for hipfire"
+
+[features]
+default = ["deltanet"]
+# The GDN / partial-RoPE / mRoPE kernels in rdna-compute are deltanet-gated,
+# matching hipfire-arch-qwen35 and hipfire-arch-qwen35-vl.
+deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet", "hipfire-arch-qwen35-vl/deltanet"]
+
+[dependencies]
+hipfire-config = { path = "../hipfire-config" }
+hipfire-runtime = { path = "../hipfire-runtime" }
+hipfire-arch-qwen35-vl = { path = "../hipfire-arch-qwen35-vl" }
+hip-bridge = { path = "../hip-bridge" }
+rdna-compute = { path = "../rdna-compute" }
+half.workspace = true
+serde_json.workspace = true

@@ -1064,6 +1064,36 @@ async fn handle_request(
         (Method::POST, "/v1/responses") => {
             handle_generation(req, shared, acks, WireApi::OpenAiResponses).await
         }
+        // OpenAI-shaped embeddings. The late-interaction extension: each
+        // data object carries `n_tokens` (the embedding field is the flat
+        // K×dim token matrix, not a single pooled vector) and the request
+        // may set `"kind": "query" | "document"` (default document) — the
+        // two sides use different markers and truncation limits.
+        (Method::POST, "/v1/embeddings") => {
+            let max_bytes = shared.max_request_bytes;
+            if req
+                .headers()
+                .get(header::CONTENT_LENGTH)
+                .and_then(|value| value.to_str().ok())
+                .and_then(|value| value.parse::<u64>().ok())
+                .is_some_and(|length| length > max_bytes)
+            {
+                return openai_error(&format!("request body exceeds {max_bytes} bytes"), 413);
+            }
+            let body_val = match read_json_body(req.into_body(), max_bytes).await {
+                Ok(v) => v,
+                Err(err) => {
+                    let msg = err.to_string();
+                    let status = if msg.contains("exceeds") { 413 } else { 400 };
+                    return openai_error(&msg, status);
+                }
+            };
+            match handle_embeddings(Arc::clone(&shared), body_val).await {
+                Ok(resp) => resp,
+                Err(message) => RequestFailure::new(message, 400)
+                    .respond(WireApi::ChatCompletions, &shared.metrics),
+            }
+        }
         (Method::POST, "/v1/images/generations") => {
             let max_bytes = shared.max_request_bytes;
             if req
@@ -1251,6 +1281,130 @@ async fn handle_generation(
 /// PNG as `b64_json`. The daemon (not the gateway) is the authority on
 /// sampler/geometry validation — everything it refuses surfaces as a 4xx
 /// here with its message.
+/// `POST /v1/embeddings` — the qwen3.5 multi-vector encoder (arch 17).
+///
+/// Body: `{"input": <string | [string] | {text, image_base64}>, "model"?,
+/// "kind"?: "query"|"document"}`. Reply is OpenAI-shaped `{object:"list",
+/// data:[{object:"embedding", index, n_tokens, embedding:[f32…]}], model,
+/// usage}` where `embedding` is the flat `n_tokens × dim` token matrix
+/// (late interaction), not a pooled vector.
+async fn handle_embeddings(
+    shared: Arc<ServeShared>,
+    body: serde_json::Value,
+) -> Result<Response<BoxBody>, String> {
+    let kind = match body.get("kind").and_then(|v| v.as_str()).unwrap_or("document") {
+        "query" => "query",
+        "document" | "doc" => "document",
+        other => {
+            return Err(format!(
+                "kind {other:?} unsupported: expected \"query\" or \"document\""
+            ))
+        }
+    };
+    // One input per request (the daemon encodes serially; batching is a
+    // follow-up). A list of length 1 is accepted; anything else refuses
+    // rather than silently dropping inputs.
+    let input = body
+        .get("input")
+        .ok_or_else(|| "input is required".to_string())?;
+    let input = match input {
+        serde_json::Value::Array(items) => match items.as_slice() {
+            [one] => one.clone(),
+            other => {
+                return Err(format!(
+                    "input has {} entries; this endpoint accepts one input per request",
+                    other.len()
+                ))
+            }
+        },
+        other => other.clone(),
+    };
+
+    let request_model = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .map(str::to_owned);
+
+    let _guard = match shared
+        .admission
+        .acquire_async(CancellationToken::new())
+        .await
+    {
+        Ok(guard) => guard,
+        Err(error) => {
+            return Ok(admission_error_response(
+                WireApi::ChatCompletions,
+                &shared.metrics,
+                &error,
+            ))
+        }
+    };
+
+    let (engine, loaded_model) = {
+        let runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
+        (runtime.engine.clone(), runtime.current_path.clone())
+    };
+    let model_echo = loaded_model
+        .as_ref()
+        .map(|p| p.display().to_string())
+        .or(request_model)
+        .unwrap_or_else(|| "unknown".to_string());
+
+    let id = request_id();
+    let request = serde_json::json!({
+        "type": "embed",
+        "id": id,
+        "kind": kind,
+        "input": input,
+    });
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<serde_json::Value, String>>();
+    tokio::task::spawn_blocking(move || {
+        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            engine.embed(&request)
+        }));
+        let result = match outcome {
+            Ok(Ok(done)) => Ok(done),
+            Ok(Err(error)) => Err(error.to_string()),
+            Err(payload) => Err(format!(
+                "embedding worker panicked: {}",
+                payload
+                    .downcast_ref::<&str>()
+                    .map(|s| (*s).to_string())
+                    .or_else(|| payload.downcast_ref::<String>().cloned())
+                    .unwrap_or_else(|| "non-string panic payload".to_string())
+            )),
+        };
+        let _ = tx.send(result);
+    });
+    let done = rx
+        .await
+        .map_err(|_| "embedding worker disconnected".to_string())?
+        .map_err(|e| e)?;
+
+    let n_tokens = done.get("n_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    let dim = done.get("dim").and_then(|v| v.as_u64()).unwrap_or(0);
+    let embeddings = done
+        .get("embeddings")
+        .cloned()
+        .unwrap_or(serde_json::Value::Array(vec![]));
+    let payload = serde_json::json!({
+        "object": "list",
+        "data": [{
+            "object": "embedding",
+            "index": 0,
+            "n_tokens": n_tokens,
+            "embedding": embeddings,
+        }],
+        "model": model_echo,
+        "usage": { "prompt_tokens": done.get("n_input_tokens").cloned().unwrap_or(serde_json::json!(0)),
+                   "total_tokens": done.get("n_input_tokens").cloned().unwrap_or(serde_json::json!(0)) },
+        // dim is reported top-level for clients that expect one vector.
+        "dim": dim,
+    });
+    Ok(json_response(payload, 200))
+}
+
 async fn handle_images_generations(
     shared: Arc<ServeShared>,
     body: serde_json::Value,

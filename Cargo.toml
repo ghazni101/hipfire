@@ -1,6 +1,7 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/hipfire-arch-qwen35-embed",
     "crates/peacemaker-ir",
     "crates/peacemaker-lift",
     "crates/peacemaker-author",

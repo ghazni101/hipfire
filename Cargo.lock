@@ -1461,6 +1461,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "hipfire-arch-qwen35-embed"
+version = "0.4.2"
+dependencies = [
+ "half",
+ "hip-bridge",
+ "hipfire-arch-qwen35-vl",
+ "hipfire-config",
+ "hipfire-runtime",
+ "rdna-compute",
+ "serde_json",
+]
+
+[[package]]
 name = "hipfire-arch-qwen35-vl"
 version = "0.4.2"
 dependencies = [
@@ -1670,6 +1683,7 @@ dependencies = [
  "hipfire-arch-muse-glimmer",
  "hipfire-arch-qwen2",
  "hipfire-arch-qwen35",
+ "hipfire-arch-qwen35-embed",
  "hipfire-arch-qwen35-vl",
  "hipfire-arch-qwen4",
  "hipfire-config",
@@ -1716,6 +1730,7 @@ dependencies = [
  "hipfire-arch-muse-glimmer",
  "hipfire-arch-qwen2",
  "hipfire-arch-qwen35",
+ "hipfire-arch-qwen35-embed",
  "hipfire-arch-qwen35-vl",
  "hipfire-arch-qwen4",
  "hipfire-config",

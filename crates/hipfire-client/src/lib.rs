@@ -737,6 +737,64 @@ impl Engine {
         }
     }
 
+    /// Embedding encode request: send `embed`, return the terminal
+    /// `embedded` value (token embeddings matrix). Same control-channel
+    /// discipline as [`Engine::img_generate`] — one persistent channel, with
+    /// the `(id, 0)` pending registration so daemon validation `error`
+    /// events reach this transaction instead of quarantine.
+    pub fn embed(&self, request: &Value) -> Result<Value> {
+        let request_id = request
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| ClientError::Protocol("embed request missing id".into()))?
+            .to_owned();
+        let (tx, rx) = mpsc::channel();
+        let key = (request_id.clone(), 0u64);
+        {
+            let mut map = self.inner.dispatch.pending.lock().unwrap();
+            if map.contains_key(&key) {
+                return Err(ClientError::Protocol(format!(
+                    "duplicate live embed id={request_id} attempt_id=0"
+                )));
+            }
+            map.insert(key.clone(), tx.clone());
+        }
+        *self.inner.dispatch.control.lock().unwrap() = Some(tx);
+        let cleanup = |inner: &EngineInner| {
+            *inner.dispatch.control.lock().unwrap() = None;
+            inner.dispatch.pending.lock().unwrap().remove(&key);
+        };
+        let send_res = self.send(request);
+        if let Err(e) = send_res {
+            cleanup(&self.inner);
+            return Err(e);
+        }
+        loop {
+            let response = match self.recv_control(&rx) {
+                Ok(v) => v,
+                Err(e) => {
+                    cleanup(&self.inner);
+                    return Err(e);
+                }
+            };
+            match response.get("type").and_then(Value::as_str) {
+                Some("embedded") => {
+                    cleanup(&self.inner);
+                    return Ok(response);
+                }
+                Some("error") => {
+                    cleanup(&self.inner);
+                    return Err(daemon_error_from_value(&response));
+                }
+                _ => {
+                    // No progress events today; ignore anything else the
+                    // daemon interleaves (e.g. metrics).
+                }
+            }
+        }
+    }
+
     pub fn generate(
         &self,
         request: &Value,
