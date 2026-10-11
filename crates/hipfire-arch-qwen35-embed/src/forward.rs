@@ -185,19 +185,35 @@ impl<'a> Enc<'a> {
         n: usize,
         cfg: &EmbedConfig,
     ) -> Result<(), rdna_compute::HipError> {
-        self.gpu.attention_text_f32(
+        // The Q-tiled bidirectional kernel (K shared across QB query rows)
+        // unless `HIPFIRE_EMBED_ATTN=naive` asks for the one-block-per-row
+        // reference — that kernel is correct for any shape but re-reads all of
+        // K/V per query row, which is ~82% of the encode at N=4096.
+        if embed_attn_naive() {
+            return self.gpu.attention_text_f32(
+                q,
+                k,
+                v,
+                None,
+                None,
+                ctx,
+                n,
+                cfg.n_heads,
+                cfg.n_kv_heads,
+                cfg.head_dim,
+                1.0 / (cfg.head_dim as f32).sqrt(),
+                false,
+            );
+        }
+        self.gpu.attention_encoder_qtiled_f32(
             q,
             k,
             v,
-            None,
-            None,
             ctx,
             n,
             cfg.n_heads,
             cfg.n_kv_heads,
             cfg.head_dim,
-            1.0 / (cfg.head_dim as f32).sqrt(),
-            false,
         )
     }
 
@@ -343,6 +359,22 @@ fn trace(
         v.len()
     );
     Ok(())
+}
+
+/// `HIPFIRE_EMBED_ATTN=naive` selects the reference per-(query, head)
+/// attention kernel instead of the Q-tiled one. Read once; the tiled kernel is
+/// the production path.
+fn embed_attn_naive() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            hipfire_config::developer_var("HIPFIRE_EMBED_ATTN")
+                .ok()
+                .as_deref(),
+            Some("naive")
+        )
+    })
 }
 
 /// `HIPFIRE_EMBED_DEBUG=1`, read once (the trace calls are on the hot path;

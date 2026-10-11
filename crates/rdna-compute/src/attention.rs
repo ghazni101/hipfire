@@ -3008,6 +3008,119 @@ impl Gpu {
         )
     }
 
+    /// Q-tiled **bidirectional** attention with separate Q/K/V and GQA —
+    /// the arch-17 embedding encoder's full-attention layer.
+    ///
+    /// `attention_text_f32` (one block per (query row, head)) re-reads all of
+    /// K and V once per query row: at N=4096, H=8, hd=256 that is ~275 GB of
+    /// traffic and 486 ms per layer on gfx1101, 82% of the encode. This shares
+    /// every K tile across `QB` query rows instead, the same structure the
+    /// vision tower uses (`vit_attention_qtiled_f32`), extended to separate
+    /// Q/K/V, GQA and `head_dim` up to 256.
+    ///
+    /// Contract: `q` is `[n, n_heads*hd]`, `k`/`v` are `[n, n_kv_heads*hd]`,
+    /// `out` is `[n, n_heads*hd]`; `n_heads % n_kv_heads == 0`,
+    /// `hd % 16 == 0` and `hd <= 256`. `scale` is folded by the caller as
+    /// `1/sqrt(hd)`, matching `attention_text_f32`.
+    pub fn attention_encoder_qtiled_f32(
+        &mut self,
+        q: &GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        out: &GpuTensor,
+        n: usize,
+        n_heads: usize,
+        n_kv_heads: usize,
+        head_dim: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        if n_kv_heads == 0 || n_heads % n_kv_heads != 0 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_encoder_qtiled_f32: n_heads {n_heads} is not a multiple \
+                     of n_kv_heads {n_kv_heads}"
+                ),
+            ));
+        }
+        if head_dim % 16 != 0 || head_dim > 256 {
+            return Err(hip_bridge::HipError::new(
+                0,
+                &format!(
+                    "attention_encoder_qtiled_f32: head_dim {head_dim} is outside the \
+                     Q-tiled contract (multiple of 16, <= 256)"
+                ),
+            ));
+        }
+        self.ensure_kernel(
+            "attention_encoder_qtiled_f32",
+            kernels::ATTENTION_ENCODER_QTILED_SRC,
+            "attention_encoder_qtiled_f32",
+        )?;
+        let func = &self.functions["attention_encoder_qtiled_f32"];
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+        // K_TILE is chosen so the LDS carve-up stays inside 64 KB for any
+        // head_dim; the layout is mirrored from the kernel's smem carve-up.
+        const QB: usize = 16;
+        const LANES: usize = 16;
+        // LDS = k_tile + q_tile + s_tile + ws_max + ws_sum + m_l. The running
+        // output is register-resident in the kernel, so it is NOT budgeted
+        // here — the two must stay in step.
+        // K rows are padded by 4 floats (K_PAD) to break LDS bank conflicts;
+        // the sizing here must match the kernel's carve-up exactly.
+        const K_PAD: usize = 4;
+        let lds_floats = |kt: usize| {
+            kt * (head_dim + K_PAD) + QB * head_dim + QB * kt + 2 * QB * LANES + 2 * QB
+        };
+        // `kt` must stay a multiple of LANES: the score pass computes
+        // `K_TILE / LANES` scores per lane, so kt < LANES would silently
+        // compute none (and a non-multiple would drop the tail keys). The
+        // floor is LANES, not the LDS minimum — at head_dim 256 the LDS
+        // budget only ever pulls kt down to 32.
+        let k_tile: usize = {
+            let mut kt = 64usize;
+            while kt > LANES && lds_floats(kt) * 4 > 64 * 1024 {
+                kt >>= 1;
+            }
+            debug_assert!(kt >= LANES && kt % LANES == 0, "k_tile {kt} breaks the score pass");
+            kt
+        };
+        let shared_floats = lds_floats(k_tile);
+        let shared_mem = (shared_floats * 4) as u32;
+        let mut qp = q.buf.as_ptr();
+        let mut kp = k.buf.as_ptr();
+        let mut vp = v.buf.as_ptr();
+        let mut op = out.buf.as_ptr();
+        let mut ni = n as i32;
+        let mut nh = n_heads as i32;
+        let mut nkv = n_kv_heads as i32;
+        let mut hd = head_dim as i32;
+        let mut sc = scale;
+        let mut kt = k_tile as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut qp as *mut _ as *mut c_void,
+            &mut kp as *mut _ as *mut c_void,
+            &mut vp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+            &mut nh as *mut _ as *mut c_void,
+            &mut nkv as *mut _ as *mut c_void,
+            &mut hd as *mut _ as *mut c_void,
+            &mut sc as *mut _ as *mut c_void,
+            &mut kt as *mut _ as *mut c_void,
+        ];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [n_heads as u32, (n as u32).div_ceil(QB as u32), 1],
+                [(QB * LANES) as u32, 1, 1],
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
     /// Multi-slot variant of
     /// [`Self::attention_flash_bf16_batched_masked_windowed`] — the bf16
     /// tile kernel is descriptor-aware (it is one of the two kernels the
