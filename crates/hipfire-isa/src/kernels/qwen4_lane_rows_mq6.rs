@@ -655,7 +655,7 @@ mod tests {
     #[cfg(feature = "toolchain")]
     #[test]
     fn lane_rows_mq6_m7() {
-        let dir = std::env::temp_dir().join(format!("hipfire-isa-mq6-lane-rows-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("hipfire-isa-lane-rows-mq6-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         for (emitted, symbol) in build_gfx1151().expect("mq6 lane rows").into_iter().zip([SYMBOL, SYMBOL_X4]) {
             // The two columns of the first packet: x1 mul against rows (0, 1) of slots 0 and 1.

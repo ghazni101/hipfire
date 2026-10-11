@@ -3471,8 +3471,7 @@ mod tests {
     }
 
     #[test]
-    // `4..3` below is deliberately reversed bad input; the lint cannot see that.
-    #[allow(clippy::reversed_empty_ranges)]
+    #[allow(clippy::reversed_empty_ranges)] // 4..3 is the reversed-range rejection case under test
     fn subimage_bounds_are_relative_and_checked() {
         let image = CodeObjectBytes::from(ELF);
         let inner = image.subimage(2..8).unwrap();
