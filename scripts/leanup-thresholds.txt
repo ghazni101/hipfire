@@ -49,7 +49,13 @@ required_features_daemon    == 0
 # the Qwen4 think-budget/EOS serve fixes (163d26d5b0, 325f31cc1a); e4d816e6b2
 # already removed formatter churn. v0.4.1 shipped at 5392 with CI red on this
 # ratchet; recorded here in 0.4.1.1 rather than masking the gate.
-daemon_lines                <= 5392
+# RATCHET-RAISE 5392 -> 5440: the `embed` wire verb (arch 17, the qwen3.5
+# multi-vector embedding encoder) adds a dispatch arm + its non-embed refusal
+# to the daemon's message loop. The body lives in hipfire-generate::embed (the
+# img_generate precedent), so the daemon only names arch_id 17 and the verb —
+# the 42 lines are the arm itself plus the refusal. Paid down when the message
+# loop's per-verb refusal boilerplate is factored out.
+daemon_lines                <= 5440
 
 # Examples compile on every `cargo build --all-targets`. Archived research
 # probes are gated behind `--features lab`; this is the count still ungated.
