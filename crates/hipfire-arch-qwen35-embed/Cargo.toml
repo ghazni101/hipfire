@@ -9,6 +9,10 @@ description = "Qwen3.5 multi-vector embedding architecture (bidirectional full a
 
 [features]
 default = ["deltanet"]
+# Archived validation probes: `cargo run -p <crate> --example vision_smoke
+# --features lab`. Gated so `cargo build --all-targets` does not type-check a
+# GPU-only smoke on every build (the leanup ungated-examples ratchet).
+lab = []
 # The GDN / partial-RoPE / mRoPE kernels in rdna-compute are deltanet-gated,
 # matching hipfire-arch-qwen35 and hipfire-arch-qwen35-vl.
 deltanet = ["hipfire-runtime/deltanet", "rdna-compute/deltanet", "hipfire-arch-qwen35-vl/deltanet"]
@@ -21,3 +25,9 @@ hip-bridge = { path = "../hip-bridge" }
 rdna-compute = { path = "../rdna-compute" }
 half.workspace = true
 serde_json.workspace = true
+
+# GPU validation probe (see the module doc): loads only the vision tower out of
+# a checkpoint dir and encodes one image.
+[[example]]
+name = "vision_smoke"
+required-features = ["lab"]
