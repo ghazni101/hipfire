@@ -2283,7 +2283,8 @@ pub fn generate_ar_with_forward<Prefill, Decode, Commit>(
             None
         };
         let nl_set: std::collections::HashSet<u32> = tok.encode("\n").into_iter().collect();
-        let cached_seq = crate::qwen::qwen_dflash_cache_seq(&streamed_tokens, im_end_token, &nl_set);
+        let cached_seq =
+            crate::qwen::qwen_dflash_cache_seq(&streamed_tokens, im_end_token, &nl_set);
         let _ = qwen_ar_apply_cache_action(
             |fp, seq| {
                 m.asst_turn_cache.insert(
@@ -3322,7 +3323,8 @@ pub fn generate(
     // and a byte-fit implies a token-fit. Near-boundary requests still
     // measure exactly, so reset decisions are unchanged.
     let prompt_est = if m.eviction.is_none()
-        && m.seq_pos.saturating_add(prompt.len())
+        && m.seq_pos
+            .saturating_add(prompt.len())
             .saturating_add(20)
             .saturating_add(max_tokens)
             > m.max_seq
@@ -4388,12 +4390,17 @@ pub fn generate(
     emit_generation_start(selected_route, stdout, id, started_in_think);
     let t0 = Instant::now();
 
-    if hipfire_loader::carrier_for(m.arch_id)
-        .map(|c| c.caps().has_deltanet)
-        .unwrap_or(false)
-    {
-        // Qwen3.5 / Qwen3.5-MoE — multi-turn: prefill only the NEW turn tokens,
-        // continuing from m.seq_pos (KV cache + DeltaNet state are cumulative)
+    // The Qwen3.5 multi-turn branch: prefill only the NEW turn tokens,
+    // continuing from `m.seq_pos` (KV cache + DeltaNet state are cumulative).
+    //
+    // Keyed on the ROUTE, not on `caps().has_deltanet`. The capability means
+    // "has GatedDeltaNet state", which is now true of an arch that is NOT
+    // Qwen35 — arch 17, the qwen3.5 multi-vector embedding encoder — so using
+    // it as a proxy for "the state is a `Qwen35Bundle`" made this branch
+    // downcast the wrong type and panic the daemon on a `generate` request.
+    // `GenerationRoute::QwenAr` is produced for exactly arch 5|6
+    // (`select_generation_route`), which is the bundle this branch needs.
+    if matches!(selected_route, GenerationRoute::QwenAr) {
         let b = m
             .state
             .as_mut()

@@ -269,6 +269,13 @@ Read only by the Qwen4 carrier and its kernels; no other model reads them.
 | `HIPFIRE_VL_FILE` | explicit `.vl` tower file for the multi-slot engine | Checked before the `<stem>.vl` sibling probe in `hipfire-runtime` `sidecar::resolve_vl_sidecar`; a set-but-missing path is reported, not silently ignored. |
 | `HIPFIRE_VIT_ATTN` | `naive` forces the per-(head, query) ViT attention kernel | Rollback/A-B switch for the Q-tiled ViT attention kernel. Head dims outside the Q-tiled contract (`head_dim % 16 != 0` or `> 128`) use the naive kernel regardless. |
 
+### Embedding (arch 17)
+
+| Variable | Default / sense | Notes |
+|---|---|---|
+| `HIPFIRE_EMBED_VISION_OFFLOAD` | `1`/`on`/`true` forces the qwen3.5 embedding model's SigLIP tower into host RAM (GPU-addressable, read over PCIe); `0`/`off`/`false` forces it device-resident; unset auto-decides | The tower is ~250 MB of the arch's ~740 MB and is only touched by an image request, so it is the component to spill when the card is busy. **Auto (the default)** keeps it resident only when it fits in the VRAM free at load plus a 64 MB margin, and spills otherwise — a machine whose desktop already holds most of the card then loads the model and serves text instead of OOMing, at the cost of PCIe reads on image requests. Same tradeoff `HIPFIRE_OFFLOAD_EXEC=pcie` makes for spilled text layers; applied per-model here because the embedding arch can offload the tower whole. Read via `developer_var` in `hipfire-arch-qwen35-embed`. |
+| `HIPFIRE_EMBED_DEBUG` | `1` traces the embedding encoder | Prints a per-layer finite-value trace of the residual stream (absmax + non-finite count) and the VRAM free/total after load. Downloads one tensor per call, so it is strictly a debugging path — it is what localized a weight-format bug that NaN'd the last rows of every projection. |
+
 ### Graph / MMQ / prefill
 
 | Variable | Notes |
@@ -1006,6 +1013,8 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_E8_ROW_GATE` | crates/saddle-lab/examples/collect_e8_hessian_native.rs | harness |
 | `HIPFIRE_E8_SOA_EXPERTS` | crates/hipfire-arch-qwen35/src/qwen35/load.rs, crates/rdna-compute/src/gemv.rs | developer |
 | `HIPFIRE_E8_STRIP` | crates/rdna-compute/src/gemv.rs, crates/rdna-compute/src/kernels.rs | developer |
+| `HIPFIRE_EMBED_DEBUG` | crates/hipfire-arch-qwen35-embed/src/carrier.rs, crates/hipfire-arch-qwen35-embed/src/forward.rs | developer |
+| `HIPFIRE_EMBED_VISION_OFFLOAD` | crates/hipfire-arch-qwen35-embed/src/vision.rs | developer |
 | `HIPFIRE_EMIT_TOKEN_IDS` | autoresearch/ar/certify/serve_runner.py, crates/hipfire-arch-cohere2moe/src/spec_emit.rs | developer |
 | `HIPFIRE_EMULATE_GPUS` | crates/hipfire-arch-qwen35/tests/route_oracle_mesh.rs, crates/hipfire-runtime/src/config.rs | developer |
 | `HIPFIRE_EMU_BF16_H` | crates/rdna-compute/src/gemv.rs | developer |
@@ -1370,7 +1379,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_GPTQ_DAMPING` | crates/hipfire-quantize/src/quant_mq.rs | developer |
 | `HIPFIRE_GPUS` | scripts/ab-dispatch-validation.sh | harness |
 | `HIPFIRE_GPU_0_BIG` | scripts/ab-dispatch-validation.sh | harness |
-| `HIPFIRE_GPU_LAYER_BUDGET` | crates/hipfire-arch-qwen35/src/qwen35/config.rs, crates/hipfire-config/src/lib.rs | stable |
+| `HIPFIRE_GPU_LAYER_BUDGET` | crates/hipfire-arch-qwen35-embed/src/vision.rs, crates/hipfire-arch-qwen35/src/qwen35/config.rs | stable |
 | `HIPFIRE_GPU_LOCKFILE` | autoresearch/ar/swarm.py, scripts/container-gate.sh | harness |
 | `HIPFIRE_GPU_LOCK_OWNER` | scripts/gpu-lock.sh, scripts/pp-gate.sh | harness |
 | `HIPFIRE_GPU_LOCK_PATH` | scripts/gpu-lock.sh | harness |
@@ -1447,7 +1456,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_KV_ADAPTIVE` | crates/hipfire-arch-qwen35/src/carrier.rs, crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_KV_BACKEND` | crates/hipfire-loader/src/admission.rs, scripts/guard_gfx1201_baseline.py | developer |
 | `HIPFIRE_KV_BF16` | crates/hipfire-dispatch/src/families/attention.rs, crates/hipfire-dispatch/src/families/kv_tier.rs | developer |
-| `HIPFIRE_KV_FP8_E4M3` | crates/rdna-compute/src/kernels.rs | developer |
+| `HIPFIRE_KV_FP8_E4M3` | crates/hipfire-runtime/src/kv_mode.rs, crates/rdna-compute/src/attention.rs | developer |
 | `HIPFIRE_KV_MODE` | benchmarks/scripts/bench_pp_gfx906.sh, crates/hipfire-arch-qwen35/src/serve_engine.rs | stable; `asymN`/`turbo*` values deprecated, removal 0.5.0 |
 | `HIPFIRE_KV_PHYSICAL_CAP` | crates/hipfire-runtime/src/loader_api.rs | developer |
 | `HIPFIRE_KV_SEQ` | crates/hipfire-arch-gemma4/src/carrier.rs, crates/hipfire-arch-gemma4/src/lowered.rs | developer |
@@ -1655,7 +1664,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_NPU_SPILLOVER` | crates/hipfire-config/src/lib.rs, crates/hipfire-runtime/src/config.rs | experimental |
 | `HIPFIRE_NPU_TRUNK_TEST_MODEL` | crates/hipfire-arch-qwen4/tests/npu_trunk_model_sanity.rs | harness |
 | `HIPFIRE_OFFLOAD_DEBUG` | crates/hipfire-arch-qwen35/src/qwen35/load.rs, crates/rdna-compute/src/dispatch.rs | developer |
-| `HIPFIRE_OFFLOAD_EXEC` | crates/hipfire-config/src/lib.rs, crates/hipfire-dispatch/src/cpu_exec.rs | stable |
+| `HIPFIRE_OFFLOAD_EXEC` | crates/hipfire-arch-qwen35-embed/src/vision.rs, crates/hipfire-config/src/lib.rs | stable |
 | `HIPFIRE_OOM_GUARD` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/kv_slots.rs | stable |
 | `HIPFIRE_ORACLE_DIVERGE` | crates/hipfire-arch-qwen35/tests/route_oracle_mesh.rs | harness |
 | `HIPFIRE_ORACLE_DUMP` | crates/saddle-lab/examples/tmp_gemm_v2_oracle.rs | harness |
@@ -1727,7 +1736,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_Q8_BATCHED_LEGACY` | crates/hipfire-config/src/lib.rs, crates/rdna-compute/src/feature_flags.rs | experimental |
 | `HIPFIRE_Q8_CLASSES` | crates/hipfire-quantize/src/diagnostics.rs, crates/hipfire-quantize/src/model_filter.rs | developer |
 | `HIPFIRE_Q8_FLASH_TILE` | crates/hipfire-arch-maple/src/maple.rs, crates/rdna-compute/src/attention.rs | developer |
-| `HIPFIRE_Q8_PREFILL_WMMA` | crates/hipfire-arch-qwen35/src/qwen35/prefill.rs | developer |
+| `HIPFIRE_Q8_PREFILL_WMMA` | crates/hipfire-arch-qwen35/src/forward_slots.rs, crates/hipfire-arch-qwen35/src/qwen35/prefill.rs | developer |
 | `HIPFIRE_QA_KV_MODES` | crates/saddle-lab/examples/test_inferenceQA.rs | harness |
 | `HIPFIRE_QCAL_BREAKDOWN` | crates/hipfire-runtime/tests/hf_tokenizer_encode_bench.rs | harness |
 | `HIPFIRE_QKVZA_BLOCK_SIZE` | crates/rdna-compute/src/kernels.rs | developer |

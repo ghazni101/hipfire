@@ -363,6 +363,37 @@ pub fn img_route(arch_id: u32) -> ImgRoute {
     }
 }
 
+/// Which non-chat wire verb an arch serves.
+///
+/// The daemon gates `generate` / `img_generate` / `embed` on these predicates
+/// rather than on an `arch_id` literal of its own, so arch knowledge stays in
+/// the loader (the same rule `img_route` follows). Today only the qwen3.5
+/// multi-vector embedding encoder (arch 17) is non-generating: it answers
+/// `embed` and nothing else — it has no LM head and no KV cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireVerb {
+    /// The default: `generate` (and, for a diffusion family, `img_generate`).
+    Generate,
+    /// The multi-vector embedding encoder: `embed` only.
+    Embed,
+}
+
+/// Classify an arch's wire verb. `Generate` is the default so a new chat arch
+/// needs no change here; a new non-generating arch is added explicitly.
+pub fn wire_verb(arch_id: u32) -> WireVerb {
+    match arch_id {
+        17 => WireVerb::Embed,
+        _ => WireVerb::Generate,
+    }
+}
+
+impl WireVerb {
+    /// True when the arch answers `generate` (and so refuses `embed`).
+    pub fn is_generate(&self) -> bool {
+        matches!(self, WireVerb::Generate)
+    }
+}
+
 /// EP prompt construction route. DeepSeek4 (arch 9) uses the DSML prompt
 /// builder; all other EP arches (10 MiniMax, etc.) use Jinja.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1188,12 +1219,10 @@ impl LoadedModel {
 
     /// Qwen3.5 multi-vector embedding bundle if this model is arch_id=17,
     /// else `None`. The daemon `embed` verb's typed handle.
-    pub fn qwen35_embed_mut(
-        &mut self,
-    ) -> Option<&mut hipfire_arch_qwen35_embed::EmbedBundle> {
-        self.state
-            .as_deref_mut()
-            .and_then(|s| (s as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35_embed::EmbedBundle>())
+    pub fn qwen35_embed_mut(&mut self) -> Option<&mut hipfire_arch_qwen35_embed::EmbedBundle> {
+        self.state.as_deref_mut().and_then(|s| {
+            (s as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35_embed::EmbedBundle>()
+        })
     }
 
     pub fn deepseek4_heterogeneous_mut(&mut self) -> Option<&mut Deepseek4HeterogeneousBundle> {
@@ -4600,7 +4629,9 @@ fn load_model_tp_qwen35_dense(
             } else {
                 errors.join("; ")
             };
-            return Err(format!("MTP head required (mtp=on) but not loaded: {reason}"));
+            return Err(format!(
+                "MTP head required (mtp=on) but not loaded: {reason}"
+            ));
         }
         head
     } else {
@@ -5207,9 +5238,14 @@ mod ep_admission_tests {
         let before = active.request();
         let mut effects = LoadEffects::default();
         let refusal = attempt_candidate_swap(
-            &candidate, 1, admission::KvBackendRequest::Explicit(hipfire_runtime::kv_backend::KvBackend::Vmm),
-            "gfx1100", &mut active, &mut effects,
-        ).unwrap_err();
+            &candidate,
+            1,
+            admission::KvBackendRequest::Explicit(hipfire_runtime::kv_backend::KvBackend::Vmm),
+            "gfx1100",
+            &mut active,
+            &mut effects,
+        )
+        .unwrap_err();
         assert!(refusal.contains("vmm") && refusal.contains("unsupported"));
         assert_eq!(effects, LoadEffects::default());
         assert_eq!(active.request(), before);
@@ -5252,6 +5288,25 @@ mod lfm2_batch_admission_tests {
                 .caps()
                 .supports_continuous_batch
         );
+    }
+}
+
+#[cfg(test)]
+#[cfg(test)]
+mod wire_verb_tests {
+    use super::{wire_verb, WireVerb};
+
+    #[test]
+    fn embed_reserved_for_arch_17_and_generate_is_the_default() {
+        assert_eq!(wire_verb(17), WireVerb::Embed);
+        assert!(!wire_verb(17).is_generate());
+        // Every other exercised arch stays a generating model, so a new chat
+        // arch needs no change here and only a non-generating one is added
+        // explicitly.
+        for a in [0, 1, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 40, 45] {
+            assert_eq!(wire_verb(a), WireVerb::Generate, "arch {a}");
+            assert!(wire_verb(a).is_generate(), "arch {a}");
+        }
     }
 }
 
