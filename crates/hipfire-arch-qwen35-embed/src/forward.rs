@@ -75,24 +75,19 @@ impl<'a> Enc<'a> {
             .map_err(|e| format!("qwen35-embed: free: {e:?}"))
     }
 
-    /// f32 → f16 operand cast (`[n]` flat).
-    fn cast_f16(&mut self, x: &GpuTensor, n: usize) -> Result<GpuTensor, String> {
-        let dst = self
-            .gpu
-            .alloc_tensor(&[n], DType::F16)
-            .map_err(|e| format!("qwen35-embed: alloc f16: {e:?}"))?;
-        self.gpu
-            .cast_f32_to_f16(x, &dst)
-            .map_err(|e| format!("qwen35-embed: cast f16: {e:?}"))?;
-        Ok(dst)
-    }
-
-    /// `y[n, out] = x_f16[n, k] · w_f16[out, k]ᵀ` (no bias — every text
+    /// `y[n, out] = x[n, k] · w_f16[out, k]ᵀ` (no bias — every text
     /// projection here is bias-free).
+    ///
+    /// **`x` is F32.** Both underlying kernels (`gemm_f16_wmma_mb8` and the
+    /// naive `gemm_f16`) read their X operand as f32 and cast to f16
+    /// internally — passing an f16 activation buffer makes the kernel read
+    /// four bytes per element and run off the end of the allocation (which
+    /// showed up as per-row NaNs on the first 2 of N rows). Only the weight
+    /// operand is f16.
     fn gemm(
         &mut self,
         w: &GpuTensor,
-        x_f16: &GpuTensor,
+        x: &GpuTensor,
         out: usize,
         k: usize,
         n: usize,
@@ -103,12 +98,12 @@ impl<'a> Enc<'a> {
         let y = self.alloc(n * out)?;
         if self.gpu.arch_caps.has_wmma_w32() || self.gpu.arch_caps.has_wmma_w32_gfx12() {
             self.gpu
-                .gemm_f16_wmma_mb8(w, x_f16, &y, out, k, n)
+                .gemm_f16_wmma_mb8(w, x, &y, out, k, n)
                 .map_err(|e| format!("qwen35-embed: gemm: {e:?}"))?;
         } else {
             let yt = self.alloc(out * n)?;
             self.gpu
-                .gemm_f16(w, x_f16, &yt, out, k, n)
+                .gemm_f16(w, x, &yt, out, k, n)
                 .map_err(|e| format!("qwen35-embed: gemm (naive): {e:?}"))?;
             self.gpu
                 .transpose_f32(&yt, &y, out, n)
@@ -319,6 +314,28 @@ impl<'a> Enc<'a> {
     }
 }
 
+/// Env-gated (`HIPFIRE_EMBED_DEBUG=1`) finite-value trace of the residual
+/// stream: prints absmax and the non-finite count at each stage so a NaN can
+/// be localized to a layer and a mixer kind. Downloads one tensor per call,
+/// so this is strictly a debugging path.
+fn trace(enc: &mut Enc<'_>, label: &str, t: &GpuTensor, n: usize) -> Result<(), String> {
+    if std::env::var("HIPFIRE_EMBED_DEBUG").ok().as_deref() != Some("1") {
+        return Ok(());
+    }
+    let v = enc.download(t)?;
+    let mut absmax = 0f32;
+    let mut bad = 0usize;
+    for &x in &v[..n.min(v.len())] {
+        if !x.is_finite() {
+            bad += 1;
+        } else if x.abs() > absmax {
+            absmax = x.abs();
+        }
+    }
+    eprintln!("  [embed-debug] {label}: absmax={absmax:.4} nonfinite={bad}/{}", v.len());
+    Ok(())
+}
+
 /// Run the full encoder and the Dense head; returns `[n, dense_out]`
 /// row-major **unmasked, unnormalized** token embeddings (the
 /// sentence-transformers modules 2/3 run host-side in [`crate::post`]).
@@ -349,10 +366,8 @@ pub fn encode_embeddings(
     let dense = {
         let fin = e.alloc(n * cfg.hidden_size)?;
         e.rmsnorm(&hidden, &w.final_norm, &fin, n, cfg.hidden_size, cfg.rms_norm_eps)?;
-        let fin16 = e.cast_f16(&fin, n * cfg.hidden_size)?;
+        let emb = e.gemm(&w.dense, &fin, cfg.dense_out_features, cfg.hidden_size, n)?;
         e.free(fin)?;
-        let emb = e.gemm(&w.dense, &fin16, cfg.dense_out_features, cfg.hidden_size, n)?;
-        e.free(fin16)?;
         emb
     };
     let out = e.download(&dense)?;
@@ -393,13 +408,12 @@ pub fn encode_hidden(
     let pos3 = e.alloc(n * 3)?;
     e.memcpy_htod(&pos3, &pos_bytes)?;
 
+    trace(&mut e, "embed", &hidden, n * h)?;
     let mut delta_layer_idx = 0usize;
     for (li, layer) in w.layers.iter().enumerate() {
         // ── pre-norm ──────────────────────────────────────────────────
         let normed = e.alloc(n * h)?;
         e.rmsnorm(&hidden, &layer.input_ln, &normed, n, h, eps)?;
-        let normed16 = e.cast_f16(&normed, n * h)?;
-        e.free(normed)?;
 
         match &layer.mixer {
             crate::weights::MixerWeights::FullAttn {
@@ -413,11 +427,11 @@ pub fn encode_hidden(
             } => {
                 let qd = cfg.q_dim();
                 let kvd = cfg.kv_dim();
-                let q = e.gemm(q_proj, &normed16, qd, h, n)?;
-                let gate = e.gemm(gate_proj, &normed16, qd, h, n)?;
-                let k = e.gemm(k_proj, &normed16, kvd, h, n)?;
-                let v = e.gemm(v_proj, &normed16, kvd, h, n)?;
-                e.free(normed16)?;
+                let q = e.gemm(q_proj, &normed, qd, h, n)?;
+                let gate = e.gemm(gate_proj, &normed, qd, h, n)?;
+                let k = e.gemm(k_proj, &normed, kvd, h, n)?;
+                let v = e.gemm(v_proj, &normed, kvd, h, n)?;
+                e.free(normed)?;
 
                 // Per-head Q/K RMSNorm (pre-rope), in place.
                 e.rmsnorm(&q, q_norm, &q, n * cfg.n_heads, cfg.head_dim, eps)?;
@@ -443,10 +457,8 @@ pub fn encode_hidden(
                 e.sigmoid_mul(&ctx, &gate)
                     .map_err(|err| format!("qwen35-embed: attn gate (layer {li}): {err:?}"))?;
                 e.free(gate)?;
-                let ctx16 = e.cast_f16(&ctx, n * qd)?;
+                let attn = e.gemm(o_proj, &ctx, h, qd, n)?;
                 e.free(ctx)?;
-                let attn = e.gemm(o_proj, &ctx16, h, qd, n)?;
-                e.free(ctx16)?;
                 e.add_inplace(&hidden, &attn, "residual")?;
                 e.free(attn)?;
             }
@@ -467,15 +479,17 @@ pub fn encode_hidden(
                 let khd = cfg.linear_key_head_dim;
                 let vhd = cfg.linear_value_head_dim;
 
-                let qkv_t = e.gemm(qkv, &normed16, k_dim * 2 + v_dim, h, n)?;
-                let z_t = e.gemm(z, &normed16, v_dim, h, n)?;
-                let a_t = e.gemm(a, &normed16, n_v, h, n)?;
-                let b_t = e.gemm(b, &normed16, n_v, h, n)?;
-                e.free(normed16)?;
+                let qkv_t = e.gemm(qkv, &normed, k_dim * 2 + v_dim, h, n)?;
+                let z_t = e.gemm(z, &normed, v_dim, h, n)?;
+                let a_t = e.gemm(a, &normed, n_v, h, n)?;
+                let b_t = e.gemm(b, &normed, n_v, h, n)?;
+                e.free(normed)?;
 
                 // β = σ(b); g = −exp(A_log)·softplus(a + dt_bias), in place.
                 e.alpha_gate(&b_t, &a_t, dt_bias, a_log, n_v, n)
                     .map_err(|err| format!("qwen35-embed: alpha gate (layer {li}): {err:?}"))?;
+                trace(&mut e, &format!("L{li} gdn: a_t(after gate)"), &a_t, n * n_v)?;
+                trace(&mut e, &format!("L{li} gdn: qkv_t"), &qkv_t, n * (k_dim * 2 + v_dim))?;
 
                 // Causal conv + SiLU split (Q|K|V channels), ring state.
                 let q_raw = e.alloc(n * k_dim)?;
@@ -489,6 +503,7 @@ pub fn encode_hidden(
                 e.free(qkv_t)?;
 
                 // L2-norm(Q)·scale + L2-norm(K) per head.
+                trace(&mut e, &format!("L{li} gdn: conv q_raw"), &q_raw, n * k_dim)?;
                 e.qk_l2_norm(&q_raw, &k_raw, cfg, khd, eps, n)
                     .map_err(|err| format!("qwen35-embed: qk norm (layer {li}): {err:?}"))?;
 
@@ -501,6 +516,7 @@ pub fn encode_hidden(
                     &state.s_matrices[delta_layer_idx], &attn_out, n, n_v, vhd,
                 )
                 .map_err(|err| format!("qwen35-embed: gdn scan (layer {li}): {err:?}"))?;
+                trace(&mut e, &format!("L{li} gdn: scan out"), &attn_out, n * v_dim)?;
                 e.free(q_raw)?;
                 e.free(k_raw)?;
                 e.free(v_t2)?;
@@ -511,33 +527,29 @@ pub fn encode_hidden(
                 let normed_gdn = e.alloc(n * v_dim)?;
                 e.gated_norm(&attn_out, &z_t, gdn_norm, &normed_gdn, n_v, vhd, eps, n)
                     .map_err(|err| format!("qwen35-embed: gated norm (layer {li}): {err:?}"))?;
+                trace(&mut e, &format!("L{li} gdn: gated_norm"), &normed_gdn, n * v_dim)?;
                 e.free(attn_out)?;
                 e.free(z_t)?;
-                let ng16 = e.cast_f16(&normed_gdn, n * v_dim)?;
+                let out = e.gemm(out_proj, &normed_gdn, h, v_dim, n)?;
                 e.free(normed_gdn)?;
-                let out = e.gemm(out_proj, &ng16, h, v_dim, n)?;
-                e.free(ng16)?;
                 e.add_inplace(&hidden, &out, "residual")?;
                 e.free(out)?;
                 delta_layer_idx += 1;
             }
         }
 
+        trace(&mut e, &format!("layer {li} post-mixer"), &hidden, n * h)?;
         // ── SwiGLU MLP (both mixer kinds) ─────────────────────────────
         let normed2 = e.alloc(n * h)?;
         e.rmsnorm(&hidden, &layer.post_ln, &normed2, n, h, eps)?;
-        let n216 = e.cast_f16(&normed2, n * h)?;
+        let g = e.gemm(&layer.gate_proj, &normed2, inter, h, n)?;
+        let u = e.gemm(&layer.up_proj, &normed2, inter, h, n)?;
         e.free(normed2)?;
-        let g = e.gemm(&layer.gate_proj, &n216, inter, h, n)?;
-        let u = e.gemm(&layer.up_proj, &n216, inter, h, n)?;
-        e.free(n216)?;
         e.silu_mul(&g, &u)
             .map_err(|err| format!("qwen35-embed: silu (layer {li}): {err:?}"))?;
         e.free(u)?;
-        let g16 = e.cast_f16(&g, n * inter)?;
+        let d = e.gemm(&layer.down_proj, &g, h, inter, n)?;
         e.free(g)?;
-        let d = e.gemm(&layer.down_proj, &g16, h, inter, n)?;
-        e.free(g16)?;
         e.add_inplace(&hidden, &d, "residual mlp")
             .map_err(|err| format!("qwen35-embed: residual mlp (layer {li}): {err:?}"))?;
         e.free(d)?;
