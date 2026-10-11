@@ -142,11 +142,23 @@ pub fn load_qwen35_embed_bundle(
             .count(),
         config.hidden_size,
         config.dense_out_features,
-        if weights.vision.is_some() { "on" } else { "off" },
+        if weights.vision.is_some() {
+            "on"
+        } else {
+            "off"
+        },
         config.query_length,
         config.document_length,
     );
 
+    if std::env::var("HIPFIRE_EMBED_DEBUG").ok().as_deref() == Some("1") {
+        let (f, t) = ctx.gpu.hip.get_vram_info().unwrap_or((0, 0));
+        eprintln!(
+            "  [embed-debug] after load: VRAM {} MB free / {} MB",
+            f / (1024 * 1024),
+            t / (1024 * 1024)
+        );
+    }
     Ok(EmbedBundle {
         config,
         weights,
@@ -245,10 +257,7 @@ pub fn assemble_input(
 /// Build positions: text rows `[p,p,p]`; each image span gets HF
 /// `get_rope_index` phases (t fixed at the span's base, h/w the merged
 /// grid) and advances the cursor by `max(grid_h, grid_w)`.
-pub fn build_positions(
-    n_tokens: usize,
-    spans: &[crate::weights::ImageSpan],
-) -> Vec<[i32; 3]> {
+pub fn build_positions(n_tokens: usize, spans: &[crate::weights::ImageSpan]) -> Vec<[i32; 3]> {
     let sp: Vec<hipfire_arch_qwen35_vl::mrope::ImageSpan> = spans
         .iter()
         .map(|s| hipfire_arch_qwen35_vl::mrope::ImageSpan {

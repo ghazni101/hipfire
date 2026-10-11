@@ -3043,8 +3043,7 @@ fn embed_command(paths: &Paths, args: EmbedArgs) -> Result<()> {
     if !matches!(kind, "query" | "document") {
         bail!("--kind must be \"query\" or \"document\", got {kind:?}");
     }
-    if args.query.is_none() && args.doc.is_none() && args.text.is_empty() && args.image.is_none()
-    {
+    if args.query.is_none() && args.doc.is_none() && args.text.is_empty() && args.image.is_none() {
         bail!(
             "nothing to encode: pass text (positional or --query/--doc) and/or --image \
              (e.g. `hipfire embed <model> --query \"what is rust\" --doc \"Rust is …\"`)"
@@ -3066,8 +3065,19 @@ fn embed_command(paths: &Paths, args: EmbedArgs) -> Result<()> {
 
     let loaded_registry = load_registry(&paths.registry);
     let registry = &loaded_registry.registry;
-    let model_path = find_model_path(paths, registry, &args.model)
-        .ok_or_else(|| anyhow!("model not found: {}", args.model))?;
+    // Embedding checkpoints are directories (an HF snapshot), which
+    // `find_model_path` does not accept (it is file-only for the registry's
+    // HFQ entries). Take a direct existing file OR directory first, then fall
+    // back to the registry.
+    let model_path = {
+        let direct = PathBuf::from(&args.model);
+        if direct.exists() {
+            std::fs::canonicalize(&direct).unwrap_or(direct)
+        } else {
+            find_model_path(paths, registry, &args.model)
+                .ok_or_else(|| anyhow!("model not found: {}", args.model))?
+        }
+    };
     let resolved = resolved_for_model(paths, &args.model, None, None)?;
     let daemon = find_daemon(paths).ok_or_else(|| {
         anyhow!("daemon binary not found; build `cargo build --release -p hipfire-daemon`")
@@ -3082,33 +3092,43 @@ fn embed_command(paths: &Paths, args: EmbedArgs) -> Result<()> {
     engine.ping()?;
     let _loaded = engine.load(&model_path, serde_json::json!({}))?;
 
-    let encode = |id: &str, kind: &str, text: &str, image: Option<&str>| -> Result<serde_json::Value> {
-        let mut input = serde_json::Map::new();
-        if !text.is_empty() {
-            input.insert("text".into(), serde_json::json!(text));
-        }
-        if let Some(b64) = image {
-            input.insert("image_base64".into(), serde_json::json!(b64));
-        }
-        let request = serde_json::json!({
-            "type": "embed",
-            "id": id,
-            "kind": kind,
-            "input": input,
-        });
-        engine
-            .embed(&request)
-            .map_err(|e| anyhow!("embed request failed: {e}"))
-    };
+    let encode =
+        |id: &str, kind: &str, text: &str, image: Option<&str>| -> Result<serde_json::Value> {
+            let mut input = serde_json::Map::new();
+            if !text.is_empty() {
+                input.insert("text".into(), serde_json::json!(text));
+            }
+            if let Some(b64) = image {
+                input.insert("image_base64".into(), serde_json::json!(b64));
+            }
+            let request = serde_json::json!({
+                "type": "embed",
+                "id": id,
+                "kind": kind,
+                "input": input,
+            });
+            engine
+                .embed(&request)
+                .map_err(|e| anyhow!("embed request failed: {e}"))
+        };
 
     let positional = args.text.join(" ");
     let mut result_json = None;
     if let (Some(q), Some(d)) = (&args.query, args.doc.as_deref()) {
         let q_res = encode("q", "query", q, image_b64.as_deref())?;
         let d_res = encode("d", "document", d, None)?;
-        let dim = q_res.get("dim").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
-        let q_tokens = q_res.get("n_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
-        let d_tokens = d_res.get("n_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
+        let dim = q_res
+            .get("dim")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize;
+        let q_tokens = q_res
+            .get("n_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize;
+        let d_tokens = d_res
+            .get("n_tokens")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0) as usize;
         let q_emb = q_res
             .get("embeddings")
             .and_then(serde_json::Value::as_array)
@@ -3165,9 +3185,15 @@ fn embed_command(paths: &Paths, args: EmbedArgs) -> Result<()> {
         } else {
             println!(
                 "{} token embeddings ({} dims), {} input tokens — pass --json for the matrix",
-                res.get("n_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0),
-                res.get("dim").and_then(serde_json::Value::as_u64).unwrap_or(0),
-                res.get("n_input_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0),
+                res.get("n_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                res.get("dim")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
+                res.get("n_input_tokens")
+                    .and_then(serde_json::Value::as_u64)
+                    .unwrap_or(0),
             );
         }
     }
@@ -3627,6 +3653,14 @@ pub(crate) fn resolve_model_path(
     model: &str,
 ) -> Result<Option<PathBuf>> {
     let explicit = Path::new(model);
+    // A directory is a valid model source (an HF safetensors snapshot — the
+    // loader's `ModelSource::Dir`), not just an HFQ file. Resolve it here so
+    // every entry point (serve prewarm, run, embed) accepts one path spelling.
+    if explicit.is_dir() {
+        return Ok(fs::canonicalize(explicit)
+            .ok()
+            .or_else(|| Some(explicit.to_path_buf())));
+    }
     let catalog_path = load_catalog(&paths.config).ok().is_some_and(|catalog| {
         catalog
             .catalog

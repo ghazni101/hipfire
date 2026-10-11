@@ -65,10 +65,7 @@ pub fn resolve_vision<'a>(
 
 /// Bare backbone names every checkpoint must provide (layer index elided).
 pub fn required_text_tensors() -> Vec<String> {
-    let mut out = vec![
-        "embed_tokens.weight".to_string(),
-        "norm.weight".to_string(),
-    ];
+    let mut out = vec!["embed_tokens.weight".to_string(), "norm.weight".to_string()];
     // Both layer kinds share the MLP + norms; the mixer names differ.
     for n in [
         "input_layernorm.weight",

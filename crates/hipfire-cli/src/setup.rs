@@ -160,7 +160,8 @@ pub(crate) fn setup_command(paths: &crate::Paths, args: crate::SetupArgs) -> Res
     let (rocm_root, has_compiler) =
         match resolve_rocm_root_with(args.rocm_root.as_deref(), hipcc_override, strict, args.yes) {
             Ok(root) => (root, true),
-            Err(error) => match pack_tag.and_then(|_| runtime_only_root(args.rocm_root.as_deref())) {
+            Err(error) => match pack_tag.and_then(|_| runtime_only_root(args.rocm_root.as_deref()))
+            {
                 Some(root) => (root, false),
                 None => return Err(error),
             },
@@ -179,7 +180,10 @@ pub(crate) fn setup_command(paths: &crate::Paths, args: crate::SetupArgs) -> Res
         let runtime = hipfire_config::rocm::runtime_library(&rocm_root)
             .map(|p| p.display().to_string())
             .unwrap_or_else(|| "not found".to_string());
-        eprintln!("ROCm root:       {} (version {version})", rocm_root.display());
+        eprintln!(
+            "ROCm root:       {} (version {version})",
+            rocm_root.display()
+        );
         eprintln!("HIPCC:           none (kernels must come from the release kernel pack)");
         eprintln!("HIP runtime:     {runtime}");
     } else {
@@ -340,7 +344,9 @@ pub(crate) fn setup_command(paths: &crate::Paths, args: crate::SetupArgs) -> Res
     })?;
 
     let pack = match (pack_tag, gpu_arch.as_deref()) {
-        (Some(tag), Some(arch)) if rdna_compute::kernel_registry::SUPPORTED_ARCHES.contains(&arch) => {
+        (Some(tag), Some(arch))
+            if rdna_compute::kernel_registry::SUPPORTED_ARCHES.contains(&arch) =>
+        {
             let base = args
                 .kernel_pack_url
                 .clone()
@@ -370,16 +376,19 @@ pub(crate) fn setup_command(paths: &crate::Paths, args: crate::SetupArgs) -> Res
             }
         }
         (Some(tag), None) => {
-            eprintln!("Kernel pack {tag} not used: GPU architecture not detected (pass --gpu-arch ARCH)");
+            eprintln!(
+                "Kernel pack {tag} not used: GPU architecture not detected (pass --gpu-arch ARCH)"
+            );
             None
         }
         _ => None,
     };
     if pack.is_some() {
         // Installed and verified above; nothing to compile.
-    } else if let Some(arch) = gpu_arch.as_deref().filter(|arch| {
-        !rdna_compute::kernel_registry::SUPPORTED_ARCHES.contains(arch)
-    }) {
+    } else if let Some(arch) = gpu_arch
+        .as_deref()
+        .filter(|arch| !rdna_compute::kernel_registry::SUPPORTED_ARCHES.contains(arch))
+    {
         eprintln!(
             "No indexed kernel registry for {arch}; hipcc remains required for JIT on this GPU."
         );
@@ -416,7 +425,8 @@ pub(crate) fn setup_command(paths: &crate::Paths, args: crate::SetupArgs) -> Res
             }
             Err(err) => {
                 rollback_replacements(&replacements);
-                return Err(err).context("failed to start installed daemon indexed kernel packaging");
+                return Err(err)
+                    .context("failed to start installed daemon indexed kernel packaging");
             }
         }
     }

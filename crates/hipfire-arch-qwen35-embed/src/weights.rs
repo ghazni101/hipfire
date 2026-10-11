@@ -66,7 +66,7 @@ pub enum MixerWeights {
         b: GpuTensor,     // in_proj_b [n_v_heads, hidden]
         a_log: GpuTensor, // f32 [n_v_heads]
         dt_bias: GpuTensor,
-        conv: GpuTensor, // f32 [conv_dim, 1, kernel]
+        conv: GpuTensor,     // f32 [conv_dim, 1, kernel]
         gdn_norm: GpuTensor, // f32 [value_head_dim], direct multiply
         out_proj: GpuTensor, // [hidden, v]
     },
@@ -302,7 +302,11 @@ fn upload_q_gate_split(
     for h in 0..heads {
         for part in 0..2 {
             let row_base = (h * 2 * half + part * half) * hidden;
-            let dst = if part == 0 { &mut q_words } else { &mut g_words };
+            let dst = if part == 0 {
+                &mut q_words
+            } else {
+                &mut g_words
+            };
             dst.extend_from_slice(&words[row_base..row_base + half * hidden]);
         }
     }
@@ -331,8 +335,8 @@ fn read_sidecar_tensor(path: &std::path::Path, want: &str) -> Result<Vec<f32>, S
     let mut header = vec![0u8; header_len];
     f.read_exact(&mut header)
         .map_err(|e| format!("{}: header: {e}", path.display()))?;
-    let meta: serde_json::Value =
-        serde_json::from_slice(&header).map_err(|e| format!("{}: header JSON: {e}", path.display()))?;
+    let meta: serde_json::Value = serde_json::from_slice(&header)
+        .map_err(|e| format!("{}: header JSON: {e}", path.display()))?;
     let entry = meta
         .get(want)
         .ok_or_else(|| format!("{}: no tensor `{want}`", path.display()))?;
@@ -373,24 +377,24 @@ fn load_dense(
     st: &dyn ModelSourceTrait,
     cfg: &EmbedConfig,
 ) -> Result<GpuTensor, String> {
-    let (words, cols): (Vec<u16>, usize) = if let Some((info, bytes)) =
-        st.tensor_data(names::DENSE_TENSOR)
-    {
-        let w = decode_f16(info, bytes, names::DENSE_TENSOR)?;
-        let cols = w.len() / cfg.hidden_size;
-        (w, cols)
-    } else {
-        let path = st.path().join(names::DENSE_SHARD);
-        let v = read_sidecar_tensor(&path, "linear.weight")?;
-        let cols = v.len() / cfg.hidden_size;
-        (v.iter().map(|&x| f16::from_f32(x).to_bits()).collect(), cols)
-    };
+    let (words, cols): (Vec<u16>, usize) =
+        if let Some((info, bytes)) = st.tensor_data(names::DENSE_TENSOR) {
+            let w = decode_f16(info, bytes, names::DENSE_TENSOR)?;
+            let cols = w.len() / cfg.hidden_size;
+            (w, cols)
+        } else {
+            let path = st.path().join(names::DENSE_SHARD);
+            let v = read_sidecar_tensor(&path, "linear.weight")?;
+            let cols = v.len() / cfg.hidden_size;
+            (
+                v.iter().map(|&x| f16::from_f32(x).to_bits()).collect(),
+                cols,
+            )
+        };
     if cols != cfg.dense_out_features {
         return Err(format!(
             "qwen35-embed: Dense head is [{cols}×{}], config says [{}×{}]",
-            cfg.hidden_size,
-            cfg.dense_out_features,
-            cfg.hidden_size
+            cfg.hidden_size, cfg.dense_out_features, cfg.hidden_size
         ));
     }
     gpu.upload_f16_bits(&words, &[cfg.dense_out_features, cfg.hidden_size])
@@ -452,8 +456,13 @@ fn stream_weights(
     for li in 0..cfg.num_layers {
         let p = format!("layers.{li}");
         let input_ln = upload_vec_f32(gpu, st, &format!("{p}.input_layernorm.weight"), h, true)?;
-        let post_ln =
-            upload_vec_f32(gpu, st, &format!("{p}.post_attention_layernorm.weight"), h, true)?;
+        let post_ln = upload_vec_f32(
+            gpu,
+            st,
+            &format!("{p}.post_attention_layernorm.weight"),
+            h,
+            true,
+        )?;
         let gate_proj = upload_lin_f16(gpu, st, &format!("{p}.mlp.gate_proj.weight"), inter, h)?;
         let up_proj = upload_lin_f16(gpu, st, &format!("{p}.mlp.up_proj.weight"), inter, h)?;
         let down_proj = upload_lin_f16(gpu, st, &format!("{p}.mlp.down_proj.weight"), h, inter)?;
@@ -473,11 +482,41 @@ fn stream_weights(
                 MixerWeights::FullAttn {
                     q_proj,
                     gate_proj,
-                    k_proj: upload_lin_f16(gpu, st, &format!("{p}.self_attn.k_proj.weight"), kvd, h)?,
-                    v_proj: upload_lin_f16(gpu, st, &format!("{p}.self_attn.v_proj.weight"), kvd, h)?,
-                    o_proj: upload_lin_f16(gpu, st, &format!("{p}.self_attn.o_proj.weight"), h, qd)?,
-                    q_norm: upload_vec_f32(gpu, st, &format!("{p}.self_attn.q_norm.weight"), cfg.head_dim, true)?,
-                    k_norm: upload_vec_f32(gpu, st, &format!("{p}.self_attn.k_norm.weight"), cfg.head_dim, true)?,
+                    k_proj: upload_lin_f16(
+                        gpu,
+                        st,
+                        &format!("{p}.self_attn.k_proj.weight"),
+                        kvd,
+                        h,
+                    )?,
+                    v_proj: upload_lin_f16(
+                        gpu,
+                        st,
+                        &format!("{p}.self_attn.v_proj.weight"),
+                        kvd,
+                        h,
+                    )?,
+                    o_proj: upload_lin_f16(
+                        gpu,
+                        st,
+                        &format!("{p}.self_attn.o_proj.weight"),
+                        h,
+                        qd,
+                    )?,
+                    q_norm: upload_vec_f32(
+                        gpu,
+                        st,
+                        &format!("{p}.self_attn.q_norm.weight"),
+                        cfg.head_dim,
+                        true,
+                    )?,
+                    k_norm: upload_vec_f32(
+                        gpu,
+                        st,
+                        &format!("{p}.self_attn.k_norm.weight"),
+                        cfg.head_dim,
+                        true,
+                    )?,
                 }
             }
             LayerType::LinearAttention => {
@@ -485,15 +524,69 @@ fn stream_weights(
                 let v_dim = cfg.gdn_value_dim();
                 let conv_dim = k_dim * 2 + v_dim;
                 MixerWeights::Gdn {
-                    qkv: upload_lin_f16(gpu, st, &format!("{p}.linear_attn.in_proj_qkv.weight"), k_dim * 2 + v_dim, h)?,
-                    z: upload_lin_f16(gpu, st, &format!("{p}.linear_attn.in_proj_z.weight"), v_dim, h)?,
-                    a: upload_lin_f16(gpu, st, &format!("{p}.linear_attn.in_proj_a.weight"), cfg.linear_num_value_heads, h)?,
-                    b: upload_lin_f16(gpu, st, &format!("{p}.linear_attn.in_proj_b.weight"), cfg.linear_num_value_heads, h)?,
-                    a_log: upload_vec_f32(gpu, st, &format!("{p}.linear_attn.A_log"), cfg.linear_num_value_heads, false)?,
-                    dt_bias: upload_vec_f32(gpu, st, &format!("{p}.linear_attn.dt_bias"), cfg.linear_num_value_heads, false)?,
-                    conv: upload_conv_f32(gpu, st, &format!("{p}.linear_attn.conv1d.weight"), conv_dim, cfg.conv_kernel_dim)?,
-                    gdn_norm: upload_vec_f32(gpu, st, &format!("{p}.linear_attn.norm.weight"), cfg.linear_value_head_dim, false)?,
-                    out_proj: upload_lin_f16(gpu, st, &format!("{p}.linear_attn.out_proj.weight"), h, v_dim)?,
+                    qkv: upload_lin_f16(
+                        gpu,
+                        st,
+                        &format!("{p}.linear_attn.in_proj_qkv.weight"),
+                        k_dim * 2 + v_dim,
+                        h,
+                    )?,
+                    z: upload_lin_f16(
+                        gpu,
+                        st,
+                        &format!("{p}.linear_attn.in_proj_z.weight"),
+                        v_dim,
+                        h,
+                    )?,
+                    a: upload_lin_f16(
+                        gpu,
+                        st,
+                        &format!("{p}.linear_attn.in_proj_a.weight"),
+                        cfg.linear_num_value_heads,
+                        h,
+                    )?,
+                    b: upload_lin_f16(
+                        gpu,
+                        st,
+                        &format!("{p}.linear_attn.in_proj_b.weight"),
+                        cfg.linear_num_value_heads,
+                        h,
+                    )?,
+                    a_log: upload_vec_f32(
+                        gpu,
+                        st,
+                        &format!("{p}.linear_attn.A_log"),
+                        cfg.linear_num_value_heads,
+                        false,
+                    )?,
+                    dt_bias: upload_vec_f32(
+                        gpu,
+                        st,
+                        &format!("{p}.linear_attn.dt_bias"),
+                        cfg.linear_num_value_heads,
+                        false,
+                    )?,
+                    conv: upload_conv_f32(
+                        gpu,
+                        st,
+                        &format!("{p}.linear_attn.conv1d.weight"),
+                        conv_dim,
+                        cfg.conv_kernel_dim,
+                    )?,
+                    gdn_norm: upload_vec_f32(
+                        gpu,
+                        st,
+                        &format!("{p}.linear_attn.norm.weight"),
+                        cfg.linear_value_head_dim,
+                        false,
+                    )?,
+                    out_proj: upload_lin_f16(
+                        gpu,
+                        st,
+                        &format!("{p}.linear_attn.out_proj.weight"),
+                        h,
+                        v_dim,
+                    )?,
                 }
             }
         };
@@ -511,11 +604,12 @@ fn stream_weights(
     let dense = load_dense(gpu, st, cfg)?;
 
     // Vision tower, when the checkpoint has one.
-    let vision = if cfg.vision.is_some() && names::resolve_vision(st, "patch_embed.proj.weight").is_some() {
-        Some(crate::vision::load_vision_weights(gpu, st, cfg)?)
-    } else {
-        None
-    };
+    let vision =
+        if cfg.vision.is_some() && names::resolve_vision(st, "patch_embed.proj.weight").is_some() {
+            Some(crate::vision::load_vision_weights(gpu, st, cfg)?)
+        } else {
+            None
+        };
 
     Ok(EmbedWeights {
         embed_table,
@@ -632,6 +726,79 @@ pub struct ImageSpan {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gather_hidden_splices_image_rows() {
+        use crate::config::{config_from_metadata, parse_config};
+        // A 6-token vocab x 2 hidden table; ids 0..5.
+        let cfgv: serde_json::Value = serde_json::from_str(
+            r#"{"config":{"model_type":"qwen3_5",
+                 "text_config":{"hidden_size":2,"num_hidden_layers":1,
+                   "num_attention_heads":1,"num_key_value_heads":1,"head_dim":2,
+                   "intermediate_size":4,"vocab_size":6,"rms_norm_eps":1e-6,
+                   "hidden_act":"silu","linear_num_key_heads":1,"linear_num_value_heads":1,
+                   "linear_key_head_dim":2,"linear_value_head_dim":2,
+                   "linear_conv_kernel_dim":4,
+                   "rope_parameters":{"rope_theta":1e4,"partial_rotary_factor":1.0,
+                                      "mrope_section":[1,0,0]},
+                   "layer_types":["full_attention"]}}}"#,
+        )
+        .unwrap();
+        let cfg = parse_config(config_from_metadata(&cfgv)).unwrap();
+        let null = || rdna_compute::GpuTensor::null_for_test();
+        let w = EmbedWeights {
+            embed_table: (0..6).flat_map(|i| [i as f32, (i * 10) as f32]).collect(),
+            layers: vec![],
+            final_norm: null(),
+            dense: null(),
+            vision: None,
+        };
+        // ids [0,3,1], image span of 1 row at token index 1, embed row = [7,7].
+        let spans = [ImageSpan {
+            start: 1,
+            len: 1,
+            embed_offset: 0,
+            grid_h: 1,
+            grid_w: 1,
+        }];
+        let mut out = Vec::new();
+        w.gather_hidden(&[0, 3, 1], &[7.0, 7.0], &spans, 2, &mut out)
+            .unwrap();
+        assert_eq!(
+            out,
+            vec![0.0, 0.0, /* spliced */ 7.0, 7.0, /* id 1 */ 1.0, 10.0]
+        );
+        // A multi-row span starting at a nonzero embed offset (the second
+        // image of a two-image request): 3 image rows, take rows 1..3.
+        let spans2 = [ImageSpan {
+            start: 0,
+            len: 2,
+            embed_offset: 1,
+            grid_h: 1,
+            grid_w: 3,
+        }];
+        let imgs = [9.0, 9.0, 8.0, 8.0, 7.0, 7.0];
+        let mut out2 = Vec::new();
+        w.gather_hidden(&[5, 5], &imgs, &spans2, 2, &mut out2)
+            .unwrap();
+        assert_eq!(out2, vec![8.0, 8.0, 7.0, 7.0]);
+        // A full-coverage span at offset 0 takes the leading rows.
+        let spans3 = [ImageSpan {
+            start: 0,
+            len: 2,
+            embed_offset: 0,
+            grid_h: 1,
+            grid_w: 2,
+        }];
+        let mut out3 = Vec::new();
+        w.gather_hidden(&[5, 5], &imgs, &spans3, 2, &mut out3)
+            .unwrap();
+        assert_eq!(out3, vec![9.0, 9.0, 8.0, 8.0]);
+        // Out-of-range token id is refused, not silently zeroed.
+        assert!(w
+            .gather_hidden(&[99], &[], &[], 2, &mut Vec::new())
+            .is_err());
+    }
 
     #[test]
     fn bf16_widen_is_exact() {

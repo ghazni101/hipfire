@@ -318,10 +318,16 @@ impl<'a> Enc<'a> {
 /// stream: prints absmax and the non-finite count at each stage so a NaN can
 /// be localized to a layer and a mixer kind. Downloads one tensor per call,
 /// so this is strictly a debugging path.
-fn trace(enc: &mut Enc<'_>, label: &str, t: &GpuTensor, n: usize) -> Result<(), String> {
-    if std::env::var("HIPFIRE_EMBED_DEBUG").ok().as_deref() != Some("1") {
+fn trace(
+    enc: &mut Enc<'_>,
+    label: impl FnOnce() -> String,
+    t: &GpuTensor,
+    n: usize,
+) -> Result<(), String> {
+    if !debug_enabled() {
         return Ok(());
     }
+    let label = label();
     let v = enc.download(t)?;
     let mut absmax = 0f32;
     let mut bad = 0usize;
@@ -332,8 +338,19 @@ fn trace(enc: &mut Enc<'_>, label: &str, t: &GpuTensor, n: usize) -> Result<(), 
             absmax = x.abs();
         }
     }
-    eprintln!("  [embed-debug] {label}: absmax={absmax:.4} nonfinite={bad}/{}", v.len());
+    eprintln!(
+        "  [embed-debug] {label}: absmax={absmax:.4} nonfinite={bad}/{}",
+        v.len()
+    );
     Ok(())
+}
+
+/// `HIPFIRE_EMBED_DEBUG=1`, read once (the trace calls are on the hot path;
+/// the label closure keeps the `format!` off it when disabled).
+fn debug_enabled() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var("HIPFIRE_EMBED_DEBUG").ok().as_deref() == Some("1"))
 }
 
 /// Run the full encoder and the Dense head; returns `[n, dense_out]`
@@ -365,7 +382,14 @@ pub fn encode_embeddings(
     let mut e = Enc::new(gpu);
     let dense = {
         let fin = e.alloc(n * cfg.hidden_size)?;
-        e.rmsnorm(&hidden, &w.final_norm, &fin, n, cfg.hidden_size, cfg.rms_norm_eps)?;
+        e.rmsnorm(
+            &hidden,
+            &w.final_norm,
+            &fin,
+            n,
+            cfg.hidden_size,
+            cfg.rms_norm_eps,
+        )?;
         let emb = e.gemm(&w.dense, &fin, cfg.dense_out_features, cfg.hidden_size, n)?;
         e.free(fin)?;
         emb
@@ -393,7 +417,13 @@ pub fn encode_hidden(
 
     // ── prologue: host gather + image splice, one upload ──────────────
     let mut host_hidden = Vec::new();
-    w.gather_hidden(input.ids, input.image_embeds, input.spans, h, &mut host_hidden)?;
+    w.gather_hidden(
+        input.ids,
+        input.image_embeds,
+        input.spans,
+        h,
+        &mut host_hidden,
+    )?;
     let mut e = Enc::new(gpu);
     let hidden = e.upload(&host_hidden, n * h)?;
 
@@ -408,7 +438,7 @@ pub fn encode_hidden(
     let pos3 = e.alloc(n * 3)?;
     e.memcpy_htod(&pos3, &pos_bytes)?;
 
-    trace(&mut e, "embed", &hidden, n * h)?;
+    trace(&mut e, || "embed".into(), &hidden, n * h)?;
     let mut delta_layer_idx = 0usize;
     for (li, layer) in w.layers.iter().enumerate() {
         // ── pre-norm ──────────────────────────────────────────────────
@@ -438,10 +468,8 @@ pub fn encode_hidden(
                 e.rmsnorm(&k, k_norm, &k, n * cfg.n_kv_heads, cfg.head_dim, eps)?;
 
                 // Interleaved mRoPE over the partial rotary dim.
-                e.rope_mrope(
-                    &q, &k, &pos3, cfg, n,
-                )
-                .map_err(|err| format!("qwen35-embed: rope (layer {li}): {err:?}"))?;
+                e.rope_mrope(&q, &k, &pos3, cfg, n)
+                    .map_err(|err| format!("qwen35-embed: rope (layer {li}): {err:?}"))?;
 
                 // Bidirectional full attention — the whole point of this
                 // architecture. One sequence per encode: no bias, no
@@ -488,22 +516,44 @@ pub fn encode_hidden(
                 // β = σ(b); g = −exp(A_log)·softplus(a + dt_bias), in place.
                 e.alpha_gate(&b_t, &a_t, dt_bias, a_log, n_v, n)
                     .map_err(|err| format!("qwen35-embed: alpha gate (layer {li}): {err:?}"))?;
-                trace(&mut e, &format!("L{li} gdn: a_t(after gate)"), &a_t, n * n_v)?;
-                trace(&mut e, &format!("L{li} gdn: qkv_t"), &qkv_t, n * (k_dim * 2 + v_dim))?;
+                trace(
+                    &mut e,
+                    || format!("L{li} gdn: a_t(after gate)"),
+                    &a_t,
+                    n * n_v,
+                )?;
+                trace(
+                    &mut e,
+                    || format!("L{li} gdn: qkv_t"),
+                    &qkv_t,
+                    n * (k_dim * 2 + v_dim),
+                )?;
 
                 // Causal conv + SiLU split (Q|K|V channels), ring state.
                 let q_raw = e.alloc(n * k_dim)?;
                 let k_raw = e.alloc(n * k_dim)?;
                 let v_t2 = e.alloc(n * v_dim)?;
                 e.conv_split(
-                    &q_raw, &k_raw, &v_t2, &qkv_t, conv,
-                    &state.conv_states[delta_layer_idx], k_dim, v_dim, n,
+                    &q_raw,
+                    &k_raw,
+                    &v_t2,
+                    &qkv_t,
+                    conv,
+                    &state.conv_states[delta_layer_idx],
+                    k_dim,
+                    v_dim,
+                    n,
                 )
                 .map_err(|err| format!("qwen35-embed: conv (layer {li}): {err:?}"))?;
                 e.free(qkv_t)?;
 
                 // L2-norm(Q)·scale + L2-norm(K) per head.
-                trace(&mut e, &format!("L{li} gdn: conv q_raw"), &q_raw, n * k_dim)?;
+                trace(
+                    &mut e,
+                    || format!("L{li} gdn: conv q_raw"),
+                    &q_raw,
+                    n * k_dim,
+                )?;
                 e.qk_l2_norm(&q_raw, &k_raw, cfg, khd, eps, n)
                     .map_err(|err| format!("qwen35-embed: qk norm (layer {li}): {err:?}"))?;
 
@@ -512,11 +562,24 @@ pub fn encode_hidden(
                 // repeat-interleave is needed.
                 let attn_out = e.alloc(n * v_dim)?;
                 e.gdn_scan(
-                    &q_raw, &k_raw, &v_t2, &a_t, &b_t,
-                    &state.s_matrices[delta_layer_idx], &attn_out, n, n_v, vhd,
+                    &q_raw,
+                    &k_raw,
+                    &v_t2,
+                    &a_t,
+                    &b_t,
+                    &state.s_matrices[delta_layer_idx],
+                    &attn_out,
+                    n,
+                    n_v,
+                    vhd,
                 )
                 .map_err(|err| format!("qwen35-embed: gdn scan (layer {li}): {err:?}"))?;
-                trace(&mut e, &format!("L{li} gdn: scan out"), &attn_out, n * v_dim)?;
+                trace(
+                    &mut e,
+                    || format!("L{li} gdn: scan out"),
+                    &attn_out,
+                    n * v_dim,
+                )?;
                 e.free(q_raw)?;
                 e.free(k_raw)?;
                 e.free(v_t2)?;
@@ -527,7 +590,12 @@ pub fn encode_hidden(
                 let normed_gdn = e.alloc(n * v_dim)?;
                 e.gated_norm(&attn_out, &z_t, gdn_norm, &normed_gdn, n_v, vhd, eps, n)
                     .map_err(|err| format!("qwen35-embed: gated norm (layer {li}): {err:?}"))?;
-                trace(&mut e, &format!("L{li} gdn: gated_norm"), &normed_gdn, n * v_dim)?;
+                trace(
+                    &mut e,
+                    || format!("L{li} gdn: gated_norm"),
+                    &normed_gdn,
+                    n * v_dim,
+                )?;
                 e.free(attn_out)?;
                 e.free(z_t)?;
                 let out = e.gemm(out_proj, &normed_gdn, h, v_dim, n)?;
@@ -538,7 +606,7 @@ pub fn encode_hidden(
             }
         }
 
-        trace(&mut e, &format!("layer {li} post-mixer"), &hidden, n * h)?;
+        trace(&mut e, || format!("layer {li} post-mixer"), &hidden, n * h)?;
         // ── SwiGLU MLP (both mixer kinds) ─────────────────────────────
         let normed2 = e.alloc(n * h)?;
         e.rmsnorm(&hidden, &layer.post_ln, &normed2, n, h, eps)?;
