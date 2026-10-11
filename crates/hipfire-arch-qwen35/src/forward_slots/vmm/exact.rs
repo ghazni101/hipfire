@@ -454,7 +454,7 @@ pub(super) fn decode(
     // Row positions, uploaded once: each row's scratch view reads its own.
     let pos_bytes: Vec<u8> = rows.iter().flat_map(|&(_, p)| (p as i32).to_ne_bytes()).collect();
     gpu.hip.memcpy_htod(&st.pbs.positions.buf, &pos_bytes)?;
-    gpu.embedding_lookup_q8_batched(&weights.token_embd, &st.pbs.x_batch, &st.pbs.tokens, n, dim)?;
+    crate::forward_slots::embed_lookup_slots(gpu, weights.embd_format, &weights.token_embd, &st.pbs.x_batch, &st.pbs.tokens, n, dim)?;
     let row_scratch: Vec<RowScratch> = (0..n).map(|r| RowScratch::new(s, st, config, r)).collect();
     // Row→slot map and flash plan for the row-batched attention.
     let slot_bytes: Vec<u8> = rows.iter().flat_map(|&(slot, _)| (slot as i32).to_ne_bytes()).collect();

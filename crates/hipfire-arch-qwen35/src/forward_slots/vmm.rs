@@ -28,10 +28,11 @@
 // every other KV mode is refused rather than routed to a legacy arena.
 
 use super::{
-    final_logits_per_slot, lm_head_slots_admissible, q8_prefill_wmma_enabled,
-    require_batchable_deltanet_layer, require_batchable_deltanet_moe_layer,
-    require_batchable_fullattn_layer, require_batchable_fullattn_moe_layer,
-    require_batchable_moe_ffn, run_layers_slots, LayerKvAddr, SlotKvTier,
+    embed_lookup_slots, final_logits_per_slot, lm_head_slots_admissible,
+    q8_prefill_wmma_enabled, require_batchable_deltanet_layer,
+    require_batchable_deltanet_moe_layer, require_batchable_fullattn_layer,
+    require_batchable_fullattn_moe_layer, require_batchable_moe_ffn,
+    run_layers_slots, slots_embed_format_admitted, LayerKvAddr, SlotKvTier,
 };
 use crate::qwen35::LayerWeights;
 use crate::carrier::Qwen35Bundle;
@@ -69,9 +70,8 @@ pub fn vmm_executor_supports(
     if route == VmmRoute::Exact {
         exact::supports(gpu, weights)?;
     }
-    if !matches!(weights.embd_format, EmbeddingFormat::Q8_0) {
-        return Err("VMM executor: embedding table must be Q8_0".into());
-    }
+    slots_embed_format_admitted(weights.embd_format)
+        .map_err(|e| format!("VMM executor: {e}"))?;
     if !lm_head_slots_admissible(weights.output.gpu_dtype) {
         return Err(format!(
             "VMM executor: lm_head dtype {:?} not admitted by the slots head",
@@ -1125,9 +1125,7 @@ impl Qwen35VmmExecutor<'_> {
     fn forward_inner(&mut self, gpu: &mut Gpu, plan: &BatchStepPlan) -> HipResult<Vec<u32>> {
         let (weights, config, s) = (self.weights, self.config, self.scratch);
         let st = &mut *self.store;
-        if !matches!(weights.embd_format, EmbeddingFormat::Q8_0) {
-            return Err(HipError::new(0, "VMM executor: embedding table must be Q8_0"));
-        }
+        slots_embed_format_admitted(weights.embd_format)?;
         let ms = st.max_slots;
         for (l, dev) in st.descs_dev.iter().enumerate() {
             gpu.hip.memcpy_htod(
@@ -1205,7 +1203,7 @@ fn run_pass(
     gpu.hip.memcpy_htod(&st.pbs.tokens.buf, &to_bytes(&st.row_slot_host))?;
     gpu.hip.memcpy_htod(&st.pbs.positions.buf, &to_bytes(&b.positions))?;
     gpu.hip.memcpy_htod(&st.row_slot_dev.buf, &to_bytes(&b.row_slot))?;
-    gpu.embedding_lookup_q8_batched(&weights.token_embd, &st.pbs.x_batch, &st.pbs.tokens, n, dim)?;
+    embed_lookup_slots(gpu, weights.embd_format, &weights.token_embd, &st.pbs.x_batch, &st.pbs.tokens, n, dim)?;
 
     let mut dn: Vec<Option<&DeltaNetState>> = vec![None; n_slots];
     for state in st.slots.iter().flatten() {
