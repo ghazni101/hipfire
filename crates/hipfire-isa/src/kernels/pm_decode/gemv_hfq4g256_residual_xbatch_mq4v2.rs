@@ -540,7 +540,7 @@ mod tests {
         assert!(emitted.s_text.contains(&format!("v_dual_mul_f32 v{d0}, v{w0}, v{x} :: v_dual_mul_f32 v{d1}, v{}, v{}", w1 + 1, x + 1)));
         assert!(emitted.s_text.contains(&format!("v_dual_fmac_f32 v{d0}, v{}, v{} :: v_dual_fmac_f32 v{d1}, v{w1}, v{x}", w0 + 1, x + 1)));
         let elf = crate::native::assemble(&emitted.s_text, Arch::Gfx1201).expect("native assemble");
-        let dir = std::path::PathBuf::from("/home/kaden/qcal/release-0.4.2/pm-decode-twins/residual-xbatch");
+        let dir = std::env::temp_dir().join(format!("hipfire-isa-residual-xbatch-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("gemv_hfq4g256_residual_xbatch_mq4v2.test.s"), &emitted.s_text).unwrap();
         let co = dir.join("gemv_hfq4g256_residual_xbatch_mq4v2.test.co");
@@ -548,5 +548,6 @@ mod tests {
         let report = crate::pm_check::m7(&co, "gfx1201", SYMBOL).expect("M7");
         println!("{report}");
         assert_eq!(report["obligations"], serde_json::json!({}), "{report}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

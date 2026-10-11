@@ -787,7 +787,7 @@ mod tests {
     #[cfg(feature = "toolchain")]
     #[test]
     fn q8_lane_rows_m7() {
-        let dir = std::path::PathBuf::from("/home/kaden/qcal/release-0.4.2/fn-batch/s7/pm");
+        let dir = std::env::temp_dir().join(format!("hipfire-isa-q8-lane-rows-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         for (emitted, symbol) in build_gfx1151().expect("q8 lane rows").into_iter().zip([K8_SYMBOL, K320_SYMBOL]) {
             let elf = crate::native::assemble(&emitted.s_text, Arch::Gfx1151).expect("native assemble");
@@ -798,5 +798,6 @@ mod tests {
             println!("{symbol}: {report}");
             assert_eq!(report["obligations"], serde_json::json!({}), "{report}");
         }
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
