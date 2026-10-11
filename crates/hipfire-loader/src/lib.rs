@@ -294,6 +294,7 @@ pub fn arch_label(arch_id: u32) -> &'static str {
         13 => "gemma4",
         14 => "muse_glimmer",
         16 => "qwen4",
+        17 => "qwen3_5_embed",
         40 => "flux_mmdit",
         45 => "flux2_mmdit",
         _ => "qwen3",
@@ -426,6 +427,7 @@ const REGISTRY: &[&dyn Carrier] = &[
     &Gemma4Carrier,
     &MuseGlimmerCarrier,
     &FluxDiffusionCarrier,
+    &Qwen35EmbedCarrier,
 ];
 
 // ─── Constants ────────────────────────────────────────────────────────
@@ -1182,6 +1184,16 @@ impl LoadedModel {
         self.state
             .as_deref_mut()
             .and_then(|s| (s as &mut dyn Any).downcast_mut::<MuseGlimmerBundle>())
+    }
+
+    /// Qwen3.5 multi-vector embedding bundle if this model is arch_id=17,
+    /// else `None`. The daemon `embed` verb's typed handle.
+    pub fn qwen35_embed_mut(
+        &mut self,
+    ) -> Option<&mut hipfire_arch_qwen35_embed::EmbedBundle> {
+        self.state
+            .as_deref_mut()
+            .and_then(|s| (s as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35_embed::EmbedBundle>())
     }
 
     pub fn deepseek4_heterogeneous_mut(&mut self) -> Option<&mut Deepseek4HeterogeneousBundle> {

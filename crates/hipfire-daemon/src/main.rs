@@ -4344,6 +4344,48 @@ fn main() {
                 let _ = stdout.flush();
             }
 
+            "embed" => {
+                // Embedding encode (arch 17, the qwen3.5 multi-vector
+                // encoder). The img_generate shape: dispatch + refusals
+                // here, the body in hipfire-generate so main.rs names no
+                // arch-crate type.
+                let id = msg
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("0")
+                    .to_string();
+                let m = match model.as_mut() {
+                    Some(m) => m,
+                    None => {
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            Some(id.as_str()),
+                            "no model loaded",
+                            "validation",
+                            false,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                };
+                if m.arch_id != 17 {
+                    emit_uncorrelated_error(
+                        &mut stdout,
+                        Some(id.as_str()),
+                        "embed refused: loaded model is not an embedding checkpoint \
+                         (qwen3.5 multi-vector encoder, arch 17) — use generate",
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
+                hipfire_generate::embed::generate_embed(m, &mut gpu, &mut stdout, &id, &msg);
+                let _ = stdout.flush();
+            }
+
             "diag" => {
                 let (vram_free, vram_total) = gpu.hip.get_vram_info().unwrap_or((0, 0));
                 let hip_ver = gpu.hip.runtime_version().unwrap_or((0, 0));

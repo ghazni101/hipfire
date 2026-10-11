@@ -4472,6 +4472,58 @@ impl Carrier for FluxDiffusionCarrier {
     }
 }
 
+// ─── qwen3.5 multi-vector embedding encoder (arch 17) ──────────────────────
+//
+// The non-chat wire verb precedent is img_generate: this carrier loads the
+// model, but embedding requests flow through the daemon's `embed` verb →
+// hipfire-generate's embed body, never through the generation routes.
+pub struct Qwen35EmbedCarrier;
+impl Carrier for Qwen35EmbedCarrier {
+    fn name(&self) -> &'static str {
+        "qwen35-embed"
+    }
+    fn claims_arch_id(&self, arch_id: u32, _is_dir: bool) -> bool {
+        arch_id == 17
+    }
+    fn caps(&self) -> saddle_core::caps::ArchCaps {
+        saddle_core::caps::ArchCaps {
+            supports_continuous_batch: false,
+            supports_ep_batch: false,
+            dflash: None,
+            supports_mtp: false,
+            spec_excludes_adaptive: false,
+            semantic_contract_version: None,
+            has_deltanet: true,
+            supports_images: true,
+            reasoning_contract: saddle_core::caps::ReasoningContract::Unsupported,
+        }
+    }
+    fn load(&self, src: ModelSource, ctx: &mut LoadCtx) -> Result<LoadedModel, String> {
+        if ctx.pp > 1 {
+            return Err(match &src {
+                ModelSource::Hfq(_) => "qwen35-embed: pipeline-parallel (pp>1) unsupported",
+                ModelSource::Dir(_) => "qwen35-embed: safetensors + pp>1 unsupported",
+            }
+            .into());
+        }
+        dir_diag(&src);
+        let meta = resolve_source_meta(&src, ctx.path)?;
+        let bundle = hipfire_arch_qwen35_embed::load_qwen35_embed_bundle(src, ctx)?;
+        Ok(LoadedModel {
+            state: Some(Box::new(bundle)),
+            speculator: None,
+            ..LoadedModel::skeleton(
+                meta.arch_id,
+                meta.tokenizer,
+                ctx.max_seq,
+                ctx.max_seq,
+                ctx.path.to_string(),
+                meta.chat_template,
+            )
+        })
+    }
+}
+
 #[cfg(test)]
 mod gemma4_route_tests {
     use super::{gemma4_use_lowered, gemma4_validate_drafter_route};

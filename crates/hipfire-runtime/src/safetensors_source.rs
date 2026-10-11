@@ -686,6 +686,14 @@ pub fn derive_arch_id(config: &serde_json::Value) -> u32 {
     // has_experts decision, so those remain explicit.
     for arch in &archs {
         let arch_lower = arch.to_lowercase();
+        // The bare composite `Qwen3_5Model` (no LM head) is the multi-vector
+        // embedding encoder (arch 17) — checked BEFORE the qwen3.5 family
+        // test because `qwen3_5model` also contains the `qwen3_5`
+        // substring, and the causal-LM class name (`Qwen3_5ForCausalLM`)
+        // never contains `qwen3_5model`.
+        if arch_lower.contains("qwen3_5model") {
+            return 17;
+        }
         // qwen3.5/3.6 family: dense (5) vs MoE (6) decided by has_experts.
         // This is the only per-arch substring check that must remain: the
         // table maps the four dense strings to 5, but a MoE checkpoint uses
@@ -993,6 +1001,34 @@ mod tests {
         assert_eq!(id, UNCLAIMED_ARCH_ID);
         assert_ne!(id, 5, "must not default to Qwen35");
     }
+
+    /// The bare composite `Qwen3_5Model` (multi-vector embedding encoder)
+    /// shares `model_type: qwen3_5` with the causal LM but must route to
+    /// arch 17 via its architectures field — including the real pplx-embed
+    /// shape, where the id lives in `architectures` and both `text_config`
+    /// and `vision_config` are present.
+    #[test]
+    fn qwen3_5_bare_model_class_routes_to_embed_arch_17() {
+        // The real pplx-embed-v2 shape (trimmed).
+        assert_eq!(
+            derive_arch_id(&json!({
+                "architectures": ["Qwen3_5Model"],
+                "model_type": "qwen3_5",
+                "text_config": { "model_type": "qwen3_5_text", "num_hidden_layers": 12,
+                                  "layer_types": ["linear_attention", "full_attention"] },
+                "vision_config": { "hidden_size": 768 }
+            })),
+            17
+        );
+        // model_type alone still means the causal LM (5) — only the class
+        // name discriminates.
+        assert_eq!(derive_arch_id(&json!({ "model_type": "qwen3_5" })), 5);
+        assert_eq!(
+            derive_arch_id(&json!({ "architectures": ["Qwen3_5ForCausalLM"], "model_type": "qwen3_5" })),
+            5
+        );
+    }
+
 
     #[test]
     fn bf16_to_f32_basic_values() {

@@ -231,6 +231,22 @@ pub fn retry_candidate_reset_inventory() -> &'static [ResetCoreCoverage] {
             reason: "maple not a serve-hardening retry candidate yet",
         },
     };
+    // Qwen3.5 multi-vector embedding encoder (arch 17): one-shot requests,
+    // no KV cache / graphs / drafter state; the GDN scratch resets before
+    // every encode, so there is no cross-request state to recover.
+    const QWEN35_EMBED: ResetCoreCoverage = ResetCoreCoverage {
+        arch: "qwen35-embed",
+        recurrent_or_conv: true,
+        s_ef_residual: true, // n/a — FP32-only GDN state
+        kv_or_aux_caches: true,
+        graphs: false,
+        drafter: false,
+        adaptive: false,
+        host_position_and_conversation: true,
+        eligibility: RetryResetEligibility::Ineligible {
+            reason: "qwen35-embed is one-shot per request — nothing to retry-reset",
+        },
+    };
     // Image-gen component (arch 40): never a text retry candidate.
     const FLUX: ResetCoreCoverage = ResetCoreCoverage {
         arch: "flux",
@@ -273,6 +289,7 @@ pub fn retry_candidate_reset_inventory() -> &'static [ResetCoreCoverage] {
         GEMMA4,
         MUSE_GLIMMER,
         MAPLE,
+        QWEN35_EMBED,
         FLUX,
         FLUX2,
     ]
@@ -570,6 +587,7 @@ mod tests {
                 13 => Some("gemma4"),
                 14 => Some("muse_glimmer"),
                 15 => Some("maple"),
+                17 => Some("qwen35-embed"),
                 40 => Some("flux"),
                 45 => Some("flux2"),
                 // Drafter sidecars (22, 23) are intentionally not retry

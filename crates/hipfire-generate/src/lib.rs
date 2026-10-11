@@ -50,6 +50,10 @@ pub mod dense;
 /// Image generation: the `img_generate` wire body (FLUX.1/FLUX.2),
 /// including reference-image decode and the GPU/CPU denoise split.
 pub mod img;
+
+/// Embeddings: the `embed` wire body (arch 17, qwen3.5 multi-vector
+/// encoder) — assemble, encode, skiplist mask, L2 normalize.
+pub mod embed;
 /// Vision and OCR: Qwen3.5-VL and dots.ocr, including the text-only
 /// dots.ocr path.
 pub mod vision;

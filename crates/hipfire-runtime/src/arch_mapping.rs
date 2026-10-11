@@ -87,6 +87,16 @@ pub const MODEL_TYPE_TO_ARCH_ID: &[(&str, u32)] = &[
     ("muse_glimmer_text", 14),
     // arch 15 — maple (Maple-Preview 20B-A1B, natively-ternary 256-expert MoE)
     ("maple", 15),
+    // arch 17 — qwen3.5 multi-vector embedding encoder (bidirectional
+    // full-attention + causal GDN hybrid; e.g. pplx-embed-v2-late-0.6b).
+    // `qwen3_5model` is the bare composite `Qwen3_5Model` architecture
+    // string (no LM head) — it must beat the plain `qwen3_5` → 5 substring
+    // in `derive_arch_id`'s architectures loop, so that entry checks for it
+    // explicitly before the qwen3.5 dense/MoE family test. The
+    // `_model_type_` is `qwen3_5` on these checkpoints, indistinguishable
+    // from the causal LM — only the architectures field discriminates.
+    ("qwen3_5model", 17),
+    ("qwen3_5_embed", 17),
     // arch 22 — gemma4 EAGLE drafter (single-block spec-decode head for arch 13)
     ("gemma4_unified_assistant", 22),
     // arch 23 — muse_glimmer DFlash drafter
@@ -119,6 +129,32 @@ pub fn lookup_model_type(model_type: &str) -> Option<u32> {
         .iter()
         .chain(RESERVED_MODEL_TYPE_TO_ARCH_ID)
         .find_map(|(key, id)| (*key == model_type).then_some(*id))
+}
+
+/// Resolve an `arch_id` from an HF `architectures` class name
+/// (case-insensitive substring, longest key wins) — the same match
+/// `derive_arch_id`'s architectures loop performs, exposed so the
+/// quantizer can stamp the same id the loader will derive from the dir.
+///
+/// Returns `None` when no table key is a substring of `arch`; the
+/// qwen3.5-family dense-vs-MoE and `qwen3_5model` embedding decisions are
+/// NOT made here (they need config context) — callers with a config
+/// should prefer `safetensors_source::derive_arch_id`.
+pub fn lookup_architecture(arch: &str) -> Option<u32> {
+    let arch_lower = arch.to_lowercase();
+    let mut best: Option<(&'static str, u32)> = None;
+    for (k, v) in MODEL_TYPE_TO_ARCH_ID
+        .iter()
+        .chain(RESERVED_MODEL_TYPE_TO_ARCH_ID)
+    {
+        if arch_lower.contains(k) {
+            match best {
+                Some((bk, _)) if k.len() <= bk.len() => {}
+                _ => best = Some((*k, *v)),
+            }
+        }
+    }
+    best.map(|(_, id)| id)
 }
 
 /// Sorted list of every recognised executable or reserved source string, for
@@ -164,5 +200,18 @@ mod tests {
     fn qwen4_near_misses_fail_closed() {
         assert_eq!(lookup_model_type("qwen4"), None);
         assert_eq!(lookup_model_type("qwen4_exp_moe"), None);
+    }
+
+    #[test]
+    fn qwen3_5_embed_architecture_resolves_to_17() {
+        use super::lookup_architecture;
+        // The bare composite class is the embedding encoder (17); the causal
+        // LM class keeps resolving through the qwen3.5 family logic (5).
+        assert_eq!(lookup_architecture("Qwen3_5Model"), Some(17));
+        assert_eq!(lookup_architecture("Qwen3_5ForCausalLM"), Some(5));
+        assert_eq!(lookup_model_type("qwen3_5model"), Some(17));
+        assert_eq!(lookup_model_type("qwen3_5_embed"), Some(17));
+        // model_type stays the causal LM's — only architectures discriminates.
+        assert_eq!(lookup_model_type("qwen3_5"), Some(5));
     }
 }

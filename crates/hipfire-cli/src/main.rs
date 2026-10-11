@@ -139,6 +139,9 @@ pub(crate) enum Commands {
     Run(RunArgs),
     /// Generate an image (txt2img) through a fresh native daemon process.
     Img(ImgArgs),
+    /// Encode text (or an image) with an embedding model; optionally score a
+    /// query against a document with late-interaction MaxSim.
+    Embed(EmbedArgs),
     /// Start an interactive conversation through the native HTTP service.
     Chat(ChatArgs),
     /// Start the native OpenAI-compatible HTTP service.
@@ -545,6 +548,35 @@ struct ImgArgs {
 }
 
 #[derive(Args, Debug)]
+struct EmbedArgs {
+    /// Model tag, alias, or path to an embedding checkpoint dir (HF
+    /// snapshot of e.g. `pplx-embed-v2-late-0.6b`) or a raw-dtype `.hfq`.
+    model: String,
+    /// Text to encode (query- or document-side per `--kind`). Quote it to
+    /// preserve exact whitespace.
+    #[arg(num_args = 0..)]
+    text: Vec<String>,
+    /// Query-side text. With `--doc`, prints the MaxSim score of query
+    /// against document.
+    #[arg(long)]
+    query: Option<String>,
+    /// Document-side text (with `--query`).
+    #[arg(long)]
+    doc: Option<String>,
+    /// Side for the positional text: `query` or `document` (default
+    /// `document`).
+    #[arg(long)]
+    kind: Option<String>,
+    /// Image input (PNG/JPEG); encoded with the checkpoint's vision tower.
+    #[arg(long = "image", value_name = "PATH")]
+    image: Option<PathBuf>,
+    /// Emit the full JSON result (token-embedding matrix / score object)
+    /// instead of the human summary.
+    #[arg(short = 'j', long)]
+    json: bool,
+}
+
+#[derive(Args, Debug)]
 struct ChatArgs {
     /// Model tag, alias, filename, or local catalog identity.
     model: Option<String>,
@@ -900,6 +932,7 @@ fn run() -> Result<()> {
         Some(Commands::SidecarGen(args)) => sidecar_command(&paths, args),
         Some(Commands::Run(args)) => run_command(&paths, args),
         Some(Commands::Img(args)) => img_command(&paths, args),
+        Some(Commands::Embed(args)) => embed_command(&paths, args),
         Some(Commands::Chat(args)) => chat_command(&paths, args),
         Some(Commands::Serve(args)) => crate::serve::serve_command(&paths, args),
         Some(Commands::Stop(args)) => crate::serve::stop_command(&paths, args),
@@ -2948,6 +2981,150 @@ fn img_command(paths: &Paths, args: ImgArgs) -> Result<()> {
         );
     } else {
         println!("{}", out_path.display());
+    }
+    Ok(())
+}
+
+/// `hipfire embed`: encode text (or an image) with an embedding model, or —
+/// with both `--query` and `--doc` — score the pair by late-interaction
+/// MaxSim. Mirrors `img_command`'s engine lifecycle (fresh daemon, load,
+/// request, unload).
+fn embed_command(paths: &Paths, args: EmbedArgs) -> Result<()> {
+    let kind = args.kind.as_deref().unwrap_or("document");
+    if !matches!(kind, "query" | "document") {
+        bail!("--kind must be \"query\" or \"document\", got {kind:?}");
+    }
+    if args.query.is_none() && args.doc.is_none() && args.text.is_empty() && args.image.is_none()
+    {
+        bail!(
+            "nothing to encode: pass text (positional or --query/--doc) and/or --image \
+             (e.g. `hipfire embed <model> --query \"what is rust\" --doc \"Rust is …\"`)"
+        );
+    }
+    if args.doc.is_some() && args.query.is_none() {
+        bail!("--doc without --query: encode the document alone with the positional text + --kind document");
+    }
+    let image_b64: Option<String> = args
+        .image
+        .as_ref()
+        .map(|p| -> Result<String> {
+            use base64::Engine as _;
+            let bytes = std::fs::read(p)
+                .with_context(|| format!("--image {}: cannot read file", p.display()))?;
+            Ok(base64::engine::general_purpose::STANDARD.encode(bytes))
+        })
+        .transpose()?;
+
+    let loaded_registry = load_registry(&paths.registry);
+    let registry = &loaded_registry.registry;
+    let model_path = find_model_path(paths, registry, &args.model)
+        .ok_or_else(|| anyhow!("model not found: {}", args.model))?;
+    let resolved = resolved_for_model(paths, &args.model, None, None)?;
+    let daemon = find_daemon(paths).ok_or_else(|| {
+        anyhow!("daemon binary not found; build `cargo build --release -p hipfire-daemon`")
+    })?;
+    let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
+    let engine = Engine::spawn_configured(
+        &daemon,
+        &BTreeMap::new(),
+        &process_config,
+        Some(&model_path),
+    )?;
+    engine.ping()?;
+    let _loaded = engine.load(&model_path, serde_json::json!({}))?;
+
+    let encode = |id: &str, kind: &str, text: &str, image: Option<&str>| -> Result<serde_json::Value> {
+        let mut input = serde_json::Map::new();
+        if !text.is_empty() {
+            input.insert("text".into(), serde_json::json!(text));
+        }
+        if let Some(b64) = image {
+            input.insert("image_base64".into(), serde_json::json!(b64));
+        }
+        let request = serde_json::json!({
+            "type": "embed",
+            "id": id,
+            "kind": kind,
+            "input": input,
+        });
+        engine
+            .embed(&request)
+            .map_err(|e| anyhow!("embed request failed: {e}"))
+    };
+
+    let positional = args.text.join(" ");
+    let mut result_json = None;
+    if let (Some(q), Some(d)) = (&args.query, args.doc.as_deref()) {
+        let q_res = encode("q", "query", q, image_b64.as_deref())?;
+        let d_res = encode("d", "document", d, None)?;
+        let dim = q_res.get("dim").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
+        let q_tokens = q_res.get("n_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
+        let d_tokens = d_res.get("n_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0) as usize;
+        let q_emb = q_res
+            .get("embeddings")
+            .and_then(serde_json::Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_f64().map(|x| x as f32))
+                    .collect::<Vec<f32>>()
+            })
+            .unwrap_or_default();
+        let d_emb = d_res
+            .get("embeddings")
+            .and_then(serde_json::Value::as_array)
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_f64().map(|x| x as f32))
+                    .collect::<Vec<f32>>()
+            })
+            .unwrap_or_default();
+        // Late interaction, same math as hipfire-arch-qwen35-embed::maxsim
+        // (kept local: the CLI deliberately declares no arch-crate dep).
+        let score = (0..q_tokens)
+            .map(|qi| {
+                (0..d_tokens)
+                    .map(|di| {
+                        q_emb[qi * dim..(qi + 1) * dim]
+                            .iter()
+                            .zip(&d_emb[di * dim..(di + 1) * dim])
+                            .map(|(a, b)| a * b)
+                            .sum::<f32>()
+                    })
+                    .fold(f32::MIN, f32::max)
+            })
+            .sum::<f32>();
+        if args.json {
+            result_json = Some(serde_json::json!({
+                "score": score,
+                "query_tokens": q_tokens,
+                "doc_tokens": d_tokens,
+                "dim": dim,
+            }));
+        } else {
+            println!("{score:.4}");
+        }
+    } else {
+        let text = if args.query.is_some() {
+            args.query.clone().unwrap_or_default()
+        } else {
+            positional
+        };
+        let kind = if args.query.is_some() { "query" } else { kind };
+        let res = encode("e", kind, &text, image_b64.as_deref())?;
+        if args.json {
+            result_json = Some(res);
+        } else {
+            println!(
+                "{} token embeddings ({} dims), {} input tokens — pass --json for the matrix",
+                res.get("n_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0),
+                res.get("dim").and_then(serde_json::Value::as_u64).unwrap_or(0),
+                res.get("n_input_tokens").and_then(serde_json::Value::as_u64).unwrap_or(0),
+            );
+        }
+    }
+    let _ = engine.unload();
+    if let Some(j) = result_json {
+        println!("{}", serde_json::to_string(&j)?);
     }
     Ok(())
 }
