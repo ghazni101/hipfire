@@ -55,7 +55,15 @@ required_features_daemon    == 0
 # img_generate precedent), so the daemon only names arch_id 17 and the verb —
 # the 42 lines are the arm itself plus the refusal. Paid down when the message
 # loop's per-verb refusal boilerplate is factored out.
-daemon_lines                <= 5440
+# RATCHET-RAISE 5440 -> 5460: the `embed` verb's sibling guard — `generate` on
+# the arch-17 embedding encoder must refuse BEFORE any generation state is
+# entered. It was not refused, and the `has_deltanet`-implies-Qwen35Bundle
+# branch in hipfire-generate then downcast the wrong bundle and PANICKED the
+# daemon (killing every in-flight request). Both verb guards now classify
+# through `hipfire_loader::wire_verb`, so the daemon still carries no arch_id
+# literal (`daemon_arch_id` stays 0). Paid down when the message loop's
+# per-verb refusal boilerplate is factored out, as noted at the 5392 raise.
+daemon_lines                <= 5460
 
 # Examples compile on every `cargo build --all-targets`. Archived research
 # probes are gated behind `--features lab`; this is the count still ungated.

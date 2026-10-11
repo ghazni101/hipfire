@@ -1303,13 +1303,20 @@ impl HfqFile {
             ple_rows: None,
         };
 
-        // Structural-pillar tripwire: a qwen3.5/3.6 checkpoint MUST carry
-        // arch_id 5 (dense) or 6 (MoE) so the daemon's chat-template resolver
-        // routes it through the froggeric pillar and its forward dispatches to
-        // the qwen35 crate. If the retained source provenance says qwen3* but
-        // the stamped arch_id is anything else, the pillar cannot fire — hard-
-        // fail at load rather than silently serving a mis-framed model.
-        if !matches!(me.arch_id, 5 | 6) {
+        // Structural-pillar tripwire: a qwen3.5/3.6 **causal LM** checkpoint
+        // MUST carry arch_id 5 (dense) or 6 (MoE) so the daemon's
+        // chat-template resolver routes it through the froggeric pillar and
+        // its forward dispatches to the qwen35 crate. If the retained source
+        // provenance says qwen3* but the stamped arch_id is anything else, the
+        // pillar cannot fire — hard-fail at load rather than silently serving
+        // a mis-framed model.
+        //
+        // 17 (the qwen3.5 multi-vector embedding encoder) shares the family's
+        // `model_type` and architecture-string prefix but is deliberately NOT
+        // a chat model: it has no chat pillar and no qwen35 forward, and it is
+        // served only through the `embed` verb. It is a valid classification
+        // for this provenance, so it is exempt from the pillar requirement.
+        if !matches!(me.arch_id, 5 | 6 | 17) {
             if let Some(prov) = me.qwen3_provenance() {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,

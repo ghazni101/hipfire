@@ -2758,6 +2758,31 @@ fn main() {
             }
 
             "generate" => {
+                // An embedding checkpoint has no generation route: its carrier
+                // answers only `embed`. Refuse here, before any generation state
+                // is entered — the mirror of `embed`'s refusal above and of
+                // `img_generate`'s non-diffusion refusal. Reaching the generic
+                // body instead downcasts the wrong bundle and panics the daemon.
+                if model
+                    .as_ref()
+                    .is_some_and(|m| !hipfire_loader::wire_verb(m.arch_id).is_generate())
+                {
+                    let id = msg
+                        .get("id")
+                        .and_then(|v| v.as_str())
+                        .unwrap_or("0")
+                        .to_string();
+                    emit_uncorrelated_error(
+                        &mut stdout,
+                        Some(id.as_str()),
+                        "generate refused: the loaded model is a qwen3.5 embedding checkpoint — use the `embed` verb",
+                        "validation",
+                        false,
+                        false,
+                    );
+                    let _ = stdout.flush();
+                    continue;
+                }
                 let gen_attempt_id = match require_wire_attempt_id(msg.get("attempt_id")) {
                     Ok(id) => id,
                     Err(reason) => {
@@ -4369,12 +4394,12 @@ fn main() {
                         continue;
                     }
                 };
-                if m.arch_id != 17 {
+                if hipfire_loader::wire_verb(m.arch_id).is_generate() {
                     emit_uncorrelated_error(
                         &mut stdout,
                         Some(id.as_str()),
                         "embed refused: loaded model is not an embedding checkpoint \
-                         (qwen3.5 multi-vector encoder, arch 17) — use generate",
+                         (qwen3.5 multi-vector encoder) — use generate",
                         "validation",
                         false,
                         false,

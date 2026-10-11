@@ -2,19 +2,56 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! Tensor-name resolution for the qwen35-embed checkpoint.
+//! Tensor-name resolution and source access for the qwen35-embed checkpoint.
+//!
+//! Two source kinds, two access conventions:
+//!
+//! - **A safetensors dir** (`ModelSource::Dir`) reads through the
+//!   `ModelSource` trait, which returns a borrowed slice into the shard mmap.
+//! - **An `.hfq`** must use `HfqFile`'s **native** methods: the trait impl
+//!   deliberately returns `None` from `tensor_data`/`tensor_info` ("the HFQ
+//!   path continues to use HfqFile's native methods"), so a loader that only
+//!   knows the trait silently sees every tensor as missing. And the native
+//!   `tensor_data` itself returns `None` once the mmap is dropped (the UMA
+//!   path), so the read must fall back to the owned `tensor_data_vec`.
+//!
+//! [`read`] is the single entry point that hides both: it tries the
+//! candidates in order and always returns owned-or-borrowed bytes plus the
+//! storage descriptor, so callers never branch on the source kind.
 //!
 //! The pplx-embed-v2 release stores the text backbone under
 //! `language_model.*` and the tower under `visual.*` (no `model.` wrapper —
 //! `Qwen3_5Model` is the bare composite, unlike `Qwen3_5ForCausalLM` whose
 //! tensors live under `model.*`). Exports that do carry the `model.` wrapper
-//! (`Qwen3_5ForConditionalGeneration`-style re-saves) are accepted too, so
-//! [`tensor_candidates`] tries both prefixes in order.
+//! are accepted too, so the candidate lists try both prefixes in order.
+
+use hipfire_runtime::loader_api::ModelSource;
+use hipfire_runtime::model_source::ModelSource as _;
+use std::borrow::Cow;
 
 /// Checkpoint-relative name of the sentence-transformers Dense weight.
 pub const DENSE_TENSOR: &str = "linear.weight";
 /// Dir-relative path of the Dense weight's safetensors shard.
 pub const DENSE_SHARD: &str = "1_Dense/model.safetensors";
+
+/// One tensor's storage descriptor + bytes. `bytes` is borrowed when the
+/// source can lend them (a live mmap) and owned when it must copy (a dropped
+/// mmap / the pread path).
+pub struct TensorBytes<'a> {
+    /// HFQ quant-type byte; `0xFF` for a safetensors dir (dtype-driven).
+    pub quant_type: u8,
+    /// Safetensors dtype string (`"F32"`/`"F16"`/`"BF16"`); empty for an
+    /// `.hfq`, where the quant-type byte carries the same information.
+    pub dtype: String,
+    pub shape: Vec<usize>,
+    pub bytes: Cow<'a, [u8]>,
+}
+
+impl TensorBytes<'_> {
+    pub fn numel(&self) -> usize {
+        self.shape.iter().product()
+    }
+}
 
 /// Candidate source names for a backbone tensor given its bare
 /// `language_model.`-stripped name (`embed_tokens.weight`,
@@ -37,36 +74,60 @@ pub fn vision_tensor_candidates(name: &str) -> Vec<String> {
     ]
 }
 
-/// Look `name` up in a source, trying every candidate prefix.
-pub fn resolve<'a>(
-    src: &'a dyn hipfire_runtime::model_source::ModelSource,
-    name: &str,
-) -> Option<(&'a hipfire_runtime::model_source::TensorInfo, &'a [u8])> {
-    for candidate in tensor_candidates(name) {
-        if let Some(hit) = src.tensor_data(&candidate) {
-            return Some(hit);
+/// Read a tensor by bare name from either source kind (see module docs).
+pub fn read<'a>(src: &'a ModelSource, name: &str, vision: bool) -> Result<TensorBytes<'a>, String> {
+    let candidates = if vision {
+        vision_tensor_candidates(name)
+    } else {
+        tensor_candidates(name)
+    };
+    match src {
+        ModelSource::Dir(d) => {
+            for cand in &candidates {
+                if let Some((info, bytes)) = d.tensor_data(cand) {
+                    let out = TensorBytes {
+                        quant_type: info.quant_type,
+                        dtype: info.dtype.clone(),
+                        shape: info.shape.clone(),
+                        bytes: Cow::Borrowed(bytes),
+                    };
+                    // Advisory streaming hint: the pages have been read.
+                    d.release_tensor_pages(cand);
+                    return Ok(out);
+                }
+            }
+        }
+        ModelSource::Hfq(h) => {
+            for cand in &candidates {
+                // Borrowed first (cheap); the owned read is the documented
+                // fallback when the mmap is gone.
+                if let Some((info, bytes)) = h.tensor_data(cand) {
+                    return Ok(TensorBytes {
+                        quant_type: info.quant_type,
+                        dtype: String::new(),
+                        shape: info.shape.iter().map(|v| *v as usize).collect(),
+                        bytes: Cow::Borrowed(bytes),
+                    });
+                }
+                if let Some((info, vec)) = h.tensor_data_vec(cand) {
+                    return Ok(TensorBytes {
+                        quant_type: info.quant_type,
+                        dtype: String::new(),
+                        shape: info.shape.iter().map(|v| *v as usize).collect(),
+                        bytes: Cow::Owned(vec),
+                    });
+                }
+            }
         }
     }
-    None
-}
-
-/// Look a vision tensor up, trying every candidate prefix.
-pub fn resolve_vision<'a>(
-    src: &'a dyn hipfire_runtime::model_source::ModelSource,
-    name: &str,
-) -> Option<(&'a hipfire_runtime::model_source::TensorInfo, &'a [u8])> {
-    for candidate in vision_tensor_candidates(name) {
-        if let Some(hit) = src.tensor_data(&candidate) {
-            return Some(hit);
-        }
-    }
-    None
+    Err(format!(
+        "qwen35-embed: missing tensor `{name}` (tried {candidates:?})"
+    ))
 }
 
 /// Bare backbone names every checkpoint must provide (layer index elided).
 pub fn required_text_tensors() -> Vec<String> {
     let mut out = vec!["embed_tokens.weight".to_string(), "norm.weight".to_string()];
-    // Both layer kinds share the MLP + norms; the mixer names differ.
     for n in [
         "input_layernorm.weight",
         "post_attention_layernorm.weight",

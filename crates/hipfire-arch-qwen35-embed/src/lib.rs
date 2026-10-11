@@ -53,6 +53,22 @@
 //! - **One sequence per encode.** No padding masks: each request encodes a
 //!   single input, so `attention_text_f32` needs no `key_mask` and GDN needs
 //!   no cumulative padding mask. Batching is a follow-up.
+//! - **Two source kinds, both supported.** The HF safetensors directory is
+//!   the native form; a `.hfq` built from it by `hipfire-quantize` loads too.
+//!   The two need different access (`HfqFile`'s native methods, with an owned
+//!   fallback once the mmap is gone) and the `.hfq` may carry a compressed
+//!   trunk (mq4 -> qt 44, q8 -> qt 3), which is decoded through the runtime's
+//!   registry-wide `dequantize_weight_to_f32`. A compressed `.hfq` therefore
+//!   saves disk, not VRAM — it serves the same f16-GEMM path as the dir. Use
+//!   `examples/compare_tensor --features lab` to check a build's per-tensor
+//!   error sits at its format's bit-width level.
+//! - **The vision tower can live in host RAM.** It is ~250 MB of the model's
+//!   ~740 MB and only an image request touches it, so when the card cannot
+//!   hold everything (`HIPFIRE_EMBED_VISION_OFFLOAD`, auto by default) the
+//!   tower's weights are host-mapped and read over PCIe, leaving the trunk
+//!   resident. Text-only embedding then runs on a card whose desktop is
+//!   holding most of it, instead of failing to load; image requests pay PCIe
+//!   reads. `examples/vision_smoke --features lab` exercises the tower alone.
 
 pub mod bundle;
 pub mod carrier;

@@ -363,6 +363,37 @@ pub fn img_route(arch_id: u32) -> ImgRoute {
     }
 }
 
+/// Which non-chat wire verb an arch serves.
+///
+/// The daemon gates `generate` / `img_generate` / `embed` on these predicates
+/// rather than on an `arch_id` literal of its own, so arch knowledge stays in
+/// the loader (the same rule `img_route` follows). Today only the qwen3.5
+/// multi-vector embedding encoder (arch 17) is non-generating: it answers
+/// `embed` and nothing else — it has no LM head and no KV cache.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WireVerb {
+    /// The default: `generate` (and, for a diffusion family, `img_generate`).
+    Generate,
+    /// The multi-vector embedding encoder: `embed` only.
+    Embed,
+}
+
+/// Classify an arch's wire verb. `Generate` is the default so a new chat arch
+/// needs no change here; a new non-generating arch is added explicitly.
+pub fn wire_verb(arch_id: u32) -> WireVerb {
+    match arch_id {
+        17 => WireVerb::Embed,
+        _ => WireVerb::Generate,
+    }
+}
+
+impl WireVerb {
+    /// True when the arch answers `generate` (and so refuses `embed`).
+    pub fn is_generate(&self) -> bool {
+        matches!(self, WireVerb::Generate)
+    }
+}
+
 /// EP prompt construction route. DeepSeek4 (arch 9) uses the DSML prompt
 /// builder; all other EP arches (10 MiniMax, etc.) use Jinja.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1188,12 +1219,10 @@ impl LoadedModel {
 
     /// Qwen3.5 multi-vector embedding bundle if this model is arch_id=17,
     /// else `None`. The daemon `embed` verb's typed handle.
-    pub fn qwen35_embed_mut(
-        &mut self,
-    ) -> Option<&mut hipfire_arch_qwen35_embed::EmbedBundle> {
-        self.state
-            .as_deref_mut()
-            .and_then(|s| (s as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35_embed::EmbedBundle>())
+    pub fn qwen35_embed_mut(&mut self) -> Option<&mut hipfire_arch_qwen35_embed::EmbedBundle> {
+        self.state.as_deref_mut().and_then(|s| {
+            (s as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35_embed::EmbedBundle>()
+        })
     }
 
     pub fn deepseek4_heterogeneous_mut(&mut self) -> Option<&mut Deepseek4HeterogeneousBundle> {
@@ -1984,7 +2013,10 @@ fn resolve_qwen35_mtp_head(
     gpu: &mut rdna_compute::Gpu,
     physical_cap: usize,
     device: Option<&str>,
-) -> (Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead>, Vec<String>) {
+) -> (
+    Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead>,
+    Vec<String>,
+) {
     let (resolved, errors) = resolve_qwen35_mtp_head_sourced(
         trunk_path,
         sidecar,
@@ -2249,7 +2281,11 @@ fn finish_qwen35_load(
             Ok(s) => {
                 eprintln!(
                     "  DFlash draft loaded: {} (layers={}, hidden={}, block={}, runtime_block={})",
-                    dp, s.draft_config.n_layers, s.draft_config.hidden, s.draft_config.block_size, s.block_size
+                    dp,
+                    s.draft_config.n_layers,
+                    s.draft_config.hidden,
+                    s.draft_config.block_size,
+                    s.block_size
                 );
                 Some(s)
             }
@@ -2280,49 +2316,50 @@ fn finish_qwen35_load(
     // (`ctx.mtp_path`), else `<trunk>.mtp`; physical_cap is the KV window. A head
     // whose hidden size or vocab differs from the trunk is refused before upload.
     // On missing/refused/failed: error when forced on (mtp=on), auto logs/falls back.
-    let mtp: Option<(hipfire_arch_qwen35::mtp_head::Qwen35MtpHead, String)> = if adaptive_blocks_generic_spec
-        || eviction.is_some()
-        || !matches!(arch_id, 5 | 6)
-        || ctx.spec.mtp == Some(false)
-        || dflash.is_some()
-        || dspark_speculator.is_some()
-    {
-        None
-    } else {
-        // `ctx.path` is canonical, so a sidecar beside a symlinked trunk is not
-        // its sibling; the CLI resolves that case into `ctx.mtp_path`. Direct
-        // daemon clients keep the canonical-sibling lookup.
-        let (resolved, errors) = resolve_qwen35_mtp_head_sourced(
-            Path::new(ctx.path),
-            ctx.mtp_path.clone(),
-            (config.dim, config.vocab_size),
-            &mut *ctx.gpu,
-            physical_cap,
-            None,
-        );
-        if resolved.is_none() {
-            if ctx.spec.mtp == Some(true) {
-                let reason = if errors.is_empty() {
-                    "no bundled trailer or .mtp sidecar found".to_string()
-                } else {
-                    errors.join("; ")
-                };
-                return Err(rollback_unfinished_qwen35(
-                    format!("MTP head required (mtp=on) but not loaded: {reason}"),
-                    bundle,
-                    vision_weights,
-                    ctx.gpu,
-                ));
+    let mtp: Option<(hipfire_arch_qwen35::mtp_head::Qwen35MtpHead, String)> =
+        if adaptive_blocks_generic_spec
+            || eviction.is_some()
+            || !matches!(arch_id, 5 | 6)
+            || ctx.spec.mtp == Some(false)
+            || dflash.is_some()
+            || dspark_speculator.is_some()
+        {
+            None
+        } else {
+            // `ctx.path` is canonical, so a sidecar beside a symlinked trunk is not
+            // its sibling; the CLI resolves that case into `ctx.mtp_path`. Direct
+            // daemon clients keep the canonical-sibling lookup.
+            let (resolved, errors) = resolve_qwen35_mtp_head_sourced(
+                Path::new(ctx.path),
+                ctx.mtp_path.clone(),
+                (config.dim, config.vocab_size),
+                &mut *ctx.gpu,
+                physical_cap,
+                None,
+            );
+            if resolved.is_none() {
+                if ctx.spec.mtp == Some(true) {
+                    let reason = if errors.is_empty() {
+                        "no bundled trailer or .mtp sidecar found".to_string()
+                    } else {
+                        errors.join("; ")
+                    };
+                    return Err(rollback_unfinished_qwen35(
+                        format!("MTP head required (mtp=on) but not loaded: {reason}"),
+                        bundle,
+                        vision_weights,
+                        ctx.gpu,
+                    ));
+                }
+                if !errors.is_empty() {
+                    eprintln!(
+                        "  MTP head not loaded: {} — falling back to AR/n-gram",
+                        errors.join("; ")
+                    );
+                }
             }
-            if !errors.is_empty() {
-                eprintln!(
-                    "  MTP head not loaded: {} — falling back to AR/n-gram",
-                    errors.join("; ")
-                );
-            }
-        }
-        resolved
-    };
+            resolved
+        };
     let mtp_present = mtp.is_some();
     let (mtp, mtp_source) = match mtp {
         Some((head, source)) => (Some(head), Some(source)),
@@ -2695,8 +2732,9 @@ fn resolve_route_plan(
     {
         return Err("vision tower".into());
     }
-    let config = <hipfire_arch_qwen35::Qwen35 as hipfire_runtime::arch::Architecture>::config_from_hfq(hfq)
-        .map_err(|e| e.to_string())?;
+    let config =
+        <hipfire_arch_qwen35::Qwen35 as hipfire_runtime::arch::Architecture>::config_from_hfq(hfq)
+            .map_err(|e| e.to_string())?;
     // Same K/V resolution as the qwen35 HFQ carrier (adaptive/CASK refused above).
     let mode_raw = req
         .kv_mode_override
@@ -2728,9 +2766,10 @@ fn resolve_route_plan(
             let name = kv_mode::qwen_k_display_name(k);
             (name, name)
         }
-        kv_mode::KvPair::Split(k, v) => {
-            (kv_mode::qwen_k_display_name(k), kv_mode::qwen_v_display_name(v))
-        }
+        kv_mode::KvPair::Split(k, v) => (
+            kv_mode::qwen_k_display_name(k),
+            kv_mode::qwen_v_display_name(v),
+        ),
     };
     let state_quant = match parse_state_quant(req.state_quant_override)? {
         StateQuant::Q8 => "q8",
@@ -2810,7 +2849,9 @@ fn begin_route_kernels(
     req: &RouteRequest<'_>,
     gpu: &mut Gpu,
 ) -> Result<Option<PlannedRoute>, String> {
-    use rdna_compute::compile_jobs::{compile_job_budget, host_available_memory, parse_job_override};
+    use rdna_compute::compile_jobs::{
+        compile_job_budget, host_available_memory, parse_job_override,
+    };
     gpu.abort_route_kernel_load()
         .map_err(|e| format!("kernel route reset: {e}"))?;
     let (plan, spec) = match resolve_route_plan(req, gpu) {
@@ -2825,7 +2866,9 @@ fn begin_route_kernels(
         .map_err(|e| format!("cannot determine compile CPU affinity: {e}"))?;
     let override_jobs = parse_job_override(
         "HIPFIRE_JIT_JOBS",
-        hipfire_config::developer_var("HIPFIRE_JIT_JOBS").ok().as_deref(),
+        hipfire_config::developer_var("HIPFIRE_JIT_JOBS")
+            .ok()
+            .as_deref(),
     )?;
     let available = host_available_memory();
     let modules = plan.entries.len();
@@ -2845,10 +2888,17 @@ fn begin_route_kernels(
             );
         }
         Err(overlap) => {
-            let jobs = compile_job_budget(cores, available, ROUTE_COMPILE_SAFETY_RESERVE, override_jobs)
-                .map_err(|e| {
-                    format!("refusing load: no kernel compile worker fits ({overlap}; before weights: {e})")
-                })?;
+            let jobs = compile_job_budget(
+                cores,
+                available,
+                ROUTE_COMPILE_SAFETY_RESERVE,
+                override_jobs,
+            )
+            .map_err(|e| {
+                format!(
+                    "refusing load: no kernel compile worker fits ({overlap}; before weights: {e})"
+                )
+            })?;
             gpu.begin_route_kernel_load(plan, jobs)
                 .and_then(|()| gpu.ensure_route_modules_preloaded())
                 .map_err(|e| {
@@ -4600,7 +4650,9 @@ fn load_model_tp_qwen35_dense(
             } else {
                 errors.join("; ")
             };
-            return Err(format!("MTP head required (mtp=on) but not loaded: {reason}"));
+            return Err(format!(
+                "MTP head required (mtp=on) but not loaded: {reason}"
+            ));
         }
         head
     } else {
@@ -5014,7 +5066,9 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
     match (first_err, weight_lease) {
         (Some(err), Some(lease)) => {
             drop(lease);
-            Err(format!("{err}; weight-host lease closed without release (teardown not proven clean)"))
+            Err(format!(
+                "{err}; weight-host lease closed without release (teardown not proven clean)"
+            ))
         }
         (Some(err), None) => Err(err),
         (None, Some(lease)) => lease.release(),
@@ -5207,9 +5261,14 @@ mod ep_admission_tests {
         let before = active.request();
         let mut effects = LoadEffects::default();
         let refusal = attempt_candidate_swap(
-            &candidate, 1, admission::KvBackendRequest::Explicit(hipfire_runtime::kv_backend::KvBackend::Vmm),
-            "gfx1100", &mut active, &mut effects,
-        ).unwrap_err();
+            &candidate,
+            1,
+            admission::KvBackendRequest::Explicit(hipfire_runtime::kv_backend::KvBackend::Vmm),
+            "gfx1100",
+            &mut active,
+            &mut effects,
+        )
+        .unwrap_err();
         assert!(refusal.contains("vmm") && refusal.contains("unsupported"));
         assert_eq!(effects, LoadEffects::default());
         assert_eq!(active.request(), before);
@@ -5252,6 +5311,25 @@ mod lfm2_batch_admission_tests {
                 .caps()
                 .supports_continuous_batch
         );
+    }
+}
+
+#[cfg(test)]
+#[cfg(test)]
+mod wire_verb_tests {
+    use super::{wire_verb, WireVerb};
+
+    #[test]
+    fn embed_reserved_for_arch_17_and_generate_is_the_default() {
+        assert_eq!(wire_verb(17), WireVerb::Embed);
+        assert!(!wire_verb(17).is_generate());
+        // Every other exercised arch stays a generating model, so a new chat
+        // arch needs no change here and only a non-generating one is added
+        // explicitly.
+        for a in [0, 1, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 40, 45] {
+            assert_eq!(wire_verb(a), WireVerb::Generate, "arch {a}");
+            assert!(wire_verb(a).is_generate(), "arch {a}");
+        }
     }
 }
 
