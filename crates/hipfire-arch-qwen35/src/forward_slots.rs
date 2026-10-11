@@ -533,9 +533,10 @@ enum GroupPlan {
     /// WMMA-vs-plain split at the call site).
     Uniform(DType),
     /// Members differ: per-weight plain GEMMs. Plan time has already
-    /// verified every member has a `slots_plain_gemm_key` and that no
-    /// member carries an AWQ sidecar (mixed-dtype AWQ groups would need
-    /// one pre-rotation input per weight — refused until needed).
+    /// verified every member has a `slots_plain_gemm_key` and that AWQ
+    /// sidecars are consistent: flat members must be scale-free (the
+    /// plain GEMM has no AWQ fold), and rotated members must all agree
+    /// on sidecar presence (the shared rotated basis carries one scale).
     Mixed { needs_rot: bool, needs_norm: bool },
 }
 
@@ -599,8 +600,11 @@ fn slots_check_residual_weight(w: &WeightTensor, name: &str, arch: &str) -> HipR
 /// Plan one projection group (see [`GroupPlan`]) from dtype+AWQ summaries —
 /// the pure core, unit-testable without GPU buffers. Uniform groups need
 /// every member admitted; mixed groups additionally need a plain key per
-/// member and refuse AWQ sidecars (each AWQ weight needs its own rotated
-/// input).
+/// member. AWQ sidecars in a mixed group are admitted only when every
+/// ROTATED member carries one — the AWQ divide folds into the fused
+/// norm+rotate that produces the shared rotated basis (one scale call, so
+/// presence must agree), while a flat member's sidecar has no kernel to
+/// apply it and must be refused outright.
 fn plan_proj_group_dtypes(members: &[(DType, bool)], arch: &str) -> Result<GroupPlan, String> {
     for (dt, _) in members {
         if !slots_proj_admissible(*dt, arch) {
@@ -613,10 +617,32 @@ fn plan_proj_group_dtypes(members: &[(DType, bool)], arch: &str) -> Result<Group
     if members.iter().all(|(dt, _)| *dt == d0) {
         return Ok(GroupPlan::Uniform(d0));
     }
-    if members.iter().any(|(_, awq)| *awq) {
+    // AWQ in a mixed group: a flat member's sidecar has no fused kernel to
+    // fold into (the plain GEMM reads the natural basis) — refuse it
+    // outright. Rotated members may carry sidecars, but only uniformly:
+    // the fused norm+rotate applies ONE awq_scale to the shared rotated
+    // activation (siblings share input, so the quantizer emits them the
+    // same scale; presence is what must agree).
+    let rotated_have_awq = members
+        .iter()
+        .filter(|(dt, _)| slots_weight_rotated(*dt))
+        .map(|(_, awq)| *awq);
+    let n_rot_awq = rotated_have_awq.clone().filter(|a| *a).count();
+    let n_rot = rotated_have_awq.count();
+    if members
+        .iter()
+        .any(|(dt, awq)| *awq && !slots_weight_rotated(*dt))
+    {
         return Err(
-            "mixes dtypes and carries an AWQ sidecar — mixed-dtype AWQ groups are \
-             refused (each scale needs its own rotated input)"
+            "mixes dtypes and a FLAT member carries an AWQ sidecar — no fused \
+             kernel applies it on the natural basis"
+                .to_string(),
+        );
+    }
+    if n_rot_awq != 0 && n_rot_awq != n_rot {
+        return Err(
+            "mixes dtypes and rotated members disagree on AWQ sidecar presence \
+             — one shared rotated activation cannot serve both"
                 .to_string(),
         );
     }
@@ -786,6 +812,55 @@ fn slots_plain_proj(
         w.k,
         n,
     )
+}
+
+/// Embedding formats the slots paths admit for a batched lookup. HostF32
+/// embeds (qt1/2/16/40/41/44/45/47-50, see `embed_classify`) arrive as
+/// `EmbeddingFormat::F32` and gather via `embedding_lookup_f32_batched`;
+/// the raw formats keep their own batched dequant kernels. Shared by the
+/// slot forward and the VMM executor so the two cannot drift.
+pub(crate) fn slots_embed_format_admitted(fmt: EmbeddingFormat) -> HipResult<()> {
+    match fmt {
+        EmbeddingFormat::Q8_0
+        | EmbeddingFormat::F32
+        | EmbeddingFormat::HFQ4G256
+        | EmbeddingFormat::HFQ4G128 => Ok(()),
+        other => Err(HipError::new(
+            0,
+            &format!(
+                "forward_batch_slots: embedding format {other:?} has no batched \
+                 lookup in the slots path (admitted: Q8_0, F32, HFQ4G256, HFQ4G128)"
+            ),
+        )),
+    }
+}
+
+/// Batched embedding lookup for the admitted slots formats: every branch
+/// reads token ids from a device buffer, so the call replays under graph
+/// capture (a host-side per-row D2D would bake stale offsets).
+pub(crate) fn embed_lookup_slots(
+    gpu: &mut Gpu,
+    fmt: EmbeddingFormat,
+    table: &GpuTensor,
+    output: &GpuTensor,
+    token_ids: &GpuTensor,
+    n: usize,
+    dim: usize,
+) -> HipResult<()> {
+    match fmt {
+        EmbeddingFormat::Q8_0 => gpu.embedding_lookup_q8_batched(table, output, token_ids, n, dim),
+        EmbeddingFormat::F32 => gpu.embedding_lookup_f32_batched(table, output, token_ids, n, dim),
+        EmbeddingFormat::HFQ4G256 => {
+            gpu.embedding_lookup_hfq4g256_batched(table, output, token_ids, n, dim)
+        }
+        EmbeddingFormat::HFQ4G128 => {
+            gpu.embedding_lookup_hfq4g128_batched(table, output, token_ids, n, dim)
+        }
+        other => Err(HipError::new(
+            0,
+            &format!("embed_lookup_slots: unsupported format {other:?}"),
+        )),
+    }
 }
 
 /// `y += w · x`, dispatching by `w.gpu_dtype` alone: Q8_0 residual path,
@@ -4007,21 +4082,19 @@ pub fn forward_batch_slots_opts(
 
     let dim = config.dim;
 
-    // ── 1. Embed tokens (Q8_0 only) ──────────────────────────────────────
-    if !matches!(weights.embd_format, EmbeddingFormat::Q8_0) {
-        return Err(HipError::new(
-            0,
-            "forward_batch_slots: embedding table must be Q8_0 (the multi-slot \
-             batched path is Q8_0-only, see sp3-task-2-report.md)",
-        ));
-    }
+    // ── 1. Embed tokens ──────────────────────────────────────────────────
+    // Every admitted format dequantizes/copies into pbs.x_batch as F32 with
+    // token ids read from a device buffer, so the call replays under graph
+    // capture. HostF32 embeds (qt1/2/16/40/41/44/45/47-50 — see
+    // `embed_classify`) arrive as `EmbeddingFormat::F32`.
+    slots_embed_format_admitted(weights.embd_format)?;
     if !opts.skip_uploads {
         let tokens_host: Vec<i32> = batch.tokens.iter().map(|&t| t as i32).collect();
         let tokens_bytes: &[u8] =
             unsafe { std::slice::from_raw_parts(tokens_host.as_ptr() as *const u8, n * 4) };
         gpu.hip.memcpy_htod(&pbs.tokens.buf, tokens_bytes)?;
     }
-    gpu.embedding_lookup_q8_batched(&weights.token_embd, &pbs.x_batch, &pbs.tokens, n, dim)?;
+    embed_lookup_slots(gpu, weights.embd_format, &weights.token_embd, &pbs.x_batch, &pbs.tokens, n, dim)?;
 
     // ── 1b. VL rows: overwrite image-pad rows with vision embeddings ─────
     // `batch.ext_emb` (per-row matrix index, -1 = token table) and the
@@ -4595,13 +4668,32 @@ mod tests {
         assert!(plan_proj_group_dtypes(&[m(DType::MQ6G256), m(DType::MQ4G256V2)], arch)
             .unwrap_err()
             .contains("no per-projection GEMM key"));
-        // AWQ + mixed dtypes refuse; AWQ + uniform is fine.
+        // AWQ in a mixed group: flat-member sidecars refuse (no kernel
+        // applies them on the natural basis); rotated members may all carry
+        // a sidecar or none, but not a mix.
         assert!(plan_proj_group_dtypes(
-            &[(DType::MQ4G256V2, true), m(DType::Q8_0)],
+            &[m(DType::MQ4G256V2), (DType::Q8_0, true)],
+            arch
+        )
+        .unwrap_err()
+        .contains("FLAT"));
+        assert!(plan_proj_group_dtypes(
+            &[(DType::MQ4G256V2, true), m(DType::MQ6G256V2)],
             arch
         )
         .unwrap_err()
         .contains("AWQ"));
+        // All-rotated members sharing AWQ presence is admitted.
+        assert_eq!(
+            plan_proj_group_dtypes(
+                &[(DType::MQ4G256V2, true), (DType::MQ6G256V2, true)],
+                arch
+            ),
+            Ok(GroupPlan::Mixed {
+                needs_rot: true,
+                needs_norm: false
+            })
+        );
         assert_eq!(
             plan_proj_group_dtypes(&[(DType::MQ4G256V2, true), (DType::MQ4G256V2, true)], arch),
             Ok(GroupPlan::Uniform(DType::MQ4G256V2))

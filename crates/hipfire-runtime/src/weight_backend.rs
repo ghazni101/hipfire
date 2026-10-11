@@ -98,19 +98,19 @@ pub enum EmbedPlan {
 /// Pure quant_type → plan. GPU-free, unit-testable.
 ///
 /// qt 6 → Raw(HFQ4G256), 7 → Raw(HFQ4G128), 3 → Raw(Q8_0),
-/// qt 1|2|16|40|41 → HostF32, else → panic with the supported-format list.
+/// qt 1|2|16|40|41|44|45|47-50 → HostF32, else → error with the supported list.
 pub fn embed_classify(quant_type: u8) -> HipResult<EmbedPlan> {
     match quant_type {
         6 => Ok(EmbedPlan::Raw(EmbeddingFormat::HFQ4G256)),
         7 => Ok(EmbedPlan::Raw(EmbeddingFormat::HFQ4G128)),
         3 => Ok(EmbedPlan::Raw(EmbeddingFormat::Q8_0)),
-        1 | 2 | 16 | 40 | 41 => Ok(EmbedPlan::HostF32),
+        1 | 2 | 16 | 40 | 41 | 44 | 45 | 47 | 48 | 49 | 50 => Ok(EmbedPlan::HostF32),
         other => Err(hip_bridge::HipError::new(
             0,
             &format!(
                 "unsupported embedding quant_type {other}; \
                  handled: 1 (F16→F32), 2 (F32), 3 (Q8_0), 6 (HFQ4G256), 7 (HFQ4G128), 16 (BF16→F32), \
-                 40 (TQ2G128→F32), 41 (BQ1G128→F32). \
+                 40 (TQ2G128→F32), 41 (BQ1G128→F32), 44/45/47-50 (MQ*G256V2→F32). \
                  Add the format to embed_classify to support it."
             ),
         )),
@@ -1013,6 +1013,99 @@ fn dequantize_to_f32(quant_type: u8, data: &[u8], n: usize) -> Vec<f32> {
                     let s = if h == 0 { st(0) } else { st(1) };
                     let z = if h == 0 { zz(0) } else { zz(1) };
                     out.push(s * nibble as f32 + z);
+                }
+                let group = &mut out[start..start + 256];
+                fwht256_inplace(group, &signs1, &signs2);
+            }
+            out
+        }
+        45 | 47 | 48 | 49 | 50 => {
+            // V2 MQ family over the G256 container: [0..8) per-128 fp16
+            // scale/zero pairs (h0 covers weights 0..127, h1 128..255), then a
+            // packed code payload at offset 8. qt45 (MQ4CG256) differs only in
+            // the header: one packed fp16 scale+zero dword + 4 B zero pad, so
+            // both halves decode with the same (s, z) — the loop below unifies
+            // that by keying `s`/`z` on the half index. Rotated formats: the
+            // FWHT inverse runs per group exactly like qt44/qt13 above.
+            // Code packing (same as hipfire-cpu quant.rs code2/3/5/6):
+            //   qt45  4-bit low-nibble-first, 128 B
+            //   qt47  6-bit, 4 codes / 3 B,    192 B
+            //   qt48  5-bit, 8 codes / 5 B,    160 B
+            //   qt49  3-bit, 8 codes / 3 B,     96 B
+            //   qt50  2-bit LSB-first, 4/B,     64 B
+            let bytes_per_group: usize = match quant_type {
+                45 => 136,
+                47 => 200,
+                48 => 168,
+                49 => 104,
+                _ => 72, // qt50
+            };
+            let n_groups = data.len() / bytes_per_group;
+            let signs1 = KvCache::gen_fwht_signs(42, 256);
+            let signs2 = KvCache::gen_fwht_signs(1042, 256);
+            let mut out = Vec::with_capacity(n_groups * 256);
+            for g in 0..n_groups {
+                let off = g * bytes_per_group;
+                let h16 = |o: usize| f16_to_f32(u16::from_le_bytes([data[off + o], data[off + o + 1]]));
+                // qt45: [0..2) s, [2..4) z for BOTH halves. Others: per-half s/z.
+                let (s0, z0) = (h16(0), h16(2));
+                let (s1, z1) = if quant_type == 45 { (s0, z0) } else { (h16(4), h16(6)) };
+                let start = out.len();
+                for i in 0..256 {
+                    let p = off + 8;
+                    let code = match quant_type {
+                        45 => {
+                            let b = data[p + i / 2] as u32;
+                            if i % 2 == 0 { b & 0xF } else { b >> 4 }
+                        }
+                        47 => {
+                            let bo = p + (i / 4) * 3;
+                            let (b0, b1, b2) = (data[bo] as u32, data[bo + 1] as u32, data[bo + 2] as u32);
+                            [
+                                b0 & 0x3F,
+                                ((b0 >> 6) | (b1 << 2)) & 0x3F,
+                                ((b1 >> 4) | (b2 << 4)) & 0x3F,
+                                (b2 >> 2) & 0x3F,
+                            ][i % 4]
+                        }
+                        48 => {
+                            let bo = p + (i / 8) * 5;
+                            let b = [
+                                data[bo] as u32,
+                                data[bo + 1] as u32,
+                                data[bo + 2] as u32,
+                                data[bo + 3] as u32,
+                                data[bo + 4] as u32,
+                            ];
+                            [
+                                b[0] & 0x1f,
+                                ((b[0] >> 5) & 0x07) | ((b[1] & 0x03) << 3),
+                                (b[1] >> 2) & 0x1f,
+                                ((b[1] >> 7) & 0x01) | ((b[2] & 0x0f) << 1),
+                                ((b[2] >> 4) & 0x0f) | ((b[3] & 0x01) << 4),
+                                (b[3] >> 1) & 0x1f,
+                                ((b[3] >> 6) & 0x03) | ((b[4] & 0x07) << 2),
+                                (b[4] >> 3) & 0x1f,
+                            ][i % 8]
+                        }
+                        49 => {
+                            let bo = p + (i / 8) * 3;
+                            let (b0, b1, b2) = (data[bo] as u32, data[bo + 1] as u32, data[bo + 2] as u32);
+                            [
+                                b0 & 7,
+                                (b0 >> 3) & 7,
+                                ((b0 >> 6) | (b1 << 2)) & 7,
+                                (b1 >> 1) & 7,
+                                (b1 >> 4) & 7,
+                                ((b1 >> 7) | (b2 << 1)) & 7,
+                                (b2 >> 2) & 7,
+                                (b2 >> 5) & 7,
+                            ][i % 8]
+                        }
+                        _ => (data[p + i / 4] as u32 >> (2 * (i % 4))) & 0x3, // qt50
+                    };
+                    let (s, z) = if i < 128 { (s0, z0) } else { (s1, z1) };
+                    out.push(s * code as f32 + z);
                 }
                 let group = &mut out[start..start + 256];
                 fwht256_inplace(group, &signs1, &signs2);
