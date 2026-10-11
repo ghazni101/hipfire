@@ -16,12 +16,15 @@
 /// punctuation. Queries keep punctuation (empty `skiplist_tasks` entry),
 /// documents drop it.
 pub const DEFAULT_SKIPLIST_WORDS: &[&str] = &[
-    "!", "\"", "#", "$", "%", "&", "'", "(", ")", "*", "+", ",", "-", ".", "/", ":", ";", "<",
-    "=", ">", "?", "@", "[", "\\", "]", "^", "_", "`", "{", "|", "}", "~",
+    "!", "\"", "#", "$", "%", "&", "'", "(", ")", "*", "+", ",", "-", ".", "/", ":", ";", "<", "=",
+    ">", "?", "@", "[", "\\", "]", "^", "_", "`", "{", "|", "}", "~",
 ];
 
 pub fn default_skiplist_words() -> Vec<String> {
-    DEFAULT_SKIPLIST_WORDS.iter().map(|s| s.to_string()).collect()
+    DEFAULT_SKIPLIST_WORDS
+        .iter()
+        .map(|s| s.to_string())
+        .collect()
 }
 
 /// Build the set of token ids whose *piece* (as stored in the tokenizer
@@ -37,7 +40,8 @@ pub fn skiplist_token_ids(
     vocab: &dyn VocabPieces,
     skiplist_words: &[String],
 ) -> std::collections::HashSet<u32> {
-    let words: std::collections::HashSet<&str> = skiplist_words.iter().map(|s| s.as_str()).collect();
+    let words: std::collections::HashSet<&str> =
+        skiplist_words.iter().map(|s| s.as_str()).collect();
     let mut out = std::collections::HashSet::new();
     for (id, piece) in vocab.pieces() {
         let stripped = strip_space_marker(&piece);
@@ -147,7 +151,7 @@ mod tests {
     fn skiplist_ids_match_exact_pieces_only() {
         let voc = TestVoc(vec![
             (1, ".".into()),
-            (2, "Ġ.".into()), // " ." — same punctuation token after a space
+            (2, "Ġ.".into()),  // " ." — same punctuation token after a space
             (3, "...".into()), // ellipsis piece: NOT a skiplist word
             (4, "a.".into()),  // multi-char piece: no match
             (5, "!".into()),

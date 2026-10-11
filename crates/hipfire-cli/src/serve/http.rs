@@ -1294,7 +1294,11 @@ async fn handle_embeddings(
     shared: Arc<ServeShared>,
     body: serde_json::Value,
 ) -> Result<Response<BoxBody>, String> {
-    let kind = match body.get("kind").and_then(|v| v.as_str()).unwrap_or("document") {
+    let kind = match body
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("document")
+    {
         "query" => "query",
         "document" | "doc" => "document",
         other => {
@@ -1362,9 +1366,8 @@ async fn handle_embeddings(
 
     let (tx, rx) = tokio::sync::oneshot::channel::<Result<serde_json::Value, String>>();
     tokio::task::spawn_blocking(move || {
-        let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
-            engine.embed(&request)
-        }));
+        let outcome =
+            std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| engine.embed(&request)));
         let result = match outcome {
             Ok(Ok(done)) => Ok(done),
             Ok(Err(error)) => Err(error.to_string()),

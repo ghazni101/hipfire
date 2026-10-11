@@ -111,7 +111,10 @@ fn f64_of(v: &serde_json::Value, key: &str) -> Option<f64> {
     v.get(key).and_then(|x| x.as_f64())
 }
 
-fn parse_layer_types(text: &serde_json::Value, num_layers: usize) -> Result<Vec<LayerType>, String> {
+fn parse_layer_types(
+    text: &serde_json::Value,
+    num_layers: usize,
+) -> Result<Vec<LayerType>, String> {
     let raw = text
         .get("layer_types")
         .and_then(|v| v.as_array())
@@ -171,14 +174,10 @@ pub fn parse_config(config: &serde_json::Value) -> Result<EmbedConfig, String> {
         .unwrap_or("silu")
         .to_string();
 
-    let linear_num_key_heads =
-        u64_of(text, "linear_num_key_heads").unwrap_or(32) as usize;
-    let linear_num_value_heads =
-        u64_of(text, "linear_num_value_heads").unwrap_or(32) as usize;
-    let linear_key_head_dim =
-        u64_of(text, "linear_key_head_dim").unwrap_or(128) as usize;
-    let linear_value_head_dim =
-        u64_of(text, "linear_value_head_dim").unwrap_or(128) as usize;
+    let linear_num_key_heads = u64_of(text, "linear_num_key_heads").unwrap_or(32) as usize;
+    let linear_num_value_heads = u64_of(text, "linear_num_value_heads").unwrap_or(32) as usize;
+    let linear_key_head_dim = u64_of(text, "linear_key_head_dim").unwrap_or(128) as usize;
+    let linear_value_head_dim = u64_of(text, "linear_value_head_dim").unwrap_or(128) as usize;
     let conv_kernel_dim = u64_of(text, "linear_conv_kernel_dim").unwrap_or(4) as usize;
 
     // rope_parameters nests the theta / partial factor / mrope section on this
@@ -194,7 +193,10 @@ pub fn parse_config(config: &serde_json::Value) -> Result<EmbedConfig, String> {
         .get("mrope_section")
         .and_then(|v| v.as_array())
         .and_then(|a| {
-            let vals: Vec<usize> = a.iter().filter_map(|x| x.as_u64().map(|v| v as usize)).collect();
+            let vals: Vec<usize> = a
+                .iter()
+                .filter_map(|x| x.as_u64().map(|v| v as usize))
+                .collect();
             (vals.len() == 3).then_some([vals[0], vals[1], vals[2]])
         })
         .unwrap_or([11, 11, 10]);
@@ -214,7 +216,9 @@ pub fn parse_config(config: &serde_json::Value) -> Result<EmbedConfig, String> {
         ));
     }
     if n_heads % n_kv_heads != 0 {
-        return Err(format!("{n_heads} heads not divisible by {n_kv_heads} kv heads"));
+        return Err(format!(
+            "{n_heads} heads not divisible by {n_kv_heads} kv heads"
+        ));
     }
     if linear_num_value_heads % linear_num_key_heads != 0 {
         return Err(format!(
@@ -228,11 +232,10 @@ pub fn parse_config(config: &serde_json::Value) -> Result<EmbedConfig, String> {
         return Err("attn_output_gate=false is not supported (fused q+gate projection)".into());
     }
 
-    let image_token_id = u64_of(config, "image_token_id").unwrap_or(DEFAULT_IMAGE_TOKEN_ID as u64)
-        as u32;
-    let vision_start_token_id =
-        u64_of(config, "vision_start_token_id").unwrap_or(DEFAULT_VISION_START_TOKEN_ID as u64)
-            as u32;
+    let image_token_id =
+        u64_of(config, "image_token_id").unwrap_or(DEFAULT_IMAGE_TOKEN_ID as u64) as u32;
+    let vision_start_token_id = u64_of(config, "vision_start_token_id")
+        .unwrap_or(DEFAULT_VISION_START_TOKEN_ID as u64) as u32;
     let vision_end_token_id =
         u64_of(config, "vision_end_token_id").unwrap_or(DEFAULT_VISION_END_TOKEN_ID as u64) as u32;
 
@@ -481,10 +484,11 @@ mod tests {
     fn sidecar_overlays_apply() {
         let v: serde_json::Value = serde_json::from_str(PPLX_CONFIG).unwrap();
         let mut cfg = parse_config(&v).unwrap();
-        let st: serde_json::Value =
-            serde_json::from_str(r#"{"prompts":{"query":"[Q] ","document":"[D] "},
-                                    "query_length":32,"document_length":128}"#)
-                .unwrap();
+        let st: serde_json::Value = serde_json::from_str(
+            r#"{"prompts":{"query":"[Q] ","document":"[D] "},
+                                    "query_length":32,"document_length":128}"#,
+        )
+        .unwrap();
         cfg.apply_st_config(&st);
         assert_eq!(cfg.query_length, 32);
         assert_eq!(cfg.document_length, 128);
@@ -504,7 +508,6 @@ mod tests {
         assert_eq!(cfg.dense_out_features, 128);
     }
 
-
     #[test]
     fn config_from_metadata_unwraps_both_shapes() {
         let v: serde_json::Value = serde_json::from_str(PPLX_CONFIG).unwrap();
@@ -520,8 +523,7 @@ mod tests {
     fn rejects_mrope_section_mismatch() {
         let v: serde_json::Value = serde_json::from_str(PPLX_CONFIG).unwrap();
         let mut bad = v.clone();
-        bad["text_config"]["rope_parameters"]["mrope_section"] =
-            serde_json::json!([8, 8, 8]);
+        bad["text_config"]["rope_parameters"]["mrope_section"] = serde_json::json!([8, 8, 8]);
         let err = parse_config(&bad).unwrap_err();
         assert!(err.contains("mrope_section"), "{err}");
     }

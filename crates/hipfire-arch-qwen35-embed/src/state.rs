@@ -37,11 +37,13 @@ impl GdnEncodeState {
             let s = gpu
                 .alloc_tensor(&[s_elems], DType::F32)
                 .map_err(|e| format!("qwen35-embed: alloc S matrix: {e:?}"))?;
-            gpu.zero_f32(&s).map_err(|e| format!("qwen35-embed: zero S matrix: {e:?}"))?;
+            gpu.zero_f32(&s)
+                .map_err(|e| format!("qwen35-embed: zero S matrix: {e:?}"))?;
             let c = gpu
                 .alloc_tensor(&[conv_elems], DType::F32)
                 .map_err(|e| format!("qwen35-embed: alloc conv ring: {e:?}"))?;
-            gpu.zero_f32(&c).map_err(|e| format!("qwen35-embed: zero conv ring: {e:?}"))?;
+            gpu.zero_f32(&c)
+                .map_err(|e| format!("qwen35-embed: zero conv ring: {e:?}"))?;
             s_matrices.push(s);
             conv_states.push(c);
         }
@@ -61,7 +63,11 @@ impl GdnEncodeState {
     }
 
     pub fn free_gpu(self, gpu: &mut Gpu) {
-        for t in self.s_matrices.into_iter().chain(self.conv_states.into_iter()) {
+        for t in self
+            .s_matrices
+            .into_iter()
+            .chain(self.conv_states.into_iter())
+        {
             let _ = gpu.free_tensor(t);
         }
     }
