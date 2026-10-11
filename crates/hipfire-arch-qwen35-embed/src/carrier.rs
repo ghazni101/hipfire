@@ -87,7 +87,7 @@ pub fn load_qwen35_embed_bundle(
     };
     let meta: serde_json::Value = serde_json::from_str(st.metadata_json())
         .map_err(|e| format!("qwen35-embed: config JSON: {e}"))?;
-    let mut config = parse_config(&meta)?;
+    let mut config = parse_config(crate::config::config_from_metadata(&meta))?;
 
     // Sidecar overlays live next to the checkpoint (dir sources; HFQ
     // re-saves fold them in via the defaults).

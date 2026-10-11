@@ -2306,8 +2306,19 @@ pub(crate) fn run() {
     // count and NO env var). Untouched in every non-prune path.
     let mut metadata_json = serde_json::to_string(&metadata).unwrap();
 
-    // Load all safetensors files
-    let st_files: Vec<SafetensorsFile> = find_safetensors(input_dir)
+    // Load all safetensors files. The qwen3.5 embedding encoder (arch 17,
+    // e.g. pplx-embed-v2) keeps its sentence-transformers Dense head in a
+    // `1_Dense/model.safetensors` subdirectory rather than the trunk shard,
+    // so fold that shard in for arch 17 — without it the .hfq would carry no
+    // `linear.weight` and the loader's Dense-head read would fail.
+    let mut shard_paths = find_safetensors(input_dir);
+    if arch_id == 17 {
+        let dense = input_dir.join("1_Dense/model.safetensors");
+        if dense.is_file() {
+            shard_paths.push(dense);
+        }
+    }
+    let st_files: Vec<SafetensorsFile> = shard_paths
         .iter()
         .map(|p| {
             eprintln!("Loading: {}", p.display());
@@ -2694,7 +2705,10 @@ pub(crate) fn run() {
     let mut _n_quant_groups = 0u64;
 
     // --vision-only implies --include-vision (tower-only sidecar build).
-    let include_vision = args.include_vision || args.vision_only;
+    // The qwen3.5 embedding encoder (arch 17) is multimodal by definition —
+    // its SigLIP tower is part of the model, not an optional VL add-on, so
+    // never silently drop it the way the default VL artifact contract does.
+    let include_vision = args.include_vision || args.vision_only || arch_id == 17;
     // Set when a vision-module tensor is actually emitted (loop-level F16
     // short-circuit) — spill-safe input for the has_vision metadata flag.
     let mut emitted_vision = false;
@@ -6065,7 +6079,12 @@ fn handle_main_quant(
     let _vision_quant = flags.vision_quant.as_str();
     let _is_gemma4_family = flags.is_gemma4_family;
     let _q8_conv1d_default = flags.q8_conv1d_default;
-    if should_quantize(name) && n_elements >= 32 {
+    // The qwen3.5 embedding encoder's sentence-transformers Dense head
+    // (`linear.weight`, 128×hidden) must stay raw — the arch crate reads it
+    // as f16 and refuses a compressed tier. Everything else quantizes as
+    // usual; norms already fall out via should_quantize.
+    let keep_dense_head = arch_id == 17 && name == "linear.weight";
+    if !keep_dense_head && should_quantize(name) && n_elements >= 32 {
         let f32_data =
             tensor_to_f32_with_optional_fp8_scale(name, raw_data, meta, &fp8_scale_for, &st_files);
         *state.quantized_params += n_elements as u64;

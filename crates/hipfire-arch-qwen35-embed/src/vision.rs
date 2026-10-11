@@ -27,6 +27,44 @@ use hipfire_arch_qwen35_vl::qwen35_vl::{
 use hipfire_runtime::model_source::ModelSource as ModelSourceTrait;
 use rdna_compute::Gpu;
 
+/// Vision tensors are kept raw by the quantizer (F16 under
+/// `--include-vision`), so both the safetensors-dir (`dtype` string) and the
+/// `.hfq` (`quant_type` 1/2) conventions resolve here.
+fn vision_storage(info: &hipfire_runtime::model_source::TensorInfo, name: &str) -> Result<u8, String> {
+    // 0 = f32, 1 = f16
+    if info.quant_type != 0xFF {
+        return match info.quant_type {
+            1 => Ok(1),
+            2 => Ok(0),
+            other => Err(format!(
+                "qwen35-embed: vision tensor `{name}` has HFQ quant_type {other} \
+                 (raw f16/f32 only)"
+            )),
+        };
+    }
+    match info.dtype.as_str() {
+        "F16" => Ok(1),
+        "F32" => Ok(0),
+        other => Err(format!(
+            "qwen35-embed: vision tensor `{name}` dtype {other} (F16/F32 only)"
+        )),
+    }
+}
+
+fn to_f32_vec(width: u8, bytes: &[u8], n: usize) -> Vec<f32> {
+    if width == 1 {
+        bytes[..n * 2]
+            .chunks_exact(2)
+            .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
+            .collect()
+    } else {
+        bytes[..n * 4]
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+            .collect()
+    }
+}
+
 fn up_lin(
     gpu: &mut Gpu,
     src: &dyn ModelSourceTrait,
@@ -35,21 +73,10 @@ fn up_lin(
     let (info, bytes) = names::resolve_vision(src, name)
         .ok_or_else(|| format!("qwen35-embed: missing vision tensor `{name}`"))?;
     let n = info.shape.iter().product::<usize>();
-    let words: Vec<u16> = match info.dtype.as_str() {
-        "F16" => bytes[..n * 2]
-            .chunks_exact(2)
-            .map(|c| u16::from_le_bytes([c[0], c[1]]))
-            .collect(),
-        "F32" => bytes[..n * 4]
-            .chunks_exact(4)
-            .map(|c| f16::from_f32(f32::from_le_bytes([c[0], c[1], c[2], c[3]])).to_bits())
-            .collect(),
-        other => {
-            return Err(format!(
-                "qwen35-embed: vision tensor `{name}` dtype {other} (F16/F32 only)"
-            ))
-        }
-    };
+    let words: Vec<u16> = to_f32_vec(vision_storage(info, name)?, bytes, n)
+        .into_iter()
+        .map(|v| f16::from_f32(v).to_bits())
+        .collect();
     let rows = info.shape.first().copied().unwrap_or(0);
     // N-D → 2-D row-major flatten: the 5-D conv-style patch-embed weight
     // `[out, in, T, h, w]` becomes `[out, in·T·h·w]`, which is exactly the
@@ -75,21 +102,7 @@ fn up_vec(
     let (info, bytes) = names::resolve_vision(src, name)
         .ok_or_else(|| format!("qwen35-embed: missing vision tensor `{name}`"))?;
     let total = info.shape.iter().product::<usize>();
-    let v: Vec<f32> = match info.dtype.as_str() {
-        "F32" => bytes[..total * 4]
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect(),
-        "F16" => bytes[..total * 2]
-            .chunks_exact(2)
-            .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
-            .collect(),
-        other => {
-            return Err(format!(
-                "qwen35-embed: vision tensor `{name}` dtype {other} (F16/F32 only)"
-            ))
-        }
-    };
+    let v = to_f32_vec(vision_storage(info, name)?, bytes, total);
     if v.len() != n {
         return Err(format!(
             "qwen35-embed: vision `{name}` is {} elems, expected {n}",
@@ -111,21 +124,7 @@ fn host_vec(
     let (info, bytes) = names::resolve_vision(src, name)
         .ok_or_else(|| format!("qwen35-embed: missing vision tensor `{name}`"))?;
     let total = info.shape.iter().product::<usize>();
-    let v: Vec<f32> = match info.dtype.as_str() {
-        "F32" => bytes[..total * 4]
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect(),
-        "F16" => bytes[..total * 2]
-            .chunks_exact(2)
-            .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
-            .collect(),
-        other => {
-            return Err(format!(
-                "qwen35-embed: vision tensor `{name}` dtype {other} (F16/F32 only)"
-            ))
-        }
-    };
+    let v = to_f32_vec(vision_storage(info, name)?, bytes, total);
     if v.len() != n {
         return Err(format!(
             "qwen35-embed: vision `{name}` is {} elems, expected {n}",

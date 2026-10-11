@@ -61,7 +61,9 @@ cache selection.
   `arch_id` (see `docs/architecture-ids.md` and `docs/ARCHITECTURE.md` §
   Architecture crates): llama (0/1), qwen35 (5/6), qwen2 (7), dots-ocr (8),
   deepseek4 (9, EP), minimax (10, EP), lfm2moe (11), cohere2moe (12), gemma4
-  (13, 22), muse-glimmer (14). `toy` (0xFF) is the new-port template; the
+  (13, 22), muse-glimmer (14), maple (15), qwen4 (16), qwen35-embed (17 —
+  the multi-vector embedding encoder, served via the non-chat `embed`
+  verb only). `toy` (0xFF) is the new-port template; the
   daemon refuses to dispatch it.
 - Support crates: hipfire-atlas (perf corpus), hipfire-reap (MoE
   expert pruning), hipfire-tui (chat/settings TUI), redline (experimental

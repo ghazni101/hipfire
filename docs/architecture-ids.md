@@ -34,6 +34,7 @@ remain fail-closed for every route outside that exact row; source-derived routin
 | 14 | Muse Glimmer (dense text) | `hipfire-arch-muse-glimmer` | `MuseGlimmerCarrier` | 3:1 sliding(RoPE θ=500k, SWA 2048)/full(**NoPE**, `layer_rope_theta[i]==0`) GQA 32:2 hd 128, sandwich RMSNorm (`rms_norm_eps` 1e-5 pre / `post_norm_eps` 1e-8 post), scale-less QK-norm + `qk_scale_factor` 3.87, `self_attn.gate_proj` gated attention, silu SwiGLU, **untied** lm_head, `output_multiplier` 0.196116 then softcap 20. Dir `muse_glimmer` / `muse_glimmer_text` → 14. Carrier claims 14 only; the arch-23 drafter rides `HIPFIRE_DFLASH_DRAFT`. `pp>1` and `params.drafter` are refused. |
 | 15 | Maple-Preview (natively-ternary MoE) | `hipfire-arch-maple` | `MapleCarrier` | 3:1 sliding(RoPE θ=10k, SWA 512)/full(**NoPE**, `nope_on_global_attention`) GQA 16:4 hd 128, **QK-norm applied BEFORE RoPE**, **partial rotary 0.5** (first 64 of 128 dims), MoE on EVERY layer (256 experts top-8, `moe_intermediate_size` 512, no shared experts, softmax→topk→renorm), **clamped SwiGLU** `silu(clamp(gate,max=7))*clamp(up,-7,7)`, **untied** lm_head, embedding tensor is `model.word_embeddings` (not `embed_tokens`). Weights are natively ternary and carried losslessly by qt=51 `MQ2G256LloydU`; `intermediate_size` 4096 and `quantize`/`preaffine` are dead keys. Dir `maple` → 15. |
 | 16 | Qwen3.8-Flash-Next / Qwen4 experimental | `hipfire-arch-qwen4` | `Qwen4Carrier` | Hybrid 3:1 GatedDeltaNet / QSA indexed sparse full attention (indexer budget 2,048), 4-stream hyper-connections, PLE n-gram embeddings on layer 2, 512-expert top-10 MoE with a shared expert, one native MTP layer. Admitted as Single-device, text-only HFQM (`max_seq` up to the native 262,144, default 32,768 when omitted). QSA K/V: `auto` is fp8 on exact gfx1201 and the exact `bf16` state elsewhere; `q8` (Q8_0 blocks of 32) is opt-in on gfx11/gfx12 ([`CONFIG.md`](CONFIG.md#mode-k-and-v)). The 54.4 GB PLE table stays in the mapped file and is leased per token. Native greedy MTP attaches by default (`.mq4r` keeps the retained AR route). Vision and PP/TP/EP are refused. |
+| 17 | Qwen3.5 multi-vector embedding encoder (`pplx-embed-v2-late-0.6b`) | `hipfire-arch-qwen35-embed` | `Qwen35EmbedCarrier` | **Not a chat model.** A bidirectional Qwen3.5 hybrid: GatedDeltaNet linear-attention layers alternating 1:1 with gated full-attention layers, `is_causal:false` on the full-attention layers (the GDN layers keep their causal scan), partial 0.25 interleaved mRoPE, zero-centered RMSNorm, no LM head. A SigLIP-style tower (hidden 768, patch 16, `spatial_merge_size` 2) merges each 2×2 patch group into one 1024-d token spliced over `<|image_pad|>` runs; a sentence-transformers `Dense` head projects to 128 dims, a ColBERT skiplist drops punctuation token vectors (document side), and each kept vector is L2-normalized. Queries score documents by late-interaction MaxSim. Served through the non-chat `embed` wire verb (`hipfire embed`, `POST /v1/embeddings`), never the generation routes. Resolved by the bare composite class `Qwen3_5Model` — its `model_type` (`qwen3_5`) is shared with the causal LM (5), so only the `architectures` field discriminates (`derive_arch_id` checks `qwen3_5model` before the qwen3.5 family test). Weights are raw f32/f16 (no compressed trunk tier); the quantizer keeps norms, the Dense head and the tower raw, folds `1_Dense/model.safetensors` into the trunk, and auto-includes the vision tower. |
 
 Ids **2–4** are unused in the carrier registry (not claimed). Do not invent
 assignments without a carrier + source mapping.
@@ -55,8 +56,9 @@ them for ordinary dispatch.
 ## Image-generation component ids (40–47)
 
 Diffusion checkpoints are **components, not chat models**: loadable for image
-generation, never text-served. The block is deliberately **high** — ids 17–19
-remain free for future primary text arches after Qwen4's id 16. Component ids
+generation, never text-served. The block is deliberately **high** — ids 18–19
+remain free for future primary text arches after Qwen4's id 16 and the
+qwen3.5 embedding encoder's id 17. Component ids
 must never silently collide with that range; the registry disjointness sweep
 covers 0..=64, so 40+ is still test-enforced.
 
@@ -87,7 +89,7 @@ sidecars next to the trunk file; no carrier claims a sidecar id on its own.
 | Namespace | Origin | Examples |
 |---|---|---|
 | HFQ header | `HfqFile::arch_id` written at quantize/pack time | Primary table above; sidecars 20/21 |
-| Safetensors dir | `derive_arch_id(&config)` | `llama`/`mistral`→0, `qwen3`→1, `qwen3.5`/`qwen3.6` (+experts→6 else 5), `qwen2`→7, `dots_ocr`→8, `deepseek_v4`→9, `minimax_m2`→10, `lfm2`/`lfm2_moe`/`lfm2_vl`→11, `cohere2_moe`→12, `qwen4_exp`/`qwen4_exp_text`→16 |
+| Safetensors dir | `derive_arch_id(&config)` | architectures-first: `qwen3_5model` (bare composite)→17; else `llama`/`mistral`→0, `qwen3`→1, `qwen3.5`/`qwen3.6` (+experts→6 else 5), `qwen2`→7, `dots_ocr`→8, `deepseek_v4`→9, `minimax_m2`→10, `lfm2`/`lfm2_moe`/`lfm2_vl`→11, `cohere2_moe`→12, `qwen4_exp`/`qwen4_exp_text`→16 |
 
 `Carrier::claims_arch_id(arch_id, is_dir)` may distinguish the two namespaces.
 Today’s carriers are disjoint on bare id for the ids they claim; registry unit

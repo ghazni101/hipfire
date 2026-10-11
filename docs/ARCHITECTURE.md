@@ -261,6 +261,7 @@ the facade/re-export plus bring-up/carrier surface. Other runtime-owned pieces
 | `hipfire-arch-lfm2moe` | LFM2.5 dense + LFM2.5-MoE hybrid short-conv / GQA |
 | `hipfire-arch-cohere2moe` | Cohere2-MoE / North-Mini-Code |
 | `hipfire-arch-diffusion` | Latent image diffusion: FLUX.1 MMDiT (40) and FLUX.2 Klein (45) — components, not chat trunks |
+| `hipfire-arch-qwen35-embed` | Qwen3.5 multi-vector embedding encoder (17) — bidirectional full attention + causal GDN, SigLIP tower, 128-d late-interaction head; served only via the non-chat `embed` verb |
 | `hipfire-arch-toy` | Template only (`arch_id = 0xFF`); daemon must not dispatch |
 
 Bring-up contract: implement `hipfire_runtime::arch::Architecture` (see
