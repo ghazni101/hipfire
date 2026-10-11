@@ -3886,6 +3886,7 @@ fn run_quality_candidate(
     let backend = hipfire_arch_qwen4::Qwen4KvBackend::automatic(&gpu);
     let mut bundle = hipfire_arch_qwen4::bundle::Qwen4Bundle::assemble_with_metadata(
         config.clone(),
+        &manifest.identity.recipe,
         transaction,
         &placements,
         &mut gpu,

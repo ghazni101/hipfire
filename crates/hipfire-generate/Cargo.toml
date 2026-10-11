@@ -53,6 +53,10 @@ serde_json = { workspace = true, features = ["preserve_order"] }
 tracing = "0.1"
 
 [features]
+qwen4-dev-profiles = [
+    "hipfire-loader/qwen4-dev-profiles",
+    "hipfire-arch-qwen4/qwen4-dev-profiles",
+]
 serve-fault-inject = [
     "hipfire-runtime/serve-fault-inject",
     "hipfire-dispatch/serve-fault-inject",

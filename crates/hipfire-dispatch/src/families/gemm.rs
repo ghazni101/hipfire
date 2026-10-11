@@ -98,6 +98,8 @@ fn is_gemm_mq4v2_key(key: KernelKey) -> bool {
         KernelKey::GemmMq4G256V2
             | KernelKey::GemmMq4G256V2Residual
             | KernelKey::GemmMq4G256V2BatchedLmhead
+            | KernelKey::GemmMq4G256V2ResidualVerifyExact
+            | KernelKey::GemmMq4G256V2LmheadVerifyExact
     )
 }
 
@@ -626,6 +628,9 @@ impl GemmFamily {
             K::GemmMq4G256V2Residual => {
                 hip!(gpu.gemm_hfq4g256_residual_mq4v2(w.buf, x, y, m, k, batch_size))
             }
+            K::GemmMq4G256V2ResidualVerifyExact => {
+                hip!(gpu.gemm_mq4g256v2_residual_verify_exact(w.buf, x, y, m, k, batch_size))
+            }
             K::GemmMq5G256V2Residual => {
                 hip!(gpu.gemm_mq5g256v2_residual_wmma(w.buf, x, y, m, k, batch_size))
             }
@@ -640,6 +645,9 @@ impl GemmFamily {
             }
             K::GemmMq4G256V2BatchedLmhead => {
                 hip!(gpu.gemm_mq4g256v2_batched_lmhead(w.buf, x, y, m, k, batch_size))
+            }
+            K::GemmMq4G256V2LmheadVerifyExact => {
+                hip!(gpu.gemm_mq4g256v2_lmhead_verify_exact(w.buf, x, y, m, k, batch_size))
             }
             K::GemmMq5G256V2BatchedLmhead => {
                 hip!(gpu.gemm_mq5g256v2_batched_lmhead(w.buf, x, y, m, k, batch_size))
@@ -673,7 +681,7 @@ impl KernelFamily for GemmFamily {
 
 #[cfg(test)]
 mod tests {
-    use super::GemmFamily;
+    use super::{residual_gemm_key_for, GemmFamily};
     use crate::context::DispatchCtx;
     use crate::types::{DispatchError, KernelKey};
     use rdna_compute::DType;
@@ -815,6 +823,33 @@ mod tests {
                 .resolve(KernelKey::GemmMq4CG256Residual, &gfx11_ctx, None)
                 .is_err(),
             "MQ4C residual should be gfx12-only"
+        );
+    }
+
+    #[test]
+    fn mq4v2_verify_exact_keys_are_gfx1201_only_and_never_dtype_selected() {
+        let gfx1201_ctx = DispatchCtx::for_test("gfx1201");
+        let gfx1200_ctx = DispatchCtx::for_test("gfx1200");
+        let gfx1100_ctx = DispatchCtx::for_test("gfx1100");
+        let fam = GemmFamily::new();
+        for key in [
+            KernelKey::GemmMq4G256V2ResidualVerifyExact,
+            KernelKey::GemmMq4G256V2LmheadVerifyExact,
+        ] {
+            assert!(
+                fam.registry().resolve(key, &gfx1201_ctx, None).is_ok(),
+                "{key:?} must resolve on gfx1201"
+            );
+            for ctx in [&gfx1200_ctx, &gfx1100_ctx] {
+                assert!(
+                    fam.registry().resolve(key, ctx, None).is_err(),
+                    "{key:?} must fail closed off gfx1201"
+                );
+            }
+        }
+        assert_eq!(
+            residual_gemm_key_for(DType::MQ4G256V2),
+            KernelKey::GemmMq4G256V2Residual
         );
     }
 }

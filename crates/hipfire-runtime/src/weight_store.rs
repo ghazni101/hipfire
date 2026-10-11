@@ -1008,6 +1008,9 @@ fn upload_range_pooled(
             gpu.hip
                 .memcpy_htod_offset(&tensor.buf, offset, chunk)
                 .map_err(|error| format!("pooled chunk upload failed: {error}"))?;
+            // Read once per load: on unified memory the cached copy only
+            // pushes other pages (the PLE table's) out of the page cache.
+            descriptor.release_uploaded(absolute_offset, chunk_len as u64);
             offset += chunk_len;
         }
         Ok::<(), String>(())

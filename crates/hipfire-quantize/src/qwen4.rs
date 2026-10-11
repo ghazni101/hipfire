@@ -31,6 +31,11 @@ use crate::quant_fwht::{
 };
 use crate::quant_q4::quantize_q8f16;
 
+#[cfg(feature = "qwen4-dev-profiles")]
+mod dev_tiny;
+#[cfg(feature = "qwen4-dev-profiles")]
+pub(crate) use dev_tiny::{run_dev_tiny_cli, Qwen4DevTinyEncoding};
+
 /// SoA row geometry: `16 + ((n_blocks + 15) >> 4) << 4 + n_blocks * 16`, with
 /// `n_blocks = k / 32`.  Returned as `(row_stride, extent)`; the padded scale
 /// block is why this cannot go through the uniform `(group, bytes)` model.
@@ -3718,6 +3723,19 @@ pub(crate) struct Qwen4PlanEntry {
 
 impl Qwen4ReopenPlan {
     pub(crate) fn open(path: &Path) -> Result<Self, Qwen4Error> {
+        Self::open_with(path, false)
+    }
+
+    /// Reopen a developer-profile artifact.  The container, index, offsets and
+    /// per-entry extents are validated exactly as for Flash-Next; only the
+    /// Flash-Next-pinned PLE metadata object and I64 record shapes are not (the
+    /// profile's own geometry is checked by runtime admission).
+    #[cfg(feature = "qwen4-dev-profiles")]
+    pub(crate) fn open_developer(path: &Path) -> Result<Self, Qwen4Error> {
+        Self::open_with(path, true)
+    }
+
+    fn open_with(path: &Path, developer: bool) -> Result<Self, Qwen4Error> {
         let file =
             File::open(path).map_err(|error| Qwen4Error::io(path.display().to_string(), error))?;
         let file_len = file
@@ -3789,7 +3807,11 @@ impl Qwen4ReopenPlan {
         })?;
         let metadata: Value = serde_json::from_str(&metadata_json)
             .map_err(|error| Qwen4Error::json("parse reopened Qwen4 metadata", error))?;
-        validate_reopened_metadata(&metadata)?;
+        if developer {
+            validate_developer_reopened_metadata(&metadata)?;
+        } else {
+            validate_reopened_metadata(&metadata)?;
+        }
 
         let mut pos = json_end;
         let read_u8 = |region: &[u8], pos: &mut usize, what: &str| -> Result<u8, Qwen4Error> {
@@ -3887,7 +3909,11 @@ impl Qwen4ReopenPlan {
                     "duplicate Qwen4 output tensor {name}"
                 )));
             }
-            validate_output_entry_len(&name, quant_type, &shape, data_len)?;
+            if developer {
+                validate_developer_output_entry_len(&name, quant_type, &shape, data_len)?;
+            } else {
+                validate_output_entry_len(&name, quant_type, &shape, data_len)?;
+            }
             entries.push(Qwen4PlanEntry {
                 name,
                 quant_type,
@@ -4151,6 +4177,52 @@ fn validate_reopened_metadata(metadata: &Value) -> Result<(), Qwen4Error> {
         return Err(Qwen4Error::Invalid(
             "reopened qwen4_ple padding is inconsistent with valid rows".to_string(),
         ));
+    }
+    Ok(())
+}
+
+/// Developer-artifact counterpart of [`validate_reopened_metadata`]: the
+/// Flash-Next PLE object is pinned to 16 heads and 128 x 2,500,012 rows, which
+/// a synthetic profile does not share, so only the envelope is checked here.
+fn validate_developer_reopened_metadata(metadata: &Value) -> Result<(), Qwen4Error> {
+    let object = metadata.as_object().ok_or_else(|| {
+        Qwen4Error::Invalid("reopened Qwen4 metadata is not an object".to_string())
+    })?;
+    if object.get("arch_id").and_then(Value::as_u64) != Some(QWEN4_ARCH_ID as u64) {
+        return Err(Qwen4Error::Invalid(
+            "reopened Qwen4 metadata arch_id is not 16".to_string(),
+        ));
+    }
+    Ok(())
+}
+
+/// Developer-artifact counterpart of [`validate_output_entry_len`]: identical
+/// for every tag except the raw-I64 PLE records, whose length is `8 x elements`
+/// of the declared shape rather than the Flash-Next 3/16/16.
+fn validate_developer_output_entry_len(
+    name: &str,
+    quant_type: u8,
+    shape: &[u32],
+    data_len: u64,
+) -> Result<(), Qwen4Error> {
+    if quant_type != QWEN4_I64_QUANT_TYPE {
+        return validate_output_entry_len(name, quant_type, shape, data_len);
+    }
+    if i64_role(name).is_none() {
+        return Err(Qwen4Error::Invalid(format!(
+            "Qwen4 raw-I64 output {name} is not a recognized PLE metadata tensor"
+        )));
+    }
+    let expected = checked_product(
+        &shape.iter().map(|&value| value as u64).collect::<Vec<_>>(),
+        name,
+    )?
+    .checked_mul(8)
+    .ok_or_else(|| Qwen4Error::Invalid(format!("{name} I64 length overflows")))?;
+    if expected != data_len {
+        return Err(Qwen4Error::Invalid(format!(
+            "{name} I64 payload is {data_len} bytes, expected {expected}"
+        )));
     }
     Ok(())
 }

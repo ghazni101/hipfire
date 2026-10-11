@@ -237,15 +237,19 @@ pub fn carrier_for(arch_id: u32) -> Option<&'static dyn Carrier> {
 pub enum ContinuousBatchRoute {
     Qwen35,
     Lfm2Moe,
+    /// Flash-Next (qwen4, arch 16) exact AR lanes. Staged only through the
+    /// VMM branch (`serve.vmm_batch`); there is no fixed-lane qwen4 body.
+    Qwen4,
 }
-/// Exact arch_id -> continuous-batch route. Only qwen35 5|6 admits: LFM2 (11)
-/// has no servable batch path (see the lfm2moe carrier caps), so the route
-/// refuses it and no batch state is ever allocated. No carrier probing — pure
-/// id match. `ContinuousBatchRoute::Lfm2Moe` stays for the staging body, which
-/// is now unreachable.
+/// Exact arch_id -> continuous-batch route. qwen35 5|6 and qwen4 16 admit:
+/// LFM2 (11) has no servable batch path (see the lfm2moe carrier caps), so
+/// the route refuses it and no batch state is ever allocated. No carrier
+/// probing — pure id match. `ContinuousBatchRoute::Lfm2Moe` stays for the
+/// staging body, which is now unreachable.
 pub fn continuous_batch_route(arch_id: u32) -> Option<ContinuousBatchRoute> {
     match arch_id {
         5 | 6 => Some(ContinuousBatchRoute::Qwen35),
+        16 => Some(ContinuousBatchRoute::Qwen4),
         _ => None,
     }
 }
@@ -1964,11 +1968,35 @@ fn build_qwen35_eviction(
 fn resolve_qwen35_mtp_head(
     trunk_path: &Path,
     sidecar: Option<std::path::PathBuf>,
-    (trunk_dim, trunk_vocab): (usize, usize),
+    trunk_shape: (usize, usize),
     gpu: &mut rdna_compute::Gpu,
     physical_cap: usize,
     device: Option<&str>,
 ) -> (Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead>, Vec<String>) {
+    let (resolved, errors) = resolve_qwen35_mtp_head_sourced(
+        trunk_path,
+        sidecar,
+        trunk_shape,
+        gpu,
+        physical_cap,
+        device,
+    );
+    (resolved.map(|(head, _)| head), errors)
+}
+
+/// [`resolve_qwen35_mtp_head`] plus a short description of where the head
+/// came from (`bundled <file>` / `sidecar <file>`), for the auto-attach notice.
+fn resolve_qwen35_mtp_head_sourced(
+    trunk_path: &Path,
+    sidecar: Option<std::path::PathBuf>,
+    (trunk_dim, trunk_vocab): (usize, usize),
+    gpu: &mut rdna_compute::Gpu,
+    physical_cap: usize,
+    device: Option<&str>,
+) -> (
+    Option<(hipfire_arch_qwen35::mtp_head::Qwen35MtpHead, String)>,
+    Vec<String>,
+) {
     use hipfire_arch_qwen35::mtp_head;
     let tag = device.map(|d| format!(", {d}")).unwrap_or_default();
     let sidecar = sidecar.unwrap_or_else(|| trunk_path.with_extension("mtp"));
@@ -1977,7 +2005,12 @@ fn resolve_qwen35_mtp_head(
         mtp_head::load_mtp_head_at_offset(path, gpu, physical_cap, offset)
             .map_err(|e| format!("{}: load failed: {e}", path.display()))
     };
-    let mut head_opt: Option<mtp_head::Qwen35MtpHead> = None;
+    let file_name = |path: &Path| {
+        path.file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.display().to_string())
+    };
+    let mut head_opt: Option<(mtp_head::Qwen35MtpHead, String)> = None;
     let mut errors: Vec<String> = Vec::new();
     match mtp_head::detect_bundled_mtp_offset(trunk_path) {
         Ok(Some(offset)) => match load(trunk_path, offset) {
@@ -1986,7 +2019,7 @@ fn resolve_qwen35_mtp_head(
                     "  MTP head loaded (bundled .mq4-mtp{tag}): n_embd={} vocab={}",
                     h.config.n_embd, h.config.vocab_size
                 );
-                head_opt = Some(h);
+                head_opt = Some((h, format!("bundled {}", file_name(trunk_path))));
             }
             Err(e) => errors.push(format!("bundled trailer: {e}")),
         },
@@ -2007,7 +2040,7 @@ fn resolve_qwen35_mtp_head(
                     h.config.n_embd,
                     h.config.vocab_size
                 );
-                head_opt = Some(h);
+                head_opt = Some((h, format!("sidecar {}", file_name(&sidecar))));
                 errors.clear();
             }
             Err(e) => errors.push(format!("sidecar {e}")),
@@ -2197,11 +2230,14 @@ fn finish_qwen35_load(
             // Upstream also suppresses DFlash when adaptive is Some; this keeps
             // admission honest if a future path reaches load_dflash_state.
             bundle.kv_adaptive.is_some(),
+            ctx.spec
+                .dflash_block
+                .unwrap_or(hipfire_runtime::dflash::DFLASH_BLOCK_UNBATCHED),
         ) {
             Ok(s) => {
                 eprintln!(
-                    "  DFlash draft loaded: {} (layers={}, hidden={}, block={})",
-                    dp, s.draft_config.n_layers, s.draft_config.hidden, s.draft_config.block_size
+                    "  DFlash draft loaded: {} (layers={}, hidden={}, block={}, runtime_block={})",
+                    dp, s.draft_config.n_layers, s.draft_config.hidden, s.draft_config.block_size, s.block_size
                 );
                 Some(s)
             }
@@ -2232,7 +2268,7 @@ fn finish_qwen35_load(
     // (`ctx.mtp_path`), else `<trunk>.mtp`; physical_cap is the KV window. A head
     // whose hidden size or vocab differs from the trunk is refused before upload.
     // On missing/refused/failed: error when forced on (mtp=on), auto logs/falls back.
-    let mtp: Option<hipfire_arch_qwen35::mtp_head::Qwen35MtpHead> = if adaptive_blocks_generic_spec
+    let mtp: Option<(hipfire_arch_qwen35::mtp_head::Qwen35MtpHead, String)> = if adaptive_blocks_generic_spec
         || eviction.is_some()
         || !matches!(arch_id, 5 | 6)
         || ctx.spec.mtp == Some(false)
@@ -2244,7 +2280,7 @@ fn finish_qwen35_load(
         // `ctx.path` is canonical, so a sidecar beside a symlinked trunk is not
         // its sibling; the CLI resolves that case into `ctx.mtp_path`. Direct
         // daemon clients keep the canonical-sibling lookup.
-        let (head_opt, errors) = resolve_qwen35_mtp_head(
+        let (resolved, errors) = resolve_qwen35_mtp_head_sourced(
             Path::new(ctx.path),
             ctx.mtp_path.clone(),
             (config.dim, config.vocab_size),
@@ -2252,7 +2288,7 @@ fn finish_qwen35_load(
             physical_cap,
             None,
         );
-        if head_opt.is_none() {
+        if resolved.is_none() {
             if ctx.spec.mtp == Some(true) {
                 let reason = if errors.is_empty() {
                     "no bundled trailer or .mtp sidecar found".to_string()
@@ -2273,9 +2309,24 @@ fn finish_qwen35_load(
                 );
             }
         }
-        head_opt
+        resolved
     };
     let mtp_present = mtp.is_some();
+    let (mtp, mtp_source) = match mtp {
+        Some((head, source)) => (Some(head), Some(source)),
+        None => (None, None),
+    };
+    // Auto-attached drafters (mode `auto`, not forced `on`) get one line that
+    // names the artifact and the switch, so an A/B never starts with a hunt.
+    let auto_draft = match (ctx.spec.dflash, &dflash, ctx.draft_path) {
+        (None, Some(_), Some(dp)) => Some(
+            Path::new(dp)
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+                .unwrap_or_else(|| dp.to_string()),
+        ),
+        _ => None,
+    };
     // Pick the arch-generic speculator: a loaded DFlash draft → DflashSpeculator,
     // else an MTP head → MtpSpeculator<Qwen35MtpDrafter>, else (opt-in) the
     // model-free n-gram drafter. `eviction` is borrowed (not moved) here so it is
@@ -2296,6 +2347,15 @@ fn finish_qwen35_load(
             )
         })
     };
+    if let Some(name) = speculator.as_ref().map(|s| s.name()) {
+        if let (Some(draft), "dflash") = (&auto_draft, name) {
+            eprintln!(
+                "DFlash: on (auto, draft {draft}) — disable with --spec off or speculation.dflash off"
+            );
+        } else if let (Some(source), None, "mtp") = (&mtp_source, ctx.spec.mtp, name) {
+            eprintln!("MTP: on (auto, {source}) — disable with --spec off or speculation.mtp off");
+        }
+    }
 
     // Move adaptive controller out of the bundle before parking the rest in
     // `Box<dyn ArchModel>`. LoadedModel.kv_adaptive is the runtime home for downshift hooks.
@@ -2474,7 +2534,7 @@ pub fn load_model_with_gemma4_drafter(
                 hipfire_config::Deepseek4ComputePlacement::Single
             ),
             vmm_runtime_available: gpu.vmm_recommended_granularity().is_ok(),
-            free_vram_bytes: gpu.hip.get_vram_info().ok().map(|(free, _)| free),
+            free_vram_bytes: gpu.device_mem_info().ok().map(|(free, _)| free),
         },
         crate::admission::SourceAdmissionOptions {
             spec,
@@ -2725,6 +2785,10 @@ fn resolve_route_plan(
     Ok((plan, spec))
 }
 
+/// User-facing note for the lazy kernel path: a cold kernel cache compiles
+/// each kernel at its first launch, which is the slow first run users see.
+const LAZY_KERNELS_NOTE: &str = "compiling kernels on first use (one-time, cached afterwards)…";
+
 /// Start a planner-closed route's kernel load: the bounded batch compile
 /// overlaps the weight load when the host budget admits a worker alongside
 /// it; otherwise the whole plan is compiled and loaded before any weight
@@ -2740,7 +2804,7 @@ fn begin_route_kernels(
     let (plan, spec) = match resolve_route_plan(req, gpu) {
         Ok(resolved) => resolved,
         Err(reason) => {
-            eprintln!("  kernels: no closed route plan ({reason}); loading kernels lazily");
+            eprintln!("  kernels: {LAZY_KERNELS_NOTE} [no closed route plan: {reason}]");
             return Ok(None);
         }
     };
@@ -2809,7 +2873,7 @@ fn finish_route_kernels(
         None
     };
     if let Some(why) = mismatch {
-        eprintln!("  kernels: loaded model left the planned route ({why}); loading kernels lazily");
+        eprintln!("  kernels: {LAZY_KERNELS_NOTE} [left the planned route: {why}]");
         return gpu
             .abort_route_kernel_load()
             .map_err(|e| format!("kernel route compile: {e}"));
@@ -4908,12 +4972,17 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
     for (_, snap) in m.dflash_checkpoints {
         snap.free_gpu(gpu);
     }
+    // Weight-host lease (imported weights): taken out before the bundle free
+    // so the infallible `ArchModel::free_gpu` cannot drop it; released at
+    // the end only when graphs, pool and VMM teardown are proven clean.
+    let mut weight_lease = None;
     if let Some(state) = m.state.as_mut().and_then(|s| {
         (s.as_mut() as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35::Qwen35Bundle>()
     }) {
         if let Some(batch_state) = state.qwen35_decode_batch.take() {
             let _ = batch_state.free_gpu(gpu);
         }
+        weight_lease = state.weight_lease.take();
     }
     // Free arch-specific GPU state from the carrier bundle via `ArchModel::free_gpu`.
     if let Some(state) = m.state {
@@ -4930,9 +4999,14 @@ pub fn unload_model(mut m: LoadedModel, gpu: &mut rdna_compute::Gpu) -> Result<(
     // After ordinary frees/pool drain, retry any VMM arenas retained by a
     // failed free_tensor. Success is reported only when none remain.
     note(gpu.ensure_vmm_cleaned().map_err(|e| e.to_string()));
-    match first_err {
-        Some(err) => Err(err),
-        None => Ok(()),
+    match (first_err, weight_lease) {
+        (Some(err), Some(lease)) => {
+            drop(lease);
+            Err(format!("{err}; weight-host lease closed without release (teardown not proven clean)"))
+        }
+        (Some(err), None) => Err(err),
+        (None, Some(lease)) => lease.release(),
+        (None, None) => Ok(()),
     }
 }
 
@@ -5151,6 +5225,18 @@ mod lfm2_batch_admission_tests {
         assert!(
             carrier_for(5)
                 .expect("qwen35 carrier")
+                .caps()
+                .supports_continuous_batch
+        );
+        // qwen4 (16) admits the exact fn-lanes route, staged only under
+        // `serve.vmm_batch`.
+        assert_eq!(
+            continuous_batch_route(16),
+            Some(super::ContinuousBatchRoute::Qwen4)
+        );
+        assert!(
+            carrier_for(16)
+                .expect("qwen4 carrier")
                 .caps()
                 .supports_continuous_batch
         );
@@ -5543,12 +5629,13 @@ mod registry_tests {
             }
         );
 
-        // ── continuous_batch_route: 5|6 -> Qwen35 only (11/LFM2 refuses) ──
+        // ── continuous_batch_route: 5|6 -> Qwen35, 16 -> Qwen4 (11/LFM2 refuses) ──
         // The Some/None half duplicates caps().supports_continuous_batch; the
-        // variant picks between two distinct staging bodies in batch_staging.
-        for id in 0u32..=14 {
+        // variant picks between distinct staging bodies in batch_staging.
+        for id in 0u32..=22 {
             let want = match id {
                 5 | 6 => Some(ContinuousBatchRoute::Qwen35),
+                16 => Some(ContinuousBatchRoute::Qwen4),
                 _ => None,
             };
             assert_eq!(

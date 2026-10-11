@@ -23,6 +23,7 @@ pub mod flash_attn_ck;
 pub mod flux_fused;
 pub mod gap_timing;
 pub mod gemm;
+mod gemm_fp8_verify;
 mod gemm_vt;
 mod packed_mq4;
 mod gemma4_ext;
@@ -43,9 +44,11 @@ pub mod fn_gdn_dense;
 pub mod norm;
 pub mod pm_decode_twins;
 pub mod pm_xbatch;
+pub mod lane_rows_pm;
 pub mod verify_twins;
 pub mod page_pool;
 pub mod pool;
+pub mod prefill_invariant;
 pub mod profile;
 pub mod profile_rocprof;
 pub mod profiler;
@@ -56,14 +59,22 @@ pub mod replay;
 pub mod sampling;
 pub mod scratch;
 pub mod select_regrid;
+pub mod lane_gdn;
+pub mod lane_fa;
+pub mod tape_copy;
 pub use scratch::{
     Int4MmqDownPrepared, Int4MmqDownReservation, Int4MmqPrepared, Int4MmqReservation, Int8MmqPrepared,
     Int8MmqReservation, Mq4v2Fp8Prepared,
 };
 pub use gemm::F2GdnTargets;
+pub use gemm_fp8_verify::{
+    fp8_verify_symbol, fp8_verify_tile, Fp8VerifyOp, Fp8VerifyReceipt, Fp8VerifyTarget, Fp8VerifyTile,
+    Fp8VerifyX,
+};
 pub mod slot_pool;
 pub mod tensor_ops;
 pub mod text_encoder;
+pub mod uma_memory;
 pub mod vae;
 pub mod trunk_mask;
 pub use trunk_mask::{
@@ -79,6 +90,8 @@ pub use dispatch::{
     MQ3G256V2_GROUP_BYTES, MQ4C_GROUP_BYTES, MQ4G128V2_GROUP_BYTES, MQ4V2_GROUP_BYTES,
     MQ5G256V2_GROUP_BYTES, MQ6G256V2_GROUP_BYTES, VmmPrefixSet, VmmPrefixSpec, VmmResourceMove,
 };
+#[cfg(target_os = "linux")]
+pub use dispatch::{ExportedWeightAllocation, ImportedWeightAllocationDesc, EXPORT_WEIGHT_TAIL_PAD_BYTES};
 pub use feature_flags::FeatureFlags;
 pub use hip_bridge::{HipError, HipResult};
 use hipfire_config::developer_bool;

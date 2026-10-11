@@ -26,6 +26,14 @@ pub struct DispatchCtx {
     pub flags: Arc<FeatureFlags>,
     pub resources: ResourceManager,
     pub workload: DispatchWorkload,
+    /// Batched masked Q8/fp8 attends of this context skip the LDS crossover
+    /// kernel and always take the tile + reduce. Set only for DFlash
+    /// ChainVerify blocks: at B = 16 the LDS kernel is 3.8-23x slower
+    /// (ctx 64-4096, fp8 KV, R9700), and the tile + reduce output does not
+    /// depend on `max_ctx_len`, so the eager verify and its HIP graph
+    /// (recorded with `physical_cap`) produce the same bytes. MTP verify
+    /// and every other workload keep the crossover (default `false`).
+    pub verify_tile_attend: bool,
     device_id: i32,
 }
 
@@ -42,6 +50,7 @@ impl DispatchCtx {
             flags,
             resources: ResourceManager::new(gpu),
             workload: DispatchWorkload::Standard,
+            verify_tile_attend: false,
             device_id: gpu.device_id,
         }
     }
@@ -57,6 +66,13 @@ impl DispatchCtx {
         self
     }
 
+    /// Route this context's batched masked Q8/fp8 attends through the tile +
+    /// reduce, bypassing the LDS crossover (DFlash ChainVerify only).
+    pub fn with_verify_tile_attend(mut self, verify_tile_attend: bool) -> Self {
+        self.verify_tile_attend = verify_tile_attend;
+        self
+    }
+
     /// Construct a `DispatchCtx` for the given arch string and device without
     /// a live GPU. Only for use in tests.
     #[cfg(any(test, feature = "test-utils"))]
@@ -69,6 +85,7 @@ impl DispatchCtx {
             flags,
             resources: crate::resource::ResourceManager::for_test(),
             workload: DispatchWorkload::Standard,
+            verify_tile_attend: false,
             device_id,
         }
     }

@@ -312,13 +312,13 @@ pub fn entries(arch: &str, extra_flags: &str) -> Result<Vec<KernelEntry>, Regist
         add!("gated_delta_net_q8_fast", kernels::GATED_DELTA_NET_Q8_FAST_SRC, ["gated_delta_net_q8_fast"]);
         add!("gdn_pre_batched_gfx1201", include_str!("../../../kernels/src/gdn_pre_batched.gfx1201.hip"), ["gdn_pre_batched_gfx1201"]);
         add!("gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2", kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_GFX12_SRC, ["gemm_gate_up_mq4g256v2_wmma_gfx12"]);
-        add!("gemm_gate_up_mq4g256v2_wmma_gfx12_vt", kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_GFX12_VT_SRC, ["gemm_gate_up_mq4g256v2_wmma_gfx12_vt2w4", "gemm_gate_up_mq4g256v2_wmma_gfx12_vt2w8", "gemm_gate_up_mq4g256v2_wmma_gfx12_vt3w4", "gemm_gate_up_mq4g256v2_wmma_gfx12_vt3w8", "gemm_gate_up_mq4g256v2_wmma_gfx12_vt4w4", "gemm_gate_up_mq4g256v2_wmma_gfx12_vt4w8"]);
+        add!("gemm_gate_up_mq4g256v2_wmma_gfx12_vt", kernels::GEMM_GATE_UP_MQ4G256V2_WMMA_GFX12_VT_SRC, ["gemm_gate_up_mq4g256v2_wmma_gfx12_vt2w4", "gemm_gate_up_mq4g256v2_wmma_gfx12_vt2w8", "gemm_gate_up_mq4g256v2_wmma_gfx12_vt3w4", "gemm_gate_up_mq4g256v2_wmma_gfx12_vt3w8", "gemm_gate_up_mq4g256v2_wmma_gfx12_vt4w4", "gemm_gate_up_mq4g256v2_wmma_gfx12_vt4w8", "gemm_gate_up_mq4g256v2_wmma_gfx12_vt4w4_k32", "gemm_gate_up_mq4g256v2_wmma_gfx12_vt4w8_k32", "gemm_gate_up_mq4g256v2_wmma_gfx12_vt8w4_k32", "gemm_gate_up_mq4g256v2_wmma_gfx12_vt8w8_k32"]);
         add!("gemm_hfq4g256_residual_wmma_gfx12_mq4v2", kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_SRC, ["gemm_mq4g256v2_residual_wmma_gfx12"]);
-        add!("gemm_mq4g256v2_residual_wmma_gfx12_vt", kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_VT_SRC, ["gemm_mq4g256v2_residual_wmma_gfx12_vt2w4", "gemm_mq4g256v2_residual_wmma_gfx12_vt2w8", "gemm_mq4g256v2_residual_wmma_gfx12_vt3w4", "gemm_mq4g256v2_residual_wmma_gfx12_vt3w8", "gemm_mq4g256v2_residual_wmma_gfx12_vt4w4", "gemm_mq4g256v2_residual_wmma_gfx12_vt4w8"]);
+        add!("gemm_mq4g256v2_residual_wmma_gfx12_vt", kernels::GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_VT_SRC, ["gemm_mq4g256v2_residual_wmma_gfx12_vt2w4", "gemm_mq4g256v2_residual_wmma_gfx12_vt2w8", "gemm_mq4g256v2_residual_wmma_gfx12_vt3w4", "gemm_mq4g256v2_residual_wmma_gfx12_vt3w8", "gemm_mq4g256v2_residual_wmma_gfx12_vt4w4", "gemm_mq4g256v2_residual_wmma_gfx12_vt4w8", "gemm_mq4g256v2_residual_wmma_gfx12_vt4w4_k32", "gemm_mq4g256v2_residual_wmma_gfx12_vt4w8_k32", "gemm_mq4g256v2_residual_wmma_gfx12_vt8w4_k32", "gemm_mq4g256v2_residual_wmma_gfx12_vt8w8_k32"]);
         add!("gemm_qkv_hfq4g256_wmma_gfx12_mq4v2", kernels::GEMM_QKV_MQ4G256V2_WMMA_GFX12_SRC, ["gemm_qkv_mq4g256v2_wmma_gfx12"]);
-        add!("gemm_qkv_mq4g256v2_wmma_gfx12_vt", kernels::GEMM_QKV_MQ4G256V2_WMMA_GFX12_VT_SRC, ["gemm_qkv_mq4g256v2_wmma_gfx12_vt2w4", "gemm_qkv_mq4g256v2_wmma_gfx12_vt2w8", "gemm_qkv_mq4g256v2_wmma_gfx12_vt3w4", "gemm_qkv_mq4g256v2_wmma_gfx12_vt3w8", "gemm_qkv_mq4g256v2_wmma_gfx12_vt4w4", "gemm_qkv_mq4g256v2_wmma_gfx12_vt4w8"]);
+        add!("gemm_qkv_mq4g256v2_wmma_gfx12_vt", kernels::GEMM_QKV_MQ4G256V2_WMMA_GFX12_VT_SRC, ["gemm_qkv_mq4g256v2_wmma_gfx12_vt2w4", "gemm_qkv_mq4g256v2_wmma_gfx12_vt2w8", "gemm_qkv_mq4g256v2_wmma_gfx12_vt3w4", "gemm_qkv_mq4g256v2_wmma_gfx12_vt3w8", "gemm_qkv_mq4g256v2_wmma_gfx12_vt4w4", "gemm_qkv_mq4g256v2_wmma_gfx12_vt4w8", "gemm_qkv_mq4g256v2_wmma_gfx12_vt4w4_k32", "gemm_qkv_mq4g256v2_wmma_gfx12_vt4w8_k32", "gemm_qkv_mq4g256v2_wmma_gfx12_vt8w4_k32", "gemm_qkv_mq4g256v2_wmma_gfx12_vt8w8_k32"]);
         add!("gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2", kernels::GEMM_QKVZA_MQ4G256V2_WMMA_GFX12_SRC, ["gemm_qkvza_mq4g256v2_wmma_gfx12"]);
-        add!("gemm_qkvza_mq4g256v2_wmma_gfx12_vt", kernels::GEMM_QKVZA_MQ4G256V2_WMMA_GFX12_VT_SRC, ["gemm_qkvza_mq4g256v2_wmma_gfx12_vt2w4", "gemm_qkvza_mq4g256v2_wmma_gfx12_vt2w8", "gemm_qkvza_mq4g256v2_wmma_gfx12_vt3w4", "gemm_qkvza_mq4g256v2_wmma_gfx12_vt3w8", "gemm_qkvza_mq4g256v2_wmma_gfx12_vt4w4", "gemm_qkvza_mq4g256v2_wmma_gfx12_vt4w8"]);
+        add!("gemm_qkvza_mq4g256v2_wmma_gfx12_vt", kernels::GEMM_QKVZA_MQ4G256V2_WMMA_GFX12_VT_SRC, ["gemm_qkvza_mq4g256v2_wmma_gfx12_vt2w4", "gemm_qkvza_mq4g256v2_wmma_gfx12_vt2w8", "gemm_qkvza_mq4g256v2_wmma_gfx12_vt3w4", "gemm_qkvza_mq4g256v2_wmma_gfx12_vt3w8", "gemm_qkvza_mq4g256v2_wmma_gfx12_vt4w4", "gemm_qkvza_mq4g256v2_wmma_gfx12_vt4w8", "gemm_qkvza_mq4g256v2_wmma_gfx12_vt4w4_k32", "gemm_qkvza_mq4g256v2_wmma_gfx12_vt4w8_k32", "gemm_qkvza_mq4g256v2_wmma_gfx12_vt8w4_k32", "gemm_qkvza_mq4g256v2_wmma_gfx12_vt8w8_k32"]);
         add!("gemv_hfq4g256_multirow_default_mq4v2", kernels::GEMV_MQ4G256V2_MULTIROW_SRC, ["gemv_mq4g256v2_multirow_r2", "gemv_mq4g256v2_multirow_r4", "gemv_mq4g256v2_multirow_r8"]);
         add!("gemv_hfq4g256_residual_mq4v2", kernels::GEMV_MQ4G256V2_RESIDUAL_SRC, ["gemv_mq4g256v2_residual"]);
         add!("gemv_mq4g256v2_mq4v2", kernels::GEMV_MQ4G256V2_SRC, ["gemv_mq4g256v2"]);
@@ -1314,13 +1314,13 @@ const QWEN36_27B_GFX1201_AR_HIP: &[RouteHip] = &[
     ("gdn_chunk_scan_bf16_mseg", &["gdn_chunk_scan_bf16_mseg"]),
     ("gdn_pre_batched_gfx1201", &["gdn_pre_batched_gfx1201"]),
     ("gemm_gate_up_hfq4g256_wmma_gfx12_mq4v2", &["gemm_gate_up_mq4g256v2_wmma_gfx12"]),
-    ("gemm_gate_up_mq4g256v2_wmma_gfx12_vt", &["gemm_gate_up_mq4g256v2_wmma_gfx12_vt2w4", "gemm_gate_up_mq4g256v2_wmma_gfx12_vt2w8", "gemm_gate_up_mq4g256v2_wmma_gfx12_vt3w4", "gemm_gate_up_mq4g256v2_wmma_gfx12_vt3w8", "gemm_gate_up_mq4g256v2_wmma_gfx12_vt4w4", "gemm_gate_up_mq4g256v2_wmma_gfx12_vt4w8"]),
+    ("gemm_gate_up_mq4g256v2_wmma_gfx12_vt", &["gemm_gate_up_mq4g256v2_wmma_gfx12_vt2w4", "gemm_gate_up_mq4g256v2_wmma_gfx12_vt2w8", "gemm_gate_up_mq4g256v2_wmma_gfx12_vt3w4", "gemm_gate_up_mq4g256v2_wmma_gfx12_vt3w8", "gemm_gate_up_mq4g256v2_wmma_gfx12_vt4w4", "gemm_gate_up_mq4g256v2_wmma_gfx12_vt4w8", "gemm_gate_up_mq4g256v2_wmma_gfx12_vt4w4_k32", "gemm_gate_up_mq4g256v2_wmma_gfx12_vt4w8_k32", "gemm_gate_up_mq4g256v2_wmma_gfx12_vt8w4_k32", "gemm_gate_up_mq4g256v2_wmma_gfx12_vt8w8_k32"]),
     ("gemm_hfq4g256_residual_wmma_gfx12_mq4v2", &["gemm_mq4g256v2_residual_wmma_gfx12"]),
-    ("gemm_mq4g256v2_residual_wmma_gfx12_vt", &["gemm_mq4g256v2_residual_wmma_gfx12_vt2w4", "gemm_mq4g256v2_residual_wmma_gfx12_vt2w8", "gemm_mq4g256v2_residual_wmma_gfx12_vt3w4", "gemm_mq4g256v2_residual_wmma_gfx12_vt3w8", "gemm_mq4g256v2_residual_wmma_gfx12_vt4w4", "gemm_mq4g256v2_residual_wmma_gfx12_vt4w8"]),
+    ("gemm_mq4g256v2_residual_wmma_gfx12_vt", &["gemm_mq4g256v2_residual_wmma_gfx12_vt2w4", "gemm_mq4g256v2_residual_wmma_gfx12_vt2w8", "gemm_mq4g256v2_residual_wmma_gfx12_vt3w4", "gemm_mq4g256v2_residual_wmma_gfx12_vt3w8", "gemm_mq4g256v2_residual_wmma_gfx12_vt4w4", "gemm_mq4g256v2_residual_wmma_gfx12_vt4w8", "gemm_mq4g256v2_residual_wmma_gfx12_vt4w4_k32", "gemm_mq4g256v2_residual_wmma_gfx12_vt4w8_k32", "gemm_mq4g256v2_residual_wmma_gfx12_vt8w4_k32", "gemm_mq4g256v2_residual_wmma_gfx12_vt8w8_k32"]),
     ("gemm_qkv_hfq4g256_wmma_gfx12_mq4v2", &["gemm_qkv_mq4g256v2_wmma_gfx12"]),
-    ("gemm_qkv_mq4g256v2_wmma_gfx12_vt", &["gemm_qkv_mq4g256v2_wmma_gfx12_vt2w4", "gemm_qkv_mq4g256v2_wmma_gfx12_vt2w8", "gemm_qkv_mq4g256v2_wmma_gfx12_vt3w4", "gemm_qkv_mq4g256v2_wmma_gfx12_vt3w8", "gemm_qkv_mq4g256v2_wmma_gfx12_vt4w4", "gemm_qkv_mq4g256v2_wmma_gfx12_vt4w8"]),
+    ("gemm_qkv_mq4g256v2_wmma_gfx12_vt", &["gemm_qkv_mq4g256v2_wmma_gfx12_vt2w4", "gemm_qkv_mq4g256v2_wmma_gfx12_vt2w8", "gemm_qkv_mq4g256v2_wmma_gfx12_vt3w4", "gemm_qkv_mq4g256v2_wmma_gfx12_vt3w8", "gemm_qkv_mq4g256v2_wmma_gfx12_vt4w4", "gemm_qkv_mq4g256v2_wmma_gfx12_vt4w8", "gemm_qkv_mq4g256v2_wmma_gfx12_vt4w4_k32", "gemm_qkv_mq4g256v2_wmma_gfx12_vt4w8_k32", "gemm_qkv_mq4g256v2_wmma_gfx12_vt8w4_k32", "gemm_qkv_mq4g256v2_wmma_gfx12_vt8w8_k32"]),
     ("gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2", &["gemm_qkvza_mq4g256v2_wmma_gfx12"]),
-    ("gemm_qkvza_mq4g256v2_wmma_gfx12_vt", &["gemm_qkvza_mq4g256v2_wmma_gfx12_vt2w4", "gemm_qkvza_mq4g256v2_wmma_gfx12_vt2w8", "gemm_qkvza_mq4g256v2_wmma_gfx12_vt3w4", "gemm_qkvza_mq4g256v2_wmma_gfx12_vt3w8", "gemm_qkvza_mq4g256v2_wmma_gfx12_vt4w4", "gemm_qkvza_mq4g256v2_wmma_gfx12_vt4w8"]),
+    ("gemm_qkvza_mq4g256v2_wmma_gfx12_vt", &["gemm_qkvza_mq4g256v2_wmma_gfx12_vt2w4", "gemm_qkvza_mq4g256v2_wmma_gfx12_vt2w8", "gemm_qkvza_mq4g256v2_wmma_gfx12_vt3w4", "gemm_qkvza_mq4g256v2_wmma_gfx12_vt3w8", "gemm_qkvza_mq4g256v2_wmma_gfx12_vt4w4", "gemm_qkvza_mq4g256v2_wmma_gfx12_vt4w8", "gemm_qkvza_mq4g256v2_wmma_gfx12_vt4w4_k32", "gemm_qkvza_mq4g256v2_wmma_gfx12_vt4w8_k32", "gemm_qkvza_mq4g256v2_wmma_gfx12_vt8w4_k32", "gemm_qkvza_mq4g256v2_wmma_gfx12_vt8w8_k32"]),
     ("gemv_hfq4g256_multirow_default_mq4v2", &["gemv_mq4g256v2_multirow_r2"]),
     ("gemv_hfq4g256_residual_mq4v2", &["gemv_mq4g256v2_residual"]),
     ("gemv_mq4g256v2_mq4v2", &["gemv_mq4g256v2"]),
@@ -1791,8 +1791,11 @@ mod tests {
         // gfx1201 65536-workgroup limit. The two RMSNorm/FWHT modules' source
         // gained the fold's batched Phase-1a behind `HIPFIRE_RMSNORM_FOLD` +
         // `HIPFIRE_RMSNORM_P1A_BATCHED` (gfx1151 `_fold_b8`); their
-        // preprocessed source is unchanged on gfx1100/gfx1151/gfx1201.
-        const REPINNED_SINCE_P0: [&str; 14] = [
+        // preprocessed source is unchanged on gfx1100/gfx1151/gfx1201. The
+        // four `sample_top_p_parallel*` modules' penalty prepass now finds
+        // each token's (last index, count) by an LDS sort; the per-token
+        // update and every result bit are unchanged (sampler oracle dumps).
+        const REPINNED_SINCE_P0: [&str; 18] = [
             "conv1d_silu_split_qknorm_b256",
             "fused_qk_l2_norm_scale",
             "fused_rmsnorm_mq_rotate",
@@ -1807,6 +1810,10 @@ mod tests {
             "kv_cache_write_q8_0_independent",
             "kv_cache_write_q8_0_independent_masked",
             "rotate_x_mq_awq",
+            "sample_top_p_parallel",
+            "sample_top_p_parallel_fast21",
+            "sample_top_p_parallel_fast65",
+            "sample_top_p_parallel_w64",
         ];
         const FLAGS_ADDED_SINCE_P0: [&str; 2] = ["-fuse-cuid=none", "-mcode-object-version=6"];
         let mut repins_seen = HashSet::new();

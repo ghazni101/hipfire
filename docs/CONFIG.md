@@ -450,9 +450,37 @@ gathered-attention workspace reserve address space for `max_seq` and map
 pages as forwards touch rows, before any capture or Redline record. Committed
 context then tracks the tokens touched, not `max_seq`: the load logs
 `qwen4 QSA context: … MiB virtual …, … MiB committed at load`, and each
-growth logs `qwen4 QSA context mapped for N tokens`. The `auto` expert reserve
-charges only committed bytes. Mapped pages stay owned until unload, and VMM is
-not eviction.
+growth logs `qwen4 QSA context mapped for N tokens`. Mapped pages stay owned
+until unload, and VMM is not eviction.
+
+Qwen4 `max_seq` on a **unified-memory APU** (gfx1151): omission is
+**automatic** under VMM (legacy storage refuses it and needs an explicit
+value). The context is the model's `max_position_embeddings` (at most
+262,144), capped by **card capacity**: after every load allocation the carrier
+measures free device memory and finds the largest context whose remaining VMM
+growth (target and MTP QSA pages, gathered workspace), native MTP request
+buffers and a 2 GiB headroom fit. The load logs one `qwen4 memory admission`
+line with those numbers, and the daemon logs `max_seq: N (bound=model|card;
+model_ctx=…, card_cap=…)`. An explicit `max_seq` that cannot grow refuses at
+load, naming the largest one that fits (with `memory.oom_guard` off it loads
+and only warns). Before any allocation, a fully resident load that does not
+fit free device memory refuses the same way. The session cache is not
+charged: its snapshots yield to context growth (see
+`memory.session_cache_bytes`). On a discrete GPU an omitted Qwen4 `max_seq`
+stays 32768 and an explicit one is not checked at load.
+
+**Free device memory on unified memory.** Every free-memory sizing site
+(this admission, expert placement, the dense Qwen card bound below, VMM KV
+provisioning, prefill rungs, the session cache) reads `Gpu::device_mem_info`.
+A discrete GPU, or an APU whose device pool is its BIOS carve-out, gets
+`hipMemGetInfo` unchanged. An APU that allocates from GTT (device pool larger
+than `mem_info_vram_total`, e.g. Strix Halo with a 1 GiB carve-out and a
+120 GiB `ttm.pages_limit`) gets `min(hipMemGetInfo free, MemAvailable + TTM
+page-pool estimate)`: `hipMemGetInfo` there is TTM's cap minus live GTT and
+ignores host RAM pressure, while freed GTT pages parked in TTM's pool are
+outside `MemAvailable` but are what the next GTT allocation takes first. An
+unreadable `MemAvailable` fails the query (callers refuse rather than size
+blind).
 
 For single-card **dense** Qwen HFQ VMM loads, omission of `max_seq` first
 preflights projected model fit before tearing down a resident model. After
@@ -531,6 +559,7 @@ Legacy one-shot alias: `HIPFIRE_SPECULATION`. CLI: `--spec`.
 | `dflash_mode` | `"off"` | `on` \| `off` \| `auto` | **Default off.** `auto` enables on dense Qwen3.5-class targets and skips known-loss A3B cases. |
 | `vision_mode` | `"off"` | `on` \| `off` \| `auto` | **Default off.** Tower sidecar gate — see [Vision tower](#vision-tower). |
 | `dflash_adaptive_b` | `false` | bool | **Opt-in.** Adaptive verify-block width: follows the trailing 8-cycle acceptance depth (τ̂+2), full below 2k context. Not output-identical (window boundaries move; per-position sampling stays target-lossless). Auto-suppressed on retained-PM4 verify loads. `HIPFIRE_DFLASH_ADAPTIVE_B=0` is a kill switch read through the `[developer]` namespace (not a schema env alias): it forces the fixed block even when this is `true`, and cannot enable adaptive. |
+| `dflash_block` | `"auto"` | `"auto"` \| int 4–16 | DFlash2 proposal width L (`speculation.dflash_block`, env `HIPFIRE_DFLASH_BLOCK`). Chosen **per serving configuration, never per live batch**: every request of a load (singleton or batched VMM lane) runs the same L, so batched output stays byte-identical to the singleton and text never depends on server load. **Default `auto`** = 8 when `serve.vmm_batch` is on with `continuous_batch_size` ≥ 4 (a full C8 verify step stays at 64 rows instead of 128), else 16. Measured on Qwen3.8-27B + DFlash2 on one R9700: C4 +20 %, C8 +27 %, BetterBench T0.7 C8 +17 %; a lone request on such a batching serve runs about 6 % slower than at 16; task scores tied (HumanEval 157 = 157, GSM8K 5-shot 1,282 vs 1,280, MMLU-Pro 871 = 871). `16` (or `HIPFIRE_DFLASH_BLOCK=16`) restores the previous fixed width. Greedy text depends on L (different window boundaries). Legacy DFlash drafts always run their declared width. Retained-PM4 verify and dense TP2 need 16. The experimental multi-slot route admits only 16 (`auto` resolves to 16 there). |
 | `dflash_ngram_block` | `"auto"` | `true` \| `false` \| `"auto"` | Verify-path n-gram defense; auto size-gates. |
 | `mtp_mode` | `"auto"` | `off` \| `on` \| `auto` | Built-in MTP when a head is present: the DeepSeek V4 trunk's MTP layer, or for Qwen a bundled `.mq4-mtp` trailer or a `.mtp` sidecar (the registry `mtp` slot; Qwen3.8-27B ships one — [MODELS.md](MODELS.md#dflash-draft-artifacts-registry)). `auto` uses a present head; `on` fails the load without one. |
 | `mtp_k` | `3` | int 1–10 | |
@@ -542,6 +571,8 @@ Legacy one-shot alias: `HIPFIRE_SPECULATION`. CLI: `--spec`.
 | `ngram_min_count` | `2` | int 1–10 | |
 | `ddtree_budget` | `0` | int 0–64 | `0` = chain DFlash (no tree). |
 | `ddtree_topk` | `4` | int 1–8 | |
+
+**DFlash IU4 verify at `dflash_block` 8.** When a DFlash load's proposal width resolves to 8 (the `auto` width of a batching serve), its target verify runs on gfx1201 with 4-bit (A4) activations: the IU4 verify. **Numerics differ from the F16 verify; quality is tied on task evals** (Qwen3.8-27B paired greedy DFlash: HumanEval 157 → 156, GSM8K 5-shot 1,282 → 1,282, MMLU-Pro subset 871 → 871). F16 == IU4 is not promised; batched == singleton stays byte-identical within the configuration. C8 +9.9 %, BetterBench T0.7 C8 +3.9 %, and a lone request on that serve −7.7 % (R9700, L8). Width-16 loads keep the F16 verify. `HIPFIRE_CB_VERIFY_IU4=0` is the kill switch, `=1` forces it on at any width; `HIPFIRE_CB_VERIFY_FP8=1` takes precedence over the default and cannot be combined with `=1` ([`env-vars.md`](env-vars.md)).
 
 Legacy compatibility input still wins at the top of the startup ladder for
 the corresponding knobs, but the engine receives only the resolved immutable
@@ -702,7 +733,9 @@ Two checks exist; only one is gated:
   overshoot is a desktop-killing OOM), **off** for discrete GPUs (overshoot is
   a failed `hipMalloc`), and for GPU-less processes by host swap state (no
   swap → on). Explicit `true`/`false` force either way; `auto` logs its
-  decision once.
+  decision once. In a unified-memory process the room it checks is
+  `MemAvailable` plus TTM's page-pool estimate (freed GTT pages the next GTT
+  allocation takes first).
 - **R9700 deployment-target VRAM budget** (32 GiB class ceiling in
   `preflight_alloc`) — **always runs**, on every arch, whether the host
   headroom guard is active or not. A configuration that does not fit the
@@ -716,7 +749,11 @@ Two checks exist; only one is gated:
 |---|---|---|
 | `memory.prompt_cache_capacity` | `32` | int ≥0; maximum cached assistant-turn tokenizations (`0` keeps none). Env: `HIPFIRE_PROMPT_CACHE_CAP`. |
 | `memory.prompt_cache_unbounded` | `false` | Remove the capacity bound. Env: `HIPFIRE_PROMPT_CACHE_UNBOUNDED`. |
-| `memory.session_cache_bytes` | `8589934592` | int 0–1 TiB; byte budget of the Qwen4 engine-owned session cache (cold-exact prefill snapshots shared across sessions, plus live continuation of the previous turn; `0` = off, cold prefill every turn). Env: `HIPFIRE_SESSION_CACHE_BYTES` ([`env-vars.md`](env-vars.md)). |
+| `memory.session_cache_bytes` | `8589934592` | int 0–1 TiB; byte budget (a ceiling, not a reservation) of the Qwen4 engine-owned session cache (cold-exact prefill snapshots shared across sessions, plus live continuation of the previous turn; `0` = off, cold prefill every turn). Snapshots take free device memory only while the context does not need it: they are skipped or evicted before VMM context growth would run short. Env: `HIPFIRE_SESSION_CACHE_BYTES` ([`env-vars.md`](env-vars.md)). |
+| `memory.ple_hot_store_bytes` | `0` | `auto` or int 0–1 TiB; prewarm budget of the Qwen4 PLE hot-row store. The most frequently used rows of the per-layer-embedding table, ranked by the `<model>.plehot` sidecar (`hipfire-quantize ple-hot-rank`), are copied verbatim from the model file into the `<model>.plehotrows` hot-row pack (`hipfire-quantize ple-hot-pack`), grouped by rank. Rows the pack holds are read from it through the page cache and decoded by the same row decoder, so output is byte-identical to the model-file path. After load the first N bytes of the pack are read into the page cache (hottest tier first, then tier 0 once more so its pages are promoted to the active list) while no request runs: `auto` = `MemAvailable` minus 4 GiB at ready, an explicit N is that many bytes, both capped at the pack. The pack is clean page cache: the kernel drops it under memory pressure instead of swapping. Off by default (`0`); unified-memory GPUs only. Env: `HIPFIRE_PLE_HOT_STORE_BYTES`, paths `HIPFIRE_PLE_HOT_RANK_FILE` / `HIPFIRE_PLE_HOT_PACK_FILE` ([`env-vars.md`](env-vars.md)). |
+| `memory.ple_format` | `auto` | `auto` \| `q4` \| `q8`; which PLE row table a Flash-Next (Qwen4) load reads. `q8` = the exact Q8F16 rows (embedded in the monolithic `qwen3.8:flash-next-mq4-xts`, or the `<model>.ple-q8` sidecar of a split base); `q4` = the 4-bit Lloyd-Max rows `<model>.ple-q4`, decode equal to the tested q4 table, derived from the Q8 rows on first load when missing (about 1 minute, progress on stderr; `hipfire ple derive --format q4 <model>` does it ahead of time). `auto` = q4 on gfx1151 (unified-memory Strix Halo), q8 elsewhere; `auto` never derives or downloads and falls back to the other available format with a note. An explicit `q8` on a split base needs `<model>.ple-q8` (`hipfire pull <tag> --ple q8`; `serve` downloads it on demand for registry models). See [Qwen4 PLE row tables](#qwen4-ple-row-tables). Env: `HIPFIRE_PLE_FORMAT` ([`env-vars.md`](env-vars.md)). |
+| `memory.ple_prewarm_bytes` | `auto` | `auto` or int 0–1 TiB; idle-only page-cache prewarm of the q4 PLE table `<model>.ple-q4` after the model is ready (a rank-ordered table: hottest tier first, then tier 0 again, the hot-row store's prewarm; a row-ordered one: sequentially). `auto` = 15 GiB (the hottest rows, where the value per GB of warm rows is highest), capped at `MemAvailable` minus 8 GiB at ready and at the table; `0` = off (kill switch); an explicit N is that many bytes. The pages are clean, reclaimable page cache: dropped, never swapped, under memory pressure, and not charged in admission. See [Qwen4 PLE row tables](#qwen4-ple-row-tables). Env: `HIPFIRE_PLE_PREWARM_BYTES` ([`env-vars.md`](env-vars.md)). |
+| `memory.ple_load_fill_bytes` | `auto` | `auto` or int 0–1 TiB; bytes of a rank-ordered q4 PLE table `<model>.ple-q4` read into the page cache **while the model loads**, hottest rows first, at most 0.2 GB/s so the weight upload keeps the drive. The upload streams the model file through the same cache and evicts the oldest pages first, so the fill re-reads evicted pages of its prefix (found with `mincore`), hottest first, until ready. Ready never waits for it; the resident prefix serves the first request, and the prewarm after ready (`memory.ple_prewarm_bytes`) continues at its end. `auto` = 14 GiB (the smallest prefix whose modelled prose and agentic 8K prefill is within 1% of the 15 GiB prewarm's); any value is capped at the table, at an explicit `memory.ple_prewarm_bytes`, and at the host RAM available at load start (`MemAvailable` plus TTM's page pool) minus the weights the load puts in host RAM minus 8 GiB. `0` = off. Clean, reclaimable page cache, not charged in admission. Env: `HIPFIRE_PLE_LOAD_FILL_BYTES` ([`env-vars.md`](env-vars.md)). |
 
 Qwen AR and DFlash multi-turn reuse store each completed assistant turn as the
 **verbatim generated token span** (whole envelope: full body tokens, plus
@@ -738,6 +775,169 @@ think cap) mid-window, **RepairForTerminal** restores the pre-window recurrent
 state and replays only the consumed prefix so the prompt/prefix cache stays
 warm. The next turn prefills only the new suffix instead of a full cold
 prefill (the previous fail-closed path reset and invalidated the cache).
+
+### Qwen4 PLE row tables
+
+The Flash-Next (Qwen4) per-layer-embedding (PLE) n-gram table is 128 shard
+tensors of `[2,500,012, 160]` Q8F16 rows (54.4 GB). A load can read it from
+two interchangeable row files, chosen by `memory.ple_format`:
+
+- **`<model>.ple-q8`** — the exact Q8F16 rows.
+- **`<model>.ple-q4`** — 4-bit Lloyd-Max rows (28.8 GB) derived from the Q8
+  rows. Each 32-weight block is an f16 scale plus 16 bytes of 4-bit labels;
+  the decoded row equals the tested q4 table bit for bit.
+
+`memory.ple_format` (env `HIPFIRE_PLE_FORMAT`):
+
+- `auto` (default) — q4 on gfx1151 (the unified-memory Strix Halo), q8
+  elsewhere. `auto` never derives and never downloads: when the preferred
+  file is absent it uses the other available format and prints a note on
+  stderr naming how to get the preferred one.
+- `q4` — always 4-bit rows. If `<model>.ple-q4` is missing it is derived from
+  the local Q8 rows on first load (about 1 minute, progress on stderr).
+  `hipfire ple derive --format q4 <model>` does the same ahead of time.
+- `q8` — always exact rows (the kill switch for the q4 default on gfx1151). A split base needs `<model>.ple-q8`
+  (`hipfire pull <tag> --ple q8`; `hipfire serve` downloads it on demand for
+  registry models); a missing file is refused with that hint, never
+  substituted.
+
+The monolithic `qwen3.8:flash-next-mq4-xts` artifact keeps its PLE rows
+embedded: with `q8` (or `auto` off gfx1151) the embedded Q8 rows are read
+exactly as before; `q4` adds `<model>.ple-q4` next to it.
+
+**Split layout.** `hipfire ple split <model>` rewrites a monolithic model as
+`<model-stem>-base.<ext>` (everything except the 128 PLE shards, about
+70.9 GB, with a `hipfire_ple_rows` marker in its metadata) plus
+`<model-stem>-base.<ext>.ple-q8` (the exact Q8 rows), e.g.
+`qwen3.8-flash-next.mq4-xts` becomes `qwen3.8-flash-next-base.mq4-xts` and
+`qwen3.8-flash-next-base.mq4-xts.ple-q8`. A sidecar is bound to its base
+file: its header records the sha256 of the base's file header and tensor
+index (the bytes before the data section) and the base's file size, and a
+load refuses a sidecar whose binding does not match the base it sits next
+to (delete it and re-derive, or re-pull). A `.ple-q4` derived from a base
+is bound to that base the same way. A split base cannot load without the
+sidecar for the selected format.
+
+`memory.ple_hot_store_bytes` (above) also applies to the sidecars: the
+hot-row pack is cut from, and verified against, the rows file in use.
+With the q4 sidecar and no hot-row pack attached, the sidecar's data is
+read into the page cache after the model is ready, while no request runs
+(a rank-ordered table hottest tier first); `memory.ple_prewarm_bytes` (env
+`HIPFIRE_PLE_PREWARM_BYTES`) sets the budget: `auto` (default) = 15 GiB,
+capped at `MemAvailable` minus 8 GiB at ready and at the sidecar's data
+bytes, `0` = off, an integer = that many bytes. A rank-ordered table's
+hottest prefix is already read during the load, throttled, by
+`memory.ple_load_fill_bytes` (env `HIPFIRE_PLE_LOAD_FILL_BYTES`, `auto` =
+14 GiB, `0` = off), so the first request after ready finds those rows
+warm; the prewarm continues after it. The pages are ordinary clean page
+cache, dropped (never swapped) under memory pressure and not charged in
+admission.
+
+---
+
+## Shared-weight host (developer, Linux, default off)
+
+Two hipfire processes — typically two different builds with different
+kernels — can decode at the same time on one card from **one** imported copy
+of a model's weights. A separate process, `hipfire-weight-host`, loads the
+weights once with the ordinary loader, turns every final weight owner into a
+read-only, exportable VMM allocation, and leases the allocation file
+descriptors to tenant daemons over a private Unix socket. Each tenant maps
+them read-only and keeps its own KV, DeltaNet state, scratch, graphs and
+kernels. Design and gates: the shared-weight host design (`WEIGHT-HOST-DESIGN.md`
+in the dev-fabric locks directory); validation route: [`VALIDATION.md`](VALIDATION.md)
+("Shared-weight host import").
+
+There are no TOML keys. The switches are bootstrap environment variables,
+read before the process config exists because they select the GPU claim:
+
+| Variable | Values | Effect |
+|---|---|---|
+| `HIPFIRE_WEIGHT_HOST` | unset / `0` / `1` | `1` opts a daemon in: weights are imported, never loaded privately. Unset or `0` (the kill switch, which wins over any socket setting) is the incumbent private load and exclusive claim, unchanged. Any other value refuses to start. `0` also refuses to start `hipfire-weight-host`. |
+| `HIPFIRE_WEIGHT_HOST_SOCKET` | absolute path | Required with `HIPFIRE_WEIGHT_HOST=1`: the host's socket. |
+| `HIPFIRE_FABRIC_ADMISSION` | `<state json>#<entry id>` | Set by the dev fabric (`fabric-run.sh --class correct`) for its child. Required by the host and every tenant. |
+
+**Envelope (v1).** Linux, exact `gfx1201`, one visible card, a dense Qwen3.5
+HFQ (arch 5), `tp = pp = 1`, text only. The load must send
+`mtp_mode`, `dflash_mode` and `dspark_mode` as `"off"` (the CLI's
+`speculation` selector `off` does) and no draft, drafter, prefill drafter,
+head overlay or vision tower; the experimental slot engine is refused.
+Anything else is refused before the prior model is torn down — there is no
+private-load fallback while opted in. Retained replay is not part of v1: use
+`HIPFIRE_REPLAY_BACKEND=hip` (with `HIPFIRE_GRAPH=0` or `1`).
+
+**Running it.** Host and tenants each run as their own correct-class fabric
+job on the same card, declaring their honest peak (`--mem-gb`): the host about
+the weight set plus the largest owner during conversion (≈17 GB for the 27B),
+each tenant only its private state.
+
+```
+mkdir -m 0700 /path/wh && \
+fabric-run.sh --class correct --card GPU-<uuid> --mem-gb 17 -- \
+  hipfire-weight-host --model /models/qwen3.8-27b.mq4-xts --socket /path/wh/host.sock
+# each tenant, with its own build and HIPFIRE_KERNEL_CACHE:
+HIPFIRE_WEIGHT_HOST=1 HIPFIRE_WEIGHT_HOST_SOCKET=/path/wh/host.sock \
+fabric-run.sh --class correct --card GPU-<uuid> --mem-gb 4 -- <driver of target/release/daemon>
+```
+
+`hipfire-weight-host` flags: `--model`, `--socket` (its directory must exist,
+belong to you and be mode 0700), `--drain-timeout-secs` (default 600),
+`--handshake-timeout-ms` (default 10000). It hashes the read-only source once
+and writes `<socket>.source-cert` (mode 0444) beside the socket; tenants only
+`fstat` the model file against it. It prints `WEIGHT_HOST_READY epoch=…
+layout_sha256=… unique_bytes=…` when the socket is published, one
+`WEIGHT_HOST_LEASE` line per lease transition, and `WEIGHT_HOST_CLOSED` after a
+clean drain. A tenant prints `WEIGHT_HOST_IMPORT epoch=… layout_sha256=…
+imported_bytes=… ack=ok` and, on every Qwen3.5 load, `QWEN35_LOAD_PHASES
+route=<private|import> weights_ms=… kv_ms=… dn_ms=… scratch_ms=…`.
+
+**Admission and locking.** Host and tenants take a *shared* `flock` on the
+machine-wide `/run/lock/hipfire/gpu-<id>.lock` (the file exclusive daemons
+lock), never write it, and write no `~/.hipfire/daemon-*.pid`. A shared claim
+is accepted only when `HIPFIRE_FABRIC_ADMISSION` names a running correct-class
+entry, the process is in that job's session, and the fabric wrapper holds that
+card's lock shared. The host also checks each tenant's token (by `SO_PEERCRED`
+pid) and that it is for the same card. A tenant whose card, source digest,
+loader ABI or layout recipe differs is rejected before any descriptor is sent.
+
+**Identity.** The loader ABI digest is generated by
+`crates/hipfire-arch-qwen35/build.rs` from the full source of the loader
+closure (`hfq.rs`, `model_load.rs`, `weight_backend.rs`, `llama.rs`,
+`weight_host.rs`, Qwen3.5 `config.rs`/`load.rs`/`weights.rs`/`shared_weights.rs`),
+the `DType` enum and top-level constants of `rdna-compute/src/dispatch.rs`,
+the `rustc -vV` output, target, opt-level and enabled features. Forward and
+JIT kernel sources are not inputs, so two builds that differ only in kernels
+share a generation; a change to any input refuses import until the host is
+rebuilt from the same loader.
+
+**Allocation layout.** One physical allocation per unique final owner (1,347
+for the 27B). Each is `round_up(logical + 64 KiB, minimum granularity)` bytes,
+with the bytes past the logical end zeroed before the allocation is sealed
+read-only. The 64 KiB tail exists because forward GEMV/attention kernels read
+a few bytes past a tensor (a phantom group header or a vector tail load, see
+`HOST_TAIL_PAD_BYTES` in `rdna-compute/src/dispatch.rs`): a private
+`hipMalloc` absorbs that in allocator slack, an exact-fit VMM mapping faults.
+64 KiB is far beyond one group header and costs about 88 MB for the 27B.
+Granularity is the runtime *minimum* (4 KiB on gfx1201, exercised by G0)
+rather than the recommended 2 MiB: for 1,347 owners the per-owner rounding to
+2 MiB adds 2.32 GB (2.89 GB with a 1 MiB tail) against 0.69 MB of rounding at
+4 KiB (S3 owner census: 15,008,626,688 logical bytes, 15,097,597,952 physical).
+Small-page mappings may cost TLB reach in weight-streaming decode; the G3
+timing diagnostic compares import against private decode before that is
+claimed either way.
+
+**Lifecycle.** The host leases a generation identified by a random 128-bit
+epoch. A tenant acknowledges an import only after mapping it, and sends
+`Release` only after its unload freed the imported owners, dropped graphs and
+reported clean VMM teardown; otherwise the lease closes unacknowledged and the
+host keeps it charged until that tenant's process (pid and start time) is
+gone. On SIGTERM/SIGINT/SIGHUP the host stops admission (unlinks the socket),
+half-closes every lease, waits until every lease is released or its process
+has exited, frees the generation and exits 0; past `--drain-timeout-secs` it
+exits 3 and the generation stays occupied by the listed tenants (their own
+mappings keep it alive). A tenant whose host went away unloads the imported
+model before its next command and fails requests until reloaded against a live
+host; there is no transparent rebind.
 
 ---
 
@@ -818,6 +1018,10 @@ uses ambient variables in engine hot paths.
 | `prompt_cache_capacity` | `memory.prompt_cache_capacity` | `HIPFIRE_PROMPT_CACHE_CAP` | 32 |
 | `prompt_cache_unbounded` | `memory.prompt_cache_unbounded` | `HIPFIRE_PROMPT_CACHE_UNBOUNDED` | false |
 | `session_cache_bytes` | `memory.session_cache_bytes` | `HIPFIRE_SESSION_CACHE_BYTES` | 8589934592 (8 GiB; `0` off) |
+| `ple_hot_store_bytes` | `memory.ple_hot_store_bytes` | `HIPFIRE_PLE_HOT_STORE_BYTES` | 0 (off; `auto` = prewarm `MemAvailable` − 4 GiB of the hot-row pack) |
+| `ple_format` | `memory.ple_format` | `HIPFIRE_PLE_FORMAT` | `auto` (q4 on gfx1151, q8 elsewhere; see [Qwen4 PLE row tables](#qwen4-ple-row-tables)) |
+| `ple_prewarm_bytes` | `memory.ple_prewarm_bytes` | `HIPFIRE_PLE_PREWARM_BYTES` | `auto` (prewarm 15 GiB of the q4 PLE table, capped at `MemAvailable` − 8 GiB; `0` off) |
+| `ple_load_fill_bytes` | `memory.ple_load_fill_bytes` | `HIPFIRE_PLE_LOAD_FILL_BYTES` | `auto` (read the hottest 14 GiB of a rank-ordered q4 PLE table during load at ≤ 0.2 GB/s; `0` off) |
 | `devices` | `hardware.devices` | `HIPFIRE_DEVICES` (alias `HIPFIRE_DEVICE`) | unset |
 | `allow_mixed_arch` | `hardware.allow_mixed_arch` | `HIPFIRE_ALLOW_MIXED_ARCH` | false unless `1` |
 | `uniform_vram_tolerance_gb` | `hardware.uniform_vram_tolerance_gb` | `HIPFIRE_UNIFORM_VRAM_TOLERANCE_GB` | unset |
@@ -855,9 +1059,23 @@ Deprecated since 0.4.0, removal in 0.5.0:
 - `speculation.prefill.*` and `diagnostic.pflash.score_layer` (PFlash; prefix caching supersedes it).
 - KV **values** `asym2|asym3|asym4`, `turbo|turbo2|turbo3|turbo4` (`kv_cache`, `kv_k`) and `legacy-asym2|3|4` (`kv_k`): Givens asym KV and its aliases; use `fwhtN` or `q8`.
 
+Removed keys. A key that shipped in a release and was later removed from the
+schema stays in `RETIRED_CONFIG_KEYS` (`crates/hipfire-config/src/lib.rs`)
+through its deprecation window: a `config.toml` that still sets it loads, the
+value is ignored, and run/serve/chat and `hipfire config show` print
+`warning: ignored <key> in <file>: removed in <version> (…)`. Custom profiles
+drop it the same way. `hipfire config set` refuses it. A key that never shipped
+in a release (for example one that only existed on an experiment branch) or a
+misspelled key is unknown and fails the load with
+`unknown configuration key '<key>'`.
+
+| Removed key | Legacy key | Shipped | Removed in | Ignored with a warning until |
+| --- | --- | --- | --- | --- |
+| `kernel.mw16` | `mw16` | 0.3.1 | 0.4.1 | 0.5.0 |
+
 <!-- lifecycle-table:begin (generated by scripts/check-lifecycle.py --write) -->
 
-**Count:** 277 schema keys, plus the `developer.<name>` namespace.
+**Count:** 283 schema keys, plus the `developer.<name>` namespace.
 
 | Key | Legacy key | Env | Lifecycle |
 |---|---|---|---|
@@ -1056,6 +1274,10 @@ Deprecated since 0.4.0, removal in 0.5.0:
 | `memory.mmq.screen_threshold` | `mmq_screen_threshold` | `HIPFIRE_MMQ_SCREEN_THRESHOLD` | stable |
 | `memory.offload_exec` | `offload_exec` | `HIPFIRE_OFFLOAD_EXEC` | stable |
 | `memory.oom_guard` | `oom_guard` | `HIPFIRE_OOM_GUARD` | stable |
+| `memory.ple_format` | `ple_format` | `HIPFIRE_PLE_FORMAT` | stable |
+| `memory.ple_hot_store_bytes` | `ple_hot_store_bytes` | `HIPFIRE_PLE_HOT_STORE_BYTES` | stable |
+| `memory.ple_load_fill_bytes` | `ple_load_fill_bytes` | `HIPFIRE_PLE_LOAD_FILL_BYTES` | stable |
+| `memory.ple_prewarm_bytes` | `ple_prewarm_bytes` | `HIPFIRE_PLE_PREWARM_BYTES` | stable |
 | `memory.prompt_cache_capacity` | `prompt_cache_capacity` | `HIPFIRE_PROMPT_CACHE_CAP` | stable |
 | `memory.prompt_cache_unbounded` | `prompt_cache_unbounded` | `HIPFIRE_PROMPT_CACHE_UNBOUNDED` | experimental |
 | `memory.session_cache_bytes` | `session_cache_bytes` | `HIPFIRE_SESSION_CACHE_BYTES` | stable |
@@ -1080,6 +1302,7 @@ Deprecated since 0.4.0, removal in 0.5.0:
 | `serve.allow_request_paths` | `allow_request_paths` | `HIPFIRE_SERVE_ALLOW_REQUEST_PATHS` | stable |
 | `serve.allow_request_pull` | `allow_request_pull` | `HIPFIRE_SERVE_ALLOW_REQUEST_PULL` | stable |
 | `serve.batch_nonexact` | `serve_batch_nonexact` | `HIPFIRE_SERVE_BATCH_NONEXACT` | experimental |
+| `serve.batch_sampled` | `serve_batch_sampled` | `HIPFIRE_SERVE_BATCH_SAMPLED` | experimental |
 | `serve.batch_spec` | `serve_batch_spec` | `HIPFIRE_SERVE_BATCH_SPEC` | experimental |
 | `serve.continuous_batch_size` | `continuous_batch_size` | `HIPFIRE_CONTINUOUS_BATCH_SIZE` | stable |
 | `serve.default_model` | `default_model` | `HIPFIRE_MODEL` | stable |
@@ -1110,6 +1333,7 @@ Deprecated since 0.4.0, removal in 0.5.0:
 | `speculation.ddtree_tree_la` | `ddtree_tree_la` | `HIPFIRE_DDTREE_TREE_LA` | experimental |
 | `speculation.dflash` | `dflash_mode` | `HIPFIRE_DFLASH_MODE` | stable |
 | `speculation.dflash_adaptive_b` | `dflash_adaptive_b` |  | stable |
+| `speculation.dflash_block` | `dflash_block` | `HIPFIRE_DFLASH_BLOCK` | stable |
 | `speculation.dflash_fast_sample` | `dflash_fast_sample` | `HIPFIRE_DFLASH_FAST_SAMPLE` | experimental |
 | `speculation.dflash_ngram_block` | `dflash_ngram_block` | `HIPFIRE_DFLASH_NGRAM_BLOCK` | stable |
 | `speculation.dflash_q8_lmhead_wmma` | `dflash_q8_lmhead_wmma` | `HIPFIRE_DFLASH_Q8_LMHEAD_WMMA` | experimental |

@@ -6,6 +6,8 @@ use crate::{cfg::InstId, inst::Program, kernarg::KernargFacts, lds::LdsFacts, wa
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct RoundTripProof {
     pub input_sha256: [u8; 32], pub tools: Vec<String>, pub streams: Vec<StreamProof>,
+    /// SHA-256 of the producer sidecar a raw lift is bound to; `None` for HSA code objects.
+    pub sidecar_sha256: Option<[u8; 32]>,
 }
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StreamProof { pub entry: u64, pub size: u64, pub stream_sha256: [u8; 32] }

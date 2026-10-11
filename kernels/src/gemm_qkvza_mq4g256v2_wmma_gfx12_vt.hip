@@ -3,11 +3,13 @@
 //
 // gfx12 MQ4G256V2 4-way fused qkv+z+beta+alpha GEMM (Qwen3.5 DeltaNet
 // preamble), verify-tile twin of gemm_qkvza_mq4g256v2_wmma_gfx12
-// (16 < N < 64). Prefixed at build time by gemm_mq4g256v2_wmma_gfx12_vt_core.hip
+// (16 < N <= 128). Prefixed at build time by gemm_mq4g256v2_wmma_gfx12_vt_core.hip
 // (kernels.rs concat!), which documents the design and the byte-exactness
 // argument. Same ABI as the one-tile kernel.
 //
-// Symbols: gemm_qkvza_mq4g256v2_wmma_gfx12_vt{2,3,4}w{4,8} — BT = ceil(N/16), 4 or 8 waves per block.
+// Symbols: gemm_qkvza_mq4g256v2_wmma_gfx12_vt{2,3,4}w{4,8} — BT = ceil(N/16), 4 or 8 waves per block,
+// 128-K slabs (16 < N < 64); gemm_qkvza_mq4g256v2_wmma_gfx12_vt{4,8}w{4,8}_k32 — wide exact verify,
+// 32-K slabs, BT4 for N = 64, BT8 for 65 <= N <= 128 (static LDS 10,240 / 20,480 B).
 // Grid: [ceil(total_m/(16*W)), ceil(N/(16*BT))]. Block: [32*W].
 // Overwrite semantics (y = acc), rows routed across the four projections.
 
@@ -34,8 +36,8 @@ struct QkvzaVtOp {
     }
 };
 
-#define GEN_QKVZA_VT(BT, W) \
-extern "C" __launch_bounds__(W * 32) __global__ void gemm_qkvza_mq4g256v2_wmma_gfx12_vt##BT##w##W( \
+#define GEN_QKVZA_VT(BT, W, SLAB, SFX) \
+extern "C" __launch_bounds__(W * 32) __global__ void gemm_qkvza_mq4g256v2_wmma_gfx12_vt##BT##w##W##SFX( \
     const char* __restrict__ A_qkv, const char* __restrict__ A_z, \
     const char* __restrict__ A_beta, const char* __restrict__ A_alpha, \
     const _Float16* __restrict__ X, \
@@ -44,12 +46,16 @@ extern "C" __launch_bounds__(W * 32) __global__ void gemm_qkvza_mq4g256v2_wmma_g
     int qkv_m, int z_m, int beta_m, int alpha_m, int K, int N) { \
     const QkvzaVtOp op{A_qkv, A_z, A_beta, A_alpha, Y_qkv, Y_z, Y_beta, Y_alpha, \
                        qkv_m, z_m, beta_m, alpha_m}; \
-    mq4v2_vt_gemm<BT, W>(op, X, qkv_m + z_m + beta_m + alpha_m, K, N); \
+    mq4v2_vt_gemm<BT, W, SLAB>(op, X, qkv_m + z_m + beta_m + alpha_m, K, N); \
 }
 
-GEN_QKVZA_VT(2, 4)
-GEN_QKVZA_VT(2, 8)
-GEN_QKVZA_VT(3, 4)
-GEN_QKVZA_VT(3, 8)
-GEN_QKVZA_VT(4, 4)
-GEN_QKVZA_VT(4, 8)
+GEN_QKVZA_VT(2, 4, 128, )
+GEN_QKVZA_VT(2, 8, 128, )
+GEN_QKVZA_VT(3, 4, 128, )
+GEN_QKVZA_VT(3, 8, 128, )
+GEN_QKVZA_VT(4, 4, 128, )
+GEN_QKVZA_VT(4, 8, 128, )
+GEN_QKVZA_VT(4, 4, 32, _k32)
+GEN_QKVZA_VT(4, 8, 32, _k32)
+GEN_QKVZA_VT(8, 4, 32, _k32)
+GEN_QKVZA_VT(8, 8, 32, _k32)

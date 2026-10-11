@@ -652,6 +652,7 @@ fn run_arm(arm: Arm, case: Case, model: &Path, dir: &Path) -> Result<(), String>
     let backend = Qwen4KvBackend::automatic(&gpu);
     let mut bundle = Qwen4Bundle::assemble_with_metadata(
         receipt.config,
+        &receipt.manifest.identity.recipe,
         transaction,
         &receipt.placements,
         &mut gpu,

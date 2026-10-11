@@ -7,10 +7,10 @@
 use std::path::{Path, PathBuf};
 
 use railgun_corpus::{
-    sha256_hex, ArtifactKey, BuildHost, CorpusIndex, CorpusRecord, JitCorpus, Lookup, NodeRecord, ProgramNode, ProgramRecord,
+    sha256_hex, ArtifactKey, BuildHost, CorpusIndex, CorpusRecord, JitCorpus, Lookup, NodeRecord, ObjectOrigin, ProgramNode, ProgramRecord,
     RejectedObject, ToolchainPin, CORPUS_INDEX, CORPUS_SCHEMA, CORPUS_VERSION,
 };
-use railgun_jitcorpus::{check, ProgramKeys};
+use railgun_jitcorpus::{check, NodeKey, ProgramKeys};
 
 const OBJECT: &[u8] = include_bytes!("../../peacemaker-lift/tests/fixtures/kt48/hipcc.co");
 const ARCH: &str = "gfx1201";
@@ -43,7 +43,7 @@ impl Fixture {
                 clang_sha256: String::new(), header_set_sha256: String::new(), build_dir: "/build".into() },
             toolchain: ToolchainPin { pin: sha256_hex(id.as_bytes()), id, version_sha256: String::new() },
             records: vec![CorpusRecord {
-                arch: ARCH.into(), artifact_sha256: sha.clone(), module: "kt48".into(), symbols: vec![symbol.clone()],
+                arch: ARCH.into(), artifact_sha256: sha.clone(), module: "kt48".into(), origin: ObjectOrigin::Hipcc, symbols: vec![symbol.clone()],
                 source_sha256: String::new(), extra_flags: String::new(), flags: Vec::new(), scheduler_profile: "default".into(),
                 packaging_key: "key-now".into(), jit_cache_key: String::new(), argv: Vec::new(), object,
                 receipt: receipt_rel, receipt_sha256: sha256_hex(&receipt_bytes), kernels: Vec::new(),
@@ -62,7 +62,12 @@ impl Fixture {
     }
 
     fn program(&self, key: &str) -> Vec<ProgramKeys> {
-        vec![ProgramKeys { id: "p".into(), arch: ARCH.into(), nodes: vec![(self.symbol.clone(), "kt48".into(), key.into())] }]
+        vec![ProgramKeys { id: "p".into(), arch: ARCH.into(), nodes: vec![(self.symbol.clone(), "kt48".into(), NodeKey::Hipcc(key.into()))] }]
+    }
+
+    fn native_program(&self) -> Vec<ProgramKeys> {
+        let key = NodeKey::Native { artifact_sha256: self.sha.clone() };
+        vec![ProgramKeys { id: "p".into(), arch: ARCH.into(), nodes: vec![(self.symbol.clone(), "kt48".into(), key)] }]
     }
 
     fn key<'a>(&'a self, pin: &'a str) -> ArtifactKey<'a> {
@@ -133,7 +138,7 @@ fn object_the_certifier_rejected_is_missing_with_the_reason() {
     let mut f = Fixture::new("rejected");
     let record = f.index.records.remove(0);
     f.index.rejected.push(RejectedObject {
-        arch: ARCH.into(), artifact_sha256: record.artifact_sha256, module: record.module, symbols: record.symbols,
+        arch: ARCH.into(), artifact_sha256: record.artifact_sha256, module: record.module, origin: ObjectOrigin::Hipcc, symbols: record.symbols,
         source_sha256: String::new(), packaging_key: record.packaging_key, object: record.object, reason: "lift: Decode at 0x10".into(),
     });
     f.write_index();
@@ -141,4 +146,48 @@ fn object_the_certifier_rejected_is_missing_with_the_reason() {
     assert!(matches!(corpus.lookup(&f.key(corpus.toolchain_pin())).unwrap(), Lookup::Missing));
     let coverage = check(&corpus, &f.program("key-now"));
     assert!(coverage[0].missing[0].reason.contains("rejected kt48: lift: Decode at 0x10"), "{:?}", coverage[0].missing);
+}
+
+#[test]
+fn pm_native_record_covers_a_native_keyed_node() {
+    let mut f = Fixture::new("native-covered");
+    f.index.records[0].origin = ObjectOrigin::PmNative;
+    f.write_index();
+    let corpus = JitCorpus::open(&f.root).unwrap();
+    let coverage = check(&corpus, &f.native_program());
+    assert_eq!((coverage[0].nodes, coverage[0].covered, coverage[0].missing.len()), (1, 1, 0), "{coverage:?}");
+}
+
+#[test]
+fn native_key_whose_artifact_is_only_recorded_as_hipcc_is_missing() {
+    let f = Fixture::new("native-wrong-origin");
+    let coverage = check(&JitCorpus::open(&f.root).unwrap(), &f.native_program());
+    assert_eq!(coverage[0].covered, 0);
+    assert!(coverage[0].missing[0].reason.contains("no pm_native record for twin kt48 image"), "{:?}", coverage[0].missing);
+}
+
+#[test]
+fn native_key_whose_twin_the_certifier_rejected_is_missing_with_the_reason() {
+    let mut f = Fixture::new("native-rejected");
+    let record = f.index.records.remove(0);
+    f.index.rejected.push(RejectedObject {
+        arch: ARCH.into(), artifact_sha256: record.artifact_sha256, module: record.module, origin: ObjectOrigin::PmNative,
+        symbols: record.symbols, source_sha256: String::new(), packaging_key: String::new(), object: record.object,
+        reason: "radiowave: differential fail".into(),
+    });
+    f.write_index();
+    let coverage = check(&JitCorpus::open(&f.root).unwrap(), &f.native_program());
+    assert!(coverage[0].missing[0].reason.contains("rejected pm_native twin kt48: radiowave: differential fail"), "{:?}", coverage[0].missing);
+}
+
+#[test]
+fn record_for_module_ignores_pm_native_records() {
+    let mut f = Fixture::new("module-lookup-origin");
+    let corpus = JitCorpus::open(&f.root).unwrap();
+    assert!(corpus.record_for_module(ARCH, "kt48", "key-now").is_some());
+    f.index.records[0].origin = ObjectOrigin::PmNative;
+    f.write_index();
+    let corpus = JitCorpus::open(&f.root).unwrap();
+    assert_eq!(corpus.index().records[0].packaging_key, "key-now");
+    assert!(corpus.record_for_module(ARCH, "kt48", "key-now").is_none());
 }

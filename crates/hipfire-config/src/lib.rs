@@ -27,6 +27,15 @@ pub const CONFIG_SCHEMA_VERSION: i64 = 1;
 pub enum ConfigError {
     #[error("unknown configuration key '{0}'")]
     UnknownKey(String),
+    #[error(
+        "configuration key '{key}' was removed in {removed_in} ({reason}); it has no effect — \
+         delete it from config.toml if it is still set"
+    )]
+    RetiredKey {
+        key: &'static str,
+        removed_in: &'static str,
+        reason: &'static str,
+    },
     #[error("invalid value for {key}: {message}")]
     InvalidValue { key: String, message: String },
     #[error("failed to read {path}: {source}")]
@@ -330,6 +339,11 @@ pub enum ValueRule {
         min: i64,
         max: i64,
     },
+    /// The string `auto` or an integer in `min..=max`.
+    AutoInteger {
+        min: i64,
+        max: i64,
+    },
     NullableFloat {
         min: f64,
         max: f64,
@@ -390,6 +404,10 @@ impl ConfigField {
                 matches!(value, ConfigValue::Bool(_))
                     || matches!(value, ConfigValue::String(v) if v == "auto")
             }
+            ValueRule::AutoInteger { min, max } => {
+                matches!(value, ConfigValue::String(v) if v == "auto")
+                    || matches!(value, ConfigValue::Integer(v) if *v >= min && *v <= max)
+            }
             ValueRule::NullableString => {
                 matches!(value, ConfigValue::Null | ConfigValue::String(_))
             }
@@ -440,6 +458,10 @@ impl ConfigField {
             ValueRule::Float { .. } => raw.parse::<f64>().ok().map(ConfigValue::Float),
             ValueRule::AutoBool if raw == "auto" => Some(ConfigValue::String(raw.to_owned())),
             ValueRule::AutoBool => parse_bool(raw).map(ConfigValue::Bool),
+            ValueRule::AutoInteger { .. } if raw.eq_ignore_ascii_case("auto") => {
+                Some(ConfigValue::String("auto".to_owned()))
+            }
+            ValueRule::AutoInteger { .. } => raw.parse::<i64>().ok().map(ConfigValue::Integer),
             ValueRule::NullableString if raw.eq_ignore_ascii_case("null") => {
                 Some(ConfigValue::Null)
             }
@@ -524,8 +546,23 @@ const KV_V_NAMES: &[&str] = &["", "q8", "lloyd2", "lloyd3", "lloyd4"];
 // (on Qwen it names the same legacy K as `--kv-k legacy-asym3`).
 const KV_MODES: &[&str] = &[
     // lifecycle: deprecated since 0.4.0, removal 0.5.0 — Givens asym KV and the asymN/turboN aliases are superseded by fwht3 (asymN / turbo*)
-    "auto", "f32", "f16", "bf16", "q8", "asym4", "asym3", "asym2", "fwht4", "fwht3", "fwht2",
-    "turbo", "turbo4", "turbo3", "turbo2", "fp8", "legacy-asym3",
+    "auto",
+    "f32",
+    "f16",
+    "bf16",
+    "q8",
+    "asym4",
+    "asym3",
+    "asym2",
+    "fwht4",
+    "fwht3",
+    "fwht2",
+    "turbo",
+    "turbo4",
+    "turbo3",
+    "turbo2",
+    "fp8",
+    "legacy-asym3",
 ];
 const AUTO_ON_OFF: &[&str] = &["auto", "on", "off"];
 /// VL image decode path: `cpu` (default) / `vcn` / `auto` (VCN when probed).
@@ -1170,6 +1207,15 @@ pub static FIELDS: &[ConfigField] = &[
         "HIPFIRE_SERVE_BATCH_NONEXACT",
         "Permit explicitly labeled non-bit-exact batched arithmetic on the VMM batch route. Always default off."
     ),
+    process_bool_field!(
+        "serve.batch_sampled",
+        "serve_batch_sampled",
+        Serve,
+        true,
+        true,
+        "HIPFIRE_SERVE_BATCH_SAMPLED",
+        "Default on (applies only with serve.vmm_batch). Admit sampled (temperature>0) requests to the VMM batch route only in the lane mode the singleton route selects for them, each proven byte-identical to that singleton (AR, native MTP, FAST_SAMPLE selector-chain DFlash). 0 is the kill switch: sampled requests stay on the serialized singleton route."
+    ),
     field!(
         "serve.queue_timeout_ms",
         "serve_queue_timeout_ms",
@@ -1334,6 +1380,18 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         None,
         "Opt in to the DFlash trailing-τ adaptive verify-block width (default fixed block)."
+    ),
+    field!(
+        "speculation.dflash_block",
+        "dflash_block",
+        Speculation,
+        ModelLoad,
+        DefaultValue::String("auto"),
+        ValueRule::AutoInteger { min: 4, max: 16 },
+        true,
+        false,
+        Some("HIPFIRE_DFLASH_BLOCK"),
+        "DFlash2 proposal width per serving configuration, never per live batch (batched lanes stay byte-identical to the singleton). Default `auto` = 8 on a `serve.vmm_batch` serve with `continuous_batch_size` >= 4, else 16; `16` restores the previous fixed width. Legacy DFlash drafts keep their declared width."
     ),
     field!(
         "speculation.dflash",
@@ -1571,6 +1629,55 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         "HIPFIRE_SESSION_CACHE_BYTES",
         "Byte budget for reusable prefill snapshots (session cache; Flash-Next). 0 disables the cache."
+    ),
+    process_field!(
+        "memory.ple_hot_store_bytes",
+        "ple_hot_store_bytes",
+        Memory,
+        DefaultValue::Integer(0),
+        ValueRule::AutoInteger {
+            min: 0,
+            max: 1099511627776
+        },
+        false,
+        "HIPFIRE_PLE_HOT_STORE_BYTES",
+        "Prewarm budget of the Qwen4 PLE hot-row store (bytes of the frequency-ranked `<model>.plehotrows` hot-row pack read into the page cache after load; rows the pack holds are read from it, everything else from the model file; unified-memory GPUs only, needs the `<model>.plehot` sidecar and the pack from `hipfire-quantize ple-hot-pack`). Default 0 (off). `auto` prewarms MemAvailable minus 4 GiB at ready, capped at the pack. The pack's pages are ordinary reclaimable page cache: they are dropped, never swapped, under memory pressure."
+    ),
+    process_field!(
+        "memory.ple_format",
+        "ple_format",
+        Memory,
+        DefaultValue::String("auto"),
+        ValueRule::Enum(&["auto", "q4", "q8"]),
+        false,
+        "HIPFIRE_PLE_FORMAT",
+        "Which PLE row table a Flash-Next (Qwen4) load reads: `q8` = the exact Q8 rows (embedded in a monolithic model, or the `<model>.ple-q8` sidecar of a split base), `q4` = the 4-bit Lloyd-Max rows (`<model>.ple-q4`, derived from the Q8 rows on first load when missing), `auto` = q4 on gfx1151 (unified-memory Strix Halo) and q8 elsewhere, using the other format when only that one is on disk (auto never derives or downloads)."
+    ),
+    process_field!(
+        "memory.ple_prewarm_bytes",
+        "ple_prewarm_bytes",
+        Memory,
+        DefaultValue::String("auto"),
+        ValueRule::AutoInteger {
+            min: 0,
+            max: 1099511627776
+        },
+        false,
+        "HIPFIRE_PLE_PREWARM_BYTES",
+        "Prewarm budget of the q4 PLE table (bytes of `<model>.ple-q4` read into the page cache after the model is ready, while no request runs; a rank-ordered table hottest tier first, then tier 0 again). Default `auto` = 15 GiB (the hottest rows), capped at MemAvailable minus 8 GiB at ready and at the table. `0` turns the prewarm off; an explicit N is that many bytes. The pages are ordinary reclaimable page cache: dropped, never swapped, under memory pressure, and not charged in admission."
+    ),
+    process_field!(
+        "memory.ple_load_fill_bytes",
+        "ple_load_fill_bytes",
+        Memory,
+        DefaultValue::String("auto"),
+        ValueRule::AutoInteger {
+            min: 0,
+            max: 1099511627776
+        },
+        false,
+        "HIPFIRE_PLE_LOAD_FILL_BYTES",
+        "Bytes of a rank-ordered q4 PLE table (`<model>.ple-q4`) read into the page cache while the model loads, hottest rows first, at no more than 0.2 GB/s so the weight upload keeps the drive, re-reading pages the upload's cache traffic evicted (hottest first) until ready; the prewarm after ready (`memory.ple_prewarm_bytes`) continues at the end of the resident prefix. Ready never waits for it: what is resident by then serves the first request. Default `auto` = 14 GiB, capped at the table, at an explicit `memory.ple_prewarm_bytes`, and at the host RAM available at load start (MemAvailable plus TTM's page pool) minus the weights the load puts in host RAM minus 8 GiB. `0` turns it off; an explicit N is that many bytes (same caps). Ordinary reclaimable page cache, not charged in admission."
     ),
     process_bool_field!(
         "memory.prompt_cache_unbounded",
@@ -3556,6 +3663,62 @@ pub fn canonical_config_key(key: &str) -> Option<String> {
         .or_else(|| is_developer_key(key).then(|| key.to_owned()))
 }
 
+/// A config key that shipped in a release and was later removed from the
+/// schema. Through its deprecation window (until `ignored_until`) a config
+/// file that still sets it loads with a warning and the value is ignored;
+/// keys that never shipped stay unknown and fail the load.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct RetiredConfigKey {
+    pub key: &'static str,
+    pub legacy_key: &'static str,
+    pub shipped_in: &'static str,
+    pub removed_in: &'static str,
+    pub ignored_until: &'static str,
+    pub reason: &'static str,
+}
+
+pub static RETIRED_CONFIG_KEYS: &[RetiredConfigKey] = &[RetiredConfigKey {
+    key: "kernel.mw16",
+    legacy_key: "mw16",
+    shipped_in: "0.3.1",
+    removed_in: "0.4.1",
+    ignored_until: "0.5.0",
+    reason: "the MW16 GEMM experiment was removed",
+}];
+
+pub fn retired_config_key(key: &str) -> Option<&'static RetiredConfigKey> {
+    RETIRED_CONFIG_KEYS
+        .iter()
+        .find(|retired| retired.key == key || retired.legacy_key == key)
+}
+
+/// The error for a key that is not in the schema: the removal message for a
+/// [`RETIRED_CONFIG_KEYS`] entry, otherwise [`ConfigError::UnknownKey`].
+pub fn unknown_key(key: &str) -> ConfigError {
+    match retired_config_key(key) {
+        Some(retired) => ConfigError::RetiredKey {
+            key: retired.key,
+            removed_in: retired.removed_in,
+            reason: retired.reason,
+        },
+        None => ConfigError::UnknownKey(key.to_owned()),
+    }
+}
+
+impl RetiredConfigKey {
+    fn warning(&self, path: &Path) -> String {
+        format!(
+            "ignored {} in {}: removed in {} ({}); the setting has no effect and is \
+             accepted with this warning until {} — delete it from the file",
+            self.key,
+            path.display(),
+            self.removed_in,
+            self.reason,
+            self.ignored_until
+        )
+    }
+}
+
 pub fn developer_env_for_key(key: &str) -> Option<String> {
     key.strip_prefix(DEVELOPER_PREFIX)
         .filter(|suffix| valid_developer_suffix(suffix))
@@ -3575,7 +3738,7 @@ impl ConfigLayer {
         } else if is_developer_key(key) {
             self.values.insert(key.to_owned(), value);
         } else {
-            return Err(ConfigError::UnknownKey(key.to_owned()));
+            return Err(unknown_key(key));
         }
         Ok(())
     }
@@ -3588,7 +3751,7 @@ impl ConfigLayer {
             // distinguish enum-like values such as `on` from boolean `1`.
             self.set(key, ConfigValue::String(raw.to_owned()))
         } else {
-            Err(ConfigError::UnknownKey(key.to_owned()))
+            Err(unknown_key(key))
         }
     }
 
@@ -3598,7 +3761,7 @@ impl ConfigLayer {
 
     pub fn remove(&mut self, key: &str) -> Result<Option<ConfigValue>> {
         let key =
-            canonical_config_key(key).ok_or_else(|| ConfigError::UnknownKey(key.to_owned()))?;
+            canonical_config_key(key).ok_or_else(|| unknown_key(key))?;
         Ok(self.values.remove(&key))
     }
 
@@ -3841,7 +4004,10 @@ fn legacy_table(config: &ProcessConfig) -> HashMap<String, String> {
         let Some(name) = developer_env_for_key(key) else {
             continue;
         };
-        if FIELDS.iter().any(|schema| schema.env_compat == Some(name.as_str())) {
+        if FIELDS
+            .iter()
+            .any(|schema| schema.env_compat == Some(name.as_str()))
+        {
             continue;
         }
         if let Some(value) = render_compat_value(value) {
@@ -4094,11 +4260,7 @@ pub fn mtp_ngram_enabled_for_arch(model_arch: u32, gpu_arch: &str) -> bool {
         gpu_arch,
     )
 }
-fn mtp_ngram_enabled_for_arch_value(
-    value: Option<&str>,
-    model_arch: u32,
-    gpu_arch: &str,
-) -> bool {
+fn mtp_ngram_enabled_for_arch_value(value: Option<&str>, model_arch: u32, gpu_arch: &str) -> bool {
     match value {
         Some("1" | "on") => true,
         Some("0" | "off") => false,
@@ -4152,9 +4314,8 @@ fn ngram_mod_triple_resolve(
     defaults: (usize, usize, usize),
     get: impl Fn(&str) -> Option<String>,
 ) -> (usize, usize, usize) {
-    let pick = |name: &str, default: usize| {
-        get(name).and_then(|s| s.parse().ok()).unwrap_or(default)
-    };
+    let pick =
+        |name: &str, default: usize| get(name).and_then(|s| s.parse().ok()).unwrap_or(default);
     (
         pick("HIPFIRE_NGRAM_MOD_N_MATCH", defaults.0),
         pick("HIPFIRE_NGRAM_MOD_N_MIN", defaults.1),
@@ -4383,12 +4544,12 @@ impl ConfigPaths {
 
 pub fn load_global(paths: &ConfigPaths) -> Result<LoadedConfig> {
     if paths.config_toml.exists() {
-        let layer = load_toml_layer(&paths.config_toml)?;
+        let (layer, warnings) = load_toml_layer_with_warnings(&paths.config_toml)?;
         return Ok(LoadedConfig {
             layer,
             path: paths.config_toml.clone(),
             format: ConfigFormat::Toml,
-            warnings: Vec::new(),
+            warnings,
         });
     }
     if paths.config_json.exists() {
@@ -4622,7 +4783,7 @@ fn validate_model_layer(layer: &ConfigLayer) -> Result<()> {
             });
         }
         let Some(schema) = field(key) else {
-            return Err(ConfigError::UnknownKey(key.clone()));
+            return Err(unknown_key(key));
         };
         if matches!(schema.scope, ConfigScope::Process | ConfigScope::Diagnostic) {
             return Err(ConfigError::InvalidValue {
@@ -4836,6 +4997,12 @@ fn migrate_legacy_aliases(
     }
 }
 
+/// Whether the legacy environment selects devices (`HIPFIRE_DEVICES` or its
+/// singular spelling `HIPFIRE_DEVICE`), without validating any other key.
+pub fn legacy_devices_env_set() -> bool {
+    env::var_os("HIPFIRE_DEVICES").is_some() || env::var_os("HIPFIRE_DEVICE").is_some()
+}
+
 pub fn load_env_layer() -> Result<ConfigLayer> {
     let mut layer = ConfigLayer::default();
     let mut stable_names = BTreeSet::new();
@@ -4893,7 +5060,15 @@ pub fn load_env_layer() -> Result<ConfigLayer> {
     Ok(layer)
 }
 
+/// Load a TOML config layer. Retired keys ([`RETIRED_CONFIG_KEYS`]) are
+/// dropped; use [`load_toml_layer_with_warnings`] to report them.
 pub fn load_toml_layer(path: &Path) -> Result<ConfigLayer> {
+    load_toml_layer_with_warnings(path).map(|(layer, _)| layer)
+}
+
+/// Load a TOML config layer, ignoring retired keys with one warning each.
+/// Every other unknown key still fails the load.
+pub fn load_toml_layer_with_warnings(path: &Path) -> Result<(ConfigLayer, Vec<String>)> {
     let raw = read_string(path)?;
     let table = toml::from_str::<toml::Table>(&raw).map_err(|source| ConfigError::Parse {
         path: path.to_owned(),
@@ -4910,10 +5085,17 @@ pub fn load_toml_layer(path: &Path) -> Result<ConfigLayer> {
     let mut flat = BTreeMap::new();
     flatten_toml("", &table, &mut flat, path)?;
     let mut layer = ConfigLayer::default();
+    let mut warnings = Vec::new();
     for (key, value) in flat {
+        if field(&key).is_none() {
+            if let Some(retired) = retired_config_key(&key) {
+                warnings.push(retired.warning(path));
+                continue;
+            }
+        }
         layer.set(&key, value)?;
     }
-    Ok(layer)
+    Ok((layer, warnings))
 }
 
 fn flatten_toml(
@@ -5428,7 +5610,10 @@ mod tests {
             values,
         };
         let table = legacy_table(&config);
-        let mut names: Vec<&str> = FIELDS.iter().filter_map(|schema| schema.env_compat).collect();
+        let mut names: Vec<&str> = FIELDS
+            .iter()
+            .filter_map(|schema| schema.env_compat)
+            .collect();
         names.extend([
             "HIPFIRE_DSPARK_Q8_WMMA",
             "HIPFIRE_NGRAM_WINDOW",
@@ -5819,6 +6004,106 @@ mod tests {
     }
 
     #[test]
+    fn retired_keys_warn_and_are_ignored() {
+        // kernel.mw16 shipped in 0.3.1/0.4.0 and was removed in 0.4.1. A file
+        // written by those releases must still load through the window.
+        for (name, body) in [
+            (
+                "canonical",
+                "schema_version = 1\n[kernel]\nmw16 = true\n[memory]\nmax_seq = 8192\n",
+            ),
+            (
+                "legacy",
+                "schema_version = 1\nmw16 = true\n[memory]\nmax_seq = 8192\n",
+            ),
+        ] {
+            let root = temp_root(&format!("retired-{name}"));
+            fs::create_dir_all(&root).unwrap();
+            let paths = ConfigPaths::under(&root);
+            fs::write(&paths.config_toml, body).unwrap();
+            let loaded = load_global(&paths).unwrap();
+            assert_eq!(loaded.format, ConfigFormat::Toml);
+            assert_eq!(
+                loaded.layer.get("memory.max_seq"),
+                Some(&ConfigValue::Integer(8192))
+            );
+            assert_eq!(
+                loaded.layer.values.len(),
+                1,
+                "{name}: retired key must be dropped"
+            );
+            assert_eq!(loaded.warnings.len(), 1, "{name}: {:?}", loaded.warnings);
+            let warning = &loaded.warnings[0];
+            for needle in ["kernel.mw16", "removed in 0.4.1", "until 0.5.0"] {
+                assert!(warning.contains(needle), "{name}: {warning}");
+            }
+            assert!(resolve([NamedLayer {
+                source: ConfigSource::GlobalUser { path: loaded.path },
+                layer: loaded.layer,
+            }])
+            .is_ok());
+            // Setting a retired key is still refused: it has no effect. The
+            // error names the removal instead of calling the key unknown.
+            let err = ConfigLayer::default()
+                .set_cli("kernel.mw16", "true")
+                .unwrap_err();
+            assert!(matches!(err, ConfigError::RetiredKey { key: "kernel.mw16", .. }));
+            assert!(err.to_string().contains("removed in 0.4.1"), "{err}");
+            assert!(matches!(
+                ConfigLayer::default().set_cli("mw16", "true"),
+                Err(ConfigError::RetiredKey { .. })
+            ));
+            assert!(matches!(
+                ConfigLayer::default().set_cli("kernel.mw17", "true"),
+                Err(ConfigError::UnknownKey(_))
+            ));
+            let _ = fs::remove_dir_all(root);
+        }
+    }
+
+    #[test]
+    fn unreleased_gfx11_iu4_swizzle_stays_unknown() {
+        // kernel.gfx11_iu4_swizzle only existed on the exp/gfx11-iu4-swizzle
+        // branch (c34c9ab3bc) and never shipped, so it is an unknown key, not
+        // a retired one. This is hipx's config written by that branch.
+        let hipx = "schema_version = 1\n\n[diagnostic]\ngemm_dump = false\n\n\
+                    [experimental.graph]\nforward = true\n\n[kernel]\n\
+                    gfx11_iu4_gridspec = true\ngfx11_iu4_shape = false\n\
+                    gfx11_iu4_swizzle = false\n\n[memory]\nmax_seq = 8192\n\n\
+                    [speculation]\ndflash = \"off\"\nmode = \"auto\"\nmtp = \"auto\"\n";
+        assert!(retired_config_key("kernel.gfx11_iu4_swizzle").is_none());
+        let root = temp_root("unreleased-swizzle");
+        fs::create_dir_all(&root).unwrap();
+        let paths = ConfigPaths::under(&root);
+        fs::write(&paths.config_toml, hipx).unwrap();
+        match load_global(&paths) {
+            Err(ConfigError::UnknownKey(key)) => assert_eq!(key, "kernel.gfx11_iu4_swizzle"),
+            other => panic!("expected UnknownKey, got {other:?}"),
+        }
+        fs::write(
+            &paths.config_toml,
+            hipx.replace("gfx11_iu4_swizzle = false\n", ""),
+        )
+        .unwrap();
+        let loaded = load_global(&paths).unwrap();
+        assert!(loaded.warnings.is_empty(), "{:?}", loaded.warnings);
+        let _ = fs::remove_dir_all(root);
+    }
+
+    #[test]
+    fn retired_keys_are_not_live_schema_keys() {
+        for retired in RETIRED_CONFIG_KEYS {
+            assert!(field(retired.key).is_none(), "{} is live", retired.key);
+            assert!(
+                field(retired.legacy_key).is_none(),
+                "{} is live",
+                retired.legacy_key
+            );
+            assert!(!retired.ignored_until.is_empty() && !retired.shipped_in.is_empty());
+        }
+    }
+
+    #[test]
     fn sparse_toml_roundtrip() {
         let root = temp_root("roundtrip");
         let paths = ConfigPaths::under(&root);
@@ -6054,7 +6339,10 @@ mod tests {
         .unwrap();
         let process = ProcessConfig::from_resolved(&resolved).unwrap();
 
-        assert_eq!(process.legacy_value("HIPFIRE_DETERMINISTIC").as_deref(), Some("1"));
+        assert_eq!(
+            process.legacy_value("HIPFIRE_DETERMINISTIC").as_deref(),
+            Some("1")
+        );
         assert_eq!(
             process.legacy_value("HIPFIRE_FLASH_ATTN_CK_LIB").as_deref(),
             Some("/opt/hipfire/ck.so")
@@ -6488,7 +6776,8 @@ mod tests {
 /// ([`GpuLayerBudget`]) and the admission arithmetic ([`largest_fitting_tail`]);
 /// the qwen35 load path consumes them to pick `i_gpu_start`.
 pub mod memory {
-    use super::process_value;
+    use super::{developer_var, process_value};
+    use std::path::{Path, PathBuf};
 
     /// Resident-layer budget for partial GPU offload (`memory.gpu_layer_budget`,
     /// compat env `HIPFIRE_GPU_LAYER_BUDGET`). Resolved once at load.
@@ -6557,6 +6846,191 @@ pub mod memory {
         process_value("HIPFIRE_SESSION_CACHE_BYTES")
             .and_then(|value| value.parse().ok())
             .unwrap_or(8589934592)
+    }
+
+    /// Prewarm budget request of the PLE hot-row store
+    /// (`memory.ple_hot_store_bytes`, compat env `HIPFIRE_PLE_HOT_STORE_BYTES`).
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum PleHotStoreBudget {
+        /// `auto`: the carrier picks the budget from `MemAvailable` when the
+        /// device, model, sidecar and pack allow it.
+        Auto,
+        /// An explicit byte budget; `0` (the default) is off.
+        Bytes(u64),
+    }
+
+    /// Pure parser behind [`ple_hot_store_bytes`]: unset and empty resolve
+    /// to off (`Bytes(0)`, the default), `auto` to [`PleHotStoreBudget::Auto`];
+    /// an integer is that budget; an unparseable value (the config layer
+    /// rejects those before they get here) fails closed to off.
+    pub fn parse_ple_hot_store_bytes(raw: Option<&str>) -> PleHotStoreBudget {
+        match raw.map(str::trim) {
+            Some(v) if v.eq_ignore_ascii_case("auto") => PleHotStoreBudget::Auto,
+            Some(v) if !v.is_empty() => v
+                .parse::<u64>()
+                .map(PleHotStoreBudget::Bytes)
+                .unwrap_or(PleHotStoreBudget::Bytes(0)),
+            _ => PleHotStoreBudget::Bytes(0),
+        }
+    }
+
+    /// Configured PLE hot-store budget from the process snapshot.
+    pub fn ple_hot_store_bytes() -> PleHotStoreBudget {
+        parse_ple_hot_store_bytes(process_value("HIPFIRE_PLE_HOT_STORE_BYTES").as_deref())
+    }
+
+    /// Which PLE row table a Flash-Next (Qwen4) load reads: the exact Q8F16
+    /// rows or the 4-bit Lloyd-Max rows derived from them.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum PleFormat {
+        /// 4-bit Lloyd-Max rows (`<model>.ple-q4`).
+        Q4,
+        /// Exact Q8F16 rows (embedded in a monolithic model, or `<model>.ple-q8`).
+        Q8,
+    }
+
+    impl PleFormat {
+        /// Spelling used in the config value and in messages.
+        pub fn name(self) -> &'static str {
+            match self {
+                PleFormat::Q4 => "q4",
+                PleFormat::Q8 => "q8",
+            }
+        }
+
+        /// Sidecar extension appended to the model file name (without the dot).
+        pub fn sidecar_suffix(self) -> &'static str {
+            match self {
+                PleFormat::Q4 => "ple-q4",
+                PleFormat::Q8 => "ple-q8",
+            }
+        }
+
+        /// Inverse of [`PleFormat::name`].
+        pub fn from_name(name: &str) -> Option<Self> {
+            match name {
+                "q4" => Some(PleFormat::Q4),
+                "q8" => Some(PleFormat::Q8),
+                _ => None,
+            }
+        }
+    }
+
+    /// The `memory.ple_format` request (compat env `HIPFIRE_PLE_FORMAT`).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum PleFormatRequest {
+        /// q4 on the unified-memory Strix Halo (`gfx1151`), q8 elsewhere; never
+        /// derives or downloads a missing sidecar.
+        Auto,
+        /// 4-bit rows; derived from the Q8 rows on first load when missing.
+        Q4,
+        /// Exact Q8 rows.
+        Q8,
+    }
+
+    impl PleFormatRequest {
+        /// Parse a config spelling (`auto`, `q4`, `q8`; trimmed, case-insensitive).
+        pub fn parse(s: &str) -> Option<Self> {
+            match s.trim().to_ascii_lowercase().as_str() {
+                "auto" => Some(PleFormatRequest::Auto),
+                "q4" => Some(PleFormatRequest::Q4),
+                "q8" => Some(PleFormatRequest::Q8),
+                _ => None,
+            }
+        }
+
+        /// The config spelling of this request.
+        pub fn name(self) -> &'static str {
+            match self {
+                PleFormatRequest::Auto => "auto",
+                PleFormatRequest::Q4 => "q4",
+                PleFormatRequest::Q8 => "q8",
+            }
+        }
+
+        /// The format this request prefers on `gpu_arch`. `Auto` picks q4 only
+        /// on `gfx1151` (the unified-memory Strix Halo) and keeps q8 elsewhere
+        /// until there is evidence for another arch.
+        pub fn resolve(self, gpu_arch: &str) -> PleFormat {
+            match self {
+                PleFormatRequest::Q4 => PleFormat::Q4,
+                PleFormatRequest::Q8 => PleFormat::Q8,
+                PleFormatRequest::Auto if gpu_arch == "gfx1151" => PleFormat::Q4,
+                PleFormatRequest::Auto => PleFormat::Q8,
+            }
+        }
+    }
+
+    /// Pure parser behind [`ple_format`]: unset, empty and unparseable values
+    /// (the config layer rejects those before they get here) resolve to `auto`.
+    pub fn parse_ple_format(raw: Option<&str>) -> PleFormatRequest {
+        raw.and_then(PleFormatRequest::parse)
+            .unwrap_or(PleFormatRequest::Auto)
+    }
+
+    /// Configured PLE row format request from the process snapshot.
+    pub fn ple_format() -> PleFormatRequest {
+        parse_ple_format(process_value("HIPFIRE_PLE_FORMAT").as_deref())
+    }
+
+    /// Pure parser behind [`ple_prewarm_bytes`]: like
+    /// [`parse_ple_hot_store_bytes`] but unset and empty resolve to `auto`
+    /// (the key's default), not off.
+    pub fn parse_ple_prewarm_bytes(raw: Option<&str>) -> PleHotStoreBudget {
+        match raw.map(str::trim) {
+            None | Some("") => PleHotStoreBudget::Auto,
+            other => parse_ple_hot_store_bytes(other),
+        }
+    }
+
+    /// Prewarm budget of the q4 PLE sidecar page-cache prewarm
+    /// (`memory.ple_prewarm_bytes`, compat env `HIPFIRE_PLE_PREWARM_BYTES`):
+    /// `Auto` (default) = 15 GiB, capped at `MemAvailable` minus 8 GiB at ready
+    /// and at the sidecar's data bytes; `Bytes(0)` = off; `Bytes(n)` = that many bytes.
+    pub fn ple_prewarm_bytes() -> PleHotStoreBudget {
+        parse_ple_prewarm_bytes(process_value("HIPFIRE_PLE_PREWARM_BYTES").as_deref())
+    }
+
+    /// Bytes of the rank-ordered q4 PLE table read during model load
+    /// (`memory.ple_load_fill_bytes`, compat env `HIPFIRE_PLE_LOAD_FILL_BYTES`;
+    /// parsed like [`parse_ple_prewarm_bytes`]): `Auto` (default) = 14 GiB,
+    /// `Bytes(0)` = off, `Bytes(n)` = that many bytes.  The loader caps it at
+    /// the table, an explicit prewarm budget and the host memory left after
+    /// the weights.
+    pub fn ple_load_fill_bytes() -> PleHotStoreBudget {
+        parse_ple_prewarm_bytes(process_value("HIPFIRE_PLE_LOAD_FILL_BYTES").as_deref())
+    }
+
+    /// Path of the PLE sidecar of `model`: `<model file name>.ple-q4` /
+    /// `.ple-q8`, appended to the full file name (extension included).
+    pub fn ple_sidecar_path(model: &Path, format: PleFormat) -> PathBuf {
+        let mut path = model.as_os_str().to_owned();
+        path.push(".");
+        path.push(format.sidecar_suffix());
+        PathBuf::from(path)
+    }
+
+    /// Optional override of the PLE hot-rank sidecar path
+    /// (`HIPFIRE_PLE_HOT_RANK_FILE`); empty or unset means `<model>.plehot`.
+    pub fn ple_hot_rank_file() -> Option<String> {
+        developer_var("HIPFIRE_PLE_HOT_RANK_FILE")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+    }
+
+    /// Optional override of the PLE hot-row pack path
+    /// (`HIPFIRE_PLE_HOT_PACK_FILE`); empty or unset means
+    /// `<model>.plehotrows`.
+    pub fn ple_hot_pack_file() -> Option<String> {
+        developer_var("HIPFIRE_PLE_HOT_PACK_FILE")
+            .ok()
+            .filter(|v| !v.trim().is_empty())
+    }
+
+    /// PLE fetch timing on stderr, one line per prefill-chunk fetch
+    /// (`HIPFIRE_PLE_HOT_DEBUG=1`, developer variable).
+    pub fn ple_hot_debug() -> bool {
+        developer_var("HIPFIRE_PLE_HOT_DEBUG").is_ok_and(|v| v == "1")
     }
 
     /// Which engine executes the ops that read a spilled layer's weights
@@ -6722,6 +7196,265 @@ pub mod memory {
             // closed to full residency rather than forcing an offload.
             assert_eq!(parse_gpu_layer_budget(Some("banana")), GpuLayerBudget::Full);
             assert_eq!(parse_gpu_layer_budget(Some("-2")), GpuLayerBudget::Full);
+        }
+
+        #[test]
+        fn ple_hot_store_bytes_parse() {
+            assert_eq!(parse_ple_hot_store_bytes(None), PleHotStoreBudget::Bytes(0));
+            assert_eq!(
+                parse_ple_hot_store_bytes(Some("")),
+                PleHotStoreBudget::Bytes(0)
+            );
+            assert_eq!(
+                parse_ple_hot_store_bytes(Some("auto")),
+                PleHotStoreBudget::Auto
+            );
+            assert_eq!(
+                parse_ple_hot_store_bytes(Some("0")),
+                PleHotStoreBudget::Bytes(0)
+            );
+            assert_eq!(
+                parse_ple_hot_store_bytes(Some(" 16000000000 ")),
+                PleHotStoreBudget::Bytes(16_000_000_000)
+            );
+            assert_eq!(
+                parse_ple_hot_store_bytes(Some("-1")),
+                PleHotStoreBudget::Bytes(0)
+            );
+            let field = crate::FIELDS
+                .iter()
+                .find(|field| field.key == "memory.ple_hot_store_bytes")
+                .expect("ple_hot_store_bytes is in the schema");
+            assert!(field
+                .validate(&crate::ConfigValue::String("auto".into()))
+                .is_ok());
+            assert!(field.validate(&crate::ConfigValue::Integer(0)).is_ok());
+            assert!(field
+                .validate(&crate::ConfigValue::String("on".into()))
+                .is_err());
+            assert!(field.validate(&crate::ConfigValue::Integer(-1)).is_err());
+            assert!(matches!(
+                field.parse_cli("auto"),
+                Ok(crate::ConfigValue::String(_))
+            ));
+            assert!(matches!(
+                field.parse_cli("42"),
+                Ok(crate::ConfigValue::Integer(42))
+            ));
+        }
+
+        #[test]
+        fn ple_format_parse_resolve_and_names() {
+            assert_eq!(
+                PleFormatRequest::parse("auto"),
+                Some(PleFormatRequest::Auto)
+            );
+            assert_eq!(PleFormatRequest::parse("q4"), Some(PleFormatRequest::Q4));
+            assert_eq!(PleFormatRequest::parse(" Q8 "), Some(PleFormatRequest::Q8));
+            assert_eq!(PleFormatRequest::parse(""), None);
+            assert_eq!(PleFormatRequest::parse("q5"), None);
+            for request in [
+                PleFormatRequest::Auto,
+                PleFormatRequest::Q4,
+                PleFormatRequest::Q8,
+            ] {
+                assert_eq!(PleFormatRequest::parse(request.name()), Some(request));
+            }
+            assert_eq!(PleFormat::from_name("q4"), Some(PleFormat::Q4));
+            assert_eq!(PleFormat::from_name("q8"), Some(PleFormat::Q8));
+            assert_eq!(PleFormat::from_name("auto"), None);
+            assert_eq!(PleFormat::Q4.name(), "q4");
+            assert_eq!(PleFormat::Q8.name(), "q8");
+            assert_eq!(PleFormat::Q4.sidecar_suffix(), "ple-q4");
+            assert_eq!(PleFormat::Q8.sidecar_suffix(), "ple-q8");
+            // Explicit requests ignore the arch; auto is q4 only on gfx1151.
+            for arch in ["gfx1151", "gfx1100", "gfx1201", ""] {
+                assert_eq!(PleFormatRequest::Q4.resolve(arch), PleFormat::Q4);
+                assert_eq!(PleFormatRequest::Q8.resolve(arch), PleFormat::Q8);
+            }
+            assert_eq!(PleFormatRequest::Auto.resolve("gfx1151"), PleFormat::Q4);
+            assert_eq!(PleFormatRequest::Auto.resolve("gfx1100"), PleFormat::Q8);
+            assert_eq!(PleFormatRequest::Auto.resolve("gfx1201"), PleFormat::Q8);
+            assert_eq!(PleFormatRequest::Auto.resolve(""), PleFormat::Q8);
+        }
+
+        #[test]
+        fn ple_sidecar_path_appends_to_full_file_name() {
+            let model = Path::new("/m/qwen3.8-flash-next-base.mq4-xts");
+            assert_eq!(
+                ple_sidecar_path(model, PleFormat::Q4),
+                PathBuf::from("/m/qwen3.8-flash-next-base.mq4-xts.ple-q4")
+            );
+            assert_eq!(
+                ple_sidecar_path(model, PleFormat::Q8),
+                PathBuf::from("/m/qwen3.8-flash-next-base.mq4-xts.ple-q8")
+            );
+            assert_eq!(
+                ple_sidecar_path(Path::new("model"), PleFormat::Q4),
+                PathBuf::from("model.ple-q4")
+            );
+        }
+
+        #[test]
+        fn ple_format_key_defaults_auto_with_env_override() {
+            let field = crate::FIELDS
+                .iter()
+                .find(|field| field.key == "memory.ple_format")
+                .expect("ple_format is in the schema");
+            assert_eq!(field.legacy_key, "ple_format");
+            assert_eq!(field.env_compat, Some("HIPFIRE_PLE_FORMAT"));
+            assert_eq!(
+                field.default.to_value(),
+                crate::ConfigValue::String("auto".into())
+            );
+            for value in ["auto", "q4", "q8"] {
+                assert_eq!(
+                    field.parse_cli(value).unwrap(),
+                    crate::ConfigValue::String(value.into())
+                );
+            }
+            assert!(field.parse_cli("q5").is_err());
+            assert!(field.validate(&crate::ConfigValue::Integer(4)).is_err());
+            // HIPFIRE_PLE_FORMAT is unique to this test; no other test reads it.
+            std::env::set_var("HIPFIRE_PLE_FORMAT", "q4");
+            let env_layer = crate::load_env_layer().expect("env layer");
+            std::env::remove_var("HIPFIRE_PLE_FORMAT");
+            let process = crate::ProcessConfig::from_resolved(
+                &crate::resolve([crate::NamedLayer {
+                    source: crate::ConfigSource::LegacyEnv {
+                        name: "HIPFIRE_PLE_FORMAT".into(),
+                    },
+                    layer: env_layer,
+                }])
+                .expect("env resolve"),
+            )
+            .expect("process");
+            let raw = process.legacy_value("HIPFIRE_PLE_FORMAT");
+            assert_eq!(raw.as_deref(), Some("q4"));
+            assert_eq!(parse_ple_format(raw.as_deref()), PleFormatRequest::Q4);
+            // Unset or unparseable resolves to the default.
+            let defaults =
+                crate::ProcessConfig::from_resolved(&crate::resolve([]).expect("empty resolve"))
+                    .expect("process");
+            assert_eq!(
+                parse_ple_format(defaults.legacy_value("HIPFIRE_PLE_FORMAT").as_deref()),
+                PleFormatRequest::Auto
+            );
+            assert_eq!(parse_ple_format(None), PleFormatRequest::Auto);
+            assert_eq!(parse_ple_format(Some("bogus")), PleFormatRequest::Auto);
+        }
+
+        #[test]
+        fn ple_prewarm_bytes_defaults_auto_with_env_override() {
+            assert_eq!(parse_ple_prewarm_bytes(None), PleHotStoreBudget::Auto);
+            assert_eq!(parse_ple_prewarm_bytes(Some("")), PleHotStoreBudget::Auto);
+            assert_eq!(parse_ple_prewarm_bytes(Some("  ")), PleHotStoreBudget::Auto);
+            assert_eq!(
+                parse_ple_prewarm_bytes(Some("auto")),
+                PleHotStoreBudget::Auto
+            );
+            assert_eq!(
+                parse_ple_prewarm_bytes(Some("0")),
+                PleHotStoreBudget::Bytes(0)
+            );
+            assert_eq!(
+                parse_ple_prewarm_bytes(Some(" 16000000000 ")),
+                PleHotStoreBudget::Bytes(16_000_000_000)
+            );
+            // An unparseable value (the config layer rejects those first) fails
+            // closed to off, like the hot-store budget.
+            assert_eq!(
+                parse_ple_prewarm_bytes(Some("-1")),
+                PleHotStoreBudget::Bytes(0)
+            );
+            let field = crate::FIELDS
+                .iter()
+                .find(|field| field.key == "memory.ple_prewarm_bytes")
+                .expect("ple_prewarm_bytes is in the schema");
+            assert_eq!(field.legacy_key, "ple_prewarm_bytes");
+            assert_eq!(field.env_compat, Some("HIPFIRE_PLE_PREWARM_BYTES"));
+            assert_eq!(
+                field.default.to_value(),
+                crate::ConfigValue::String("auto".into())
+            );
+            assert!(field
+                .validate(&crate::ConfigValue::String("auto".into()))
+                .is_ok());
+            assert!(field.validate(&crate::ConfigValue::Integer(0)).is_ok());
+            assert!(field
+                .validate(&crate::ConfigValue::String("on".into()))
+                .is_err());
+            assert!(field.validate(&crate::ConfigValue::Integer(-1)).is_err());
+            assert!(matches!(
+                field.parse_cli("auto"),
+                Ok(crate::ConfigValue::String(_))
+            ));
+            assert!(matches!(
+                field.parse_cli("42"),
+                Ok(crate::ConfigValue::Integer(42))
+            ));
+            // HIPFIRE_PLE_PREWARM_BYTES is unique to this test; no other test reads it.
+            std::env::set_var("HIPFIRE_PLE_PREWARM_BYTES", "0");
+            let env_layer = crate::load_env_layer().expect("env layer");
+            std::env::remove_var("HIPFIRE_PLE_PREWARM_BYTES");
+            let process = crate::ProcessConfig::from_resolved(
+                &crate::resolve([crate::NamedLayer {
+                    source: crate::ConfigSource::LegacyEnv {
+                        name: "HIPFIRE_PLE_PREWARM_BYTES".into(),
+                    },
+                    layer: env_layer,
+                }])
+                .expect("env resolve"),
+            )
+            .expect("process");
+            let raw = process.legacy_value("HIPFIRE_PLE_PREWARM_BYTES");
+            assert_eq!(raw.as_deref(), Some("0"));
+            assert_eq!(
+                parse_ple_prewarm_bytes(raw.as_deref()),
+                PleHotStoreBudget::Bytes(0)
+            );
+            // Without the env the default (auto) resolves.
+            let defaults =
+                crate::ProcessConfig::from_resolved(&crate::resolve([]).expect("empty resolve"))
+                    .expect("process");
+            assert_eq!(
+                parse_ple_prewarm_bytes(
+                    defaults
+                        .legacy_value("HIPFIRE_PLE_PREWARM_BYTES")
+                        .as_deref()
+                ),
+                PleHotStoreBudget::Auto
+            );
+        }
+
+        #[test]
+        fn ple_load_fill_bytes_is_an_auto_integer_defaulting_to_auto() {
+            let field = crate::FIELDS
+                .iter()
+                .find(|field| field.key == "memory.ple_load_fill_bytes")
+                .expect("ple_load_fill_bytes is in the schema");
+            assert_eq!(field.legacy_key, "ple_load_fill_bytes");
+            assert_eq!(field.env_compat, Some("HIPFIRE_PLE_LOAD_FILL_BYTES"));
+            assert_eq!(
+                field.default.to_value(),
+                crate::ConfigValue::String("auto".into())
+            );
+            assert!(field
+                .validate(&crate::ConfigValue::String("auto".into()))
+                .is_ok());
+            assert!(field.validate(&crate::ConfigValue::Integer(0)).is_ok());
+            assert!(field.validate(&crate::ConfigValue::Integer(-1)).is_err());
+            let defaults =
+                crate::ProcessConfig::from_resolved(&crate::resolve([]).expect("empty resolve"))
+                    .expect("process");
+            assert_eq!(
+                parse_ple_prewarm_bytes(
+                    defaults
+                        .legacy_value("HIPFIRE_PLE_LOAD_FILL_BYTES")
+                        .as_deref()
+                ),
+                PleHotStoreBudget::Auto
+            );
         }
 
         #[test]

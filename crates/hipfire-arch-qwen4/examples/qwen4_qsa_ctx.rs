@@ -841,6 +841,7 @@ fn main() -> Result<()> {
     let vocab = receipt.config.vocab_size;
     let mut bundle = Qwen4Bundle::assemble_with_metadata(
         receipt.config,
+        &receipt.manifest.identity.recipe,
         transaction,
         &receipt.placements,
         &mut gpu,

@@ -17,6 +17,7 @@ arch-qwen35-vl = ["dep:hipfire-arch-qwen35-vl"]
 arch-llama = ["dep:hipfire-arch-llama"]
 arch-qwen2 = ["dep:hipfire-arch-qwen2"]
 arch-deepseek4 = ["dep:hipfire-arch-deepseek4"]
+qwen4-dev-profiles = ["hipfire-arch-qwen4/qwen4-dev-profiles"]
 # Test-only: compile the HIPFIRE_EP_FAIL_RANK partial-load fault injector. OFF by
 # default so production builds can never synthetically fail an EP load.
 ep-fault-inject = []

@@ -102,7 +102,8 @@ mod tests {
         let mut program = Program {
             target: Target { arch: Arch::Gfx1201, xnack: Setting::Any, sramecc: Setting::Any, abi_version: 4 },
             kernels: vec![Kernel { symbol: SymbolId("test".into()), wave: Wave::Wave32,
-                abi: Abi::Raw { user_sgprs: vec![], wave: Wave::Wave32, lds_bytes: 0, sidecar_sha256: [0; 32] },
+                abi: Abi::Raw(inst::RawAbi { wave: Wave::Wave32, resources: Default::default(), fp: Default::default(),
+                    relocations: vec![], entry: vec![], sidecar_sha256: [0; 32] }),
                 body, origin: KernelOrigin::Authored { builder_crate: "test".into(), version: "1".into(), git: "0".into() } }],
             source: None,
         };
@@ -112,6 +113,54 @@ mod tests {
         program.kernels[0].body.blocks[0].term = Terminator::EndPgm;
         program.kernels[0].wave = Wave::Wave64;
         assert!(matches!(&program.validate(), Err(inst::ValidateError::Layout(reason)) if reason.contains("raw ABI wave")));
+    }
+
+    #[test]
+    fn raw_abi_rejects_malformed_entry_facts_and_resources() {
+        use inst::{Axis, EntryFact, EntryLoc, EntryValue, FpState, LocalIdField, RawAbi, RawResources, Relocation, Wave};
+        use operand::Special;
+        use reg::{Kind, RegRef};
+        let reg = |kind, base, len| EntryLoc::Reg(RegRef { kind, base, len });
+        let fact = |loc, value| EntryFact { loc, value };
+        let good = RawAbi {
+            wave: Wave::Wave32,
+            resources: RawResources { vgprs_actual: 4, vgprs_allocated: 8, sgprs_actual: 4, sgprs_allocated: 8, ..Default::default() },
+            fp: FpState::default(), relocations: vec![], sidecar_sha256: [0; 32],
+            entry: vec![
+                fact(reg(Kind::S, 0, 2), EntryValue::Defined),
+                fact(reg(Kind::Ttmp, 9, 1), EntryValue::WorkgroupId(Axis::X)),
+                fact(reg(Kind::V, 0, 1), EntryValue::LocalId(vec![LocalIdField { axis: Axis::X, shift: 0, bits: 10, max: 31 }])),
+                fact(EntryLoc::Special(Special::Exec), EntryValue::Defined),
+                fact(reg(Kind::S, 2, 1), EntryValue::Exact(7)),
+                fact(reg(Kind::S, 3, 1), EntryValue::Bounded { min: 0, max: 255 }),
+            ],
+        };
+        good.validate().unwrap();
+        let cells = good.entry_cells().unwrap();
+        assert!(cells.iter().any(|(c, _)| *c == inst::EntryCell::ExecLo));
+        assert!(!cells.iter().any(|(c, _)| *c == inst::EntryCell::ExecHi), "wave32 EXEC is one dword");
+        assert!(!cells.iter().any(|(c, _)| *c == inst::EntryCell::VccLo), "VCC is undefined unless declared");
+        let reject = |mutate: &dyn Fn(&mut RawAbi)| {
+            let mut abi = good.clone();
+            mutate(&mut abi);
+            assert!(matches!(abi.validate(), Err(inst::ValidateError::RawAbi(_))), "{abi:?}");
+        };
+        reject(&|a| a.entry.push(fact(reg(Kind::S, 1, 1), EntryValue::Defined)));
+        reject(&|a| a.entry.push(fact(reg(Kind::S, 6, 2), EntryValue::Exact(0))));
+        reject(&|a| a.entry.push(fact(reg(Kind::S, 7, 1), EntryValue::Bounded { min: 2, max: 1 })));
+        reject(&|a| a.entry.push(fact(EntryLoc::Special(Special::ExecHi), EntryValue::Defined)));
+        reject(&|a| a.entry.push(fact(EntryLoc::Special(Special::Null), EntryValue::Defined)));
+        reject(&|a| a.entry.push(fact(reg(Kind::V, 8, 1), EntryValue::Defined)));
+        reject(&|a| a.entry.push(fact(reg(Kind::S, 8, 1), EntryValue::Defined)));
+        reject(&|a| a.entry.push(fact(reg(Kind::V, 1, 1), EntryValue::WorkgroupId(Axis::Y))));
+        reject(&|a| a.entry.push(fact(reg(Kind::V, 2, 2), EntryValue::LocalId(vec![LocalIdField { axis: Axis::X, shift: 0, bits: 4, max: 3 }]))));
+        reject(&|a| a.entry.push(fact(reg(Kind::V, 2, 1), EntryValue::LocalId(vec![
+            LocalIdField { axis: Axis::X, shift: 0, bits: 10, max: 31 }, LocalIdField { axis: Axis::Y, shift: 9, bits: 10, max: 31 }]))));
+        reject(&|a| a.entry.push(fact(reg(Kind::V, 2, 1), EntryValue::LocalId(vec![LocalIdField { axis: Axis::X, shift: 0, bits: 4, max: 16 }]))));
+        reject(&|a| a.fp.round32 = 4);
+        reject(&|a| a.fp.exceptions = 0x200);
+        reject(&|a| a.resources.vgprs_actual = 9);
+        reject(&|a| a.relocations.push(Relocation { offset: 2, r_type: 1, symbol: "s".into(), addend: 0 }));
     }
 
     #[test]

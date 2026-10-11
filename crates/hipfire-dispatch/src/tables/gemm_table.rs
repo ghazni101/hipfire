@@ -454,6 +454,18 @@ pub fn populate(registry: &mut KernelRegistry) {
         has_awq: false,
         tile: TileImpl::None,
     });
+    // Explicit exact verify residual (1..=128 rows, singleton F16-WMMA chain).
+    // Only reachable via an explicit key for `DenseBatchMath::SingletonWmma`;
+    // never selected by dtype. The Gpu method fails closed off gfx1201 itself,
+    // so the predicate matches the wrapper.
+    registry.register(KernelVariant {
+        key: KernelKey::GemmMq4G256V2ResidualVerifyExact,
+        arch_required: ArchPredicate::IsGfx1201,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
     registry.register(KernelVariant {
         key: KernelKey::GemmMq3G256V2Residual,
         arch_required: ArchPredicate::HasWmma,
@@ -489,6 +501,18 @@ pub fn populate(registry: &mut KernelRegistry) {
     registry.register(KernelVariant {
         key: KernelKey::GemmMq4G256V2BatchedLmhead,
         arch_required: ArchPredicate::HasWmma,
+        shape_gate: None,
+        steps: &[PipelineOp::Gemv],
+        has_awq: false,
+        tile: TileImpl::None,
+    });
+    // Explicit exact verify lm_head (1..=128 rows, singleton F16-WMMA chain).
+    // Only reachable via an explicit key for `DenseBatchMath::SingletonWmma`;
+    // never selected by dtype. The Gpu method fails closed off gfx1201 itself,
+    // so the predicate matches the wrapper.
+    registry.register(KernelVariant {
+        key: KernelKey::GemmMq4G256V2LmheadVerifyExact,
+        arch_required: ArchPredicate::IsGfx1201,
         shape_gate: None,
         steps: &[PipelineOp::Gemv],
         has_awq: false,

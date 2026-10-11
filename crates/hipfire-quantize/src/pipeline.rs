@@ -758,6 +758,11 @@ fn is_early_special_format(format: &str) -> bool {
 /// Which `run()` path these arguments dispatch to (same precedence as `run()`).
 fn route_for(args: &QuantizeArgs) -> crate::cli::Route {
     use crate::cli::Route;
+    #[cfg(feature = "qwen4-dev-profiles")]
+    if args.qwen4_dev_tiny.is_some() {
+        // clap makes this exclusive with --flux-pipe and --qwen4-flash-next.
+        return Route::Qwen4DevTiny;
+    }
     if args.flux_pipe.is_some() {
         Route::Flux
     } else if args.qwen4_flash_next {
@@ -846,6 +851,53 @@ pub(crate) fn run() {
             }
             Err(error) => {
                 eprintln!("error: qwen4 streaming pack: {error}");
+                std::process::exit(2);
+            }
+        }
+    }
+
+    // ── Developer-only complete tiny Qwen4 checkpoint ───────────────────
+    // Feature-gated; consumes only --input/--output/--qwen4-dev-tiny and is
+    // dispatched to its own producer entry, never to the Flash-Next path.
+    #[cfg(feature = "qwen4-dev-profiles")]
+    if let Some(encoding) = args.qwen4_dev_tiny.as_deref() {
+        let encoding = match encoding {
+            "source-exact" => crate::qwen4::Qwen4DevTinyEncoding::SourceExact,
+            "packed" => crate::qwen4::Qwen4DevTinyEncoding::Packed,
+            other => {
+                eprintln!(
+                    "error: --qwen4-dev-tiny unknown encoding '{other}' \
+                     (expected source-exact|packed)"
+                );
+                std::process::exit(2);
+            }
+        };
+        let input = args
+            .input
+            .as_deref()
+            .expect("--input is required with --qwen4-dev-tiny");
+        if input.starts_with("hf://") {
+            eprintln!(
+                "error: --qwen4-dev-tiny needs a local safetensors directory, not '{input}'"
+            );
+            std::process::exit(2);
+        }
+        match crate::qwen4::run_dev_tiny_cli(Path::new(input), Path::new(&args.output), encoding) {
+            Ok(summary) => {
+                eprintln!(
+                    "qwen4 dev-tiny: wrote {} ({} entries: {} experts; \
+                     resident={} bytes; predicted={} bytes, scratch_high_water={} bytes)",
+                    args.output,
+                    summary.entries,
+                    summary.expert_entries,
+                    summary.resident_bytes,
+                    summary.predicted_output_bytes,
+                    summary.scratch_high_water_bytes
+                );
+                return;
+            }
+            Err(error) => {
+                eprintln!("error: qwen4 dev-tiny pack: {error}");
                 std::process::exit(2);
             }
         }

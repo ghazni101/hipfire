@@ -12,6 +12,7 @@ use crate::cpu_exec;
 use crate::families::fused_qkv::{FusedQkvBiasParams, FusedQkvFamily, FusedQkvParams};
 use crate::families::gemv::{GemvFamily, GemvParams, RotateInputs, WeightRef};
 use crate::families::rotation::{RotationFamily, RotationParams};
+use crate::pipeline::layer_ops::MixerPhase;
 use crate::pipeline::sealed_moe;
 use crate::types::GemvVariant;
 use crate::types::{DispatchError, KernelKey, PipelineOp, RotationPlan, RotationVariant};
@@ -104,6 +105,10 @@ pub enum Step<'a> {
     Project(crate::pipeline::layer_ops::ProjectOp<'a>),
     /// Per-row broadcast add of one activation row.
     BroadcastAdd(crate::pipeline::layer_ops::BroadcastAddOp<'a>),
+    /// Dense gated feed-forward block (gate/up projections, SiLU product,
+    /// down projection) with the source's BF16 storage boundaries.  Opaque to
+    /// fusion: no HC read/write pairing or epilogue fold crosses it.
+    DenseFfn(crate::pipeline::layer_ops::DenseFfnOp<'a>),
     /// Complete validated MoE program; granular operands come from its shared lowerer.
     Moe(sealed_moe::SealedMoeCall<'a>),
     /// Validated granular MoE stage; the sealed call is still the public authority.
@@ -135,6 +140,7 @@ fn op_kind(step: &Step) -> Option<PipelineOp> {
         | Step::Project(_)
         | Step::BroadcastAdd(_)
         | Step::Moe(_)
+        | Step::DenseFfn(_)
         | Step::MoeStage(..) => None,
     }
 }
@@ -756,6 +762,7 @@ pub fn validate_steps<'a>(gpu: &Gpu, steps: &[Step<'a>]) -> Result<(), DispatchE
             Step::HyperNorm(op) => op.validate_for_gpu(gpu)?,
             Step::Project(op) => op.validate_for_gpu(gpu)?,
             Step::BroadcastAdd(op) => op.validate_for_gpu(gpu)?,
+            Step::DenseFfn(op) => op.validate_for_gpu(gpu)?,
             _ => {}
         }
     }
@@ -865,7 +872,11 @@ pub fn execute_validated_steps_with_moe_hooks<'a>(
                 // write already has its gates carries that write in its output
                 // projection's epilogue; unfused when its projection is not
                 // covered (the write then runs pregated as at level 1).
-                Step::GatedDeltaNet(op) if hc_level >= 2 && pregated == Some(i + 1) => {
+                Step::GatedDeltaNet(op)
+                    if hc_level >= 2
+                        && pregated == Some(i + 1)
+                        && matches!(op.phase, MixerPhase::Whole | MixerPhase::OutProj) =>
+                {
                     if let Step::HyperWrite(write) = &steps[i + 1] {
                         let mut fused = false;
                         execute_gated_delta_net_hc(gpu, op, Some(write), &mut fused)?;
@@ -877,7 +888,11 @@ pub fn execute_validated_steps_with_moe_hooks<'a>(
                         continue;
                     }
                 }
-                Step::IndexedAttention(op) if hc_level >= 2 && pregated == Some(i + 1) => {
+                Step::IndexedAttention(op)
+                    if hc_level >= 2
+                        && pregated == Some(i + 1)
+                        && matches!(op.phase, MixerPhase::Whole | MixerPhase::OutProj) =>
+                {
                     if let Step::HyperWrite(write) = &steps[i + 1] {
                         let mut fused = false;
                         execute_indexed_attention_hc(gpu, op, Some(write), &mut fused)?;
@@ -1016,10 +1031,18 @@ pub fn execute_validated_steps_with_moe_hooks<'a>(
                 // first rotate, cleared after that step).
                 let mixed = read.mixed.buf.as_ptr();
                 let rotate_into = match steps.get(i + if clear.is_some() { 3 } else { 2 }) {
-                    Some(Step::GatedDeltaNet(op)) if op.input.buf.as_ptr() == mixed => {
+                    // Only a phase that rotates its `input` can take the read's
+                    // rotation: the core and the output projection never do.
+                    Some(Step::GatedDeltaNet(op))
+                        if op.input.buf.as_ptr() == mixed
+                            && matches!(op.phase, MixerPhase::Whole | MixerPhase::InProj) =>
+                    {
                         Some(op.rotation)
                     }
-                    Some(Step::IndexedAttention(op)) if op.input.buf.as_ptr() == mixed => {
+                    Some(Step::IndexedAttention(op))
+                        if op.input.buf.as_ptr() == mixed
+                            && matches!(op.phase, MixerPhase::Whole | MixerPhase::InProj) =>
+                    {
                         Some(op.rotation)
                     }
                     Some(Step::Moe(call)) => call
@@ -1467,6 +1490,7 @@ fn launch_op(gpu: &mut Gpu, ctx: &DispatchCtx, step: &Step) -> Result<(), Dispat
         Step::HyperNorm(op) => crate::pipeline::layer_ops::execute_hyper_norm(gpu, op),
         Step::Project(op) => crate::pipeline::layer_ops::execute_project(gpu, op),
         Step::BroadcastAdd(op) => crate::pipeline::layer_ops::execute_broadcast_add(gpu, op),
+        Step::DenseFfn(op) => crate::pipeline::layer_ops::execute_dense_ffn(gpu, op),
         Step::Moe(call) => sealed_moe::execute_sealed(gpu, call),
         Step::MoeStage(op, stage) => op.execute_stage(gpu, *stage),
     }

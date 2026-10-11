@@ -136,9 +136,16 @@ pub fn project_weight(
 }
 
 /// [`project_weight`] for several weights reading the same `input`.  On the
-/// gfx1151 MQ6 BT8 route the input is rotated straight to F16 once per K and
-/// every MQ6 GEMM reads that copy (the per-weight path rotates to F32 and
-/// converts to F16 again for each); the bytes each GEMM sees are unchanged.
+/// gfx1151 MQ6 BT8 and MQ4 prefill routes the input is rotated straight to F16
+/// once per K and every MQ6 / MQ4 GEMM reads that copy (the per-weight path
+/// rotates to F32 and converts to F16 again for each); the bytes each GEMM sees
+/// are unchanged.
+///
+/// Few-row verify (2..=8 rows): the MQ4G256V2 members of one rotated input run
+/// through `Gpu::gemv_mq4g256v2_rows_x4`, four per launch (a lone member takes
+/// it too, via `project_rotated`), each output bitwise the AR `gemv_mq4g256v2`;
+/// the MQ6G256V2 members take `gemm_mq6g256v2_f32_rows_x4` the same way. One row
+/// keeps the single-matrix GEMVs; more than 8 rows keep the GEMMs.
 pub fn project_weights(
     gpu: &mut Gpu,
     input: &GpuTensor,
@@ -167,8 +174,12 @@ fn project_weights_inner(
     region_members: Option<&[bool]>,
 ) -> Result<(), DispatchError> {
     debug_assert!(region_members.is_none_or(|m| m.len() == projections.len()));
-    let shared = |w: &WeightRef<'_>, gpu: &Gpu| {
-        w.dtype == DType::MQ6G256V2 && gpu.gemm_mq6g256v2_xf16_applies(w.k, rows)
+    let route = gpu.route_rows(rows);
+    let shared = |w: &WeightRef<'_>, gpu: &Gpu| match w.dtype {
+        DType::MQ6G256V2 => gpu.gemm_mq6g256v2_xf16_applies(w.k, rows),
+        // gfx1151, more than 8 rows (N >= 96): PM or exact bt4 on the shared F16 rotation.
+        DType::MQ4G256V2 => gpu.gemm_mq4g256v2_xf16_applies(w.k, rows),
+        _ => false,
     };
     // Shared-rotation weights first, grouped by K: other projections reuse
     // the same F16 scratch and would overwrite the rotated copy.
@@ -181,40 +192,56 @@ fn project_weights_inner(
         let x_f16 = hip(gpu.rotate_x_mq_batched_f16(input, weight.k, rows))?;
         // The chunked GDN qkv output is BF16; its three F32 a/b/z siblings
         // may share one row-region launch without sharing their accumulators.
-        if let (Some(members), true) = (region_members, gpu.qwen4_mq6_x4_regions()) {
-            let mut indices = [0usize; 3];
-            let mut count = 0;
-            for j in i..projections.len() {
-                let (w, out) = projections[j];
-                if members[j]
-                    && !done[j]
-                    && w.k == weight.k
-                    && shared(w, gpu)
-                    && out.dtype == DType::F32
-                {
-                    if count < 3 { indices[count] = j; }
-                    count += 1;
+        if let Some(members) = region_members {
+            for fold in [DType::MQ6G256V2, DType::MQ4G256V2] {
+                // The MQ6 fold has its own switch; the MQ4 one is the PM module's.
+                if fold == DType::MQ6G256V2 && !gpu.qwen4_mq6_x4_regions() {
+                    continue;
                 }
-            }
-            if count == 3 {
-                let regions = indices.map(|j| {
+                let mut indices = [0usize; 3];
+                let mut count = 0;
+                for j in i..projections.len() {
                     let (w, out) = projections[j];
-                    (w.buf, out, w.m)
-                });
-                if hip(gpu.gemm_mq6g256v2_xf16_regions(&regions, &x_f16, weight.k, rows))? {
-                    for j in indices { done[j] = true; }
+                    if members[j]
+                        && !done[j]
+                        && w.dtype == fold
+                        && w.k == weight.k
+                        && shared(w, gpu)
+                        && out.dtype == DType::F32
+                    {
+                        if count < 3 { indices[count] = j; }
+                        count += 1;
+                    }
+                }
+                if count == 3 {
+                    let regions = indices.map(|j| {
+                        let (w, out) = projections[j];
+                        (w.buf, out, w.m)
+                    });
+                    let folded = if fold == DType::MQ4G256V2 {
+                        gpu.gemm_mq4g256v2_xf16_regions(&regions, &x_f16, weight.k, rows)
+                    } else {
+                        gpu.gemm_mq6g256v2_xf16_regions(&regions, &x_f16, weight.k, rows)
+                    };
+                    if hip(folded)? {
+                        for j in indices { done[j] = true; }
+                    }
                 }
             }
         }
         for j in i..projections.len() {
             let (w, out) = projections[j];
             if !done[j] && w.k == weight.k && shared(w, gpu) {
-                hip(gpu.gemm_mq6g256v2_xf16(w.buf, &x_f16, out, w.m, w.k, rows))?;
+                hip(if w.dtype == DType::MQ4G256V2 {
+                    gpu.gemm_mq4g256v2_xf16(w.buf, &x_f16, out, w.m, w.k, rows)
+                } else {
+                    gpu.gemm_mq6g256v2_xf16(w.buf, &x_f16, out, w.m, w.k, rows)
+                })?;
                 done[j] = true;
             }
         }
     }
-    // Only the shared MQ6 rotation reads a BF16 activation.
+    // Only the shared F16 rotation reads a BF16 activation.
     if input.dtype != DType::F32 && done.iter().any(|d| !d) {
         return Err(DispatchError::UnsupportedVariant {
             family: "layer-operations",
@@ -247,7 +274,7 @@ fn project_weights_inner(
     // rotate it once for the whole group instead of once per weight.
     // Few rows (speculative verify) on gfx11+: BF16 weights of one K share
     // multi-row launches, four matrices at a time, each weight read once.
-    if (2..=8).contains(&rows) && gpu.arch_caps.has_gfx11_plus_simt() {
+    if (2..=8).contains(&route) && gpu.arch_caps.has_gfx11_plus_simt() {
         for i in 0..projections.len() {
             let (weight, _) = projections[i];
             if done[i] || weight.dtype != DType::BF16 {
@@ -301,7 +328,7 @@ fn project_weights_inner(
         let mut mq6: SmallVec<[usize; 4]> = group
             .iter()
             .copied()
-            .filter(|&j| rows <= 8 && projections[j].0.dtype == DType::MQ6G256V2)
+            .filter(|&j| route <= 8 && projections[j].0.dtype == DType::MQ6G256V2)
             .collect();
         if mq6.len() < 2 {
             mq6.clear();
@@ -318,7 +345,26 @@ fn project_weights_inner(
                 gpu.gemm_mq6g256v2_f32_rows_x4(parts, x, weight.k, rows)
             })?;
         }
-        for &j in group.iter().filter(|j| !mq6.contains(j)) {
+        // Few-row verify (2..=8 rows): the group's MQ4G256V2 members share
+        // `gemv_mq4g256v2_rows_x4` launches, four at a time (a lone member
+        // takes the same launch with empty slots); each output is bitwise the
+        // AR singleton `gemv_mq4g256v2`. One row keeps that singleton.
+        let mq4: SmallVec<[usize; 4]> = group
+            .iter()
+            .copied()
+            .filter(|&j| {
+                (2..=8).contains(&rows) && projections[j].0.dtype == DType::MQ4G256V2
+            })
+            .collect();
+        for chunk in mq4.chunks(4) {
+            let part = |n: usize| {
+                let (w, y) = projections[chunk[n.min(chunk.len() - 1)]];
+                (w.buf, y, if n < chunk.len() { w.m } else { 0 })
+            };
+            let parts = [part(0), part(1), part(2), part(3)];
+            hip(gpu.gemv_mq4g256v2_rows_x4(parts, x, weight.k, rows))?;
+        }
+        for &j in group.iter().filter(|j| !mq6.contains(j) && !mq4.contains(j)) {
             let (w, out) = projections[j];
             project_rotated(gpu, w, x, out, rows)?;
         }
@@ -339,7 +385,7 @@ struct ZbaFold<'a> {
 /// Qwen4 trunk projections (GDN in/out, QSA in/out) of one shared input.
 ///
 /// `a4[i]` says the per-layer mask (`HIPFIRE_QWEN4_TRUNK_IU4`) selected
-/// `projections[i]`. Each projection takes one of three routes, run as
+/// `projections[i]`. Each projection takes one of two routes, run as
 /// groups that each finish before the next starts (the A4 sidecar, the
 /// rotation scratch and the shared F16 X scratch are reused group to group):
 ///
@@ -350,11 +396,11 @@ struct ZbaFold<'a> {
 ///    V2B / `pm_v2b` where eligible, X5 / symfold otherwise); a GDN `zba`
 ///    fold, when all of Z, beta and alpha are in this group, runs
 ///    Z|beta|alpha as one V2B SET with the split in its epilogue.
-/// 2. Any other MQ4G256V2 projection of an F32 prefill input (more than 8
-///    rows, gfx1151): exact (F16) activations, one shared rotation.
-/// 3. Everything else (MQ6 and the rest): [`project_weights`] exactly as if
-///    no MQ4 sibling existed. When siblings were split off a GDN in-projection
-///    group (`gdn_in_proj`), the MQ6 row-region fold stays enabled for the
+/// 2. Everything else: [`project_weights`]. That includes every other MQ4G256V2
+///    projection of a prefill input (more than 8 rows, gfx1151): the shared F16
+///    rotation per K with the exact PM / bt4 GEMMs (see `project_weights_inner`).
+///    When siblings were split off a GDN in-projection
+///    group (`gdn_in_proj`), the MQ6 / MQ4 row-region fold stays enabled for the
 ///    group's original a/b/z only (never qkv).
 #[allow(clippy::too_many_arguments)]
 fn project_trunk(
@@ -411,18 +457,7 @@ fn project_trunk(
                 }
             }
         }
-        let exact: SmallVec<[usize; 4]> = mq4.iter().copied().filter(|&j| !done[j]).collect();
-        if rows > 8 && !exact.is_empty() {
-            let x = view(rotation, 0, rows * k);
-            hip(gpu.rotate_x_mq_batched(input, &x, k, rows))?;
-            for &j in &exact {
-                let (w, out) = projections[j];
-                if !hip(gpu.gemm_qwen4_trunk_mq4_xf16(w.buf, &x, out, w.m, k, rows))? {
-                    break;
-                }
-                done[j] = true;
-            }
-        }
+
     }
     if done.iter().all(|d| !d) {
         return project_weights(gpu, input, rows, Some(rotation), projections);
@@ -499,7 +534,7 @@ fn rotate_input(
     let elements = checked_mul(rows, weight.k, "rotation scratch")?;
     let scratch = view(rotation, 0, elements);
     match basis {
-        RotationBasis::Aligned256 if rows > 1 => {
+        RotationBasis::Aligned256 if gpu.route_rows(rows) > 1 => {
             hip(gpu.rotate_x_mq_batched(input, &scratch, weight.k, rows))?
         }
         RotationBasis::Aligned256 => hip(gpu.rotate_x_mq(input, &scratch, weight.k))?,
@@ -516,16 +551,25 @@ fn project_rotated(
     output: &GpuTensor,
     rows: usize,
 ) -> Result<(), DispatchError> {
-    if weight.dtype == DType::MQ6G256V2 && (2..=8).contains(&rows) {
+    let route = gpu.route_rows(rows);
+    if weight.dtype == DType::MQ6G256V2 && (2..=8).contains(&route) {
         return hip(gpu.gemm_mq6g256v2_f32_rows(weight.buf, x, output, weight.m, weight.k, rows));
     }
-    if weight.dtype == DType::BF16 && (2..=8).contains(&rows) && gpu.arch_caps.has_gfx11_plus_simt()
+    if weight.dtype == DType::BF16 && (2..=8).contains(&route) && gpu.arch_caps.has_gfx11_plus_simt()
     {
         let part = (weight.buf, output, weight.m);
         let none = (weight.buf, output, 0);
         return hip(gpu.gemv_bf16_xf32_x4_rows([part, none, none, none], x, weight.k, rows));
     }
-    let result = match (weight.dtype, rows > 1) {
+    // Few-row verify (2..=8 rows): the exact MQ4 rows kernel, bitwise the AR
+    // `gemv_mq4g256v2` per activation row. One row keeps that GEMV; more than
+    // eight rows keep the WMMA `gemm_mq4g256v2`.
+    if weight.dtype == DType::MQ4G256V2 && (2..=8).contains(&route) {
+        let part = (weight.buf, output, weight.m);
+        let none = (weight.buf, output, 0);
+        return hip(gpu.gemv_mq4g256v2_rows_x4([part, none, none, none], x, weight.k, rows));
+    }
+    let result = match (weight.dtype, route > 1) {
         (DType::BF16, false) => gpu.gemv_bf16_xf32(weight.buf, x, output, weight.m, weight.k),
         (DType::BF16, true) => {
             // Long prefill on gfx11 or gfx1201: the KLD-gated F16 WMMA route,
@@ -537,6 +581,9 @@ fn project_rotated(
                 rows,
             ) {
                 Ok(true) => Ok(()),
+                Ok(false) if rows == 1 => {
+                    gpu.gemv_bf16_xf32(weight.buf, x, output, weight.m, weight.k)
+                }
                 Ok(false) => {
                     gpu.gemm_bf16_xf32_multirow(weight.buf, x, output, weight.m, weight.k, rows)
                 }
@@ -752,7 +799,7 @@ pub fn execute_hyper_read_prenormed(
 fn hyper_read_wmma_route(gpu: &Gpu, op: &HyperReadOp<'_>) -> bool {
     let wide = op.branches * op.hidden;
     let up_fused = gpu.arch_caps.has_gfx11_plus_simt()
-        && op.rows > 1
+        && gpu.route_rows(op.rows) > 1
         && op.branches == 4
         && op.input_mix_up.dtype == DType::BF16
         && op.input_mix_up.m == wide
@@ -794,7 +841,7 @@ fn execute_hyper_read_inner(
     // Multi-row: the up projection feeds the branch mix directly; bitwise
     // identical to the GEMM + hyper_read_projected pair below.
     let up_fused = gpu.arch_caps.has_gfx11_plus_simt()
-        && op.rows > 1
+        && gpu.route_rows(op.rows) > 1
         && op.branches == 4
         && op.input_mix_up.dtype == DType::BF16
         && op.input_mix_up.m == wide
@@ -854,7 +901,7 @@ fn execute_hyper_read_inner(
         ))?;
         normalized_f16 = Some(x16);
     } else if gpu.arch_caps.has_gfx11_plus_simt()
-        && op.rows <= 8
+        && gpu.route_rows(op.rows) <= 8
         && ((op.input_mix_down.dtype == DType::BF16 && op.input_mix_down.k.is_multiple_of(32))
             || (op.input_mix_down.dtype == DType::Q8_0
                 && op.input_mix_down.k.is_multiple_of(256)))
@@ -1082,7 +1129,8 @@ pub fn execute_hyper_write_pregated(
     execute_hyper_write_inner(gpu, op, true)
 }
 
-/// H4 attention epilogue (`HIPFIRE_QWEN4_HC_FUSE` >= 2): an MQ6G256V2 output
+/// H4 attention epilogue (`HIPFIRE_QWEN4_HC_FUSE` >= 2): an MQ6G256V2 (or, on the
+/// gfx1151 PM module, MQ4G256V2) output
 /// projection that applies the paired HC write `write` in its GEMM epilogue.
 /// `write`'s gates must already be in `write.gates` (the paired read produced
 /// them from the streams the write overwrites; see
@@ -1098,13 +1146,24 @@ fn project_output_into_hyper_write(
     input: &GpuTensor,
     rows: usize,
     rotation: Option<&GpuTensor>,
+    a4: bool,
     write: &HyperWriteOp<'_>,
 ) -> Result<bool, DispatchError> {
     let Some(wide) = write.branches.checked_mul(write.hidden) else {
         return Ok(false);
     };
+    // MQ4G256V2 (gfx1151 PM module only) is declined where the unfused route
+    // would run the IU4 trunk projection (`a4`: its trunk bit) instead.
+    let covered = match weight.dtype {
+        DType::MQ6G256V2 => gpu.gemm_mq6g256v2_hcw_applies(weight.m, weight.k, rows),
+        DType::MQ4G256V2 => {
+            gpu.gemm_mq4g256v2_hcw_applies(weight.m, weight.k, rows)
+                && !(a4 && gpu.qwen4_trunk_iu4_applies(rows))
+        }
+        _ => false,
+    };
     if gpu.flags.qwen4_hc_fuse_level() < 2
-        || weight.dtype != DType::MQ6G256V2
+        || !covered
         || weight.m != write.hidden
         || write.branches != 4
         || write.rows != rows
@@ -1113,9 +1172,23 @@ fn project_output_into_hyper_write(
         || write.input.numel() < rows * wide
         || write.gates.dtype != DType::F32
         || write.gates.numel() < rows * write.branches
-        || !gpu.gemm_mq6g256v2_hcw_applies(weight.m, weight.k, rows)
     {
         return Ok(false);
+    }
+    if weight.dtype == DType::MQ4G256V2 {
+        let x = hip(gpu.rotate_x_mq_batched_f16(input, weight.k, rows))?;
+        hip(gpu.gemm_mq4g256v2_hcw(
+            weight.buf,
+            &x,
+            None,
+            weight.m,
+            weight.k,
+            rows,
+            write.input,
+            write.gates,
+            write.state_bf16,
+        ))?;
+        return Ok(true);
     }
     let (x, x_is_f16) = if gpu.arch_caps.is_gfx1151() || input.dtype == DType::BF16 {
         (hip(gpu.rotate_x_mq_batched_f16(input, weight.k, rows))?, true)
@@ -1207,7 +1280,7 @@ pub fn execute_hyper_write_then_read(
     clear: Option<&ClearOp<'_>>,
     rotate_into: Option<&GpuTensor>,
 ) -> Result<Option<bool>, DispatchError> {
-    let fusable = (1..=8).contains(&write.rows)
+    let fusable = (1..=8).contains(&gpu.route_rows(write.rows))
         && read.rows == write.rows
         && !write.state_bf16
         && !read.state_bf16
@@ -1284,14 +1357,14 @@ fn hyper_write_gates(
     // K across four waves, and a verify row is bitwise the decode row it
     // replaces (greedy MTP == AR depends on it).
     let k4 = gpu.arch_caps.has_gfx11_plus_simt()
-        && op.rows <= 8
+        && gpu.route_rows(op.rows) <= 8
         && op.block_inject.dtype == DType::BF16
         && op.block_inject.k.is_multiple_of(32);
     // Multi-row: one launch normalizes each row into LDS and projects the
     // BF16 gate from there; `normalized` (read by nothing below) is not
     // written.  Bitwise identical to hyper_norm + project_weight.
     let fused = gpu.arch_caps.has_gfx11_plus_simt()
-        && op.rows > 1
+        && gpu.route_rows(op.rows) > 1
         && !k4
         && op.block_inject.dtype == DType::BF16
         && op.block_inject.m == op.branches
@@ -1349,6 +1422,18 @@ fn hyper_write_gates(
     Ok(())
 }
 
+/// Which part of a mixer op runs: `Whole` is the op as it has always run;
+/// a multi-lane forward splits it into the row-local input projections
+/// (`InProj`, over every lane's rows), the per-lane state `Core`, and the
+/// row-local output projection (`OutProj`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MixerPhase {
+    Whole,
+    InProj,
+    Core,
+    OutProj,
+}
+
 /// Gated DeltaNet recurrence with explicit convolution and projection order.
 pub struct GatedDeltaNetOp<'a> {
     pub qkv: WeightRef<'a>,
@@ -1397,6 +1482,8 @@ pub struct GatedDeltaNetOp<'a> {
     /// route when their weight is symmetric MQ4G256V2 and the route applies
     /// (`0` = none; tests).
     pub trunk_a4: u16,
+    /// Which part of the mixer this call runs (see [`MixerPhase`]).
+    pub phase: MixerPhase,
 }
 
 /// Where a few-row GDN forward leaves what a later rollback to any accepted
@@ -1418,7 +1505,28 @@ impl GatedDeltaNetOp<'_> {
         self.validate_layout()
     }
 
+    /// A row capture spans the stateful part of the op: the whole mixer, or
+    /// its core when the input projections ran in an earlier call (the core
+    /// then copies the qkv projection rows into the capture's `inputs`). The
+    /// projection-only phases cannot honor one.
+    fn check_phase(&self) -> Result<(), DispatchError> {
+        if matches!(self.phase, MixerPhase::InProj | MixerPhase::OutProj)
+            && self.row_capture.is_some()
+        {
+            return Err(DispatchError::Hip(
+                "GDN row capture needs the whole mixer op or its core".into(),
+            ));
+        }
+        Ok(())
+    }
+
     fn validate_layout(&self) -> Result<(), DispatchError> {
+        self.check_phase()?;
+        // Only the tensors a phase touches are checked; the state (core) tensors
+        // are never reached by the projection phases.
+        let inproj = matches!(self.phase, MixerPhase::Whole | MixerPhase::InProj);
+        let core = matches!(self.phase, MixerPhase::Whole | MixerPhase::Core);
+        let outproj = matches!(self.phase, MixerPhase::Whole | MixerPhase::OutProj);
         if self.rows == 0
             || self.input_width == 0
             || self.key_heads == 0
@@ -1441,103 +1549,125 @@ impl GatedDeltaNetOp<'_> {
         let rows_input = checked_mul(self.rows, self.input_width, "gated delta input")?;
         let rows_value = checked_mul(self.rows, value, "gated delta value rows")?;
         let rows_heads = checked_mul(self.rows, self.value_heads, "gated delta head rows")?;
-        require_tensor(self.input, rows_input, DType::F32, "gated delta input")?;
-        require_tensor(self.projection, qkv, DType::F32, "gated delta projection")?;
-        require_tensor(
-            self.projection2,
-            qkv,
-            DType::F32,
-            "gated delta projection scratch",
-        )?;
-        let state_format = GdnStateFormat::of(self.recurrent).map_err(|error| {
-            DispatchError::Hip(format!("gated delta state: {error}"))
-        })?;
-        if !state_format.supports(self.key_dim, self.value_dim) {
-            return Err(DispatchError::Hip(format!(
-                "gated delta {} state needs 128x128 heads",
-                state_format.name()
-            )));
+        if inproj {
+            require_tensor(self.input, rows_input, DType::F32, "gated delta input")?;
         }
-        require_tensor(
-            self.recurrent,
-            state_format.state_units(self.value_heads, self.key_dim, self.value_dim),
-            state_format.dtype(),
-            "gated delta state",
-        )?;
-        require_tensor(
-            self.conv_state,
-            checked_mul(self.conv_kernel - 1, qkv_width, "gated delta conv state")?,
-            DType::F32,
-            "gated delta conv state",
-        )?;
-        require_tensor(
-            self.conv,
-            checked_mul(qkv_width, self.conv_kernel, "gated delta conv")?,
-            DType::BF16,
-            "gated delta conv",
-        )?;
-        require_tensor(self.a, rows_heads, DType::F32, "gated delta A")?;
-        require_tensor(self.b, rows_heads, DType::F32, "gated delta B")?;
-        require_tensor(self.gate, rows_heads, DType::F32, "gated delta gate")?;
-        require_tensor(self.beta, rows_heads, DType::F32, "gated delta beta")?;
-        require_tensor(
-            self.recurrent_output,
-            rows_value,
-            DType::F32,
-            "gated delta recurrent output",
-        )?;
-        require_tensor(self.z_output, rows_value, DType::F32, "gated delta Z")?;
-        require_tensor(
-            self.output_scratch,
-            rows_value,
-            DType::F32,
-            "gated delta output scratch",
-        )?;
+        if inproj || core {
+            require_tensor(self.projection, qkv, DType::F32, "gated delta projection")?;
+        }
+        if core {
+            require_tensor(
+                self.projection2,
+                qkv,
+                DType::F32,
+                "gated delta projection scratch",
+            )?;
+            let state_format = GdnStateFormat::of(self.recurrent).map_err(|error| {
+                DispatchError::Hip(format!("gated delta state: {error}"))
+            })?;
+            if !state_format.supports(self.key_dim, self.value_dim) {
+                return Err(DispatchError::Hip(format!(
+                    "gated delta {} state needs 128x128 heads",
+                    state_format.name()
+                )));
+            }
+            require_tensor(
+                self.recurrent,
+                state_format.state_units(self.value_heads, self.key_dim, self.value_dim),
+                state_format.dtype(),
+                "gated delta state",
+            )?;
+            require_tensor(
+                self.conv_state,
+                checked_mul(self.conv_kernel - 1, qkv_width, "gated delta conv state")?,
+                DType::F32,
+                "gated delta conv state",
+            )?;
+            require_tensor(
+                self.conv,
+                checked_mul(qkv_width, self.conv_kernel, "gated delta conv")?,
+                DType::BF16,
+                "gated delta conv",
+            )?;
+        }
+        if inproj || core {
+            require_tensor(self.a, rows_heads, DType::F32, "gated delta A")?;
+            require_tensor(self.b, rows_heads, DType::F32, "gated delta B")?;
+        }
+        if core {
+            require_tensor(self.gate, rows_heads, DType::F32, "gated delta gate")?;
+            require_tensor(self.beta, rows_heads, DType::F32, "gated delta beta")?;
+            require_tensor(
+                self.recurrent_output,
+                rows_value,
+                DType::F32,
+                "gated delta recurrent output",
+            )?;
+        }
+        if inproj || core {
+            require_tensor(self.z_output, rows_value, DType::F32, "gated delta Z")?;
+        }
+        if core || outproj {
+            require_tensor(
+                self.output_scratch,
+                rows_value,
+                DType::F32,
+                "gated delta output scratch",
+            )?;
+        }
         require_tensor(
             self.bf16_scratch,
             value.max(self.input_width),
             DType::BF16,
             "gated delta BF16 scratch",
         )?;
-        require_tensor(
-            self.a_log,
-            self.value_heads,
-            DType::BF16,
-            "gated delta A-log",
-        )?;
-        require_tensor(
-            self.dt_bias,
-            self.value_heads,
-            DType::BF16,
-            "gated delta dt bias",
-        )?;
-        require_tensor(self.norm, self.value_dim, DType::BF16, "gated delta norm")?;
-        require_tensor(
-            self.output_tensor,
-            rows_input,
-            DType::F32,
-            "gated delta output",
-        )?;
-        require_weight(&self.qkv, qkv_width, self.input_width, "gated delta qkv")?;
-        require_weight(
-            &self.in_proj_a,
-            self.value_heads,
-            self.input_width,
-            "gated delta a",
-        )?;
-        require_weight(
-            &self.in_proj_b,
-            self.value_heads,
-            self.input_width,
-            "gated delta b",
-        )?;
-        require_weight(&self.z, value, self.input_width, "gated delta z")?;
-        require_weight(
-            &self.output,
-            self.input_width,
-            value,
-            "gated delta output projection",
-        )?;
+        if core {
+            require_tensor(
+                self.a_log,
+                self.value_heads,
+                DType::BF16,
+                "gated delta A-log",
+            )?;
+            require_tensor(
+                self.dt_bias,
+                self.value_heads,
+                DType::BF16,
+                "gated delta dt bias",
+            )?;
+            require_tensor(self.norm, self.value_dim, DType::BF16, "gated delta norm")?;
+        }
+        if outproj {
+            require_tensor(
+                self.output_tensor,
+                rows_input,
+                DType::F32,
+                "gated delta output",
+            )?;
+        }
+        if inproj {
+            require_weight(&self.qkv, qkv_width, self.input_width, "gated delta qkv")?;
+            require_weight(
+                &self.in_proj_a,
+                self.value_heads,
+                self.input_width,
+                "gated delta a",
+            )?;
+            require_weight(
+                &self.in_proj_b,
+                self.value_heads,
+                self.input_width,
+                "gated delta b",
+            )?;
+            require_weight(&self.z, value, self.input_width, "gated delta z")?;
+        }
+        if core || outproj {
+            require_weight(
+                &self.output,
+                self.input_width,
+                value,
+                "gated delta output projection",
+            )?;
+        }
         Ok(())
     }
 }
@@ -1558,6 +1688,8 @@ pub fn execute_gated_delta_net_hc(
     hc: Option<&HyperWriteOp<'_>>,
     fused: &mut bool,
 ) -> Result<(), DispatchError> {
+    op.check_phase()?;
+    let phase = op.phase;
     let qk = op.key_heads * op.key_dim;
     let value = op.value_heads * op.value_dim;
     let qkv = 2 * qk + value;
@@ -1570,7 +1702,7 @@ pub fn execute_gated_delta_net_hc(
     let z = view(op.z_output, 0, op.rows * value);
     let history_rows = op.conv_kernel.saturating_sub(1);
     let persistent_batch = gpu.arch_caps.has_gfx11_plus_simt()
-        && op.rows > 1
+        && gpu.route_rows(op.rows) > 1
         && op.key_dim == 128
         && op.value_dim == 128
         && op.conv_kernel == 4;
@@ -1582,10 +1714,16 @@ pub fn execute_gated_delta_net_hc(
     }
     let capture = op.row_capture.as_ref();
     // A row capture keeps the qkv projection and the recurrence inputs:
-    // write them straight into it.
+    // write them straight into it. A split core receives the projection
+    // the input phase left in `op.projection`, copied into the capture
+    // unchanged (the convolution reads the same values either way).
     let mut conv_output = view(op.projection2, 0, op.rows * qkv);
     if let Some(capture) = capture {
-        projection = view(capture.inputs, 0, op.rows * qkv);
+        let inputs = view(capture.inputs, 0, op.rows * qkv);
+        if phase == MixerPhase::Core {
+            hip(gpu.copy_d2d(&projection, &inputs, inputs.byte_size()))?;
+        }
+        projection = inputs;
         let heads = op.rows * op.value_heads;
         conv_output = view(capture.recurrence, 0, op.rows * qkv);
         gate = view(capture.recurrence, op.rows * qkv, heads);
@@ -1613,35 +1751,57 @@ pub fn execute_gated_delta_net_hc(
         ));
     }
     // On the chunked route the qkv projection is read (by the convolution)
-    // only through its BF16 rounding, so the MQ6 GEMM stores it as BF16 bits.
-    let bf16_store = |w: &WeightRef<'_>, gpu: &Gpu| {
-        chunked && w.dtype == DType::MQ6G256V2 && gpu.gemm_mq6g256v2_xf16_applies(w.k, op.rows)
+    // only through its BF16 rounding, so the MQ6 / MQ4 GEMM stores it as BF16 bits
+    // (RNE of the F32 projection, the same value the convolution would round).
+    // MQ4 has BF16 output only in the PM module and never when the IU4 route
+    // (`a4` = the projection's trunk bit; F32 output only) takes the projection.
+    let bf16_store = |w: &WeightRef<'_>, a4: u16, gpu: &Gpu| {
+        chunked
+            && match w.dtype {
+                DType::MQ6G256V2 => gpu.gemm_mq6g256v2_xf16_applies(w.k, op.rows),
+                DType::MQ4G256V2 => {
+                    gpu.gemm_mq4g256v2_pm_applies(w.k, op.rows)
+                        && !(op.trunk_a4 & a4 != 0 && gpu.qwen4_trunk_iu4_applies(op.rows))
+                }
+                _ => false,
+            }
     };
-    if bf16_store(&op.qkv, gpu) {
+    if bf16_store(&op.qkv, TrunkFamily::GdnQkv.bit(), gpu) {
         projection.dtype = DType::BF16;
     }
-    project_trunk(
-        gpu,
-        op.input,
-        op.rows,
-        op.rotation,
-        &[
-            (&op.qkv, &projection),
-            (&op.in_proj_a, &a),
-            (&op.in_proj_b, &b),
-            (&op.z, &z),
-        ],
-        &[
-            op.trunk_a4 & TrunkFamily::GdnQkv.bit() != 0,
-            op.trunk_a4 & TrunkFamily::GdnA.bit() != 0,
-            op.trunk_a4 & TrunkFamily::GdnB.bit() != 0,
-            op.trunk_a4 & TrunkFamily::GdnZ.bit() != 0,
-        ],
-        op.zba_fold.map(|rows| ZbaFold { rows, z: 3, beta: 2, alpha: 1 }),
-        true,
-    )?;
+    if matches!(phase, MixerPhase::Whole | MixerPhase::InProj) {
+        project_trunk(
+            gpu,
+            op.input,
+            op.rows,
+            op.rotation,
+            &[
+                (&op.qkv, &projection),
+                (&op.in_proj_a, &a),
+                (&op.in_proj_b, &b),
+                (&op.z, &z),
+            ],
+            &[
+                op.trunk_a4 & TrunkFamily::GdnQkv.bit() != 0,
+                op.trunk_a4 & TrunkFamily::GdnA.bit() != 0,
+                op.trunk_a4 & TrunkFamily::GdnB.bit() != 0,
+                op.trunk_a4 & TrunkFamily::GdnZ.bit() != 0,
+            ],
+            op.zba_fold.map(|rows| ZbaFold { rows, z: 3, beta: 2, alpha: 1 }),
+            true,
+        )?;
+    }
+    if phase == MixerPhase::InProj {
+        return Ok(());
+    }
     let mut gdn_output = view(op.output_scratch, 0, op.rows * value);
-    if persistent_batch {
+    if phase == MixerPhase::OutProj {
+        // The core ran in an earlier call; only the dtype decision it made for
+        // its output is owed here.
+        if persistent_batch && bf16_store(&op.output, TrunkFamily::GdnOut.bit(), gpu) {
+            gdn_output.dtype = DType::BF16;
+        }
+    } else if persistent_batch {
         let start_cursor = op.start_position % history_rows;
         // The F16 prefill route's chunked recurrence reads the convolution
         // output as packed BF16 (every value is BF16-rounded already).
@@ -1705,7 +1865,7 @@ pub fn execute_gated_delta_net_hc(
         }
         // The chunked route's output is BF16-rounded: stored as BF16 when the
         // output projection rotates it straight to F16 (half the bytes).
-        if bf16_store(&op.output, gpu) {
+        if bf16_store(&op.output, TrunkFamily::GdnOut.bit(), gpu) {
             gdn_output.dtype = DType::BF16;
         }
         let gated = GatedDeltaGateBatched {
@@ -1831,6 +1991,9 @@ pub fn execute_gated_delta_net_hc(
             ))?;
         }
     }
+    if phase == MixerPhase::Core {
+        return Ok(());
+    }
     // H4 (`HIPFIRE_QWEN4_HC_FUSE` >= 2): the paired HC write rides the output
     // projection's epilogue; the projection then never lands in `output_tensor`.
     if let Some(write) = hc {
@@ -1840,6 +2003,7 @@ pub fn execute_gated_delta_net_hc(
             &gdn_output,
             op.rows,
             Some(op.rotation),
+            op.trunk_a4 & TrunkFamily::GdnOut.bit() != 0,
             write,
         )? {
             *fused = true;
@@ -1928,6 +2092,13 @@ pub struct IndexedAttentionOp<'a> {
     pub heads: usize,
     pub kv_heads: usize,
     pub head_dim: usize,
+    /// RoPE width of the queries, keys and the indexer
+    /// (`head_dim * partial_rotary_factor`; Flash-Next: 64).  Even, within
+    /// `2..=min(head_dim, index_dim)`.  The one-launch decode prologue and
+    /// the pooled-key RoPE kernel derive `min(dim, 64)` themselves: a width
+    /// they would not derive runs the batched launches (queries/keys) or is
+    /// refused (pooled keys).
+    pub rotary_dim: usize,
     pub input_width: usize,
     /// FWHT basis scratch for quantized payloads (`rows * k` elements); the
     /// BF16 path never reads it.
@@ -1938,6 +2109,8 @@ pub struct IndexedAttentionOp<'a> {
     /// is symmetric MQ4G256V2 and the route applies (`0` = none; MTP and
     /// tests).
     pub trunk_a4: u16,
+    /// Which part of the mixer this call runs (see [`MixerPhase`]).
+    pub phase: MixerPhase,
 }
 
 impl IndexedAttentionOp<'_> {
@@ -1945,7 +2118,54 @@ impl IndexedAttentionOp<'_> {
         self.validate_layout()
     }
 
+    /// Selection reuse and the K/V-only append are single-row, whole-op modes.
+    fn check_phase(&self) -> Result<(), DispatchError> {
+        if self.phase != MixerPhase::Whole && !matches!(self.mode, IndexedAttentionMode::Full) {
+            return Err(DispatchError::Hip(
+                "indexed attention selection reuse and K/V-only append need the whole mixer op"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// The RoPE width ([`Self::rotary_dim`]) against the op's geometry and the
+    /// fixed width the pooled-key RoPE kernel rotates.
+    fn validate_rotary(&self) -> Result<(), DispatchError> {
+        if self.rotary_dim < 2
+            || self.rotary_dim % 2 != 0
+            || self.rotary_dim > self.head_dim
+            || self.rotary_dim > self.index_dim
+        {
+            return Err(DispatchError::Hip(format!(
+                "indexed attention rotary width {} must be even and within 2..=min(head_dim {}, index_dim {})",
+                self.rotary_dim, self.head_dim, self.index_dim
+            )));
+        }
+        // The pooled-key RoPE kernel rotates `min(index_kv_width, 64)` channels
+        // and only runs with the core.
+        let pooled = checked_mul(
+            self.index_kv_heads,
+            self.index_dim,
+            "indexed attention index KV",
+        )?
+        .min(64);
+        if matches!(self.phase, MixerPhase::Whole | MixerPhase::Core) && self.rotary_dim != pooled {
+            return Err(DispatchError::Hip(format!(
+                "indexed attention rotary width {} differs from the pooled-key RoPE kernel's {pooled}",
+                self.rotary_dim
+            )));
+        }
+        Ok(())
+    }
+
     fn validate_layout(&self) -> Result<(), DispatchError> {
+        self.check_phase()?;
+        // Only the tensors a phase touches are checked; the state (core) checks
+        // are never reached by the projection phases.
+        let inproj = matches!(self.phase, MixerPhase::Whole | MixerPhase::InProj);
+        let core = matches!(self.phase, MixerPhase::Whole | MixerPhase::Core);
+        let outproj = matches!(self.phase, MixerPhase::Whole | MixerPhase::OutProj);
         if let IndexedAttentionMode::ReuseSelection { selected_len_out } = self.mode {
             if self.rows != 1 {
                 return Err(DispatchError::Hip(
@@ -1979,11 +2199,12 @@ impl IndexedAttentionOp<'_> {
             || (self.head_dim < 64 && self.head_dim % 2 != 0)
             || self.kv_heads > self.heads
             || self.heads % self.kv_heads != 0
-            || self.state.full_capacity == 0
-            || self.state.raw_capacity == 0
-            || self.state.pooled_capacity == 0
-            || self.state.selected_capacity == 0
-            || self.state.position_capacity == 0
+            || (core
+                && (self.state.full_capacity == 0
+                    || self.state.raw_capacity == 0
+                    || self.state.pooled_capacity == 0
+                    || self.state.selected_capacity == 0
+                    || self.state.position_capacity == 0))
         {
             return Err(DispatchError::Hip(
                 "indexed attention has invalid geometry".into(),
@@ -2003,6 +2224,7 @@ impl IndexedAttentionOp<'_> {
             self.index_dim,
             "indexed attention index KV",
         )?;
+        self.validate_rotary()?;
         let q_width = checked_mul(self.heads, self.head_dim, "indexed attention Q width")?;
         let qgate_width = checked_mul(2, q_width, "indexed attention Q/G width")?;
         let kv_width = checked_mul(self.kv_heads, self.head_dim, "indexed attention KV width")?;
@@ -2010,7 +2232,7 @@ impl IndexedAttentionOp<'_> {
         let rows_q = checked_mul(self.rows, q_width, "indexed attention Q rows")?;
         let rows_kv = checked_mul(self.rows, kv_width, "indexed attention KV rows")?;
         let rows_input = checked_mul(self.rows, self.input_width, "indexed attention input")?;
-        if self.state.position > self.state.position_capacity
+        if core && (self.state.position > self.state.position_capacity
             || self.state.full_len > self.state.full_capacity
             || self.state.raw_len > self.state.raw_capacity
             || self.state.pooled_len > self.state.pooled_capacity
@@ -2019,191 +2241,205 @@ impl IndexedAttentionOp<'_> {
             || self.state.position != self.state.raw_len
             || self.state.pooled_len != self.state.position / self.compress
             || self.state.selected_len > self.state.position
-            || self.rows > self.state.position_capacity - self.state.position
+            || self.rows > self.state.position_capacity - self.state.position)
         {
             return Err(DispatchError::Hip(
                 "indexed attention state length/capacity mismatch".into(),
             ));
         }
-        require_tensor(
-            self.input,
-            rows_input,
-            DType::F32,
-            "indexed attention input",
-        )?;
-        require_tensor(
-            self.index_scratch,
-            rows_index,
-            DType::F32,
-            "indexed attention index scratch",
-        )?;
-        require_tensor(
-            self.qgate_scratch,
-            checked_mul(self.rows, qgate_width, "indexed attention q/g rows")?,
-            DType::F32,
-            "indexed attention q/g scratch",
-        )?;
-        require_tensor(
-            self.k_scratch,
-            rows_kv,
-            DType::F32,
-            "indexed attention k scratch",
-        )?;
-        require_tensor(
-            self.v_scratch,
-            rows_kv,
-            DType::F32,
-            "indexed attention v scratch",
-        )?;
-        require_tensor(
-            self.qsa_output,
-            rows_q,
-            DType::F32,
-            "indexed attention output scratch",
-        )?;
-        require_tensor(
-            self.attention_output,
-            checked_mul(
-                self.rows,
-                self.input_width,
-                "indexed attention projected rows",
-            )?,
-            DType::F32,
-            "indexed attention projected output",
-        )?;
-        let kv_row_units = self.state.format.kv_row_units(self.kv_heads, self.head_dim);
-        if !self.state.format.supports(self.kv_heads, self.head_dim) {
-            return Err(DispatchError::Hip(format!(
-                "indexed attention {} K/V does not support {} KV heads x {}",
-                self.state.format.name(),
-                self.kv_heads,
-                self.head_dim
-            )));
+        if inproj {
+            require_tensor(
+                self.input,
+                rows_input,
+                DType::F32,
+                "indexed attention input",
+            )?;
         }
-        require_tensor(
-            self.state.full_keys,
-            checked_mul(
-                self.state.full_capacity,
-                kv_row_units,
-                "indexed attention full keys",
-            )?,
-            self.state.format.kv_dtype(),
-            "indexed attention full keys",
-        )?;
-        require_tensor(
-            self.state.full_values,
-            checked_mul(
-                self.state.full_capacity,
-                kv_row_units,
-                "indexed attention full values",
-            )?,
-            self.state.format.kv_dtype(),
-            "indexed attention full values",
-        )?;
-        require_tensor(
-            self.state.raw_index_keys,
-            checked_mul(
-                self.state.raw_capacity,
-                index_kv_width,
-                "indexed attention raw keys",
-            )?,
-            self.state.format.index_dtype(),
-            "indexed attention raw keys",
-        )?;
-        require_tensor(
-            self.state.pooled_keys,
-            checked_mul(
-                self.state.pooled_capacity,
-                index_kv_width,
-                "indexed attention pooled keys",
-            )?,
-            self.state.format.index_dtype(),
-            "indexed attention pooled keys",
-        )?;
-        require_tensor(
-            self.state.selected_indices,
-            checked_mul(
-                self.state.selected_capacity,
-                std::mem::size_of::<i32>(),
-                "indexed attention selected bytes",
-            )?,
-            DType::Raw,
-            "indexed attention selected",
-        )?;
-        require_tensor(
-            self.selected_scratch,
-            checked_mul(
+        if inproj || core {
+            require_tensor(
+                self.index_scratch,
+                rows_index,
+                DType::F32,
+                "indexed attention index scratch",
+            )?;
+            require_tensor(
+                self.qgate_scratch,
+                checked_mul(self.rows, qgate_width, "indexed attention q/g rows")?,
+                DType::F32,
+                "indexed attention q/g scratch",
+            )?;
+            require_tensor(
+                self.k_scratch,
+                rows_kv,
+                DType::F32,
+                "indexed attention k scratch",
+            )?;
+            require_tensor(
+                self.v_scratch,
+                rows_kv,
+                DType::F32,
+                "indexed attention v scratch",
+            )?;
+        }
+        if core || outproj {
+            require_tensor(
+                self.qsa_output,
+                rows_q,
+                DType::F32,
+                "indexed attention output scratch",
+            )?;
+        }
+        if outproj {
+            require_tensor(
+                self.attention_output,
                 checked_mul(
                     self.rows,
-                    self.state.selected_capacity,
-                    "indexed attention selected rows",
+                    self.input_width,
+                    "indexed attention projected rows",
                 )?,
-                std::mem::size_of::<i32>(),
-                "indexed attention selected scratch bytes",
-            )?,
-            DType::Raw,
-            "indexed attention selected scratch",
-        )?;
-        require_tensor(
-            self.indexer_q_norm,
-            self.index_dim,
-            DType::BF16,
-            "indexed attention index Q norm",
-        )?;
-        require_tensor(
-            self.indexer_k_norm,
-            self.index_dim,
-            DType::BF16,
-            "indexed attention index K norm",
-        )?;
-        require_tensor(
-            self.q_norm,
-            self.head_dim,
-            DType::BF16,
-            "indexed attention Q norm",
-        )?;
-        require_tensor(
-            self.k_norm,
-            self.head_dim,
-            DType::BF16,
-            "indexed attention K norm",
-        )?;
+                DType::F32,
+                "indexed attention projected output",
+            )?;
+        }
+        if core {
+            let kv_row_units = self.state.format.kv_row_units(self.kv_heads, self.head_dim);
+            if !self.state.format.supports(self.kv_heads, self.head_dim) {
+                return Err(DispatchError::Hip(format!(
+                    "indexed attention {} K/V does not support {} KV heads x {}",
+                    self.state.format.name(),
+                    self.kv_heads,
+                    self.head_dim
+                )));
+            }
+            require_tensor(
+                self.state.full_keys,
+                checked_mul(
+                    self.state.full_capacity,
+                    kv_row_units,
+                    "indexed attention full keys",
+                )?,
+                self.state.format.kv_dtype(),
+                "indexed attention full keys",
+            )?;
+            require_tensor(
+                self.state.full_values,
+                checked_mul(
+                    self.state.full_capacity,
+                    kv_row_units,
+                    "indexed attention full values",
+                )?,
+                self.state.format.kv_dtype(),
+                "indexed attention full values",
+            )?;
+            require_tensor(
+                self.state.raw_index_keys,
+                checked_mul(
+                    self.state.raw_capacity,
+                    index_kv_width,
+                    "indexed attention raw keys",
+                )?,
+                self.state.format.index_dtype(),
+                "indexed attention raw keys",
+            )?;
+            require_tensor(
+                self.state.pooled_keys,
+                checked_mul(
+                    self.state.pooled_capacity,
+                    index_kv_width,
+                    "indexed attention pooled keys",
+                )?,
+                self.state.format.index_dtype(),
+                "indexed attention pooled keys",
+            )?;
+            require_tensor(
+                self.state.selected_indices,
+                checked_mul(
+                    self.state.selected_capacity,
+                    std::mem::size_of::<i32>(),
+                    "indexed attention selected bytes",
+                )?,
+                DType::Raw,
+                "indexed attention selected",
+            )?;
+            require_tensor(
+                self.selected_scratch,
+                checked_mul(
+                    checked_mul(
+                        self.rows,
+                        self.state.selected_capacity,
+                        "indexed attention selected rows",
+                    )?,
+                    std::mem::size_of::<i32>(),
+                    "indexed attention selected scratch bytes",
+                )?,
+                DType::Raw,
+                "indexed attention selected scratch",
+            )?;
+            require_tensor(
+                self.indexer_q_norm,
+                self.index_dim,
+                DType::BF16,
+                "indexed attention index Q norm",
+            )?;
+            require_tensor(
+                self.indexer_k_norm,
+                self.index_dim,
+                DType::BF16,
+                "indexed attention index K norm",
+            )?;
+            require_tensor(
+                self.q_norm,
+                self.head_dim,
+                DType::BF16,
+                "indexed attention Q norm",
+            )?;
+            require_tensor(
+                self.k_norm,
+                self.head_dim,
+                DType::BF16,
+                "indexed attention K norm",
+            )?;
+        }
         require_tensor(
             self.bf16_scratch,
             q_width.max(kv_width),
             DType::BF16,
             "indexed attention BF16 scratch",
         )?;
-        require_weight(
-            &self.indexer_qk,
-            index_width,
-            self.input_width,
-            "indexed attention index projection",
-        )?;
-        require_weight(
-            &self.q,
-            qgate_width,
-            self.input_width,
-            "indexed attention q projection",
-        )?;
-        require_weight(
-            &self.k,
-            kv_width,
-            self.input_width,
-            "indexed attention k projection",
-        )?;
-        require_weight(
-            &self.v,
-            kv_width,
-            self.input_width,
-            "indexed attention v projection",
-        )?;
-        require_weight(
-            &self.output,
-            self.input_width,
-            q_width,
-            "indexed attention output projection",
-        )?;
+        if inproj {
+            require_weight(
+                &self.indexer_qk,
+                index_width,
+                self.input_width,
+                "indexed attention index projection",
+            )?;
+            require_weight(
+                &self.q,
+                qgate_width,
+                self.input_width,
+                "indexed attention q projection",
+            )?;
+            require_weight(
+                &self.k,
+                kv_width,
+                self.input_width,
+                "indexed attention k projection",
+            )?;
+            require_weight(
+                &self.v,
+                kv_width,
+                self.input_width,
+                "indexed attention v projection",
+            )?;
+        }
+        if outproj {
+            require_weight(
+                &self.output,
+                self.input_width,
+                q_width,
+                "indexed attention output projection",
+            )?;
+        }
         Ok(())
     }
 
@@ -2291,6 +2527,45 @@ fn qsa_projection_hook_run(gpu: &mut Gpu, op: &IndexedAttentionOp<'_>) -> Result
     })
 }
 
+/// The output projection of the full-mode body: the paired HC write rides its
+/// epilogue when it can (`fused`), else the projection lands in
+/// `attention_output`.
+fn qsa_project_output(
+    gpu: &mut Gpu,
+    op: &IndexedAttentionOp<'_>,
+    qsa_output_batch: &GpuTensor,
+    hc: Option<&HyperWriteOp<'_>>,
+    fused: &mut bool,
+) -> Result<(), DispatchError> {
+    let fused_hc = match hc {
+        Some(write) => project_output_into_hyper_write(
+            gpu,
+            &op.output,
+            qsa_output_batch,
+            op.rows,
+            Some(op.rotation),
+            op.trunk_a4 & TrunkFamily::QsaO.bit() != 0,
+            write,
+        )?,
+        None => false,
+    };
+    if fused_hc {
+        *fused = true;
+    } else {
+        project_trunk(
+            gpu,
+            qsa_output_batch,
+            op.rows,
+            op.rotation,
+            &[(&op.output, &view(op.attention_output, 0, op.rows * op.output.m))],
+            &[op.trunk_a4 & TrunkFamily::QsaO.bit() != 0],
+            None,
+            false,
+        )?;
+    }
+    Ok(())
+}
+
 pub fn execute_indexed_attention(
     gpu: &mut Gpu,
     op: &IndexedAttentionOp<'_>,
@@ -2306,6 +2581,8 @@ pub fn execute_indexed_attention_hc(
     hc: Option<&HyperWriteOp<'_>>,
     fused: &mut bool,
 ) -> Result<(), DispatchError> {
+    op.check_phase()?;
+    let phase = op.phase;
     let index_width = (op.index_heads + op.index_kv_heads) * op.index_dim;
     let index_q_width = op.index_heads * op.index_dim;
     let index_kv_width = op.index_kv_heads * op.index_dim;
@@ -2345,10 +2622,26 @@ pub fn execute_indexed_attention_hc(
         IndexedAttentionMode::AppendOnly => &a4_without_q,
         _ => &a4_all,
     };
-    project_trunk(gpu, op.input, op.rows, op.rotation, projections, a4, None, false)?;
-    qsa_projection_hook_run(gpu, op)?;
+    if matches!(phase, MixerPhase::Whole | MixerPhase::InProj) {
+        project_trunk(gpu, op.input, op.rows, op.rotation, projections, a4, None, false)?;
+        qsa_projection_hook_run(gpu, op)?;
+    }
+    if phase == MixerPhase::InProj {
+        return Ok(());
+    }
+    if phase == MixerPhase::OutProj {
+        return qsa_project_output(gpu, op, &qsa_output_batch, hc, fused);
+    }
 
-    if op.rows <= 8 && op.index_dim <= 256 && op.head_dim <= 256 {
+    // The prologue's kernel rotates `min(dim, 64)` channels of the queries,
+    // keys and indexer; any other width takes the batched launches below.
+    let prologue_rotary =
+        op.rotary_dim == op.head_dim.min(64) && op.rotary_dim == op.index_dim.min(64);
+    if gpu.route_rows(op.rows) <= 8
+        && op.index_dim <= 256
+        && op.head_dim <= 256
+        && prologue_rotary
+    {
         // Decode / few-row verify: the norms, RoPE, cache append and
         // index-key round trip and copy below, in one launch.
         hip(indexed_attention_decode_prologue(
@@ -2387,7 +2680,7 @@ pub fn execute_indexed_attention_hc(
                 head_dim: op.index_dim,
                 head_stride: op.index_dim,
                 position_start: initial_position,
-                rotary_dim: op.index_dim.min(64),
+                rotary_dim: op.rotary_dim,
             },
         ))?;
         if op.state.format.index_dtype() == DType::BF16 {
@@ -2444,7 +2737,7 @@ pub fn execute_indexed_attention_hc(
                 head_dim: op.head_dim,
                 head_stride: 2 * op.head_dim,
                 position_start: initial_position,
-                rotary_dim: op.head_dim.min(64),
+                rotary_dim: op.rotary_dim,
             },
         ))?;
         hip(indexed_attention_norm_rope_batch(
@@ -2458,7 +2751,7 @@ pub fn execute_indexed_attention_hc(
                 head_dim: op.head_dim,
                 head_stride: op.head_dim,
                 position_start: initial_position,
-                rotary_dim: op.head_dim.min(64),
+                rotary_dim: op.rotary_dim,
             },
         ))?;
         hip(indexed_attention_cache_append_batch(
@@ -2477,9 +2770,10 @@ pub fn execute_indexed_attention_hc(
         ))?;
     }
 
-    // Every QSA launch declares a position-independent shape: the pool grid and
-    // both dynamic-LDS reservations come from the declared capacities while the
-    // active lengths stay scalars. Measured bit-identical to the position-derived
+    // Every QSA launch declares a position-independent shape: the incremental
+    // pool grid is `ceil(rows / compress)` (offset by the `first_block` kernarg)
+    // and both dynamic-LDS reservations come from the declared capacities while
+    // the active lengths stay scalars. Measured bit-identical to the position-derived
     // shapes with no throughput delta (docs/design/qwen4-program-retained-pm4.md).
     if complete > 0 {
         // Pool only the blocks this launch's rows complete: blocks below
@@ -2590,30 +2884,8 @@ pub fn execute_indexed_attention_hc(
             shape_selected: op.state.selected_capacity,
         },
     ))?;
-    let fused_hc = match hc {
-        Some(write) => project_output_into_hyper_write(
-            gpu,
-            &op.output,
-            &qsa_output_batch,
-            op.rows,
-            Some(op.rotation),
-            write,
-        )?,
-        None => false,
-    };
-    if fused_hc {
-        *fused = true;
-    } else {
-        project_trunk(
-            gpu,
-            &qsa_output_batch,
-            op.rows,
-            op.rotation,
-            &[(&op.output, &view(op.attention_output, 0, op.rows * op.output.m))],
-            &[op.trunk_a4 & TrunkFamily::QsaO.bit() != 0],
-            None,
-            false,
-        )?;
+    if phase != MixerPhase::Core {
+        qsa_project_output(gpu, op, &qsa_output_batch, hc, fused)?;
     }
     let final_selected = view(
         &selected_batch,
@@ -2640,9 +2912,10 @@ pub struct GroupedDepthwiseOp<'a> {
     /// The HC streams hold BF16 bits for this forward
     /// ([`Gpu::qwen4_bf16_streams`]).
     pub state_bf16: bool,
-    /// `rows_tensor` already holds the PLE rows as F16 (first `rows * hidden`
+    /// `rows_tensor` already holds the PLE rows as F16 (first `rows * embed_dim`
     /// halves of its storage; `HIPFIRE_QWEN4_PLE_FUSE`'s F16 gather): the key
     /// and value projections read them directly and the fused tail must run.
+    /// Only admitted when `embed_dim == hidden`.
     pub rows_f16: bool,
     pub key: WeightRef<'a>,
     pub value: WeightRef<'a>,
@@ -2662,6 +2935,9 @@ pub struct GroupedDepthwiseOp<'a> {
     pub rows: usize,
     pub branches: usize,
     pub hidden: usize,
+    /// Width of the staged PLE rows: the key/value projections' K
+    /// (`ple_embed_dim`; Flash-Next: equal to `hidden`).
+    pub embed_dim: usize,
     pub kernel_size: usize,
     pub dilation: usize,
     pub epsilon: f32,
@@ -2672,7 +2948,12 @@ pub struct GroupedDepthwiseOp<'a> {
 
 impl GroupedDepthwiseOp<'_> {
     pub fn validate_for_gpu(&self, _gpu: &Gpu) -> Result<(), DispatchError> {
+        self.validate_layout()
+    }
+
+    fn validate_layout(&self) -> Result<(), DispatchError> {
         if self.rows == 0
+            || self.embed_dim == 0
             || self.branches == 0
             || self.hidden == 0
             || self.kernel_size == 0
@@ -2687,6 +2968,7 @@ impl GroupedDepthwiseOp<'_> {
             checked_mul(self.kernel_size - 1, self.dilation, "grouped history rows")?;
         let rows_channels = checked_mul(self.rows, channels, "grouped row channels")?;
         let rows_hidden = checked_mul(self.rows, self.hidden, "grouped row hidden")?;
+        let rows_embed = checked_mul(self.rows, self.embed_dim, "grouped row embeddings")?;
         let conv_elements = checked_mul(channels, self.kernel_size, "grouped convolution")?;
         let state_elements = checked_mul(history_rows, channels, "grouped state")?;
         require_tensor(self.streams, rows_channels, DType::F32, "grouped streams")?;
@@ -2700,7 +2982,12 @@ impl GroupedDepthwiseOp<'_> {
         require_tensor(self.gated, rows_channels, DType::F32, "grouped gated")?;
         require_tensor(self.normed, rows_channels, DType::F32, "grouped normed")?;
         require_tensor(self.output, rows_channels, DType::F32, "grouped output")?;
-        require_tensor(self.rows_tensor, rows_hidden, DType::F32, "grouped rows")?;
+        if self.rows_f16 && self.embed_dim != self.hidden {
+            return Err(DispatchError::Hip(
+                "grouped PLE F16 rows need the embedding width to equal hidden".into(),
+            ));
+        }
+        require_tensor(self.rows_tensor, rows_embed, DType::F32, "grouped rows")?;
         require_tensor(
             self.value_scratch,
             rows_hidden,
@@ -2717,8 +3004,8 @@ impl GroupedDepthwiseOp<'_> {
             "grouped convolution norm",
         )?;
         require_tensor(self.conv, conv_elements, DType::BF16, "grouped convolution")?;
-        require_weight(&self.key, channels, self.hidden, "grouped key")?;
-        require_weight(&self.value, self.hidden, self.hidden, "grouped value")?;
+        require_weight(&self.key, channels, self.embed_dim, "grouped key")?;
+        require_weight(&self.value, self.hidden, self.embed_dim, "grouped value")?;
         Ok(())
     }
 }
@@ -2752,16 +3039,17 @@ pub fn execute_grouped_depthwise(
         ));
     }
     if op.rows_f16 {
-        // SAFETY: `rows_tensor` holds `rows * hidden` F32 elements, so its first
-        // `rows * hidden * 2` bytes hold the F16 rows; the view is non-owning.
+        // SAFETY: `rows_tensor` holds `rows * embed_dim` F32 elements
+        // (`embed_dim == hidden`, validated), so its first
+        // `rows * embed_dim * 2` bytes hold the F16 rows; the view is non-owning.
         let x_f16 = GpuTensor {
             buf: unsafe {
                 hip_bridge::DeviceBuffer::from_raw(
                     op.rows_tensor.buf.as_ptr(),
-                    op.rows * op.hidden * 2,
+                    op.rows * op.embed_dim * 2,
                 )
             },
-            shape: vec![op.rows * op.hidden],
+            shape: vec![op.rows * op.embed_dim],
             dtype: DType::F16,
         };
         for (weight, out) in [(&op.key, &key), (&op.value, &value)] {
@@ -3055,6 +3343,117 @@ pub fn execute_project(gpu: &mut Gpu, op: &ProjectOp<'_>) -> Result<(), Dispatch
     project_weight(gpu, &op.weight, op.input, op.output, op.rows, op.rotation)
 }
 
+/// Dense feed-forward recipe: which source equation and storage boundaries
+/// [`execute_dense_ffn`] runs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DenseFfnRecipe {
+    /// `down(silu(gate(x)) * up(x))` with BF16 storage after the gate
+    /// projection, the up projection, the SiLU, the product and the down
+    /// projection.
+    SiluBf16Source,
+}
+
+/// Dense gated FFN over `rows` row-major rows of `hidden`: gate and up
+/// projections of `input` (`m = intermediate`, `k = hidden`), the recipe's
+/// activation, and the down projection (`m = hidden`, `k = intermediate`) into
+/// `output`.  `gate_scratch` and `up_scratch` must be distinct tensors; the
+/// op writes both and `output`, and reads `input` only before it writes
+/// `output`.
+pub struct DenseFfnOp<'a> {
+    pub recipe: DenseFfnRecipe,
+    pub gate: WeightRef<'a>,
+    pub up: WeightRef<'a>,
+    pub down: WeightRef<'a>,
+    /// F32, at least `rows * hidden`.
+    pub input: &'a GpuTensor,
+    /// F32, at least `rows * intermediate`.
+    pub gate_scratch: &'a GpuTensor,
+    /// F32, at least `rows * intermediate`.
+    pub up_scratch: &'a GpuTensor,
+    /// F32, at least `rows * hidden`.
+    pub output: &'a GpuTensor,
+    /// FWHT basis scratch, at least `rows * max(hidden, intermediate)`; read
+    /// only for payloads that carry an FWHT basis.
+    pub rotation: &'a GpuTensor,
+    pub rows: usize,
+    pub hidden: usize,
+    pub intermediate: usize,
+}
+
+impl DenseFfnOp<'_> {
+    pub fn validate_for_gpu(&self, _gpu: &Gpu) -> Result<(), DispatchError> {
+        self.validate_layout()
+    }
+
+    fn validate_layout(&self) -> Result<(), DispatchError> {
+        if self.rows == 0 || self.hidden == 0 || self.intermediate == 0 {
+            return Err(DispatchError::Hip("dense FFN has empty geometry".into()));
+        }
+        require_weight(&self.gate, self.intermediate, self.hidden, "dense FFN gate")?;
+        require_weight(&self.up, self.intermediate, self.hidden, "dense FFN up")?;
+        require_weight(&self.down, self.hidden, self.intermediate, "dense FFN down")?;
+        let wide = checked_mul(self.rows, self.hidden, "dense FFN hidden rows")?;
+        let inner = checked_mul(self.rows, self.intermediate, "dense FFN intermediate rows")?;
+        require_tensor(self.input, wide, DType::F32, "dense FFN input")?;
+        require_tensor(
+            self.gate_scratch,
+            inner,
+            DType::F32,
+            "dense FFN gate scratch",
+        )?;
+        require_tensor(self.up_scratch, inner, DType::F32, "dense FFN up scratch")?;
+        require_tensor(self.output, wide, DType::F32, "dense FFN output")?;
+        if [&self.gate, &self.up, &self.down]
+            .iter()
+            .any(|weight| rotation_basis(weight.dtype).is_some())
+        {
+            let rotated = checked_mul(
+                self.rows,
+                self.hidden.max(self.intermediate),
+                "dense FFN rotation",
+            )?;
+            require_tensor(self.rotation, rotated, DType::F32, "dense FFN rotation")?;
+        }
+        Ok(())
+    }
+}
+
+/// Run a [`DenseFfnOp`].  `SiluBf16Source` order, each step on exact-length
+/// views, no allocation:
+///
+/// 1. gate and up projections of `input` (`project_weights`);
+/// 2. BF16 round trip of gate, then of up (storage after each projection);
+/// 3. `gate = silu(gate)`, BF16 round trip (storage after the activation);
+/// 4. `gate = gate * up`, BF16 round trip (storage after the product);
+/// 5. down projection of the product into `output`;
+/// 6. BF16 round trip of `output` (storage after the down projection).
+///
+/// The element-wise kernels read each element before writing it, so the
+/// in-place SiLU and product are safe.
+pub fn execute_dense_ffn(gpu: &mut Gpu, op: &DenseFfnOp<'_>) -> Result<(), DispatchError> {
+    let DenseFfnRecipe::SiluBf16Source = op.recipe;
+    let wide = checked_mul(op.rows, op.hidden, "dense FFN hidden rows")?;
+    let inner = checked_mul(op.rows, op.intermediate, "dense FFN intermediate rows")?;
+    let gate = view(op.gate_scratch, 0, inner);
+    let up = view(op.up_scratch, 0, inner);
+    let output = view(op.output, 0, wide);
+    project_weights(
+        gpu,
+        op.input,
+        op.rows,
+        Some(op.rotation),
+        &[(&op.gate, &gate), (&op.up, &up)],
+    )?;
+    hip(gpu.bf16_round_trip_f32(&gate))?;
+    hip(gpu.bf16_round_trip_f32(&up))?;
+    hip(gpu.silu_f32(&gate, &gate))?;
+    hip(gpu.bf16_round_trip_f32(&gate))?;
+    hip(gpu.mul_f32(&gate, &up, &gate))?;
+    hip(gpu.bf16_round_trip_f32(&gate))?;
+    project_weight(gpu, &op.down, &gate, &output, op.rows, Some(op.rotation))?;
+    hip(gpu.bf16_round_trip_f32(&output))
+}
+
 /// `output[r] = rows_input[r] + row` for every one of `rows` rows of `width`.
 pub struct BroadcastAddOp<'a> {
     pub rows_input: &'a GpuTensor,
@@ -3134,7 +3533,10 @@ pub fn execute_lm_head(
     requested_rows: usize,
 ) -> Result<(), DispatchError> {
     validate_lm_head(weight, hidden_batch, logits, rows, requested_rows)?;
-    if requested_rows == rows {
+    // Under the batch-invariant prefill profile a one-row head is the final-row
+    // head's GEMV (never the routed GEMM), so a one-row forward and a longer
+    // forward's final row produce the same bytes.
+    if requested_rows == rows && (rows > 1 || !gpu.prefill_invariant_scope) {
         match weight.dtype {
             DType::BF16 => project_weight(gpu, weight, hidden_batch, logits, rows, None),
             DType::F32 => hip(gpu.gemm_f32_batched(
@@ -3301,6 +3703,7 @@ mod tests {
                 row_capture: None,
                 zba_fold: None,
                 trunk_a4: 0,
+                phase: MixerPhase::Whole,
             }
         }
     }
@@ -3360,6 +3763,7 @@ mod tests {
             lloyd_lut_c16: None,
         };
         IndexedAttentionOp {
+            rotary_dim: 2,
             indexer_qk: weight,
             indexer_q_norm: t,
             indexer_k_norm: t,
@@ -3409,6 +3813,7 @@ mod tests {
             rotation: t,
             mode,
             trunk_a4: 0,
+            phase: MixerPhase::Whole,
         }
     }
 
@@ -3441,6 +3846,47 @@ mod tests {
     }
 
     #[test]
+    fn gdn_projection_phases_refuse_a_row_capture() {
+        let fixture = GdnFixture::new();
+        let scratch = tensor(64, DType::F32);
+        for (phase, refused) in [
+            (MixerPhase::InProj, true),
+            (MixerPhase::OutProj, true),
+            (MixerPhase::Core, false),
+            (MixerPhase::Whole, false),
+        ] {
+            let mut op = fixture.op();
+            op.phase = phase;
+            op.row_capture = Some(GdnRowCapture {
+                states: tensor(64, DType::F32),
+                inputs: &scratch,
+                recurrence: &scratch,
+            });
+            assert_eq!(
+                op.check_phase().is_err(),
+                refused,
+                "{phase:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn gdn_projection_phases_skip_the_core_metadata_checks() {
+        let mut fixture = GdnFixture::new();
+        fixture.a_log.dtype = DType::F32;
+        let mut op = fixture.op();
+        for (phase, ok) in [
+            (MixerPhase::Whole, false),
+            (MixerPhase::InProj, true),
+            (MixerPhase::Core, false),
+            (MixerPhase::OutProj, true),
+        ] {
+            op.phase = phase;
+            assert_eq!(op.validate_layout().is_ok(), ok, "{phase:?}");
+        }
+    }
+
+    #[test]
     fn indexed_attention_reuse_validation_refuses_stale_or_multirow_selection() {
         let t = tensor(1, DType::F32);
         let scalar = tensor(4, DType::Raw);
@@ -3455,6 +3901,45 @@ mod tests {
             .validate_layout()
             .expect_err("a K/V-only append leaves no selection to reuse");
         assert!(error.to_string().contains("after a K/V-only append"));
+    }
+
+    #[test]
+    fn indexed_attention_split_phase_refuses_reuse_and_append_modes() {
+        let t = tensor(1, DType::F32);
+        let scalar = tensor(4, DType::Raw);
+        let reuse = IndexedAttentionMode::ReuseSelection {
+            selected_len_out: &scalar,
+        };
+        for phase in [MixerPhase::InProj, MixerPhase::Core, MixerPhase::OutProj] {
+            for mode in [reuse, IndexedAttentionMode::AppendOnly] {
+                let mut op = indexed_attention(&t, 1, 20, 12, mode);
+                op.phase = phase;
+                let error = op
+                    .validate_layout()
+                    .expect_err("split phases are full-mode only");
+                assert!(error.to_string().contains("need the whole mixer op"), "{phase:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn indexed_attention_projection_phases_skip_state_checks() {
+        let t = tensor(1, DType::F32);
+        let mut op = indexed_attention(&t, 1, 20, 12, IndexedAttentionMode::Full);
+        op.state.full_len = 0;
+        let error = op.validate_layout().expect_err("whole op checks the state");
+        assert!(error.to_string().contains("state length/capacity mismatch"));
+        for phase in [MixerPhase::InProj, MixerPhase::OutProj] {
+            op.phase = phase;
+            let error = op.validate_layout().expect_err("null tensors are too small");
+            assert!(
+                !error.to_string().contains("state length/capacity mismatch"),
+                "{phase:?}: {error}"
+            );
+        }
+        op.phase = MixerPhase::Core;
+        let error = op.validate_layout().expect_err("core checks the state");
+        assert!(error.to_string().contains("state length/capacity mismatch"));
     }
 
     /// H4 attention epilogue: the MQ6G256V2 output projection that carries its
@@ -3581,6 +4066,7 @@ mod tests {
                             &input,
                             rows,
                             Some(&rotation),
+                            false,
                             &write_op!(&fused),
                         )
                         .expect("fused"),
@@ -3612,5 +4098,249 @@ mod tests {
             lloyd_lut_f16: None,
             lloyd_lut_c16: None,
         }
+    }
+
+    fn dense_ffn_fixture(rows: usize, hidden: usize, intermediate: usize) -> [GpuTensor; 7] {
+        [
+            tensor(hidden * intermediate, DType::BF16),
+            tensor(hidden * intermediate, DType::BF16),
+            tensor(hidden * intermediate, DType::BF16),
+            tensor(rows * hidden, DType::F32),
+            tensor(rows * intermediate, DType::F32),
+            tensor(rows * intermediate, DType::F32),
+            tensor(rows * hidden, DType::F32),
+        ]
+    }
+
+    fn dense_ffn_op<'a>(
+        t: &'a [GpuTensor; 7],
+        rotation: &'a GpuTensor,
+        rows: usize,
+        hidden: usize,
+        intermediate: usize,
+    ) -> DenseFfnOp<'a> {
+        DenseFfnOp {
+            recipe: DenseFfnRecipe::SiluBf16Source,
+            gate: plain_weight(&t[0], DType::BF16, intermediate, hidden),
+            up: plain_weight(&t[1], DType::BF16, intermediate, hidden),
+            down: plain_weight(&t[2], DType::BF16, hidden, intermediate),
+            input: &t[3],
+            gate_scratch: &t[4],
+            up_scratch: &t[5],
+            output: &t[6],
+            rotation,
+            rows,
+            hidden,
+            intermediate,
+        }
+    }
+
+    /// Message of the refusal `op` must produce.
+    fn dense_ffn_refusal(op: &DenseFfnOp<'_>) -> String {
+        op.validate_layout()
+            .expect_err("dense FFN op must be refused")
+            .to_string()
+    }
+
+    #[test]
+    fn dense_ffn_geometry_validation() {
+        let (rows, hidden, intermediate) = (3, 16, 8);
+        let t = dense_ffn_fixture(rows, hidden, intermediate);
+        let rotation = tensor(1, DType::F32);
+        let op = || dense_ffn_op(&t, &rotation, rows, hidden, intermediate);
+        assert!(op().validate_layout().is_ok());
+
+        let mut bad = op();
+        bad.rows = 0;
+        assert!(dense_ffn_refusal(&bad).contains("empty geometry"));
+        let mut bad = op();
+        bad.hidden = 0;
+        assert!(dense_ffn_refusal(&bad).contains("empty geometry"));
+        let mut bad = op();
+        bad.intermediate = 0;
+        assert!(dense_ffn_refusal(&bad).contains("empty geometry"));
+
+        // Transposed or mis-sized projection geometry.
+        let mut bad = op();
+        bad.gate = plain_weight(&t[0], DType::BF16, hidden, intermediate);
+        assert!(dense_ffn_refusal(&bad).contains("dense FFN gate"));
+        let mut bad = op();
+        bad.up = plain_weight(&t[1], DType::BF16, intermediate, intermediate);
+        assert!(dense_ffn_refusal(&bad).contains("dense FFN up"));
+        let mut bad = op();
+        bad.down = plain_weight(&t[2], DType::BF16, intermediate, hidden);
+        assert!(dense_ffn_refusal(&bad).contains("dense FFN down"));
+
+        // A weight buffer smaller than its geometry, and an unprojectable dtype.
+        let short = tensor(hidden * intermediate - 1, DType::BF16);
+        let mut bad = op();
+        bad.down = plain_weight(&short, DType::BF16, hidden, intermediate);
+        assert!(dense_ffn_refusal(&bad).contains("dense FFN down"));
+        let mut bad = op();
+        bad.gate = plain_weight(&t[0], DType::F32, intermediate, hidden);
+        assert!(dense_ffn_refusal(&bad).contains("dense FFN gate"));
+    }
+
+    #[test]
+    fn dense_ffn_scratch_validation() {
+        let (rows, hidden, intermediate) = (3, 16, 8);
+        let rotation = tensor(1, DType::F32);
+        let small_wide = tensor(rows * hidden - 1, DType::F32);
+        let small_inner = tensor(rows * intermediate - 1, DType::F32);
+        let wrong_dtype = tensor(rows * hidden, DType::BF16);
+        let t = dense_ffn_fixture(rows, hidden, intermediate);
+        let op = || dense_ffn_op(&t, &rotation, rows, hidden, intermediate);
+
+        let mut bad = op();
+        bad.input = &small_wide;
+        assert!(dense_ffn_refusal(&bad).contains("dense FFN input"));
+        let mut bad = op();
+        bad.input = &wrong_dtype;
+        assert!(dense_ffn_refusal(&bad).contains("dense FFN input"));
+        let mut bad = op();
+        bad.gate_scratch = &small_inner;
+        assert!(dense_ffn_refusal(&bad).contains("gate scratch"));
+        let mut bad = op();
+        bad.up_scratch = &small_inner;
+        assert!(dense_ffn_refusal(&bad).contains("up scratch"));
+        let mut bad = op();
+        bad.output = &small_wide;
+        assert!(dense_ffn_refusal(&bad).contains("dense FFN output"));
+
+        // Rotation scratch is owed only to FWHT payloads, and then at
+        // rows * max(hidden, intermediate).
+        let mut bad = op();
+        bad.down = plain_weight(&t[2], DType::MQ4G256V2, hidden, intermediate);
+        assert!(dense_ffn_refusal(&bad).contains("dense FFN rotation"));
+        let enough = tensor(rows * hidden, DType::F32);
+        let mut fwht = dense_ffn_op(&t, &enough, rows, hidden, intermediate);
+        fwht.down = plain_weight(&t[2], DType::MQ4G256V2, hidden, intermediate);
+        assert!(fwht.validate_layout().is_ok());
+    }
+
+    #[test]
+    fn indexed_attention_rotary_validation() {
+        let t = tensor(1, DType::F32);
+        let base = || indexed_attention(&t, 1, 8, 0, IndexedAttentionMode::Full);
+        assert!(base().validate_rotary().is_ok());
+        for (rotary, head_dim, index_dim, why) in [
+            (0usize, 8usize, 8usize, "zero"),
+            (3, 8, 8, "odd"),
+            (6, 4, 8, "above head_dim"),
+            (4, 8, 2, "above index_dim"),
+        ] {
+            let mut op = base();
+            (op.rotary_dim, op.head_dim, op.index_dim) = (rotary, head_dim, index_dim);
+            let error = op.validate_rotary().expect_err(why);
+            assert!(
+                error.to_string().contains("must be even and within"),
+                "{why}: {error}"
+            );
+        }
+        // The pooled-key kernel's fixed width: refused whenever the core runs,
+        // accepted for a projection-only phase.
+        let mut op = base();
+        (op.rotary_dim, op.head_dim, op.index_dim) = (2, 8, 8);
+        let error = op.validate_rotary().expect_err("pooled-key width");
+        assert!(error.to_string().contains("pooled-key"), "{error}");
+        op.phase = MixerPhase::InProj;
+        assert!(op.validate_rotary().is_ok());
+        // Flash-Next geometry: 64 of 256 / 128.
+        let mut op = base();
+        (op.rotary_dim, op.head_dim, op.index_dim) = (64, 256, 128);
+        assert!(op.validate_rotary().is_ok());
+        // A partial-rotary tiny profile: 4 of 8 / 4.
+        let mut op = base();
+        (op.rotary_dim, op.head_dim, op.index_dim) = (4, 8, 4);
+        assert!(op.validate_rotary().is_ok());
+    }
+
+    #[test]
+    fn grouped_depthwise_validates_embedding_width() {
+        // hidden 16, 2 branches (32 channels), PLE rows 8 wide, kernel 2.
+        let (rows, hidden, branches, embed) = (3usize, 16usize, 2usize, 8usize);
+        let channels = branches * hidden;
+        let f32s = |n: usize| tensor(n, DType::F32);
+        let bf16s = |n: usize| tensor(n, DType::BF16);
+        let (key_w, value_w) = (bf16s(channels * embed), bf16s(hidden * embed));
+        let (norm_key, norm_query, norm_conv) = (bf16s(channels), bf16s(channels), bf16s(channels));
+        let conv = bf16s(channels * 2);
+        let (state, streams) = (f32s(channels), f32s(rows * channels));
+        let rows_tensor = f32s(rows * embed);
+        let (query, key_scratch, value_scratch) = (
+            f32s(rows * channels),
+            f32s(rows * channels),
+            f32s(rows * hidden),
+        );
+        let (gated, normed, output) = (
+            f32s(rows * channels),
+            f32s(rows * channels),
+            f32s(rows * channels),
+        );
+        let rotation = f32s(1);
+        let op = || GroupedDepthwiseOp {
+            state_bf16: false,
+            rows_f16: false,
+            key: plain_weight(&key_w, DType::BF16, channels, embed),
+            value: plain_weight(&value_w, DType::BF16, hidden, embed),
+            norm_key: &norm_key,
+            norm_query: &norm_query,
+            norm_conv: &norm_conv,
+            conv: &conv,
+            state: &state,
+            streams: &streams,
+            rows_tensor: &rows_tensor,
+            query: &query,
+            key_scratch: &key_scratch,
+            value_scratch: &value_scratch,
+            gated: &gated,
+            normed: &normed,
+            output: &output,
+            rows,
+            branches,
+            hidden,
+            embed_dim: embed,
+            kernel_size: 2,
+            dilation: 1,
+            epsilon: 1e-6,
+            rotation: &rotation,
+        };
+        assert!(op().validate_layout().is_ok());
+
+        let refusal = |op: &GroupedDepthwiseOp<'_>| {
+            op.validate_layout()
+                .expect_err("must be refused")
+                .to_string()
+        };
+        let mut bad = op();
+        bad.embed_dim = 0;
+        assert!(refusal(&bad).contains("invalid geometry"));
+        // Key/value K must be the embedding width, not hidden.
+        let mut bad = op();
+        bad.key = plain_weight(&key_w, DType::BF16, channels, hidden);
+        assert!(refusal(&bad).contains("grouped key"));
+        let mut bad = op();
+        bad.value = plain_weight(&value_w, DType::BF16, hidden, hidden);
+        assert!(refusal(&bad).contains("grouped value"));
+        // The staged rows hold rows * embed_dim, not rows * hidden.
+        let short = f32s(rows * embed - 1);
+        let mut bad = op();
+        bad.rows_tensor = &short;
+        assert!(refusal(&bad).contains("grouped rows"));
+        // F16 rows are only defined for embed_dim == hidden.
+        let mut bad = op();
+        bad.rows_f16 = true;
+        assert!(refusal(&bad).contains("F16 rows"));
+        // embed_dim == hidden (Flash-Next): hidden-wide rows and K, F16 admitted.
+        let wide_rows = f32s(rows * hidden);
+        let (wide_key, wide_value) = (bf16s(channels * hidden), bf16s(hidden * hidden));
+        let mut fn_like = op();
+        fn_like.embed_dim = hidden;
+        fn_like.rows_tensor = &wide_rows;
+        fn_like.key = plain_weight(&wide_key, DType::BF16, channels, hidden);
+        fn_like.value = plain_weight(&wide_value, DType::BF16, hidden, hidden);
+        assert!(fn_like.validate_layout().is_ok());
+        fn_like.rows_f16 = true;
+        assert!(fn_like.validate_layout().is_ok());
     }
 }

@@ -18,8 +18,11 @@ pub mod elf;
 pub mod kd;
 pub mod layout;
 pub mod metadata;
+pub mod raw;
 pub mod rewrite;
 pub mod text;
+
+pub use raw::lift_raw;
 
 use peacemaker_ir::cfg::{BlockId, Body};
 use peacemaker_ir::codec::{gfx11, gfx12};
@@ -67,6 +70,11 @@ pub enum Rule {
     ModuleIdentity,
     /// `lift_text`: the source disagrees with the object it was assembled into.
     Text,
+    /// `lift_raw`: the declaration (spec, hashes, extent, frontend, resources, relocations,
+    /// sidecar) is inconsistent with itself or with the binary.
+    Spec,
+    /// `lift_raw`: the code reads a location the declared entry facts do not define.
+    Entry,
 }
 
 #[derive(Debug, thiserror::Error)]
@@ -208,13 +216,17 @@ pub fn lift_object(bytes: &[u8], options: Options) -> Result<Lifted<Program>, Li
     }
     Ok(Lifted {
         program,
-        proof: RoundTripProof { input_sha256: sha256(bytes), tools: Vec::new(), streams },
+        proof: RoundTripProof { input_sha256: sha256(bytes), tools: Vec::new(), streams, sidecar_sha256: None },
         report: LiftReport::default(),
     })
 }
 
+fn rejected(kernel: &str, offset: u64, rule: Rule, reason: impl ToString) -> LiftError {
+    LiftError::Rejected { kernel: Some(kernel.to_owned()), offset, rule, reason: reason.to_string() }
+}
+
 fn kernel_error(image: &KernelImage, offset: u64, rule: Rule, reason: impl ToString) -> LiftError {
-    LiftError::Rejected { kernel: Some(image.name.clone()), offset, rule, reason: reason.to_string() }
+    rejected(&image.name, offset, rule, reason)
 }
 
 fn lift_kernel(image: &KernelImage, slot: &KernelSlot, arch: Arch, frontend: Frontend, object_sha: [u8; 32]) -> Result<Kernel, LiftError> {
@@ -224,48 +236,7 @@ fn lift_kernel(image: &KernelImage, slot: &KernelSlot, arch: Arch, frontend: Fro
     if image.code.len() % 4 != 0 {
         return Err(kernel_error(image, image.entry_va, Rule::Decode, format!("symbol size {} is not a dword multiple", image.code.len())));
     }
-    let words: Vec<u32> = image.code.chunks_exact(4).map(|w| u32::from_le_bytes(w.try_into().expect("dword"))).collect();
-    let mut body = Body::default();
-    let mut vas = Vec::new();
-    let mut at = 0;
-    while at < words.len() {
-        let va = image.entry_va + 4 * at as u64;
-        let (mut inst, n) = match arch { Arch::Gfx1100 | Arch::Gfx1151 => gfx11::decode(arch, &words[at..]),
-            _ => gfx12::decode(&words[at..]) }.map_err(|e| kernel_error(image, va, Rule::Decode, e))?;
-        let original = &words[at..at + n];
-        let encoded = gfx12::encode_for(arch, &inst).map_err(|e| kernel_error(image, va, Rule::StreamIdentity, e))?;
-        if encoded.as_slice() != original {
-            return Err(kernel_error(image, va, Rule::StreamIdentity, format!("re-encoded {encoded:08x?} != input {original:08x?}")));
-        }
-        let mut kept = [0u32; 3];
-        kept[..n].copy_from_slice(original);
-        let pc = u32::try_from(va).map_err(|_| kernel_error(image, va, Rule::Envelope, "VA exceeds 32 bits"))?;
-        inst.prov = Provenance { source: Origin::Object(ObjectSha(object_sha)), pc: Some(pc), bytes: Some(kept), line: None, edit: None };
-        vas.push(va);
-        let id = body.insts.insert(inst);
-        body.layout.push(id);
-        at += n;
-    }
-    let va_at = |index: usize| vas.get(index).copied().unwrap_or(image.entry_va);
-    build_blocks(&mut body, arch).map_err(|e| {
-        let (index, rule) = match e {
-            CfgError::TargetOutsideKernel { index, .. } | CfgError::TargetMidInstruction { index, .. } => (index, Rule::BranchTarget),
-            CfgError::MissingOffset { index } | CfgError::UnexpectedLabel { index } => (index, Rule::ControlFlow),
-            CfgError::MissingEndPgm => (vas.len().saturating_sub(1), Rule::ControlFlow),
-            CfgError::Empty | CfgError::AlreadyBuilt | CfgError::DanglingInst { .. } | CfgError::BlocksNotBuilt => (0, Rule::ControlFlow),
-        };
-        kernel_error(image, va_at(index), rule, e)
-    })?;
-    check_windows(&body).map_err(|e| {
-        let index = match e {
-            WindowError::CrossesLeader { index, .. } | WindowError::ClauseLengthMissing { index }
-            | WindowError::NonMemoryMember { index, .. } | WindowError::MixedClass { index, .. }
-            | WindowError::WaitInsideClause { index, .. } | WindowError::EndPgmInsideClause { index }
-            | WindowError::HintMissing { index } | WindowError::DelayCrossesLeader { index } => index,
-            WindowError::BlocksNotBuilt => 0,
-        };
-        kernel_error(image, va_at(index), Rule::Window, e)
-    })?;
+    let body = decode_body(&image.name, &image.code, image.entry_va, arch, object_sha)?;
     kd::validate(&image.descriptor, arch).map_err(|e| kernel_error(image, slot.kd_va, Rule::Descriptor, e))?;
     metadata::check(&image.metadata.parsed, &image.name, &image.descriptor)
         .map_err(|e| kernel_error(image, slot.kd_va, Rule::Metadata, e))?;
@@ -277,6 +248,56 @@ fn lift_kernel(image: &KernelImage, slot: &KernelSlot, arch: Arch, frontend: Fro
         body,
         origin: KernelOrigin::Frontend { kind: frontend, object_sha256: object_sha, entry_va: slot.entry_va, size: slot.size },
     })
+}
+
+/// Decode one kernel stream (`code` at `entry_va`) into a typed body: every instruction is
+/// decoded by the target codec, re-encoded from its typed fields and compared word for word,
+/// the CFG is built from the encoded branch offsets and the clause/delay windows are checked.
+/// Shared by the HSA and the raw lifters; `prov.bytes` is recorded but never read back.
+fn decode_body(name: &str, code: &[u8], entry_va: u64, arch: Arch, object_sha: [u8; 32]) -> Result<Body, LiftError> {
+    let words: Vec<u32> = code.chunks_exact(4).map(|w| u32::from_le_bytes(w.try_into().expect("dword"))).collect();
+    let mut body = Body::default();
+    let mut vas = Vec::new();
+    let mut at = 0;
+    while at < words.len() {
+        let va = entry_va + 4 * at as u64;
+        let (mut inst, n) = match arch { Arch::Gfx1100 | Arch::Gfx1151 => gfx11::decode(arch, &words[at..]),
+            _ => gfx12::decode(&words[at..]) }.map_err(|e| rejected(name, va, Rule::Decode, e))?;
+        let original = &words[at..at + n];
+        let encoded = gfx12::encode_for(arch, &inst).map_err(|e| rejected(name, va, Rule::StreamIdentity, e))?;
+        if encoded.as_slice() != original {
+            return Err(rejected(name, va, Rule::StreamIdentity, format!("re-encoded {encoded:08x?} != input {original:08x?}")));
+        }
+        let mut kept = [0u32; 3];
+        kept[..n].copy_from_slice(original);
+        let pc = u32::try_from(va).map_err(|_| rejected(name, va, Rule::Envelope, "VA exceeds 32 bits"))?;
+        inst.prov = Provenance { source: Origin::Object(ObjectSha(object_sha)), pc: Some(pc), bytes: Some(kept), line: None, edit: None };
+        vas.push(va);
+        let id = body.insts.insert(inst);
+        body.layout.push(id);
+        at += n;
+    }
+    let va_at = |index: usize| vas.get(index).copied().unwrap_or(entry_va);
+    build_blocks(&mut body, arch).map_err(|e| {
+        let (index, rule) = match e {
+            CfgError::TargetOutsideKernel { index, .. } | CfgError::TargetMidInstruction { index, .. } => (index, Rule::BranchTarget),
+            CfgError::MissingOffset { index } | CfgError::UnexpectedLabel { index } => (index, Rule::ControlFlow),
+            CfgError::MissingEndPgm => (vas.len().saturating_sub(1), Rule::ControlFlow),
+            CfgError::Empty | CfgError::AlreadyBuilt | CfgError::DanglingInst { .. } | CfgError::BlocksNotBuilt => (0, Rule::ControlFlow),
+        };
+        rejected(name, va_at(index), rule, e)
+    })?;
+    check_windows(&body).map_err(|e| {
+        let index = match e {
+            WindowError::CrossesLeader { index, .. } | WindowError::ClauseLengthMissing { index }
+            | WindowError::NonMemoryMember { index, .. } | WindowError::MixedClass { index, .. }
+            | WindowError::WaitInsideClause { index, .. } | WindowError::EndPgmInsideClause { index }
+            | WindowError::HintMissing { index } | WindowError::DelayCrossesLeader { index } => index,
+            WindowError::BlocksNotBuilt => 0,
+        };
+        rejected(name, va_at(index), Rule::Window, e)
+    })?;
+    Ok(body)
 }
 
 /// Lift an authoritative `.s` through `object`, the code object the pinned assembler
@@ -353,10 +374,6 @@ pub fn lift_text(source: &str, object: &[u8], options: Options) -> Result<Lifted
         }
     }
     Ok(lifted)
-}
-
-pub fn lift_raw(_bytes: &[u8], _abi: Abi, _arch: Arch) -> Result<Lifted<Program>, LiftError> {
-    todo!("C2/C3 raw byte lifting")
 }
 
 /// Emission from typed fields: branch labels are lowered against the current layout and

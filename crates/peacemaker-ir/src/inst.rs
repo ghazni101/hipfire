@@ -6,7 +6,7 @@ use std::fmt::Write as _;
 use smallvec::SmallVec;
 use thiserror::Error;
 
-use crate::{cfg::{Body, Terminator}, descriptor::KernelDescriptor, effects::Effects, envelope::Source, metadata::HsaKernelMetadata, operand::{Modifiers, Operand}, provenance::Provenance};
+use crate::{cfg::{Body, Terminator}, descriptor::KernelDescriptor, effects::Effects, envelope::Source, metadata::HsaKernelMetadata, operand::{Modifiers, Operand, Special}, provenance::Provenance, reg::RegRef};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
 pub enum Arch { Gfx1010, Gfx1030, Gfx1100, Gfx1151, Gfx1201 }
@@ -165,10 +165,301 @@ pub struct Kernel { pub symbol: SymbolId, pub wave: Wave, pub abi: Abi, pub body
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum Abi {
     Hsa { descriptor: KernelDescriptor, metadata: HsaKernelMetadata },
-    Raw { user_sgprs: Vec<UserSgprRole>, wave: Wave, lds_bytes: u32, sidecar_sha256: [u8; 32] },
+    /// A foreign (non-HSA) executable stream such as a Mesa/ACO shader. It carries the
+    /// producer's declared entry state and resources; nothing is inferred from HSA.
+    Raw(RawAbi),
 }
+
+/// Workgroup/local-ID axis.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum Axis { X, Y, Z }
+
+/// One local-ID component packed into a VGPR dword: `(v >> shift) & (2^bits - 1)`, known to
+/// be at most `max` for every launch the contract admits.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LocalIdField { pub axis: Axis, pub shift: u8, pub bits: u8, pub max: u32 }
+
+/// A physical location at kernel entry.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum EntryLoc {
+    /// `len` consecutive registers of one file.
+    Reg(RegRef),
+    /// Architectural special register. `Exec`/`Vcc` cover the lanes of the kernel's wave.
+    Special(Special),
+    /// The `s_getreg` hardware-register state.
+    Hwreg,
+}
+
+/// What is known about the dword(s) of a location at entry.
 #[derive(Clone, Debug, Eq, PartialEq)]
-pub enum UserSgprRole { PrivateSegmentBuffer, DispatchPtr, QueuePtr, KernargSegmentPtr, DispatchId, FlatScratchInit, PrivateSegmentSize }
+pub enum EntryValue {
+    /// Defined with a value the contract does not constrain (descriptor pointers, push
+    /// constants, the wave's initial EXEC).
+    Defined,
+    /// A work-group id of the dispatch (single dword, unconstrained).
+    WorkgroupId(Axis),
+    /// Exactly this value (single dword).
+    Exact(u32),
+    /// Within `min..=max` inclusive (single dword, unsigned).
+    Bounded { min: u32, max: u32 },
+    /// Local work-item ids packed into one VGPR; bits outside the fields are zero.
+    LocalId(Vec<LocalIdField>),
+}
+
+/// A location defined at entry. A location with no fact is undefined at entry.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct EntryFact { pub loc: EntryLoc, pub value: EntryValue }
+
+/// Declared resources. Actual and allocated register counts are distinct, and every
+/// register an entry fact names must be inside the allocation.
+///
+/// Count basis: SGPR counts may be ordinary (`s0..s105`, at most 106) or the driver's physical
+/// count, where `VCC_LO` = 106 and `VCC_HI` = 107 follow the ordinary file (at most 108); the
+/// producer's value is kept verbatim, never truncated. Only the first
+/// [`RawResources::ORDINARY_SGPRS`] are ordinary: code and entry facts are bound by
+/// [`RawResources::ordinary_sgprs_actual`] / [`RawResources::ordinary_sgprs_allocated`], never by
+/// the total, and VCC is a `Special` that needs its own entry fact.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct RawResources {
+    pub lds_bytes: u32,
+    pub scratch_bytes_per_lane: u32,
+    pub vgprs_actual: u16,
+    pub vgprs_allocated: u16,
+    pub sgprs_actual: u16,
+    pub sgprs_allocated: u16,
+}
+impl RawResources {
+    /// Addressable ordinary SGPRs `s0..s105`.
+    pub const ORDINARY_SGPRS: u16 = 106;
+    /// Physical SGPR count limit including `VCC_LO`/`VCC_HI` (106, 107).
+    pub const SGPR_COUNT_LIMIT: u16 = 108;
+    pub fn ordinary_sgprs_actual(&self) -> u16 { self.sgprs_actual.min(Self::ORDINARY_SGPRS) }
+    pub fn ordinary_sgprs_allocated(&self) -> u16 { self.sgprs_allocated.min(Self::ORDINARY_SGPRS) }
+}
+
+/// Floating-point and execution mode state the shader config declares (RSRC1/RSRC2 fields,
+/// no defaults). The MODE register is defined at entry because this state is declared.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct FpState {
+    pub round32: u8,
+    pub round16_64: u8,
+    pub denorm32: u8,
+    pub denorm16_64: u8,
+    pub dx10_clamp: bool,
+    pub ieee_mode: bool,
+    pub fp16_overflow: bool,
+    pub wgp_mode: bool,
+    pub mem_ordered: bool,
+    pub forward_progress: bool,
+    /// gfx12 RSRC1 bit 21 `WG_RR_EN` (`.amdhsa_round_robin_scheduling`). Bit 21 is
+    /// `DX10_CLAMP` on gfx11, so it must be false there.
+    pub wg_round_robin: bool,
+    /// RSRC2 `EXCP_EN` bits.
+    pub exceptions: u16,
+}
+
+/// A relocation against a dword of the executable range. Its dword must be an instruction
+/// literal; the stored value is the unrelocated one. `emit::module` and any adapter must
+/// refuse a program with relocations they do not resolve.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct Relocation { pub offset: u64, pub r_type: u32, pub symbol: String, pub addend: i64 }
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RawAbi {
+    pub wave: Wave,
+    pub resources: RawResources,
+    pub fp: FpState,
+    pub relocations: Vec<Relocation>,
+    pub entry: Vec<EntryFact>,
+    pub sidecar_sha256: [u8; 32],
+}
+
+/// The byte range of the executable stream inside the binary handed to `lift_raw`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct ExecExtent { pub offset: u64, pub len: u64 }
+
+/// Everything a producer must state about one raw kernel. Owned by the core so the lifter,
+/// the adapter and the certifier share one definition.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RawKernelSpec {
+    pub target: Target,
+    pub symbol: SymbolId,
+    pub wave: Wave,
+    pub extent: ExecExtent,
+    /// SHA-256 of the whole binary and of the executable range, as the producer recorded.
+    pub binary_sha256: [u8; 32],
+    pub exec_sha256: [u8; 32],
+    pub resources: RawResources,
+    pub fp: FpState,
+    pub relocations: Vec<Relocation>,
+    pub entry: Vec<EntryFact>,
+    pub sidecar_sha256: [u8; 32],
+}
+
+/// A single architectural storage cell named by an entry fact (VGPR/SGPR/TTMP dword,
+/// VCC/EXEC half, ...). Wave32 has no `VccHi`/`ExecHi`.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash, Ord, PartialOrd)]
+pub enum EntryCell {
+    Vgpr(u16), Sgpr(u16), Ttmp(u8), VccLo, VccHi, ExecLo, ExecHi, Scc, M0,
+    FlatScratch, SrcSharedBase, SrcSharedLimit, SrcPrivateBase, SrcPrivateLimit, Pc, Hwreg,
+}
+
+impl EntryLoc {
+    /// The cells the location covers under `wave`; an error names an unrepresentable location.
+    pub fn cells(self, wave: Wave) -> Result<SmallVec<[EntryCell; 4]>, String> {
+        let mut out: SmallVec<[EntryCell; 4]> = SmallVec::new();
+        let wide = wave == Wave::Wave64;
+        match self {
+            EntryLoc::Reg(reg) => {
+                reg.validate()?;
+                for n in reg.base..reg.base + u16::from(reg.len) {
+                    out.push(match reg.kind {
+                        crate::reg::Kind::V => EntryCell::Vgpr(n),
+                        crate::reg::Kind::S => EntryCell::Sgpr(n),
+                        crate::reg::Kind::Ttmp => EntryCell::Ttmp(n as u8),
+                    });
+                }
+            }
+            EntryLoc::Special(special) => match special {
+                Special::Vcc => { out.push(EntryCell::VccLo); if wide { out.push(EntryCell::VccHi); } }
+                Special::VccLo => out.push(EntryCell::VccLo),
+                Special::VccHi if wide => out.push(EntryCell::VccHi),
+                Special::Exec => { out.push(EntryCell::ExecLo); if wide { out.push(EntryCell::ExecHi); } }
+                Special::ExecLo => out.push(EntryCell::ExecLo),
+                Special::ExecHi if wide => out.push(EntryCell::ExecHi),
+                Special::VccHi | Special::ExecHi => return Err("high half of a wave32 mask".into()),
+                Special::Scc => out.push(EntryCell::Scc),
+                Special::M0 => out.push(EntryCell::M0),
+                Special::Null => return Err("null is not a storage location".into()),
+                Special::Ttmp(n) if n < 16 => out.push(EntryCell::Ttmp(n)),
+                Special::Ttmp(n) => return Err(format!("ttmp{n} is out of range")),
+                Special::FlatScratch => out.push(EntryCell::FlatScratch),
+                Special::SrcSharedBase => out.push(EntryCell::SrcSharedBase),
+                Special::SrcSharedLimit => out.push(EntryCell::SrcSharedLimit),
+                Special::SrcPrivateBase => out.push(EntryCell::SrcPrivateBase),
+                Special::SrcPrivateLimit => out.push(EntryCell::SrcPrivateLimit),
+                Special::Pc => out.push(EntryCell::Pc),
+            },
+            EntryLoc::Hwreg => out.push(EntryCell::Hwreg),
+        }
+        Ok(out)
+    }
+}
+
+impl FpState {
+    /// Target-dependent rules: RSRC1 bit 21 is `WG_RR_EN` on gfx12 and `DX10_CLAMP` on gfx11,
+    /// so `wg_round_robin` is only meaningful on gfx12.
+    pub fn validate_for(&self, arch: Arch) -> Result<(), String> {
+        if self.wg_round_robin && arch != Arch::Gfx1201 {
+            return Err(format!("wg_round_robin (RSRC1 bit 21) is a gfx12 field; it is DX10_CLAMP on {arch:?}"));
+        }
+        Ok(())
+    }
+    fn validate(&self) -> Result<(), String> {
+        for (name, v) in [("round32", self.round32), ("round16_64", self.round16_64), ("denorm32", self.denorm32), ("denorm16_64", self.denorm16_64)] {
+            if v > 3 { return Err(format!("{name} {v} does not fit two bits")); }
+        }
+        if self.exceptions > 0x1ff { return Err(format!("exception enables {:#x} exceed nine bits", self.exceptions)); }
+        Ok(())
+    }
+}
+
+impl RawAbi {
+    /// Entry cells of every fact, each with its fact; errors on malformed or overlapping facts.
+    pub fn entry_cells(&self) -> Result<Vec<(EntryCell, &EntryFact)>, String> {
+        let mut seen: Vec<(EntryCell, &EntryFact)> = Vec::new();
+        for fact in &self.entry {
+            let cells = fact.loc.cells(self.wave)?;
+            let single = cells.len() == 1;
+            match &fact.value {
+                EntryValue::Defined => {}
+                EntryValue::WorkgroupId(_) | EntryValue::Exact(_) | EntryValue::Bounded { .. } if !single =>
+                    return Err(format!("{:?}: exact, bounded and work-group-id values need a single-dword location", fact.loc)),
+                EntryValue::Bounded { min, max } if min > max => return Err(format!("{:?}: empty bound {min}..={max}", fact.loc)),
+                EntryValue::WorkgroupId(_) if !matches!(fact.loc, EntryLoc::Reg(RegRef { kind: crate::reg::Kind::S | crate::reg::Kind::Ttmp, .. }) | EntryLoc::Special(Special::Ttmp(_))) =>
+                    return Err(format!("{:?}: a work-group id lives in an SGPR or TTMP", fact.loc)),
+                EntryValue::LocalId(fields) => {
+                    if !matches!(fact.loc, EntryLoc::Reg(RegRef { kind: crate::reg::Kind::V, len: 1, .. })) {
+                        return Err(format!("{:?}: packed local ids live in one VGPR", fact.loc));
+                    }
+                    if fields.is_empty() { return Err("local-id packing has no fields".into()); }
+                    let mut used = 0u32;
+                    let mut axes = 0u8;
+                    for f in fields {
+                        if f.bits == 0 || u32::from(f.shift) + u32::from(f.bits) > 32 {
+                            return Err(format!("local-id field shift {} bits {} is outside a dword", f.shift, f.bits));
+                        }
+                        let mask = (u64::MAX >> (64 - u32::from(f.bits))) as u32;
+                        let field = mask << f.shift;
+                        if f.max > mask { return Err(format!("local-id bound {} does not fit {} bits", f.max, f.bits)); }
+                        if used & field != 0 { return Err("local-id fields overlap".into()); }
+                        used |= field;
+                        let bit = 1u8 << (f.axis as u8);
+                        if axes & bit != 0 { return Err(format!("local-id axis {:?} is packed twice", f.axis)); }
+                        axes |= bit;
+                    }
+                }
+                _ => {}
+            }
+            for cell in cells {
+                if let Some((_, other)) = seen.iter().find(|(c, _)| *c == cell) {
+                    return Err(format!("entry facts {:?} and {:?} overlap at {cell:?}", other.loc, fact.loc));
+                }
+                seen.push((cell, fact));
+            }
+        }
+        Ok(seen)
+    }
+
+    pub fn validate(&self) -> Result<(), ValidateError> {
+        let bad = ValidateError::RawAbi;
+        let r = &self.resources;
+        if r.vgprs_actual > r.vgprs_allocated || r.vgprs_allocated > 256 {
+            return Err(bad(format!("VGPR counts actual {} / allocated {} are inconsistent", r.vgprs_actual, r.vgprs_allocated)));
+        }
+        if r.sgprs_actual > r.sgprs_allocated || r.sgprs_allocated > RawResources::SGPR_COUNT_LIMIT {
+            return Err(bad(format!("SGPR counts actual {} / allocated {} are inconsistent (physical basis, at most {})",
+                r.sgprs_actual, r.sgprs_allocated, RawResources::SGPR_COUNT_LIMIT)));
+        }
+        self.fp.validate().map_err(bad)?;
+        for (cell, _) in self.entry_cells().map_err(bad)? {
+            match cell {
+                EntryCell::Vgpr(n) if n >= r.vgprs_allocated => return Err(bad(format!("entry v{n} is outside the {} allocated VGPRs", r.vgprs_allocated))),
+                EntryCell::Sgpr(n) if n >= r.ordinary_sgprs_allocated() => return Err(bad(format!("entry s{n} is outside the {} allocated ordinary SGPRs", r.ordinary_sgprs_allocated()))),
+                _ => {}
+            }
+        }
+        if let Some(rel) = self.relocations.iter().find(|rel| rel.offset % 4 != 0) {
+            return Err(bad(format!("relocation offset {:#x} is not dword aligned", rel.offset)));
+        }
+        Ok(())
+    }
+}
+
+impl RawKernelSpec {
+    /// The ABI a lifted kernel carries.
+    pub fn abi(&self) -> RawAbi {
+        RawAbi {
+            wave: self.wave, resources: self.resources, fp: self.fp,
+            relocations: self.relocations.clone(), entry: self.entry.clone(), sidecar_sha256: self.sidecar_sha256,
+        }
+    }
+    /// Self-consistency of the declaration (not of any binary).
+    pub fn validate(&self) -> Result<(), ValidateError> {
+        self.abi().validate()?;
+        self.fp.validate_for(self.target.arch).map_err(ValidateError::RawAbi)?;
+        if self.extent.len == 0 || self.extent.len % 4 != 0 || self.extent.offset % 4 != 0 {
+            return Err(ValidateError::RawAbi(format!("executable extent {:#x}+{:#x} is empty or not dword aligned", self.extent.offset, self.extent.len)));
+        }
+        if self.extent.offset.checked_add(self.extent.len).is_none() {
+            return Err(ValidateError::RawAbi("executable extent overflows".into()));
+        }
+        if let Some(rel) = self.relocations.iter().find(|rel| rel.offset >= self.extent.len) {
+            return Err(ValidateError::RawAbi(format!("relocation offset {:#x} is outside the executable range", rel.offset)));
+        }
+        Ok(())
+    }
+}
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum KernelOrigin {
     Frontend { kind: Frontend, object_sha256: [u8; 32], entry_va: u64, size: u64 },
@@ -194,6 +485,8 @@ pub enum ValidateError {
     MisalignedSmemSdata { base: u16, len: u8 },
     #[error("invalid program layout: {0}")]
     Layout(String),
+    #[error("invalid raw kernel contract: {0}")]
+    RawAbi(String),
     #[error("kernel {0} overlaps another kernel in the source image")]
     KernelOverlap(String),
 }
@@ -228,9 +521,12 @@ impl Program {
                         return Err(ValidateError::Layout("kernel wave disagrees with descriptor".into()));
                     }
                 }
-                Abi::Raw { wave, .. } if *wave != kernel.wave =>
+                Abi::Raw(raw) if raw.wave != kernel.wave =>
                     return Err(ValidateError::Layout("raw ABI wave disagrees with kernel".into())),
-                Abi::Raw { .. } => {}
+                Abi::Raw(raw) => {
+                    raw.validate()?;
+                    raw.fp.validate_for(self.target.arch).map_err(ValidateError::RawAbi)?;
+                }
             }
             let body = &kernel.body;
             if body.layout.is_empty() || body.blocks.is_empty() {

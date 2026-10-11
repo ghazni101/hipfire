@@ -628,8 +628,9 @@ fn sample_unnormalized(w: &[f32], u: f32) -> u32 {
 /// the seed matches later `verify_block_sampled` policy (temp/top_p/top_k) and
 /// the same `rng_state` sequence `set_sampling` reseeds per request.
 ///
-/// - `top_k == 0` or `top_k >= vocab` disables the top-k cut.
-/// - `top_p >= 0.999` disables nucleus (matches qwen35 chain prefill).
+/// - `top_k == 0` or `top_k >= vocab` disables the top-k cut. Pass the AR
+///   candidate cap ([`crate::llama::ar_candidate_cap`]) to reproduce AR.
+/// - `top_p >= 1.0` disables the nucleus.
 /// - Caller must gate greedy (`temp <= 1e-6`) before calling; this always
 ///   advances `rng_state` once on the multinomial path.
 pub fn sample_host_nucleus(
@@ -663,7 +664,7 @@ pub fn sample_host_nucleus(
             }
         }
     }
-    if top_p < 0.999 {
+    if top_p < 1.0 {
         // In-place nucleus: sort desc, cut at first cum >= top_p, renorm kept.
         let mut order: Vec<usize> = (0..probs.len()).collect();
         order.sort_by(|&a, &b| {

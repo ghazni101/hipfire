@@ -37,10 +37,11 @@ use crate::serve_contract::{CacheDomain, CheckpointId};
 
 /// Byte alignment of each part inside a stored snapshot.
 const PART_ALIGN: usize = 256;
-/// Unified memory: a snapshot is system RAM, and overshoot reaches the global
-/// OOM killer, so leave the desktop this much `MemAvailable`.
-const UMA_HEADROOM: u64 = 8 << 30;
-/// Discrete GPUs: free VRAM left after a snapshot and the state's growth.
+/// Free device memory a snapshot, and the live state's context growth it
+/// must leave room for, keep untouched. Unified memory (an APU's carve-out or
+/// GTT): an overshoot can reach the global OOM killer, so it keeps more.
+const UMA_DEVICE_HEADROOM: u64 = 1 << 30;
+/// Discrete GPUs: an overshoot fails one allocation.
 const VRAM_HEADROOM: u64 = 256 << 20;
 
 /// Which decode route the snapshot serves. Routes own different state (MTP
@@ -115,9 +116,10 @@ pub trait SessionState {
         route: SessionRoute,
         meta: &[u8],
     ) -> Result<(), String>;
-    /// Bytes the live state may still map or allocate before reaching its
-    /// admitted context.
-    fn growth_reserve_bytes(&self) -> u64;
+    /// Device bytes the live state may still map or allocate before it
+    /// reaches the end of the prompt in flight (the cache leaves them free:
+    /// it never takes memory the context needs).
+    fn growth_reserve_bytes(&self, gpu: &Gpu) -> u64;
     /// Cold-start the live state.
     fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String>;
 }
@@ -215,16 +217,18 @@ fn free_buffer(gpu: &mut Gpu, snapshot: StoredSnapshot) {
     }
 }
 
-/// Whether `need` more bytes leave the guard's headroom; `None` when the
-/// free-memory query itself fails.
+/// Whether `need` more device bytes leave the guard's headroom free, in the
+/// pool the device allocates from (`Gpu::device_mem_info`: VRAM, a
+/// unified-memory APU's carve-out, or its GTT clamped to `MemAvailable` plus
+/// TTM's page pool); `None` when the free-memory query itself fails.
 fn memory_fits(gpu: &mut Gpu, need: u64) -> Option<bool> {
-    if gpu.is_uma() {
-        let available = rdna_compute::kv_slots::mem_available_bytes()?;
-        Some(available >= need + UMA_HEADROOM)
+    let (free, _) = gpu.device_mem_info().ok()?;
+    let headroom = if gpu.is_uma() {
+        UMA_DEVICE_HEADROOM
     } else {
-        let (free, _) = gpu.hip.get_vram_info().ok()?;
-        Some(free as u64 >= need + VRAM_HEADROOM)
-    }
+        VRAM_HEADROOM
+    };
+    Some(free as u64 >= need.saturating_add(headroom))
 }
 
 impl SessionCache {
@@ -515,7 +519,7 @@ impl SessionCache {
         if self.pool.contains(&domain, p as u64, fp) {
             return Ok(());
         }
-        let growth = state.growth_reserve_bytes();
+        let growth = state.growth_reserve_bytes(gpu);
         let ancestors: Vec<Key> = state
             .snapshot_boundaries(prefix, 0, p - 1)
             .into_iter()
@@ -693,6 +697,45 @@ impl SessionCache {
         self.children.clear();
         self.turn = None;
     }
+
+    /// Make room for `need` more device bytes the live state is about to
+    /// map (context growth): free snapshots, displaced ones first, then the
+    /// least recently used published leaves, then this turn's pending
+    /// captures deepest first, until the memory guard passes or nothing is
+    /// left. Snapshots are opportunistic and never hold memory the context
+    /// needs. Returns the bytes freed.
+    pub fn release_for(&mut self, gpu: &mut Gpu, need: u64) -> u64 {
+        let mut freed = 0;
+        loop {
+            // A failed query cannot be helped by evicting.
+            if memory_fits(gpu, need) != Some(false) {
+                break;
+            }
+            let snapshot = match self.release.pop() {
+                Some(snapshot) => {
+                    freed += snapshot.bytes;
+                    free_buffer(gpu, snapshot);
+                    continue;
+                }
+                None => self
+                    .pool
+                    .pop_lru()
+                    .or_else(|| self.pending.pop().map(|entry| entry.1)),
+            };
+            let Some(snapshot) = snapshot else {
+                break;
+            };
+            freed += snapshot.bytes;
+            self.drop_snapshot(gpu, snapshot);
+        }
+        if freed > 0 {
+            eprintln!(
+                "  session cache: released {} MiB for context growth",
+                freed >> 20
+            );
+        }
+        freed
+    }
 }
 
 #[cfg(test)]
@@ -798,7 +841,7 @@ mod tests {
             self.position = u64::from_le_bytes(meta.try_into().unwrap()) as usize;
             Ok(())
         }
-        fn growth_reserve_bytes(&self) -> u64 {
+        fn growth_reserve_bytes(&self, _gpu: &Gpu) -> u64 {
             0
         }
         fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {

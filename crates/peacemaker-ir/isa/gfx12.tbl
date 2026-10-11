@@ -320,6 +320,8 @@ v_cmpx_gt_u32_e64	vop3	0xcc	VDST:64,SRC0:32,SRC1:32	VDST	SRC0,SRC1	exec:w	-	v_cm
 v_cmpx_le_i32_e64	vop3	0xc3	VDST:64,SRC0:32,SRC1:32	VDST	SRC0,SRC1	exec:w	-	v_cmpx_le_i32_e64 s20, v10	D4C3007E 02021414	src2_unused:ignored:0x1ff:0x00/0x80/0x101
 v_cmpx_le_u32_e64	vop3	0xcb	VDST:64,SRC0:32,SRC1:32	VDST	SRC0,SRC1	exec:w	-	v_cmpx_le_u32_e64 s19, v0	D4CB007E 02020013	src2_unused:ignored:0x1ff:0x00/0x80/0x101
 v_cmpx_lt_i32_e32	vopc	0xc1	SRC0:32,VSRC1:32	-	SRC0,VSRC1	exec:w	-	v_cmpx_lt_i32_e32 14, v13	7D821A8E	-
+v_cmpx_le_i32_e32	vopc	0xc3	SRC0:32,VSRC1:32	-	SRC0,VSRC1	exec:w	-	v_cmpx_le_i32_e32 s14, v1	7D86020E	-
+v_cmpx_le_f32_e64	vop3	0x93	VDST:64,SRC0:32,SRC1:32,literal@last	VDST	SRC0,SRC1	exec:w	-	v_cmpx_le_f32_e64 0x48000000, |v3|	D493027E 020206FF 48000000	src2_unused:ignored:0x1ff:0x00/0x80/0x101
 v_cmpx_lt_u32_e64	vop3	0xc9	VDST:64,SRC0:32,SRC1:32	VDST	SRC0,SRC1	exec:w	-	v_cmpx_lt_u32_e64 v0, v3	D4C9007E 02020700	src2_unused:ignored:0x1ff:0x00/0x80/0x101
 v_cmpx_ne_u32_e32	vopc	0xcd	SRC0:32,VSRC1:32	-	SRC0,VSRC1	exec:w	-	v_cmpx_ne_u32_e32 0, v13	7D9A1A80	-
 v_cmpx_ne_u32_e64	vop3	0xcd	VDST:64,SRC0:32,SRC1:32	VDST	SRC0,SRC1	exec:w	-	v_cmpx_ne_u32_e64 s19, v0	D4CD007E 02020013	src2_unused:ignored:0x1ff:0x00/0x80/0x101
@@ -461,3 +463,6 @@ v_cmpx_lt_u32_e32	vopc	0xc9	SRC0:32,VSRC1:32	implicit	SRC0,VSRC1	exec:w	-	v_cmpx
 v_dual_min_num_f32	vopd	0xb	VDSTX:32,SRCX0:32,VSRCX1:32	VDSTX	SRCX0,VSRCX1	-	-	v_dual_min_num_f32 v6, v6, v7 :: v_dual_max_num_f32 v7, v8, v7	CAD40F06 06060F08	-
 # pm/native-emit (2026-10-02): PM corpus v_wmma_i32_16x16x16_iu8 (wave32: A/B 2 VGPRs each); sample = pinned llvm-mc -mcpu=gfx1201 encoding.
 v_wmma_i32_16x16x16_iu8	vop3p	0x44	VDST:256,SRC0:64,SRC1:64,SRC2:256	VDST	SRC0,SRC1,SRC2	-	-	v_wmma_i32_16x16x16_iu8 v[8:15], v[0:1], v[4:5], v[8:15] neg_lo:[1,1,0]	CC444008 7C220900	w0_extra:ignored:0x800000:0x0
+# pm/aco-pilot (2026-10-11): Mesa 60e95b7 aco_opcodes.py SOP2 s_bfm_b32 gfx11+=0x2a dst(U32) (no SCC def); SOPC s_cmp_lg_i32 0x01 dst(SCC); samples = pinned llvm-mc -mcpu=gfx1201 words from the MQ4 RADV/ACO binary.
+s_bfm_b32	sop2	0x2a	SDST:32,SSRC0:32,SSRC1:32	SDST	SSRC0,SSRC1	-	-	s_bfm_b32 vcc_lo, 16, 0	956A8090	-
+s_cmp_lg_i32	sopc	0x1	SSRC0:32,SSRC1:32	-	SSRC0,SSRC1	scc:w	-	s_cmp_lg_i32 s20, 0	BF018014	-

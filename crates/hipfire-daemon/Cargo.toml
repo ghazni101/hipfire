@@ -23,6 +23,10 @@ flash-attn-ck = [
 ]
 serve-fault-inject = ["hipfire-runtime/serve-fault-inject", "hipfire-generate/serve-fault-inject"]
 ep-fault-inject = ["hipfire-loader/ep-fault-inject", "hipfire-runtime/ep-fault-inject"]
+qwen4-dev-profiles = [
+    "hipfire-loader/qwen4-dev-profiles",
+    "hipfire-generate/qwen4-dev-profiles",
+]
 # VCN JPEG decode for VL images (`image.decode = vcn|auto`): pooled libva
 # decode straight to device patches. Compiled into the normal product build
 # (default) so `cargo build --release -p hipfire-daemon` serves it; the
@@ -53,3 +57,5 @@ serde_json = { workspace = true, features = ["preserve_order"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 libc = "0.2"
+# hipfire-weight-host lease registry.
+parking_lot = "0.12"

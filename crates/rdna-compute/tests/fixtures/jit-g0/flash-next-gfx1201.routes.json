@@ -2250,7 +2250,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "6bc6a02ece8f4f61080fd53b6cd76028e854a106a43f062f7b6f31de74470ad3",
+      "sha256": "8faaa38f32c59fd62d91d8f5db0abf739f875e57f56c5eef18b6ed83a460754c",
       "symbols": [
         "argmax_f32",
         "bf16_scaled_add_batched_f32",
@@ -4480,7 +4480,7 @@
           ],
           "scheduler_profile": "default",
           "cache_abi": 6,
-          "sha256": "6bc6a02ece8f4f61080fd53b6cd76028e854a106a43f062f7b6f31de74470ad3",
+          "sha256": "8faaa38f32c59fd62d91d8f5db0abf739f875e57f56c5eef18b6ed83a460754c",
           "symbols": [
             "argmax_f32",
             "bf16_scaled_add_batched_f32",

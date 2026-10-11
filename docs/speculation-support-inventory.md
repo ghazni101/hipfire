@@ -63,9 +63,14 @@ Everything else remains plain autoregressive unless source gains a new arm.
 - **Daemon:** `params.dflash_mode == "off"` skips draft load even if a draft
   path is supplied.
 - **qwen35:** production greedy path can use `DflashSpeculator` when a draft is
-  loaded; temp>0 uses distribution-preserving verifies (SWOR / fast-sample
-  paths) with documented env opt-outs (`HIPFIRE_DFLASH_TEMP_SPEC=0`,
-  `HIPFIRE_DFLASH_CHAT=0`, etc.).
+  loaded. In chain mode, temp>0 verifies reproduce the AR sampler's law
+  (`llama::sample_top_k_p`: top_k pool, absent = 20, then the nucleus over
+  the pool's mass) in distribution. That holds since the AR-exact
+  `softmax_temp_topp_batched_f32` threshold and the truncated full-accept
+  bonus; before them, top_k binding or the host-loop bonus drifted from AR.
+  DFlash ignores min_p and penalties (the daemon warns). The DDTree SWOR arm
+  honours temperature only. Env opt-outs are documented
+  (`HIPFIRE_DFLASH_TEMP_SPEC=0`, `HIPFIRE_DFLASH_CHAT=0`, etc.).
 - **llama 0/1:** `dflash_generic` requires arch_id=20 HFQ from `dflash_convert`.
   Chain is default; tree arm opt-in `HIPFIRE_DFLASH_TREE=1`.
 - **Genre conditionality** is a measured property (see historical tables in

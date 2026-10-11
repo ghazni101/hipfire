@@ -509,10 +509,10 @@ pub fn certify(toolchain: &Toolchain, build: &BuildOutput, source: &Path, arch: 
         // registers across phases: F2 and the fused A4 GDN projection.
         let gdn_iu4=contract.symbol.contains("_iu4_qkvzagdn_");
         // gfx11 builder kernels and the gfx1201 Qwen4 MoE, QSA gathered and
-        // MQ6 X4 trunk GEMM families carry M7's lift identity and analyses
+        // MQ6 / MQ4 X4 trunk GEMM families carry M7's lift identity and analyses
         // (M7's gfx1201 tables).
         let qsa_pm=contract.symbol.starts_with("indexed_attention_")&&contract.symbol.contains("_pm_gfx");
-        let mq6_pm=contract.symbol.starts_with("qwen4_mq6_x4_pm_gfx");
+        let mq6_pm=contract.symbol.starts_with("qwen4_mq6_x4_pm_gfx")||contract.symbol.starts_with("qwen4_mq4_x4_pm_gfx");
         let m7_cert=matches!(arch,"gfx1100"|"gfx1151")
             || arch=="gfx1201" && (contract.symbol.starts_with("qwen4_moe_") || qsa_pm || mq6_pm);
         if contract.symbol.starts_with("gemm_mq4g256v2_fp8_") || gdn_iu4 || m7_cert {

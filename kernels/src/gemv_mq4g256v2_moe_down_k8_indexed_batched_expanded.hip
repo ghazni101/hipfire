@@ -132,14 +132,28 @@ extern "C" __global__ void HIPFIRE_MOE_DOWN_KERNEL(
         float sc = __half2float(__ushort_as_half((unsigned short)(h & 0xFFFFu))); \
         float zp = __half2float(__ushort_as_half((unsigned short)(h >> 16))); \
         unsigned int pk = HIPFIRE_WEIGHT_LOAD_PTR_U32(rsrc, (gp) + 8 + boff, (weight_offset) + 8 + boff); \
-        (a) += (sc * (float)((pk) & 0xFu)         + zp) * (x0) \
-             + (sc * (float)(((pk) >> 4) & 0xFu)  + zp) * (x1) \
-             + (sc * (float)(((pk) >> 8) & 0xFu)  + zp) * (x2) \
-             + (sc * (float)(((pk) >> 12) & 0xFu) + zp) * (x3) \
-             + (sc * (float)(((pk) >> 16) & 0xFu) + zp) * (x4) \
-             + (sc * (float)(((pk) >> 20) & 0xFu) + zp) * (x5) \
-             + (sc * (float)(((pk) >> 24) & 0xFu) + zp) * (x6) \
-             + (sc * (float)(((pk) >> 28) & 0xFu) + zp) * (x7); \
+        /* Pinned contraction orientation (must match shipped fused D4 */ \
+        /* ninepath: round d1*x1 first, then FMA(d0,x0,that), then d2..d7), */ \
+        /* NOT the compiler's default of rounding d0*x0 then FMA(d1,x1,..). */ \
+        /* Dequant d_i = fma(sc,q_i,zp) is fused in both. Group sum is formed */ \
+        /* separately and added to the accumulator (a) += sum, never seeded. */ \
+        const float d0 = __fmaf_rn(sc, (float)((pk) & 0xFu), zp); \
+        const float d1 = __fmaf_rn(sc, (float)(((pk) >> 4) & 0xFu), zp); \
+        const float d2 = __fmaf_rn(sc, (float)(((pk) >> 8) & 0xFu), zp); \
+        const float d3 = __fmaf_rn(sc, (float)(((pk) >> 12) & 0xFu), zp); \
+        const float d4 = __fmaf_rn(sc, (float)(((pk) >> 16) & 0xFu), zp); \
+        const float d5 = __fmaf_rn(sc, (float)(((pk) >> 20) & 0xFu), zp); \
+        const float d6 = __fmaf_rn(sc, (float)(((pk) >> 24) & 0xFu), zp); \
+        const float d7 = __fmaf_rn(sc, (float)(((pk) >> 28) & 0xFu), zp); \
+        float sum = __fmul_rn(d1, (x1)); \
+        sum = __fmaf_rn(d0, (x0), sum); \
+        sum = __fmaf_rn(d2, (x2), sum); \
+        sum = __fmaf_rn(d3, (x3), sum); \
+        sum = __fmaf_rn(d4, (x4), sum); \
+        sum = __fmaf_rn(d5, (x5), sum); \
+        sum = __fmaf_rn(d6, (x6), sum); \
+        sum = __fmaf_rn(d7, (x7), sum); \
+        (a) += sum; \
     } while (0)
 
     if (groups_per_row == 2) {

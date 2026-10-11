@@ -131,6 +131,156 @@ const VMM_FLASH_PARTIALS_BYTES: usize = 256 << 20;
 /// prefill runs on the singleton scratch, which may widen after mapping.
 const VMM_MAP_DEVICE_RESERVE_BYTES: usize = 512 << 20;
 
+/// Rows past `prompt + max_tokens` a lane may still write: the last
+/// speculative window (DFlash block, at most 63 rows; MTP `k + 1`) and the
+/// finish drain.
+pub const VMM_RESERVE_SLACK_ROWS: usize = 64;
+
+/// Device bytes a VMM KV map can use: HIP's free figure plus the buffers the
+/// pool parks (a VMM map returns them to HIP before mapping,
+/// `Gpu::vmm_pool_headroom`), less [`VMM_MAP_DEVICE_RESERVE_BYTES`].
+pub fn vmm_map_room(device_free: usize, pool_parked: usize) -> usize {
+    device_free
+        .saturating_add(pool_parked)
+        .saturating_sub(VMM_MAP_DEVICE_RESERVE_BYTES)
+}
+
+/// Device bytes one admitted lane holds and may still map.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct VmmLaneNeed {
+    /// Bytes held now (mapped KV, DeltaNet state, speculation state); all
+    /// of it is freed when the lane completes.
+    pub held: usize,
+    /// The mapped-KV part of `held` (charged to the staged KV budget).
+    pub held_kv: usize,
+    /// KV bytes the lane may still map before it completes.
+    pub remaining: usize,
+}
+
+/// Kind of lane an admission check charges: AR (no speculation state), a
+/// DFlash lane or an MTP lane.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum VmmLaneSpec {
+    Ar,
+    Dflash,
+    Mtp,
+}
+
+/// Device bytes of a lane's speculation state: nothing for AR, the probed
+/// MTP lane state for MTP, the probed DFlash lane state plus `checkpoints`
+/// DeltaNet snapshots for DFlash.
+pub fn vmm_spec_bytes(
+    kind: VmmLaneSpec,
+    mtp_lane_bytes: usize,
+    dflash_lane_bytes: usize,
+    snapshot_bytes: usize,
+    checkpoints: usize,
+) -> usize {
+    match kind {
+        VmmLaneSpec::Ar => 0,
+        VmmLaneSpec::Mtp => mtp_lane_bytes,
+        VmmLaneSpec::Dflash => dflash_lane_bytes + checkpoints * snapshot_bytes,
+    }
+}
+
+/// Slack on top of a new lane's charged owners (prompt KV, DeltaNet state,
+/// lane state) when predicting the free device bytes of its prompt seed's
+/// chunk-ceiling query: VMM granule rounding, small scratch and any
+/// allocation the charge does not itemize.
+pub const VMM_SEED_CEILING_MARGIN_BYTES: usize = 256 << 20;
+
+/// Free bytes the lane's own allocations take between its admission check
+/// and its prompt seed's chunk-ceiling query: `fixed_held` (the lane's
+/// charged bytes before checkpoints) plus the margin.
+pub fn vmm_seed_free_deduction(fixed_held: usize) -> usize {
+    fixed_held.saturating_add(VMM_SEED_CEILING_MARGIN_BYTES)
+}
+
+/// Banker's-algorithm safety of a set of lanes: some completion order
+/// exists in which every lane's remaining KV growth fits the device room
+/// and the KV budget, each completed lane returning what it holds. Lanes
+/// in ascending `remaining` order are such an order whenever one exists
+/// (a completion only ever adds room).
+pub fn vmm_lanes_safe(room: usize, kv_room: usize, lanes: &[VmmLaneNeed]) -> bool {
+    let mut order: Vec<&VmmLaneNeed> = lanes.iter().collect();
+    order.sort_by_key(|l| l.remaining);
+    let (mut room, mut kv_room) = (room, kv_room);
+    for lane in order {
+        if lane.remaining > room || lane.remaining > kv_room {
+            return false;
+        }
+        // room - remaining + (held + remaining): the lane maps its rest,
+        // completes and frees everything it then holds.
+        room = room.saturating_add(lane.held);
+        kv_room = kv_room.saturating_add(lane.held_kv);
+    }
+    true
+}
+
+/// Whether a lane may map `grow` more KV bytes now: it fits the room and
+/// leaves the lanes safe ([`vmm_lanes_safe`]) with the growth applied to
+/// `lanes[lane]`. On `true`, `room`, `kv_room` and `lanes[lane]` carry the
+/// growth. A zero growth is always granted.
+pub fn vmm_grant_growth(
+    room: &mut usize,
+    kv_room: &mut usize,
+    lanes: &mut [VmmLaneNeed],
+    lane: usize,
+    grow: usize,
+) -> bool {
+    if grow == 0 {
+        return true;
+    }
+    if grow > *room || grow > *kv_room {
+        return false;
+    }
+    let before = lanes[lane];
+    lanes[lane] = VmmLaneNeed {
+        held: before.held + grow,
+        held_kv: before.held_kv + grow,
+        remaining: before.remaining.saturating_sub(grow),
+    };
+    if vmm_lanes_safe(*room - grow, *kv_room - grow, lanes) {
+        *room -= grow;
+        *kv_room -= grow;
+        true
+    } else {
+        lanes[lane] = before;
+        false
+    }
+}
+
+/// Admission of a new lane: it can take what it holds right after its
+/// prompt fill (`need.held`) and the lanes stay safe with it added.
+pub fn vmm_admission_fits(room: usize, kv_room: usize, lanes: &[VmmLaneNeed], need: VmmLaneNeed) -> bool {
+    if need.held > room || need.held_kv > kv_room {
+        return false;
+    }
+    let mut all = lanes.to_vec();
+    all.push(need);
+    vmm_lanes_safe(room - need.held, kv_room - need.held_kv, &all)
+}
+
+/// Device memory view of the store at a step boundary: the room a KV map
+/// can use, the staged KV budget left, and every admitted lane's need.
+pub struct VmmMemoryState {
+    pub room: usize,
+    pub kv_room: usize,
+    pub lanes: Vec<(RequestEpoch, VmmLaneNeed)>,
+}
+
+/// Admission verdict of [`Qwen35VmmStore::admission_check`].
+#[derive(Clone, Copy, Debug)]
+pub struct VmmAdmission {
+    pub fits: bool,
+    /// The new lane's need (fixed state + KV after its prompt, KV to its end).
+    pub need: VmmLaneNeed,
+    pub room: usize,
+    pub kv_room: usize,
+    /// Remaining KV growth summed over the admitted lanes.
+    pub committed: usize,
+}
+
 /// KV write (K and V) and causal attend over independent request owners.
 pub(super) fn vmm_kv_write_attend(
     gpu: &mut Gpu,
@@ -205,6 +355,11 @@ pub struct Qwen35RequestState {
     pub position: usize,
     /// Last committed id not yet fed through the trunk (the next AR row).
     pub pending_seed: Option<u32>,
+    /// KV positions this request may map before it completes (prompt +
+    /// output budget + [`VMM_RESERVE_SLACK_ROWS`]), set by the admitting
+    /// driver; the memory scheduler reserves growth up to it. `0` reserves
+    /// nothing past the current position.
+    pub reserve_end: usize,
     /// Set when a participating forward failed: device state is not trusted.
     pub poisoned: bool,
     /// Total prompt rows; the Prefill chunk ending here carries the head
@@ -261,6 +416,18 @@ fn owner_mapped_bytes(kv: &KvCache, n_kv_layers: usize) -> Result<usize, String>
     Ok(tokens * format.bytes_per_token(kv.n_kv_heads, kv.head_dim) * 2 * n_kv_layers)
 }
 
+/// Device bytes of a DeltaNet state (S matrices, scales, conv rings,
+/// error-feedback residuals) as allocated.
+fn dn_state_bytes(dn: &DeltaNetState) -> usize {
+    dn.s_matrices
+        .iter()
+        .chain(&dn.s_scales)
+        .chain(&dn.conv_states)
+        .chain(&dn.s_ef_residual)
+        .map(|t| t.buf.size())
+        .sum()
+}
+
 impl Qwen35RequestState {
     /// Allocate a fresh request owner shaped exactly like the resident
     /// singleton `template` (same resolved KV mode, logical bound and
@@ -309,6 +476,7 @@ impl Qwen35RequestState {
             dn,
             position: 0,
             pending_seed: None,
+            reserve_end: 0,
             gdn_frame: rdna_compute::norm::gdn_requant_frame_checkpoint(),
             poisoned: false,
             prompt_len: init.prompt_len,
@@ -477,6 +645,11 @@ pub struct Qwen35VmmStore {
     skip: Vec<bool>,
     /// RNG states produced by the forwarded step, published by commit.
     pending_rng: Vec<(RequestEpoch, u32)>,
+    /// Batched head sampler (`hipfire_runtime::batch_sampler`): device result
+    /// slots, packed penalty-scope slab and pinned stage. Allocated on the
+    /// first sampled pass (needs the scratch's `repeat_buf` capacity, which
+    /// `new` does not see); freed with the store.
+    sampler_arena: Option<hipfire_runtime::batch_sampler::BatchSamplerArena>,
     /// Plan-ordered pre-norm hidden rows of a split (decode + prefill) step.
     hidden_out: GpuTensor,
     /// Exact route: device row tables of the rows-batched twins (one
@@ -501,6 +674,10 @@ pub struct Qwen35VmmStore {
     /// DFlash lanes. May coexist with the MTP engine: a request is one or
     /// the other.
     dflash_engine: Option<dflash::VmmDflashEngine>,
+    /// Staged `serve.batch_sampled`: sampled (temperature>0) requests may be
+    /// admitted to this store's lanes (set by the loader at staging; default
+    /// false = greedy-only).
+    sampled: bool,
 }
 
 /// Arithmetic of a VMM batched step.
@@ -531,6 +708,18 @@ impl Qwen35VmmStore {
     /// nonexact slots body.
     pub fn route(&self) -> VmmRoute {
         self.route
+    }
+
+    /// Whether the store was staged with `serve.batch_sampled` on (sampled
+    /// requests admitted to the batch route for provably singleton-exact lane
+    /// modes).
+    pub fn sampled(&self) -> bool {
+        self.sampled
+    }
+
+    /// Staging: record `serve.batch_sampled` (loader, before first use).
+    pub fn set_sampled(&mut self, sampled: bool) {
+        self.sampled = sampled;
     }
 
     /// The singleton route's prefill chunk length for `epoch` with
@@ -668,6 +857,7 @@ impl Qwen35VmmStore {
             row_slot_host: Vec::with_capacity(row_budget),
             skip: vec![false; max_slots],
             pending_rng: Vec::with_capacity(max_slots),
+            sampler_arena: None,
             hidden_out,
             rows_tables,
             rows_tables_key: Vec::new(),
@@ -679,6 +869,7 @@ impl Qwen35VmmStore {
             spec: None,
             prefix_pool: Vec::new(),
             dflash_engine: None,
+            sampled: false,
         })
     }
 
@@ -833,6 +1024,237 @@ impl Qwen35VmmStore {
         Ok(total)
     }
 
+    /// What `st` holds on the device and may still map. Held: mapped KV,
+    /// DeltaNet state, and a DFlash lane's state at the engine's probed
+    /// footprint plus its checkpoints, or an MTP lane's state at the MTP
+    /// engine's probed footprint. Remaining: KV growth up to
+    /// `reserve_end` (never below the current position).
+    fn lane_need(&self, gpu: &Gpu, st: &Qwen35RequestState) -> Result<VmmLaneNeed, String> {
+        let held_kv = owner_mapped_bytes(&st.kv, self.kv_layer_ids.len())?;
+        let spec = if let (Some(lane), Some(engine)) = (&st.dflash, &self.dflash_engine) {
+            vmm_spec_bytes(
+                VmmLaneSpec::Dflash,
+                0,
+                engine.lane_bytes(),
+                engine.snapshot_bytes(),
+                lane.checkpoints.len(),
+            )
+        } else if let (Some(_), Some(engine)) = (&st.mtp, &self.spec) {
+            vmm_spec_bytes(VmmLaneSpec::Mtp, engine.lane_bytes(), 0, 0, 0)
+        } else {
+            0
+        };
+        let end = st.reserve_end.max(st.position).min(st.kv.vmm_logical_bound());
+        let remaining = st
+            .kv
+            .planned_mapped_growth_bytes(gpu, end)
+            .map_err(|e| format!("VMM memory: planned growth of {:?}: {e}", st.epoch))?;
+        Ok(VmmLaneNeed {
+            held: held_kv + dn_state_bytes(&st.dn) + spec,
+            held_kv,
+            remaining,
+        })
+    }
+
+    /// The store's memory view now (see [`VmmMemoryState`]). Retained
+    /// prefix entries are outside the room and never complete, so they are
+    /// not lanes.
+    pub fn memory_state(&self, gpu: &Gpu) -> Result<VmmMemoryState, String> {
+        let free = gpu.device_mem_info().map_err(|e| format!("VMM memory: VRAM query: {e}"))?.0;
+        let lanes = self
+            .slots
+            .iter()
+            .flatten()
+            .map(|st| Ok((st.epoch, self.lane_need(gpu, st)?)))
+            .collect::<Result<Vec<_>, String>>()?;
+        Ok(VmmMemoryState {
+            room: vmm_map_room(free, gpu.pool_parked_bytes()),
+            kv_room: self.kv_budget_bytes.saturating_sub(self.mapped_kv_bytes()?),
+            lanes,
+        })
+    }
+
+    /// Admission of a new request owner shaped like `template_kv` /
+    /// `template_dn` (the resident singleton's) with `prompt_len` prompt
+    /// rows that may grow to `reserve_end` positions, as a lane of kind
+    /// `lane` (a DFlash lane is charged its lane state and a checkpoint
+    /// bound, an MTP lane its probed MTP state). Fits when the room holds the
+    /// lane after its prompt fill and every lane, the new one included, can
+    /// still complete ([`vmm_admission_fits`]).
+    ///
+    /// DFlash checkpoint bound. The lane's prompt seed takes its checkpoints
+    /// at the ends of outer chunks whose ceiling is memory-admitted at the
+    /// seed's plan time (`dflash_seed_ceiling`), so the old
+    /// `ceil(prompt/interval)` over-charges. Here the ceiling is queried now
+    /// with `free_deduction` = the bytes charged for the lane before its
+    /// checkpoints (prompt KV, DeltaNet state, lane state) plus
+    /// [`VMM_SEED_CEILING_MARGIN_BYTES`]. Soundness: between this check and
+    /// the seed's plan the driver allocates exactly those owners
+    /// (`new_like`, KV provision, lane state; synchronous), so device free
+    /// at plan time is at least free now minus the deduction; the byte
+    /// admission is monotone in free bytes, so the actual ceiling is at least
+    /// the queried one (`min_ceiling`) and, being a staged rung or
+    /// `min_ceiling` itself, one of the candidates the bound maximizes over
+    /// (the checkpoint count is not monotone in the ceiling). A failed
+    /// ceiling query falls back to the whole-prompt bound.
+    #[allow(clippy::too_many_arguments)]
+    pub fn admission_check(
+        &self,
+        gpu: &Gpu,
+        weights: &Qwen35Weights,
+        config: &Qwen35Config,
+        template_kv: &KvCache,
+        template_dn: &DeltaNetState,
+        prompt_len: usize,
+        reserve_end: usize,
+        lane: VmmLaneSpec,
+    ) -> Result<VmmAdmission, String> {
+        let bound = template_kv.vmm_logical_bound();
+        let planned = |positions: usize| {
+            template_kv
+                .planned_mapped_bytes_from_empty(gpu, positions.min(bound))
+                .map_err(|e| format!("VMM admission: planned KV for {positions} positions: {e}"))
+        };
+        let kv_prompt = planned(prompt_len)?;
+        let kv_end = planned(reserve_end.max(prompt_len))?;
+        let dn = dn_state_bytes(template_dn);
+        let spec = match lane {
+            VmmLaneSpec::Ar => 0,
+            VmmLaneSpec::Mtp => self
+                .spec
+                .as_ref()
+                .map_or(0, |e| vmm_spec_bytes(VmmLaneSpec::Mtp, e.lane_bytes(), 0, 0, 0)),
+            VmmLaneSpec::Dflash => match &self.dflash_engine {
+                None => 0,
+                Some(engine) => {
+                    let lane_state = engine.lane_bytes();
+                    let deduction = vmm_seed_free_deduction(kv_prompt + dn + lane_state);
+                    let bound = match crate::speculative::dflash_seed_ceiling(
+                        gpu,
+                        weights,
+                        config,
+                        template_dn,
+                        template_kv,
+                        deduction,
+                    ) {
+                        Ok(min_ceiling) => engine.checkpoint_bound(prompt_len, min_ceiling),
+                        Err(_) => engine.checkpoint_bound_unplanned(prompt_len),
+                    };
+                    vmm_spec_bytes(VmmLaneSpec::Dflash, 0, lane_state, engine.snapshot_bytes(), bound)
+                }
+            },
+        };
+        let need = VmmLaneNeed {
+            held: kv_prompt + dn + spec,
+            held_kv: kv_prompt,
+            remaining: kv_end - kv_prompt,
+        };
+        let mem = self.memory_state(gpu)?;
+        let lanes: Vec<VmmLaneNeed> = mem.lanes.iter().map(|(_, l)| *l).collect();
+        Ok(VmmAdmission {
+            fits: vmm_admission_fits(mem.room, mem.kv_room, &lanes, need),
+            need,
+            room: mem.room,
+            kv_room: mem.kv_room,
+            committed: lanes.iter().map(|l| l.remaining).sum(),
+        })
+    }
+
+    /// Per-step KV growth grants. `granted` are `(epoch, end)` requests
+    /// already granted this step (applied first, unconditionally);
+    /// `candidates` are granted in order by [`vmm_grant_growth`]: a request
+    /// whose mapping to `end` positions would leave the lanes unable to
+    /// complete waits (`false`) with its state untouched, as a lane that
+    /// does not fit the row budget does. Unknown epochs are not granted.
+    pub fn step_grants(
+        &self,
+        gpu: &Gpu,
+        granted: &[(RequestEpoch, usize)],
+        candidates: &[(RequestEpoch, usize)],
+    ) -> Result<Vec<bool>, String> {
+        let VmmMemoryState {
+            mut room,
+            mut kv_room,
+            lanes,
+        } = self.memory_state(gpu)?;
+        let epochs: Vec<RequestEpoch> = lanes.iter().map(|(e, _)| *e).collect();
+        let mut needs: Vec<VmmLaneNeed> = lanes.into_iter().map(|(_, l)| l).collect();
+        let growth = |epoch: &RequestEpoch, end: usize| -> Result<Option<(usize, usize)>, String> {
+            let Some(i) = epochs.iter().position(|e| e == epoch) else {
+                return Ok(None);
+            };
+            let st = self.request_state(epoch).expect("epoch listed above");
+            let g = st
+                .kv
+                .planned_mapped_growth_bytes(gpu, end.min(st.kv.vmm_logical_bound()))
+                .map_err(|e| format!("VMM memory: planned growth of {epoch:?}: {e}"))?;
+            Ok(Some((i, g)))
+        };
+        for (epoch, end) in granted {
+            if let Some((i, g)) = growth(epoch, *end)? {
+                room = room.saturating_sub(g);
+                kv_room = kv_room.saturating_sub(g);
+                let n = needs[i];
+                needs[i] = VmmLaneNeed {
+                    held: n.held + g,
+                    held_kv: n.held_kv + g,
+                    remaining: n.remaining.saturating_sub(g),
+                };
+            }
+        }
+        candidates
+            .iter()
+            .map(|(epoch, end)| {
+                Ok(match growth(epoch, *end)? {
+                    Some((i, g)) => vmm_grant_growth(&mut room, &mut kv_room, &mut needs, i, g),
+                    None => false,
+                })
+            })
+            .collect()
+    }
+
+    /// One-line itemization of the staged KV budget and of what every
+    /// admitted lane and retained prefix entry holds on the device (mapped
+    /// KV, DeltaNet state, DFlash checkpoints, MTP/DFlash presence, reserved
+    /// end), plus device free and the pool's parked bytes. Logged with a
+    /// provision refusal.
+    pub fn budget_report(&self, gpu: &Gpu) -> String {
+        let n_kv = self.kv_layer_ids.len();
+        let free = gpu.device_mem_info().map_or(0, |(f, _)| f);
+        let (lane_bytes, snapshot_bytes) =
+            self.dflash_engine.as_ref().map_or((0, 0), |e| (e.lane_bytes(), e.snapshot_bytes()));
+        let mtp_lane_bytes = self.spec.as_ref().map_or(0, |e| e.lane_bytes());
+        let mut s = format!(
+            "kv_budget={} mapped_kv={} device_free={free} pool_parked={} map_reserve={VMM_MAP_DEVICE_RESERVE_BYTES} dflash_lane_bytes={lane_bytes} mtp_lane_bytes={mtp_lane_bytes} dn_snapshot_bytes={snapshot_bytes} lanes=[",
+            self.kv_budget_bytes,
+            self.mapped_kv_bytes().unwrap_or(usize::MAX),
+            gpu.pool_parked_bytes(),
+        );
+        for st in self.slots.iter().flatten() {
+            s += &format!(
+                " slot{}:pos={} reserve_end={} kv={} dn={} dflash={} dflash_ckpt={} mtp={};",
+                st.slot,
+                st.position,
+                st.reserve_end,
+                owner_mapped_bytes(&st.kv, n_kv).unwrap_or(usize::MAX),
+                dn_state_bytes(&st.dn),
+                st.dflash.is_some(),
+                st.dflash.as_ref().map_or(0, |d| d.checkpoints.len()),
+                st.mtp.is_some(),
+            );
+        }
+        s += &format!(" ] prefix_pool={}:[", self.prefix_pool.len());
+        for e in &self.prefix_pool {
+            s += &format!(
+                " kv={} dn={} ckpt={};",
+                owner_mapped_bytes(&e.state.kv, n_kv).unwrap_or(usize::MAX),
+                dn_state_bytes(&e.state.dn),
+                e.checkpoints.len()
+            );
+        }
+        s + " ]"
+    }
+
     pub fn free_gpu(self, gpu: &mut Gpu) -> Result<(), String> {
         let mut first: Option<String> = None;
         for s in self.slots.into_iter().flatten() {
@@ -854,6 +1276,9 @@ impl Qwen35VmmStore {
         let _ = gpu.free_tensor(self.hidden_out);
         if let Some(t) = self.rows_tables {
             let _ = gpu.free_tensor(t);
+        }
+        if let Some(arena) = self.sampler_arena {
+            arena.free_gpu(gpu);
         }
         if let Some(engine) = self.spec {
             engine.free_gpu(gpu);
@@ -1020,17 +1445,18 @@ impl Qwen35VmmExecutor<'_> {
             return Err("provision_step: rows outside every request range".into());
         }
         // Map granules (outside any forward/capture) against the shared
-        // physical budget AND the device's actual free memory (less a
-        // reserve for the singleton prefill scratch the exact route widens),
-        // so an overstated budget is a typed refusal, never a raw HIP OOM.
-        // Refusal maps nothing for that request.
+        // physical budget AND the device memory a map can use (HIP free plus
+        // the pool's parked buffers, which the map returns to HIP first,
+        // less a reserve for the singleton prefill scratch the exact route
+        // widens), so an overstated budget is a typed refusal, never a raw
+        // HIP OOM. Refusal maps nothing for that request.
         let mut mapped_total = self.store.mapped_kv_bytes()?;
-        let mut device_room = gpu
-            .hip
-            .get_vram_info()
-            .map_err(|e| format!("provision_step: VRAM query: {e}"))?
-            .0
-            .saturating_sub(VMM_MAP_DEVICE_RESERVE_BYTES);
+        let mut device_room = vmm_map_room(
+            gpu.device_mem_info()
+                .map_err(|e| format!("provision_step: VRAM query: {e}"))?
+                .0,
+            gpu.pool_parked_bytes(),
+        );
         let st = &mut *self.store;
         for r in &plan.requests {
             let budget = st.kv_budget_bytes.saturating_sub(mapped_total).min(device_room);
@@ -1041,10 +1467,14 @@ impl Qwen35VmmExecutor<'_> {
                 .find(|s| s.epoch == r.epoch)
                 .expect("validated above");
             let end = s.position + r.rows.len;
-            let grown = s
-                .kv
-                .provision_vmm_positions(gpu, end, budget)
-                .map_err(|e| format!("provision_step: map {end} positions for {:?}: {e}", r.epoch))?;
+            let grown = match s.kv.provision_vmm_positions(gpu, end, budget) {
+                Ok(g) => g,
+                Err(e) => {
+                    let msg = format!("provision_step: map {end} positions for {:?}: {e}", r.epoch);
+                    eprintln!("[vmm-budget] refused: {msg}; {}", st.budget_report(gpu));
+                    return Err(msg);
+                }
+            };
             mapped_total += grown;
             device_room = device_room.saturating_sub(grown);
         }
@@ -1150,8 +1580,9 @@ impl Qwen35VmmExecutor<'_> {
             st.hidden_split = false;
             exact::decode(gpu, st, weights, config, s, plan, &decode, &mut picks)?;
             for &i in &prefill {
-                exact::prefill(gpu, st, weights, config, s, plan, i, &mut picks)?;
+                exact::prefill(gpu, st, weights, config, s, plan, i)?;
             }
+            sample_heads(gpu, st, config, s, plan, &prefill, &mut picks)?;
         } else if split {
             run_pass(gpu, st, weights, config, s, plan, &decode, true, &mut picks)?;
             run_pass(gpu, st, weights, config, s, plan, &prefill, true, &mut picks)?;
@@ -1296,55 +1727,76 @@ fn run_pass(
         return Ok(());
     }
     final_logits_per_slot(gpu, weights, config, &b, &st.pbs, s, &st.logits, &st.skip)?;
-    for &i in members {
-        sample_head(gpu, st, config, s, plan, i, picks)?;
-    }
-    Ok(())
+    sample_heads(gpu, st, config, s, plan, members, picks)
 }
 
-/// Pick plan request `i`'s head row from its `logits` row with the singleton
-/// route's own sampler (`sampler::sample`: same kernel, same scratch window
-/// cap, same penalty/blocked-token order), its own history/config and a COPY
-/// of its RNG; the advanced RNG is published only by commit. No-op for a
-/// request without a head this step.
-fn sample_head(
+/// Pick every head row of `members` (plan request indices) from its `logits`
+/// row with ONE `batch_sampler::sample_batch` — byte-identical per request to
+/// the singleton route's own `sampler::sample` (same kernels, same scratch
+/// window cap = `s.repeat_buf`, same blocked-token/penalty order), each with
+/// its own history/config and a COPY of its RNG; the advanced RNG is
+/// published only by commit. Requests without a head this step are skipped.
+fn sample_heads(
     gpu: &mut Gpu,
     st: &mut Qwen35VmmStore,
     config: &Qwen35Config,
     s: &Qwen35Scratch,
     plan: &BatchStepPlan,
-    i: usize,
+    members: &[usize],
     picks: &mut [u32],
 ) -> HipResult<()> {
-    let r = &plan.requests[i];
-    if !st.wants_head(r) {
+    let vocab = config.vocab_size;
+    if !members.iter().any(|&i| st.wants_head(&plan.requests[i])) {
         return Ok(());
     }
-    let state = st
-        .slots
-        .iter()
-        .flatten()
-        .find(|x| x.epoch == r.epoch)
-        .expect("provisioned epoch");
-    let view = st
-        .logits
-        .sub_offset(state.slot * config.vocab_size, config.vocab_size);
-    let mut rng = state.rng_state;
-    let id = hipfire_runtime::sampler::sample(
-        gpu,
-        &view,
-        &s.sample_buf,
-        &s.repeat_buf,
-        config.vocab_size,
-        &state.history,
-        &state.sampler,
-        &mut rng,
-    );
-    if id as usize >= config.vocab_size {
-        return Err(HipError::new(0, &format!("VMM executor: pick {id} out of vocab")));
+    if st.sampler_arena.is_none() {
+        st.sampler_arena = Some(hipfire_runtime::batch_sampler::BatchSamplerArena::new(
+            gpu,
+            st.max_slots,
+            s.repeat_buf.buf.size() / 4,
+        )?);
     }
-    picks[r.rows.begin + r.rows.len - 1] = id;
-    st.pending_rng.push((r.epoch, rng));
+    let mut heads: Vec<(usize, &Qwen35RequestState)> = Vec::with_capacity(members.len());
+    for &i in members {
+        let r = &plan.requests[i];
+        if !st.wants_head(r) {
+            continue;
+        }
+        let state = st
+            .slots
+            .iter()
+            .flatten()
+            .find(|x| x.epoch == r.epoch)
+            .expect("provisioned epoch");
+        heads.push((i, state));
+    }
+    let views: Vec<GpuTensor> = heads
+        .iter()
+        .map(|(_, state)| st.logits.sub_offset(state.slot * vocab, vocab))
+        .collect();
+    let jobs: Vec<hipfire_runtime::batch_sampler::BatchSampleJob<'_>> = heads
+        .iter()
+        .zip(&views)
+        .map(|((_, state), view)| hipfire_runtime::batch_sampler::BatchSampleJob {
+            logits: view,
+            history: &state.history,
+            cfg: &state.sampler,
+            rng_state: state.rng_state,
+        })
+        .collect();
+    let arena = st.sampler_arena.as_mut().expect("allocated above");
+    let sampled = hipfire_runtime::batch_sampler::sample_batch(gpu, arena, &jobs)?;
+    for (&(i, _), pick) in heads.iter().zip(sampled) {
+        let r = &plan.requests[i];
+        if pick.token_id as usize >= vocab {
+            return Err(HipError::new(
+                0,
+                &format!("VMM executor: pick {} out of vocab", pick.token_id),
+            ));
+        }
+        picks[r.rows.begin + r.rows.len - 1] = pick.token_id;
+        st.pending_rng.push((r.epoch, pick.advanced_rng));
+    }
     Ok(())
 }
 
@@ -1431,5 +1883,127 @@ impl Qwen35VmmExecutor<'_> {
         }
         st.phase = Phase::Idle;
         Ok(out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const MIB: usize = 1 << 20;
+    /// One 2 MiB granule on each of the 27B's 32 KV tensors.
+    const CHUNK: usize = 64 * MIB;
+
+    fn lane(held: usize, held_kv: usize, remaining: usize) -> VmmLaneNeed {
+        VmmLaneNeed {
+            held,
+            held_kv,
+            remaining,
+        }
+    }
+
+    /// The R9700 long8 K=8 refusal: 88 MiB HIP-free and 367 MiB parked are
+    /// below the 512 MiB map reserve, so the map room is 0 and the staged
+    /// KV budget (13.4 GB unused) never bound. Parked buffers count as room.
+    #[test]
+    fn map_room_counts_parked_pool_bytes_above_the_reserve() {
+        assert_eq!(vmm_map_room(88_080_384, 384_518_400), 0);
+        assert_eq!(vmm_map_room(600 * MIB, 0), 88 * MIB);
+        assert_eq!(vmm_map_room(100 * MIB, 500 * MIB), 88 * MIB);
+        assert_eq!(vmm_map_room(usize::MAX, usize::MAX), usize::MAX - VMM_MAP_DEVICE_RESERVE_BYTES);
+    }
+
+    /// Lanes that already hold their whole reservation complete first and
+    /// return their footprint, so lanes still needing a chunk are safe even
+    /// with no room left; with every lane needing growth they are not.
+    #[test]
+    fn lanes_safe_orders_completions_by_remaining_growth() {
+        let done = lane(1_500 * MIB, 192 * MIB, 0);
+        let grow = lane(1_400 * MIB, 128 * MIB, CHUNK);
+        assert!(vmm_lanes_safe(0, usize::MAX, &[grow, done, grow, done]));
+        assert!(!vmm_lanes_safe(0, usize::MAX, &[grow, grow]));
+        assert!(vmm_lanes_safe(CHUNK, usize::MAX, &[grow, grow]));
+        // The KV budget is a second resource: a released lane returns only
+        // its mapped KV to it.
+        assert!(!vmm_lanes_safe(usize::MAX, CHUNK - 1, &[grow]));
+        assert!(vmm_lanes_safe(usize::MAX, CHUNK, &[grow, grow]));
+        assert!(vmm_lanes_safe(0, 0, &[]));
+    }
+
+    #[test]
+    fn grant_growth_keeps_some_completion_order() {
+        let mut lanes = vec![lane(1_400 * MIB, 128 * MIB, 2 * CHUNK); 2];
+        let (mut room, mut kv_room) = (2 * CHUNK, usize::MAX);
+        // Lane 1 may take one chunk: it can then finish in the chunk left.
+        assert!(vmm_grant_growth(&mut room, &mut kv_room, &mut lanes, 1, CHUNK));
+        assert_eq!(room, CHUNK);
+        assert_eq!(lanes[1], lane(1_400 * MIB + CHUNK, 128 * MIB + CHUNK, CHUNK));
+        // Lane 0 taking that chunk would leave both lanes a chunk short with
+        // no room: it waits, and nothing changes.
+        let before = (room, lanes.clone());
+        assert!(!vmm_grant_growth(&mut room, &mut kv_room, &mut lanes, 0, CHUNK));
+        assert_eq!((room, lanes.clone()), before);
+        // Lane 1 taking it completes lane 1's reservation; its release then
+        // covers lane 0.
+        assert!(vmm_grant_growth(&mut room, &mut kv_room, &mut lanes, 1, CHUNK));
+        assert_eq!(room, 0);
+        // A step that maps nothing is always granted, even with no room.
+        assert!(vmm_grant_growth(&mut room, &mut kv_room, &mut lanes, 0, 0));
+        // Growth past the room is never granted.
+        let mut lanes = vec![lane(0, 0, 0)];
+        let (mut room, mut kv_room) = (CHUNK - 1, usize::MAX);
+        assert!(!vmm_grant_growth(&mut room, &mut kv_room, &mut lanes, 0, CHUNK));
+    }
+
+    /// Measured long8 footprint per DFlash lane: lane state 1,038,090,240 B,
+    /// one 150,994,944 B checkpoint, 120,324,096 B DeltaNet, 3 KV chunks
+    /// after a ~4.2K prompt; the request needs no further chunk.
+    #[test]
+    fn admission_charges_the_whole_lane_and_keeps_lanes_completable() {
+        let held = 1_038_090_240 + 150_994_944 + 120_324_096 + 3 * CHUNK;
+        let running = vec![lane(held, 3 * CHUNK, 0); 6];
+        let new = lane(held, 3 * CHUNK, 0);
+        assert!(vmm_admission_fits(held, usize::MAX, &running, new));
+        assert!(!vmm_admission_fits(held - 1, usize::MAX, &running, new));
+        // The new lane fits now, but every lane (it included) then needs a
+        // chunk the room no longer has: it waits.
+        let growing = vec![lane(held, 2 * CHUNK, CHUNK); 6];
+        let new = lane(held, 2 * CHUNK, CHUNK);
+        assert!(!vmm_admission_fits(held, usize::MAX, &growing, new));
+        assert!(vmm_admission_fits(held + CHUNK, usize::MAX, &growing, new));
+        // Its prompt KV is charged to the staged KV budget as well.
+        assert!(!vmm_admission_fits(usize::MAX, 2 * CHUNK - 1, &[], new));
+        assert!(vmm_admission_fits(usize::MAX, 3 * CHUNK, &[], new));
+    }
+
+    #[test]
+    fn spec_bytes_charge_the_lane_kind_state() {
+        // AR lanes hold no speculation state, whatever the engines probed.
+        assert_eq!(vmm_spec_bytes(VmmLaneSpec::Ar, 7, 11, 13, 3), 0);
+        // MTP: the probed MTP lane state only.
+        assert_eq!(vmm_spec_bytes(VmmLaneSpec::Mtp, 7, 11, 13, 3), 7);
+        // DFlash: lane state plus one snapshot per checkpoint.
+        assert_eq!(vmm_spec_bytes(VmmLaneSpec::Dflash, 7, 11, 13, 3), 11 + 3 * 13);
+        assert_eq!(vmm_spec_bytes(VmmLaneSpec::Dflash, 7, 11, 13, 0), 11);
+    }
+
+    #[test]
+    fn seed_free_deduction_covers_the_lane_owners_and_a_margin() {
+        let (kv, dn, lane_state) = (3 * CHUNK, 120_324_096, 1_038_090_240);
+        assert_eq!(vmm_seed_free_deduction(kv + dn + lane_state), kv + dn + lane_state + 256 * MIB);
+        assert_eq!(vmm_seed_free_deduction(usize::MAX), usize::MAX);
+    }
+
+    #[test]
+    fn mtp_lane_charge_enters_admission() {
+        // A running MTP lane holds its probed state; a new one is refused
+        // when the room cannot hold it after its prompt.
+        let mtp = 600 * MIB;
+        let held = vmm_spec_bytes(VmmLaneSpec::Mtp, mtp, 0, 0, 0) + 120_324_096 + 3 * CHUNK;
+        let new = lane(held, 3 * CHUNK, 0);
+        assert!(vmm_admission_fits(held, usize::MAX, &[], new));
+        assert!(!vmm_admission_fits(held - 1, usize::MAX, &[], new));
+        // Uncharged (the old behaviour) it would have fit.
+        assert!(held - mtp < held);
     }
 }

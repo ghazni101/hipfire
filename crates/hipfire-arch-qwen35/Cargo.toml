@@ -28,6 +28,10 @@ sha2.workspace = true
 serde = { workspace = true, features = ["derive"] }
 serde_json.workspace = true
 
+[build-dependencies]
+# build.rs: shared-weight loader ABI identity (hashes the loader closure).
+sha2.workspace = true
+
 [dev-dependencies]
 # `tests/gpu_gemv_parity.rs`: drives the production GEMV launcher against the
 # CPU transcription on identical inputs. Lives here (not in hipfire-cpu) so the
@@ -55,6 +59,31 @@ path = "examples/cb_vmm_state_oracle.rs"
 required-features = ["deltanet"]
 
 [[example]]
+name = "cb_verify_gemm_oracle"
+path = "examples/cb_verify_gemm_oracle.rs"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "pm_fp8_verify_oracle"
+path = "examples/pm_fp8_verify_oracle.rs"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "pm_fp8_verify_kld"
+path = "examples/pm_fp8_verify_kld.rs"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "iu4_verify_oracle"
+path = "examples/iu4_verify_oracle.rs"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "iu4_verify_kld"
+path = "examples/iu4_verify_kld.rs"
+required-features = ["lab", "deltanet"]
+
+[[example]]
 name = "qwen_dense_tp2_parity"
 path = "examples/qwen_dense_tp2_parity.rs"
 required-features = ["deltanet"]
@@ -72,6 +101,11 @@ required-features = ["deltanet"]
 [[example]]
 name = "test_dflash_draft_collapse_gfx1100"
 path = "examples/test_dflash_draft_collapse_gfx1100.rs"
+required-features = ["deltanet"]
+
+[[example]]
+name = "dflash_draft_graph_replay"
+path = "examples/dflash_draft_graph_replay.rs"
 required-features = ["deltanet"]
 
 [[example]]
@@ -123,3 +157,8 @@ required-features = ["deltanet", "moe-oracle"]
 name = "host_offload_smoke"
 path = "examples/host_offload_smoke.rs"
 required-features = ["lab"]
+
+[[example]]
+name = "shared_weight_state_oracle"
+path = "examples/shared_weight_state_oracle.rs"
+required-features = ["lab", "deltanet"]

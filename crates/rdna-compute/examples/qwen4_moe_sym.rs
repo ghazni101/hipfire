@@ -25,13 +25,22 @@
 //! unscatter/SiLU/FWHT128 and the SIMT down) runs on the same weights for
 //! timing and an informative general-input delta.
 //!
-//! CLI: --mode check|graph|time|sweep|stress --routing one|all|skew|FILE
+//! CLI: --mode check|graph|time|sweep|stress|rows --routing one|all|skew|FILE
 //!      [--x FILE.f16] [--tokens T] [--seed N] [--iters N] [--residency vram|host]
 //! Routing FILE = little-endian i32 top-10 expert ids [T*10]; X FILE = F16
 //! [T*2560] (captured activations). `--residency host` places the expert
 //! weights in host-mapped memory. Output: one JSON object on stdout.
 //! Needs `HIPFIRE_QWEN4_MOE_SYM_IU4=1` only for the route predicate report;
 //! the launchers themselves run regardless.
+//!
+//! `--mode rows` (prefill batch invariance, see `rows_mode`): per-token
+//! routing (a function of the token's own index), reference at T = 8192
+//! tokens, then every T of `--rows` on the first T tokens and the same T
+//! tokens at row offsets inside a larger batch of other tokens; each token's
+//! final combined MoE output row must be byte-identical to the reference's.
+//! One JSON object per run on stdout; exit 1 on any difference.
+//!      [--rows LIST] [--offsets LIST] [--scope on|off|both] [--ref-tokens N]
+//!      [--distinct N] [--diag] [--print all|fail]
 
 use hip_bridge::KernargBlob;
 use rdna_compute::{DType, Gpu, GpuTensor, Int4MmqPrepared};
@@ -1107,6 +1116,466 @@ fn x_onehot_sweep(
     Ok((gu_mis, dn_mis, n, anchor_mis))
 }
 
+// ---------------------------------------------------------------- rows mode
+
+const ROWS_FILLER_BASE: u64 = 1 << 40;
+
+/// Default `--rows`: 1..=64, every multiple of 16 up to 1024, and the tile /
+/// threshold neighbours up to 8191.
+fn rows_default() -> Vec<usize> {
+    let mut v: Vec<usize> = (1..=64).collect();
+    v.extend((16..=1024).step_by(16));
+    v.extend([255, 256, 257, 511, 512, 513, 1023, 1025, 2047, 2048, 2049, 4095, 4096, 4097, 8191]);
+    v.sort_unstable();
+    v.dedup();
+    v
+}
+
+/// `--rows` list: comma separated `N`, `A-B` or `A-B:STEP` (empty = default).
+fn rows_list(spec: &str) -> Res<Vec<usize>> {
+    if spec.is_empty() {
+        return Ok(rows_default());
+    }
+    let mut v = Vec::new();
+    for tok in spec.split(',').filter(|t| !t.is_empty()) {
+        let (range, step) = match tok.split_once(':') {
+            Some((r, s)) => (r, s.parse::<usize>()?),
+            None => (tok, 1),
+        };
+        if step == 0 {
+            return Err(format!("--rows {tok}: step 0").into());
+        }
+        match range.split_once('-') {
+            Some((a, b)) => v.extend((a.parse::<usize>()?..=b.parse::<usize>()?).step_by(step)),
+            None => v.push(range.parse()?),
+        }
+    }
+    v.sort_unstable();
+    v.dedup();
+    if v.first() == Some(&0) {
+        return Err("--rows: 0 tokens".into());
+    }
+    Ok(v)
+}
+
+/// Offsets (> 0) tested for `t` tokens; `t` = place the end of the rows at
+/// row 4096 (only when t < 4096).
+fn rows_offsets(spec: &str, t: usize) -> Res<Vec<usize>> {
+    let mut v = Vec::new();
+    for tok in spec.split(',').filter(|s| !s.is_empty()) {
+        if tok == "t" {
+            if t < 4096 {
+                v.push(4096 - t);
+            }
+        } else {
+            v.push(tok.parse()?);
+        }
+    }
+    v.retain(|&o| o > 0);
+    v.sort_unstable();
+    v.dedup();
+    Ok(v)
+}
+
+fn rows_bytes<T>(v: &[T]) -> &[u8] {
+    // SAFETY: plain-old-data slices (i32/f32), read as bytes of the same extent.
+    unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
+}
+
+fn rows_hex(b: &[u8]) -> String {
+    b.iter().map(|x| format!("{x:02x}")).collect()
+}
+
+/// Token `idx`'s top-10 experts and weights, a function of `(seed, idx)` only:
+/// 0..5 picks from 8 hot experts (hit by a large share of all tokens, so one
+/// expert's run spans many tokens and tiles), then warm (8..64) and cold
+/// (64..512, often empty at small T) experts; all ten distinct, in a random
+/// (not sorted) rank order.
+fn row_route(seed: u64, idx: u64) -> ([i32; TOPK], [f32; TOPK]) {
+    let mut r = Rng(seed ^ idx.wrapping_mul(0xD6E8_FEB8_6659_FD93) ^ 0x0007_0077);
+    let hot = [0usize, 1, 1, 2, 2, 3, 3, 5][r.below(8) as usize];
+    let mut ids = [0i32; TOPK];
+    let mut n = 0;
+    while n < TOPK {
+        let e = if n < hot {
+            r.below(8) as i32
+        } else if r.below(3) == 0 {
+            8 + r.below(56) as i32
+        } else {
+            64 + r.below((E - 64) as u64) as i32
+        };
+        if !ids[..n].contains(&e) {
+            ids[n] = e;
+            n += 1;
+        }
+    }
+    for i in (1..TOPK).rev() {
+        let j = r.below(i as u64 + 1) as usize;
+        ids.swap(i, j);
+    }
+    let mut w = [0f32; TOPK];
+    let mut s = 0f32;
+    for x in w.iter_mut() {
+        *x = 0.02 + r.unit();
+        s += *x;
+    }
+    for x in w.iter_mut() {
+        *x /= s;
+    }
+    (ids, w)
+}
+
+/// Token `idx`'s activation row (F32 [2560]), a function of `(seed, idx)`
+/// only: per-token magnitude (0.25..2) and a sparse channel outlier.
+fn row_x(seed: u64, idx: u64) -> Vec<f32> {
+    let mut r = Rng(seed ^ idx.wrapping_mul(0x9E37_79B9_7F4A_7C15) ^ 0x5858);
+    let scale = [0.25f32, 0.5, 1.0, 2.0][(idx % 4) as usize];
+    (0..HID)
+        .map(|i| {
+            let v = (r.unit() - 0.5) * 4.0 * scale;
+            if i % 97 == 13 {
+                v * 8.0
+            } else {
+                v
+            }
+        })
+        .collect()
+}
+
+/// `n` consecutive tokens' routing and activations from index `first`.
+struct RowPool {
+    topk: Vec<i32>,
+    wts: Vec<f32>,
+    x: Vec<f32>,
+}
+
+fn row_pool(seed: u64, first: u64, n: usize) -> RowPool {
+    let mut p = RowPool {
+        topk: Vec::with_capacity(n * TOPK),
+        wts: Vec::with_capacity(n * TOPK),
+        x: Vec::with_capacity(n * HID),
+    };
+    for j in 0..n as u64 {
+        let (ids, w) = row_route(seed, first + j);
+        p.topk.extend(ids);
+        p.wts.extend(w);
+        p.x.extend(row_x(seed, first + j));
+    }
+    p
+}
+
+/// Device state of the rows-mode chain, sized for the largest batch.
+struct RowBufs {
+    gu_ptrs: GpuTensor,
+    dn_ptrs: GpuTensor,
+    topk: GpuTensor,
+    wts: GpuTensor,
+    x: GpuTensor,
+    counts: GpuTensor,
+    offsets: GpuTensor,
+    sorted: GpuTensor,
+    tiles: GpuTensor,
+    inverse: GpuTensor,
+    ygu: GpuTensor,
+    ydn: GpuTensor,
+    order: GpuTensor,
+    out: GpuTensor,
+}
+
+struct RowOut {
+    /// Combined MoE output rows of the `t0` tested tokens (F32 [t0][2560]).
+    out: Vec<u8>,
+    /// Kernel of the last launch of each stage (scatter, rotate256, gate/up,
+    /// rotate128, down, combine).
+    kernels: Vec<String>,
+    /// `--diag`: de-permuted per-slot SwiGLU (BF16 [t0*10][640]) and down
+    /// (BF16 [t0*10][2560]) rows of the tested tokens.
+    slots: Option<(Vec<u8>, Vec<u8>)>,
+}
+
+fn rows_slots(buf: &[u8], inv: &[i32], first: usize, n: usize, rb: usize) -> Vec<u8> {
+    let mut v = Vec::with_capacity(n * rb);
+    for f in first..first + n {
+        let row = inv[f] as usize;
+        v.extend_from_slice(&buf[row * rb..(row + 1) * rb]);
+    }
+    v
+}
+
+/// Byte comparison by rows: `None` when identical, else the first differing
+/// row and a JSON description.
+fn rows_diff(got: &[u8], want: &[u8], rb: usize, elem: usize) -> Option<(usize, serde_json::Value)> {
+    if got == want {
+        return None;
+    }
+    let n = got.len().min(want.len()) / rb;
+    let mut count = 0usize;
+    let mut first: Option<(usize, usize)> = None;
+    for r in 0..n {
+        let (a, b) = (&got[r * rb..(r + 1) * rb], &want[r * rb..(r + 1) * rb]);
+        if a != b {
+            count += 1;
+            if first.is_none() {
+                first = Some((r, a.iter().zip(b).position(|(x, y)| x != y).unwrap_or(0)));
+            }
+        }
+    }
+    let (row, byte) = first.unwrap_or((0, 0));
+    let col = byte / elem;
+    let at = |v: &[u8]| rows_hex(&v[row * rb + col * elem..row * rb + (col + 1) * elem]);
+    Some((
+        row,
+        serde_json::json!({
+            "row": row, "col": col, "byte": byte,
+            "got": at(got), "want": at(want), "rows_differing": count,
+        }),
+    ))
+}
+
+/// One chain run over a batch of `o + t0` tokens: `o` filler tokens (other
+/// data) then the first `t0` pool tokens at row offset `o`.
+#[allow(clippy::too_many_arguments)]
+fn rows_run(
+    gpu: &mut Gpu,
+    b: &RowBufs,
+    base: &RowPool,
+    fill: &RowPool,
+    o: usize,
+    t0: usize,
+    host: bool,
+    diag: bool,
+) -> Res<RowOut> {
+    let t = o + t0;
+    let l = t * TOPK;
+    let pmax = (l + E * 15).div_ceil(16) * 16;
+    if o > 0 {
+        gpu.hip.memcpy_htod_offset(&b.topk.buf, 0, rows_bytes(&fill.topk[..o * TOPK]))?;
+        gpu.hip.memcpy_htod_offset(&b.wts.buf, 0, rows_bytes(&fill.wts[..o * TOPK]))?;
+        gpu.hip.memcpy_htod_offset(&b.x.buf, 0, rows_bytes(&fill.x[..o * HID]))?;
+    }
+    gpu.hip.memcpy_htod_offset(&b.topk.buf, o * TOPK * 4, rows_bytes(&base.topk[..t0 * TOPK]))?;
+    gpu.hip.memcpy_htod_offset(&b.wts.buf, o * TOPK * 4, rows_bytes(&base.wts[..t0 * TOPK]))?;
+    gpu.hip.memcpy_htod_offset(&b.x.buf, o * HID * 4, rows_bytes(&base.x[..t0 * HID]))?;
+    gpu.hip.memset(&b.ygu.buf, 0x7B, pmax * MI * 2)?;
+    gpu.hip.memset(&b.ydn.buf, 0x7B, pmax * DN_M * 2)?;
+    gpu.hip.memset(&b.out.buf, 0xA5, t * HID * 4)?;
+    let mut kernels: Vec<String> = Vec::new();
+    gpu.moe_scatter_stable_top10(&b.topk, &b.counts, &b.offsets, &b.sorted, &b.tiles, &b.inverse, l, E, pmax)?;
+    kernels.push(gpu.last_launched_kernel().unwrap_or("?").to_string());
+    let x_view = b.x.sub_offset(0, t * HID);
+    let gate = gpu.qwen4_moe_rotate256_i4(&x_view, HID, t)?;
+    kernels.push(gpu.last_launched_kernel().unwrap_or("?").to_string());
+    gpu.gemm_qwen4_moe_gate_up_silu_iu4_sym(
+        &b.gu_ptrs, &b.tiles, &b.sorted, &gate, &b.ygu, GU_M, HID, TOPK, pmax, t, host,
+    )?;
+    kernels.push(gpu.last_launched_kernel().unwrap_or("?").to_string());
+    let down = gpu.qwen4_moe_rotate128_i4(&b.ygu, &b.sorted, MI, pmax, l)?;
+    kernels.push(gpu.last_launched_kernel().unwrap_or("?").to_string());
+    gpu.gemm_qwen4_moe_down_iu4_sym(&b.dn_ptrs, &b.tiles, &b.sorted, &down, &b.ydn, DN_M, MI, 1, pmax, l, host)?;
+    kernels.push(gpu.last_launched_kernel().unwrap_or("?").to_string());
+    // The prefill's combine: BF16 grouped rows, rank order by expert id,
+    // written from +0.0 (`combine_initial_zero_applies` on this route).
+    gpu.moe_down_combine_grouped_top10_bf16in(
+        &b.ydn, &b.inverse, &b.topk, &b.wts, &b.out, &b.order, HID, pmax, t, true,
+    )?;
+    kernels.push(gpu.last_launched_kernel().unwrap_or("?").to_string());
+    gpu.hip.device_synchronize()?;
+    let mut out = vec![0u8; t0 * HID * 4];
+    gpu.hip.memcpy_dtoh_at(&mut out, &b.out.buf, o * HID * 4)?;
+    let slots = if diag {
+        let mut inv = vec![0u8; l * 4];
+        gpu.hip.memcpy_dtoh(&mut inv, &b.inverse.buf)?;
+        let inv = to_i32(&inv);
+        let mut ygu = vec![0u8; pmax * MI * 2];
+        gpu.hip.memcpy_dtoh(&mut ygu, &b.ygu.buf)?;
+        let mut ydn = vec![0u8; pmax * DN_M * 2];
+        gpu.hip.memcpy_dtoh(&mut ydn, &b.ydn.buf)?;
+        Some((rows_slots(&ygu, &inv, o * TOPK, t0 * TOPK, MI * 2), rows_slots(&ydn, &inv, o * TOPK, t0 * TOPK, DN_M * 2)))
+    } else {
+        None
+    };
+    Ok(RowOut { out, kernels, slots })
+}
+
+/// `--mode rows`: per-token batch invariance of the production grouped
+/// symmetric IU4 MoE chain (stable top-10 scatter, rotate256 A4, gate/up +
+/// SiLU, rotate128 A4, down, and the prefill's BF16-row combine).  Routing is
+/// per token (`row_route`: hot, warm, cold and colliding experts across
+/// tokens), the reference is the chain over T = `--ref-tokens` (8192) tokens,
+/// and for every T of `--rows` the first T tokens, alone (offset 0) and at
+/// each `--offsets` row offset inside a batch of T + o tokens whose first o
+/// are other data, must reproduce the reference's per-token combined output
+/// rows (`[token][2560]` F32, de-permuted by the combine; packed slots are
+/// never compared except under `--diag`, which localizes a difference to the
+/// gate/up, down or combine stage).
+///
+/// The example calls the sym launchers directly, so `--scope` (it sets
+/// `Gpu::prefill_invariant_scope`) cannot change what runs: the launchers
+/// never consult a row count to choose an entry (the `>= 512` rows predicate
+/// `Gpu::qwen4_moe_sym_iu4_applies` is a dispatch-side gate, reported per run
+/// as `sym_applies` for the row count the scope's routing sees).
+fn rows_mode(mut gpu: Gpu, args: &[String], host: bool, seed: u64) -> Res<()> {
+    let scopes: Vec<bool> = match arg(args, "--scope", "on").as_str() {
+        "on" => vec![true],
+        "off" => vec![false],
+        "both" => vec![false, true],
+        other => return Err(format!("--scope {other}: expected on, off or both").into()),
+    };
+    let ref_t: usize = arg(args, "--ref-tokens", "8192").parse()?;
+    let rows = rows_list(&arg(args, "--rows", ""))?;
+    let offset_spec = arg(args, "--offsets", "1,17,256,t");
+    let diag = args.iter().any(|a| a == "--diag");
+    let print_all = arg(args, "--print", "all") != "fail";
+    let distinct: usize = arg(args, "--distinct", &E.to_string()).parse()?;
+    if distinct == 0 || distinct > E || ref_t == 0 {
+        return Err("--distinct must be 1..=512 and --ref-tokens > 0".into());
+    }
+    let rmax = *rows.last().ok_or("--rows is empty")?;
+    if rmax > ref_t {
+        return Err(format!("--rows max {rmax} exceeds --ref-tokens {ref_t}").into());
+    }
+    let (mut tmax, mut omax) = (ref_t, 1usize);
+    for &t in &rows {
+        for o in rows_offsets(&offset_spec, t)? {
+            tmax = tmax.max(t + o);
+            omax = omax.max(o);
+        }
+    }
+
+    let mut gu_w = Vec::with_capacity(distinct * GU_STRIDE);
+    let mut dn_w = Vec::with_capacity(distinct * DN_STRIDE);
+    for e in 0..distinct as u64 {
+        gu_w.extend(symmetric_weights(GU_M, HID, GU_GB, seed * 1000 + e));
+        dn_w.extend(symmetric_weights(DN_M, MI, DN_GB, seed * 1000 + 600 + e));
+    }
+    let (gu_t, dn_t) = if host {
+        (gpu.upload_raw_host_mapped(&gu_w, &[gu_w.len()])?, gpu.upload_raw_host_mapped(&dn_w, &[dn_w.len()])?)
+    } else {
+        (gpu.upload_raw(&gu_w, &[gu_w.len()])?, gpu.upload_raw(&dn_w, &[dn_w.len()])?)
+    };
+    drop((gu_w, dn_w));
+    let l_max = tmax * TOPK;
+    let pmax_max = (l_max + E * 15).div_ceil(16) * 16;
+    let bufs = RowBufs {
+        gu_ptrs: gpu.upload_raw(&ptr_table(&gu_t, GU_STRIDE, distinct), &[E * 8])?,
+        dn_ptrs: gpu.upload_raw(&ptr_table(&dn_t, DN_STRIDE, distinct), &[E * 8])?,
+        topk: alloc(&mut gpu, l_max * 4)?,
+        wts: alloc(&mut gpu, l_max * 4)?,
+        x: alloc(&mut gpu, tmax * HID * 4)?,
+        counts: alloc(&mut gpu, E * 4)?,
+        offsets: alloc(&mut gpu, (E + 1) * 4)?,
+        sorted: alloc(&mut gpu, pmax_max * 4)?,
+        tiles: alloc(&mut gpu, pmax_max / 16 * 4)?,
+        inverse: alloc(&mut gpu, l_max * 4)?,
+        ygu: alloc(&mut gpu, pmax_max * MI * 2 + GUARD)?,
+        ydn: alloc(&mut gpu, pmax_max * DN_M * 2 + GUARD)?,
+        order: alloc(&mut gpu, tmax * TOPK * 8)?,
+        out: alloc(&mut gpu, tmax * HID * 4)?,
+    };
+    let base = row_pool(seed, 0, ref_t);
+    let fill = row_pool(seed, ROWS_FILLER_BASE, omax);
+
+    let (cand, _) = cand_and_anchors(&gpu, host)?;
+    println!(
+        "{}",
+        serde_json::json!({
+            "event": "start", "mode": "rows", "arch": gpu.arch, "seed": seed,
+            "residency": if host { "host" } else { "vram" },
+            "gemm_symbols": [cand.gate_up, cand.down], "candidate_entry": cand.name,
+            "down_rr": cand.down_rr, "distinct_experts": distinct,
+            "ref_tokens": ref_t, "tokens_list": rows.len(), "offsets": offset_spec,
+            "scopes": scopes.iter().map(|s| if *s { "on" } else { "off" }).collect::<Vec<_>>(),
+            "route_requested": gpu.qwen4_moe_sym_iu4_requested(),
+            "note": "the sym launchers are called directly; scope changes only the reported sym_applies",
+        })
+    );
+
+    let (mut runs, mut fails) = (0usize, 0usize);
+    let mut prev_ref: Option<Vec<u8>> = None;
+    for &scope in &scopes {
+        gpu.prefill_invariant_scope = scope;
+        let sname = if scope { "on" } else { "off" };
+        let rf = rows_run(&mut gpu, &bufs, &base, &fill, 0, ref_t, host, diag)?;
+        println!(
+            "{}",
+            serde_json::json!({
+                "event": "ref", "scope": sname, "tokens": ref_t, "kernels": rf.kernels,
+                "sym_applies": gpu.qwen4_moe_sym_iu4_applies(gpu.route_rows(ref_t)),
+            })
+        );
+        if let Some(p) = &prev_ref {
+            let d = rows_diff(&rf.out, p, HID * 4, 4);
+            runs += 1;
+            fails += usize::from(d.is_some());
+            println!(
+                "{}",
+                serde_json::json!({
+                    "event": "ref_cross_scope", "tokens": ref_t,
+                    "verdict": if d.is_some() { "differs" } else { "identical" },
+                    "first_diff": d.map(|x| x.1),
+                })
+            );
+        }
+        for &t0 in &rows {
+            let mut offs = vec![0usize];
+            offs.extend(rows_offsets(&offset_spec, t0)?);
+            for o in offs {
+                if o == 0 && t0 == ref_t {
+                    continue;
+                }
+                let run = rows_run(&mut gpu, &bufs, &base, &fill, o, t0, host, diag)?;
+                runs += 1;
+                let d = rows_diff(&run.out, &rf.out[..t0 * HID * 4], HID * 4, 4);
+                let mut stage = serde_json::Value::Null;
+                let mut stage_diff = serde_json::Value::Null;
+                if d.is_some() {
+                    if let (Some((gy, dy)), Some((rg, rd))) = (&run.slots, &rf.slots) {
+                        let n = t0 * TOPK;
+                        let hit = rows_diff(gy, &rg[..n * MI * 2], MI * 2, 2)
+                            .map(|x| ("gate_up_silu", x))
+                            .or_else(|| rows_diff(dy, &rd[..n * DN_M * 2], DN_M * 2, 2).map(|x| ("down", x)))
+                            .or(Some(("combine", (0, serde_json::Value::Null))));
+                        if let Some((name, (row, mut v))) = hit {
+                            stage = serde_json::json!(name);
+                            if name != "combine" {
+                                v["token"] = serde_json::json!(row / TOPK);
+                                v["rank"] = serde_json::json!(row % TOPK);
+                                stage_diff = v;
+                            }
+                        }
+                    }
+                    fails += 1;
+                }
+                if d.is_some() || print_all {
+                    let first = d.as_ref().map(|(tok, v)| {
+                        let mut v = v.clone();
+                        v["token"] = serde_json::json!(tok);
+                        v["experts"] = serde_json::json!(base.topk[tok * TOPK..(tok + 1) * TOPK].to_vec());
+                        v
+                    });
+                    println!(
+                        "{}",
+                        serde_json::json!({
+                            "event": "run", "scope": sname, "tokens": t0, "offset": o, "batch": t0 + o,
+                            "route_rows": gpu.route_rows(t0 + o),
+                            "sym_applies": gpu.qwen4_moe_sym_iu4_applies(gpu.route_rows(t0 + o)),
+                            "verdict": if d.is_some() { "differs" } else { "identical" },
+                            "first_diff": first, "stage": stage, "stage_first_diff": stage_diff,
+                            "kernels": run.kernels,
+                        })
+                    );
+                }
+            }
+        }
+        prev_ref = Some(rf.out);
+    }
+    println!("{}", serde_json::json!({ "event": "summary", "runs": runs, "differing": fails }));
+    if fails > 0 {
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------- main
 
 fn arg(args: &[String], k: &str, d: &str) -> String {
@@ -1131,6 +1600,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut gpu = Gpu::init()?;
     if !matches!(gpu.arch.as_str(), "gfx1151" | "gfx1201") {
         return Err(format!("the symmetric IU4 MoE route is gfx1151/gfx1201-only, device is {}", gpu.arch).into());
+    }
+    if mode == "rows" {
+        return rows_mode(gpu, &args, host, seed);
     }
     load_oracle(&mut gpu)?;
     let mut out = BTreeMap::<String, String>::new();

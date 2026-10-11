@@ -1266,6 +1266,7 @@ fn cq_load_rig(gpu: &mut Gpu, model_path: &Path, mode: CqMode) -> Result<CqRig, 
     let max_seq = crate::QWEN4_DEFAULT_CONTEXT.min(config.max_position_embeddings);
     let mut bundle = Qwen4Bundle::assemble_with_metadata(
         config.clone(),
+        &manifest.identity.recipe,
         transaction,
         &placements,
         gpu,

@@ -54,13 +54,13 @@ fn synced_wall_us(gpu: &Gpu, start: Instant) -> f64 {
 /// recorded on the null stream and resolved once at window end, so the
 /// instrument never synchronizes mid-window and never changes launch order:
 /// the number it prints is the GPU time the phase actually occupies.
-struct MtpPhaseTimers {
+pub(crate) struct MtpPhaseTimers {
     spans: SpanProfiler,
     open: Option<Span>,
 }
 
 impl MtpPhaseTimers {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             spans: SpanProfiler::new(phase_timing_enabled()),
             open: None,
@@ -550,12 +550,27 @@ impl SpecTarget for Qwen4Bundle {
     }
 }
 
-/// Draft-step hidden conditioning mode; see [`Qwen4MtpDrafter::draft_pairing`].
+/// Draft-step hidden conditioning mode; see [`draft_pairing`].
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum DraftPairing {
+pub(crate) enum DraftPairing {
     HeadState,
     AlignedHead,
     AlignedTarget,
+}
+
+/// Native MTP draft-step conditioning.  `HeadState` is the historical
+/// chain: row 0 is fed the window's pending hidden and every later row is
+/// fed the head's own previous-step hidden (`forward_token` with no target hidden).
+/// `AlignedHead` feeds the target's hidden of the token being processed at
+/// row 0 and the head's own hidden afterwards; `AlignedTarget` feeds the
+/// target's same-row hidden at every row.  Selectable so the pairing can be
+/// measured rather than argued: `HIPFIRE_MTP_PAIRING=aligned-head|aligned`.
+pub(crate) fn draft_pairing() -> DraftPairing {
+    match hipfire_config::developer_var("HIPFIRE_MTP_PAIRING").as_deref() {
+        Ok("aligned-head") => DraftPairing::AlignedHead,
+        Ok("aligned") => DraftPairing::AlignedTarget,
+        _ => DraftPairing::HeadState,
+    }
 }
 
 /// How a native batched window's drafting closure ended.
@@ -595,11 +610,11 @@ fn takeover_probe(gpu: &Gpu, start: Instant) -> TakeoverProbe {
 /// measured: interleaved ~33.5 ms/token, K=2 window ~62.5 ms, K=3 ~75.4 ms;
 /// the others from the few-row forward's growth (2 rows ~50 ms, 5 ~69,
 /// 8 ~98) plus ~2.7 ms per draft step.
-const MTP_WINDOW_COST: [f32; 8] = [1.0, 1.7, 1.87, 2.25, 2.55, 2.75, 3.0, 3.6];
+pub(crate) const MTP_WINDOW_COST: [f32; 8] = [1.0, 1.7, 1.87, 2.25, 2.55, 2.75, 3.0, 3.6];
 /// Per-window decay of the per-depth agreement counts.
 const MTP_AGREEMENT_DECAY: f32 = 0.875;
 /// Per-depth (accepted, compared) counts a request starts from (0.8).
-const MTP_AGREEMENT_PRIOR: (f32, f32) = (1.6, 2.0);
+pub(crate) const MTP_AGREEMENT_PRIOR: (f32, f32) = (1.6, 2.0);
 /// Per-window relaxation of a depth the window did not compare toward
 /// `MTP_AGREEMENT_PRIOR`. An unobserved depth must drift back to the prior so
 /// the chooser re-explores it: a ratio frozen below the depth's threshold
@@ -614,18 +629,18 @@ const NGRAM_YIELD_PRIOR: f32 = 3.0;
 /// source that lost to native MTP is re-tried once the evidence ages out.
 const NGRAM_YIELD_RECOVERY: f32 = 0.95;
 /// Draft depths tracked (the drafter's K is clamped to this).
-const MTP_MAX_DEPTH: usize = 10;
+pub(crate) const MTP_MAX_DEPTH: usize = 10;
 /// Smallest probability that a verify row's whole draft prefix is accepted
 /// for the row (plus its draft step) to pay: ~6 ms of a ~47 ms window
 /// emitting ~2-3.5 tokens.
-const MTP_ROW_WORTH: f32 = 0.2;
+pub(crate) const MTP_ROW_WORTH: f32 = 0.2;
 /// Best per-draft acceptance [`draft_accept_estimate`] gives.
-const DRAFT_ACCEPT_MAX: f32 = 0.98;
+pub(crate) const DRAFT_ACCEPT_MAX: f32 = 0.98;
 
 /// Acceptance of a draft whose exact logit leads its runner-up (among the
 /// re-scored candidates) by `margin`; measured on the committed sweep prompts
 /// (gfx1151, Qwen3.8-Flash-Next, all depths pooled).
-fn draft_accept_estimate(margin: f32) -> f32 {
+pub(crate) fn draft_accept_estimate(margin: f32) -> f32 {
     match margin {
         m if m < 0.25 => 0.3,
         m if m < 1.5 => 0.5,
@@ -656,11 +671,11 @@ fn trace_rows(drafts: &[u32], picks: &[u32]) -> String {
 /// at most one head append plus this many windows.
 const MTP_FLOOR_PROBE_WINDOWS: usize = 3;
 
-type Agreement = [(f32, f32); MTP_MAX_DEPTH];
+pub(crate) type Agreement = [(f32, f32); MTP_MAX_DEPTH];
 
 /// Route the floor picks for one native window.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum FloorRoute {
+pub(crate) enum FloorRoute {
     /// Ordinary target-only token, no head work (after sticky retirement).
     Ar,
     Interleaved,
@@ -669,7 +684,7 @@ enum FloorRoute {
 
 /// Which native route a measured window ran.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
-enum NativeWindow {
+pub(crate) enum NativeWindow {
     Interleaved,
     Batched,
 }
@@ -687,7 +702,7 @@ fn decay_add(entry: &mut (f32, f32), sum: f32, weight: f32) {
 
 /// Expected tokens a `depth`-draft window emits (the seed's bonus plus the
 /// accepted-prefix probabilities); the arithmetic of `batched_depth`.
-fn expected_emitted(agreement: &Agreement, depth: usize) -> f32 {
+pub(crate) fn expected_emitted(agreement: &Agreement, depth: usize) -> f32 {
     let mut prefix = 1.0f32;
     let mut expected = 1.0f32;
     for &(accepted, total) in agreement.iter().take(depth) {
@@ -695,6 +710,51 @@ fn expected_emitted(agreement: &Agreement, depth: usize) -> f32 {
         expected += prefix;
     }
     expected
+}
+
+/// Only the drafts compared before the first rejection count, so each
+/// depth measures the agreement conditional on its prefix being accepted
+/// (the same quantity on both routes). Compared depths decay and take the
+/// observation; depths the window did not compare relax toward
+/// `MTP_AGREEMENT_PRIOR` (`MTP_AGREEMENT_RELAX`) instead of decaying, so a
+/// depth rejected once is re-explored rather than frozen below its
+/// threshold.
+pub(crate) fn observe_agreement(agreement: &mut Agreement, window: &MtpWindow) {
+    let compared = (window.accepted + 1).min(window.drafts_generated);
+    let (prior_accepted, prior_total) = MTP_AGREEMENT_PRIOR;
+    for (depth, (accepted, total)) in agreement.iter_mut().enumerate() {
+        if depth < compared {
+            *accepted *= MTP_AGREEMENT_DECAY;
+            *total *= MTP_AGREEMENT_DECAY;
+            *total += 1.0;
+            *accepted += f32::from(u8::from(depth < window.accepted));
+        } else {
+            *accepted =
+                *accepted * MTP_AGREEMENT_RELAX + prior_accepted * (1.0 - MTP_AGREEMENT_RELAX);
+            *total = *total * MTP_AGREEMENT_RELAX + prior_total * (1.0 - MTP_AGREEMENT_RELAX);
+        }
+    }
+}
+
+/// Draft depth for the next window: the K maximizing expected emitted
+/// tokens (1 + sum over depths of the accepted-prefix probability) per
+/// window cost, or 0 (interleaved) when no batched window beats one
+/// token per interleaved step.
+pub(crate) fn batched_depth(agreement: &Agreement, k: usize) -> usize {
+    let mut best = (0, 1.0f32);
+    let mut prefix = 1.0f32;
+    let mut expected = 1.0f32;
+    let depths = agreement.iter().zip(&MTP_WINDOW_COST[1..]).take(k);
+    for (i, (&(accepted, total), &cost)) in depths.enumerate() {
+        let depth = i + 1;
+        prefix *= accepted / total.max(f32::MIN_POSITIVE);
+        expected += prefix;
+        let rate = expected / cost;
+        if rate > best.1 {
+            best = (depth, rate);
+        }
+    }
+    best.0
 }
 
 /// Same-request AR floor of native MTP.
@@ -722,7 +782,7 @@ fn expected_emitted(agreement: &Agreement, depth: usize) -> f32 {
 /// retires, stickily, at the first window where that stops holding.  A
 /// measured native option that beats AR needs no external help.
 #[derive(Clone, Debug)]
-struct MtpFloor {
+pub(crate) struct MtpFloor {
     calibrated: bool,
     /// Microseconds of one ordinary AR token; 0 when the measurement was
     /// invalid.
@@ -742,7 +802,7 @@ struct MtpFloor {
 }
 
 impl MtpFloor {
-    fn new() -> Self {
+    pub(crate) fn new() -> Self {
         Self {
             calibrated: false,
             ar_us: 0.0,
@@ -754,6 +814,11 @@ impl MtpFloor {
             external_blocked: false,
             combined: (0.0, 0.0),
         }
+    }
+
+    /// Whether the floor retired stickily to head-free AR.
+    pub(crate) fn retired(&self) -> bool {
+        self.retired
     }
 
     /// Measured native window cost in AR-step units, once probing finishes.
@@ -773,14 +838,14 @@ impl MtpFloor {
         self.probes = (self.probes + 1).min(MTP_FLOOR_PROBE_WINDOWS);
     }
 
-    fn observe_calibration(&mut self, us: f32, agreement: &Agreement) {
+    pub(crate) fn observe_calibration(&mut self, us: f32, agreement: &Agreement) {
         self.calibrated = true;
         self.ar_us = if valid_us(us) { us } else { 0.0 };
         self.decide(agreement);
     }
 
     /// One finished native window of `k > 0` budget with wall time `us`.
-    fn observe_native(
+    pub(crate) fn observe_native(
         &mut self,
         route: NativeWindow,
         window: &MtpWindow,
@@ -898,7 +963,12 @@ impl MtpFloor {
     /// measured depth, a losing measured option, no valid AR price) the
     /// request retires, stickily, and runs AR: no unmeasured or losing route
     /// is ever run after the budget.
-    fn route(&mut self, agreement: &Agreement, k: usize, provisional: usize) -> FloorRoute {
+    pub(crate) fn route(
+        &mut self,
+        agreement: &Agreement,
+        k: usize,
+        provisional: usize,
+    ) -> FloorRoute {
         if self.retired {
             return FloorRoute::Ar;
         }
@@ -1294,6 +1364,18 @@ impl SampledVerify {
     }
 }
 
+/// What a promoted singleton's drafter hands its lane
+/// ([`Qwen4MtpDrafter::promotion_parts`]).
+pub struct Qwen4PromotionParts<'a> {
+    /// The next window's row-0 hidden (F32, `hc_count * hidden`).
+    pub pending_hidden: &'a GpuTensor,
+    /// Per-depth agreement (performance only).
+    pub agreement: [(f32, f32); 10],
+    /// The floor retired the request: the head lags, the lane must stay
+    /// `ArRetired`.
+    pub retired: bool,
+}
+
 /// Native GPU MTP drafter.  The MTP operator/state stay model-owned by the
 /// target bundle; this adapter owns only the reusable verifier scratch and one
 /// pending target-hidden row needed to seed each MTP window.
@@ -1471,7 +1553,7 @@ impl Qwen4MtpDrafter {
             let bundle = Self::bundle(target)?;
             if bundle.mtp_append_rows_supported(gpu) {
                 let rows = MTP_FILL_ROWS.min(prefill_rows);
-                let scratch = MtpAppendScratch::new(gpu, &bundle.config, rows)
+                let scratch = MtpAppendScratch::new(gpu, &bundle.config, rows, prefill_rows)
                     .map_err(|error| format!("Qwen4 MTP append scratch allocation: {error}"))?;
                 self.append_scratch = Some(scratch);
             }
@@ -1485,19 +1567,9 @@ impl Qwen4MtpDrafter {
             .ok_or_else(|| "Qwen4 MTP row hidden is not allocated".to_string())
     }
 
-    /// Native MTP draft-step conditioning.  `HeadState` is the historical
-    /// chain: row 0 is fed the window's pending hidden and every later row is
-    /// fed the head's own previous-step hidden (`forward_token` with no target hidden).
-    /// `AlignedHead` feeds the target's hidden of the token being processed at
-    /// row 0 and the head's own hidden afterwards; `AlignedTarget` feeds the
-    /// target's same-row hidden at every row.  Selectable so the pairing can be
-    /// measured rather than argued: `HIPFIRE_MTP_PAIRING=aligned-head|aligned`.
+    /// Native MTP draft-step conditioning; see the free [`draft_pairing`].
     fn draft_pairing() -> DraftPairing {
-        match hipfire_config::developer_var("HIPFIRE_MTP_PAIRING").as_deref() {
-            Ok("aligned-head") => DraftPairing::AlignedHead,
-            Ok("aligned") => DraftPairing::AlignedTarget,
-            _ => DraftPairing::HeadState,
-        }
+        draft_pairing()
     }
 
     /// Incremental verify: interleave one target row with one draft step and
@@ -1689,49 +1761,14 @@ impl Qwen4MtpDrafter {
         })
     }
 
-    /// Only the drafts compared before the first rejection count, so each
-    /// depth measures the agreement conditional on its prefix being accepted
-    /// (the same quantity on both routes). Compared depths decay and take the
-    /// observation; depths the window did not compare relax toward
-    /// `MTP_AGREEMENT_PRIOR` (`MTP_AGREEMENT_RELAX`) instead of decaying, so a
-    /// depth rejected once is re-explored rather than frozen below its
-    /// threshold.
+    /// See the free [`observe_agreement`].
     fn observe_agreement(&mut self, window: &MtpWindow) {
-        let compared = (window.accepted + 1).min(window.drafts_generated);
-        let (prior_accepted, prior_total) = MTP_AGREEMENT_PRIOR;
-        for (depth, (accepted, total)) in self.agreement.iter_mut().enumerate() {
-            if depth < compared {
-                *accepted *= MTP_AGREEMENT_DECAY;
-                *total *= MTP_AGREEMENT_DECAY;
-                *total += 1.0;
-                *accepted += f32::from(u8::from(depth < window.accepted));
-            } else {
-                *accepted = *accepted * MTP_AGREEMENT_RELAX
-                    + prior_accepted * (1.0 - MTP_AGREEMENT_RELAX);
-                *total = *total * MTP_AGREEMENT_RELAX + prior_total * (1.0 - MTP_AGREEMENT_RELAX);
-            }
-        }
+        observe_agreement(&mut self.agreement, window);
     }
 
-    /// Draft depth for the next window: the K maximizing expected emitted
-    /// tokens (1 + sum over depths of the accepted-prefix probability) per
-    /// window cost, or 0 (interleaved) when no batched window beats one
-    /// token per interleaved step.
+    /// See the free [`batched_depth`].
     fn batched_depth(&self, k: usize) -> usize {
-        let mut best = (0, 1.0f32);
-        let mut prefix = 1.0f32;
-        let mut expected = 1.0f32;
-        let depths = self.agreement.iter().zip(&MTP_WINDOW_COST[1..]).take(k);
-        for (i, (&(accepted, total), &cost)) in depths.enumerate() {
-            let depth = i + 1;
-            prefix *= accepted / total.max(f32::MIN_POSITIVE);
-            expected += prefix;
-            let rate = expected / cost;
-            if rate > best.1 {
-                best = (depth, rate);
-            }
-        }
-        best.0
+        batched_depth(&self.agreement, k)
     }
 
     /// Price both sources on the same clock; unsupported arches retain the
@@ -1983,6 +2020,25 @@ impl Qwen4MtpDrafter {
     /// external takeover must pass before it runs.
     pub(crate) fn floor_takeover_blocked(&self) -> bool {
         self.floor.retired || self.floor_needs_calibration()
+    }
+
+    /// What a promoted singleton hands its lane: the next window's row-0
+    /// hidden, the per-depth agreement and whether the floor retired the
+    /// request (the head then lags the target, so the lane must stay
+    /// head-free). Err when no prefill ran (the drafter holds no pending
+    /// hidden). The drafter keeps no window state between windows; an
+    /// active target snapshot in its verify scratch is a ticket of the
+    /// bundle's trunk arena, which `Qwen4Bundle::prepare_promotion` refuses
+    /// (the scratch cannot be downcast through `&self`).
+    pub fn promotion_parts(&self) -> Result<Qwen4PromotionParts<'_>, String> {
+        let pending_hidden = self.pending_hidden.as_ref().ok_or_else(|| {
+            "Qwen4 MTP promotion: the drafter holds no request resources".to_string()
+        })?;
+        Ok(Qwen4PromotionParts {
+            pending_hidden,
+            agreement: self.agreement,
+            retired: self.floor_enabled && self.floor.retired,
+        })
     }
 
     /// Developer-forced route that bypasses the floor.
@@ -2355,7 +2411,7 @@ impl Qwen4MtpDrafter {
                 .filter(|fill| consumed >= 2 && consumed <= fill.rows() && mtp_batched_fill_enabled());
             match fill {
                 Some(fill) => bundle
-                    .mtp_append_rows(gpu, fill, &block[..consumed], 0, None, position)
+                    .mtp_append_rows(gpu, fill, &block[..consumed], 0, None, None, position)
                     .map_err(|error| error.to_string())?,
                 None => {
                     let row_hidden = self
@@ -2620,6 +2676,327 @@ impl Qwen4MtpDrafter {
     }
 }
 
+/// Close the open phase of `timers` (when given) and open `label`.
+fn mark_phase(timers: &mut Option<&mut MtpPhaseTimers>, gpu: &Gpu, label: &'static str) {
+    if let Some(timers) = timers.as_deref_mut() {
+        timers.mark(gpu, label);
+    }
+}
+
+/// The body of `mtp_prefill`'s chunk loop for the chunk `chunk` at `pos`:
+/// the trunk tile with wide-hidden capture (`spec_prefill_rows` when
+/// `needs_pick`, else `spec_prefill_rows_silent`), then the head append of
+/// every row (`append_scratch` given: batched sub-chunks of `scratch.rows()`,
+/// a lone row per-row; `None`: per-row), leaving `pending` on the chunk's last
+/// row. Returns the trunk pick when `needs_pick`. The boundary, session and
+/// pick bookkeeping stay with the caller; `abort` is polled before every
+/// sub-chunk (or row) and a hit resets the target.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn mtp_prefill_chunk(
+    bundle: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    chunk: &[u32],
+    pos: usize,
+    needs_pick: bool,
+    pending: &GpuTensor,
+    append_scratch: Option<&mut MtpAppendScratch>,
+    reuse_trunk_ids: bool,
+    abort: &dyn Fn() -> bool,
+) -> Result<Option<u32>, String> {
+    let pick = if needs_pick {
+        Some(
+            bundle
+                .spec_prefill_rows(gpu, chunk, true)
+                .map_err(|error| error.to_string())?,
+        )
+    } else {
+        bundle
+            .spec_prefill_rows_silent(gpu, chunk)
+            .map_err(|error| error.to_string())?;
+        None
+    };
+    if let Some(scratch) = append_scratch {
+        // The chunk's ids upload once, here: the target forward's pick
+        // readback has already drained the stream (a silent chunk
+        // leaves the copy waiting for that forward, once per chunk
+        // instead of once per sub-chunk). Each sub-chunk then embeds
+        // from its rows of that upload; the bytes are the chunk's own
+        // tokens as i32, exactly what `append_rows` would upload
+        // itself. With the trunk-id reuse lever on, the head keeps
+        // that lever's own ids (and its own upload when they differ).
+        let chunk_ids_uploaded =
+            prefill_uploads_chunk_ids(reuse_trunk_ids, chunk.len(), scratch.prompt_id_rows());
+        if chunk_ids_uploaded {
+            scratch
+                .upload_prompt_ids(gpu, chunk)
+                .map_err(|error| error.to_string())?;
+        }
+        // Map the head's QSA context through the chunk's last row once,
+        // here (the device is idle after the target forward), instead
+        // of growing inside each sub-chunk's Append: a VMM grow
+        // zero-fills with a blocking memset. Same pages, same zero
+        // fill, all before any Append writes; each sub-chunk's own
+        // mapping check then finds the coverage in place.
+        bundle
+            .mtp_map_through(gpu, pos + chunk.len() - 1)
+            .map_err(|error| error.to_string())?;
+        // One batched Append pass per sub-chunk of at most `scratch.rows()`
+        // rows; row `i` is still paired with spec hidden row `i`.
+        let mut off = 0;
+        while off < chunk.len() {
+            if abort() {
+                bundle.reset_recurrent(gpu)?;
+                return Err("Qwen4 native MTP prefill aborted".to_string());
+            }
+            let n = (chunk.len() - off).min(scratch.rows());
+            let position = pos
+                .checked_add(off)
+                .ok_or_else(|| "Qwen4 native MTP prefill position overflow".to_string())?;
+            if n == 1 {
+                // The multirow projections need two rows or more; a
+                // lone row is exactly the per-row Append (its token
+                // upload stays the per-row path's own, blocking one).
+                bundle
+                    .copy_spec_hidden_row_to(gpu, off, pending)
+                    .map_err(|error| error.to_string())?;
+                bundle
+                    .mtp_append_token(gpu, chunk[off], Some(pending), position)
+                    .map_err(|error| error.to_string())?;
+            } else {
+                let prompt_ids = if chunk_ids_uploaded {
+                    Some(
+                        scratch
+                            .prompt_ids_view(off, n)
+                            .map_err(|error| error.to_string())?,
+                    )
+                } else {
+                    None
+                };
+                bundle
+                    .mtp_append_rows(
+                        gpu,
+                        scratch,
+                        &chunk[off..off + n],
+                        off,
+                        prefill_trunk_ids_row(reuse_trunk_ids, off),
+                        prompt_ids.as_ref(),
+                        position,
+                    )
+                    .map_err(|error| error.to_string())?;
+            }
+            off += n;
+        }
+        // The per-row loop leaves `pending` on the chunk's last row: the
+        // next draft step's row-0 hidden.
+        bundle
+            .copy_spec_hidden_row_to(gpu, chunk.len() - 1, pending)
+            .map_err(|error| error.to_string())?;
+    } else {
+        for (index, &token) in chunk.iter().enumerate() {
+            if abort() {
+                bundle.reset_recurrent(gpu)?;
+                return Err("Qwen4 native MTP prefill aborted".to_string());
+            }
+            let position = pos
+                .checked_add(index)
+                .ok_or_else(|| "Qwen4 native MTP prefill position overflow".to_string())?;
+            bundle
+                .copy_spec_hidden_row_to(gpu, index, pending)
+                .map_err(|error| error.to_string())?;
+            bundle
+                .mtp_append_token(gpu, token, Some(pending), position)
+                .map_err(|error| error.to_string())?;
+        }
+    }
+    Ok(pick)
+}
+
+/// What [`finish_native_window`] needs from a batched window's verify.
+pub(crate) struct NativeFinish<'a> {
+    /// Seed position: the window's first row.
+    pub position: usize,
+    /// `[seed, drafts..]`, the verify's rows.
+    pub block: &'a [u32],
+    /// Draft steps the head ran (one more than the kept drafts when the
+    /// last step drafted a dropped token).
+    pub steps: usize,
+    pub acceptance: GreedyAccept,
+    /// The target ticket taken before the verify.
+    pub target_snapshot: Qwen4StateSnapshot,
+    /// The head ticket taken before the window's draft steps.
+    pub mtp_ticket: MtpGpuStateSnapshot,
+    /// Destination of the next window's row-0 hidden.
+    pub pending_hidden: &'a GpuTensor,
+    /// Row `i` = block row `i`'s wide hidden (F32, `hc_count * hidden`).
+    pub verify_hidden: &'a GpuTensor,
+    /// The verify's PLE convolution input rows from block row 0.
+    pub ple_normed: &'a GpuTensor,
+}
+
+/// A batched window's tail, from the target's accepted length through the
+/// ticket commit: ring rollback (or the replay when the ring does not cover
+/// the verify), head commit (append, truncate or restore-and-replay), the
+/// position checks, the pending hidden copy and the commit of both tickets.
+/// `mtp_step` and the lane executor both end their windows here; the caller
+/// clears its own scratch ticket and head ticket after `Ok`.
+pub(crate) fn finish_native_window(
+    picks: &mut Qwen4Bundle,
+    gpu: &mut Gpu,
+    f: NativeFinish<'_>,
+    mut timers: Option<&mut MtpPhaseTimers>,
+) -> Result<MtpWindow, String> {
+    let NativeFinish {
+        position,
+        block,
+        steps,
+        acceptance,
+        target_snapshot,
+        mtp_ticket,
+        pending_hidden,
+        verify_hidden,
+        ple_normed,
+    } = f;
+    let drafts = block
+        .get(1..)
+        .ok_or_else(|| "Qwen4 native MTP window has no seed row".to_string())?;
+    let k = drafts.len();
+    let target_accept_len = target_commit_accept_len(&acceptance);
+    let full_accept = target_accept_len == k;
+
+    // Keep both pre-window tickets active until every replay and hidden
+    // copy succeeds. A retained restore lets the outer rollback repair
+    // both owners if either side's GPU work fails.
+    if !full_accept && picks.state.row_capture_rows() >= block.len() {
+        mark_phase(&mut timers, gpu, "target_rollback");
+        picks
+            .rollback_verify_rows_retain_with(
+                gpu,
+                target_snapshot,
+                target_accept_len + 1,
+                block,
+                ple_normed,
+            )
+            .map_err(|error| error.to_string())?;
+    } else if !full_accept {
+        mark_phase(&mut timers, gpu, "target_replay");
+        picks
+            .restore_retain(gpu, target_snapshot)
+            .map_err(|error| error.to_string())?;
+        picks
+            .spec_forward_rows(gpu, &block[..target_accept_len + 1], true)
+            .map(|_| ())
+            .map_err(|error| error.to_string())?;
+    }
+    mark_phase(&mut timers, gpu, "mtp_commit");
+    if full_accept && steps > k {
+        // The step that drafted the dropped token already consumed
+        // the last kept draft at its position.
+    } else if full_accept && k > 0 {
+        let last_draft = *drafts
+            .last()
+            .ok_or_else(|| "Qwen4 native MTP full accept has no final draft".to_string())?;
+        let last_position = position
+            .checked_add(k)
+            .ok_or_else(|| "Qwen4 MTP step position overflow".to_string())?;
+        picks
+            .mtp_append_token(gpu, last_draft, None, last_position)
+            .map_err(|error| error.to_string())?;
+    } else if target_accept_len < drafts.len() {
+        // The draft steps already consumed the kept prefix with the
+        // replay's exact inputs: keep them, drop the rejected tail.
+        picks
+            .mtp_truncate_retain(mtp_ticket, target_accept_len + 1)
+            .map_err(|error| error.to_string())?;
+    } else {
+        picks
+            .mtp_restore_retain(gpu, mtp_ticket)
+            .map_err(|error| error.to_string())?;
+        // Snapshot restore brings back the pre-window QSA selection;
+        // replay must reselect on its first row.
+        for (index, &token) in block[..target_accept_len + 1].iter().enumerate() {
+            let hidden = if index == 0 {
+                Some(pending_hidden)
+            } else {
+                None
+            };
+            let token_position = position
+                .checked_add(index)
+                .ok_or_else(|| "Qwen4 MTP step position overflow".to_string())?;
+            let result = if index == target_accept_len {
+                picks.mtp_append_token(gpu, token, hidden, token_position)
+            } else {
+                picks.mtp_advance_token(gpu, token, hidden, token_position, index == 0)
+            };
+            result.map_err(|error| error.to_string())?;
+        }
+    }
+    mark_phase(&mut timers, gpu, "commit");
+    let committed_end = position
+        .checked_add(target_accept_len + 1)
+        .ok_or_else(|| "Qwen4 MTP commit position overflow".to_string())?;
+    if picks.state.position != committed_end
+        || picks.mtp_position().map_err(|error| error.to_string())? != committed_end
+    {
+        return Err(format!(
+            "Qwen4 native MTP transaction ended at target={} mtp={}, expected {committed_end}",
+            picks.state.position,
+            picks.mtp_position().map_err(|error| error.to_string())?
+        ));
+    }
+    picks
+        .copy_hidden_row(gpu, verify_hidden, target_accept_len, pending_hidden)
+        .map_err(|error| error.to_string())?;
+
+    let window = MtpWindow {
+        committed: acceptance.committed,
+        accepted: acceptance.accepted,
+        drafts_generated: drafts.len(),
+    };
+    // All fallible GPU operations are complete. Validate both tickets
+    // before invalidating either arena, then perform the no-copy commit
+    // boundary.
+    picks
+        .validate_commit(target_snapshot)
+        .map_err(|error| error.to_string())?;
+    picks
+        .mtp_validate_commit(mtp_ticket)
+        .map_err(|error| error.to_string())?;
+    picks.commit_validated(target_snapshot);
+    picks.mtp_commit_validated(mtp_ticket);
+    Ok(window)
+}
+
+#[cfg(feature = "lab")]
+impl Qwen4MtpDrafter {
+    /// Oracle reference: the AR-floor window (`calibrate` = the request's
+    /// first, head-synced window; else the retired head-free one) of
+    /// `mtp_step`, after the resources `mtp_step` ensures.
+    pub fn lab_ar_window(
+        &mut self,
+        gpu: &mut Gpu,
+        target: &mut dyn SpecTarget,
+        position: usize,
+        seed: u32,
+        calibrate: bool,
+    ) -> Result<MtpWindow, String> {
+        self.ensure_resources(gpu, target)?;
+        self.mtp_ar_step(gpu, target, position, seed, calibrate)
+    }
+
+    /// F32 bytes of the pending hidden row.
+    pub fn lab_pending_hidden_bytes(&self, gpu: &Gpu) -> Result<Vec<u8>, String> {
+        let pending = self.pending_hidden()?;
+        gpu.hip
+            .device_synchronize()
+            .map_err(|error| format!("Qwen4 MTP lab pending hidden sync: {error}"))?;
+        let mut bytes = vec![0u8; pending.byte_size()];
+        gpu.hip
+            .memcpy_dtoh(&mut bytes, &pending.buf)
+            .map_err(|error| format!("Qwen4 MTP lab pending hidden download: {error}"))?;
+        Ok(bytes)
+    }
+}
+
 impl MtpDrafter for Qwen4MtpDrafter {
     fn mtp_prefill(
         &mut self,
@@ -2710,78 +3087,17 @@ impl MtpDrafter for Qwen4MtpDrafter {
             // but skips the final hyper, LM head, argmax and readback.
             let needs_pick =
                 mtp_prefill_chunk_needs_pick(end, prompt_tokens.len(), skip_intermediate_pick);
-            let pick = if needs_pick {
-                Some(
-                    Self::bundle(target)?
-                        .spec_prefill_rows(gpu, chunk, true)
-                        .map_err(|error| error.to_string())?,
-                )
-            } else {
-                Self::bundle(target)?
-                    .spec_prefill_rows_silent(gpu, chunk)
-                    .map_err(|error| error.to_string())?;
-                None
-            };
-            if let Some(scratch) = batched_scratch.as_deref_mut() {
-                // One batched Append pass per sub-chunk of at most `scratch.rows()`
-                // rows; row `i` is still paired with spec hidden row `i`.
-                let mut off = 0;
-                while off < chunk.len() {
-                    if abort() {
-                        target.reset_recurrent(gpu)?;
-                        return Err("Qwen4 native MTP prefill aborted".to_string());
-                    }
-                    let n = (chunk.len() - off).min(scratch.rows());
-                    let position = pos
-                        .checked_add(off)
-                        .ok_or_else(|| "Qwen4 native MTP prefill position overflow".to_string())?;
-                    if n == 1 {
-                        // The multirow projections need two rows or more; a
-                        // lone row is exactly the per-row Append.
-                        let bundle = Self::bundle(target)?;
-                        bundle
-                            .copy_spec_hidden_row_to(gpu, off, pending)
-                            .map_err(|error| error.to_string())?;
-                        bundle
-                            .mtp_append_token(gpu, chunk[off], Some(pending), position)
-                            .map_err(|error| error.to_string())?;
-                    } else {
-                        Self::bundle(target)?
-                            .mtp_append_rows(
-                                gpu,
-                                scratch,
-                                &chunk[off..off + n],
-                                off,
-                                prefill_trunk_ids_row(reuse_trunk_ids, off),
-                                position,
-                            )
-                            .map_err(|error| error.to_string())?;
-                    }
-                    off += n;
-                }
-                // The per-row loop leaves `pending` on the chunk's last row: the
-                // next draft step's row-0 hidden.
-                Self::bundle(target)?
-                    .copy_spec_hidden_row_to(gpu, chunk.len() - 1, pending)
-                    .map_err(|error| error.to_string())?;
-            } else {
-                for (index, &token) in chunk.iter().enumerate() {
-                    if abort() {
-                        target.reset_recurrent(gpu)?;
-                        return Err("Qwen4 native MTP prefill aborted".to_string());
-                    }
-                    let position = pos
-                        .checked_add(index)
-                        .ok_or_else(|| "Qwen4 native MTP prefill position overflow".to_string())?;
-                    let bundle = Self::bundle(target)?;
-                    bundle
-                        .copy_spec_hidden_row_to(gpu, index, pending)
-                        .map_err(|error| error.to_string())?;
-                    bundle
-                        .mtp_append_token(gpu, token, Some(pending), position)
-                        .map_err(|error| error.to_string())?;
-                }
-            }
+            let pick = mtp_prefill_chunk(
+                Self::bundle(target)?,
+                gpu,
+                chunk,
+                pos,
+                needs_pick,
+                pending,
+                batched_scratch.as_deref_mut(),
+                reuse_trunk_ids,
+                abort,
+            )?;
             // Target and head both hold the exact state at `end` only now: a
             // due snapshot boundary is reported here, after the forward and the
             // head append of this chunk.
@@ -3070,8 +3386,6 @@ impl MtpDrafter for Qwen4MtpDrafter {
                     acceptance.committed
                 );
             }
-            let target_accept_len = target_commit_accept_len(&acceptance);
-            let full_accept = target_accept_len == k;
             let target_scratch = scratch
                 .as_any_mut()
                 .downcast_mut::<Qwen4SpecScratch>()
@@ -3079,110 +3393,36 @@ impl MtpDrafter for Qwen4MtpDrafter {
             let target_snapshot = target_scratch
                 .target_snapshot
                 .ok_or("Qwen4 native MTP target snapshot disappeared")?;
-
-            // Keep both pre-window tickets active until every replay and hidden
-            // copy succeeds. A retained restore lets the outer rollback repair
-            // both owners if either side's GPU work fails.
-            if !full_accept && picks.state.row_capture_rows() >= block.len() {
-                timers.mark(gpu, "target_rollback");
-                picks
-                    .rollback_verify_rows_retain(
-                        gpu,
-                        target_snapshot,
-                        target_accept_len + 1,
-                        &block,
-                    )
-                    .map_err(|error| error.to_string())?;
-            } else if !full_accept {
-                timers.mark(gpu, "target_replay");
-                picks
-                    .restore_retain(gpu, target_snapshot)
-                    .map_err(|error| error.to_string())?;
-                picks
-                    .spec_forward_rows(gpu, &block[..target_accept_len + 1], true)
-                    .map(|_| ())
-                    .map_err(|error| error.to_string())?;
-            }
-            timers.mark(gpu, "mtp_commit");
             let mtp_ticket = snapshot
                 .as_ref()
                 .copied()
                 .expect("MTP snapshot remains active until transaction commit");
-            if full_accept && steps > k {
-                // The step that drafted the dropped token already consumed
-                // the last kept draft at its position.
-            } else if full_accept && k > 0 {
-                let last_draft = *drafts
-                    .last()
-                    .ok_or_else(|| "Qwen4 native MTP full accept has no final draft".to_string())?;
-                let last_position = position
-                    .checked_add(k)
-                    .ok_or_else(|| "Qwen4 MTP step position overflow".to_string())?;
-                picks
-                    .mtp_append_token(gpu, last_draft, None, last_position)
-                    .map_err(|error| error.to_string())?;
-            } else if target_accept_len < drafts.len() {
-                // The draft steps already consumed the kept prefix with the
-                // replay's exact inputs: keep them, drop the rejected tail.
-                picks
-                    .mtp_truncate_retain(mtp_ticket, target_accept_len + 1)
-                    .map_err(|error| error.to_string())?;
-            } else {
-                picks
-                    .mtp_restore_retain(gpu, mtp_ticket)
-                    .map_err(|error| error.to_string())?;
-                // Snapshot restore brings back the pre-window QSA selection;
-                // replay must reselect on its first row.
-                for (index, &token) in block[..target_accept_len + 1].iter().enumerate() {
-                    let hidden = if index == 0 {
-                        Some(pending_hidden)
-                    } else {
-                        None
-                    };
-                    let token_position = position
-                        .checked_add(index)
-                        .ok_or_else(|| "Qwen4 MTP step position overflow".to_string())?;
-                    let result = if index == target_accept_len {
-                        picks.mtp_append_token(gpu, token, hidden, token_position)
-                    } else {
-                        picks.mtp_advance_token(gpu, token, hidden, token_position, index == 0)
-                    };
-                    result.map_err(|error| error.to_string())?;
-                }
-            }
-            timers.mark(gpu, "commit");
-            let committed_end = position
-                .checked_add(target_accept_len + 1)
-                .ok_or_else(|| "Qwen4 MTP commit position overflow".to_string())?;
-            if picks.state.position != committed_end
-                || picks.mtp_position().map_err(|error| error.to_string())? != committed_end
-            {
-                return Err(format!(
-                    "Qwen4 native MTP transaction ended at target={} mtp={}, expected {committed_end}",
-                    picks.state.position,
-                    picks.mtp_position().map_err(|error| error.to_string())?
-                ));
-            }
-            picks
-                .copy_spec_hidden_row_to(gpu, target_accept_len, pending_hidden)
-                .map_err(|error| error.to_string())?;
-
-            let window = MtpWindow {
-                committed: acceptance.committed,
-                accepted: acceptance.accepted,
-                drafts_generated: drafts.len(),
+            // The whole captured hidden and the verify's PLE rows from row 0.
+            let verify_hidden = {
+                let hidden = picks.spec_hidden.as_ref().ok_or_else(|| {
+                    "Qwen4 native MTP spec hidden is not allocated".to_string()
+                })?;
+                hidden.sub_offset(0, hidden.numel())
             };
-            // All fallible GPU operations are complete. Validate both tickets
-            // before invalidating either arena, then perform the no-copy commit
-            // boundary and clear the target scratch ticket.
-            picks
-                .validate_commit(target_snapshot)
+            let ple_normed = picks
+                .lane_ple_normed_rows(0, block.len())
                 .map_err(|error| error.to_string())?;
-            picks
-                .mtp_validate_commit(mtp_ticket)
-                .map_err(|error| error.to_string())?;
-            picks.commit_validated(target_snapshot);
-            picks.mtp_commit_validated(mtp_ticket);
+            let window = finish_native_window(
+                picks,
+                gpu,
+                NativeFinish {
+                    position,
+                    block: &block,
+                    steps,
+                    acceptance,
+                    target_snapshot,
+                    mtp_ticket,
+                    pending_hidden,
+                    verify_hidden: &verify_hidden,
+                    ple_normed: &ple_normed,
+                },
+                Some(&mut timers),
+            )?;
             target_scratch.target_snapshot = None;
             snapshot = None;
             Ok(NativeOutcome::Window(window))
@@ -3411,7 +3651,7 @@ pub fn qwen4_ngram_mod_config(
 
 /// `HIPFIRE_QWEN4_MTP_BATCHED_FILL`: the batched prompt-fill Append pass is on
 /// unless set to `0`; read at every `mtp_prefill`.
-fn mtp_batched_fill_enabled() -> bool {
+pub(crate) fn mtp_batched_fill_enabled() -> bool {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_MTP_BATCHED_FILL", true)
 }
 
@@ -3420,7 +3660,7 @@ fn mtp_batched_fill_enabled() -> bool {
 /// (checked against the chunk's tokens), instead of uploading them again,
 /// only when set to `1` (default off: the warm path was not output-identical);
 /// read at every `mtp_prefill`.
-fn mtp_reuse_prefill_ids_enabled() -> bool {
+pub(crate) fn mtp_reuse_prefill_ids_enabled() -> bool {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_MTP_REUSE_PREFILL_IDS", false)
 }
 
@@ -3431,10 +3671,18 @@ fn prefill_trunk_ids_row(reuse: bool, off: usize) -> Option<usize> {
     reuse.then_some(off)
 }
 
+/// Whether a prompt-fill chunk of `chunk_rows` rows uploads its token ids once
+/// into the `capacity`-row prompt id buffer for its sub-chunks to embed from:
+/// not with the trunk-id reuse lever on (it supplies its own ids), not for a
+/// lone row (the per-row Append uploads its own), and not past the buffer.
+fn prefill_uploads_chunk_ids(reuse: bool, chunk_rows: usize, capacity: usize) -> bool {
+    !reuse && (2..=capacity).contains(&chunk_rows)
+}
+
 /// `HIPFIRE_QWEN4_MTP_SKIP_INTERMEDIATE_PICK`: a non-final `mtp_prefill` chunk
 /// skips the LM head, argmax and readback unless set to `0`; read at every
 /// `mtp_prefill`.
-fn mtp_skip_intermediate_pick_enabled() -> bool {
+pub(crate) fn mtp_skip_intermediate_pick_enabled() -> bool {
     hipfire_config::developer_bool("HIPFIRE_QWEN4_MTP_SKIP_INTERMEDIATE_PICK", true)
 }
 
@@ -3444,7 +3692,11 @@ fn mtp_skip_intermediate_pick_enabled() -> bool {
 /// chunk's pick is read (the seed, and the last row's logits for a sampled
 /// draw), so with the skip on every chunk ending before the prompt end is
 /// silent; the skip off keeps the pick on every chunk.
-fn mtp_prefill_chunk_needs_pick(end: usize, prompt_len: usize, skip_intermediate: bool) -> bool {
+pub(crate) fn mtp_prefill_chunk_needs_pick(
+    end: usize,
+    prompt_len: usize,
+    skip_intermediate: bool,
+) -> bool {
     !skip_intermediate || end == prompt_len
 }
 /// Whether this GPU's GDN route captures verify rows: row capture rides the
@@ -3483,20 +3735,49 @@ pub fn native_mtp_device_bytes(
     row_capture: Option<crate::GdnStateFormat>,
     batched_fill: bool,
 ) -> Option<u64> {
+    let request = native_mtp_request_bytes(
+        config,
+        context.max_seq,
+        chunk_rows,
+        max_k,
+        row_capture,
+        batched_fill,
+    )?;
+    let (resident, scratch) =
+        crate::mtp_gpu::Qwen4MtpGpu::device_bytes(config, context, head_dtype)?;
+    u64::try_from(resident).ok()?.checked_add(u64::try_from(scratch).ok()?.max(request))
+}
+
+/// Device bytes the first speculative request of a native MTP load of
+/// `max_seq` tokens allocates once and keeps (after the head attached): the
+/// verify hidden rows (`max_k + 1` rows or one `chunk_rows` forward chunk,
+/// whichever is larger), the pending and row hidden carries, with
+/// `row_capture` the `max_k + 1`-row GDN capture in that format, and with
+/// `batched_fill` the batched prompt-fill scratch and one chunk of prompt ids.
+pub fn native_mtp_request_bytes(
+    config: &crate::Qwen4Config,
+    max_seq: usize,
+    chunk_rows: usize,
+    max_k: usize,
+    row_capture: Option<crate::GdnStateFormat>,
+    batched_fill: bool,
+) -> Option<u64> {
     let rows = max_k.clamp(1, 10) + 1;
     let hidden_row = config
         .hc_count
         .checked_mul(config.hidden_size)?
         .checked_mul(std::mem::size_of::<f32>())?;
-    let verify_rows = rows.max(context.max_seq.min(chunk_rows));
+    let verify_rows = rows.max(max_seq.min(chunk_rows));
     let capture = match row_capture {
         Some(gdn) => crate::state::Qwen4State::row_capture_bytes(config, gdn, rows)?,
         None => 0,
     };
-    let (resident, scratch) =
-        crate::mtp_gpu::Qwen4MtpGpu::device_bytes(config, context, head_dtype)?;
     let fill = if batched_fill {
-        MtpAppendScratch::device_bytes(config, MTP_FILL_ROWS.min(chunk_rows).max(1))?
+        MtpAppendScratch::device_bytes(
+            config,
+            MTP_FILL_ROWS.min(chunk_rows).max(1),
+            chunk_rows.max(1),
+        )?
     } else {
         0
     };
@@ -3505,7 +3786,7 @@ pub fn native_mtp_device_bytes(
         .checked_mul(hidden_row)?
         .checked_add(capture)?
         .checked_add(fill)?;
-    u64::try_from(resident.checked_add(scratch.max(request))?).ok()
+    u64::try_from(request).ok()
 }
 
 #[cfg(any(test, feature = "reference-parity"))]
@@ -3602,6 +3883,20 @@ mod tests {
         assert_eq!(prefill_trunk_ids_row(true, 1024), Some(1024));
         assert_eq!(prefill_trunk_ids_row(false, 0), None);
         assert_eq!(prefill_trunk_ids_row(false, 1024), None);
+    }
+
+    #[test]
+    fn prefill_head_append_uploads_the_chunk_ids_once_unless_reuse_or_oversized() {
+        // A chunk of two rows or more has a multirow sub-chunk to feed.
+        assert!(prefill_uploads_chunk_ids(false, 8192, 8192));
+        assert!(prefill_uploads_chunk_ids(false, 1025, 8192));
+        assert!(prefill_uploads_chunk_ids(false, 2, 8192));
+        // A lone row is the per-row Append, which never reads the upload.
+        assert!(!prefill_uploads_chunk_ids(false, 1, 8192));
+        // The reuse lever keeps its own ids.
+        assert!(!prefill_uploads_chunk_ids(true, 8192, 8192));
+        // A chunk past the buffer's capacity keeps the per-sub-chunk upload.
+        assert!(!prefill_uploads_chunk_ids(false, 8193, 8192));
     }
 
     #[test]

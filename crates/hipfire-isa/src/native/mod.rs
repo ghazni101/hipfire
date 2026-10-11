@@ -176,6 +176,42 @@ pub fn assemble(source: &str, arch: Arch) -> Result<Vec<u8>, String> {
     elf::link(arch, &linked, &metadata)
 }
 
+/// One kernel whose code is already encoded: the typed encoder's words (not text) plus
+/// the `.amdhsa_*` directive set of its descriptor. `.amdhsa_inst_pref_size` is derived
+/// from the code extent here, exactly as `assemble` derives it, and must not be listed.
+pub struct EncodedKernel<'a> {
+    pub symbol: &'a str,
+    pub words: &'a [u32],
+    /// `(".amdhsa_<field>", value)`, each field once.
+    pub directives: &'a [(String, String)],
+}
+
+/// Link already-encoded kernels and their `.amdgpu_metadata` YAML body (the lines between
+/// `---` and `...`) into the same v6 code object `assemble` lays out. This is the descriptor,
+/// metadata and ELF writer `assemble` uses, minus the text front end: no instruction is
+/// parsed or re-encoded here.
+pub fn link_encoded(kernels: &[EncodedKernel<'_>], metadata_yaml: &str, arch: Arch) -> Result<Vec<u8>, String> {
+    if kernels.is_empty() { return Err("no kernel to link".into()) }
+    let metadata = metadata::msgpack(metadata_yaml)?;
+    let mut linked = Vec::with_capacity(kernels.len());
+    for (index, kernel) in kernels.iter().enumerate() {
+        if kernels[..index].iter().any(|k| k.symbol == kernel.symbol) { return Err(format!("duplicate kernel {}", kernel.symbol)) }
+        if kernel.words.is_empty() { return Err(format!("{}: empty kernel", kernel.symbol)) }
+        let end = format!(".L{}_end", kernel.symbol);
+        let mask = if arch.gfx12() { 4080 } else { 1008 };
+        let inst_pref = format!("((instprefsize({end}-{})<<4)&{mask})>>4", kernel.symbol);
+        if kernel.directives.iter().any(|(name, _)| name == ".amdhsa_inst_pref_size") {
+            return Err(format!("{}: .amdhsa_inst_pref_size is derived from the code extent", kernel.symbol));
+        }
+        let mut directives: Vec<(&str, &str)> = kernel.directives.iter().map(|(n, v)| (n.as_str(), v.as_str())).collect();
+        directives.push((".amdhsa_inst_pref_size", inst_pref.as_str()));
+        let code_bytes = 4 * kernel.words.len() as u64;
+        let descriptor = descriptor::encode(arch, kernel.symbol, &directives, &end, code_bytes)?;
+        linked.push(elf::Kernel { symbol: kernel.symbol.to_owned(), code: kernel.words.iter().flat_map(|w| w.to_le_bytes()).collect(), descriptor });
+    }
+    elf::link(arch, &linked, &metadata)
+}
+
 /// Uncompressed `__CLANG_OFFLOAD_BUNDLE__` of an empty host entry and the
 /// HIP device code object, each entry at a 4096-byte boundary
 /// (`clang-offload-bundler -type=o -bundle-align=4096`).

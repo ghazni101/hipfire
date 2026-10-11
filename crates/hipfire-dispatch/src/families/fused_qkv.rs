@@ -47,6 +47,9 @@ fn is_fused_mq4v2_key(key: KernelKey) -> bool {
         KernelKey::FusedQkvMq4G256V2
             | KernelKey::FusedQkvzaMq4G256V2
             | KernelKey::FusedGateUpMq4G256V2
+            | KernelKey::FusedQkvMq4G256V2VerifyExact
+            | KernelKey::FusedQkvzaMq4G256V2VerifyExact
+            | KernelKey::FusedGateUpMq4G256V2VerifyExact
     )
 }
 
@@ -80,6 +83,9 @@ fn is_fused_v2_key(key: KernelKey) -> bool {
             | KernelKey::FusedGateUpMq3G256V2
             | KernelKey::FusedGateUpMq2G256V2
             | KernelKey::FusedGateUpMq4CG256
+            | KernelKey::FusedQkvMq4G256V2VerifyExact
+            | KernelKey::FusedQkvzaMq4G256V2VerifyExact
+            | KernelKey::FusedGateUpMq4G256V2VerifyExact
     )
 }
 
@@ -137,6 +143,9 @@ fn guard_fused_qkv_dtype_key(weights: &[&GpuTensor], key: KernelKey) -> Result<(
                     KernelKey::FusedQkvMq4G256V2
                         | KernelKey::FusedQkvzaMq4G256V2
                         | KernelKey::FusedGateUpMq4G256V2
+                        | KernelKey::FusedQkvMq4G256V2VerifyExact
+                        | KernelKey::FusedQkvzaMq4G256V2VerifyExact
+                        | KernelKey::FusedGateUpMq4G256V2VerifyExact
                 ),
                 DType::MQ6G256V2 => matches!(
                     key,
@@ -328,6 +337,24 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                     hip!(gpu.fused_qkv_hfq4g256_mq4v2(wq, wk, wv, x, q, kout, v, mq, mk, mv, k))
                 }
             }
+        }
+        // Explicit exact verify QKV (1..=128 rows, singleton F16-WMMA chain).
+        // Batched-only: never falls back to a product kernel.
+        KernelKey::FusedQkvMq4G256V2VerifyExact => {
+            let [wq, wk, wv] = <[&GpuTensor; 3]>::try_from(params.weights)
+                .map_err(|_| err_wrong_arity(params.kind, 3))?;
+            let [q, kout, v] = <[&GpuTensor; 3]>::try_from(params.outputs)
+                .map_err(|_| err_wrong_arity(params.kind, 3))?;
+            let [mq, mk, mv] =
+                <[usize; 3]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 3))?;
+            let n = params
+                .batch_size
+                .ok_or(DispatchError::MissingImpl { key: params.kind })?;
+            // Calibration taps: one per constituent weight, shared input x.
+            gpu.maybe_capture_activation(wq, x, n, k);
+            gpu.maybe_capture_activation(wk, x, n, k);
+            gpu.maybe_capture_activation(wv, x, n, k);
+            hip!(gpu.gemm_qkv_mq4g256v2_verify_exact(wq, wk, wv, x, q, kout, v, mq, mk, mv, k, n))
         }
         KernelKey::FusedQkvMq6G256V2 => {
             let [wq, wk, wv] = <[&GpuTensor; 3]>::try_from(params.weights)
@@ -629,6 +656,27 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                     wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k
                 )),
             }
+        }
+        // Explicit exact verify QKVZA (1..=128 rows, singleton F16-WMMA chain).
+        // Batched-only: never falls back to a product kernel.
+        KernelKey::FusedQkvzaMq4G256V2VerifyExact => {
+            let [wqkv, wz, w_beta, w_alpha] = <[&GpuTensor; 4]>::try_from(params.weights)
+                .map_err(|_| err_wrong_arity(params.kind, 4))?;
+            let [qkv, z, beta, alpha] = <[&GpuTensor; 4]>::try_from(params.outputs)
+                .map_err(|_| err_wrong_arity(params.kind, 4))?;
+            let [mqkv, mz, mbeta, malpha] =
+                <[usize; 4]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 4))?;
+            let n = params
+                .batch_size
+                .ok_or(DispatchError::MissingImpl { key: params.kind })?;
+            // Calibration taps: one per constituent weight, shared input x.
+            gpu.maybe_capture_activation(wqkv, x, n, k);
+            gpu.maybe_capture_activation(wz, x, n, k);
+            gpu.maybe_capture_activation(w_beta, x, n, k);
+            gpu.maybe_capture_activation(w_alpha, x, n, k);
+            hip!(gpu.gemm_qkvza_mq4g256v2_verify_exact(
+                wqkv, wz, w_beta, w_alpha, x, qkv, z, beta, alpha, mqkv, mz, mbeta, malpha, k, n
+            ))
         }
         KernelKey::FusedQkvzaMq5G256V2 => {
             let [wqkv, wz, wb, wa] = <[&GpuTensor; 4]>::try_from(params.weights)
@@ -981,6 +1029,23 @@ fn dispatch_fused_qkv(gpu: &mut Gpu, params: &FusedQkvParams) -> Result<(), Disp
                     hip!(gpu.fused_gate_up_hfq4g256_mq4v2(w_gate, w_up, x, gate, up, mg, mu, k))
                 }
             }
+        }
+        // Explicit exact verify gate+up (1..=128 rows, singleton F16-WMMA chain).
+        // Batched-only: never falls back to a product kernel.
+        KernelKey::FusedGateUpMq4G256V2VerifyExact => {
+            let [w_gate, w_up] = <[&GpuTensor; 2]>::try_from(params.weights)
+                .map_err(|_| err_wrong_arity(params.kind, 2))?;
+            let [gate, up] = <[&GpuTensor; 2]>::try_from(params.outputs)
+                .map_err(|_| err_wrong_arity(params.kind, 2))?;
+            let [mg, mu] =
+                <[usize; 2]>::try_from(params.m).map_err(|_| err_wrong_arity(params.kind, 2))?;
+            let n = params
+                .batch_size
+                .ok_or(DispatchError::MissingImpl { key: params.kind })?;
+            // Calibration taps: one per constituent weight, shared input x.
+            gpu.maybe_capture_activation(w_gate, x, n, k);
+            gpu.maybe_capture_activation(w_up, x, n, k);
+            hip!(gpu.gemm_gate_up_mq4g256v2_verify_exact(w_gate, w_up, x, gate, up, mg, mu, k, n))
         }
         KernelKey::FusedGateUpMq5G256V2 => {
             let [wg, wu] = <[&GpuTensor; 2]>::try_from(params.weights)

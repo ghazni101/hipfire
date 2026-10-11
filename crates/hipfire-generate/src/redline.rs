@@ -3736,10 +3736,13 @@ fn redline_qwen4_snapshot(
             qsa.selected_len,
         ));
     }
-    for (name, tensor) in [
-        ("ple.conv", &state.ple_conv),
-        ("ple.hyper_feedback", &state.hyper_feedback),
-    ] {
+    for (name, tensor) in state
+        .ple_conv
+        .as_ref()
+        .map(|tensor| ("ple.conv", tensor))
+        .into_iter()
+        .chain([("ple.hyper_feedback", &state.hyper_feedback)])
+    {
         let mut bytes = Vec::new();
         redline_append_buffer(gpu, &mut bytes, &tensor.buf)?;
         regions.push((name.to_string(), bytes));

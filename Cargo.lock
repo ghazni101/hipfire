@@ -1561,6 +1561,7 @@ name = "hipfire-cpu"
 version = "0.4.2"
 dependencies = [
  "half",
+ "proptest",
  "rayon",
 ]
 
@@ -1579,6 +1580,7 @@ dependencies = [
  "hipfire-pflash",
  "hipfire-runtime",
  "libc",
+ "parking_lot",
  "rdna-compute",
  "saddle-core",
  "serde_json",
@@ -1823,6 +1825,7 @@ dependencies = [
  "memmap2",
  "minijinja",
  "minijinja-contrib",
+ "proptest",
  "rayon",
  "rdna-compute",
  "regex",

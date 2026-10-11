@@ -7,6 +7,7 @@
 //! scheduler.  It only computes checked physical row ids for a model-owned
 //! reader.
 
+use crate::config::Qwen4PleConfig;
 use serde_json::Value;
 use std::convert::TryFrom;
 
@@ -23,6 +24,10 @@ pub const PLE_VALID_ROWS: u64 = 320_001_446;
 pub const PLE_PADDED_ROWS: u64 = 320_001_536;
 /// Physical padding alignment used by the checkpoint.
 pub const PLE_PADDING_MULTIPLE: u64 = 128;
+/// Upper bound on stored head tables a generalized (developer-profile) layout
+/// may carry: `(ngram_size - 1) * heads_per_ngram` with at most 64 heads per
+/// n-gram order.
+pub const PLE_MAX_HEAD_COUNT: usize = 128;
 
 /// The exact signed-int64 hash multipliers stored by the checkpoint.
 ///
@@ -95,6 +100,8 @@ pub enum PleMetadataError {
     FieldMissing(&'static str),
     FieldWrongType(&'static str),
     NumberOutOfRange(&'static str),
+    /// Hash metadata disagrees with the typed PLE geometry it must serve.
+    GeometryMismatch(String),
 }
 
 impl std::fmt::Display for PleMetadataError {
@@ -103,7 +110,12 @@ impl std::fmt::Display for PleMetadataError {
             Self::WrongMultiplierCount { got } => {
                 write!(f, "PLE metadata requires 3 multipliers, got {got}")
             }
-            Self::WrongHeadCount { got } => write!(f, "PLE metadata requires 16 heads, got {got}"),
+            Self::WrongHeadCount { got } => {
+                write!(f, "PLE metadata head count {got} is not a supported layout")
+            }
+            Self::GeometryMismatch(reason) => {
+                write!(f, "PLE metadata disagrees with the typed geometry: {reason}")
+            }
             Self::EmptyHead { head } => write!(f, "PLE head {head} has zero valid rows"),
             Self::HeadSizeTooLarge { head, size } => {
                 write!(
@@ -146,10 +158,11 @@ impl std::error::Error for PleMetadataError {}
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PleHashMetadata {
     multipliers: [i64; PLE_MULTIPLIER_COUNT],
-    head_vocab_sizes: [u64; PLE_HEAD_COUNT],
-    head_offsets: [u64; PLE_HEAD_COUNT],
+    head_vocab_sizes: Vec<u64>,
+    head_offsets: Vec<u64>,
     valid_rows: u64,
     padded_rows: u64,
+    padding_multiple: u64,
 }
 
 impl PleHashMetadata {
@@ -209,14 +222,43 @@ impl PleHashMetadata {
         padded_rows: u64,
         padding_multiple: u64,
     ) -> Result<Self, PleMetadataError> {
+        Self::from_parts(
+            multipliers,
+            &head_vocab_sizes,
+            &head_offsets,
+            padded_rows,
+            padding_multiple,
+        )
+    }
+
+    /// General constructor for an explicit head count (even, `2..=`
+    /// [`PLE_MAX_HEAD_COUNT`]: the first half are bigram heads, the second half
+    /// trigram heads) and padding alignment.  Every invariant of the canonical
+    /// constructor is enforced; nothing is inferred from the Qwen4 constants.
+    pub fn from_parts(
+        multipliers: [i64; PLE_MULTIPLIER_COUNT],
+        head_vocab_sizes: &[u64],
+        head_offsets: &[u64],
+        padded_rows: u64,
+        padding_multiple: u64,
+    ) -> Result<Self, PleMetadataError> {
         if padding_multiple == 0 {
             return Err(PleMetadataError::PaddedRowsMisaligned {
                 padded: padded_rows,
                 multiple: padding_multiple,
             });
         }
+        let head_count = head_vocab_sizes.len();
+        if head_count < 2 || head_count % 2 != 0 || head_count > PLE_MAX_HEAD_COUNT {
+            return Err(PleMetadataError::WrongHeadCount { got: head_count });
+        }
+        if head_offsets.len() != head_count {
+            return Err(PleMetadataError::WrongHeadCount {
+                got: head_offsets.len(),
+            });
+        }
         let mut valid_rows = 0u64;
-        for head in 0..PLE_HEAD_COUNT {
+        for head in 0..head_count {
             let size = head_vocab_sizes[head];
             if size == 0 {
                 return Err(PleMetadataError::EmptyHead { head });
@@ -262,10 +304,11 @@ impl PleHashMetadata {
         }
         Ok(Self {
             multipliers,
-            head_vocab_sizes,
-            head_offsets,
+            head_vocab_sizes: head_vocab_sizes.to_vec(),
+            head_offsets: head_offsets.to_vec(),
             valid_rows,
             padded_rows,
+            padding_multiple,
         })
     }
 
@@ -281,6 +324,27 @@ impl PleHashMetadata {
         .expect("pinned Qwen4 PLE metadata must satisfy its invariants")
     }
 
+    /// Identity of the row layout: SHA-256 over the little-endian bytes of
+    /// `padded_rows` (u64), each multiplier (i64), each head vocabulary size
+    /// (u64), and each head offset (u64), in that order.  Sidecar files that
+    /// are indexed by global row id (the PLE hot-row rank) record this value so
+    /// a rank built for one hash layout is never applied to another.
+    pub fn fingerprint(&self) -> [u8; 32] {
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(self.padded_rows.to_le_bytes());
+        for multiplier in self.multipliers {
+            hasher.update(multiplier.to_le_bytes());
+        }
+        for size in &self.head_vocab_sizes {
+            hasher.update(size.to_le_bytes());
+        }
+        for offset in &self.head_offsets {
+            hasher.update(offset.to_le_bytes());
+        }
+        hasher.finalize().into()
+    }
+
     /// Parse the canonical version-1 `qwen4_ple` object without converting
     /// typed integer arrays through floating point.
     ///
@@ -288,6 +352,56 @@ impl PleHashMetadata {
     /// fields are the complete object schema.  Source tensor names and shapes
     /// remain typed I64/index records; they are not duplicated here.
     pub fn from_json_value(value: &Value) -> Result<Self, PleMetadataError> {
+        let fields = Self::parse_object(value)?;
+        Self::from_slices(
+            &fields.multipliers,
+            &fields.head_vocab_sizes,
+            &fields.head_offsets,
+            fields.padded_rows,
+        )
+    }
+
+    /// Parse the same version-1 `qwen4_ple` object for an explicit typed
+    /// profile: the head count and padding alignment come from `config`, and
+    /// the result must agree with the config's row geometry
+    /// ([`Qwen4PleConfig::check_hash_metadata`]).  For the Flash-Next config
+    /// this is equivalent to [`Self::from_json_value`] plus the pinned check.
+    pub fn from_json_value_for(
+        value: &Value,
+        config: &Qwen4PleConfig,
+    ) -> Result<Self, PleMetadataError> {
+        let fields = Self::parse_object(value)?;
+        if fields.multipliers.len() != PLE_MULTIPLIER_COUNT {
+            return Err(PleMetadataError::WrongMultiplierCount {
+                got: fields.multipliers.len(),
+            });
+        }
+        let multipliers = [
+            fields.multipliers[0],
+            fields.multipliers[1],
+            fields.multipliers[2],
+        ];
+        let metadata = Self::from_parts(
+            multipliers,
+            &fields.head_vocab_sizes,
+            &fields.head_offsets,
+            fields.padded_rows,
+            config.padding_multiple as u64,
+        )?;
+        config
+            .check_hash_metadata(&metadata)
+            .map_err(PleMetadataError::GeometryMismatch)?;
+        Ok(metadata)
+    }
+
+    /// [`Self::from_json_value_for`] from JSON text.
+    pub fn from_json_for(json: &str, config: &Qwen4PleConfig) -> Result<Self, String> {
+        let value: Value = serde_json::from_str(json)
+            .map_err(|error| format!("qwen4 PLE metadata is not valid JSON: {error}"))?;
+        Self::from_json_value_for(&value, config).map_err(|error| error.to_string())
+    }
+
+    fn parse_object(value: &Value) -> Result<PleObjectFields, PleMetadataError> {
         const FIELDS: [&str; 5] = [
             "version",
             "multipliers",
@@ -318,13 +432,13 @@ impl PleHashMetadata {
                 .ok_or(PleMetadataError::FieldMissing("multipliers"))?,
             "multipliers",
         )?;
-        let sizes = parse_u64_array(
+        let head_vocab_sizes = parse_u64_array(
             object
                 .get("head_vocab_sizes")
                 .ok_or(PleMetadataError::FieldMissing("head_vocab_sizes"))?,
             "head_vocab_sizes",
         )?;
-        let offsets = parse_u64_array(
+        let head_offsets = parse_u64_array(
             object
                 .get("head_offsets")
                 .ok_or(PleMetadataError::FieldMissing("head_offsets"))?,
@@ -336,7 +450,12 @@ impl PleHashMetadata {
                 .ok_or(PleMetadataError::FieldMissing("padded_rows"))?,
             "padded_rows",
         )?;
-        Self::from_slices(&multipliers, &sizes, &offsets, padded_rows)
+        Ok(PleObjectFields {
+            multipliers,
+            head_vocab_sizes,
+            head_offsets,
+            padded_rows,
+        })
     }
 
     /// Parse a JSON metadata envelope containing the canonical `qwen4_ple`
@@ -351,12 +470,24 @@ impl PleHashMetadata {
         &self.multipliers
     }
 
-    pub fn head_vocab_sizes(&self) -> &[u64; PLE_HEAD_COUNT] {
+    /// Valid row count of each stored head table (length [`Self::head_count`]).
+    pub fn head_vocab_sizes(&self) -> &[u64] {
         &self.head_vocab_sizes
     }
 
-    pub fn head_offsets(&self) -> &[u64; PLE_HEAD_COUNT] {
+    /// Prefix-sum offset of each stored head table.
+    pub fn head_offsets(&self) -> &[u64] {
         &self.head_offsets
+    }
+
+    /// Number of stored head tables: half bigram heads, half trigram heads.
+    pub fn head_count(&self) -> usize {
+        self.head_vocab_sizes.len()
+    }
+
+    /// Physical padding alignment of [`Self::padded_rows`].
+    pub const fn padding_multiple(&self) -> u64 {
+        self.padding_multiple
     }
 
     pub const fn valid_rows(&self) -> u64 {
@@ -388,7 +519,7 @@ impl PleHashMetadata {
     /// Hash one n-gram's already normalized token inputs into one head table.
     /// Multiplication is explicitly wrapping signed-i64 arithmetic.
     pub fn hash_one(&self, tokens: &[u32], head: usize) -> Result<u64, PleMetadataError> {
-        let ngram_len = if head < PLE_HEAD_COUNT / 2 { 2 } else { 3 };
+        let ngram_len = if head < self.head_count() / 2 { 2 } else { 3 };
         if tokens.len() != ngram_len {
             return Err(PleMetadataError::FieldWrongType("ngram token count"));
         }
@@ -403,13 +534,37 @@ impl PleHashMetadata {
     /// Hash one current token using the supplied two-token history and EOS
     /// boundary.  The returned order is eight bigram ids followed by eight
     /// trigram ids, matching the concatenated PLE row.
+    ///
+    /// This is the canonical 16-head form; it panics for any other head
+    /// count.  Generalized layouts use [`Self::hash_token_heads`].
     pub fn hash_token(
         &self,
         previous: [u32; 2],
         token: u32,
         eos_token_id: u32,
     ) -> [u64; PLE_HEAD_COUNT] {
+        assert_eq!(
+            self.head_count(),
+            PLE_HEAD_COUNT,
+            "hash_token requires the canonical 16-head layout; use hash_token_heads"
+        );
         let mut output = [0u64; PLE_HEAD_COUNT];
+        self.hash_token_heads(previous, token, eos_token_id, &mut output);
+        output
+    }
+
+    /// Head-count-generic form of [`Self::hash_token`]: writes
+    /// `head_count()` ids (first-half bigram heads, then trigram heads) into
+    /// `output`, which must have exactly that length.
+    pub fn hash_token_heads(
+        &self,
+        previous: [u32; 2],
+        token: u32,
+        eos_token_id: u32,
+        output: &mut [u64],
+    ) {
+        let head_count = self.head_count();
+        assert_eq!(output.len(), head_count, "PLE output slot count");
         // The source implementation's shifted context is equivalent to using
         // the trailing non-EOS segment of the two-token history.  A shift that
         // crosses EOS is replaced with EOS, never with an older token.
@@ -421,8 +576,8 @@ impl PleHashMetadata {
             2
         };
         let context = [previous[0], previous[1], token];
-        for head in 0..PLE_HEAD_COUNT {
-            let ngram_len = if head < PLE_HEAD_COUNT / 2 { 2 } else { 3 };
+        for head in 0..head_count {
+            let ngram_len = if head < head_count / 2 { 2 } else { 3 };
             let mut mixed = (context[2] as i64).wrapping_mul(self.multipliers[0]);
             for shift in 1..ngram_len {
                 let source_index = 2 - shift;
@@ -437,8 +592,14 @@ impl PleHashMetadata {
             let remainder = mixed.rem_euclid(modulus) as u64;
             output[head] = self.head_offsets[head] + remainder;
         }
-        output
     }
+}
+
+struct PleObjectFields {
+    multipliers: Vec<i64>,
+    head_vocab_sizes: Vec<u64>,
+    head_offsets: Vec<u64>,
+    padded_rows: u64,
 }
 
 fn parse_u64_number(value: &Value, field: &'static str) -> Result<u64, PleMetadataError> {
@@ -535,11 +696,14 @@ impl PleHistory {
     /// history without advancing it: callers commit history only after the
     /// surrounding request commits.
     pub fn row_ids(self, metadata: &PleHashMetadata, tokens: &[u32]) -> Vec<u64> {
+        let heads = metadata.head_count();
         let mut history = self;
-        tokens
-            .iter()
-            .flat_map(|&token| history.hash_token(metadata, token))
-            .collect()
+        let mut ids = vec![0u64; tokens.len() * heads];
+        for (slot, &token) in ids.chunks_exact_mut(heads).zip(tokens) {
+            metadata.hash_token_heads(history.previous, token, history.eos_token_id, slot);
+            history.push(token);
+        }
+        ids
     }
 }
 pub type PleRowId = u64;
@@ -562,6 +726,36 @@ mod tests {
                 "padded_rows": 2048
             }
         })
+    }
+
+    #[test]
+    fn fingerprint_is_stable_and_layout_sensitive() {
+        use sha2::{Digest, Sha256};
+        let metadata = PleHashMetadata::qwen4();
+        let mut hasher = Sha256::new();
+        hasher.update(PLE_PADDED_ROWS.to_le_bytes());
+        for multiplier in PLE_MULTIPLIERS {
+            hasher.update(multiplier.to_le_bytes());
+        }
+        for size in PLE_HEAD_VOCAB_SIZES {
+            hasher.update(size.to_le_bytes());
+        }
+        for offset in PLE_HEAD_OFFSETS {
+            hasher.update(offset.to_le_bytes());
+        }
+        let expected: [u8; 32] = hasher.finalize().into();
+        assert_eq!(metadata.fingerprint(), expected);
+        assert_eq!(metadata.fingerprint(), PleHashMetadata::qwen4().fingerprint());
+        let mut multipliers = PLE_MULTIPLIERS;
+        multipliers[2] += 1;
+        let other = PleHashMetadata::from_stored(
+            multipliers,
+            PLE_HEAD_VOCAB_SIZES,
+            PLE_HEAD_OFFSETS,
+            PLE_PADDED_ROWS,
+        )
+        .unwrap();
+        assert_ne!(metadata.fingerprint(), other.fingerprint());
     }
 
     #[test]
@@ -748,5 +942,156 @@ mod tests {
                 multiple: 128
             })
         ));
+    }
+
+    fn tiny_config() -> Qwen4PleConfig {
+        // embed 16, one head per n-gram order, base 7, padding 8, one shard.
+        Qwen4PleConfig::new(&[1], 16, 2, 1, 1, 3, 7, 8, None).unwrap()
+    }
+
+    fn tiny_value() -> Value {
+        json!({"qwen4_ple": {
+            "version": 1,
+            "multipliers": [3, 5, 7],
+            "head_vocab_sizes": [7, 11],
+            "head_offsets": [0, 7],
+            "padded_rows": 24
+        }})
+    }
+
+    #[test]
+    fn generalized_layout_accepts_two_heads_padding_eight() {
+        let config = tiny_config();
+        let metadata = PleHashMetadata::from_json_value_for(&tiny_value(), &config).unwrap();
+        assert_eq!(metadata.head_count(), 2);
+        assert_eq!(metadata.padding_multiple(), 8);
+        assert_eq!((metadata.valid_rows(), metadata.padded_rows()), (18, 24));
+        assert_eq!(metadata.head_vocab_sizes(), &[7, 11]);
+        assert_eq!(metadata.head_offsets(), &[0, 7]);
+        assert_eq!(
+            PleHashMetadata::from_json_for(&tiny_value().to_string(), &config).unwrap(),
+            metadata
+        );
+        // The canonical 16-head/128 parser refuses the same object.
+        assert!(PleHashMetadata::from_json_value(&tiny_value()).is_err());
+        // Distinct layouts have distinct fingerprints.
+        assert_ne!(metadata.fingerprint(), PleHashMetadata::qwen4().fingerprint());
+    }
+
+    #[test]
+    fn generalized_layout_rejects_geometry_mismatch() {
+        let config = tiny_config();
+        let mut wrong_heads = tiny_value();
+        wrong_heads["qwen4_ple"]["head_vocab_sizes"] = json!([7, 11, 13, 17]);
+        wrong_heads["qwen4_ple"]["head_offsets"] = json!([0, 7, 18, 31]);
+        wrong_heads["qwen4_ple"]["padded_rows"] = json!(48);
+        assert!(matches!(
+            PleHashMetadata::from_json_value_for(&wrong_heads, &config),
+            Err(PleMetadataError::GeometryMismatch(_))
+        ));
+        let mut wrong_primes = tiny_value();
+        wrong_primes["qwen4_ple"]["head_vocab_sizes"] = json!([8, 10]);
+        wrong_primes["qwen4_ple"]["head_offsets"] = json!([0, 8]);
+        assert!(matches!(
+            PleHashMetadata::from_json_value_for(&wrong_primes, &config),
+            Err(PleMetadataError::GeometryMismatch(_))
+        ));
+        // Odd head counts, empty heads, and a bad multiplier count fail
+        // before any geometry comparison.
+        let mut odd = tiny_value();
+        odd["qwen4_ple"]["head_vocab_sizes"] = json!([7, 11, 13]);
+        odd["qwen4_ple"]["head_offsets"] = json!([0, 7, 18]);
+        assert!(matches!(
+            PleHashMetadata::from_json_value_for(&odd, &config),
+            Err(PleMetadataError::WrongHeadCount { got: 3 })
+        ));
+        let mut empty = tiny_value();
+        empty["qwen4_ple"]["head_vocab_sizes"] = json!([]);
+        empty["qwen4_ple"]["head_offsets"] = json!([]);
+        assert!(matches!(
+            PleHashMetadata::from_json_value_for(&empty, &config),
+            Err(PleMetadataError::WrongHeadCount { got: 0 })
+        ));
+        let mut multipliers = tiny_value();
+        multipliers["qwen4_ple"]["multipliers"] = json!([3, 5]);
+        assert!(matches!(
+            PleHashMetadata::from_json_value_for(&multipliers, &config),
+            Err(PleMetadataError::WrongMultiplierCount { got: 2 })
+        ));
+        let mut unaligned = tiny_value();
+        unaligned["qwen4_ple"]["padded_rows"] = json!(32);
+        assert!(matches!(
+            PleHashMetadata::from_json_value_for(&unaligned, &config),
+            Err(PleMetadataError::PaddedRowsMisaligned { .. })
+        ));
+        // Row-count overflow and over-limit head counts.
+        assert!(matches!(
+            PleHashMetadata::from_parts(
+                [1, 2, 3],
+                &[u64::MAX / 2 + 1, 1],
+                &[0, u64::MAX / 2 + 1],
+                0,
+                1
+            ),
+            Err(PleMetadataError::HeadSizeTooLarge { .. })
+        ));
+        let big = vec![(i64::MAX / 2) as u64; 4];
+        let offsets: Vec<u64> = (0..4).map(|head| head * (i64::MAX / 2) as u64).collect();
+        assert!(matches!(
+            PleHashMetadata::from_parts([1, 2, 3], &big, &offsets, u64::MAX, 1),
+            Err(PleMetadataError::RowCountOverflow | PleMetadataError::PaddedRowsMisaligned { .. })
+        ));
+        let too_many = vec![1u64; PLE_MAX_HEAD_COUNT + 2];
+        let offsets: Vec<u64> = (0..too_many.len() as u64).collect();
+        assert!(matches!(
+            PleHashMetadata::from_parts([1, 2, 3], &too_many, &offsets, 256, 1),
+            Err(PleMetadataError::WrongHeadCount { .. })
+        ));
+    }
+
+    #[test]
+    fn generalized_hash_token_heads_matches_manual_arithmetic() {
+        let metadata = PleHashMetadata::from_json_value_for(&tiny_value(), &tiny_config()).unwrap();
+        let eos = 3u32;
+        let mut out = [0u64; 2];
+        metadata.hash_token_heads([5, 9], 12, eos, &mut out);
+        // Bigram head 0: 12*m0 ^ 9*m1 mod 7; trigram head 1: 12*m0 ^ 9*m1 ^ 5*m2 mod 11.
+        let bigram = (12i64 * 3) ^ (9i64 * 5);
+        let trigram = bigram ^ (5i64 * 7);
+        assert_eq!(out[0], bigram.rem_euclid(7) as u64);
+        assert_eq!(out[1], 7 + trigram.rem_euclid(11) as u64);
+        // EOS truncates the context exactly as in the canonical form.
+        metadata.hash_token_heads([5, eos], 12, eos, &mut out);
+        let bigram = (12i64 * 3) ^ (eos as i64 * 5);
+        let trigram = bigram ^ (eos as i64 * 7);
+        assert_eq!(out[0], bigram.rem_euclid(7) as u64);
+        assert_eq!(out[1], 7 + trigram.rem_euclid(11) as u64);
+        // Every id addresses a valid row, token-major in `row_ids`.
+        let ids = PleHistory::new(eos).row_ids(&metadata, &[1, 2, 3, 4]);
+        assert_eq!(ids.len(), 8);
+        assert!(ids.iter().all(|&row| metadata.is_valid_row(row)));
+        assert!(ids.chunks(2).all(|pair| pair[0] < 7 && pair[1] >= 7));
+        // The canonical array form panics for a non-16-head layout.
+        assert!(std::panic::catch_unwind(|| {
+            let metadata =
+                PleHashMetadata::from_json_value_for(&tiny_value(), &tiny_config()).unwrap();
+            metadata.hash_token([1, 2], 3, 4)
+        })
+        .is_err());
+    }
+
+    #[test]
+    fn generalized_history_matches_canonical_for_sixteen_heads() {
+        let metadata = PleHashMetadata::qwen4();
+        let history = PleHistory::new(7);
+        let tokens = [11u32, 7, 13, 17, 19];
+        let expected: Vec<u64> = {
+            let mut history = history;
+            tokens
+                .iter()
+                .flat_map(|&token| history.hash_token(&metadata, token))
+                .collect()
+        };
+        assert_eq!(history.row_ids(&metadata, &tokens), expected);
     }
 }

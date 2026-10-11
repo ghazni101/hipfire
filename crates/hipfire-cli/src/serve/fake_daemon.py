@@ -75,6 +75,7 @@ def scenario_from(req):
         "t11-usage",
         "t11-long-nonstream",
         "t11-open-think-stop",
+        "t21-think-text",
     )
     for tag in tags:
         if tag in blob:
@@ -471,6 +472,20 @@ def handle_generate(req):
             "tokens": 3,
             "tok_s": 7.0,
         }, rid, aid)
+        return
+
+    if scenario == "t21-think-text":
+        # Reasoning span, then an answer span: the adapter block/item order.
+        for text in ("plan ", "it"):
+            emit_correlated({"type": "reasoning", "text": text}, rid, aid)
+        for text in ("answer ", "text"):
+            emit_correlated({"type": "token", "text": text}, rid, aid)
+        terminal = {"finish_reason": "stop", "prompt_tokens": 11, "tokens": 5,
+                    "cached_tokens": 2, "tok_s": 10.0}
+        emit_correlated(dict(terminal, type="commit_ready"), rid, aid)
+        if wait_commit(rid, aid) != "commit":
+            return
+        emit_correlated(dict(terminal, type="done"), rid, aid)
         return
 
     if scenario == "t11-dirty-markers":

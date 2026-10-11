@@ -540,7 +540,7 @@ one per forward) for `h2_gfx1201`. Without `--g0-program` none are allowed.
 ### railgun shadow diff (M1, G7 diagnostic)
 
 `HIPFIRE_RAILGUN_SHADOW=<corpus dir>` (a `railgun-jit-corpus` build,
-`<out>/v1/<host key>`) makes every recorded launch also feed railgun
+`<out>/v2/<host key>`) makes every recorded launch also feed railgun
 (`crates/rdna-compute/src/replay/railgun_shadow.rs`): the SHA-256 of the object
 the launch ran is looked up in the corpus, the receipt's A1/A3/A4 facts type
 its arguments, A1 pointer arguments are bound to their live allocations, and
@@ -573,9 +573,34 @@ planners. Other arches lower unpaced.
 - Artifact hashes match the corpus only when the runtime loads the corpus
   pack (install `pack/<arch>` as `kernels/compiled/<arch>`); locally
   JIT-compiled objects are loud `receipt_missing` nodes lowered `HipDirect`.
-  Redline reads Radiowave argument effects from `*.radiowave.json` sidecars,
-  which only the JIT path writes; without them it falls back to its name
-  tables.
+  On exact gfx1201 the five embedded PeaceMaker decode twins
+  (`kernel.pm_decode`, default on) load instead of their hipcc objects; the
+  corpus records their images too (`origin: pm_native`, `native/<arch>/`,
+  keyed by image digest), so they need no install step.
+  Redline reads Radiowave argument effects from `*.radiowave.json` sidecars
+  beside each object; without them it falls back to its name tables and keeps
+  boundaries (16 K→V `kv_cache_write_fp8_e4m3` waits on the 27B) that railgun's
+  facts drop, which G7 reports as `railgun_weaker`. The corpus pack ships one
+  sidecar per hipcc object (`KernelCompiler::certify_radiowave`, the
+  inspection the JIT attaches to its own cache entries), and railgun-cert
+  cross-checks each receipt against it.
+
+The corpus is bound to the tree and the toolchain: every registry source,
+recipe flag, cache ABI, twin image or `hipcc --version` change leaves nodes
+without a record, and railgun then refuses the tape. Rebuild it on the host
+that runs railgun, at the commit that built the daemon (CPU only):
+
+```bash
+cargo build --release -p railgun-jitcorpus
+HIP_VISIBLE_DEVICES=-1 target/release/railgun-jit-corpus build --out "$CORPUS" --arch gfx1201
+target/release/railgun-jit-corpus check --corpus "$CORPUS/v2/<host key>" --arch gfx1201   # exit 0 = every node covered
+cp -a "$CORPUS/v2/<host key>/pack/gfx1201" "$HOME/.hipfire/bin/kernels/compiled/gfx1201"
+```
+
+`build` prints the corpus directory. `check` names every node without a
+record and why: a changed key, or a railgun-cert rejection such as an
+instruction the PeaceMaker gfx12 ISA table (`crates/peacemaker-ir/isa/gfx12.tbl`)
+does not decode yet, which a new compiler can emit.
 
 ### railgun G4 probe, backend and check mode (M2)
 

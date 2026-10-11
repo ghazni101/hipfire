@@ -4249,9 +4249,62 @@ pub const QWEN4_MQ6_X4_PM_GFX1201: &[u8] = include_bytes!("../../../kernels/qwen
 /// (plain F32), `_{w4,w8}_bf16out`, `_w8_regions` and `_w8_hcw`; the runtime
 /// launches only `_w8`, `_w8_bf16out` and `_w8_regions`, from M >= 2560 and
 /// N >= 2048 (`HIPFIRE_QWEN4_MQ6_X4_PM=0` keeps hipcc).
-/// SHA-256 24aa35df635e08bb04df422bbb0faaa9dc491579d13619794fa9d77c122b7b01
+/// SHA-256 3af58382793bddf8ab25d9c8ec7ced94e8444a55cf2c47ad77b815ba91104500
 /// (`sha256sum kernels/qwen4_mq6_x4_pm_gfx1151.hxaco`).
 pub const QWEN4_MQ6_X4_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qwen4_mq6_x4_pm_gfx1151.hxaco");
+/// Certified builder module of the gfx1151 Flash-Next lane-step row kernels
+/// (`hipfire-isa emit --kernel qwen4_lane_rows --arch gfx1151`, M7
+/// obligation-free): four multi-column (1..=8 activation columns) GEMVs that
+/// keep every column byte-identical to the 1-row HIP incumbent while sharing
+/// the activation loads across weight rows: `gemv_mq6g256v2_xbatch_pm`,
+/// `gemv_mq6g256v2_x4_xbatch_pm`, `gemv_q8_0_k8_xbatch_pm` and
+/// `gemv_q8_0_k320_xbatch_pm` (`crate::lane_rows_pm`). Routed from the four
+/// incumbent rows launchers only inside the lane step (typed flag
+/// `fn_lane_pm_rows`, gfx1151 default on, `0` kills it).
+/// SHA-256 pin: [`QWEN4_LANE_ROWS_PM_GFX1151_SHA256`]
+/// (`sha256sum kernels/qwen4_lane_rows_pm_gfx1151.hxaco`).
+pub const QWEN4_LANE_ROWS_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qwen4_lane_rows_pm_gfx1151.hxaco");
+/// SHA-256 of [`QWEN4_LANE_ROWS_PM_GFX1151`], verified before the first load
+/// (`sha256sum kernels/qwen4_lane_rows_pm_gfx1151.hxaco`).
+pub const QWEN4_LANE_ROWS_PM_GFX1151_SHA256: &str = "31efa309145ce2cf7ed481bacfe5fb26b99db503cd4a71113d9c53162421b62a";
+/// Certified builder module of gfx1151's MQ4G256V2 trunk prefill GEMM (the builder
+/// `crates/hipfire-isa/src/kernels/qwen4_mq6_x4_gfx11.rs` over the MQ4G256V2 weight format):
+/// the exact twin of hipcc `gemm_mq4g256v2_residual_wmma_gfx11_bt4` on a zeroed
+/// output (F16 activations, one ascending-K WMMA chain), over 256-token tiles (grid
+/// `[ceil(M/(16*wr)), ceil(N/256), 1]`, block `32*wr`, static LDS 40960). Entries
+/// `qwen4_mq4_x4_pm_gfx1151_{w4,w8}` (plain F32), `_{w4,w8}_bf16out`, `_w8_regions` and
+/// `_w8_hcw`, with the kernarg ABIs of the MQ6 entries. The runtime launches them for
+/// N >= 96 (`w4` for M <= 64); `HIPFIRE_QWEN4_MQ4_X4_PM=0` keeps hipcc bt4 and the
+/// unfused HC write.
+/// SHA-256 8281105b382654e560297af5732caff8da1198706abbc2c1f2e3f145b569574c
+/// (`sha256sum kernels/qwen4_mq4_x4_pm_gfx1151.hxaco`).
+pub const QWEN4_MQ4_X4_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qwen4_mq4_x4_pm_gfx1151.hxaco");
+/// Certified builder modules of the few-row MQ4G256V2 projection kernel
+/// `gemv_mq4g256v2_rows_x4_pm_gfx{1151,1201}` (`hipfire-isa emit --kernel
+/// mq4_rows_x4 --arch gfx{1151,1201}`): MTP verify (2..=8 activation rows) of four
+/// MQ4G256V2 trunk projections per launch, each output bitwise the AR decode GEMV
+/// `gemv_mq4g256v2` (96-byte kernarg: A0..A3, x, y0..y3, M0..M3, K, B; grid
+/// `[sum(ceil(M_i/2)), 1, 1]`, block 32). Default on
+/// (`HIPFIRE_QWEN4_MQ4_ROWS_PM=0` runs the per-row `gemv_mq4g256v2` launches).
+/// SHA-256 bf9d23d10ca351835f1c5983f43889d5360ffa1d1866a0ca902d07e4d830184c
+/// (`sha256sum kernels/mq4_rows_x4_pm_gfx1151.hxaco`).
+pub const MQ4_ROWS_X4_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/mq4_rows_x4_pm_gfx1151.hxaco");
+/// The gfx1201 image of [`MQ4_ROWS_X4_PM_GFX1151`].
+/// SHA-256 eb9f5700257e353bee5105d28129f0df9dbfb73ecdf4a312b85b374c1a7433aa
+/// (`sha256sum kernels/mq4_rows_x4_pm_gfx1201.hxaco`).
+pub const MQ4_ROWS_X4_PM_GFX1201: &[u8] = include_bytes!("../../../kernels/mq4_rows_x4_pm_gfx1201.hxaco");
+/// Certified builder module of gfx1151's fused Flash-Next shared-expert gate/up
+/// (`hipfire-isa emit --kernel qwen4_shared_gu_gfx11 --epi all --arch gfx1151`, M7
+/// obligation-free): one launch of `qwen4_shared_gu_pm_gfx1151_{w8,w4}` replaces the
+/// gate and up `gemm_wmma_lds_128_128_32_64_k64_p` GEMMs, `shared_expert_activation_bf16_f32`
+/// and the shared down's F32 -> F16 hidden conversion, leaving the F16 hidden `[N, I]` and the
+/// post-sigmoid selector `[N]` byte for byte what that chain leaves (same ascending K16 WMMA
+/// chains, same BF16-recipe activation ops; grid `[ceil(I / (16 wr)), ceil(N / 128), 1]`,
+/// block `32 wr`). Default on for exact gfx1151 prefill (`HIPFIRE_QWEN4_SHARED_GU_PM=0` keeps
+/// the chain).
+/// SHA-256 9509a2cdda96981bfbaa85bdda228a589bf4c2c0fd61cdb9bce8ea55f727acb1
+/// (`sha256sum kernels/qwen4_shared_gu_pm_gfx1151.hxaco`).
+pub const QWEN4_SHARED_GU_PM_GFX1151: &[u8] = include_bytes!("../../../kernels/qwen4_shared_gu_pm_gfx1151.hxaco");
 /// Certified builder rows16 BF16 pooled-key score kernel for the live QSA
 /// selector pair, with the F32 score kernel's kernargs, grid and block.
 /// Selection uses [`QSA_SELECT_PM_GFX1151`]; default on, with
@@ -4372,6 +4425,12 @@ pub const GEMM_HFQ4G256_RESIDUAL_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_hfq4g256_residual_wmma.gfx12.hip");
 pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_SRC: &str =
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_wmma.gfx12.hip");
+/// gfx12 MQ4G256V2 OVERWRITE twin of GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_SRC
+/// (`Y = acc + 0.0f`, no pre-zero fill; byte-identical to memset + `Y += acc`).
+/// Symbol `gemm_mq4g256v2_overwrite_wmma_gfx12`. Used by the gfx1201 DFlash
+/// draft route (`dflash_draft_fusion.rs`).
+pub const GEMM_MQ4G256V2_OVERWRITE_WMMA_GFX12_SRC: &str =
+    include_str!("../../../kernels/src/gemm_mq4g256v2_overwrite_wmma.gfx12.hip");
 /// gfx11 (RDNA3 / RDNA3.5) MQ4V2 residual WMMA — sister of
 /// GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_SRC. Same dual-half header contract
 /// (136 B groups, [s0,z0,s1,z1] fp16 headers, payload +8, kt<8 half0) but
@@ -4766,6 +4825,30 @@ pub const GEMM_MQ4G256V2_RESIDUAL_MMQ_IU4_GFX12_B1S: &[u8] =
 /// and one contract-checked `peacemaker custom build` per Row epilogue.
 pub const GEMM_MQ4G256V2_WMMA_FP8_GFX12_B1: &[u8] =
     include_bytes!("../../../kernels/gemm_mq4g256v2_wmma_fp8_gfx12_b1.hxaco");
+/// Certified gfx1201 PeaceMaker bundle of the exact 64..=128-row MQ4V2 verify
+/// GEMMs (`hipfire-isa emit --kernel mq4_verify --epi all --arch gfx1201`,
+/// one native bundle): the twins of the hipcc K32-slab `_vt{4,8}w{4,8}_k32`
+/// symbols with their ABI, grid and output bytes. Sixteen entries
+/// `mq4_verify_{qkvza,qkv,gate_up,residual}_pm_gfx1201_bt{4,8}w{4,8}`.
+/// Selected by default inside the `HIPFIRE_CB_VERIFY_CHUNK128` route
+/// (`HIPFIRE_CB_VERIFY_PM=0` runs the hipcc twins); a bundle or symbol that
+/// does not load is an error, never a hipcc fallback. The file is generated by
+/// the native-emit stage (`kernels/mq4_verify_pm_gfx1201.hxaco`), not authored.
+pub const MQ4_VERIFY_PM_GFX1201: &[u8] =
+    include_bytes!("../../../kernels/mq4_verify_pm_gfx1201.hxaco");
+/// Certified gfx1201 PeaceMaker bundle of the FP8 verify GEMM family
+/// (`hipfire-isa emit --kernel mq4_fp8_verify --epi all --arch gfx1201`, one
+/// native bundle): symmetric MQ4G256V2 weights dequantized exactly to E4M3,
+/// per-row E4M3 activations, `v_wmma_f32_16x16x16_fp8_fp8`, per-output
+/// reduction order identical for every row count 1..=128. Thirty-five entries
+/// `mq4_fp8_verify_{qkvza,qkv,gate_up,residual,set}_pm_gfx1201_bt{BT}w{W}`
+/// for (BT, W) in (1,1), (2,4), (2,8), (4,4), (4,8), (8,4), (8,8). Selected
+/// only inside the `HIPFIRE_CB_VERIFY_FP8` scope (`crate::gemm_fp8_verify`);
+/// a bundle or symbol that does not load is an error, never a fallback. The
+/// file is generated by the native-emit stage
+/// (`kernels/mq4_fp8_verify_pm_gfx1201.hxaco`), not authored.
+pub const MQ4_FP8_VERIFY_PM_GFX1201: &[u8] =
+    include_bytes!("../../../kernels/mq4_fp8_verify_pm_gfx1201.hxaco");
 /// Fused Wf/Rw/Ew repacker. SHA-256
 /// ef2f779637e797745651630b916858f64d2a006ca86502df2f4c91f417a64d29.
 pub const MQ4V2_FP8_FRAGMENT_REPACK_GFX1201: &[u8] =
@@ -5484,6 +5567,13 @@ pub const GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_VT_SRC: &str = concat!(
     include_str!("../../../kernels/src/gemm_mq4g256v2_wmma_gfx12_vt_core.hip"),
     include_str!("../../../kernels/src/gemm_mq4g256v2_residual_wmma_gfx12_vt.hip"),
 );
+/// Verify-tile (16 < N < 64) overwrite twin of
+/// GEMM_MQ4G256V2_RESIDUAL_WMMA_GFX12_VT_SRC; same symbol grid with prefix
+/// `gemm_mq4g256v2_overwrite_wmma_gfx12`.
+pub const GEMM_MQ4G256V2_OVERWRITE_WMMA_GFX12_VT_SRC: &str = concat!(
+    include_str!("../../../kernels/src/gemm_mq4g256v2_wmma_gfx12_vt_core.hip"),
+    include_str!("../../../kernels/src/gemm_mq4g256v2_overwrite_wmma_gfx12_vt.hip"),
+);
 /// gfx11 (RDNA3 / RDNA3.5) MQ4V2 qkv WMMA — sister of
 /// GEMM_QKV_MQ4G256V2_WMMA_GFX12_SRC. Same dual-half header contract but
 /// gfx11 WMMA contracts (half16_t, w32, interleaved C). Distinct file so
@@ -5562,6 +5652,12 @@ pub const PACK_F16_TO_FP8_MQ4V2_GFX12_SRC: &str =
 // accepted last-ulp note).
 pub const PACK_F32_TO_FP8_MQ4V2_GFX12_SRC: &str =
     include_str!("../../../kernels/src/pack_f16_to_fp8_mq4v2.gfx12.hip");
+// Lean row-independent F32 -> E4M3 activation pack of the PeaceMaker FP8
+// verify family (`pack_f32_to_fp8_verify_rows_gfx1201`): bytes and scales
+// bit-identical to `pack_f32_to_fp8_mq4v2_gfx12` scale_mode 1, no half sums,
+// one global read per element.
+pub const PACK_FP8_VERIFY_ROWS_GFX1201_SRC: &str =
+    include_str!("../../../kernels/src/pack_fp8_verify_rows.gfx1201.hip");
 // Fused MagnumQuant FWHT rotation + FP8 (E4M3) pack — gfx12 only.
 // Writes both F32 (for legacy consumers) and FP8 outputs in one launch.
 // Replaces the standalone mq_rotate_x + pack_f32_to_fp8 sequence on the

@@ -418,7 +418,11 @@ static __device__ __forceinline__ float gdn_q8_halves_peak(
 // `kCapture` too (verify and its rollback), every earlier row also
 // requantizes at its own position, as single-row decode does, so the window
 // is token-exact with AR; the unarmed batch keeps one requantization.
-template <bool kCapture, bool kQ8 = false>
+// `kTokenQ8` (default `kCapture`): every row requantizes at its own position
+// as described above. The `canon_q8` entry sets it without `kCapture`: the
+// final state is stored to `state` (not a ring slot), so the result is the
+// token-canonical recurrence, independent of how rows split into launches.
+template <bool kCapture, bool kQ8 = false, bool kTokenQ8 = kCapture>
 __device__ __forceinline__ void gated_delta_step_persistent256_body(
     const float* projection,
     const float* gate,
@@ -631,7 +635,7 @@ __device__ __forceinline__ void gated_delta_step_persistent256_body(
             // state; the next row runs on that state requantized at the row's
             // own frame and dequantized (scale * code, the next decode's read).
             // The last row's requantization is the final store below.
-            if constexpr (kCapture && kQ8) {
+            if constexpr (kTokenQ8 && kQ8) {
                 if (row + 1 < rows) {
                     const float peak = gdn_q8_halves_peak(state_half, half, value_index);
                     const float inv = gdn_q8_inv(peak);
@@ -722,6 +726,19 @@ extern "C" __global__ void gated_delta_step_halves_state128_persistent256_captur
     gated_delta_step_persistent256_body<true, true>(projection, gate, beta, state, output,
         row_states, rows, qkv_width, key_heads, value_heads, key_dim, value_dim, query_scale,
         frame);
+}
+
+// Token-canonical Q8 prefill recurrence (`HIPFIRE_QWEN4_GDN_PREFILL=canon`):
+// the plain `_q8` signature and final store (`state`, no row ring), with the
+// capture kernel's per-row requantization at `frame - (rows - 1 - row)`.
+__launch_bounds__(256)
+extern "C" __global__ void gated_delta_step_halves_state128_persistent256_canon_q8(
+    const float* projection, const float* gate, const float* beta, signed char* state,
+    float* output, int rows, int qkv_width, int key_heads, int value_heads,
+    int key_dim, int value_dim, float query_scale, unsigned int frame) {
+    gated_delta_step_persistent256_body<false, true, true>(projection, gate, beta, state,
+        output, nullptr, rows, qkv_width, key_heads, value_heads, key_dim, value_dim,
+        query_scale, frame);
 }
 
 #if defined(__GFX12__)
@@ -2132,9 +2149,11 @@ extern "C" __global__ void gated_delta_conv_bf16_f32(
 // row-0 chunk reads the history, and it alone writes next_history after its
 // reads: history may alias next_history.
 // `output_bf16`: store the (BF16-rounded) outputs as packed BF16 bits.
-// Optional gate parameters (`param_elements` > 0): blocks past the channel
-// grid run gated_delta_params_bf16_f32_batched's body (block row 0 only).
-// Grid [ceil(channels / 256) + param blocks, ceil(rows / 16)], block 256.
+// Optional gate parameters (`param_elements` > 0): the trailing blocks past
+// the convolution tiles run gated_delta_params_bf16_f32_batched's body.
+// Grid [ceil(channels / 256) * ceil(rows / 16) + param blocks], block 256: block
+// i < conv_blocks * row_grid is conv tile (bx = i % conv_blocks, by = i / conv_blocks),
+// the rest are parameter blocks i - conv_blocks * row_grid.
 static __device__ __forceinline__ void gated_delta_params_flat(
     const float* a,
     const float* b,
@@ -2176,15 +2195,21 @@ extern "C" __global__ void gated_delta_conv_bf16_f32_batched_k4(
     float* beta,
     int param_elements,
     int heads) {
-    const int conv_blocks = (channels + 255) / 256;
-    if ((int)blockIdx.x >= conv_blocks) {
-        const int flat = ((int)blockIdx.x - conv_blocks) * 256 + (int)threadIdx.x;
-        if (blockIdx.y == 0 && flat < param_elements)
+    // Compact 1-D grid: blocks [0, conv_blocks * row_grid) are the convolution
+    // tiles (bx = channel block, by = 16-row block), the trailing blocks are
+    // the parameter blocks.
+    const unsigned conv_blocks = (unsigned)(channels + 255) / 256u;
+    const unsigned conv_total = conv_blocks * (((unsigned)rows + 15u) / 16u);
+    if (blockIdx.x >= conv_total) {
+        const int flat = (int)(blockIdx.x - conv_total) * 256 + (int)threadIdx.x;
+        if (flat < param_elements)
             gated_delta_params_flat(param_a, param_b, a_log, dt_bias, gate, beta, flat, heads);
         return;
     }
-    const int channel = (int)(blockIdx.x * blockDim.x + threadIdx.x);
-    const int r0 = (int)blockIdx.y * 16;
+    const unsigned by = blockIdx.x / conv_blocks;
+    const unsigned bx = blockIdx.x - by * conv_blocks;
+    const int channel = (int)(bx * blockDim.x + threadIdx.x);
+    const int r0 = (int)by * 16;
     if (channel >= channels || r0 >= rows
         || history_rows != 3 || kernel_size != 4) {
         return;
@@ -2249,7 +2274,7 @@ extern "C" __global__ void gated_delta_conv_bf16_f32_batched_k4(
 //   * the first 16 blocks of the channel grid (channels [0, 4096) = the 16 q
 //     heads then the 16 k heads, 128 channels each) are remapped: a wave owns
 //     one head (32 lanes x 4 contiguous channels) and 4 rows of the 16-row
-//     tile, wave w -> head blockIdx.x * 2 + (w & 1), rows r0 + 4 * (w >> 1)
+//     tile, wave w -> head bx * 2 + (w & 1), rows r0 + 4 * (w >> 1)
 //     .. +3.  Each output row is independent (only the 3-row history
 //     window is replayed from the input at the wave's first row), so the
 //     conv values are the plain kernel's;
@@ -2268,8 +2293,8 @@ extern "C" __global__ void gated_delta_conv_bf16_f32_batched_k4(
 // the V output as packed BF16 (the plain kernel's meaning); bit 1 = also
 // store the *unnormalized* Q/K convolution output into `output` (debug /
 // capture); without bit 1 the Q/K columns of `output` are NOT written.
-// Grid [ceil(channels / 256) + param blocks, ceil(rows / 16)], block 256
-// (identical to the plain kernel's launch).  wave32 (the DPP rows/xor-16
+// Grid [ceil(channels / 256) * ceil(rows / 16) + param blocks] (1-D, the plain
+// kernel's compact grid), block 256.  wave32 (the DPP rows/xor-16
 // shuffle are the plain qk-norm kernel's).
 // ---------------------------------------------------------------------------
 static __device__ __forceinline__ __hip_bfloat16 gated_delta_conv_silu_tap(
@@ -2320,24 +2345,27 @@ extern "C" __global__ __launch_bounds__(256) void gated_delta_conv_qknorm_bf16_f
     int heads,
     __hip_bfloat16* qn,
     __hip_bfloat16* kn) {
-    const int conv_blocks = (channels + 255) / 256;
-    if ((int)blockIdx.x >= conv_blocks) {
-        const int flat = ((int)blockIdx.x - conv_blocks) * 256 + (int)threadIdx.x;
-        if (blockIdx.y == 0 && flat < param_elements)
+    const unsigned conv_blocks = (unsigned)(channels + 255) / 256u;
+    const unsigned conv_total = conv_blocks * (((unsigned)rows + 15u) / 16u);
+    if (blockIdx.x >= conv_total) {
+        const int flat = (int)(blockIdx.x - conv_total) * 256 + (int)threadIdx.x;
+        if (flat < param_elements)
             gated_delta_params_flat(param_a, param_b, a_log, dt_bias, gate, beta, flat, heads);
         return;
     }
-    const int r0 = (int)blockIdx.y * 16;
+    const unsigned by = blockIdx.x / conv_blocks;
+    const unsigned bx = blockIdx.x - by * conv_blocks;
+    const int r0 = (int)by * 16;
     if (r0 >= rows || history_rows != 3 || kernel_size != 4) return;
     const int store_bf16 = output_bf16 & 1;
 
     // 128-channel slices (4 contiguous channels per lane) x 4-row quarters.  The
     // q / k heads (blocks 0..15) are also normalized; the V channels use the
     // same tile when channels is a multiple of 256, else the scalar body below.
-    const bool norm = (int)blockIdx.x < 16 && channels >= 4096;
+    const bool norm = bx < 16u && channels >= 4096;
     if (norm || (channels & 255) == 0) {
         const int wave = (int)(threadIdx.x >> 5), lane = (int)(threadIdx.x & 31);
-        const int head = (int)blockIdx.x * 2 + (wave & 1);
+        const int head = (int)bx * 2 + (wave & 1);
         const int rb = r0 + (wave >> 1) * 4;
         if (rb >= rows) return;  // wave-uniform; no block barrier follows
         const int re = min(rb + 4, min(r0 + 16, rows));
@@ -2438,7 +2466,7 @@ extern "C" __global__ __launch_bounds__(256) void gated_delta_conv_qknorm_bf16_f
     }
 
     // V channels: the plain kernel's body.
-    const int channel = (int)(blockIdx.x * blockDim.x + threadIdx.x);
+    const int channel = (int)(bx * blockDim.x + threadIdx.x);
     if (channel >= channels) return;
     auto in = [&](int j) {
         if (input_bf16) {
@@ -3389,11 +3417,13 @@ static __device__ __forceinline__ void qsa_pool_rope(
     int compress,
     int index_dim,
     int first_block) {
-    int block = (int)blockIdx.x;
+    // The grid starts at `first_block` (0 for the full pool): blocks below it
+    // already hold this kernel's output for their unchanged raw keys (the
+    // incremental decode caller), so an incremental launch covers only the
+    // blocks its rows complete.
+    int block = first_block + (int)blockIdx.x;
     int channel = (int)(blockIdx.y * blockDim.x + threadIdx.x);
-    // Blocks below `first_block` already hold this kernel's output for their
-    // unchanged raw keys (the incremental decode caller).
-    if (block < first_block || block >= block_count || compress <= 0) return;
+    if ( block >= block_count || compress <= 0) return;
     bool active = channel < index_dim;
     int base = block * compress * index_dim;
     float mean = 0.0f;

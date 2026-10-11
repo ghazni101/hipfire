@@ -258,6 +258,26 @@ impl DraftHead {
         head: &GpuTensor,
         hidden: &GpuTensor,
     ) -> Result<u32, DispatchError> {
+        let top1 = self.top1.sub_offset(0, Gpu::TOPK8_OUT_BYTES);
+        self.draft_enqueue(gpu, head, hidden, &top1)?;
+        let mut top = [0u8; Gpu::TOPK8_OUT_BYTES];
+        let read = if self.partial.is_some() { top.len() } else { 8 };
+        hip(gpu.hip.memcpy_dtoh(&mut top[..read], &top1.buf))?;
+        self.draft_finish(&top[..read])
+    }
+
+    /// The device work of [`Self::draft`]: rank `hidden` (`[hidden]` F32)
+    /// into `top1_out` (a Raw tensor of at least `Gpu::TOPK8_OUT_BYTES`
+    /// bytes): projection, then the re-score or the argmax. Counts down the
+    /// full-vocabulary hold exactly as `draft` does; the result is parsed by
+    /// [`Self::draft_finish`] once the caller has downloaded `top1_out`.
+    pub fn draft_enqueue(
+        &mut self,
+        gpu: &mut Gpu,
+        head: &GpuTensor,
+        hidden: &GpuTensor,
+        top1_out: &GpuTensor,
+    ) -> Result<(), DispatchError> {
         let (ranked, order) = ranking(self.front, self.special, self.vocab, self.full_steps);
         self.full_steps = self.full_steps.saturating_sub(1);
         let ranking_head = self.copy.as_ref().unwrap_or(head);
@@ -297,14 +317,29 @@ impl DraftHead {
                 head,
                 x,
                 partial,
-                &self.top1,
+                top1_out,
             ))?;
         } else {
-            execute_argmax(gpu, &self.logits, &self.top1, 1, ranked)?;
+            execute_argmax(gpu, &self.logits, top1_out, 1, ranked)?;
         }
-        let mut top = [0u8; Gpu::TOPK8_OUT_BYTES];
-        let read = if self.partial.is_some() { top.len() } else { 8 };
-        hip(gpu.hip.memcpy_dtoh(&mut top[..read], &self.top1.buf))?;
+        Ok(())
+    }
+
+    /// Parse a downloaded `top1_out` of [`Self::draft_enqueue`] (its first
+    /// `Gpu::TOPK8_OUT_BYTES` bytes with re-scoring, 8 bytes without): the
+    /// draft token, the margin and the re-scored candidates, as `draft`.
+    pub fn draft_finish(&mut self, top: &[u8]) -> Result<u32, DispatchError> {
+        let need = if self.partial.is_some() {
+            Gpu::TOPK8_OUT_BYTES
+        } else {
+            8
+        };
+        if top.len() < need {
+            return Err(DispatchError::Hip(format!(
+                "draft result holds {} bytes, expected {need}",
+                top.len()
+            )));
+        }
         let word = |i: usize| [top[4 * i], top[4 * i + 1], top[4 * i + 2], top[4 * i + 3]];
         let token = u32::from_ne_bytes(word(0));
         self.margin = if self.partial.is_some() {

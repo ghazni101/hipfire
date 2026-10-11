@@ -54,7 +54,7 @@ Tools only — not a checkout. From a local tree:
 
 ```bash
 nix develop
-cargo build --release --features deltanet --example daemon -p hipfire-runtime
+cargo build --release -p hipfire-daemon
 ```
 
 ### Build CLI + daemon

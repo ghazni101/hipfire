@@ -1107,6 +1107,21 @@ fn fused_qkv_keys_resolve_on_fleet_archs() {
             key: KernelKey::FusedGateUpParo4G128T,
             archs: ALL,
         },
+        // ── Exact verify fused (MQ4G256V2, singleton F16-WMMA chain): explicit
+        //    key only, IsGfx1201-gated; fail-closed elsewhere is pinned by
+        //    mq4v2_verify_exact_keys_resolve_on_gfx1201_only. ──
+        FusedKeyUse {
+            key: KernelKey::FusedQkvMq4G256V2VerifyExact,
+            archs: &["gfx1201"],
+        },
+        FusedKeyUse {
+            key: KernelKey::FusedQkvzaMq4G256V2VerifyExact,
+            archs: &["gfx1201"],
+        },
+        FusedKeyUse {
+            key: KernelKey::FusedGateUpMq4G256V2VerifyExact,
+            archs: &["gfx1201"],
+        },
     ];
 
     let family = FusedQkvFamily::new();
@@ -1900,5 +1915,55 @@ fn mqv2_fused_and_gemm_keys_resolve_on_gfx11_gfx12() {
         "\n{} MQV2 fused/GEMM resolve failures:\n{}\n",
         failures.len(),
         failures.join("\n")
+    );
+}
+
+/// Exact verify keys (MQ4G256V2, 1..=128 rows, singleton F16-WMMA chain) are
+/// explicit-key-only and IsGfx1201-gated: they resolve on gfx1201, fail closed
+/// everywhere else, and are never produced by the dtype→key selectors.
+#[test]
+fn mq4v2_verify_exact_keys_resolve_on_gfx1201_only() {
+    use crate::families::fused_qkv::{fused_gate_up_key_for, FusedQkvFamily};
+    use crate::families::gemm::{residual_gemm_key_for, GemmFamily};
+
+    let fused = FusedQkvFamily::new();
+    let gemm = GemmFamily::new();
+    let fused_keys = [
+        KernelKey::FusedQkvMq4G256V2VerifyExact,
+        KernelKey::FusedQkvzaMq4G256V2VerifyExact,
+        KernelKey::FusedGateUpMq4G256V2VerifyExact,
+    ];
+    let gemm_keys = [
+        KernelKey::GemmMq4G256V2ResidualVerifyExact,
+        KernelKey::GemmMq4G256V2LmheadVerifyExact,
+    ];
+    let mut failures = Vec::new();
+    for &arch in ALL {
+        let ctx = DispatchCtx::for_test(arch);
+        let admitted = arch == "gfx1201";
+        for &key in &fused_keys {
+            if fused.resolve(key, &ctx, None).is_ok() != admitted {
+                failures.push(format!("  fused {:?} on {} admitted != {}", key, arch, admitted));
+            }
+        }
+        for &key in &gemm_keys {
+            if gemm.registry().resolve(key, &ctx, None).is_ok() != admitted {
+                failures.push(format!("  gemm {:?} on {} admitted != {}", key, arch, admitted));
+            }
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "\n{} verify-exact key × arch failures:\n{}\n",
+        failures.len(),
+        failures.join("\n")
+    );
+    assert_eq!(
+        residual_gemm_key_for(MQ4G256V2),
+        KernelKey::GemmMq4G256V2Residual
+    );
+    assert_eq!(
+        fused_gate_up_key_for(MQ4G256V2),
+        KernelKey::FusedGateUpMq4G256V2
     );
 }

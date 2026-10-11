@@ -9,7 +9,8 @@
 //! load transaction/census (including external PLE descriptors).  No loader
 //! local may outlive publication as a second owner.
 
-use crate::config::Qwen4Config;
+use crate::artifact::{Qwen4PleRows, SidecarRows};
+use crate::config::{Qwen4Config, Qwen4PleConfig};
 use crate::gpu_forward::{
     qwen4_forward_device_bytes, qwen4_prefill_chunk_requested, qwen4_prefill_chunk_rungs,
     qwen4_spec_logit_rows, Qwen4GpuForward, Qwen4OutputRows, QWEN4_FORWARD_HEADROOM_BYTES,
@@ -20,11 +21,12 @@ use crate::ple::PleHashMetadata;
 use crate::state::Qwen4StateFormat;
 use crate::state::{Qwen4State, Qwen4StateSnapshot, StateError};
 use crate::weights::{
-    ple_valid_rows_for_shard, Qwen4Manifest, Qwen4Placement, Qwen4Weights, WeightError,
-    PLE_ROW_WIDTH, PLE_SHARD_COUNT, PLE_SHARD_ROWS,
+    ple_valid_rows_for_shard, Qwen4Manifest, Qwen4Placement, Qwen4TierRecipe, Qwen4Weights,
+    WeightError, PLE_ROW_WIDTH, PLE_SHARD_COUNT, PLE_SHARD_ROWS,
 };
 use hipfire_runtime::external_rows::{RowEncoding, RowStore, RowStoreError};
 use hipfire_runtime::model_source::{SourceFormat, SourceRangeDescriptor};
+use hipfire_runtime::ple_hot_store::HotRowStore;
 use hipfire_runtime::sampler::{
     apply_logit_policy_candidates_cpu, apply_logit_policy_cpu, PenaltyTable, SamplerConfig,
 };
@@ -34,9 +36,10 @@ use hipfire_runtime::session_cache::{
 use hipfire_runtime::spec_sampling::{SampleSpec, SparseDist};
 use hipfire_runtime::weight_manifest::{WeightEntry, WeightResidency};
 use hipfire_runtime::weight_store::{WeightLoadTransaction, WeightStoreError};
-use rdna_compute::{Gpu, GpuTensor};
 use rdna_compute::sampling::PenaltyTableStage;
+use rdna_compute::{Gpu, GpuTensor};
 use std::fmt;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 const PLE_RESET_TIMEOUT: Duration = Duration::from_secs(5);
@@ -189,15 +192,36 @@ fn session_boundaries(
     boundaries
 }
 
+/// The PLE rows owner of a bundle: present exactly when the profile declares
+/// PLE (`config.ple`), so a profile without it holds no row store, hash
+/// metadata, hot store or prewarm — and no placeholder for them.
+pub(crate) struct Qwen4BundlePle {
+    /// Bounded model-owned PLE reader/cache.  It must quiesce before source
+    /// descriptors and the attached transaction are dropped.
+    pub(crate) rows: RowStore,
+    pub(crate) metadata: PleHashMetadata,
+    /// Where the PLE rows come from: the model file itself or the sidecar
+    /// whose descriptors the row store was built from (never
+    /// [`Qwen4PleRows::Absent`]).
+    source: Qwen4PleRows,
+    /// PLE hot-row store and its worker thread (`attach_ple_hot_store`);
+    /// `None` = off. Dropping it stops and joins the worker; `free_gpu` does
+    /// so before the row store unloads.
+    hot: Option<PleHotWorker>,
+    /// Page-cache prewarm of a Q4LM PLE sidecar (`attach_ple_prewarm`); `None`
+    /// = off.  Like `hot` it reads the sidecar, so dropping it stops and
+    /// joins its thread, and `free_gpu` does so before the row store unloads.
+    prewarm: Option<hipfire_runtime::ple_prewarm::PleRowsPrewarm>,
+}
+
 /// Published Qwen4 architecture owner.
 pub struct Qwen4Bundle {
     pub config: Qwen4Config,
     pub weights: Qwen4Weights,
     pub state: Qwen4State,
-    /// Bounded model-owned PLE reader/cache.  It must quiesce before source
-    /// descriptors and the attached transaction are dropped.
-    pub(crate) ple_rows: RowStore,
-    pub(crate) ple_metadata: PleHashMetadata,
+    /// PLE rows, hash metadata and their attachments; `None` exactly when
+    /// `config.ple` is `None`.
+    pub(crate) ple: Option<Qwen4BundlePle>,
     /// Canonical load census and external descriptors.  This is deliberately
     /// not left in the loader or carrier after publication.
     pub(crate) weight_store: AttachedWeightStore,
@@ -235,6 +259,9 @@ pub struct Qwen4Bundle {
     turn_end_token: Option<u32>,
     /// Request-state storage, part of every session snapshot's scope.
     state_format: Qwen4StateFormat,
+    /// Exact AR lane store of the Flash-Next batch route (`stage_lanes`);
+    /// `None` = not staged. Lane steps never touch `state` or `mtp`.
+    pub(crate) lanes: Option<crate::lane::Qwen4LaneStore>,
 }
 
 /// `HIPFIRE_QWEN4_PENALTY_PREPASS=0` keeps a penalized request's repeat /
@@ -292,7 +319,7 @@ pub fn session_snapshot_bytes(
         + selected;
     let ple = config
         .ple_conv_history_rows()
-        .checked_mul(config.ple_embed_dim)?
+        .checked_mul(config.hidden_size)?
         .checked_mul(config.hc_count)?
         .checked_mul(4)?;
     let feedback = config
@@ -416,12 +443,13 @@ impl SessionState for Qwen4Bundle {
         .map_err(|e| e.to_string())
     }
 
-    fn growth_reserve_bytes(&self) -> u64 {
-        self.state.context_growth_bytes()
-            + self
-                .mtp
-                .as_ref()
-                .map_or(0, Qwen4MtpGpu::context_growth_bytes)
+    fn growth_reserve_bytes(&self, gpu: &Gpu) -> u64 {
+        let through = self
+            .turn
+            .as_ref()
+            .map_or(self.state.position, |(prompt, _)| prompt.len());
+        let (context, gather) = self.context_growth_bytes(gpu, through);
+        context.saturating_add(gather)
     }
 
     fn reset(&mut self, gpu: &mut Gpu) -> Result<(), String> {
@@ -431,12 +459,15 @@ impl SessionState for Qwen4Bundle {
 
 impl Qwen4Bundle {
     /// Assemble a complete Single bundle using metadata parsed from the
-    /// artifact's canonical `qwen4_ple` object. `state_format` is the request
-    /// state's storage ([`crate::resolve_state_format`]); `backend` the QSA
-    /// context storage load admission resolved, shared by target and MTP.
+    /// artifact's canonical `qwen4_ple` object. `recipe` is the recipe the
+    /// artifact was admitted under (`Qwen4HfqmArtifact::recipe()`).
+    /// `state_format` is the request state's storage
+    /// ([`crate::resolve_state_format`]); `backend` the QSA context storage
+    /// load admission resolved, shared by target and MTP.
     #[allow(clippy::too_many_arguments)]
     pub fn assemble(
         config: Qwen4Config,
+        recipe: &Qwen4TierRecipe,
         transaction: WeightLoadTransaction,
         placements: &[Qwen4Placement],
         gpu: &mut Gpu,
@@ -447,6 +478,7 @@ impl Qwen4Bundle {
     ) -> Result<Self, BundleError> {
         Self::assemble_with_metadata(
             config,
+            recipe,
             transaction,
             placements,
             gpu,
@@ -460,18 +492,74 @@ impl Qwen4Bundle {
     /// Assemble with validated metadata read from the artifact's exact I64
     /// arrays.  The transaction is consumed so no load-side owner can remain
     /// live after this method publishes the bundle.
+    /// `metadata` is `Some` exactly when the profile declares PLE (the
+    /// admission receipt's `ple`): the rows are then the embedded shard
+    /// tensors; a profile without PLE passes `None` and gets no rows source.
     #[allow(clippy::too_many_arguments)]
     pub fn assemble_with_metadata(
         config: Qwen4Config,
+        recipe: &Qwen4TierRecipe,
+        transaction: WeightLoadTransaction,
+        placements: &[Qwen4Placement],
+        gpu: &mut Gpu,
+        max_seq_len: usize,
+        metadata: impl Into<Option<PleHashMetadata>>,
+        state_format: Qwen4StateFormat,
+        backend: Qwen4KvBackend,
+    ) -> Result<Self, BundleError> {
+        let metadata = metadata.into();
+        let ple_source = if metadata.is_some() {
+            Qwen4PleRows::Embedded
+        } else {
+            Qwen4PleRows::Absent
+        };
+        Self::assemble_with_ple_rows(
+            config,
+            recipe,
+            transaction,
+            placements,
+            gpu,
+            max_seq_len,
+            metadata,
+            ple_source,
+            state_format,
+            backend,
+        )
+    }
+
+    /// Assemble with validated metadata and an explicit PLE rows source:
+    /// [`Qwen4PleRows::Embedded`] reads the shard tensors fulfilled in
+    /// `transaction` (the monolithic artifact, exactly the pre-sidecar path);
+    /// [`Qwen4PleRows::Sidecar`] builds the row store from the sidecar's
+    /// descriptors, and `transaction` then carries no PLE shards (the
+    /// admitted manifest was trimmed).  The row geometry (shards, rows per
+    /// shard, row width, heads) is the profile's `config.ple`.
+    /// A profile without PLE takes `None` metadata and
+    /// [`Qwen4PleRows::Absent`] and builds no PLE owner; any other pairing of
+    /// the profile with the metadata and rows source, and a sidecar for a
+    /// developer profile (sidecar rows, the hot store and the rank table are
+    /// Flash-Next-only), is refused before weights are assembled or state is
+    /// allocated.
+    #[allow(clippy::too_many_arguments)]
+    pub fn assemble_with_ple_rows(
+        config: Qwen4Config,
+        recipe: &Qwen4TierRecipe,
         mut transaction: WeightLoadTransaction,
         placements: &[Qwen4Placement],
         gpu: &mut Gpu,
         max_seq_len: usize,
-        metadata: PleHashMetadata,
+        metadata: impl Into<Option<PleHashMetadata>>,
+        ple_source: Qwen4PleRows,
         state_format: Qwen4StateFormat,
         backend: Qwen4KvBackend,
     ) -> Result<Self, BundleError> {
-        let weights = match Qwen4Weights::assemble(&mut transaction, &config, placements) {
+        let ple_inputs = match admit_ple_inputs(&config, metadata.into(), ple_source) {
+            Ok(inputs) => inputs,
+            Err(error) => {
+                return Err(cleanup_transaction(error, transaction.rollback(gpu)));
+            }
+        };
+        let weights = match Qwen4Weights::assemble(&mut transaction, &config, recipe, placements) {
             Ok(weights) => weights,
             Err(error) => {
                 return Err(cleanup_transaction(
@@ -480,37 +568,40 @@ impl Qwen4Bundle {
                 ));
             }
         };
-        let descriptors = match ple_descriptors(&transaction, &weights.manifest, &metadata) {
-            Ok(descriptors) => descriptors,
-            Err(error) => {
-                let weight_result = weights.free_gpu(gpu);
-                let cleanup = transaction.rollback(gpu);
-                return Err(cleanup_bundle_failure(error, weight_result, cleanup));
+        let ple = match (ple_inputs, config.ple.as_ref()) {
+            (Some(inputs), Some(ple_config)) => {
+                // One prefill chunk prefetches `rows * head_count` n-gram rows
+                // in a single row-store request, so staging holds the
+                // requested chunk.
+                let staging_rows =
+                    qwen4_prefill_chunk_requested(&gpu.arch, max_seq_len) * ple_config.head_count;
+                match build_ple_row_store(
+                    &inputs.source,
+                    &transaction,
+                    &weights.manifest,
+                    ple_config,
+                    &inputs.metadata,
+                    staging_rows,
+                    // `HIPFIRE_QWEN4_PLE_WIDE_READERS=0` keeps 16 concurrent
+                    // reads for every PLE request, including a whole prefill
+                    // chunk.
+                    hipfire_config::developer_bool("HIPFIRE_QWEN4_PLE_WIDE_READERS", true),
+                ) {
+                    Ok(rows) => Some(Qwen4BundlePle {
+                        rows,
+                        metadata: inputs.metadata,
+                        source: inputs.source,
+                        hot: None,
+                        prewarm: None,
+                    }),
+                    Err(error) => {
+                        let weight_result = weights.free_gpu(gpu);
+                        let cleanup = transaction.rollback(gpu);
+                        return Err(cleanup_bundle_failure(error, weight_result, cleanup));
+                    }
+                }
             }
-        };
-        // One prefill chunk prefetches `rows * PLE_HEAD_COUNT` n-gram rows in
-        // a single row-store request, so staging holds the requested chunk.
-        let staging_rows =
-            qwen4_prefill_chunk_requested(&gpu.arch, max_seq_len) * crate::ple::PLE_HEAD_COUNT;
-        let ple_rows = match RowStore::with_staging_rows(
-            "qwen4-ple-reader",
-            descriptors,
-            metadata.valid_rows(),
-            staging_rows,
-            // `HIPFIRE_QWEN4_PLE_WIDE_READERS=0` keeps 16 concurrent reads
-            // for every PLE request, including a whole prefill chunk.
-            hipfire_config::developer_bool("HIPFIRE_QWEN4_PLE_WIDE_READERS", true),
-        ) {
-            Ok(rows) => rows,
-            Err(error) => {
-                let weight_result = weights.free_gpu(gpu);
-                let cleanup = transaction.rollback(gpu);
-                return Err(cleanup_bundle_failure(
-                    BundleError::PleRows(error),
-                    weight_result,
-                    cleanup,
-                ));
-            }
+            _ => None,
         };
         let mut state =
             match Qwen4State::new_with_backend(gpu, &config, max_seq_len, state_format, backend) {
@@ -518,7 +609,9 @@ impl Qwen4Bundle {
                 Err(error) => {
                     // `unload` consumes the reader and joins its worker even on a
                     // quiesce error, so source descriptors cannot outlive failure.
-                    let _ = ple_rows.unload();
+                    if let Some(ple) = ple {
+                        let _ = ple.rows.unload();
+                    }
                     let weight_result = weights.free_gpu(gpu);
                     let cleanup = transaction.rollback(gpu);
                     return Err(cleanup_bundle_failure(
@@ -533,8 +626,7 @@ impl Qwen4Bundle {
             config,
             weights,
             state,
-            ple_rows,
-            ple_metadata: metadata,
+            ple,
             weight_store: AttachedWeightStore::new(transaction),
             execution: None,
             mtp: None,
@@ -549,6 +641,7 @@ impl Qwen4Bundle {
             turn_snapshots: hipfire_config::developer_bool(TURN_SNAPSHOTS_ENV, false),
             turn_end_token: None,
             state_format,
+            lanes: None,
         })
     }
 
@@ -564,25 +657,55 @@ impl Qwen4Bundle {
             .external_descriptor(&placement.name, placement.layer, placement.device)
     }
 
-    /// Return all numerically ordered PLE shard descriptors from the
-    /// attached canonical transaction census.
+    /// Return all numerically ordered PLE shard descriptors of the active
+    /// rows source: the attached canonical transaction census for the
+    /// embedded shards, or the sidecar's descriptors.
     ///
     /// This strict accessor is useful to admission and diagnostics callers;
     /// the bundle's own reader already owns the same sealed descriptors.
     pub fn ple_descriptors(&self) -> Result<Vec<SourceRangeDescriptor>, BundleError> {
-        ple_descriptors(
-            &self.weight_store.transaction,
-            self.manifest(),
-            &self.ple_metadata,
-        )
+        let (Some(ple), Some(ple_config)) = (&self.ple, self.config.ple.as_ref()) else {
+            return Err(no_ple_rows());
+        };
+        match &ple.source {
+            Qwen4PleRows::Absent => Err(no_ple_rows()),
+            Qwen4PleRows::Embedded => ple_descriptors(
+                &self.weight_store.transaction,
+                self.manifest(),
+                ple_config,
+                &ple.metadata,
+            ),
+            Qwen4PleRows::Sidecar {
+                rows: SidecarRows::Descriptors(descriptors),
+                ..
+            } => sidecar_ple_descriptors(descriptors, &ple.metadata),
+            Qwen4PleRows::Sidecar {
+                path,
+                rows: SidecarRows::Table(_),
+                ..
+            } => Err(BundleError::Weights(WeightError::DescriptorMismatch(
+                format!(
+                    "PLE rows {} are a rank-order table served through its store; \
+                     it has no row-order shard descriptors",
+                    path.display()
+                ),
+            ))),
+        }
     }
 
-    pub fn ple_rows(&self) -> &RowStore {
-        &self.ple_rows
+    /// Where this bundle's PLE rows come from; `None` for a profile without
+    /// PLE.
+    pub fn ple_source(&self) -> Option<&Qwen4PleRows> {
+        self.ple.as_ref().map(|ple| &ple.source)
     }
 
-    pub fn ple_rows_mut(&mut self) -> &mut RowStore {
-        &mut self.ple_rows
+    /// The PLE row store; `None` for a profile without PLE.
+    pub fn ple_rows(&self) -> Option<&RowStore> {
+        self.ple.as_ref().map(|ple| &ple.rows)
+    }
+
+    pub fn ple_rows_mut(&mut self) -> Option<&mut RowStore> {
+        self.ple.as_mut().map(|ple| &mut ple.rows)
     }
 
     pub fn attached_origin(&self) -> Option<hipfire_runtime::weight_store::WeightOrigin> {
@@ -611,8 +734,13 @@ impl Qwen4Bundle {
             ));
         }
         // A chunk's PLE prefetch is one row-store request: the staging sized
-        // at assembly bounds it.
-        let ple_rows_cap = self.ple_rows.max_rows_per_prefetch() / crate::ple::PLE_HEAD_COUNT;
+        // at assembly bounds it.  A profile without PLE has no row store.
+        let ple_rows_cap = match (&self.ple, &self.config.ple) {
+            (Some(ple), Some(ple_config)) => {
+                ple.rows.max_rows_per_prefetch() / ple_config.head_count
+            }
+            _ => usize::MAX,
+        };
         let requested = qwen4_prefill_chunk_requested(&gpu.arch, max_chunk).min(ple_rows_cap);
         if requested == 0 {
             return Err(BundleError::Forward(
@@ -663,7 +791,7 @@ impl Qwen4Bundle {
         // The largest rung whose chunk-sized resources fit the free device
         // memory beside the kernels' lazily sized workspaces; the smallest
         // rung is attempted regardless and fails at allocation if it must.
-        let (free, _) = gpu.hip.get_vram_info().map_err(BundleError::Hip)?;
+        let (free, _) = gpu.device_mem_info().map_err(BundleError::Hip)?;
         let max_chunk = qwen4_prefill_chunk_rungs(requested)
             .find(|&rows| {
                 qwen4_forward_device_bytes(&self.config, rows)
@@ -711,6 +839,7 @@ impl Qwen4Bundle {
     }
     /// Attach the reusable native MTP head and its bounded GPU state.
     pub fn attach_mtp(&mut self, gpu: &mut Gpu, max_seq: usize) -> Result<(), BundleError> {
+        Self::require_mtp_head(self.config.profile.id(), self.weights.mtp.is_some())?;
         if self.mtp.is_some() {
             return Err(BundleError::Forward(
                 "Qwen4 MTP resources are already attached".to_string(),
@@ -726,6 +855,19 @@ impl Qwen4Bundle {
         .map_err(|error| BundleError::Forward(error.to_string()))?;
         self.mtp = Some(mtp);
         Ok(())
+    }
+
+    /// Native MTP attaches only where the profile's weights carry an MTP head
+    /// (`weights.mtp`); a head-free profile is refused with a typed error
+    /// before any allocation.
+    fn require_mtp_head(profile: &str, has_head: bool) -> Result<(), BundleError> {
+        if has_head {
+            Ok(())
+        } else {
+            Err(BundleError::NoMtpHead {
+                profile: profile.to_string(),
+            })
+        }
     }
 
     pub(crate) fn ensure_spec_hidden(
@@ -836,7 +978,7 @@ impl Qwen4Bundle {
         tokens: &[u32],
         capture_hidden: bool,
     ) -> Result<Vec<u32>, BundleError> {
-        self.spec_forward_rows_with_output(gpu, tokens, capture_hidden, Qwen4OutputRows::All)
+        self.spec_forward_rows_with_output(gpu, tokens, capture_hidden, Qwen4OutputRows::All, false)
     }
 
     /// Final-row argmax of one forward over `tokens`: prompt fills and
@@ -847,7 +989,7 @@ impl Qwen4Bundle {
         tokens: &[u32],
         capture_hidden: bool,
     ) -> Result<u32, BundleError> {
-        self.spec_forward_rows_with_output(gpu, tokens, capture_hidden, Qwen4OutputRows::Final)?
+        self.spec_forward_rows_with_output(gpu, tokens, capture_hidden, Qwen4OutputRows::Final, true)?
             .into_iter()
             .next()
             .ok_or_else(|| BundleError::Forward("Qwen4 prefill produced no argmax".into()))
@@ -899,9 +1041,11 @@ impl Qwen4Bundle {
         let mut forward = self.execution.take().ok_or_else(|| {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
         })?;
+        let prior_scope = std::mem::replace(&mut forward.prefill_scope, true);
         let result = forward
             .forward_chunk_silent(self, gpu, tokens, Some(&hidden))
             .map_err(|error| BundleError::Forward(error.to_string()));
+        forward.prefill_scope = prior_scope;
         self.execution = Some(forward);
         result
     }
@@ -912,6 +1056,7 @@ impl Qwen4Bundle {
         tokens: &[u32],
         capture_hidden: bool,
         output_rows: Qwen4OutputRows,
+        prefill: bool,
     ) -> Result<Vec<u32>, BundleError> {
         if tokens.is_empty() {
             return Err(BundleError::Forward(
@@ -980,6 +1125,7 @@ impl Qwen4Bundle {
         let mut forward = self.execution.take().ok_or_else(|| {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
         })?;
+        let prior_scope = std::mem::replace(&mut forward.prefill_scope, prefill);
         let result = forward
             .forward_chunk(
                 self,
@@ -991,6 +1137,7 @@ impl Qwen4Bundle {
                 output_rows,
             )
             .map_err(|error| BundleError::Forward(error.to_string()));
+        forward.prefill_scope = prior_scope;
         self.execution = Some(forward);
         result?;
         let bytes_len = output_count * std::mem::size_of::<i32>();
@@ -1015,6 +1162,22 @@ impl Qwen4Bundle {
         row: usize,
         destination: &GpuTensor,
     ) -> Result<(), BundleError> {
+        let source = self.spec_hidden.as_ref().ok_or_else(|| {
+            BundleError::Forward("Qwen4 spec hidden is not allocated".to_string())
+        })?;
+        self.copy_hidden_row(gpu, source, row, destination)
+    }
+
+    /// Copy row `row` (`hc_count * hidden_size` F32) of `source` into
+    /// `destination`. `source` holds captured wide-hidden rows (the spec
+    /// hidden, or a lane's rows of it).
+    pub(crate) fn copy_hidden_row(
+        &self,
+        gpu: &mut Gpu,
+        source: &GpuTensor,
+        row: usize,
+        destination: &GpuTensor,
+    ) -> Result<(), BundleError> {
         let width = self
             .config
             .hc_count
@@ -1025,9 +1188,6 @@ impl Qwen4Bundle {
                 "Qwen4 spec hidden destination shape mismatch".to_string(),
             ));
         }
-        let source = self.spec_hidden.as_ref().ok_or_else(|| {
-            BundleError::Forward("Qwen4 spec hidden is not allocated".to_string())
-        })?;
         let offset = row
             .checked_mul(width)
             .ok_or_else(|| BundleError::Forward("spec hidden row offset overflow".to_string()))?;
@@ -1040,8 +1200,18 @@ impl Qwen4Bundle {
             ));
         }
         let source = source.sub_offset(offset, width);
-        gpu.copy_d2d(&source, destination, destination.byte_size())
-            .map_err(BundleError::Hip)
+        // Stream-ordered and host-asynchronous: the copy rides the stream the
+        // kernels launch on (the active stream, else the default stream), so
+        // every consumer sees it in order without the host waiting for the
+        // work queued before it.
+        gpu.memcpy_dtod_at_ordered_async(
+            &destination.buf,
+            0,
+            &source.buf,
+            0,
+            destination.byte_size(),
+        )
+        .map_err(BundleError::Hip)
     }
 
     /// Keep the first `keep` rows of the armed `tokens.len()`-row verify the
@@ -1054,14 +1224,30 @@ impl Qwen4Bundle {
         keep: usize,
         tokens: &[u32],
     ) -> Result<(), BundleError> {
-        let ple_normed = &self
-            .execution
-            .as_ref()
-            .ok_or_else(|| {
-                BundleError::Forward("Qwen4 forward resources are not attached".to_string())
-            })?
-            .scratch
-            .ple_normed;
+        let ple_normed = {
+            let tensor = &self
+                .execution
+                .as_ref()
+                .ok_or_else(|| {
+                    BundleError::Forward("Qwen4 forward resources are not attached".to_string())
+                })?
+                .scratch
+                .ple_normed;
+            tensor.sub_offset(0, tensor.numel())
+        };
+        self.rollback_verify_rows_retain_with(gpu, snapshot, keep, tokens, &ple_normed)
+    }
+
+    /// [`Self::rollback_verify_rows_retain`] with the verify's PLE
+    /// convolution input rows (`ple_normed`, from the block's row 0) given.
+    pub(crate) fn rollback_verify_rows_retain_with(
+        &mut self,
+        gpu: &mut Gpu,
+        snapshot: Qwen4StateSnapshot,
+        keep: usize,
+        tokens: &[u32],
+        ple_normed: &GpuTensor,
+    ) -> Result<(), BundleError> {
         self.state
             .rollback_rows_retain(
                 gpu,
@@ -1078,12 +1264,50 @@ impl Qwen4Bundle {
             .map_err(BundleError::State)
     }
 
+    /// The forward scratch's PLE convolution input rows from row `row`
+    /// through `row + rows` (`hc_count * hidden_size` F32 per row); a view
+    /// running to the end of the scratch tensor, valid until the next forward.
+    pub(crate) fn lane_ple_normed_rows(
+        &self,
+        row: usize,
+        rows: usize,
+    ) -> Result<GpuTensor, BundleError> {
+        let width = self
+            .config
+            .hc_count
+            .checked_mul(self.config.hidden_size)
+            .ok_or_else(|| BundleError::Forward("PLE row width overflow".to_string()))?;
+        let tensor = &self
+            .execution
+            .as_ref()
+            .ok_or_else(|| {
+                BundleError::Forward("Qwen4 forward resources are not attached".to_string())
+            })?
+            .scratch
+            .ple_normed;
+        let offset = row
+            .checked_mul(width)
+            .ok_or_else(|| BundleError::Forward("PLE row offset overflow".to_string()))?;
+        let end = row
+            .checked_add(rows)
+            .and_then(|end| end.checked_mul(width))
+            .ok_or_else(|| BundleError::Forward("PLE row extent overflow".to_string()))?;
+        if end > tensor.numel() {
+            return Err(BundleError::Forward(
+                "Qwen4 PLE rows are outside the forward scratch".to_string(),
+            ));
+        }
+        Ok(tensor.sub_offset(offset, tensor.numel() - offset))
+    }
+
     /// Start reading the PLE rows `tokens` (the next tokens after the
     /// committed history, in order) will need, so a forward over them later
     /// finds them cached. Best effort: a failure only loses the head start.
     pub(crate) fn warm_ple_rows(&self, tokens: &[u32]) {
-        let ids = self.state.ple_history.row_ids(&self.ple_metadata, tokens);
-        let _ = self.ple_rows.warm(ids);
+        if let Some(ple) = &self.ple {
+            let ids = self.state.ple_history.row_ids(&ple.metadata, tokens);
+            let _ = ple.rows.warm(ids);
+        }
     }
 
     pub(crate) fn spec_capture_token(
@@ -1104,11 +1328,7 @@ impl Qwen4Bundle {
     /// the greedy argmax (read into the first 4 bytes of `spec_host_top1`, no
     /// allocation); the row's logits stay in row 0 of `spec_logits` for a
     /// sampled follow-up. Clears any stale PLE lookahead first.
-    pub(crate) fn spec_ar_token(
-        &mut self,
-        gpu: &mut Gpu,
-        token: u32,
-    ) -> Result<u32, BundleError> {
+    pub(crate) fn spec_ar_token(&mut self, gpu: &mut Gpu, token: u32) -> Result<u32, BundleError> {
         let vocab = self.config.vocab_size;
         let logits = self
             .spec_logits
@@ -1185,6 +1405,63 @@ impl Qwen4Bundle {
         })
     }
 
+    /// [`Self::mtp_forward_token`] with the draft read deferred: the draft's
+    /// device work lands in `top1_out` (Raw, at least `Gpu::TOPK8_OUT_BYTES`)
+    /// and [`Self::mtp_draft_finish`] parses it once downloaded.
+    pub(crate) fn mtp_forward_token_deferred(
+        &mut self,
+        gpu: &mut Gpu,
+        token: u32,
+        backbone_hidden: Option<&GpuTensor>,
+        position: usize,
+        fresh_qsa_selection: bool,
+        top1_out: &GpuTensor,
+    ) -> Result<(), BundleError> {
+        mapped_mtp(self.mtp.as_mut(), gpu, position)?
+            .forward_token_deferred(
+                gpu,
+                &self.weights,
+                &self.config,
+                token,
+                backbone_hidden,
+                position,
+                fresh_qsa_selection,
+                top1_out,
+            )
+            .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
+    /// Parse a downloaded deferred draft (`top1_out`'s first
+    /// `Gpu::TOPK8_OUT_BYTES` bytes): the draft token, with the head's
+    /// margin and candidates updated as `draft` does.
+    pub(crate) fn mtp_draft_finish(&mut self, top: &[u8]) -> Result<u32, BundleError> {
+        self.mtp
+            .as_mut()
+            .ok_or_else(|| {
+                BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
+            })?
+            .draft
+            .draft_finish(top)
+            .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
+    /// Every byte family of the resident MTP head state
+    /// ([`crate::mtp_gpu::lab_head_items`]) followed by its draft request
+    /// state (`full_steps` u32 LE, `margin` f32 LE).
+    #[cfg(feature = "lab")]
+    pub fn lab_resident_head_items(&self, gpu: &Gpu) -> Result<Vec<(String, Vec<u8>)>, String> {
+        let mtp = self
+            .mtp
+            .as_ref()
+            .ok_or_else(|| "Qwen4 MTP resources are not attached".to_string())?;
+        let mut items = crate::mtp_gpu::lab_head_items(gpu, &mtp.state)?;
+        let request = mtp.draft.request_state();
+        let mut bytes = request.full_steps.to_le_bytes().to_vec();
+        bytes.extend_from_slice(&request.margin.to_le_bytes());
+        items.push(("draft_request_state".to_string(), bytes));
+        Ok(items)
+    }
+
     /// Exact logit margin of the last MTP draft over its runner-up.
     pub(crate) fn mtp_draft_margin(&self) -> f32 {
         self.mtp
@@ -1201,9 +1478,7 @@ impl Qwen4Bundle {
         self.mtp
             .as_ref()
             .map(|mtp| mtp.draft.request_state())
-            .ok_or_else(|| {
-                BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
-            })
+            .ok_or_else(|| BundleError::Forward("Qwen4 MTP resources are not attached".to_string()))
     }
 
     pub(crate) fn set_mtp_draft_request_state(
@@ -1213,9 +1488,7 @@ impl Qwen4Bundle {
         self.mtp
             .as_mut()
             .map(|mtp| mtp.draft.set_request_state(state))
-            .ok_or_else(|| {
-                BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
-            })
+            .ok_or_else(|| BundleError::Forward("Qwen4 MTP resources are not attached".to_string()))
     }
 
     /// GPU penalty prepass: apply `table` in place to its `table.rows()`
@@ -1423,6 +1696,19 @@ impl Qwen4Bundle {
         self.mtp.is_some() && Qwen4MtpGpu::append_rows_supported(gpu, &self.weights, &self.config)
     }
 
+    /// Map the MTP head's QSA context through `last_position` (the row the
+    /// last Append of a run writes) in one go: the coverage each Append's own
+    /// `mapped_mtp` would grow to, so those calls then find it mapped. A VMM
+    /// grow zero-fills with a blocking memset, which belongs where the device
+    /// is idle (before the run's first Append) rather than between launches.
+    pub(crate) fn mtp_map_through(
+        &mut self,
+        gpu: &mut Gpu,
+        last_position: usize,
+    ) -> Result<(), BundleError> {
+        mapped_mtp(self.mtp.as_mut(), gpu, last_position).map(|_| ())
+    }
+
     /// Batched prompt fill: [`MtpStep::Append`] for `tokens` at
     /// `position..position + tokens.len()`, row `i` paired with captured spec
     /// hidden row `hidden_row0 + i`; the same (token p, hidden p) rows as
@@ -1430,8 +1716,11 @@ impl Qwen4Bundle {
     ///
     /// `trunk_ids_row` is `Some(r)` when `tokens` are rows `r..` of the spec
     /// forward that just ran, with nothing run since: the head then embeds
-    /// from that forward's device token ids when they hold exactly `tokens`,
-    /// and uploads its own copy otherwise (or when `None`).
+    /// from that forward's device token ids when they hold exactly `tokens`.
+    /// Otherwise it embeds from `prompt_ids`, device ids that already hold
+    /// exactly `tokens` as i32 (the caller's once-per-chunk upload, see
+    /// `MtpAppendScratch::upload_prompt_ids`), and uploads its own copy when
+    /// that is `None` too.
     pub(crate) fn mtp_append_rows(
         &mut self,
         gpu: &mut Gpu,
@@ -1439,6 +1728,7 @@ impl Qwen4Bundle {
         tokens: &[u32],
         hidden_row0: usize,
         trunk_ids_row: Option<usize>,
+        prompt_ids: Option<&GpuTensor>,
         position: usize,
     ) -> Result<(), BundleError> {
         if tokens.is_empty() {
@@ -1472,11 +1762,12 @@ impl Qwen4Bundle {
         let hidden = source.sub_offset(offset, len);
         // The ids the trunk forward already uploaded stand in for the head's
         // own copy; no forward runs between that upload and this call.
-        let device_ids = trunk_ids_row.and_then(|row| {
+        let trunk_ids = trunk_ids_row.and_then(|row| {
             self.execution
                 .as_ref()
                 .and_then(|forward| forward.uploaded_token_ids(row, tokens))
         });
+        let device_ids = trunk_ids.as_ref().or(prompt_ids);
         let last = position
             .checked_add(tokens.len() - 1)
             .ok_or_else(|| BundleError::Forward("Qwen4 MTP position overflows".to_string()))?;
@@ -1488,7 +1779,7 @@ impl Qwen4Bundle {
                 scratch,
                 tokens,
                 &hidden,
-                device_ids.as_ref(),
+                device_ids,
                 position,
             )
             .map_err(|error| BundleError::Forward(error.to_string()))
@@ -1649,9 +1940,11 @@ impl Qwen4Bundle {
         let mut forward = self.execution.take().ok_or_else(|| {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
         })?;
+        let prior_scope = std::mem::replace(&mut forward.prefill_scope, true);
         let result = forward
             .forward_chunk(self, gpu, tokens, logits, top1, None, Qwen4OutputRows::All)
             .map_err(|error| BundleError::Forward(error.to_string()));
+        forward.prefill_scope = prior_scope;
         self.execution = Some(forward);
         result
     }
@@ -1671,6 +1964,7 @@ impl Qwen4Bundle {
         let mut forward = self.execution.take().ok_or_else(|| {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
         })?;
+        let prior_scope = std::mem::replace(&mut forward.prefill_scope, true);
         let result = forward
             .forward_chunk(
                 self,
@@ -1682,6 +1976,7 @@ impl Qwen4Bundle {
                 Qwen4OutputRows::Final,
             )
             .map_err(|error| BundleError::Forward(error.to_string()));
+        forward.prefill_scope = prior_scope;
         self.execution = Some(forward);
         result
     }
@@ -1698,9 +1993,11 @@ impl Qwen4Bundle {
         let mut forward = self.execution.take().ok_or_else(|| {
             BundleError::Forward("Qwen4 forward resources are not attached".to_string())
         })?;
+        let prior_scope = std::mem::replace(&mut forward.prefill_scope, true);
         let result = forward
             .forward_chunk_silent(self, gpu, tokens, None)
             .map_err(|error| BundleError::Forward(error.to_string()));
+        forward.prefill_scope = prior_scope;
         self.execution = Some(forward);
         result
     }
@@ -1708,13 +2005,19 @@ impl Qwen4Bundle {
     /// Name the tokens the next prefill forward is followed by, so it warms
     /// their PLE rows while its own chunk runs. Best effort; bytes unchanged.
     pub(crate) fn set_ple_lookahead(&mut self, tokens: &[u32]) {
+        if self.ple.is_none() {
+            return;
+        }
         if let Some(forward) = self.execution.as_mut() {
             forward.set_ple_lookahead(tokens);
         }
     }
 
     fn invalidate_ple_epoch(&self) -> Result<(), BundleError> {
-        self.ple_rows
+        let Some(ple) = &self.ple else {
+            return Ok(());
+        };
+        ple.rows
             .reset_epoch(PLE_RESET_TIMEOUT)
             .map(|_| ())
             .map_err(BundleError::PleRows)
@@ -1725,11 +2028,14 @@ impl Qwen4Bundle {
     /// `invalidate_ple_epoch` instead so work from the discarded state cannot
     /// publish after the state transition.
     fn quiesce_ple(&self) -> Result<(), BundleError> {
-        self.ple_rows
+        let Some(ple) = &self.ple else {
+            return Ok(());
+        };
+        ple.rows
             .quiesce(PLE_RESET_TIMEOUT)
             .map(|_| ())
             .map_err(BundleError::PleRows)?;
-        self.ple_rows.resume().map_err(BundleError::PleRows)
+        ple.rows.resume().map_err(BundleError::PleRows)
     }
 
     /// Reset every owner for a cold prefill.
@@ -1759,6 +2065,109 @@ impl Qwen4Bundle {
             None => 0,
         };
         Ok((target, mtp))
+    }
+
+    /// Device bytes the live state may still commit before it holds
+    /// `through` tokens (at most the admitted context), `(QSA context arenas
+    /// of target and MTP head, gathered prefill attention workspace)`: the
+    /// unmapped part of VMM arenas (0 for legacy ones, allocated whole) and
+    /// the workspace's extent past what this GPU committed (0 when the route
+    /// is off).
+    pub fn context_growth_bytes(&self, gpu: &Gpu, through: usize) -> (u64, u64) {
+        let through = through.min(self.state.max_seq_len);
+        let context = self.state.context_growth_bytes(through).saturating_add(
+            self.mtp
+                .as_ref()
+                .map_or(0, |mtp| mtp.context_growth_bytes(through)),
+        );
+        let gather = self
+            .state
+            .qsa
+            .first()
+            .filter(|qsa| rdna_compute::tensor_ops::qsa_gathered_wmma_enabled(gpu, qsa.format))
+            .and_then(|_| {
+                rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(
+                    self.config.num_key_value_heads,
+                    through,
+                )
+            })
+            .map_or(0, |bytes| {
+                (bytes as u64).saturating_sub(gpu.qsa_gather_scratch_bytes() as u64)
+            });
+        (context, gather)
+    }
+
+    /// Before a forward maps context past what is mapped (a VMM growth
+    /// boundary, never on the steady path), have the session cache free
+    /// snapshots until the growth through `end_position` fits: the cache
+    /// never causes a context allocation to fail.
+    pub(crate) fn release_session_for_growth(&mut self, gpu: &mut Gpu, end_position: usize) {
+        if self.session.is_none() || end_position <= self.state.mapped_context_tokens() {
+            return;
+        }
+        let (context, gather) = self.context_growth_bytes(gpu, end_position);
+        if let Some(cache) = self.session.as_mut() {
+            cache.release_for(gpu, context.saturating_add(gather));
+        }
+    }
+
+    /// Attach the PLE hot-row store and its worker thread: the row store reads
+    /// the rows its pack holds from the pack.  A geometry mismatch is logged
+    /// and the store is dropped (stopped and joined).  The hot store, the
+    /// prewarm and the rank table are Flash-Next-only: a profile without PLE
+    /// or a developer profile refuses (and drops the worker).
+    pub fn attach_ple_hot_store(&mut self, hot: PleHotWorker) -> Result<(), BundleError> {
+        let ple = self.ple_attachment_owner("hot-row store")?;
+        if let Err(error) = ple.rows.attach_hot_store(hot.store().clone()) {
+            eprintln!("  qwen4 ple hot store: not attached to the row store ({error})");
+            return Ok(());
+        }
+        ple.hot = Some(hot);
+        Ok(())
+    }
+
+    /// The attached PLE hot-row store, if any.
+    pub fn ple_hot_store(&self) -> Option<&std::sync::Arc<HotRowStore>> {
+        self.ple.as_ref()?.hot.as_ref().map(PleHotWorker::store)
+    }
+
+    /// Attach the page-cache prewarm of a Q4LM PLE sidecar (see
+    /// `hipfire_runtime::ple_prewarm`).  The bundle owns it from here:
+    /// `free_gpu` stops and joins it before the row store unloads.
+    pub fn attach_ple_prewarm(
+        &mut self,
+        prewarm: hipfire_runtime::ple_prewarm::PleRowsPrewarm,
+    ) -> Result<(), BundleError> {
+        self.ple_attachment_owner("sidecar prewarm")?.prewarm = Some(prewarm);
+        Ok(())
+    }
+
+    /// The attached PLE sidecar prewarm, if any.
+    pub fn ple_prewarm(&self) -> Option<&hipfire_runtime::ple_prewarm::PleRowsPrewarm> {
+        self.ple.as_ref()?.prewarm.as_ref()
+    }
+
+    /// Keep the prewarm worker of a rank-order PLE table
+    /// (`HotRowStore::spawn_table_worker`, wrapped with
+    /// [`PleHotWorker::new`]) with the bundle.  Unlike
+    /// [`Self::attach_ple_hot_store`] nothing is attached to the row store:
+    /// it was built over this very store at assembly.  `free_gpu` stops and
+    /// joins the worker before the row store unloads.
+    pub fn attach_ple_table_worker(&mut self, worker: PleHotWorker) -> Result<(), BundleError> {
+        self.ple_attachment_owner("rank-table worker")?.hot = Some(worker);
+        Ok(())
+    }
+
+    /// The PLE owner an attachment (hot store, prewarm, rank-table worker)
+    /// hangs from, or the refusal for a bundle that cannot carry one.
+    fn ple_attachment_owner(&mut self, what: &str) -> Result<&mut Qwen4BundlePle, BundleError> {
+        if !self.config.profile.is_flash_next() {
+            return Err(BundleError::Config(format!(
+                "the PLE {what} is Flash-Next-only; profile {} reads its embedded PLE rows directly",
+                self.config.profile.id()
+            )));
+        }
+        self.ple.as_mut().ok_or_else(no_ple_rows)
     }
 
     /// Attach the session cache (`hipfire_runtime::session_cache`): prefill
@@ -1822,9 +2231,8 @@ impl Qwen4Bundle {
     ) -> Result<(), BundleError> {
         // A lookahead left by an aborted request names another prompt's rows.
         self.set_ple_lookahead(&[]);
-        let live = reused > 0
-            && self.session.is_some()
-            && self.live_hit(prompt, route) == Some(reused);
+        let live =
+            reused > 0 && self.session.is_some() && self.live_hit(prompt, route) == Some(reused);
         self.live = None;
         self.turn = None;
         let capture = self.turn_snapshots_active();
@@ -1837,8 +2245,7 @@ impl Qwen4Bundle {
                 });
             })
         } else {
-            match self
-                .with_session(|cache, bundle| cache.begin(gpu, bundle, prompt, route, reused))
+            match self.with_session(|cache, bundle| cache.begin(gpu, bundle, prompt, route, reused))
             {
                 Some(result) => result.map_err(BundleError::Forward),
                 None if reused == 0 => self.reset(gpu),
@@ -1901,6 +2308,482 @@ impl Qwen4Bundle {
         Ok(())
     }
 
+    /// Request-state storage formats of the resident (and every lane) state.
+    pub fn state_format(&self) -> Qwen4StateFormat {
+        self.state_format
+    }
+
+    /// Stage the exact lane store: `max_lanes` request owners, at most
+    /// `row_budget` decode lanes per step. Lane states are allocated on first
+    /// admission into a slot. With `spec` every lane is an MTP lane (native
+    /// MTP windows of at most `spec.k` drafts); refused when the bundle has
+    /// no MTP head or `k + 1` verify rows exceed `LANE_MAX_ROWS`.
+    pub fn stage_lanes(
+        &mut self,
+        gpu: &mut Gpu,
+        max_lanes: usize,
+        row_budget: usize,
+        spec: Option<crate::lane::LaneSpecConfig>,
+    ) -> Result<(), BundleError> {
+        if self.lanes.is_some() {
+            return Err(BundleError::Forward(
+                "Qwen4 lanes are already staged".to_string(),
+            ));
+        }
+        if self.execution.is_none() {
+            return Err(BundleError::Forward(
+                "Qwen4 lanes need the attached forward".to_string(),
+            ));
+        }
+        if let Some(spec) = spec {
+            if self.mtp.is_none() {
+                return Err(BundleError::Forward(
+                    "Qwen4 MTP lanes need the attached MTP head".to_string(),
+                ));
+            }
+            if spec.k == 0 || spec.k + 1 > crate::gpu_forward_lanes::LANE_MAX_ROWS {
+                return Err(BundleError::Forward(format!(
+                    "Qwen4 MTP lanes need 1 <= k <= {}, got {}",
+                    crate::gpu_forward_lanes::LANE_MAX_ROWS - 1,
+                    spec.k
+                )));
+            }
+            // The lanes' prompt fill captures wide hidden rows into the
+            // resident spec buffer, as the singleton prefill does.
+            let chunk = self.spec_chunk_rows().unwrap_or(1).max(1);
+            self.ensure_spec_hidden(gpu, (spec.k + 1).max(chunk))?;
+        }
+        let store = crate::lane::Qwen4LaneStore::new(gpu, self, max_lanes, row_budget, spec)
+            .map_err(BundleError::Forward)?;
+        self.lanes = Some(store);
+        Ok(())
+    }
+
+    pub fn lanes(&self) -> Option<&crate::lane::Qwen4LaneStore> {
+        self.lanes.as_ref()
+    }
+
+    pub fn lanes_mut(&mut self) -> Option<&mut crate::lane::Qwen4LaneStore> {
+        self.lanes.as_mut()
+    }
+
+    /// The frozen §4.2 executor over the staged lanes.
+    pub fn lane_executor(
+        &mut self,
+    ) -> Result<crate::lane_exec::Qwen4LaneExecutor<'_>, BundleError> {
+        if self.lanes.is_none() {
+            return Err(BundleError::Forward(
+                "Qwen4 lanes are not staged".to_string(),
+            ));
+        }
+        Ok(crate::lane_exec::Qwen4LaneExecutor { bundle: self })
+    }
+
+    /// Run `f` on the staged store taken out of the bundle, so it may borrow
+    /// the bundle (weights, formats) while the store is mutated.
+    fn with_lanes<R>(
+        &mut self,
+        f: impl FnOnce(&mut crate::lane::Qwen4LaneStore, &mut Self) -> Result<R, String>,
+    ) -> Result<R, BundleError> {
+        let mut store = self
+            .lanes
+            .take()
+            .ok_or_else(|| BundleError::Forward("Qwen4 lanes are not staged".to_string()))?;
+        let result = f(&mut store, self);
+        self.lanes = Some(store);
+        result.map_err(BundleError::Forward)
+    }
+
+    /// Admit `epoch` with its canonical `prompt` into a free lane; returns
+    /// the lane slot.
+    pub fn admit_lane(
+        &mut self,
+        gpu: &mut Gpu,
+        epoch: hipfire_runtime::slot_batch::RequestEpoch,
+        prompt: Vec<u32>,
+    ) -> Result<usize, BundleError> {
+        self.with_lanes(|store, bundle| store.admit(gpu, bundle, epoch, prompt))
+    }
+
+    /// Free `epoch`'s lane (its device state stays allocated for reuse).
+    pub fn release_lane(
+        &mut self,
+        epoch: &hipfire_runtime::slot_batch::RequestEpoch,
+    ) -> Result<(), BundleError> {
+        self.with_lanes(|store, _| store.release(epoch))
+    }
+
+    /// Mark `epoch`'s lane untrusted: it runs no further step.
+    pub fn poison_lane(&mut self, epoch: &hipfire_runtime::slot_batch::RequestEpoch) {
+        if let Some(store) = self.lanes.as_mut() {
+            store.poison(epoch);
+        }
+    }
+
+    /// Feed `token` as `epoch`'s next AR row instead of its last pick (the
+    /// singleton's think-budget forced close tokens).
+    pub fn force_lane_seed(
+        &mut self,
+        epoch: &hipfire_runtime::slot_batch::RequestEpoch,
+        token: u32,
+    ) -> Result<(), BundleError> {
+        self.with_lanes(|store, _| store.force_seed(epoch, token))
+    }
+
+    /// The resident owners must be at a clean window boundary to move into a
+    /// lane: no armed GDN ring and no outstanding trunk or head snapshot.
+    fn promotion_resident_ready(&self) -> Result<(), String> {
+        if self.state.row_capture_armed {
+            return Err("promotion: the resident GDN ring is armed".to_string());
+        }
+        if self.state.snapshot_active() {
+            return Err("promotion: the resident trunk has an active snapshot ticket".to_string());
+        }
+        if self
+            .mtp
+            .as_ref()
+            .is_some_and(|mtp| mtp.state.snapshot_active())
+        {
+            return Err("promotion: the resident MTP head has an active snapshot ticket".to_string());
+        }
+        Ok(())
+    }
+
+    /// Promotion step 1 (fallible, resident untouched): admit `epoch` into a
+    /// free lane as Decoding with `prompt`, the `generated` picks and
+    /// `pending_seed` (the next AR row's token), `prefilled = prompt.len()`,
+    /// allocating the slot's states if it has none. On an MTP lane store the
+    /// singleton drafter's `parts` seed the lane: its pending hidden is
+    /// copied in and the lane policy starts from its agreement (a retired
+    /// request stays `ArRetired`); an AR store takes `None`. Refused: lanes
+    /// not staged, a step in flight, no free lane, `position` not the
+    /// resident `state.position`, an armed ring or an active snapshot ticket
+    /// on the resident owners, a spec store without `parts` (or an AR store
+    /// with), and `state.position != head.position` unless retired. Pair
+    /// with [`Self::commit_promotion`] or [`Self::abort_promotion`].
+    #[allow(clippy::too_many_arguments)]
+    pub fn prepare_promotion(
+        &mut self,
+        gpu: &mut Gpu,
+        epoch: hipfire_runtime::slot_batch::RequestEpoch,
+        prompt: Vec<u32>,
+        generated: Vec<u32>,
+        pending_seed: u32,
+        position: usize,
+        parts: Option<crate::mtp_spec::Qwen4PromotionParts<'_>>,
+    ) -> Result<usize, BundleError> {
+        let spec = self
+            .lanes
+            .as_ref()
+            .ok_or_else(|| BundleError::Forward("Qwen4 lanes are not staged".to_string()))?
+            .spec();
+        if position != self.state.position {
+            return Err(BundleError::Forward(format!(
+                "promotion: position {position} is not the resident state's {}",
+                self.state.position
+            )));
+        }
+        self.promotion_resident_ready().map_err(BundleError::Forward)?;
+        match (spec, parts.as_ref()) {
+            (Some(_), None) => {
+                return Err(BundleError::Forward(
+                    "promotion: an MTP lane store needs the drafter's parts".to_string(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(BundleError::Forward(
+                    "promotion: an AR lane store takes no drafter parts".to_string(),
+                ));
+            }
+            _ => {}
+        }
+        if let (Some(spec), Some(parts)) = (spec, parts.as_ref()) {
+            let head = self.mtp.as_ref().ok_or_else(|| {
+                BundleError::Forward("Qwen4 MTP resources are not attached".to_string())
+            })?;
+            if !parts.retired && head.position() != self.state.position {
+                return Err(BundleError::Forward(format!(
+                    "promotion: the MTP head is at {}, the resident state at {}",
+                    head.position(),
+                    self.state.position
+                )));
+            }
+            // The lane keeps the resident state's GDN ring: size it for the
+            // lane's windows (bytes unchanged; a no-op once large enough).
+            self.state
+                .ensure_row_capture(gpu, spec.k + 1, self.config.linear_conv_kernel_dim - 1)
+                .map_err(|e| BundleError::Forward(format!("promotion: resident ring: {e}")))?;
+        }
+        self.with_lanes(|store, bundle| {
+            store.admit_promoted(gpu, bundle, epoch, prompt, generated, pending_seed, parts)
+        })
+    }
+
+    /// Undo a prepared promotion: release `epoch`'s lane. The resident state
+    /// was never touched by [`Self::prepare_promotion`].
+    pub fn abort_promotion(
+        &mut self,
+        epoch: &hipfire_runtime::slot_batch::RequestEpoch,
+    ) -> Result<(), BundleError> {
+        self.with_lanes(|store, _| store.release(epoch))
+    }
+
+    /// Promotion step 3: swap the resident trunk state (and, on an MTP lane
+    /// store, the resident head state and draft request state) into the
+    /// prepared lane `epoch`, then reset the resident owners for the next
+    /// singleton request ([`Self::reset`]: session live record and turn
+    /// dropped). Every refusal comes before the swap and leaves both sides
+    /// untouched; once the lane holds the moved states only the reset can
+    /// fail, and its error is returned with the lane already live.
+    pub fn commit_promotion(
+        &mut self,
+        gpu: &mut Gpu,
+        epoch: &hipfire_runtime::slot_batch::RequestEpoch,
+    ) -> Result<(), BundleError> {
+        self.with_lanes(|store, bundle| {
+            if store.phase != crate::lane_exec::LanePhase::Idle {
+                return Err("promotion: a lane step is in flight".to_string());
+            }
+            let ring_rows = store.spec().map(|spec| spec.k + 1);
+            bundle.promotion_resident_ready()?;
+            let lane = store
+                .lane_mut(epoch)
+                .ok_or_else(|| format!("promotion: unknown or stale epoch {epoch:?}"))?;
+            if lane.host.status != crate::lane::LaneStatus::Decoding {
+                return Err(format!(
+                    "promotion: lane {epoch:?} is {:?}, not Decoding",
+                    lane.host.status
+                ));
+            }
+            if lane.spec.is_some() != bundle.mtp.is_some() {
+                return Err("promotion: the lane's MTP state does not match the bundle".to_string());
+            }
+            if let Some(rows) = ring_rows {
+                if bundle.state.row_capture_rows() < rows {
+                    return Err(format!(
+                        "promotion: the resident ring holds {} rows, the lane needs {rows}",
+                        bundle.state.row_capture_rows()
+                    ));
+                }
+            }
+            std::mem::swap(&mut bundle.state, &mut lane.state);
+            if let (Some(spec), Some(mtp)) = (lane.spec.as_mut(), bundle.mtp.as_mut()) {
+                std::mem::swap(&mut mtp.state, &mut spec.head);
+                spec.draft = mtp.draft.request_state();
+                mtp.draft.reset_request_state();
+            }
+            Ok(())
+        })?;
+        self.reset(gpu)
+    }
+
+    /// A fresh lane trunk state: the resident state's formats, QSA backend
+    /// and context bound, allocated through the same constructor.
+    pub(crate) fn new_lane_state(&self, gpu: &mut Gpu) -> Result<Qwen4State, BundleError> {
+        Qwen4State::new_with_backend(
+            gpu,
+            &self.config,
+            self.state.max_seq_len,
+            self.state_format,
+            self.state.qsa_backend(),
+        )
+        .map_err(BundleError::State)
+    }
+
+    pub(crate) fn lane_vocab(&self) -> usize {
+        self.config.vocab_size
+    }
+
+    /// The tile [`Self::prefill_final`] runs next on a cold prefill of
+    /// `prompt` that has forwarded `prefilled` tokens: up to the next session
+    /// boundary (the cache's cold schedule, when one is attached), tiled by
+    /// the forward's `max_chunk` from the segment start.
+    pub fn lane_prefill_tile_len(&self, prompt: &[u32], prefilled: usize) -> usize {
+        let remaining = prompt.len().saturating_sub(prefilled);
+        let Some(max_chunk) = self.spec_chunk_rows() else {
+            return remaining;
+        };
+        // The cold schedule's segments start at 0 and at every boundary; a
+        // segment is tiled by `max_chunk` from its start.
+        let boundaries = if self.session.is_some() {
+            SessionState::snapshot_boundaries(self, prompt, 0, prompt.len())
+        } else {
+            Vec::new()
+        };
+        let segment_start = boundaries
+            .iter()
+            .copied()
+            .filter(|&b| b <= prefilled)
+            .max()
+            .unwrap_or(0);
+        let segment_end = boundaries
+            .iter()
+            .copied()
+            .find(|&b| b > prefilled)
+            .unwrap_or(prompt.len())
+            .min(prompt.len());
+        let tile_end =
+            segment_start + ((prefilled - segment_start) / max_chunk + 1).saturating_mul(max_chunk);
+        tile_end
+            .min(segment_end)
+            .saturating_sub(prefilled)
+            .min(remaining)
+    }
+
+    /// Run `f` with the lane's `state` (and, when given, its head state and
+    /// draft request state) swapped into the resident slots, the session
+    /// cache out and the forward in lane scope with no PLE lookahead, so
+    /// the singleton chunk/verify/head programs run on the lane's own
+    /// states and never record or replay the resident state's retained
+    /// body. Everything is back in place, the lane's updated draft request
+    /// state written to `head`, before this returns; `Err` is only returned
+    /// before anything was swapped (no forward attached, or `head` given
+    /// with no MTP head attached).
+    pub(crate) fn with_lane<R>(
+        &mut self,
+        state: &mut Qwen4State,
+        head: Option<(
+            &mut crate::mtp_gpu::MtpGpuState,
+            &mut hipfire_dispatch::pipeline::DraftHeadRequestState,
+        )>,
+        f: impl FnOnce(&mut Self) -> R,
+    ) -> Result<R, BundleError> {
+        if self.execution.is_none() {
+            return Err(BundleError::Forward(
+                "Qwen4 forward resources are not attached".to_string(),
+            ));
+        }
+        if head.is_some() && self.mtp.is_none() {
+            return Err(BundleError::Forward(
+                "Qwen4 MTP resources are not attached".to_string(),
+            ));
+        }
+        let mut head = head;
+        let session = self.session.take();
+        std::mem::swap(&mut self.state, state);
+        let resident_draft = match (head.as_mut(), self.mtp.as_mut()) {
+            (Some((head_state, draft)), Some(mtp)) => {
+                std::mem::swap(&mut mtp.state, &mut **head_state);
+                let resident = mtp.draft.request_state();
+                mtp.draft.set_request_state(**draft);
+                Some(resident)
+            }
+            _ => None,
+        };
+        let prior_scope = match self.execution.as_mut() {
+            Some(forward) => {
+                let prior = forward.lane_scope;
+                forward.lane_scope = true;
+                // No lookahead names this lane's next rows: never adopt
+                // another request's PLE ticket by accident (ids would have
+                // to match exactly, which keeps bytes identical anyway, but
+                // the prefetch is wasted).
+                forward.set_ple_lookahead(&[]);
+                prior
+            }
+            None => false,
+        };
+        let result = f(self);
+        if let Some(forward) = self.execution.as_mut() {
+            forward.lane_scope = prior_scope;
+        }
+        if let (Some(resident), Some((head_state, draft)), Some(mtp)) =
+            (resident_draft, head.as_mut(), self.mtp.as_mut())
+        {
+            **draft = mtp.draft.request_state();
+            mtp.draft.set_request_state(resident);
+            std::mem::swap(&mut mtp.state, &mut **head_state);
+        }
+        std::mem::swap(&mut self.state, state);
+        self.session = session;
+        Ok(result)
+    }
+
+    /// One prefill tile of a lane: the singleton chunk program
+    /// (`forward_chunk_final` / `forward_chunk_silent`) on `state`, inside
+    /// [`Self::with_lane`] (lanes keep no session cache; the forward never
+    /// records or replays the resident state's retained body). The resident
+    /// state is back in place on every return path.
+    pub(crate) fn lane_prefill_tile(
+        &mut self,
+        gpu: &mut Gpu,
+        state: &mut Qwen4State,
+        tokens: &[u32],
+        final_logits: Option<&GpuTensor>,
+    ) -> Result<(), BundleError> {
+        self.with_lane(state, None, |bundle| {
+            let mut forward = bundle.execution.take().ok_or_else(|| {
+                BundleError::Forward("Qwen4 forward resources are not attached".to_string())
+            })?;
+            let prior_scope = std::mem::replace(&mut forward.prefill_scope, true);
+            let result = match final_logits {
+                Some(logits) => forward.forward_chunk(
+                    bundle,
+                    gpu,
+                    tokens,
+                    logits,
+                    None,
+                    None,
+                    Qwen4OutputRows::Final,
+                ),
+                None => forward.forward_chunk_silent(bundle, gpu, tokens, None),
+            }
+            .map_err(|error| BundleError::Forward(error.to_string()));
+            forward.prefill_scope = prior_scope;
+            bundle.execution = Some(forward);
+            result
+        })?
+    }
+
+    /// A fresh prefill-wave lane state: the same constructor as a lane
+    /// store's states (the resident state's formats, QSA backend and context
+    /// bound).
+    pub fn new_wave_state(&self, gpu: &mut Gpu) -> Result<Qwen4State, BundleError> {
+        self.new_lane_state(gpu)
+    }
+
+    /// One prefill wave: every lane's rows forwarded together
+    /// ([`crate::gpu_forward_lanes`] module docs). Each lane state's QSA
+    /// arenas are mapped through its end position first; the wave then runs
+    /// one forward in which row-local stages follow `policy` and stateful
+    /// stages run per lane on the lane's own state, publishing each lane's
+    /// host state as the singleton forward does. `logits` is F32,
+    /// `lanes.len() * vocab` (`WaveHead::Final`) or `total_rows * vocab`
+    /// (`WaveHead::All`); `top1` is Raw, one i32 per output row. The wave
+    /// never touches the resident `state`, the MTP head, the session cache
+    /// or the retained tape (eager HIP); `execution` is back in place on
+    /// every return path.
+    pub fn prefill_wave(
+        &mut self,
+        gpu: &mut Gpu,
+        lanes: &mut [crate::gpu_forward_lanes::WaveLane<'_>],
+        head: crate::gpu_forward_lanes::WaveHead,
+        logits: &GpuTensor,
+        top1: Option<&GpuTensor>,
+        policy: &crate::gpu_forward_lanes::LaneStagePolicy,
+    ) -> Result<(), BundleError> {
+        for lane in lanes.iter_mut() {
+            let end = lane
+                .state
+                .position
+                .checked_add(lane.tokens.len())
+                .ok_or_else(|| BundleError::Forward("Qwen4 wave lane position overflows".to_string()))?;
+            if end > lane.state.max_seq_len {
+                return Err(BundleError::Forward(format!(
+                    "Qwen4 wave lane end position {end} exceeds its context capacity {}",
+                    lane.state.max_seq_len
+                )));
+            }
+            lane.state.ensure_mapped_capacity(gpu, end).map_err(|error| {
+                BundleError::Forward(format!(
+                    "map Qwen4 wave lane QSA context through {end} tokens: {error}"
+                ))
+            })?;
+        }
+        crate::gpu_forward_lanes::forward_wave(gpu, self, lanes, head, logits, top1, policy)
+            .map_err(|error| BundleError::Forward(error.to_string()))
+    }
+
     pub fn snapshot(&mut self, gpu: &mut Gpu) -> Result<Qwen4StateSnapshot, BundleError> {
         self.quiesce_ple()?;
         self.state.snapshot(gpu).map_err(BundleError::State)
@@ -1953,7 +2836,7 @@ impl Qwen4Bundle {
         let Qwen4Bundle {
             weights,
             state,
-            ple_rows,
+            ple,
             weight_store,
             execution,
             mtp,
@@ -1962,12 +2845,26 @@ impl Qwen4Bundle {
             spec_hidden,
             session,
             penalty_stage,
+            lanes,
             ..
         } = self;
+        let ple_rows = ple.map(|ple| {
+            let Qwen4BundlePle {
+                rows, hot, prewarm, ..
+            } = ple;
+            // The hot-row store's worker reads the pack and the model file:
+            // stop and join it before the row store unloads.
+            drop(hot);
+            // The sidecar prewarm reads the sidecar the row store also reads.
+            drop(prewarm);
+            rows
+        });
         if let Some(mut session) = session {
             session.clear(gpu);
         }
-        let ple_result = ple_rows.unload().map(|_| ()).map_err(BundleError::PleRows);
+        let ple_result = ple_rows
+            .map(|rows| rows.unload().map(|_| ()).map_err(BundleError::PleRows))
+            .unwrap_or(Ok(()));
         let execution_result = execution
             .map(|forward| forward.free_gpu(gpu).map_err(BundleError::Hip))
             .unwrap_or(Ok(()));
@@ -1987,10 +2884,17 @@ impl Qwen4Bundle {
             .map_or(Ok(()), |error| Err(BundleError::Hip(error)))
             .and(
                 penalty_stage
-                    .map(|stage| gpu.free_penalty_table_stage(stage).map_err(BundleError::Hip))
+                    .map(|stage| {
+                        gpu.free_penalty_table_stage(stage)
+                            .map_err(BundleError::Hip)
+                    })
                     .unwrap_or(Ok(())),
             );
-        let state_result = state.free_gpu(gpu).map_err(BundleError::State);
+        // Lane states are request owners like `state`: free them first.
+        let lanes_result = lanes
+            .map(|store| store.free_gpu(gpu).map_err(BundleError::Forward))
+            .unwrap_or(Ok(()));
+        let state_result = lanes_result.and(state.free_gpu(gpu).map_err(BundleError::State));
         let weight_result = weights.free_gpu(gpu).map_err(BundleError::Hip);
         let store_result = weight_store.drain(gpu).map_err(BundleError::Hip);
         first_bundle_error([
@@ -2084,12 +2988,20 @@ impl hipfire_runtime::arch_model::ArchModel for Qwen4Bundle {
     }
 }
 
-const PLE_SHARD_NAME_PREFIX: &str =
-    "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_";
+/// Name prefix of the PLE shard tensors of `ple`
+/// (`model.language_model.layers.{layer}.ple...ngram_embedding.shard_`); the
+/// Flash-Next layer is 1.
+fn ple_shard_name_prefix(ple: &Qwen4PleConfig) -> String {
+    format!(
+        "model.language_model.layers.{}.ple.ple_embedding.ngram_embedding.shard_",
+        ple.layer
+    )
+}
 
-fn ple_shard_index(name: &str) -> Result<usize, WeightError> {
+fn ple_shard_index(ple: &Qwen4PleConfig, name: &str) -> Result<usize, WeightError> {
+    let prefix = ple_shard_name_prefix(ple);
     let suffix = name
-        .strip_prefix(PLE_SHARD_NAME_PREFIX)
+        .strip_prefix(prefix.as_str())
         .and_then(|name| name.strip_suffix(".weight"))
         .ok_or_else(|| {
             WeightError::DescriptorMismatch(format!("invalid PLE shard name '{name}'"))
@@ -2102,7 +3014,7 @@ fn ple_shard_index(name: &str) -> Result<usize, WeightError> {
     let index = suffix
         .parse::<usize>()
         .map_err(|_| WeightError::DescriptorMismatch(format!("invalid PLE shard name '{name}'")))?;
-    if index >= PLE_SHARD_COUNT || index.to_string() != suffix {
+    if index >= ple.shard_count || index.to_string() != suffix {
         return Err(WeightError::DescriptorMismatch(format!(
             "PLE shard index {index} is outside canonical range in '{name}'"
         )));
@@ -2112,19 +3024,20 @@ fn ple_shard_index(name: &str) -> Result<usize, WeightError> {
 
 fn ordered_ple_entries<'a>(
     manifest: &'a Qwen4Manifest,
+    ple: &Qwen4PleConfig,
 ) -> Result<Vec<&'a WeightEntry>, WeightError> {
     let entries = manifest.external_entries().collect::<Vec<_>>();
-    if entries.len() != PLE_SHARD_COUNT {
+    if entries.len() != ple.shard_count {
         return Err(WeightError::PleShardCount {
-            expected: PLE_SHARD_COUNT,
+            expected: ple.shard_count,
             actual: entries.len(),
         });
     }
-    let mut ordered = vec![None; PLE_SHARD_COUNT];
+    let mut ordered = vec![None; ple.shard_count];
     for entry in entries {
-        let index = ple_shard_index(&entry.name)?;
-        if entry.layer != Some(1)
-            || entry.logical_shape.as_slice() != [PLE_SHARD_ROWS, PLE_ROW_WIDTH]
+        let index = ple_shard_index(ple, &entry.name)?;
+        if entry.layer != Some(ple.layer)
+            || entry.logical_shape.as_slice() != [ple.shard_rows, ple.row_width]
         {
             return Err(WeightError::DescriptorMismatch(entry.name.clone()));
         }
@@ -2143,6 +3056,102 @@ fn ordered_ple_entries<'a>(
             })
         })
         .collect()
+}
+
+/// [`validate_ple_metadata`] for an explicit profile geometry: the stored
+/// head tables must match the profile's head count and its physical row
+/// layout (`shard_count * shard_rows` padded rows, per-shard valid rows).
+fn validate_ple_geometry(
+    ple: &Qwen4PleConfig,
+    metadata: &PleHashMetadata,
+) -> Result<(), BundleError> {
+    let mismatch = |message: String| BundleError::Weights(WeightError::DescriptorMismatch(message));
+    if metadata.head_count() != ple.head_count {
+        return Err(mismatch(format!(
+            "PLE metadata has {} head tables; the profile declares {}",
+            metadata.head_count(),
+            ple.head_count
+        )));
+    }
+    let physical_rows = (ple.shard_rows as u64)
+        .checked_mul(ple.shard_count as u64)
+        .ok_or_else(|| mismatch("PLE physical row count overflow".to_string()))?;
+    if metadata.padded_rows() != physical_rows {
+        return Err(mismatch(format!(
+            "PLE metadata padded rows {} do not match physical rows {physical_rows}",
+            metadata.padded_rows()
+        )));
+    }
+    let valid_rows = (0..ple.shard_count).try_fold(0u64, |sum, shard| {
+        sum.checked_add(ple.shard_valid_rows(shard) as u64)
+            .ok_or_else(|| mismatch("PLE valid row count overflow".to_string()))
+    })?;
+    if metadata.valid_rows() != valid_rows {
+        return Err(mismatch(format!(
+            "PLE metadata valid rows {} do not match canonical rows {valid_rows}",
+            metadata.valid_rows()
+        )));
+    }
+    Ok(())
+}
+
+/// The refusal of a PLE operation on a profile that declares no PLE.
+fn no_ple_rows() -> BundleError {
+    BundleError::Weights(WeightError::DescriptorMismatch(
+        "qwen4: this profile declares no PLE; it has no PLE rows source".into(),
+    ))
+}
+
+/// Whether the Qwen4 executor can run `config` at all: the weights binder's
+/// profile admission (a developer profile only under the
+/// `qwen4-dev-profiles` feature, and only a dense FFN) and the forward's
+/// (the RoPE base the QSA kernels implement).  Both refusals otherwise
+/// surface after the weights were fulfilled onto the device; a loader calls
+/// this right after artifact admission, before any allocation.
+pub fn admit_executable_profile(config: &Qwen4Config) -> Result<(), BundleError> {
+    crate::weights::admit_executable_profile(config).map_err(BundleError::Weights)?;
+    Qwen4GpuForward::admit_profile(config).map_err(|error| BundleError::Forward(error.to_string()))
+}
+
+/// What a PLE-declaring profile builds its [`Qwen4BundlePle`] from.
+struct PleInputs {
+    metadata: PleHashMetadata,
+    source: Qwen4PleRows,
+}
+
+/// The profile, the PLE hash metadata and the rows source must agree before
+/// anything is assembled: `config.ple` `None` <=> no metadata <=> no rows
+/// source.  Sidecar rows (and with them the hot store, the prewarm and the
+/// rank table) are Flash-Next-only; a developer profile reads its embedded
+/// rows.  The metadata must match the profile's PLE geometry.
+fn admit_ple_inputs(
+    config: &Qwen4Config,
+    metadata: Option<PleHashMetadata>,
+    source: Qwen4PleRows,
+) -> Result<Option<PleInputs>, BundleError> {
+    let refuse = |message: String| BundleError::Weights(WeightError::DescriptorMismatch(message));
+    let profile = config.profile.id();
+    match (config.ple.as_ref(), metadata, source) {
+        (None, None, Qwen4PleRows::Absent) => Ok(None),
+        (None, _, _) => Err(refuse(format!(
+            "qwen4: profile {profile} declares no PLE, so it takes no PLE hash metadata and no PLE rows source"
+        ))),
+        (Some(_), None, _) => Err(refuse(format!(
+            "qwen4: profile {profile} declares PLE but no PLE hash metadata was provided"
+        ))),
+        (Some(_), Some(_), Qwen4PleRows::Absent) => Err(refuse(format!(
+            "qwen4: profile {profile} declares PLE but no PLE rows source was provided"
+        ))),
+        (Some(ple), Some(metadata), source) => {
+            if !config.profile.is_flash_next() && !matches!(source, Qwen4PleRows::Embedded) {
+                return Err(refuse(format!(
+                    "qwen4: PLE sidecar rows are Flash-Next-only; profile {profile} reads its embedded PLE rows"
+                )));
+            }
+            validate_ple_geometry(ple, &metadata)?;
+            Ok(Some(PleInputs { metadata, source }))
+        }
+    }
 }
 
 fn validate_ple_metadata(metadata: &PleHashMetadata) -> Result<(), BundleError> {
@@ -2179,13 +3188,286 @@ fn validate_ple_metadata(metadata: &PleHashMetadata) -> Result<(), BundleError> 
     }
     Ok(())
 }
+
+/// Inputs of the PLE hot-row store, resolved before the weight sweep from the
+/// PLE rows source's shard descriptors (no transaction exists yet).
+#[derive(Debug)]
+pub struct PleHotPlan {
+    /// Absolute file offset of each PLE shard's first row in
+    /// [`Self::source_path`], in shard order.
+    pub shard_offsets: Vec<u64>,
+    pub rows_per_shard: usize,
+    /// Row encoding of the PLE shards: Q8F16 or Q4Lm (`ple_hot_plan` returns
+    /// `None` for any other).
+    pub row_encoding: RowEncoding,
+    /// Values per PLE row.
+    pub row_width: usize,
+    pub encoded_row_bytes: usize,
+    pub padded_rows: u64,
+    /// Lowercase hex of [`PleHashMetadata::fingerprint`], the sidecar's key.
+    pub fingerprint_hex: String,
+    /// The rows source file the shard offsets address: the model file
+    /// (monolithic artifact) or the PLE rows sidecar.  The hot-row pack is
+    /// cut from, bound to and verified against exactly this file.
+    pub source_path: PathBuf,
+    /// Length of [`Self::source_path`], the pack header's binding.
+    pub source_file_bytes: u64,
+}
+
+/// The hot-row store's plan, or `None` when the PLE shards are neither Q8F16
+/// nor Q4Lm (the store holds raw encoded rows).  `descriptors` are the 128
+/// ordered shard ranges of the rows source (`Qwen4HfqmArtifact::
+/// ple_row_descriptors`); `source_path` / `source_file_bytes` name that
+/// source's file.
+pub fn ple_hot_plan(
+    metadata: &PleHashMetadata,
+    descriptors: &[SourceRangeDescriptor],
+    source_path: &Path,
+    source_file_bytes: u64,
+) -> Result<Option<PleHotPlan>, String> {
+    hot_plan_from_layouts(
+        metadata,
+        &shard_layouts(descriptors),
+        source_path,
+        source_file_bytes,
+    )
+}
+
+/// [`ple_hot_plan`] over the layout facts of the descriptors.
+fn hot_plan_from_layouts(
+    metadata: &PleHashMetadata,
+    descriptors: &[ShardLayout],
+    source_path: &Path,
+    source_file_bytes: u64,
+) -> Result<Option<PleHotPlan>, String> {
+    validate_ple_metadata(metadata).map_err(|error| error.to_string())?;
+    if descriptors.len() != PLE_SHARD_COUNT {
+        return Err(format!(
+            "PLE rows source has {} shard descriptors, expected {PLE_SHARD_COUNT}",
+            descriptors.len()
+        ));
+    }
+    let mut encoding = None;
+    let mut shard_offsets = Vec::with_capacity(descriptors.len());
+    for (shard, descriptor) in descriptors.iter().enumerate() {
+        let shard_encoding = match RowEncoding::from_dtype(&descriptor.dtype) {
+            Some(shard_encoding @ (RowEncoding::Q8F16 | RowEncoding::Q4Lm)) => shard_encoding,
+            _ => return Ok(None),
+        };
+        if *encoding.get_or_insert(shard_encoding) != shard_encoding {
+            return Err(format!(
+                "PLE shard {shard} is {} but shard 0 is {}",
+                shard_encoding.dtype_name(),
+                encoding.unwrap_or(shard_encoding).dtype_name()
+            ));
+        }
+        let row_bytes = shard_encoding.encoded_row_bytes(PLE_ROW_WIDTH);
+        let expected = (PLE_SHARD_ROWS * row_bytes) as u64;
+        if descriptor.logical_shape.as_slice() != [PLE_SHARD_ROWS, PLE_ROW_WIDTH]
+            || descriptor.length != expected
+        {
+            return Err(format!(
+                "PLE shard {shard} is {:?} / {} bytes, expected [{PLE_SHARD_ROWS}, {PLE_ROW_WIDTH}] / {expected}",
+                descriptor.logical_shape, descriptor.length
+            ));
+        }
+        shard_offsets.push(descriptor.offset);
+    }
+    let Some(row_encoding) = encoding else {
+        return Ok(None);
+    };
+    let fingerprint_hex = metadata
+        .fingerprint()
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>();
+    Ok(Some(PleHotPlan {
+        shard_offsets,
+        rows_per_shard: PLE_SHARD_ROWS,
+        row_encoding,
+        row_width: PLE_ROW_WIDTH,
+        encoded_row_bytes: row_encoding.encoded_row_bytes(PLE_ROW_WIDTH),
+        padded_rows: metadata.padded_rows(),
+        fingerprint_hex,
+        source_path: source_path.to_path_buf(),
+        source_file_bytes,
+    }))
+}
+
+/// A PLE hot-row store and its worker thread (verification, then prewarm).
+/// Dropping stops the worker and joins it (the worker holds its own `Arc`),
+/// so every load error path and unload quiesces it.
+pub struct PleHotWorker {
+    store: std::sync::Arc<HotRowStore>,
+    handle: Option<std::thread::JoinHandle<()>>,
+}
+
+impl PleHotWorker {
+    pub fn new(store: std::sync::Arc<HotRowStore>, handle: std::thread::JoinHandle<()>) -> Self {
+        Self {
+            store,
+            handle: Some(handle),
+        }
+    }
+
+    pub fn store(&self) -> &std::sync::Arc<HotRowStore> {
+        &self.store
+    }
+}
+
+impl Drop for PleHotWorker {
+    fn drop(&mut self) {
+        self.store.stop();
+        if let Some(handle) = self.handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+/// The sidecar's 128 shard descriptors, checked to the same standard as
+/// [`ple_descriptors`] checks the embedded ones: count, order, shape, row
+/// stride (Q8F16's 170 or Q4LM's 90 bytes, one encoding for all shards),
+/// extent, valid rows (through the metadata) and one sealed
+/// [`SourceFormat::PleRows`] identity.
+fn sidecar_ple_descriptors(
+    descriptors: &[SourceRangeDescriptor],
+    metadata: &PleHashMetadata,
+) -> Result<Vec<SourceRangeDescriptor>, BundleError> {
+    let mismatch = |message: String| BundleError::Weights(WeightError::DescriptorMismatch(message));
+    validate_ple_metadata(metadata)?;
+    check_sidecar_layout(&shard_layouts(descriptors)).map_err(mismatch)?;
+    let first = &descriptors[0];
+    if first.source_identity().format != SourceFormat::PleRows {
+        return Err(mismatch(
+            "PLE sidecar descriptors are not sealed from a PLE rows file".to_string(),
+        ));
+    }
+    for (shard, descriptor) in descriptors.iter().enumerate() {
+        if descriptor.source_identity() != first.source_identity() {
+            return Err(mismatch(format!(
+                "PLE sidecar shard {shard} source identity differs"
+            )));
+        }
+    }
+    Ok(descriptors.to_vec())
+}
+
+/// The part of a shard descriptor the PLE row layout checks read.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ShardLayout {
+    dtype: String,
+    logical_shape: Vec<usize>,
+    offset: u64,
+    length: u64,
+}
+
+fn shard_layouts(descriptors: &[SourceRangeDescriptor]) -> Vec<ShardLayout> {
+    descriptors
+        .iter()
+        .map(|descriptor| ShardLayout {
+            dtype: descriptor.dtype.clone(),
+            logical_shape: descriptor.logical_shape.clone(),
+            offset: descriptor.offset,
+            length: descriptor.length,
+        })
+        .collect()
+}
+
+/// A sidecar's shard layout: [`PLE_SHARD_COUNT`] shards of one Q8F16/Q4Lm
+/// encoding, each `[PLE_SHARD_ROWS, PLE_ROW_WIDTH]`, laid back to back in
+/// shard order (so position proves order: shard `i` sits at
+/// `first.offset + i * shard_bytes`).
+fn check_sidecar_layout(layouts: &[ShardLayout]) -> Result<RowEncoding, String> {
+    if layouts.len() != PLE_SHARD_COUNT {
+        return Err(format!(
+            "PLE sidecar has {} shard descriptors, expected {PLE_SHARD_COUNT}",
+            layouts.len()
+        ));
+    }
+    let first = &layouts[0];
+    let encoding = match RowEncoding::from_dtype(&first.dtype) {
+        Some(encoding @ (RowEncoding::Q8F16 | RowEncoding::Q4Lm)) => encoding,
+        _ => {
+            return Err(format!(
+                "PLE sidecar rows are {}, expected Q8_0 or Q4LM",
+                first.dtype
+            ))
+        }
+    };
+    let shard_bytes = (PLE_SHARD_ROWS * encoding.encoded_row_bytes(PLE_ROW_WIDTH)) as u64;
+    for (shard, layout) in layouts.iter().enumerate() {
+        let expected_offset = first.offset.checked_add(shard as u64 * shard_bytes);
+        if RowEncoding::from_dtype(&layout.dtype) != Some(encoding)
+            || layout.logical_shape.as_slice() != [PLE_SHARD_ROWS, PLE_ROW_WIDTH]
+            || layout.length != shard_bytes
+            || Some(layout.offset) != expected_offset
+        {
+            return Err(format!(
+                "PLE sidecar shard {shard} is {} {:?} at {} for {} bytes, expected {} \
+                 [{PLE_SHARD_ROWS}, {PLE_ROW_WIDTH}] at {expected_offset:?} for {shard_bytes} bytes",
+                layout.dtype,
+                layout.logical_shape,
+                layout.offset,
+                layout.length,
+                encoding.dtype_name(),
+            ));
+        }
+    }
+    Ok(encoding)
+}
+
+/// The bundle's PLE row store over its rows source: the embedded shards'
+/// descriptors (from the fulfilled transaction), a row-order sidecar's
+/// descriptors, or a rank-order table's store.
+fn build_ple_row_store(
+    source: &Qwen4PleRows,
+    transaction: &WeightLoadTransaction,
+    manifest: &Qwen4Manifest,
+    ple: &Qwen4PleConfig,
+    metadata: &PleHashMetadata,
+    staging_rows: usize,
+    wide_readers: bool,
+) -> Result<RowStore, BundleError> {
+    let descriptors = match source {
+        Qwen4PleRows::Absent => return Err(no_ple_rows()),
+        Qwen4PleRows::Embedded => ple_descriptors(transaction, manifest, ple, metadata)?,
+        Qwen4PleRows::Sidecar {
+            rows: SidecarRows::Descriptors(descriptors),
+            ..
+        } => sidecar_ple_descriptors(descriptors, metadata)?,
+        Qwen4PleRows::Sidecar {
+            rows: SidecarRows::Table(store),
+            ..
+        } => {
+            validate_ple_metadata(metadata)?;
+            return RowStore::from_table_store(
+                "qwen4-ple-reader",
+                store.clone(),
+                metadata.valid_rows(),
+                staging_rows,
+                wide_readers,
+            )
+            .map_err(BundleError::PleRows);
+        }
+    };
+    RowStore::with_staging_rows(
+        "qwen4-ple-reader",
+        descriptors,
+        metadata.valid_rows(),
+        staging_rows,
+        wide_readers,
+    )
+    .map_err(BundleError::PleRows)
+}
+
 fn ple_descriptors(
     transaction: &WeightLoadTransaction,
     manifest: &Qwen4Manifest,
+    ple: &Qwen4PleConfig,
     metadata: &PleHashMetadata,
 ) -> Result<Vec<SourceRangeDescriptor>, BundleError> {
-    validate_ple_metadata(metadata)?;
-    let entries = ordered_ple_entries(manifest).map_err(BundleError::Weights)?;
+    validate_ple_geometry(ple, metadata)?;
+    let entries = ordered_ple_entries(manifest, ple).map_err(BundleError::Weights)?;
     let mut descriptors: Vec<SourceRangeDescriptor> = Vec::with_capacity(entries.len());
     let mut valid_rows_total = 0u64;
     for (index, entry) in entries.into_iter().enumerate() {
@@ -2216,13 +3498,11 @@ fn ple_descriptors(
         // fulfilled. Here the declaration only has to name a tier the reader
         // decodes, so a sealed BF16-PLE artifact stays loadable next to a
         // Q8F16 one.
-        if ![
-            RowEncoding::Bf16.encoded_row_bytes(PLE_ROW_WIDTH),
-            RowEncoding::Q8F16.encoded_row_bytes(PLE_ROW_WIDTH),
-        ]
-        .contains(&row_bytes)
-            || valid_rows != ple_valid_rows_for_shard(index)
-        {
+        let accepted = [RowEncoding::Bf16, RowEncoding::Q8F16]
+            .into_iter()
+            .filter_map(|encoding| encoding.checked_encoded_row_bytes(ple.row_width))
+            .collect::<Vec<_>>();
+        if !accepted.contains(&row_bytes) || valid_rows != ple.shard_valid_rows(index) {
             return Err(BundleError::Weights(WeightError::DescriptorMismatch(
                 entry.name.clone(),
             )));
@@ -2336,6 +3616,10 @@ pub enum BundleError {
         error: hip_bridge::HipError,
     },
     Transaction(WeightStoreError),
+    /// Native MTP was requested for a profile whose weights carry no MTP head.
+    NoMtpHead {
+        profile: String,
+    },
 }
 
 impl From<WeightError> for BundleError {
@@ -2363,6 +3647,10 @@ impl fmt::Display for BundleError {
                 write!(f, "Qwen4 bundle cleanup after {cause}: {error}")
             }
             Self::Transaction(error) => write!(f, "Qwen4 bundle transaction: {error}"),
+            Self::NoMtpHead { profile } => write!(
+                f,
+                "Qwen4 bundle: profile {profile} has no MTP head; native MTP cannot attach"
+            ),
         }
     }
 }
@@ -2374,10 +3662,104 @@ mod tests {
     use super::*;
     use crate::ple::PLE_HEAD_COUNT;
 
+    /// The 128 canonical shard layouts of `encoding`, laid back to back from
+    /// `base` (a sidecar's data section).
+    fn layouts(encoding: RowEncoding, base: u64) -> Vec<ShardLayout> {
+        let shard_bytes = (PLE_SHARD_ROWS * encoding.encoded_row_bytes(PLE_ROW_WIDTH)) as u64;
+        (0..PLE_SHARD_COUNT)
+            .map(|shard| ShardLayout {
+                dtype: encoding.dtype_name().to_string(),
+                logical_shape: vec![PLE_SHARD_ROWS, PLE_ROW_WIDTH],
+                offset: base + shard as u64 * shard_bytes,
+                length: shard_bytes,
+            })
+            .collect()
+    }
+
+    #[test]
+    fn hot_plan_covers_q8f16_and_q4lm_sources() {
+        let metadata = PleHashMetadata::qwen4();
+        for (encoding, row_bytes) in [(RowEncoding::Q8F16, 170), (RowEncoding::Q4Lm, 90)] {
+            let path = Path::new("/models/flash.ple-q4");
+            let plan = hot_plan_from_layouts(&metadata, &layouts(encoding, 4096), path, 12_345)
+                .unwrap()
+                .expect("a plan for this encoding");
+            assert_eq!(plan.row_encoding, encoding);
+            assert_eq!(plan.encoded_row_bytes, row_bytes);
+            assert_eq!(plan.row_width, PLE_ROW_WIDTH);
+            assert_eq!(plan.rows_per_shard, PLE_SHARD_ROWS);
+            assert_eq!(plan.padded_rows, metadata.padded_rows());
+            assert_eq!(plan.shard_offsets.len(), PLE_SHARD_COUNT);
+            assert_eq!(plan.shard_offsets[0], 4096);
+            assert_eq!(
+                plan.shard_offsets[1] - plan.shard_offsets[0],
+                (PLE_SHARD_ROWS * row_bytes) as u64
+            );
+            assert_eq!(plan.source_path, path);
+            assert_eq!(plan.source_file_bytes, 12_345);
+            assert_eq!(plan.fingerprint_hex.len(), 64);
+        }
+    }
+
+    #[test]
+    fn hot_plan_is_off_for_bf16_and_refuses_inconsistent_shards() {
+        let metadata = PleHashMetadata::qwen4();
+        let path = Path::new("/models/flash.mq4-xts");
+        // BF16 shards (an old artifact): no plan, not an error.
+        let mut bf16 = layouts(RowEncoding::Q8F16, 0);
+        for layout in &mut bf16 {
+            layout.dtype = "BF16".to_string();
+            layout.length = (PLE_SHARD_ROWS * 320) as u64;
+        }
+        assert!(hot_plan_from_layouts(&metadata, &bf16, path, 1)
+            .unwrap()
+            .is_none());
+        // A short list, a wrong extent and a mixed encoding are errors.
+        let q8 = layouts(RowEncoding::Q8F16, 0);
+        assert!(hot_plan_from_layouts(&metadata, &q8[..127], path, 1).is_err());
+        let mut short = q8.clone();
+        short[5].length -= 1;
+        let error = hot_plan_from_layouts(&metadata, &short, path, 1).unwrap_err();
+        assert!(error.contains("shard 5"), "{error}");
+        let mut mixed = q8.clone();
+        mixed[7].dtype = "Q4LM".to_string();
+        mixed[7].length = (PLE_SHARD_ROWS * 90) as u64;
+        let error = hot_plan_from_layouts(&metadata, &mixed, path, 1).unwrap_err();
+        assert!(error.contains("shard 7"), "{error}");
+        let mut reshaped = q8;
+        reshaped[0].logical_shape = vec![PLE_SHARD_ROWS, 128];
+        assert!(hot_plan_from_layouts(&metadata, &reshaped, path, 1).is_err());
+    }
+
+    #[test]
+    fn sidecar_layout_accepts_both_encodings_and_proves_order_by_position() {
+        for encoding in [RowEncoding::Q8F16, RowEncoding::Q4Lm] {
+            let mut ok = layouts(encoding, 8192);
+            assert_eq!(check_sidecar_layout(&ok).unwrap(), encoding);
+            // Swapping two shards (out of order) is refused.
+            ok.swap(2, 3);
+            let error = check_sidecar_layout(&ok).unwrap_err();
+            assert!(error.contains("shard 2"), "{error}");
+        }
+        let q4 = layouts(RowEncoding::Q4Lm, 0);
+        // The 90-byte stride is part of the contract: a 170-byte extent under a
+        // Q4LM label is refused, as is a short shard list or a BF16 sidecar.
+        let mut wrong_stride = q4.clone();
+        wrong_stride[0].length = (PLE_SHARD_ROWS * 170) as u64;
+        assert!(check_sidecar_layout(&wrong_stride).is_err());
+        assert!(check_sidecar_layout(&q4[..100]).is_err());
+        let mut bf16 = q4;
+        for layout in &mut bf16 {
+            layout.dtype = "BF16".to_string();
+        }
+        let error = check_sidecar_layout(&bf16).unwrap_err();
+        assert!(error.contains("expected Q8_0 or Q4LM"), "{error}");
+    }
+
     #[test]
     fn rejects_metadata_with_same_padding_but_different_valid_rows() {
         let canonical = PleHashMetadata::qwen4();
-        let mut sizes = *canonical.head_vocab_sizes();
+        let mut sizes: [u64; PLE_HEAD_COUNT] = canonical.head_vocab_sizes().try_into().unwrap();
         sizes[PLE_HEAD_COUNT - 1] -= 1;
         let mut offsets = [0u64; PLE_HEAD_COUNT];
         for head in 1..PLE_HEAD_COUNT {
@@ -2428,7 +3810,10 @@ mod tests {
         assert!(message_end_boundaries(&prompt, END, 7, 7).is_empty());
         assert!(message_end_boundaries(&prompt, END, 3, 4).is_empty());
         // Consecutive im_end tokens each end a message.
-        assert_eq!(message_end_boundaries(&[END, END, 1, END], END, 0, 4), [1, 2, 4]);
+        assert_eq!(
+            message_end_boundaries(&[END, END, 1, END], END, 0, 4),
+            [1, 2, 4]
+        );
         // im_end at the last position ends at the prompt length.
         assert_eq!(message_end_boundaries(&[1, 2, END], END, 0, 3), [3]);
         // `up_to` beyond the prompt never reads past it.
@@ -2441,18 +3826,27 @@ mod tests {
         prompt[2] = END; // ends at 3
         prompt[7] = END; // ends at 8: a chunk multiple
         prompt[13] = END; // ends at 14
-        // Chunk multiples only without a token (flag off or token unknown).
-        assert_eq!(session_boundaries(4, &prompt, None, 0, 20), [4, 8, 12, 16, 20]);
+                          // Chunk multiples only without a token (flag off or token unknown).
+        assert_eq!(
+            session_boundaries(4, &prompt, None, 0, 20),
+            [4, 8, 12, 16, 20]
+        );
         // Union, sorted and deduplicated (8 is both).
         assert_eq!(
             session_boundaries(4, &prompt, Some(END), 0, 20),
             [3, 4, 8, 12, 14, 16, 20]
         );
         // The `(after, up_to]` window applies to both sources.
-        assert_eq!(session_boundaries(4, &prompt, Some(END), 3, 14), [4, 8, 12, 14]);
+        assert_eq!(
+            session_boundaries(4, &prompt, Some(END), 3, 14),
+            [4, 8, 12, 14]
+        );
         assert_eq!(session_boundaries(4, &prompt, None, 3, 14), [4, 8, 12]);
         // Message ends below one chunk are boundaries on their own.
-        assert_eq!(session_boundaries(64, &prompt, Some(END), 0, 20), [3, 8, 14]);
+        assert_eq!(
+            session_boundaries(64, &prompt, Some(END), 0, 20),
+            [3, 8, 14]
+        );
         assert!(session_boundaries(64, &prompt, None, 0, 20).is_empty());
         // A prompt without the token matches the chunk-only schedule.
         assert_eq!(
@@ -2496,10 +3890,22 @@ mod tests {
         assert_eq!(live_start(Some(&mtp), &prompt, MTP, 3, Some(3), true), None);
         // AR ignores the head; MTP needs it exactly at L (floor retirement
         // leaves it behind, a missing head cannot continue).
-        assert_eq!(live_start(Some(&ar), &prompt, AR, 3, Some(1), false), Some(3));
-        assert_eq!(live_start(Some(&mtp), &prompt, MTP, 3, Some(3), false), Some(3));
-        assert_eq!(live_start(Some(&mtp), &prompt, MTP, 3, Some(2), false), None);
-        assert_eq!(live_start(Some(&mtp), &prompt, MTP, 3, Some(4), false), None);
+        assert_eq!(
+            live_start(Some(&ar), &prompt, AR, 3, Some(1), false),
+            Some(3)
+        );
+        assert_eq!(
+            live_start(Some(&mtp), &prompt, MTP, 3, Some(3), false),
+            Some(3)
+        );
+        assert_eq!(
+            live_start(Some(&mtp), &prompt, MTP, 3, Some(2), false),
+            None
+        );
+        assert_eq!(
+            live_start(Some(&mtp), &prompt, MTP, 3, Some(4), false),
+            None
+        );
         assert_eq!(live_start(Some(&mtp), &prompt, MTP, 3, None, false), None);
     }
 
@@ -2529,16 +3935,37 @@ mod tests {
     fn live_after_commit_checks_head_and_row_capture() {
         let prompt = [1, 2, 3];
         let consumed = [1, 2, 3, 7, 8];
-        assert!(live_after_commit(&prompt, MTP, &consumed, 5, Some(5), false));
+        assert!(live_after_commit(
+            &prompt,
+            MTP,
+            &consumed,
+            5,
+            Some(5),
+            false
+        ));
         // Floor retirement left the head behind (or absent).
-        assert!(!live_after_commit(&prompt, MTP, &consumed, 5, Some(3), false));
+        assert!(!live_after_commit(
+            &prompt,
+            MTP,
+            &consumed,
+            5,
+            Some(3),
+            false
+        ));
         assert!(!live_after_commit(&prompt, MTP, &consumed, 5, None, false));
         // AR does not care about the head.
         assert!(live_after_commit(&prompt, AR, &consumed, 5, Some(3), false));
         assert!(live_after_commit(&prompt, AR, &consumed, 5, None, false));
         // Row capture armed.
         assert!(!live_after_commit(&prompt, AR, &consumed, 5, None, true));
-        assert!(!live_after_commit(&prompt, MTP, &consumed, 5, Some(5), true));
+        assert!(!live_after_commit(
+            &prompt,
+            MTP,
+            &consumed,
+            5,
+            Some(5),
+            true
+        ));
     }
 
     #[test]
@@ -2570,5 +3997,215 @@ mod tests {
         // A re-rendered history that rewrote the assistant turn diverges.
         let rewritten = [1u32, 2, 3, 70, 8, 11, 12];
         assert_eq!(live_start(Some(&rec), &rewritten, AR, 5, None, false), None);
+    }
+
+    use crate::config::Qwen4FfnConfig;
+
+    fn dense_config(with_ple: bool, with_mtp: bool) -> Qwen4Config {
+        crate::config::synthetic_test_config(
+            Qwen4FfnConfig::Dense {
+                intermediate_size: 8,
+            },
+            16,
+            4,
+            with_ple,
+            with_mtp,
+        )
+    }
+
+    fn ple_metadata_of(config: &Qwen4Config) -> PleHashMetadata {
+        PleHashMetadata::from_json_for(
+            &config.developer_metadata_json(),
+            config.ple.as_ref().expect("a PLE profile"),
+        )
+        .expect("developer PLE metadata")
+    }
+
+    #[test]
+    fn ple_inputs_must_agree_with_the_profile() {
+        let pled = dense_config(true, true);
+        let bare = dense_config(false, false);
+        let metadata = ple_metadata_of(&pled);
+        let sidecar = || Qwen4PleRows::Sidecar {
+            path: PathBuf::from("/models/dev.ple-q8"),
+            encoding: RowEncoding::Q8F16,
+            rows: SidecarRows::Descriptors(Vec::new()),
+        };
+        // PLE <=> metadata <=> rows source.
+        assert!(matches!(
+            admit_ple_inputs(&pled, Some(metadata.clone()), Qwen4PleRows::Embedded),
+            Ok(Some(_))
+        ));
+        assert!(matches!(
+            admit_ple_inputs(&bare, None, Qwen4PleRows::Absent),
+            Ok(None)
+        ));
+        let refused = |result: Result<Option<PleInputs>, BundleError>| match result {
+            Ok(_) => panic!("expected a refusal"),
+            Err(error) => error.to_string(),
+        };
+        assert!(refused(admit_ple_inputs(
+            &bare,
+            Some(metadata.clone()),
+            Qwen4PleRows::Absent
+        ))
+        .contains("declares no PLE"));
+        assert!(
+            refused(admit_ple_inputs(&bare, None, Qwen4PleRows::Embedded))
+                .contains("declares no PLE")
+        );
+        assert!(
+            refused(admit_ple_inputs(&pled, None, Qwen4PleRows::Embedded))
+                .contains("no PLE hash metadata")
+        );
+        assert!(refused(admit_ple_inputs(
+            &pled,
+            Some(metadata.clone()),
+            Qwen4PleRows::Absent
+        ))
+        .contains("no PLE rows source"));
+        // Sidecar rows are Flash-Next-only.
+        assert!(
+            refused(admit_ple_inputs(&pled, Some(metadata), sidecar())).contains("Flash-Next-only")
+        );
+        // The metadata must be this profile's geometry: the pinned Flash-Next
+        // tables have 16 heads, the tiny profile 2.
+        assert!(refused(admit_ple_inputs(
+            &pled,
+            Some(PleHashMetadata::qwen4()),
+            Qwen4PleRows::Embedded
+        ))
+        .contains("head tables"));
+    }
+
+    #[test]
+    fn flash_next_geometry_checks_equal_the_pinned_constants() {
+        let config = crate::config::compact_test_config();
+        let ple = config.ple.as_ref().expect("Flash-Next declares PLE");
+        assert_eq!(
+            (
+                ple.shard_count,
+                ple.shard_rows,
+                ple.row_width,
+                ple.head_count
+            ),
+            (
+                PLE_SHARD_COUNT,
+                PLE_SHARD_ROWS,
+                PLE_ROW_WIDTH,
+                PLE_HEAD_COUNT
+            )
+        );
+        let metadata = PleHashMetadata::qwen4();
+        validate_ple_geometry(ple, &metadata)
+            .expect("the pinned metadata fits the pinned geometry");
+        validate_ple_metadata(&metadata).expect("the Flash-Next sidecar/hot check agrees");
+        assert!(matches!(
+            admit_ple_inputs(&config, Some(metadata.clone()), Qwen4PleRows::Embedded),
+            Ok(Some(_))
+        ));
+        // A different padded row count fails both checks the same way.
+        let mut other = ple.clone();
+        other.shard_rows -= 1;
+        assert!(validate_ple_geometry(&other, &metadata).is_err());
+        // The shard tensors are the pinned layer-1 names.
+        assert_eq!(
+            ple_shard_name_prefix(ple),
+            "model.language_model.layers.1.ple.ple_embedding.ngram_embedding.shard_"
+        );
+        let manifest = Qwen4Manifest::build(&config).expect("FN manifest");
+        let entries = ordered_ple_entries(&manifest, ple).expect("128 ordered shards");
+        assert_eq!(entries.len(), PLE_SHARD_COUNT);
+        assert!(entries.iter().all(|entry| entry.layer == Some(1)
+            && entry.logical_shape == [PLE_SHARD_ROWS, PLE_ROW_WIDTH]));
+    }
+
+    #[test]
+    fn synthetic_shards_follow_the_profile_geometry() {
+        let config = dense_config(true, true);
+        let ple = config.ple.as_ref().expect("PLE profile");
+        let prefix = ple_shard_name_prefix(ple);
+        assert!(
+            prefix.contains(&format!(".layers.{}.ple.", ple.layer)),
+            "{prefix}"
+        );
+        let name = |index: usize| format!("{prefix}{index}.weight");
+        assert_eq!(ple_shard_index(ple, &name(0)).unwrap(), 0);
+        assert!(ple_shard_index(ple, &name(ple.shard_count)).is_err());
+        assert!(ple_shard_index(ple, &format!("{prefix}00.weight")).is_err());
+        let manifest = Qwen4Manifest::build(&config).expect("synthetic manifest");
+        let entries = ordered_ple_entries(&manifest, ple).expect("ordered synthetic shards");
+        assert_eq!(entries.len(), ple.shard_count);
+        for entry in &entries {
+            assert_eq!(entry.layer, Some(ple.layer));
+            assert_eq!(entry.logical_shape, [ple.shard_rows, ple.row_width]);
+        }
+        validate_ple_geometry(ple, &ple_metadata_of(&config)).expect("synthetic metadata");
+        // The staged prefetch width comes from the profile, not the pinned 16.
+        assert_eq!(ple.head_count, 2);
+    }
+
+    #[test]
+    fn session_snapshots_omit_the_absent_ple_parts() {
+        use crate::state::Qwen4StateFormat;
+        let with = dense_config(true, true);
+        let without = dense_config(false, true);
+        let format = Qwen4StateFormat::F32;
+        let part = |bytes: usize| bytes.next_multiple_of(256);
+        let ple_bytes = with.ple_conv_history_rows() * with.hidden_size * with.hc_count * 4;
+        assert!(ple_bytes > 0 && without.ple_conv_history_rows() == 0);
+        for p in [1usize, 3, 8] {
+            let with_ple = session_snapshot_bytes(&with, format, false, p).expect("with PLE");
+            let no_ple = session_snapshot_bytes(&without, format, false, p).expect("without PLE");
+            assert_eq!(with_ple - no_ple, part(ple_bytes) as u64, "p={p}");
+        }
+    }
+
+    #[test]
+    fn a_head_free_profile_refuses_native_mtp_with_a_typed_error() {
+        assert!(Qwen4Bundle::require_mtp_head("tiny-dense", true).is_ok());
+        match Qwen4Bundle::require_mtp_head("tiny-dense", false) {
+            Err(error @ BundleError::NoMtpHead { .. }) => {
+                let text = error.to_string();
+                assert!(
+                    text.contains("tiny-dense") && text.contains("no MTP head"),
+                    "{text}"
+                );
+            }
+            other => panic!("expected NoMtpHead, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn executable_profile_admission_runs_before_any_allocation() {
+        // Flash-Next and a dense developer profile (with the kernel RoPE base)
+        // are executable, with and without PLE and MTP.
+        admit_executable_profile(&crate::config::compact_test_config()).expect("Flash-Next");
+        for (with_ple, with_mtp) in [(true, true), (false, false), (true, false), (false, true)] {
+            let mut config = dense_config(with_ple, with_mtp);
+            config.rope_theta = crate::program::QWEN4_QSA_KERNEL_ROPE_THETA;
+            admit_executable_profile(&config)
+                .unwrap_or_else(|error| panic!("dense ple={with_ple} mtp={with_mtp}: {error}"));
+        }
+        // A RoPE base the QSA kernels do not implement is the forward's refusal.
+        let error = admit_executable_profile(&dense_config(true, true)).unwrap_err();
+        assert!(matches!(error, BundleError::Forward(_)), "{error}");
+        // A synthetic MoE has no sealed route: the weights refusal text.
+        let moe = crate::config::synthetic_test_config(
+            Qwen4FfnConfig::Moe {
+                num_experts: 8,
+                top_k: 2,
+                intermediate_size: 64,
+                shared_intermediate_size: Some(64),
+                norm_topk_prob: true,
+            },
+            256,
+            4,
+            true,
+            true,
+        );
+        let error = admit_executable_profile(&moe).unwrap_err();
+        assert!(matches!(error, BundleError::Weights(_)), "{error}");
+        assert!(error.to_string().contains("no sealed MoE route"), "{error}");
     }
 }

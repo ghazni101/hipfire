@@ -6,8 +6,8 @@
 //! store's DFlash lanes). See [`draft_forward_lanes`].
 
 use super::{
-    draft_ffn_layer, gemm_dispatch, ring_segments, upload_slice_i32, DflashConfig, DflashLayerWeights,
-    DflashScratch, DflashWeights, DraftCtxMode,
+    draft_dtod_at, draft_ffn_layer, gemm_dispatch, ordered_draft, ring_segments, upload_slice_i32, DflashConfig,
+    DflashLayerWeights, DflashScratch, DflashWeights, DraftCtxMode,
 };
 use hip_bridge::HipResult;
 use rdna_compute::{Gpu, GpuTensor};
@@ -43,15 +43,29 @@ struct LaneGeo {
     cached_rows: usize,
 }
 
+/// The key positions a lane uploads: from `l - w_full` on in windowed mode
+/// (the windowed `positions_k` holds the full-window span), the whole
+/// `[l + b]` array in legacy mode.
+fn lane_key_positions<'p>(ls: &DflashScratch, positions_k: &'p [i32], l: usize) -> &'p [i32] {
+    match ls.ctx_mode {
+        DraftCtxMode::Legacy => positions_k,
+        DraftCtxMode::Windowed { w_full, .. } => &positions_k[l.saturating_sub(w_full)..],
+    }
+}
+
 /// Context fill of one layer of one lane: the incremental K/V projection of
 /// the rows past the layer's watermark into the lane's own K/V ring. Verbatim
 /// the context block of `draft_forward_opts` (`q_dummy` is the ignored query
-/// operand of the K-only RoPE).
+/// operand of the K-only RoPE). The FWHT rotation temporaries of the two
+/// GEMMs come from `shared` (see [`draft_forward_lanes`]), never from the
+/// lane: a lane scratch may be allocated without them.
+#[allow(clippy::too_many_arguments)]
 fn lane_ctx_fill(
     gpu: &mut Gpu,
     cfg: &DflashConfig,
     layer: &DflashLayerWeights,
     ls: &DflashScratch,
+    shared: &DflashScratch,
     q_dummy: &GpuTensor,
     li: usize,
     g: &LaneGeo,
@@ -101,8 +115,8 @@ fn lane_ctx_fill(
             &layer.wk,
             &k_slot,
             step,
-            ls.mq_x_rot.as_ref(),
-            ls.mq_x_rot_f16.as_ref(),
+            shared.mq_x_rot.as_ref(),
+            shared.mq_x_rot_f16.as_ref(),
         )?;
         gemm_dispatch(
             gpu,
@@ -110,8 +124,8 @@ fn lane_ctx_fill(
             &layer.wv,
             &v_slot,
             step,
-            ls.mq_x_rot.as_ref(),
-            ls.mq_x_rot_f16.as_ref(),
+            shared.mq_x_rot.as_ref(),
+            shared.mq_x_rot_f16.as_ref(),
         )?;
         gpu.rmsnorm_batched(&k_slot, &layer.k_norm, &k_slot, step * cfg.n_kv_heads, hd, eps)?;
         let fill_positions = ls.positions_k.sub_offset(row - g.pos_base, step);
@@ -133,6 +147,7 @@ fn lane_attention(
     shared: &DflashScratch,
     li: usize,
     g: &LaneGeo,
+    ordered: bool,
 ) -> HipResult<()> {
     let kvd = cfg.kv_dim();
     let qd = cfg.q_dim();
@@ -164,16 +179,12 @@ fn lane_attention(
     let mut cat_off = 0usize;
     for (_row0, slot0, len) in ring_segments(span_start, l, layer_w) {
         let seg_bytes = len * kvd * 4;
-        gpu.hip
-            .memcpy_dtod_at(&k_cat_l.buf, cat_off, &k_cache_layer.buf, slot0 * kvd * 4, seg_bytes)?;
-        gpu.hip
-            .memcpy_dtod_at(&v_cat_l.buf, cat_off, &v_cache_layer.buf, slot0 * kvd * 4, seg_bytes)?;
+        draft_dtod_at(gpu, ordered, &k_cat_l.buf, cat_off, &k_cache_layer.buf, slot0 * kvd * 4, seg_bytes)?;
+        draft_dtod_at(gpu, ordered, &v_cat_l.buf, cat_off, &v_cache_layer.buf, slot0 * kvd * 4, seg_bytes)?;
         cat_off += seg_bytes;
     }
-    gpu.hip
-        .memcpy_dtod_at(&k_cat_l.buf, cat_off, &shared.k_noise.buf, g.off * kvd * 4, noise_bytes)?;
-    gpu.hip
-        .memcpy_dtod_at(&v_cat_l.buf, cat_off, &shared.v_noise.buf, g.off * kvd * 4, noise_bytes)?;
+    draft_dtod_at(gpu, ordered, &k_cat_l.buf, cat_off, &shared.k_noise.buf, g.off * kvd * 4, noise_bytes)?;
+    draft_dtod_at(gpu, ordered, &v_cat_l.buf, cat_off, &shared.v_noise.buf, g.off * kvd * 4, noise_bytes)?;
     let q_view = shared.q.sub_offset(g.off * qd, b * qd);
     let out_view = shared.attn_out.sub_offset(g.off * qd, b * qd);
     let is_swa_layer = g.windowed && (g.all_sliding_windowed || !is_full_layer);
@@ -233,6 +244,20 @@ fn lane_attention(
 /// row-count independent for the row counts used (`sum b_i`); the caller owns
 /// that proof (exact gfx1201 MQ4 v2 below 64 rows). Requires the non-fused
 /// (non-gfx1100) draft route, `ctx_slice = None` geometry and no FFN graph.
+///
+/// FWHT rotation scratch: the per-lane GEMMs (the `fc` projection and the
+/// context-fill `wk`/`wv`) rotate their activation into `shared.mq_x_rot`
+/// / `shared.mq_x_rot_f16`, NOT into the lane's own buffers (a lane may be
+/// allocated without them). This is byte-exact: the rotation buffer is a
+/// per-`gemm_dispatch`-call temporary (each call writes the rotated rows,
+/// the GEMM reads them, in the same call and on the single stream, and
+/// nothing reads it afterwards), and `gemm_dispatch` chunks by the element
+/// count of the buffer, which is identical for every `DflashScratch`
+/// (`MQ_X_ROT_CHUNK_ROWS × max(inter, q_dim, num_extract × hidden)`,
+/// independent of block/context size) — so chunking, kernels and row order
+/// are unchanged. A lane that does own a rotation buffer must match the
+/// shared one in shape (checked), and MQ draft weights with no shared
+/// rotation buffer are an error, not a panic.
 pub fn draft_forward_lanes(
     gpu: &mut Gpu,
     weights: &DflashWeights,
@@ -242,6 +267,25 @@ pub fn draft_forward_lanes(
 ) -> HipResult<()> {
     if lanes.is_empty() {
         return Ok(());
+    }
+    // Checked before any launch: the per-lane GEMMs borrow the shared
+    // rotation scratch (see the doc comment).
+    if weights.has_mq && shared.mq_x_rot.is_none() {
+        return Err(hip_bridge::HipError::new(
+            0,
+            "draft_forward_lanes: MQ draft weights need the shared FWHT rotation scratch (shared.mq_x_rot is None)",
+        ));
+    }
+    if let Some(sh) = shared.mq_x_rot.as_ref() {
+        if lanes
+            .iter()
+            .any(|ln| ln.scratch.mq_x_rot.as_ref().is_some_and(|t| t.shape != sh.shape))
+        {
+            return Err(hip_bridge::HipError::new(
+                0,
+                "draft_forward_lanes: a lane's own FWHT rotation scratch differs in size from the shared one",
+            ));
+        }
     }
     if gpu.draft_collapse_fused_enabled() {
         return Err(hip_bridge::HipError::new(
@@ -259,8 +303,25 @@ pub fn draft_forward_lanes(
     assert!(total <= shared.max_block_size, "lane rows > shared scratch max");
 
     // ── Per-lane geometry, key positions, context projection ─────────────
+    let ordered = ordered_draft();
+    // Owned staging (capacity `max_block_size >= total`, never grown).
+    shared.lane_positions_q.clear();
+    for lane in lanes.iter() {
+        shared.lane_positions_q.extend_from_slice(lane.positions_q);
+    }
+    if ordered {
+        // Every host position upload precedes the draft body, so no
+        // synchronous H2D drains the queue between the lane fc GEMMs. The fc
+        // GEMMs and hidden norms read no positions; every position reader
+        // (context RoPE, query/noise RoPE) still runs after its upload.
+        for lane in lanes.iter() {
+            assert_eq!(lane.positions_k.len(), lane.ctx_len + lane.b, "positions_k size");
+            let ls = &*lane.scratch;
+            upload_slice_i32(gpu, &ls.positions_k, lane_key_positions(ls, lane.positions_k, lane.ctx_len))?;
+        }
+        upload_slice_i32(gpu, &shared.positions_q, &shared.lane_positions_q)?;
+    }
     let mut geos: Vec<LaneGeo> = Vec::with_capacity(lanes.len());
-    let mut positions_q: Vec<i32> = Vec::with_capacity(total);
     let mut off = 0usize;
     for lane in lanes.iter_mut() {
         let (b, l) = (lane.b, lane.ctx_len);
@@ -287,11 +348,8 @@ pub fn draft_forward_lanes(
                 );
             }
         }
-        positions_q.extend_from_slice(lane.positions_q);
-        if windowed {
-            upload_slice_i32(gpu, &ls.positions_k, &lane.positions_k[pos_base..])?;
-        } else {
-            upload_slice_i32(gpu, &ls.positions_k, lane.positions_k)?;
+        if !ordered {
+            upload_slice_i32(gpu, &ls.positions_k, lane_key_positions(ls, lane.positions_k, l))?;
         }
         let cached_rows = ls.thlog.proj_cached_rows();
         let fc_start = cached_rows.max(l.saturating_sub(swa_w));
@@ -299,15 +357,20 @@ pub fn draft_forward_lanes(
             for (_row0, slot0, len) in ring_segments(fc_start, l, swa_w) {
                 let th_slice = ls.target_hidden.sub_offset(slot0 * ne * h, len * ne * h);
                 let thp_slice = ls.target_hidden_proj.sub_offset(slot0 * h, len * h);
-                gemm_dispatch(
+                // Per-lane fc projection (`len` rows): singleton route, outside
+                // the batched 64-row scope.
+                let scoped = gpu.draft_rows64_enter(false);
+                let fc = gemm_dispatch(
                     gpu,
                     &th_slice,
                     &weights.fc,
                     &thp_slice,
                     len,
-                    ls.mq_x_rot.as_ref(),
-                    ls.mq_x_rot_f16.as_ref(),
-                )?;
+                    shared.mq_x_rot.as_ref(),
+                    shared.mq_x_rot_f16.as_ref(),
+                );
+                gpu.draft_rows64_exit(scoped);
+                fc?;
                 gpu.rmsnorm_batched(&thp_slice, &weights.hidden_norm, &thp_slice, len, h, eps)?;
             }
         }
@@ -324,7 +387,9 @@ pub fn draft_forward_lanes(
         });
         off += b;
     }
-    upload_slice_i32(gpu, &shared.positions_q, &positions_q)?;
+    if !ordered {
+        upload_slice_i32(gpu, &shared.positions_q, &shared.lane_positions_q)?;
+    }
 
     // ── Per-layer decoder ────────────────────────────────────────────────
     let rows = total;
@@ -335,8 +400,7 @@ pub fn draft_forward_lanes(
     };
     for li in 0..cfg.n_layers {
         let layer = &weights.layers[li];
-        gpu.hip
-            .memcpy_dtod(&shared.residual.buf, &shared.x.buf, (rows * h) * 4)?;
+        draft_dtod_at(gpu, ordered, &shared.residual.buf, 0, &shared.x.buf, 0, (rows * h) * 4)?;
         gpu.rmsnorm_batched(&shared.x, &layer.attn_norm, &shared.x_norm, rows, h, eps)?;
 
         // DFlash2 prepare convolution (causal across the rows of ONE block ⇒
@@ -399,9 +463,18 @@ pub fn draft_forward_lanes(
         )?;
 
         // Context K/V of every lane into its own ring.
+        // Per-lane context fill is a lane-local GEMM of arbitrary row count: it
+        // keeps the singleton's route even inside the batched 64-row scope.
+        let scoped = gpu.draft_rows64_enter(false);
+        let mut filled = Ok(());
         for (lane, g_) in lanes.iter().zip(&geos) {
-            lane_ctx_fill(gpu, cfg, layer, lane.scratch, &shared.q, li, g_)?;
+            filled = lane_ctx_fill(gpu, cfg, layer, lane.scratch, shared, &shared.q, li, g_);
+            if filled.is_err() {
+                break;
+            }
         }
+        gpu.draft_rows64_exit(scoped);
+        filled?;
 
         gpu.rmsnorm_batched(&shared.q, &layer.q_norm, &shared.q, rows * cfg.n_heads, hd, eps)?;
         gpu.rmsnorm_batched(&shared.k_noise, &layer.k_norm, &shared.k_noise, rows * cfg.n_kv_heads, hd, eps)?;
@@ -417,7 +490,7 @@ pub fn draft_forward_lanes(
         )?;
 
         for (lane, g_) in lanes.iter().zip(&geos) {
-            lane_attention(gpu, cfg, lane.scratch, shared, li, g_)?;
+            lane_attention(gpu, cfg, lane.scratch, shared, li, g_, ordered)?;
         }
 
         // wo lands in x (the non-fused route), then the DFlash2 finish
@@ -455,8 +528,7 @@ pub fn draft_forward_lanes(
             &shared.conv_dynamic,
             &shared.conv_temp,
         ) {
-            gpu.hip
-                .memcpy_dtod(&shared.residual.buf, &shared.x.buf, (rows * h) * 4)?;
+            draft_dtod_at(gpu, ordered, &shared.residual.buf, 0, &shared.x.buf, 0, (rows * h) * 4)?;
             gpu.rmsnorm_batched(&shared.x, &layer.ffn_norm, &shared.x_norm, rows, h, eps)?;
             let (k, g, groups, stride) = conv_kgs();
             let dyn_all = dyn_buf.sub_offset(0, rows * stride);

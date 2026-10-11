@@ -219,7 +219,7 @@ hipfire config set hardware.devices 0,1
 # Bit-stable k-split reduction for pp=1 vs pp=2 parity work
 export HIPFIRE_DETERMINISTIC=1
 
-cargo run --release --features deltanet -p hipfire-runtime --example daemon
+cargo run --release -p hipfire-daemon
 # then send the load JSON above on stdin
 ```
 

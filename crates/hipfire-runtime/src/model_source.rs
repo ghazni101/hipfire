@@ -33,6 +33,9 @@ pub enum SourceFormat {
     Hfq,
     /// A HuggingFace safetensors shard set.
     Safetensors,
+    /// A Flash-Next PLE row sidecar (`HFPLERW1` container, `<model>.ple-q4` /
+    /// `<model>.ple-q8`): one file whose manifest is the PLE shard row ranges.
+    PleRows,
 }
 
 /// File identity captured when a source is opened.
@@ -184,6 +187,10 @@ impl std::error::Error for SourceError {
 pub(crate) trait SourceReaderImpl: Send + Sync {
     fn identity(&self) -> &SourceIdentity;
     fn read_exact_at(&self, offset: u64, dst: &mut [u8]) -> Result<(), SourceError>;
+    /// The bytes at `offset..offset + len` were uploaded and will not be read
+    /// again by the load: a source whose page-cache policy evicts drops them
+    /// (advice only; the default keeps them).
+    fn release_uploaded(&self, _offset: u64, _len: u64) {}
 }
 
 /// A sealed, source-owned positional reader.
@@ -318,6 +325,14 @@ impl SourceRangeDescriptor {
             });
         }
         self.read_exact_at(self.offset, dst)
+    }
+
+    /// The weight upload is done with `offset..offset + len` of this range:
+    /// let the source drop those pages from the page cache if its policy says
+    /// so (HFQ on unified memory), so a load does not fill the cache with
+    /// weight bytes it never reads again.  Advice only; never fails.
+    pub(crate) fn release_uploaded(&self, offset: u64, len: u64) {
+        self.reader.inner.release_uploaded(offset, len);
     }
 }
 

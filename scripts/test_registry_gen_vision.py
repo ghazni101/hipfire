@@ -3,14 +3,19 @@
 # hipfire — see LICENSE and NOTICE in the project root.
 """The shared Qwen3.8-27B vision-tower sidecar slot (`vision` kind).
 
-Every `qwen3.8:27b*` tier declares the same `qwen3.8-27b-vision.hfq` file
-(llama.cpp mmproj-style) so each text quant tier serves images without
+Every non-draft `qwen3.8:27b*` target tier declares the same
+`qwen3.8-27b-vision.hfq` file (llama.cpp mmproj-style) so each text quant
+tier serves images without
 requantizing the trunk. The pack ships after the registry slot: sha256 and
 size_bytes stay absent until the file lands on HF, at which point
 `registry_gen.py` annotates them like any other sidecar kind.
 
 Unlike dflash, the vision file is standalone — no registry entry's `file`
 names it — so there is no "pairs with an entry file" invariant to pin here.
+
+Tags containing `-draft` (`qwen3.8:27b-draft` alias and
+`qwen3.8:27b-draft-mq3`..`-mq6`) are text-only DFlash controller sidecars,
+not target tiers, and carry no vision slot; `_tiers` excludes them.
 """
 import importlib.util
 import json
@@ -32,7 +37,7 @@ def _curated() -> dict:
 
 
 def _tiers(models: dict) -> dict:
-    return {k: v for k, v in models.items() if k.startswith("qwen3.8:27b")}
+    return {k: v for k, v in models.items() if k.startswith("qwen3.8:27b") and "-draft" not in k}
 
 
 def test_every_qwen38_27b_tier_declares_the_shared_vision_file():
@@ -49,6 +54,22 @@ def test_every_qwen38_27b_tier_declares_the_shared_vision_file():
     # one tier would verify a different file than `rm`'s shared-keeper logic
     # protects for another.
     assert len(digests) == 1, f"qwen3.8 tiers disagree on the vision pack digest: {digests}"
+
+
+def test_tiers_excludes_text_only_draft_sidecars():
+    # `-draft` (alias) and `-draft-mq3..mq6` are text-only DFlash controller
+    # sidecars, not vision-bearing target tiers.
+    models = {
+        "qwen3.8:27b": {},
+        "qwen3.8:27b-mq3": {},
+        "qwen3.8:27b-draft": {},
+        "qwen3.8:27b-draft-mq3": {},
+        "qwen3.8:27b-draft-mq4": {},
+        "qwen3.8:27b-draft-mq5": {},
+        "qwen3.8:27b-draft-mq6": {},
+        "qwen3.6:35b-a3b": {},
+    }
+    assert set(_tiers(models)) == {"qwen3.8:27b", "qwen3.8:27b-mq3"}
 
 
 def test_annotate_sidecar_resolves_vision_digest_from_tree():

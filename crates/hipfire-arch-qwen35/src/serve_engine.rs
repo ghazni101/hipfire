@@ -732,7 +732,7 @@ impl Rig {
             hipfire_runtime::hfq::HfqFile::open(p)
                 .ok()
                 .and_then(|h| hipfire_runtime::dflash::DflashConfig::from_hfq(&h))
-                .map(|c| c.runtime_block_size())
+                .map(|c| c.runtime_block_size(hipfire_runtime::dflash::DFLASH_BLOCK_UNBATCHED))
         });
         if cfg.dflash_required && cfg.dflash_draft.is_some() && dflash_block.is_none() {
             return Err(format!(
@@ -870,8 +870,7 @@ impl Rig {
             ));
         }
         let (vram_free, vram_total) = gpu
-            .hip
-            .get_vram_info()
+            .device_mem_info()
             .map_err(|e| format!("vram info: {e}"))?;
         preflight_alloc(planned, vram_free as u64, "SlotEngine")
             .map_err(|e| format!("preflight refused: {e}"))?;
@@ -1453,9 +1452,11 @@ impl Rig {
                     },
                 )
                 .transpose()?;
+        // Capture-only: the batched verify is repaired per layer by
+        // `mtp_dn_repair_from_tape`, never by `GdnTape::replay_gdn`.
         let spec_verify_tape = if (mtp_head.is_some() && mtp_k > 0) || dflash.is_some() {
             Some(
-                crate::speculative::GdnTape::new_for_config(
+                crate::speculative::GdnTape::new_capture_only(
                     &mut gpu,
                     &config,
                     cfg.n_slots * spec_rows,

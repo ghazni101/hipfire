@@ -16,6 +16,10 @@ required-features = ["toolchain"]
 name = "pm_r4_screen"
 required-features = ["toolchain"]
 
+[[example]]
+name = "aco_hsa_emit"
+required-features = ["toolchain"]
+
 [features]
 # The ROCm assembler/linker/bundler oracle and certification (`toolchain`):
 # the native writer (`native`) is the default path; ROCm is a test oracle.

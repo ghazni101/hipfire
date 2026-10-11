@@ -23,8 +23,8 @@ fn probe(arch:Arch)->Result<Emitted,String>{
  b.control(Instruction::new("s_endpgm",vec![],vec![]))?;
  b.finish()
 }
-const USAGE:&str="usage: hipfire-isa emit --kernel fold_magic --arch gfx1201 --out FILE --proof FILE\n       hipfire-isa emit --kernel iu4_v2c [--epi set|add|silu|all] --arch gfx1100 --out FILE --proof FILE\n       hipfire-isa emit --kernel iu4_v2b --epi set|add|silu|all --arch gfx1151 --out FILE --proof FILE\n       hipfire-isa emit --kernel iu4_v2b_a4 --epi m512|a4|all --arch gfx1151 --out FILE --proof FILE\n       hipfire-isa emit --kernel iu4_gemm --fold k128 --tile 128x128x8|256x128x16 --cacc 1 --epi set|add|silu|silu-bf16|qkvzagdn|all [--alayout token|slab] --arch gfx1201 --out FILE --proof FILE\n       hipfire-isa emit --kernel fp8_gemm --scale row|k128|both --epi set|add|silu|qkv|qkvza|all --arch gfx1201 --out FILE --proof FILE\n       hipfire-isa emit --kernel gdn_scan --arch gfx1201 --out FILE --proof FILE\n       hipfire-isa emit --kernel qsa_select --epi score|score-bf16|select|all|bf16 --arch gfx1151 --out FILE --proof FILE\n       hipfire-isa emit --kernel qwen4_mq6_x4 [--epi w4|w8|all] --arch gfx1201 --out FILE --proof FILE\n       hipfire-isa emit --kernel qwen4_mq6_x4_gfx11 [--epi w4|w8|w4_bf16out|w8_bf16out|w8_regions|w8_hcw|all] --arch gfx1151 --out FILE --proof FILE\n       hipfire-isa region-import --disassembly OBJDUMP.txt [--symbol gemm_mq4g256v2_gate_up_silu_mmq_iu4_v3]";
-const NATIVE_USAGE:&str="       emit options: [--co FILE] [--bundle FILE [--host-target TRIPLE]] also write the native code object / HIP offload bundle (no ROCm tools)\n       hipfire-isa emit --kernel pm_decode_<module> --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape FILE.shape.json] [--m7 FILE.m7.json]\n         (<module>: fused_gate_up_hfq4g256_mq4v2|gemv_hfq4g256_residual_mq4v2|fused_qkvza_hfq4g256_mq4v2|gemv_hfq4g256_multirow_default_mq4v2|fused_qkv_hfq4g256_mq4v2|gemv_hfq4g256_residual_xbatch_mq4v2|gemv_hfq4g256_xbatch_mq4v2; M7 runs on every export of the linked --co)";
+const USAGE:&str="usage: hipfire-isa emit --kernel fold_magic --arch gfx1201 --out FILE --proof FILE\n       hipfire-isa emit --kernel iu4_v2c [--epi set|add|silu|all] --arch gfx1100 --out FILE --proof FILE\n       hipfire-isa emit --kernel iu4_v2b --epi set|add|silu|all --arch gfx1151 --out FILE --proof FILE\n       hipfire-isa emit --kernel iu4_v2b_a4 --epi m512|a4|all --arch gfx1151 --out FILE --proof FILE\n       hipfire-isa emit --kernel iu4_gemm --fold k128 --tile 128x128x8|256x128x16 --cacc 1 --epi set|add|silu|silu-bf16|qkvzagdn|all [--alayout token|slab] --arch gfx1201 --out FILE --proof FILE\n       hipfire-isa emit --kernel fp8_gemm --scale row|k128|both --epi set|add|silu|qkv|qkvza|all --arch gfx1201 --out FILE --proof FILE\n       hipfire-isa emit --kernel gdn_scan --arch gfx1201 --out FILE --proof FILE\n       hipfire-isa emit --kernel qsa_select --epi score|score-bf16|select|all|bf16 --arch gfx1151 --out FILE --proof FILE\n       hipfire-isa emit --kernel qwen4_mq6_x4 [--epi w4|w8|all] --arch gfx1201 --out FILE --proof FILE\n       hipfire-isa emit --kernel qwen4_mq6_x4_gfx11 [--epi w4|w8|w4_bf16out|w8_bf16out|w8_regions|w8_hcw|all] --arch gfx1151 --out FILE --proof FILE\n       hipfire-isa emit --kernel qwen4_mq4_x4_gfx11 [--epi w4|w8|w4_bf16out|w8_bf16out|w8_regions|w8_hcw|all] --arch gfx1151 --out FILE --proof FILE\n       hipfire-isa emit --kernel mq4_rows_x4 [--epi entry|all] --arch gfx1151|gfx1201 --out FILE --proof FILE\n       hipfire-isa region-import --disassembly OBJDUMP.txt [--symbol gemm_mq4g256v2_gate_up_silu_mmq_iu4_v3]";
+const NATIVE_USAGE:&str="       emit options: [--co FILE] [--bundle FILE [--host-target TRIPLE]] also write the native code object / HIP offload bundle (no ROCm tools)\n       hipfire-isa emit --kernel pm_decode_<module> --arch gfx1201 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--shape FILE.shape.json] [--m7 FILE.m7.json]\n         (<module>: fused_gate_up_hfq4g256_mq4v2|gemv_hfq4g256_residual_mq4v2|fused_qkvza_hfq4g256_mq4v2|gemv_hfq4g256_multirow_default_mq4v2|fused_qkv_hfq4g256_mq4v2|gemv_hfq4g256_residual_xbatch_mq4v2|gemv_hfq4g256_xbatch_mq4v2; M7 runs on every export of the linked --co)\n       hipfire-isa emit --kernel mq4_verify [--epi <qkvza|qkv|gate_up|residual>_bt<4|8>w<4|8>|all] --arch gfx1201 --out FILE.s --proof FILE.proof.json [--co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]]\n         (with --co, M7 runs on every export of the linked object; --shape writes DIR/mq4_verify.gfx1201.<entry>.contract.json)\n       hipfire-isa emit --kernel mq4_fp8_verify [--epi <qkvza|qkv|gate_up|residual|set>_bt<1|2|4|8>w<1|4|8>|all] --arch gfx1201 --out FILE.s --proof FILE.proof.json [--co FILE.co [--bundle FILE.hxaco] [--shape DIR] [--m7 FILE.m7.json]]\n         (tiles bt1w1, bt{2,4,8}w{4,8}; with --co, M7 runs on every export of the linked object; --shape writes DIR/mq4_fp8_verify.gfx1201.<entry>.contract.json)\n       hipfire-isa emit --kernel qwen4_lane_rows --arch gfx1151 --out FILE.s --proof FILE.proof.json --co FILE.co [--bundle FILE.hxaco] [--m7 FILE.m7.json]\n         (the four-export lane-rows module qwen4_lane_rows_pm; --co is required and M7 runs on every export of the linked object)\n       hipfire-isa emit --kernel mq4_rows_x4 [--epi entry|all] --arch gfx1151|gfx1201 --out FILE.s --proof FILE.proof.json [--co FILE.co] [--bundle FILE.hxaco]\n         (the module mq4_rows_x4_pm_<arch> holds the single export gemv_mq4g256v2_rows_x4_pm_<arch>)";
 /// `--epi all` emits the three epilogue symbols as one module (the product
 /// code object the oracle loads); a single epilogue emits one symbol.
 fn iu4_gemm(fold:&str,tile:&str,cacc:&str,epi:&str,act:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
@@ -104,6 +104,76 @@ fn qwen4_mq6_x4_gfx11(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
  let (wr,kind)=match epi{"w4"=>(4,Kind::Plain),"w8"=>(8,Kind::Plain),"w4_bf16out"=>(4,Kind::Bf16),"w8_bf16out"=>(8,Kind::Bf16),"w8_regions"=>(8,Kind::Regions),"w8_hcw"=>(8,Kind::Hcw),
   _=>return Err(format!("qwen4_mq6_x4_gfx11 --epi {epi} (w4|w8|w4_bf16out|w8_bf16out|w8_regions|w8_hcw|all)"))};
  let e=qwen4_mq6_x4_gfx11::emit(Spec{arch,wr,kind})?;
+ Ok((e.s_text,serde_json::to_vec_pretty(&e.proof).map_err(|e|e.to_string())?))
+}
+/// gfx1151 Flash-Next lane-step row kernels: the whole `qwen4_lane_rows_pm` module (`--epi all` only).
+fn qwen4_lane_rows(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
+ use hipfire_isa::kernels::qwen4_lane_rows;
+ if epi!="all"{return Err(format!("qwen4_lane_rows --epi {epi} (all)"))}
+ if arch!=Arch::Gfx1151{return Err("qwen4_lane_rows is exact-gfx1151 only".into())}
+ let (_,text,proof)=qwen4_lane_rows::emit_module()?;
+ Ok((text,serde_json::to_vec_pretty(&proof).map_err(|e|e.to_string())?))
+}
+/// gfx1151 MQ4G256V2 trunk GEMM twin of the hipcc MQ4 route (the `qwen4_mq6_x4_gfx11` builder over
+/// the 136-byte MQ4 group): `--epi <wr>[_<kind>]` as there, `all` the module.
+fn qwen4_mq4_x4_gfx11(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
+ use hipfire_isa::kernels::qwen4_mq4_x4_gfx11::{self,Kind,Spec};
+ if epi=="all"{let (_,text,proof)=qwen4_mq4_x4_gfx11::emit_module(arch)?;return Ok((text,serde_json::to_vec_pretty(&proof).map_err(|e|e.to_string())?))}
+ let (wr,kind)=match epi{"w4"=>(4,Kind::Plain),"w8"=>(8,Kind::Plain),"w4_bf16out"=>(4,Kind::Bf16),"w8_bf16out"=>(8,Kind::Bf16),"w8_regions"=>(8,Kind::Regions),"w8_hcw"=>(8,Kind::Hcw),
+  _=>return Err(format!("qwen4_mq4_x4_gfx11 --epi {epi} (w4|w8|w4_bf16out|w8_bf16out|w8_regions|w8_hcw|all)"))};
+ let e=qwen4_mq4_x4_gfx11::emit(Spec{arch,wr,kind})?;
+ Ok((e.s_text,serde_json::to_vec_pretty(&e.proof).map_err(|e|e.to_string())?))
+}
+/// Few-row exact MQ4G256V2 GEMV over four matrices, gfx1151 and gfx1201:
+/// the one entry (`--epi entry|all`, default `all`), which is also the module.
+fn mq4_rows_x4(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
+ use hipfire_isa::kernels::mq4_rows_x4::{self,Spec};
+ if epi=="all"{let (_,text,proof)=mq4_rows_x4::emit_module(arch)?;return Ok((text,serde_json::to_vec_pretty(&proof).map_err(|e|e.to_string())?))}
+ if epi!="entry"{return Err(format!("mq4_rows_x4 --epi {epi} (entry|all)"))}
+ let e=mq4_rows_x4::emit(Spec{arch})?;
+ Ok((e.s_text,serde_json::to_vec_pretty(&e.proof).map_err(|e|e.to_string())?))
+}
+/// gfx1151 Flash-Next shared-expert gate/up (fused GEMM + BF16-recipe SwiGLU + selector sigmoid + F16 hidden):
+/// `--epi w8|w4` one entry, `all` the module.
+fn qwen4_shared_gu_gfx11(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
+ use hipfire_isa::kernels::qwen4_shared_gu_gfx11::{self,Spec};
+ if epi=="all"{let (_,text,proof)=qwen4_shared_gu_gfx11::emit_module(arch)?;return Ok((text,serde_json::to_vec_pretty(&proof).map_err(|e|e.to_string())?))}
+ let wr=match epi{"w4"=>4,"w8"=>8,_=>return Err(format!("qwen4_shared_gu_gfx11 --epi {epi} (w4|w8|all)"))};
+ let e=qwen4_shared_gu_gfx11::emit(Spec{arch,wr})?;
+ Ok((e.s_text,serde_json::to_vec_pretty(&e.proof).map_err(|e|e.to_string())?))
+}
+/// gfx1201 MQ4G256V2 wide exact-verify twins of hipcc's `_vt{4,8}w{4,8}_k32`
+/// entries: `--epi <op>_bt<4|8>w<4|8>` one entry, `all` (default) the module.
+fn mq4_verify_specs(epi:&str,arch:Arch)->Result<Vec<hipfire_isa::kernels::mq4_verify::Spec>,String>{
+ use hipfire_isa::kernels::mq4_verify::Spec;
+ if epi=="all"{return Ok(Spec::all(arch))}
+ let bad=||format!("mq4_verify --epi {epi} (<qkvza|qkv|gate_up|residual>_bt<4|8>w<4|8>|all)");
+ let (op,tile)=epi.rsplit_once("_bt").ok_or_else(bad)?;
+ let (bt,waves)=tile.split_once('w').ok_or_else(bad)?;
+ Ok(vec![Spec{arch,bt:bt.parse().map_err(|_|bad())?,waves:waves.parse().map_err(|_|bad())?,op:op.parse()?}])
+}
+fn mq4_verify(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
+ use hipfire_isa::kernels::mq4_verify;
+ if epi=="all"{let (_,text,proof)=mq4_verify::emit_module(arch)?;return Ok((text,serde_json::to_vec_pretty(&proof).map_err(|e|e.to_string())?))}
+ let [spec]=mq4_verify_specs(epi,arch)?[..] else {return Err("mq4_verify: one entry expected".into())};
+ let e=mq4_verify::emit(spec)?;
+ Ok((e.s_text,serde_json::to_vec_pretty(&e.proof).map_err(|e|e.to_string())?))
+}
+/// gfx1201 MQ4G256V2 symmetric FP8 verify GEMMs (1 <= N <= 128): `--epi <op>_bt<b>w<w>`
+/// (`qkvza|qkv|gate_up|residual|set`, tiles `bt1w1`, `bt{2,4,8}w{4,8}`) one entry, `all` (default) the module.
+fn mq4_fp8_verify_specs(epi:&str,arch:Arch)->Result<Vec<hipfire_isa::kernels::mq4_fp8_verify::Spec>,String>{
+ use hipfire_isa::kernels::mq4_fp8_verify::Spec;
+ if epi=="all"{return Ok(Spec::all(arch))}
+ let bad=||format!("mq4_fp8_verify --epi {epi} (<qkvza|qkv|gate_up|residual|set>_bt<1|2|4|8>w<1|4|8>|all)");
+ let (op,tile)=epi.rsplit_once("_bt").ok_or_else(bad)?;
+ let (bt,waves)=tile.split_once('w').ok_or_else(bad)?;
+ Ok(vec![Spec{arch,bt:bt.parse().map_err(|_|bad())?,waves:waves.parse().map_err(|_|bad())?,op:op.parse()?}])
+}
+fn mq4_fp8_verify(epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
+ use hipfire_isa::kernels::mq4_fp8_verify;
+ if epi=="all"{let (_,text,proof)=mq4_fp8_verify::emit_module(arch)?;return Ok((text,serde_json::to_vec_pretty(&proof).map_err(|e|e.to_string())?))}
+ let [spec]=mq4_fp8_verify_specs(epi,arch)?[..] else {return Err("mq4_fp8_verify: one entry expected".into())};
+ let e=mq4_fp8_verify::emit(spec)?;
  Ok((e.s_text,serde_json::to_vec_pretty(&e.proof).map_err(|e|e.to_string())?))
 }
 fn fp8_gemm(scale:&str,epi:&str,arch:Arch)->Result<(String,Vec<u8>),String>{
@@ -204,12 +274,25 @@ fn run()->Result<(),String>{let mut args=env::args().skip(1);let command=args.ne
   "qsa_select"=>qsa_select(epi.as_deref().unwrap_or("all"),arch)?,
   "qwen4_mq6_x4"=>qwen4_mq6_x4(epi.as_deref().unwrap_or("all"),arch)?,
   "qwen4_mq6_x4_gfx11"=>qwen4_mq6_x4_gfx11(epi.as_deref().unwrap_or("all"),arch)?,
+  "qwen4_lane_rows"=>qwen4_lane_rows(epi.as_deref().unwrap_or("all"),arch)?,
+  "qwen4_mq4_x4_gfx11"=>qwen4_mq4_x4_gfx11(epi.as_deref().unwrap_or("all"),arch)?,
+  "mq4_rows_x4"=>mq4_rows_x4(epi.as_deref().unwrap_or("all"),arch)?,
+  "qwen4_shared_gu_gfx11"=>qwen4_shared_gu_gfx11(epi.as_deref().unwrap_or("all"),arch)?,
+  "mq4_verify"=>mq4_verify(epi.as_deref().unwrap_or("all"),arch)?,
+  "mq4_fp8_verify"=>mq4_fp8_verify(epi.as_deref().unwrap_or("all"),arch)?,
   "fp8_gemm"=>fp8_gemm(scale.as_deref().ok_or("missing --scale")?,epi.as_deref().ok_or("missing --epi")?,arch)?,
   k if k.starts_with("pm_decode_")=>pm_decode(&k["pm_decode_".len()..],arch)?,
   _=>return Err(format!("kernel {kernel} is not authored\n{USAGE}"))};
  let pm_module=kernel.strip_prefix("pm_decode_");
- if pm_module.is_none()&&(shape.is_some()||m7.is_some()) {return Err("--shape/--m7 apply only to pm_decode_<module>".into())}
+ let mq4v=kernel=="mq4_verify";
+ let mq4f8=kernel=="mq4_fp8_verify";
+ let lane_rows=kernel=="qwen4_lane_rows";
+ if pm_module.is_none()&&!mq4v&&!mq4f8&&!lane_rows&&(shape.is_some()||m7.is_some()) {return Err("--shape/--m7 apply only to pm_decode_<module>, mq4_verify, mq4_fp8_verify and qwen4_lane_rows".into())}
+ if lane_rows&&shape.is_some() {return Err("qwen4_lane_rows has no --shape contract (use --m7)".into())}
+ if lane_rows&&co.is_none() {return Err("qwen4_lane_rows emission requires --co (M7 certifies the linked object)".into())}
  if pm_module.is_some()&&co.is_none() {return Err("pm_decode emission requires --co (M7 certifies the linked object)".into())}
+ if mq4v&&co.is_none()&&(shape.is_some()||m7.is_some()) {return Err("mq4_verify --shape/--m7 require --co (M7 certifies the linked object)".into())}
+ if mq4f8&&co.is_none()&&(shape.is_some()||m7.is_some()) {return Err("mq4_fp8_verify --shape/--m7 require --co (M7 certifies the linked object)".into())}
  // Native emission: the code object `llvm-mc` + `ld.lld -shared` would link, and its bundle.
  if co.is_some()||bundle.is_some(){
   let elf=hipfire_isa::native::assemble(&text,arch)?;
@@ -230,6 +313,63 @@ fn run()->Result<(),String>{let mut args=env::args().skip(1);let command=args.ne
   println!("{}",String::from_utf8_lossy(&receipts));
   if let Some(file)=&m7 {fs::write(file,&receipts).map_err(|e|format!("{file}: {e}"))?}
   if let Some(file)=&shape {fs::write(file,serde_json::to_vec_pretty(&hipfire_isa::kernels::pm_decode::shape_contract(module)?).map_err(|e|e.to_string())?).map_err(|e|format!("{file}: {e}"))?}
+ }
+ // Lane-step row kernels: M7 on every export of the linked object.
+ #[cfg(not(feature="toolchain"))]
+ if lane_rows {return Err("qwen4_lane_rows emission certifies with M7: build hipfire-isa with --features toolchain".into())}
+ #[cfg(feature="toolchain")]
+ if lane_rows {
+  let path=co.as_deref().ok_or("missing --co")?;
+  let mut receipts=serde_json::Map::new();
+  for symbol in hipfire_isa::kernels::qwen4_lane_rows::SYMBOLS {
+   receipts.insert(symbol.to_owned(),hipfire_isa::pm_check::m7(std::path::Path::new(path),arch.name(),symbol)?);
+  }
+  let receipts=serde_json::to_vec_pretty(&receipts).map_err(|e|e.to_string())?;
+  println!("{}",String::from_utf8_lossy(&receipts));
+  if let Some(file)=&m7 {fs::write(file,&receipts).map_err(|e|format!("{file}: {e}"))?}
+ }
+ // mq4_verify twins: with --co, M7 on every export of the linked object
+ // (toolchain builds), plus each export's shape contract (--shape DIR).
+ #[cfg(not(feature="toolchain"))]
+ if mq4v&&(shape.is_some()||m7.is_some()) {return Err("mq4_verify --shape/--m7 certify with M7: build hipfire-isa with --features toolchain".into())}
+ #[cfg(not(feature="toolchain"))]
+ if mq4f8&&(shape.is_some()||m7.is_some()) {return Err("mq4_fp8_verify --shape/--m7 certify with M7: build hipfire-isa with --features toolchain".into())}
+ #[cfg(feature="toolchain")]
+ if mq4v&&co.is_some() {
+  let path=co.as_deref().ok_or("missing --co")?;
+  let mut receipts=serde_json::Map::new();
+  for spec in mq4_verify_specs(epi.as_deref().unwrap_or("all"),arch)? {
+   let symbol=spec.symbol();
+   let m7=hipfire_isa::pm_check::m7(std::path::Path::new(path),arch.name(),&symbol)?;
+   if let Some(dir)=&shape {
+    let e=hipfire_isa::kernels::mq4_verify::emit(spec)?;
+    let file=format!("{dir}/mq4_verify.{}.{}.contract.json",arch.name(),spec.tag());
+    fs::write(&file,serde_json::to_vec_pretty(&hipfire_isa::kernels::mq4_verify::contract(spec,&e)).map_err(|e|e.to_string())?).map_err(|e|format!("{file}: {e}"))?;
+   }
+   receipts.insert(symbol,m7);
+  }
+  let receipts=serde_json::to_vec_pretty(&receipts).map_err(|e|e.to_string())?;
+  println!("{}",String::from_utf8_lossy(&receipts));
+  if let Some(file)=&m7 {fs::write(file,&receipts).map_err(|e|format!("{file}: {e}"))?}
+ }
+ // mq4_fp8_verify: the same, for the FP8 verify entries.
+ #[cfg(feature="toolchain")]
+ if mq4f8&&co.is_some() {
+  let path=co.as_deref().ok_or("missing --co")?;
+  let mut receipts=serde_json::Map::new();
+  for spec in mq4_fp8_verify_specs(epi.as_deref().unwrap_or("all"),arch)? {
+   let symbol=spec.symbol();
+   let m7=hipfire_isa::pm_check::m7(std::path::Path::new(path),arch.name(),&symbol)?;
+   if let Some(dir)=&shape {
+    let e=hipfire_isa::kernels::mq4_fp8_verify::emit(spec)?;
+    let file=format!("{dir}/mq4_fp8_verify.{}.{}.contract.json",arch.name(),spec.tag());
+    fs::write(&file,serde_json::to_vec_pretty(&hipfire_isa::kernels::mq4_fp8_verify::contract(spec,&e)).map_err(|e|e.to_string())?).map_err(|e|format!("{file}: {e}"))?;
+   }
+   receipts.insert(symbol,m7);
+  }
+  let receipts=serde_json::to_vec_pretty(&receipts).map_err(|e|e.to_string())?;
+  println!("{}",String::from_utf8_lossy(&receipts));
+  if let Some(file)=&m7 {fs::write(file,&receipts).map_err(|e|format!("{file}: {e}"))?}
  }
  fs::write(out.ok_or("missing --out")?,text).map_err(|e|e.to_string())?;fs::write(proof.ok_or("missing --proof")?,proof_json).map_err(|e|e.to_string())?;Ok(())}
 fn main(){if let Err(e)=run(){eprintln!("hipfire-isa: {e}");std::process::exit(1)}}

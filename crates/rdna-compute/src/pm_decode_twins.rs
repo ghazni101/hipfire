@@ -18,6 +18,13 @@
 //! flag until it is re-accepted here. Only twins that passed the
 //! full-symbol whole-buffer oracle (zero mismatch bytes) are listed; the
 //! accepted gfx1201 ELF digest is recorded alongside for provenance.
+//!
+//! Re-accepting a new `source_sha256` after editing one of these HIP sources
+//! takes a fresh whole-buffer oracle, even for a change that does not touch
+//! the arithmetic. Under `-ffp-contract=fast` the backend's FMA fusion of the
+//! group dot depends on the surrounding code, so an edit elsewhere in the
+//! kernel can change its output bytes while the twin keeps the old ones (see
+//! `hipfire_isa::kernels::pm_decode`).
 
 use sha2::{Digest, Sha256};
 

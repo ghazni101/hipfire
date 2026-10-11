@@ -12,6 +12,13 @@ Upstream parity usage::
     python3 crates/hipfire-arch-qwen4/reference_oracle/generate_fixtures.py \
         --upstream-reference --out .codeinsight+research/qwen4/oracle --seed 3800
 
+Tiny full-stack profile usage (clean CPU venv; see ``QWEN4_PROFILES.md``)::
+
+    HIPFIRE_QWEN4_ORACLE_CACHE=~/.hipfire/datasets/cachequality-qwen4-upstream \
+    s0-cpu-venv/bin/python -I crates/hipfire-arch-qwen4/reference_oracle/generate_fixtures.py \
+        --tiny-profile tiny-moe --out /tmp/qwen4-tiny-moe --seed 3800
+    ... --tiny-profile tiny-dense-dev --hidden-size 5120 --layers 1 --out /tmp/qwen4-tiny-dense-5120
+
 The default path implements only small synthetic tensors (plus optional
 selected BF16 PLE rows).  ``--source-bf16-slices`` accepts an NPZ with
 ``ple_row_ids`` (int64, ``[tokens,16]``) and ``ple_rows_bf16`` (uint16 BF16
@@ -742,13 +749,63 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--upstream-reference", action="store_true", help="execute exact SHA-verified Transformers/vLLM source snapshots with torch and range-read checkpoint slices")
     parser.add_argument("--cache-dir", help="bounded upstream cache (under ~/.hipfire/datasets or .codeinsight+research)")
     parser.add_argument("--self-test", action="store_true", help="validate synthetic preservation and rejection guards")
+    tiny = parser.add_argument_group("tiny full-stack profiles (see QWEN4_PROFILES.md; needs the clean CPU venv with torch/transformers/safetensors/tokenizers)")
+    tiny.add_argument("--tiny-profile", choices=("tiny-moe", "tiny-dense-dev"), help="write a complete tiny checkpoint (config, tokenizer, BF16 safetensors, per-op dumps, MTP, manifest) under --out")
+    tiny.add_argument("--hidden-size", type=int, default=16, help="tiny profile hidden size (5120 is accepted with 1-2 layers and the reduced projections)")
+    tiny.add_argument("--layers", type=int, default=2, help="tiny profile decoder layers (default 2; 1 = linear-attention layer only, no cached runs)")
+    tiny.add_argument("--ffn-intermediate", type=int, default=8, help="dense intermediate_size / MoE expert intermediate size")
+    tiny.add_argument("--experts", type=int, default=3, help="tiny-moe routed expert count")
+    tiny.add_argument("--top-k", type=int, default=2, help="tiny-moe experts per token")
+    tiny.add_argument("--shared-intermediate", type=int, default=8, help="tiny-moe shared expert intermediate size")
+    tiny.add_argument("--no-norm-topk-prob", action="store_true", help="tiny-moe: do not renormalise the selected router weights")
+    tiny.add_argument("--rope-theta", type=float, default=10000.0, help="tiny profile RoPE base, applied to the main and MTP configs (default 10000; GPU variant 10000000)")
+    tiny.add_argument("--max-position-embeddings", type=int, default=64, help="tiny profile max_position_embeddings, applied to the main and MTP configs (default 64; GPU variant 1024)")
+    tiny.add_argument("--no-ple", action="store_true", help="tiny profile without PLE: no PLE layer/tensors/buffers/config marker, ple_layer_ids=[] and absent PLE scalars (default: PLE present)")
+    tiny.add_argument("--no-mtp", action="store_true", help="tiny profile without native MTP: no MTP head is built; no mtp.* tensors, text_config.mtp or mtp_step0 dump (default: MTP present)")
+    tiny.add_argument("--no-controls", action="store_true", help="skip the negative-control reruns")
+    tiny.add_argument("--screen-qsa-ties", action="store_true", help="opt-in QSA tie screen: --seed becomes the START seed; the smallest seed >= start whose main and MTP-step-0 QSA rows all have a clear top-k boundary margin is used (default: off, the seed is used exactly)")
+    tiny.add_argument("--screen-qsa-max-seeds", type=int, default=None, help="upper bound on screened candidate seeds (default 4096); exhausting it is an error, never a fallback seed")
     return parser
+
+
+def _tiny_options(args: argparse.Namespace):
+    try:
+        from .tiny_profiles import ProfileOptions
+    except ImportError:  # direct execution from this directory
+        from tiny_profiles import ProfileOptions  # type: ignore
+    return ProfileOptions(
+        profile_id=args.tiny_profile,
+        seed=args.seed,
+        hidden_size=args.hidden_size,
+        num_layers=args.layers,
+        ffn_intermediate_size=args.ffn_intermediate,
+        num_experts=args.experts,
+        top_k=args.top_k,
+        shared_intermediate_size=args.shared_intermediate,
+        norm_topk_prob=not args.no_norm_topk_prob,
+        rope_theta=args.rope_theta,
+        max_position_embeddings=args.max_position_embeddings,
+        with_ple=not args.no_ple,
+        with_mtp=not args.no_mtp,
+    )
 
 
 def main(argv: Sequence[str] | None = None) -> int:
     args = _parser().parse_args(argv)
     if args.self_test and args.upstream_reference:
         print("qwen4 reference fixture generation failed: --self-test and --upstream-reference are exclusive", file=sys.stderr)
+        return 2
+    if args.tiny_profile and (args.self_test or args.upstream_reference or args.source_path):
+        print("qwen4 reference fixture generation failed: --tiny-profile is exclusive with --self-test, --upstream-reference and --source-bf16-slices", file=sys.stderr)
+        return 2
+    if not args.tiny_profile and (args.no_ple or args.no_mtp):
+        print("qwen4 reference fixture generation failed: --no-ple and --no-mtp are only valid with --tiny-profile", file=sys.stderr)
+        return 2
+    if not args.tiny_profile and (args.screen_qsa_ties or args.screen_qsa_max_seeds is not None):
+        print("qwen4 reference fixture generation failed: --screen-qsa-ties and --screen-qsa-max-seeds are only valid with --tiny-profile", file=sys.stderr)
+        return 2
+    if args.screen_qsa_max_seeds is not None and not args.screen_qsa_ties:
+        print("qwen4 reference fixture generation failed: --screen-qsa-max-seeds requires --screen-qsa-ties", file=sys.stderr)
         return 2
     if not args.self_test and not args.out:
         print("qwen4 reference fixture generation failed: --out is required unless --self-test is used", file=sys.stderr)
@@ -758,11 +815,28 @@ def main(argv: Sequence[str] | None = None) -> int:
             self_test(args.cache_dir)
             print("qwen4 reference fixture self-test passed")
             return 0
+        if args.tiny_profile:
+            try:
+                from .tiny_profiles import generate_profile
+            except ImportError:  # direct execution from this directory
+                from tiny_profiles import generate_profile  # type: ignore
+            screen_kwargs: dict[str, object] = {}
+            if args.screen_qsa_ties:
+                screen_kwargs["qsa_tie_screen"] = True
+                if args.screen_qsa_max_seeds is not None:
+                    screen_kwargs["qsa_screen_max_seeds"] = args.screen_qsa_max_seeds
+            manifest = generate_profile(args.out, _tiny_options(args), cache_dir=args.cache_dir, controls=not args.no_controls, **screen_kwargs)
+            print(f"wrote tiny profile {args.tiny_profile} ({manifest['checkpoint']['safetensors']['tensor_count']} tensors, {len(manifest['dumps'])} dump files) to {Path(args.out)}")
+            screen = manifest.get("qsa_tie_screen")
+            if screen is not None:
+                print(f"qsa tie screen: start seed {screen['start_seed']} effective seed {screen['effective_seed']} rejected {screen['rejected_count']}")
+            print(f"manifest: {Path(args.out) / 'manifest.json'}")
+            return 0
         if args.upstream_reference:
             manifest = generate_upstream(args.out, args.seed, args.cache_dir)
         else:
             if args.cache_dir:
-                raise FixtureError("--cache-dir is only valid with --upstream-reference or --self-test")
+                raise FixtureError("--cache-dir is only valid with --upstream-reference, --tiny-profile or --self-test")
             manifest = generate(args.out, args.seed, args.source_path)
     except (FixtureError, OSError, ValueError) as exc:
         print(f"qwen4 reference fixture generation failed: {exc}", file=sys.stderr)

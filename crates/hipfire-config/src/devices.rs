@@ -808,6 +808,39 @@ pub fn active_devices() -> Option<&'static ActiveDevices> {
     ACTIVE_DEVICES.get()
 }
 
+/// Whether a direct GPU entry point must resolve `HIPFIRE_DEVICES` itself:
+/// only when the variable is set and no caller already applied a selection.
+fn needs_entry_point_resolution(spec_set: bool, already_applied: bool) -> bool {
+    spec_set && !already_applied
+}
+
+/// Entry-point seam for processes that reach the GPU runtime without the
+/// daemon's startup (`rdna_compute::Gpu::init` in examples, tests, bins).
+///
+/// With `HIPFIRE_DEVICES` set and no selection applied yet in this process,
+/// resolves it through [`apply_device_visibility`] (taking no daemon card
+/// lock) and returns the selection; a set-but-unresolvable value is an error.
+/// Returns `Ok(None)` when the variable is unset (unfiltered: today's default
+/// device 0) or a caller such as the daemon already applied visibility, so
+/// visibility is never applied twice. Must run before the HIP runtime first
+/// initializes.
+pub fn apply_entry_point_device_visibility() -> Result<Option<DeviceSelection>> {
+    static GUARD: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    let _guard = GUARD.lock().unwrap_or_else(|poison| poison.into_inner());
+    if !needs_entry_point_resolution(crate::legacy_devices_env_set(), active_devices().is_some()) {
+        return Ok(None);
+    }
+    // An installed process policy (native CLI launch) is authoritative; a
+    // direct invocation resolves TOML plus the legacy env layer here.
+    let config = match crate::active_process_config() {
+        Some(config) if config.legacy_value("HIPFIRE_DEVICES").is_none() => return Ok(None),
+        Some(config) => config.clone(),
+        None => crate::load_local_process_config()?,
+    };
+    config.validate()?;
+    apply_device_visibility(&config, &mut |_| Ok(Claim::Claimed)).map(Some)
+}
+
 /// The cards this process may use, read from the KFD topology before any GPU
 /// runtime loads: the cards `hardware.devices` resolved to, else the GPUs
 /// that ROCr's filter (`ROCR_VISIBLE_DEVICES`, as [`apply_device_visibility`]
@@ -1435,5 +1468,22 @@ mod tests {
         assert_eq!(archs(Some("GPU-0000000000000001")), None);
         assert_eq!(archs(Some("7")), None);
         assert_eq!(archs(Some("")), None);
+    }
+
+    #[test]
+    fn entry_point_resolves_only_when_set_and_not_yet_applied() {
+        assert!(needs_entry_point_resolution(true, false));
+        assert!(!needs_entry_point_resolution(false, false), "unset keeps device 0");
+        assert!(!needs_entry_point_resolution(true, true), "daemon already applied");
+        assert!(!needs_entry_point_resolution(false, true));
+    }
+
+    #[test]
+    fn entry_point_selectors_pick_card_e_and_reject_absent_arch() {
+        let host = five_gfx1201();
+        let picked = resolve_free("GPU-05f92432f2312a0e", &host).unwrap();
+        assert_eq!(uuids(&picked), ["GPU-05f92432f2312a0e"]);
+        assert_eq!(picked[0].bdf.to_string(), "0000:c3:00.0");
+        assert!(resolve_free("gfx1151", &host).is_err());
     }
 }

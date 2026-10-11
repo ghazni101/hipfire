@@ -29,7 +29,7 @@ The mechanical section is fenced by explicit markers:
 
 ```text
 <!-- crate-map:generated:begin -->
-...modules, public API, dependencies, reverse dependencies, totals...
+...modules with exported symbols, dependencies, reverse dependencies...
 <!-- crate-map:generated:end -->
 ```
 
@@ -37,14 +37,15 @@ Regeneration replaces **only** the text between the markers; everything
 outside (purpose, status, gotchas) is hand-written judgement and is preserved
 byte-for-byte. Never hand-edit inside the markers — rerun the generator.
 
-The generated section carries, all measured from the tree:
+The generated section carries only stable structure, measured from the tree:
 
-- module inventory: every `src/**/*.rs` with line counts, public-item counts,
-  and per-file test counts (doubles as the TOC, with relative links);
-- public API surface: top-level `pub` items per file (capped, `+N more`);
+- modules and exported symbols: every `src/**/*.rs` (doubles as the TOC, with
+  relative links) followed by its `pub` item names, sorted, uncapped;
 - direct dependencies from `Cargo.toml`, split path / external / dev / build;
-- reverse dependencies: workspace crates with a path dependency on this one;
-- totals, including `tests/` and `examples/` counts.
+- reverse dependencies: workspace crates with a path dependency on this one.
+
+It deliberately carries no line counts, item/test counts, or totals, so a
+change that only edits function bodies never requires a map regen.
 
 ## Running it
 
@@ -64,11 +65,11 @@ crate without a map.
 
 `--check` fails when:
 
-- a `src/**/*.rs` file exists with no row in the module table;
-- the module table lists a file that no longer exists;
+- a `src/**/*.rs` file exists with no map entry;
+- the map lists a file that no longer exists;
+- a file gained, lost, or renamed an exported (`pub`) symbol;
 - a declared dependency (or reverse dependency) in the map is stale or
-  missing relative to `Cargo.toml`;
-- any generated count has drifted (line counts, public items, tests).
+  missing relative to `Cargo.toml`.
 
 Fix drift by rerunning the generator for that crate — never by editing inside
 the markers. Crates without a `map.md` are reported as a count but do not

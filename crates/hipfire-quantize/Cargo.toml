@@ -7,6 +7,10 @@ license.workspace = true
 [features]
 # Archived research probes; see the note by the [[example]] blocks.
 lab = []
+# Developer-only: the complete tiny Qwen4 producer (`--qwen4-dev-tiny`) and the
+# synthetic profile admission it is checked against.  Never part of a default
+# or release build; forwarded to the arch crate's feature of the same name.
+qwen4-dev-profiles = ["hipfire-arch-qwen4/qwen4-dev-profiles"]
 
 [dependencies]
 hipfire-config = { path = "../hipfire-config" }

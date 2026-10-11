@@ -249,6 +249,9 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if self.fp8_verify_scope {
+            return Err(crate::gemm_fp8_verify::fp8_verify_scope_error("gemm_qkvza_mq4g256v2_wmma_f16"));
+        }
         if !self.arch_caps.is_gfx1100() {
             return Err(hip_bridge::HipError::new(
                 0,
@@ -364,6 +367,9 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if self.fp8_verify_scope {
+            return Err(crate::gemm_fp8_verify::fp8_verify_scope_error("gemm_qkv_mq4g256v2_wmma_f16"));
+        }
         if !self.arch_caps.is_gfx1100() {
             return Err(hip_bridge::HipError::new(
                 0,
@@ -468,6 +474,9 @@ impl Gpu {
         k: usize,
         batch_size: usize,
     ) -> HipResult<()> {
+        if self.fp8_verify_scope {
+            return Err(crate::gemm_fp8_verify::fp8_verify_scope_error("gemm_gate_up_mq4g256v2_wmma_f16"));
+        }
         if !self.arch_caps.is_gfx1100() {
             return Err(hip_bridge::HipError::new(
                 0,

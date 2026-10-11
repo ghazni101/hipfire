@@ -373,3 +373,275 @@ mod test {
         );
     }
 }
+
+/// Property tests: the batched / partitioned entry points are bit-identical to
+/// the singleton ones. These live in-file because they build weights with
+/// `crate::testfix` (`pub(crate)`).
+///
+/// Why exact equality is the right claim: every output element is produced by
+/// the same `dot_row_simd(q, row, k, x_token, use_simd)` call regardless of how
+/// the (token, row) pairs are batched or partitioned, so any difference is a
+/// stride/offset bug, never rounding.
+#[cfg(test)]
+mod prop_tests {
+    use super::*;
+    use proptest::prelude::*;
+
+    /// Every `CpuQuant` variant (all are valid for `gemm`: `k % 256 == 0`
+    /// satisfies each format's group size).
+    const ALL: [CpuQuant; 28] = [
+        CpuQuant::Mq4G256,
+        CpuQuant::Mq4G256V2,
+        CpuQuant::Mq6G256,
+        CpuQuant::Mq3G256,
+        CpuQuant::Mq3G256Lloyd,
+        CpuQuant::Hfq6G256,
+        CpuQuant::Hfq3G256,
+        CpuQuant::Hfq2G256,
+        CpuQuant::Hfq4G128,
+        CpuQuant::Hfq3G128,
+        CpuQuant::Hfq2G128,
+        CpuQuant::Mq5G256,
+        CpuQuant::Mq2G256,
+        CpuQuant::Mq2G256Lloyd,
+        CpuQuant::Mq2G256LloydU,
+        CpuQuant::Mq4G256Lloyd,
+        CpuQuant::Mq4CG256,
+        CpuQuant::Mq6G256V2,
+        CpuQuant::Mq5G256V2,
+        CpuQuant::Mq3G256V2,
+        CpuQuant::Mq2G256V2,
+        CpuQuant::Tq2G128,
+        CpuQuant::Bq1G128,
+        CpuQuant::Hfq4G256,
+        CpuQuant::F16,
+        CpuQuant::F32,
+        CpuQuant::Bf16,
+        CpuQuant::Q8F16,
+    ];
+
+    /// Compile-time-ish guard: adding a `CpuQuant` variant without extending
+    /// `ALL` fails to compile here (exhaustive match, no wildcard).
+    #[allow(dead_code)]
+    fn all_is_exhaustive(q: CpuQuant) {
+        match q {
+            CpuQuant::Mq4G256
+            | CpuQuant::Mq4G256V2
+            | CpuQuant::Mq6G256
+            | CpuQuant::Mq3G256
+            | CpuQuant::Mq3G256Lloyd
+            | CpuQuant::Hfq6G256
+            | CpuQuant::Hfq3G256
+            | CpuQuant::Hfq2G256
+            | CpuQuant::Hfq4G128
+            | CpuQuant::Hfq3G128
+            | CpuQuant::Hfq2G128
+            | CpuQuant::Mq5G256
+            | CpuQuant::Mq2G256
+            | CpuQuant::Mq2G256Lloyd
+            | CpuQuant::Mq2G256LloydU
+            | CpuQuant::Mq4G256Lloyd
+            | CpuQuant::Mq4CG256
+            | CpuQuant::Mq6G256V2
+            | CpuQuant::Mq5G256V2
+            | CpuQuant::Mq3G256V2
+            | CpuQuant::Mq2G256V2
+            | CpuQuant::Tq2G128
+            | CpuQuant::Bq1G128
+            | CpuQuant::Hfq4G256
+            | CpuQuant::F16
+            | CpuQuant::F32
+            | CpuQuant::Bf16
+            | CpuQuant::Q8F16 => {}
+        }
+    }
+
+    /// SplitMix64: deterministic byte/salt stream from the proptest-drawn seed.
+    struct Rng(u64);
+    impl Rng {
+        fn next(&mut self) -> u64 {
+            self.0 = self.0.wrapping_add(0x9E37_79B9_7F4A_7C15);
+            let mut z = self.0;
+            z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+            z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+            z ^ (z >> 31)
+        }
+    }
+
+    /// Bytes of the per-group scale/codebook header that must stay valid (finite
+    /// decode): everything after it is free-form code payload.
+    fn header_len(q: CpuQuant) -> usize {
+        match q {
+            CpuQuant::Mq4G256Lloyd => 32,
+            CpuQuant::Mq3G256Lloyd => 16,
+            _ => 8,
+        }
+    }
+
+    /// `[m, k]` weight bytes: the crate fixture group (valid, finite header) with
+    /// a random salt and random code payload. The unquantized formats keep the
+    /// fixture's finite small-value tables (random bits there would be NaN/Inf).
+    fn random_weights(q: CpuQuant, m: usize, k: usize, seed: u64) -> Vec<u8> {
+        let mut rng = Rng(seed);
+        let groups = k / q.group_elems();
+        let quantized = !matches!(q, CpuQuant::F16 | CpuQuant::F32 | CpuQuant::Bf16);
+        let mut out = Vec::with_capacity(m * groups * q.group_bytes());
+        for _ in 0..m * groups {
+            let mut g = crate::testfix::group_bytes(q, (rng.next() % 4096) as usize);
+            if quantized {
+                for b in &mut g[header_len(q)..] {
+                    *b = rng.next() as u8;
+                }
+            }
+            out.extend_from_slice(&g);
+        }
+        out
+    }
+
+    /// Finite activations in `[-512, 512)` on a 2^-6 grid.
+    fn random_x(len: usize, seed: u64) -> Vec<f32> {
+        let mut rng = Rng(seed ^ 0xA5A5_5A5A_DEAD_BEEF);
+        (0..len)
+            .map(|_| ((rng.next() % 65536) as i64 - 32768) as f32 / 64.0)
+            .collect()
+    }
+
+    #[derive(Debug)]
+    struct Case {
+        q: CpuQuant,
+        /// `Some(false)` = forced scalar, `None` = runtime SIMD detection.
+        simd: Option<bool>,
+        /// Output features (weight rows).
+        m: usize,
+        k: usize,
+        /// Batch (tokens).
+        n: usize,
+        packed: Vec<u8>,
+        x: Vec<f32>,
+        /// Raw split-point entropy (reduced mod the relevant range by the property).
+        cuts: Vec<usize>,
+    }
+
+    fn case() -> impl Strategy<Value = Case> {
+        (
+            0..ALL.len(),
+            any::<bool>(),
+            1usize..=24,
+            1usize..=4,
+            1usize..=9,
+            any::<u64>(),
+            prop::collection::vec(any::<usize>(), 0..5),
+        )
+            .prop_map(|(qi, scalar, m, groups, n, seed, cuts)| {
+                let q = ALL[qi];
+                // gemv/gemm assert `k % 256 == 0`, which is a multiple of every
+                // format's group size (32/128/256).
+                let k = 256 * groups;
+                Case {
+                    q,
+                    simd: scalar.then_some(false),
+                    m,
+                    k,
+                    n,
+                    packed: random_weights(q, m, k, seed),
+                    x: random_x(n * k, seed),
+                    cuts,
+                }
+            })
+    }
+
+    /// Sorted, deduplicated interior split points in `1..len`, plus both ends.
+    fn boundaries(raw: &[usize], len: usize) -> Vec<usize> {
+        let mut b: Vec<usize> = raw
+            .iter()
+            .filter(|_| len > 1)
+            .map(|c| 1 + c % (len - 1))
+            .collect();
+        b.push(0);
+        b.push(len);
+        b.sort_unstable();
+        b.dedup();
+        b
+    }
+
+    fn bits(v: &[f32]) -> Vec<u32> {
+        v.iter().map(|f| f.to_bits()).collect()
+    }
+
+    proptest! {
+        #![proptest_config(ProptestConfig::with_cases(64))]
+
+        /// gemm over `n` tokens == `n` independent gemv calls, bit for bit.
+        #[test]
+        fn prop_gemm_equals_n_gemv(c in case()) {
+            let Case { q, simd, m, k, n, packed, x, .. } = c;
+            let mut batch = vec![0.0f32; n * m];
+            gemm_with_simd(q, &packed, m, k, &x, n, &mut batch, simd);
+            for t in 0..n {
+                let mut single = vec![0.0f32; m];
+                gemv_with_simd(q, &packed, m, k, &x[t * k..(t + 1) * k], &mut single, simd);
+                prop_assert_eq!(
+                    bits(&batch[t * m..(t + 1) * m]),
+                    bits(&single),
+                    "{:?} m={} k={} n={} token {}", q, m, k, n, t
+                );
+            }
+        }
+
+        /// gemm over the whole batch == concatenation of gemm over contiguous
+        /// chunks of the batch (random split points), bit for bit.
+        #[test]
+        fn prop_gemm_batch_partition_invariant(c in case()) {
+            let Case { q, simd, m, k, n, packed, x, cuts } = c;
+            let mut full = vec![0.0f32; n * m];
+            gemm_with_simd(q, &packed, m, k, &x, n, &mut full, simd);
+            let b = boundaries(&cuts, n);
+            let mut stitched: Vec<f32> = Vec::with_capacity(n * m);
+            for w in b.windows(2) {
+                let (lo, hi) = (w[0], w[1]);
+                let mut part = vec![0.0f32; (hi - lo) * m];
+                gemm_with_simd(q, &packed, m, k, &x[lo * k..hi * k], hi - lo, &mut part, simd);
+                stitched.extend_from_slice(&part);
+            }
+            prop_assert_eq!(
+                bits(&full),
+                bits(&stitched),
+                "{:?} m={} k={} n={} partition {:?}", q, m, k, n, b
+            );
+        }
+
+        /// Output-row split. Weights are row-major with `row_bytes(q, k)` per
+        /// output row (the layout `gemv`/`gemm` index by `row * rb`), so a
+        /// contiguous row range is a contiguous byte slice. gemm/gemv over that
+        /// slice == the matching columns of the full result, bit for bit.
+        #[test]
+        fn prop_output_row_split_invariant(c in case()) {
+            let Case { q, simd, m, k, n, packed, x, cuts } = c;
+            let rb = row_bytes(q, k);
+            let mut full = vec![0.0f32; n * m];
+            gemm_with_simd(q, &packed, m, k, &x, n, &mut full, simd);
+            let b = boundaries(&cuts, m);
+            for w in b.windows(2) {
+                let (lo, hi) = (w[0], w[1]);
+                let sub = &packed[lo * rb..hi * rb];
+                let mr = hi - lo;
+                let mut part = vec![0.0f32; n * mr];
+                gemm_with_simd(q, sub, mr, k, &x, n, &mut part, simd);
+                for t in 0..n {
+                    prop_assert_eq!(
+                        bits(&part[t * mr..(t + 1) * mr]),
+                        bits(&full[t * m + lo..t * m + hi]),
+                        "{:?} m={} k={} n={} rows {}..{} token {} (gemm)", q, m, k, n, lo, hi, t
+                    );
+                    let mut single = vec![0.0f32; mr];
+                    gemv_with_simd(q, sub, mr, k, &x[t * k..(t + 1) * k], &mut single, simd);
+                    prop_assert_eq!(
+                        bits(&single),
+                        bits(&full[t * m + lo..t * m + hi]),
+                        "{:?} m={} k={} n={} rows {}..{} token {} (gemv)", q, m, k, n, lo, hi, t
+                    );
+                }
+            }
+        }
+    }
+}

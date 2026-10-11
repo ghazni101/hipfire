@@ -1379,7 +1379,7 @@ fn parse_number(text: &str, name: &str, operand: &str) -> Result<u16, ParseError
 /// Canonical don't-care defaults plus honored values re-derived from the
 /// parsed operands/modifiers, mirroring the codec's own derivation.
 fn derive_fields(row: &OpRow, parsed: &ParsedOperands) -> Result<FormFields, ParseError> {
-    if row.form == Form::Vop3
+    if matches!(row.form, Form::Vop3 | Form::Vop3p)
         && !row.grammar.contains("SRC2:")
         && !row.benign_src2.is_empty()
         && row.fields.len() == 1
@@ -1391,10 +1391,10 @@ fn derive_fields(row: &OpRow, parsed: &ParsedOperands) -> Result<FormFields, Par
     }
     let mut ignored: SmallVec<[NamedField; 4]> = SmallVec::new();
     let mut honored: SmallVec<[NamedField; 4]> = SmallVec::new();
-    // The codec emits src2_unused first for VOP3 rows without a SRC2
+    // The codec emits src2_unused first for VOP3/VOP3P rows without a SRC2
     // slot, then the remaining rules in table order; mirror that order
     // exactly (field lists compare order-sensitively).
-    let vop3_no_src2 = row.form == Form::Vop3
+    let vop3_no_src2 = matches!(row.form, Form::Vop3 | Form::Vop3p)
         && !row.grammar.contains("SRC2:")
         && !row.benign_src2.is_empty();
     if vop3_no_src2 {

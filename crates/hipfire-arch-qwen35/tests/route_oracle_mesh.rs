@@ -1010,7 +1010,13 @@ impl EpOracleDump {
     }
 
     fn write_snapshot(&self, rank: usize, pos: usize, snap: &StateSnap) {
-        let dir = self.rank_position(rank, pos);
+        Self::write_snapshot_to(&self.rank_position(rank, pos), snap, true);
+    }
+
+    /// `include_scratch=false` writes only the recurrent/KV state files (the
+    /// bisection tool does not compare scratch; scratch is optional).
+    fn write_snapshot_to(dir: &Path, snap: &StateSnap, include_scratch: bool) {
+        let dir = dir.to_path_buf();
         for (layer, bytes) in snap.kv_k.iter().enumerate() {
             Self::write(dir.join(format!("kv-k-{layer}.bin")), bytes);
         }
@@ -1028,6 +1034,9 @@ impl EpOracleDump {
         }
         for (layer, bytes) in snap.dn_ef.iter().enumerate() {
             Self::write(dir.join(format!("dn-ef-{layer}.bin")), bytes);
+        }
+        if !include_scratch {
+            return;
         }
         for (field, bytes) in snap.scratch.fixed.iter().enumerate() {
             Self::write(dir.join(format!("scratch-fixed-{field}.bin")), bytes);
@@ -1059,6 +1068,96 @@ impl EpOracleDump {
             self.write_snapshot(rank, pos, &snap);
         }
     }
+
+    /// Single-arm POST-step observation, written with the exact layout the EP
+    /// arm uses (`position-P/{token.u32,position.u64}`,
+    /// `rank-0/position-P/{root-logits.f32,kv-*,dn-*,scratch-*}`) so
+    /// `tools/ep_bisect.py` can diff `single/` against `ep2/` file for file.
+    /// `snap` MUST be taken after the step: the EP arm's files are post-step
+    /// (`write_observation` runs after `mesh.step`), whereas `snaps[pos]` in the
+    /// oracle is the PRE-step state used to restore the mesh; pre-step state
+    /// goes through `write_pre_step` into a separate root instead.
+    fn write_single_observation(&self, token: u32, pos: usize, logits: &[f32], snap: &StateSnap) {
+        let position = self.position_root(pos);
+        Self::write(position.join("token.u32"), &token.to_le_bytes());
+        Self::write(position.join("position.u64"), &(pos as u64).to_le_bytes());
+        Self::write_f32(self.rank_position(0, pos).join("root-logits.f32"), logits);
+        self.write_snapshot(0, pos, snap);
+    }
+
+    /// State-only PRE-step snapshot (the bytes the EP arm was restored to).
+    fn write_pre_step(&self, pos: usize, snap: &StateSnap) {
+        Self::write_snapshot_to(&self.rank_position(0, pos), snap, false);
+    }
+
+    /// Physical-layer map for the state files. `kv-k-L`/`kv-v-L` are indexed by
+    /// physical layer (non-FullAttention layers hold a 1-element placeholder),
+    /// but `dn-*-L` are COMPACT over LinearAttention layers only: file suffix
+    /// `L` is the L-th DeltaNet slot, not the physical layer index.
+    fn write_layer_map(&self, config: &Qwen35Config, kv: &KvCache, dn: &DeltaNetState) {
+        let types: Vec<&str> = config
+            .layer_types
+            .iter()
+            .map(|t| match t {
+                qwen35::LayerType::FullAttention => "full_attention",
+                qwen35::LayerType::LinearAttention => "linear_attention",
+            })
+            .collect();
+        let kv_layers: Vec<usize> = (0..types.len())
+            .filter(|&l| types[l] == "full_attention")
+            .collect();
+        let dn_layers: Vec<usize> = (0..types.len())
+            .filter(|&l| types[l] == "linear_attention")
+            .collect();
+        assert_eq!(
+            kv.k_gpu.len(),
+            types.len(),
+            "layer map: kv arrays must be indexed by physical layer"
+        );
+        assert_eq!(
+            dn.s_matrices.len(),
+            dn_layers.len(),
+            "layer map: dn arrays must be compact over LinearAttention layers"
+        );
+        let map = serde_json::json!({
+            "schema": 1,
+            "n_layers": config.n_layers,
+            "hidden_dim": config.dim,
+            "num_experts": config.num_experts,
+            "top_k": config.num_experts_per_tok,
+            "layer_types": types,
+            "kv_files_indexed_by": "physical_layer",
+            "kv_layers_with_real_state": kv_layers,
+            "dn_files_indexed_by": "compact_linear_attention_slot",
+            "dn_slot_to_physical_layer": dn_layers,
+            "kv_k_format": if kv.quant_fwht { "fwht3_packed" } else { "other" },
+            "kv_v_format": if kv.quant_fwht { "q8_blocks" } else { "other" },
+            "dn_s_format": match state_quant_name(dn.quant) {
+                "q8" => "q8_int8",
+                "fp32" => "f32",
+                _ => "other",
+            },
+        });
+        let bytes = serde_json::to_vec_pretty(&map).expect("serialize layer map");
+        Self::write(self.root.join("layer-map.json"), &bytes);
+    }
+}
+
+/// Tag the opt-in per-layer MoE dump hook (`HIPFIRE_MOE_DUMP_DIR`,
+/// `hipfire_dispatch::pipeline::moe_dump`) with the arm and position about to
+/// run; the hook adds rank and layer. `set_context` is a no-op unless the hook
+/// directory is set, so the default launch sequence is unchanged. The hook
+/// synchronises the device per capture and requires `HIPFIRE_GRAPH=0`.
+fn moe_dump_tag(arm: &str, pos: usize) {
+    if !hipfire_dispatch::pipeline::moe_dump::enabled() {
+        return;
+    }
+    if std::env::var("HIPFIRE_GRAPH").as_deref() != Ok("0") {
+        eprintln!(
+            "moe-dump: WARNING HIPFIRE_GRAPH is not 0; graph-replayed layers will not be dumped"
+        );
+    }
+    hipfire_dispatch::pipeline::moe_dump::set_context(arm, pos);
 }
 
 fn download_tensors(gpu: &mut Gpu, tensors: &[GpuTensor]) -> Vec<Vec<u8>> {
@@ -1722,6 +1821,21 @@ fn qwen35_ep2_vs_single_oracle() {
     );
     check_dn(TEST, &single.dn);
 
+    // Opt-in single-arm dump (`HIPFIRE_EP_ORACLE_DUMP/single/`), post-step like
+    // the EP arm. Pre-step state (the bytes the mesh is restored to, equal to the
+    // previous position's post-step state) is redundant multi-GB output and is
+    // written to `single-pre-step/` only with `HIPFIRE_EP_ORACLE_DUMP_PRE_STEP=1`.
+    let single_dump = EpOracleDump::from_env("single");
+    let single_pre_dump = if std::env::var("HIPFIRE_EP_ORACLE_DUMP_PRE_STEP").as_deref() == Ok("1")
+    {
+        EpOracleDump::from_env("single-pre-step")
+    } else {
+        None
+    };
+    if let Some(dump) = single_dump.as_ref() {
+        dump.write_layer_map(&single.config, &single.kv, &single.dn);
+    }
+
     // Reference run: greedy decode, keeping every committed token, its logits,
     // and its pre-step state snapshot for the mesh replay below.
     let mut committed = Vec::with_capacity(total);
@@ -1740,7 +1854,16 @@ fn qwen35_ep2_vs_single_oracle() {
             &single.dn,
             &single.scratch,
         ));
+        moe_dump_tag("single", pos);
         let logits = single.step(token, pos);
+        if let Some(dump) = single_dump.as_ref() {
+            // Post-step state: the EP arm's files are post-step too.
+            let post = snap_state(&mut single.gpu, &single.kv, &single.dn, &single.scratch);
+            dump.write_single_observation(token, pos, &logits, &post);
+        }
+        if let Some(dump) = single_pre_dump.as_ref() {
+            dump.write_pre_step(pos, &snaps[pos]);
+        }
         let choice = argmax(&logits);
         eprintln!("{TEST}: single pos {pos:>2} token {token:>6} (choice {choice})");
         next_token = choice;
@@ -1754,6 +1877,17 @@ fn qwen35_ep2_vs_single_oracle() {
         return;
     };
     let dump = EpOracleDump::from_env("ep2");
+    if let Some(dump) = dump.as_ref() {
+        dump.write_layer_map(&mesh.config, &mesh.kvs[0], &mesh.dns[0]);
+    }
+    // Source-evaluated admission (not runtime-probed): `Qwen35Bindings` does not
+    // override `ForwardBindings::attention_tp_enabled`, whose default is `false`
+    // (`superop.rs:581`), and the mesh is the pure-EP `Gpus::init_ep` shape, so
+    // attention never reaches the all-reduce guarded at `ep.rs:676`.
+    eprintln!(
+        "{TEST}: admission mesh=init_ep ep={} tp=1 attention_tp_enabled=false (source: ForwardBindings default, Qwen35Bindings no override)",
+        mesh.gpus.devices.len()
+    );
 
     eprintln!(
         "{TEST}: route identity — single=forward_scratch/Layout::single, mesh=forward_ep/ep=2 stride-sharded"
@@ -1839,6 +1973,7 @@ fn qwen35_ep2_vs_single_oracle() {
                 eprintln!("{TEST}: restore roundtrip pos0 OK");
             }
         }
+        moe_dump_tag("ep2", pos);
         let ep_logits = mesh.step(committed[pos], pos);
         if let Some(dump) = dump.as_ref() {
             dump.write_observation(&mut mesh, committed[pos], pos, &ep_logits);

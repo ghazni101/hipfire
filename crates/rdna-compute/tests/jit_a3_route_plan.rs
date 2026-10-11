@@ -308,10 +308,20 @@ fn conflicting_public_entry_plans_refuse() {
     validate_route_plan(&same).unwrap();
 }
 
+/// The accepted PM multi-column objects (`pm_xbatch.rs`): `(module, image
+/// sha256, symbol)`.
+const PM_XBATCH_OBJECTS: [(&str, &str, &str); 3] = [
+    ("gemv_hfq4g256_xbatch_mq4v2_pm", "1b4da1135f5623b6188a0c13b78106177a9a1cddef6cbc4c2839aa495753db6e", "gemv_mq4g256v2_xbatch_pm"),
+    ("gemv_hfq4g256_residual_xbatch_mq4v2_pm", "cf64991bb24e4d99fd57c304545b47b2a5a7a893e4e65c612adb0b49b7573267", "gemv_mq4g256v2_residual_xbatch"),
+    ("gemv_hfq4g256_multirow_xbatch_mq4v2_pm", "07ea1deb45e546345567bf1e891923b0fcf05f7959be51448787059a6867c2e4", "gemv_mq4g256v2_multirow_r2_xbatch_pm"),
+];
+
 /// Default `kernel.pm_decode` on exact gfx1201: every accepted twin replaces its HIP
 /// entry (same module and symbols, embedded image), the replaced HIP recipe
-/// is the exact source the oracle accepted against, nothing else changes,
-/// and the flag never reaches another architecture.
+/// is the exact source the oracle accepted against, the VMM exact route's
+/// hipcc x-batch GEMV fallback gives way to the accepted PM multi-column
+/// objects (`pm_xbatch`), nothing else changes, and the flag never reaches
+/// another architecture.
 #[test]
 fn pm_decode_twins_replace_their_hip_route_entries() {
     use rdna_compute::pm_decode_twins::GFX1201_TWINS;
@@ -346,6 +356,15 @@ fn pm_decode_twins_replace_their_hip_route_entries() {
             assert_eq!(pm.0, "embedded", "{}", twin.module);
             assert_eq!(pm.1, sha256(twin.image), "{}", twin.module);
             assert_eq!(pm.4, hip.4, "{}: symbols changed", twin.module);
+        }
+        let xbatch = off.remove("gemv_mq4g256v2_xbatch").expect("hipcc x-batch fallback not in the pm_decode=false route");
+        assert_eq!(xbatch.0, "hip");
+        assert!(!on.contains_key("gemv_mq4g256v2_xbatch"), "pm_decode route keeps the hipcc x-batch fallback");
+        for (module, digest, symbol) in PM_XBATCH_OBJECTS {
+            let pm = on.remove(module).unwrap_or_else(|| panic!("{module} not in the pm_decode route"));
+            assert_eq!(pm.0, "embedded", "{module}");
+            assert_eq!(pm.1, digest, "{module}: embedded image is not the accepted object");
+            assert_eq!(pm.4, BTreeSet::from([symbol.to_owned()]), "{module}");
         }
         assert_eq!(off, on, "{spec:?}: pm_decode changed a non-twin entry");
     }

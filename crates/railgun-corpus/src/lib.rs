@@ -18,6 +18,11 @@
 //! own compiles (the `__hip_cuid_*` marker is named after the input path and
 //! argv), so a corpus is keyed per build host: its records bind the exact
 //! object bytes built there, which ship in the corpus pack.
+//!
+//! The runtime also loads PeaceMaker-emitted native twin images embedded in
+//! its binary instead of the hipcc objects for some modules. Those images are
+//! recorded too ([`ObjectOrigin::PmNative`]), keyed by image digest and with no
+//! compile recipe; their bytes ship under `native/<arch>/`, not in the pack.
 pub mod receipt;
 
 use std::collections::{BTreeMap, HashMap};
@@ -29,7 +34,7 @@ use sha2::{Digest, Sha256};
 pub use receipt::*;
 
 pub const CORPUS_SCHEMA: &str = "railgun-jit-corpus";
-pub const CORPUS_VERSION: u32 = 1;
+pub const CORPUS_VERSION: u32 = 2;
 /// The index file at the root of a corpus directory.
 pub const CORPUS_INDEX: &str = "index.json";
 
@@ -77,14 +82,24 @@ pub struct ToolchainPin {
     pub version_sha256: String,
 }
 
-/// One certified object: the runtime's JIT cache-key inputs for the module,
-/// the object they produced on the build host, and its receipt.
+/// How the runtime obtains an object: compiled by hipcc from the registry source, or a
+/// PeaceMaker-emitted image embedded in the runtime (`rdna_compute::pm_decode_twins`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ObjectOrigin {
+    Hipcc,
+    PmNative,
+}
+
+/// One certified object: the runtime's JIT cache-key inputs for the module
+/// (hipcc origin; empty for native images), the object and its receipt.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct CorpusRecord {
     pub arch: String,
     pub artifact_sha256: String,
     pub module: String,
+    pub origin: ObjectOrigin,
     pub symbols: Vec<String>,
     pub source_sha256: String,
     pub extra_flags: String,
@@ -112,6 +127,7 @@ pub struct RejectedObject {
     pub arch: String,
     pub artifact_sha256: String,
     pub module: String,
+    pub origin: ObjectOrigin,
     pub symbols: Vec<String>,
     pub source_sha256: String,
     pub packaging_key: String,
@@ -315,10 +331,12 @@ impl JitCorpus {
         self.index.rejected.iter().find(|r| r.arch == arch && r.artifact_sha256 == artifact_sha256)
     }
 
-    /// The first record for `(arch, module, packaging_key)`: the runtime's
-    /// toolchain-free JIT cache key for the module's generated source.
+    /// The first hipcc-built record for `(arch, module, packaging_key)`: the
+    /// runtime's toolchain-free JIT cache key for the module's generated source.
+    /// Native ([`ObjectOrigin::PmNative`]) records have no packaging key and are
+    /// never matched here; they are found by image digest through [`Self::record`].
     pub fn record_for_module(&self, arch: &str, module: &str, packaging_key: &str) -> Option<&CorpusRecord> {
-        self.index.records.iter().find(|r| r.arch == arch && r.module == module && r.packaging_key == packaging_key)
+        self.index.records.iter().find(|r| r.origin == ObjectOrigin::Hipcc && r.arch == arch && r.module == module && r.packaging_key == packaging_key)
     }
 
     /// Look an artifact up and return its verified receipt. A receipt that is

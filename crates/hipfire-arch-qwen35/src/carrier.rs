@@ -42,6 +42,12 @@ pub struct Qwen35Bundle {
     /// row-budget scratch). `None` unless the VMM batch route is staged;
     /// freed before KV/weights in every bundle free path.
     pub vmm_store: Option<crate::forward_slots::vmm::Qwen35VmmStore>,
+    /// Live weight-host lease (`HIPFIRE_WEIGHT_HOST=1`): `Some` exactly when
+    /// `weights` were imported from a host generation. Released only by
+    /// [`free_qwen35_bundle`] / the loader's `unload_model` after the imported
+    /// owners are freed and VMM teardown is clean; dropping it closes the
+    /// lease without a release acknowledgement.
+    pub weight_lease: Option<SharedWeightLease>,
 }
 /// Build the Qwen35 GPU bundle from an HFQ source.
 ///
@@ -63,14 +69,26 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
     eprintln!("  DeltaNet state: {}", state_quant_label(dn_quant));
     warn_tiny_model_state(&hfq, dn_quant);
 
-    // ── Weight upload (first GPU ownership) ──────────────────────────
-    let weights = <Qwen35 as Architecture>::load_weights(&mut hfq, &config, ctx.gpu)?;
+    // ── Weights (first GPU ownership): private upload, or import from the
+    //    weight host when HIPFIRE_WEIGHT_HOST=1. No private-load fallback
+    //    once opted in. ─────────────────────────────────────────────────
+    let weights_started = std::time::Instant::now();
+    let socket = weight_host_socket()?;
+    let route = if socket.is_some() { "import" } else { "private" };
+    let (weights, mut weight_lease) = match socket {
+        None => (<Qwen35 as Architecture>::load_weights(&mut hfq, &config, ctx.gpu)?, None),
+        Some(socket) => {
+            let (weights, lease) = import_from_weight_host(&socket, &hfq, &config, ctx)?;
+            (weights, Some(lease))
+        }
+    };
     hipfire_runtime::maybe_screen_mmq(&weights, ctx.gpu);
+    let weights_ms = weights_started.elapsed().as_secs_f64() * 1e3;
     // The real card bound is determined only now: weights (including any
     // expanded tensors) already own VRAM, while KV and lazy PBS do not.
     if let Some(mut sequence) = ctx.sequence {
         let capacity = (|| -> Result<(usize, usize, usize, usize), String> {
-            let (free, _) = ctx.gpu.hip.get_vram_info().map_err(|e| format!("Qwen post-weight VRAM query: {e}"))?;
+            let (free, _) = ctx.gpu.device_mem_info().map_err(|e| format!("Qwen post-weight VRAM query: {e}"))?;
             let minimum = crate::qwen35::prefill::minimum_prefill_reservation_bytes(
                 &config, &ctx.gpu.arch,
             ).ok_or("Qwen minimum PBS sizing overflow")?;
@@ -84,7 +102,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
             Ok(v) => v,
             Err(e) => {
                 weights.free_gpu(ctx.gpu);
-                return Err(e);
+                return Err(release_after_failed_load(e, weight_lease.take(), ctx.gpu));
             }
         };
         eprintln!(
@@ -94,7 +112,11 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
         if sequence.automatic {
             if card_cap < 512 {
                 weights.free_gpu(ctx.gpu);
-                return Err("Qwen VMM load refused: measured post-weight VRAM cannot hold minimum PBS and KV".into());
+                return Err(release_after_failed_load(
+                    "Qwen VMM load refused: measured post-weight VRAM cannot hold minimum PBS and KV".into(),
+                    weight_lease.take(),
+                    ctx.gpu,
+                ));
             }
             ctx.max_seq = sequence.model_ctx.min(card_cap);
         }
@@ -104,40 +126,52 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
             Ok(v) => v,
             Err(e) => {
                 weights.free_gpu(ctx.gpu);
-                return Err(e);
+                return Err(release_after_failed_load(e, weight_lease.take(), ctx.gpu));
             }
         };
     }
 
     // ── KV (transactional: free weights on fail) ─────────────────────
+    let kv_started = std::time::Instant::now();
     let (kv, kv_adaptive) = match construct_kv_cache(&config, ctx, plan) {
         Ok(v) => v,
         Err(e) => {
             weights.free_gpu(ctx.gpu);
-            return Err(append_cleanup_context(e, note_vmm_after_free(ctx.gpu)));
+            let e = append_cleanup_context(e, note_vmm_after_free(ctx.gpu));
+            return Err(release_after_failed_load(e, weight_lease.take(), ctx.gpu));
         }
     };
+    let kv_ms = kv_started.elapsed().as_secs_f64() * 1e3;
 
     // ── DeltaNet state (free kv + weights on fail) ───────────────────
+    let dn_started = std::time::Instant::now();
     let dn = match DeltaNetState::new_with_quant(ctx.gpu, &config, dn_quant) {
         Ok(v) => v,
         Err(e) => {
             let cleanup = free_kv_and_weights(kv, weights, ctx.gpu);
-            return Err(append_cleanup_context(format!("{e}"), cleanup));
+            let e = append_cleanup_context(format!("{e}"), cleanup);
+            return Err(release_after_failed_load(e, weight_lease.take(), ctx.gpu));
         }
     };
+    let dn_ms = dn_started.elapsed().as_secs_f64() * 1e3;
 
     // ── Scratch (free dn + kv + weights on fail) ─────────────────────
     // Flash-attention partials address physical KV slots, not the logical
     // context range.  An eviction-bounded cache can make this cap much smaller
     // than max_seq, so sizing from max_seq retains memory for unreachable tiles.
+    let scratch_started = std::time::Instant::now();
     let scratch = match Qwen35Scratch::new_with_kv_max(ctx.gpu, &config, 2048, kv.physical_cap) {
         Ok(v) => v,
         Err(e) => {
             let cleanup = free_dn_kv_and_weights(dn, kv, weights, ctx.gpu);
-            return Err(append_cleanup_context(format!("{e}"), cleanup));
+            let e = append_cleanup_context(format!("{e}"), cleanup);
+            return Err(release_after_failed_load(e, weight_lease.take(), ctx.gpu));
         }
     };
+    let scratch_ms = scratch_started.elapsed().as_secs_f64() * 1e3;
+    eprintln!(
+        "QWEN35_LOAD_PHASES route={route} weights_ms={weights_ms:.3} kv_ms={kv_ms:.3} dn_ms={dn_ms:.3} scratch_ms={scratch_ms:.3}"
+    );
 
     Ok(Qwen35Bundle {
         config,
@@ -151,6 +185,7 @@ pub fn load_bundle(src: ModelSource, ctx: &mut LoadCtx) -> Result<Qwen35Bundle, 
         vision_weights: None,
         qwen35_decode_batch: None,
         vmm_store: None,
+        weight_lease,
     })
 }
 
@@ -540,6 +575,7 @@ pub fn free_qwen35_bundle(bundle: Qwen35Bundle, gpu: &mut rdna_compute::Gpu) -> 
         vision_weights,
         qwen35_decode_batch,
         vmm_store,
+        weight_lease,
     } = bundle;
     debug_assert!(
         pp_scratch_set.is_none(),
@@ -566,12 +602,238 @@ pub fn free_qwen35_bundle(bundle: Qwen35Bundle, gpu: &mut rdna_compute::Gpu) -> 
         vw.free_gpu(gpu);
     }
     let vmm = note_vmm_after_free(gpu);
-    match (first, vmm) {
+    let result = match (first, vmm) {
         (None, Ok(())) => Ok(()),
         (Some(e), Ok(())) => Err(e),
         (None, Err(c)) => Err(c),
         (Some(e), Err(c)) => Err(format!("{e}; cleanup also failed: {c}")),
+    };
+    match (weight_lease, result) {
+        (None, result) => result,
+        (Some(lease), Ok(())) => {
+            // Captured graphs embed imported addresses; drop them before
+            // telling the host this tenant holds no references.
+            gpu.invalidate_graph_state();
+            lease.release()
+        }
+        (Some(lease), Err(e)) => {
+            drop(lease);
+            Err(format!("{e}; weight-host lease closed without release (teardown not proven clean)"))
+        }
     }
+}
+
+/// Live lease on one weight-host generation, held by [`Qwen35Bundle`] for as
+/// long as imported weights may be referenced. Dropping it closes the lease
+/// without a release acknowledgement: the host then keeps the lease until this
+/// process exits.
+pub struct SharedWeightLease {
+    #[cfg(target_os = "linux")]
+    inner: hipfire_runtime::weight_host::WeightHostLease,
+    #[cfg(not(target_os = "linux"))]
+    _never: std::convert::Infallible,
+}
+
+impl SharedWeightLease {
+    /// `Ok(false)` once the host closed the lease (drain or exit).
+    pub fn host_alive(&self) -> Result<bool, String> {
+        #[cfg(target_os = "linux")]
+        return self.inner.host_alive().map_err(|e| e.to_string());
+        #[cfg(not(target_os = "linux"))]
+        match self._never {}
+    }
+
+    /// Send `Release` (closing every allocation FD first). Call only after
+    /// every imported owner is freed and VMM teardown reported clean.
+    pub fn release(self) -> Result<(), String> {
+        #[cfg(target_os = "linux")]
+        {
+            let mut inner = self.inner;
+            inner.close_allocation_fds();
+            inner.release().map_err(|e| format!("weight-host release: {e}"))
+        }
+        #[cfg(not(target_os = "linux"))]
+        match self._never {}
+    }
+}
+
+/// `HIPFIRE_WEIGHT_HOST` opt-in, read at bootstrap (it selects the GPU claim
+/// before the process config exists). `Ok(None)`: unset or the `0` kill
+/// switch, incumbent private loading. `Ok(Some(socket))`: import from the
+/// weight host at `HIPFIRE_WEIGHT_HOST_SOCKET`. Anything else fails closed.
+pub fn weight_host_socket() -> Result<Option<std::path::PathBuf>, String> {
+    #[cfg(target_os = "linux")]
+    {
+        hipfire_runtime::weight_host::weight_host_socket_from_env().map_err(|e| e.to_string())
+    }
+    #[cfg(not(target_os = "linux"))]
+    match std::env::var("HIPFIRE_WEIGHT_HOST").as_deref() {
+        Err(std::env::VarError::NotPresent) | Ok("0") => Ok(None),
+        Ok("1") => Err("HIPFIRE_WEIGHT_HOST=1 is supported on Linux only".into()),
+        _ => Err("HIPFIRE_WEIGHT_HOST must be unset, 0 or 1".into()),
+    }
+}
+
+/// Failed load after an import: release the lease only when the imported
+/// owners are gone and VMM teardown is clean, else close it unacknowledged.
+fn release_after_failed_load(
+    error: String,
+    lease: Option<SharedWeightLease>,
+    gpu: &mut rdna_compute::Gpu,
+) -> String {
+    let Some(lease) = lease else {
+        return error;
+    };
+    match note_vmm_after_free(gpu) {
+        Ok(()) => match lease.release() {
+            Ok(()) => error,
+            Err(release) => format!("{error}; {release}"),
+        },
+        Err(cleanup) => format!("{error}; {cleanup}; weight-host lease closed without release"),
+    }
+}
+
+/// Weight-host v1 envelope for an import: single device, plain dense decode.
+/// Checked before connecting, so an unsupported request never takes a lease.
+fn refuse_outside_weight_host_envelope(ctx: &LoadCtx) -> Result<(), String> {
+    let refuse = |what: &str| Err(format!("HIPFIRE_WEIGHT_HOST=1 does not support {what}"));
+    if ctx.pp != 1 {
+        return refuse("pp > 1");
+    }
+    if ctx.draft_path.is_some() || ctx.gemma4_drafter_path.is_some() {
+        return refuse("a draft model");
+    }
+    if ctx.mtp_path.is_some() || ctx.spec.mtp == Some(true) {
+        return refuse("MTP");
+    }
+    if ctx.spec.dflash == Some(true) || ctx.spec.dspark == Some(true) {
+        return refuse("DFlash/DSpark");
+    }
+    if ctx.vision_path.is_some() {
+        return refuse("a vision tower");
+    }
+    if ctx.gpu.arch != "gfx1201" {
+        return refuse(&format!("{} (v1 is gfx1201 only)", ctx.gpu.arch));
+    }
+    Ok(())
+}
+
+/// Card identity both sides of the handshake compute the same way: HIP UUID,
+/// PCI bus ID and architecture of the bound device.
+#[cfg(target_os = "linux")]
+pub fn weight_host_card_identity(
+    gpu: &rdna_compute::Gpu,
+) -> Result<hipfire_runtime::weight_host::CardIdentity, String> {
+    let uuid = gpu.hip.device_uuid(gpu.device_id).map_err(|e| format!("card UUID: {e}"))?;
+    let pci_bus_id = gpu.hip.device_pci_bus_id(gpu.device_id).map_err(|e| format!("card PCI bus ID: {e}"))?;
+    Ok(hipfire_runtime::weight_host::CardIdentity { uuid, pci_bus_id, device_arch: gpu.arch.clone() })
+}
+
+/// Source certificate the host publishes beside its socket (same private
+/// directory): `<socket>.source-cert`.
+pub fn weight_host_source_certificate_path(socket: &std::path::Path) -> std::path::PathBuf {
+    let mut name = socket.file_name().map(|n| n.to_os_string()).unwrap_or_default();
+    name.push(".source-cert");
+    socket.with_file_name(name)
+}
+
+#[cfg(target_os = "linux")]
+mod loader_abi_generated {
+    include!(concat!(env!("OUT_DIR"), "/loader_abi.rs"));
+}
+
+/// `LoaderAbiSha256` inputs of this build (build.rs: loader closure source
+/// digests, quant representation constants, CPU toolchain and features).
+/// Forward kernels are not inputs, so compute-only builds share one ABI.
+#[cfg(target_os = "linux")]
+pub fn loader_abi() -> hipfire_runtime::weight_host::LoaderAbi {
+    use hipfire_runtime::weight_host::{FieldValue, LoaderAbi, Sha256Digest};
+    let mut abi = LoaderAbi::new("hipfire.qwen35.dense.loader-abi/v1")
+        .with("representation_tag", FieldValue::str(crate::shared_weights::DENSE_REPRESENTATION_TAG));
+    for (name, digest) in loader_abi_generated::LOADER_ABI_COMPONENTS {
+        abi.components.insert((*name).to_owned(), Sha256Digest(*digest));
+    }
+    abi
+}
+
+/// `ModelContentSha256` of the base HFQ, the only v1 source.
+#[cfg(target_os = "linux")]
+pub fn weight_host_source_sha256(
+    cert: &hipfire_runtime::weight_host::SourceCertificate,
+) -> Result<hipfire_runtime::weight_host::Sha256Digest, String> {
+    hipfire_runtime::weight_host::model_content_sha256(&[cert.to_source_digest()]).map_err(|e| e.to_string())
+}
+
+/// Diagnostics-only provenance: never compared or hashed.
+#[cfg(target_os = "linux")]
+pub fn weight_host_provenance(role: &str) -> hipfire_runtime::weight_host::BuildProvenance {
+    let exe = std::env::current_exe().map(|p| p.display().to_string()).unwrap_or_default();
+    hipfire_runtime::weight_host::BuildProvenance {
+        label: format!("{role} {exe} pid {}", std::process::id()),
+        ..Default::default()
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn import_from_weight_host(
+    socket: &std::path::Path,
+    hfq: &HfqFile,
+    config: &Qwen35Config,
+    ctx: &mut LoadCtx,
+) -> Result<(Qwen35Weights, SharedWeightLease), String> {
+    use hipfire_runtime::weight_host as wh;
+    refuse_outside_weight_host_envelope(ctx)?;
+    let connect_started = std::time::Instant::now();
+    let admission_token = std::env::var("HIPFIRE_FABRIC_ADMISSION")
+        .map_err(|_| "HIPFIRE_WEIGHT_HOST=1 needs HIPFIRE_FABRIC_ADMISSION (dev-fabric correct-class job)".to_string())?;
+    let card = weight_host_card_identity(ctx.gpu)?;
+    let cert_path = weight_host_source_certificate_path(socket);
+    // Identity check only (fstat), no content scan: the host hashed once.
+    let (_source, cert) = wh::SourceCertificate::verify_source_path(&cert_path, std::path::Path::new(ctx.path))
+        .map_err(|e| format!("weight host source certificate {}: {e}", cert_path.display()))?;
+    let source_sha256 = weight_host_source_sha256(&cert)?;
+    crate::shared_weights::apply_source_dispatch_flags(ctx.gpu, hfq);
+    let recipe = crate::shared_weights::resolve_dense_recipe(ctx.gpu, config).map_err(|e| e.to_string())?;
+    let hello = wh::HostHello {
+        card,
+        source_sha256,
+        loader_abi_sha256: loader_abi().sha256().map_err(|e| e.to_string())?,
+        recipe,
+        admission_token,
+        provenance: weight_host_provenance("tenant"),
+        options: wh::ConnectOptions { handshake_timeout: std::time::Duration::from_secs(30), expected_host_pid: None },
+    };
+    let mut lease = wh::WeightHostClient::connect(socket, hello)
+        .map_err(|e| format!("weight host {}: {e}", socket.display()))?;
+    let connect_ms = connect_started.elapsed().as_secs_f64() * 1e3;
+    let import_started = std::time::Instant::now();
+    // Failures before ImportAck drop the lease unacknowledged (Release is only
+    // valid after an ack); the host keeps it charged until this process exits.
+    let weights = crate::shared_weights::import_dense_weights(ctx.gpu, config, &lease)
+        .map_err(|e| format!("weight host import (rolled back): {e}"))?;
+    let imported_bytes = crate::shared_weights::dense_imported_physical_bytes(lease.manifest());
+    if let Err(e) = lease.ack_import(imported_bytes) {
+        weights.free_gpu(ctx.gpu);
+        return Err(append_cleanup_context(format!("weight host import ack: {e}"), note_vmm_after_free(ctx.gpu)));
+    }
+    let import_map_ms = import_started.elapsed().as_secs_f64() * 1e3;
+    eprintln!(
+        "WEIGHT_HOST_IMPORT epoch={} layout_sha256={} imported_bytes={imported_bytes} fds={} connect_ms={connect_ms:.3} import_map_ms={import_map_ms:.3} ack=ok",
+        lease.epoch(),
+        lease.layout_sha256(),
+        lease.allocation_fds().len(),
+    );
+    Ok((weights, SharedWeightLease { inner: lease }))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn import_from_weight_host(
+    _socket: &std::path::Path,
+    _hfq: &HfqFile,
+    _config: &Qwen35Config,
+    _ctx: &mut LoadCtx,
+) -> Result<(Qwen35Weights, SharedWeightLease), String> {
+    Err("HIPFIRE_WEIGHT_HOST=1 is supported on Linux only".into())
 }
 
 fn free_kv_and_weights(

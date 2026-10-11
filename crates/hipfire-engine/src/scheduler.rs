@@ -746,7 +746,16 @@ pub fn request_seed_for(key: &AttemptKey, client_seed: Option<u64>) -> u32 {
 }
 
 /// Eligibility for continuous batching. Conservative: only single-GPU
-/// exact HIP Qwen 5/6 and dense LFM 11 stateless text without excluded features.
+/// exact HIP Qwen 5/6, Flash-Next (qwen4, 16) exact AR lanes and dense LFM 11
+/// stateless text without excluded features.
+///
+/// This is the architecture-capability and request-shape gate only: it reads
+/// the static `supports_continuous_batch` cap and says nothing about whether a
+/// batch route was actually staged. The qwen4 cap is true solely for the
+/// fn-lanes route, which exists only when the load staged it under
+/// `serve.vmm_batch`; the daemon decides on the staged route
+/// (`continuous_batch_capable`, the staged bundle state) before a request
+/// enters the scheduler. This function never constructs or admits lanes.
 pub fn is_batch_eligible(
     caps: &saddle_core::caps::ArchCaps,
     req: &saddle_core::caps::BatchEligibilityRequest,
@@ -865,6 +874,7 @@ pub fn parse_continuous_batch_size(params: Option<&serde_json::Value>) -> usize 
 pub struct VmmBatchParams {
     pub spec: bool,
     pub nonexact: bool,
+    pub sampled: bool,
     pub max_batch_tokens: usize,
     pub prefill_min_tokens: usize,
 }
@@ -876,6 +886,7 @@ pub fn parse_vmm_batch_params(params: Option<&serde_json::Value>) -> Option<VmmB
     Some(VmmBatchParams {
         spec: flag("spec", true),
         nonexact: flag("nonexact", false),
+        sampled: flag("sampled", false),
         max_batch_tokens: num("max_batch_tokens", 4096).max(1),
         prefill_min_tokens: num("prefill_min_tokens", 1).max(1),
     })

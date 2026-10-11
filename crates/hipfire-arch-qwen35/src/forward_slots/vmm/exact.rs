@@ -769,15 +769,14 @@ pub(super) fn decode(
         }
         final_logits_per_slot(gpu, weights, config, &b, &st.pbs, s, &st.logits, &st.skip)?;
     }
-    for &i in members {
-        super::sample_head(gpu, st, config, s, plan, i, picks)?;
-    }
+    super::sample_heads(gpu, st, config, s, plan, members, picks)?;
     Ok(())
 }
 
 /// Exact prefill chunk for plan request `i`: the singleton prefill on the
-/// request's own KV/DN; the chunk that completes the prompt picks from the
-/// singleton's last-token logits.
+/// request's own KV/DN; the chunk that completes the prompt leaves the
+/// singleton's last-token logits in its `st.logits` row (picked by
+/// `sample_heads` after the prefill phase).
 pub(super) fn prefill(
     gpu: &mut Gpu,
     st: &mut Qwen35VmmStore,
@@ -786,7 +785,6 @@ pub(super) fn prefill(
     s: &Qwen35Scratch,
     plan: &BatchStepPlan,
     i: usize,
-    picks: &mut [u32],
 ) -> HipResult<()> {
     let r = &plan.requests[i];
     if r.kind != RequestStepKind::Prefill {
@@ -815,7 +813,9 @@ pub(super) fn prefill(
     if head {
         let view = st.logits.sub_offset(slot * config.vocab_size, config.vocab_size);
         gpu.memcpy_dtod_at_auto(&view.buf, 0, &s.logits.buf, 0, config.vocab_size * 4)?;
-        super::sample_head(gpu, st, config, s, plan, i, picks)?;
+        // Sampled once for all completing prompts by `forward_inner` after the
+        // prefill phase: each head's logits row is a distinct slot view of
+        // `st.logits` that no later prefill chunk touches.
     }
     let _ = DType::F32;
     Ok(())

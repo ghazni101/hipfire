@@ -45,11 +45,23 @@ redline-rocr = { path = "../redline-rocr" }
 # The UNGATED example count is ratcheted; see scripts/leanup-ratchets.sh.
 # ---------------------------------------------------------------------------
 [[example]]
+name = "pm_aco_oracle"
+required-features = ["lab"]
+
+[[example]]
 name = "test_mq4v2_gate_up_a4_gfx1151"
 required-features = ["lab"]
 
 [[example]]
 name = "qwen4_moe_sym"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_mq6_rows"
+required-features = ["lab"]
+
+[[example]]
+name = "qwen4_shared_gu_pm"
 required-features = ["lab"]
 
 [[example]]
@@ -874,6 +886,30 @@ required-features = ["lab"]
 
 [[example]]
 name = "pm_xbatch_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "lane_rows_pm_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "mq4_rows_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "draft_overwrite_gfx12_oracle"
+required-features = ["lab"]
+
+[[example]]
+name = "lane_gdn_oracle"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "lane_fa_oracle"
+required-features = ["lab", "deltanet"]
+
+[[example]]
+name = "qwen4_mq4_x4_pm_oracle"
 required-features = ["lab"]
 
 [[example]]

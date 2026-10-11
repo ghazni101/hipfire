@@ -309,6 +309,36 @@ pub struct FeatureFlags {
     /// outputs are byte-identical. N <= 16 never uses it. Default ON on exact
     /// gfx1201; `=0` restores the one-batch-tile-per-block launch.
     pub wmma_batch_tiles: bool,
+    /// `HIPFIRE_CB_VERIFY_CHUNK128=1` (default OFF) admits exact 64..=128-row
+    /// aggregated verify chunks for the continuous-batching speculative route
+    /// on exact gfx1201 (see `Gpu::mq4_verify_chunk_rows`): 128 rows through
+    /// the explicit `gemm_*_verify_exact` kernels instead of 63. `=0` keeps
+    /// the 63-row chunks and every existing route. Needs `wmma_batch_tiles`.
+    pub cb_verify_chunk128: bool,
+    /// `HIPFIRE_CB_VERIFY_PM` (default ON; only meaningful with the wide
+    /// verify route): runs the 64..=128-row exact kernels from the embedded
+    /// PeaceMaker bundle; `=0` runs their byte-identical hipcc twins. Never
+    /// selects IU4/FP8, and a missing PM image is a load error.
+    pub cb_verify_pm: bool,
+    /// `HIPFIRE_CB_VERIFY_FP8=1` (developer, default OFF): the Qwen3.5
+    /// hybrid target verify (DFlash and MTP; singleton and continuous
+    /// batching) runs its dense MQ4G256V2 GEMMs, including the verify
+    /// lm_head, through the PeaceMaker FP8 verify family
+    /// (`crate::gemm_fp8_verify`): symmetric weights dequantized exactly to
+    /// E4M3, per-row E4M3 activations, `v_wmma_f32_16x16x16_fp8_fp8`, and a
+    /// per-output reduction order fixed for every row count 1..=128, so
+    /// batched rows are byte-identical to singleton rows by construction.
+    /// Needs exact gfx1201, symmetric MQ4G256V2 weights and an eligible
+    /// forward; the scope entry fails closed otherwise. Not the PM F16
+    /// family: `HIPFIRE_CB_VERIFY_PM` does not apply.
+    pub cb_verify_fp8: bool,
+    /// `HIPFIRE_CB_VERIFY_IU4` (developer): DFlash IU4 (A4-activation) verify.
+    /// `None` (unset) = the per-load default (on when `speculation.dflash_block`
+    /// resolves to 8, i.e. a batching serve, unless `HIPFIRE_CB_VERIFY_FP8` is
+    /// on); `Some(false)` = the kill switch; `Some(true)` = forced on (with
+    /// `HIPFIRE_CB_VERIFY_FP8=1` the DFlash load fails). The decision is taken
+    /// in `load_dflash_state` (`Gpu::iu4_verify_load`).
+    pub cb_verify_iu4: Option<bool>,
     /// Staged-tile v2 selector for the four gfx1201 FP8-WMMA MQ4v2 prefill
     /// routes (`HIPFIRE_GFX12_MQ4V2_FP8_V2`, `kernel.gfx12_mq4v2_fp8_v2`).
     /// Default ON on exact gfx1201; `=0` selects the s2bt8/BT symbols.
@@ -556,7 +586,9 @@ pub struct FeatureFlags {
     pub gdn_pre_fuse_off: bool,
     /// S6: `HIPFIRE_FA_BATCH_FUSE_OFF=1` restores unbatched FA prep/KV writes.
     pub fa_batch_fuse_off: bool,
-    /// S7: `HIPFIRE_DRAFT_COLLAPSE_OFF=1` restores scalar draft embeddings.
+    /// S7: `HIPFIRE_DRAFT_COLLAPSE_OFF=1` restores scalar draft embeddings. Also
+    /// vetoes the gfx1201 DFlash draft overwrite-GEMM route
+    /// (`gemm_mq4g256v2_overwrite_gfx12_dflash`), restoring memset + residual.
     pub draft_collapse_off: bool,
     /// S8: `HIPFIRE_DDTREE_TOPK_DIRECT_OFF=1` restores full-logits top-K.
     pub ddtree_topk_direct_off: bool,
@@ -579,6 +611,11 @@ pub struct FeatureFlags {
     /// Default-on gfx1201 Flash-Next dense GDN prefill scan (architecture and
     /// admission are gated by the runtime); `HIPFIRE_FN_GDN_DENSE_SCAN=0` opts out.
     pub fn_gdn_dense_scan: bool,
+    /// Flash-Next lane-step PeaceMaker row kernels (`HIPFIRE_FN_LANE_PM_ROWS`):
+    /// multi-column GEMVs that keep every column byte-identical to the 1-row
+    /// incumbent while sharing activation loads across weight rows. Default on
+    /// for gfx1151 (`0` is the kill switch); exact gfx1151 and the lane step only.
+    pub fn_lane_pm_rows: bool,
 }
 
 impl FeatureFlags {
@@ -886,6 +923,10 @@ impl FeatureFlags {
             gfx12_mq4v2_fp8_qkv: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_QKV")
                 .unwrap_or(arch == "gfx1201"),
             wmma_batch_tiles: parse_bool("HIPFIRE_WMMA_BATCH_TILES").unwrap_or(arch == "gfx1201"),
+            cb_verify_chunk128: parse_bool("HIPFIRE_CB_VERIFY_CHUNK128").unwrap_or(false),
+            cb_verify_pm: parse_bool("HIPFIRE_CB_VERIFY_PM").unwrap_or(true),
+            cb_verify_fp8: parse_bool("HIPFIRE_CB_VERIFY_FP8").unwrap_or(false),
+            cb_verify_iu4: parse_bool("HIPFIRE_CB_VERIFY_IU4"),
             gfx12_mq4v2_fp8_v2: parse_bool("HIPFIRE_GFX12_MQ4V2_FP8_V2")
                 .unwrap_or(arch == "gfx1201"),
             gfx12_gdn_pre_fused: parse_bool("HIPFIRE_GFX12_GDN_PRE_FUSED")
@@ -1024,6 +1065,7 @@ impl FeatureFlags {
             select_regrid_off: value("HIPFIRE_SELECT_REGRID_OFF").ok().as_deref() == Some("1"),
             dn_snapshot_flip: value("HIPFIRE_DN_SNAPSHOT_FLIP").ok().as_deref() != Some("0"),
             fn_gdn_dense_scan: value("HIPFIRE_FN_GDN_DENSE_SCAN").ok().as_deref() != Some("0"),
+            fn_lane_pm_rows: parse_bool("HIPFIRE_FN_LANE_PM_ROWS").unwrap_or(arch == "gfx1151"),
         }
     }
 
@@ -1083,6 +1125,14 @@ impl FeatureFlags {
     /// Exact gfx1151 only.
     pub fn qwen4_gdn_q8_inline_enabled(&self) -> bool {
         self.qwen4_gdn_q8_inline && self.arch == "gfx1151"
+    }
+
+    /// Flash-Next lane step: the gfx1151 PeaceMaker multi-column row kernels
+    /// (`HIPFIRE_FN_LANE_PM_ROWS`, gfx1151: on unless `0`). Exact gfx1151 only; the
+    /// runtime additionally requires the lane-step scope
+    /// ([`crate::Gpu::lane_rows_pm_enabled`]).
+    pub fn fn_lane_pm_rows_enabled(&self) -> bool {
+        self.fn_lane_pm_rows && self.arch == "gfx1151"
     }
 
     /// H4: Qwen4 HC read/write fusion level (`HIPFIRE_QWEN4_HC_FUSE`, 0 = off):
@@ -1368,6 +1418,10 @@ impl FeatureFlags {
             gfx12_mq4v2_fp8_qkvza: false,
             gfx12_mq4v2_fp8_qkv: false,
             wmma_batch_tiles: false,
+            cb_verify_chunk128: false,
+            cb_verify_pm: true,
+            cb_verify_fp8: false,
+            cb_verify_iu4: None,
             gfx12_mq4v2_fp8_v2: false,
             gfx12_fa2_prefill: false,
             gfx12_fa_packet: false,
@@ -1426,6 +1480,7 @@ impl FeatureFlags {
             select_regrid_off: false,
             dn_snapshot_flip: false,
             fn_gdn_dense_scan: false,
+            fn_lane_pm_rows: false,
         }
     }
 }
@@ -1463,6 +1518,24 @@ mod tests {
             });
             assert_eq!(flags.fn_gdn_dense_scan, expected);
         }
+    }
+
+    /// The lane-rows PM kernels default on for exact gfx1151 only: `0` is the
+    /// kill switch, and no other arch admits them whatever the variable says.
+    #[test]
+    fn fn_lane_pm_rows_defaults_on_exact_gfx1151_and_zero_kills() {
+        for arch in ["gfx906", "gfx1100", "gfx1150", "gfx1151", "gfx1152", "gfx1201"] {
+            let flags = |raw: Option<&str>| {
+                FeatureFlags::from_lookup(arch, |name| match raw {
+                    Some(v) if name == "HIPFIRE_FN_LANE_PM_ROWS" => Ok(v.into()),
+                    _ => Err(()),
+                })
+            };
+            assert_eq!(flags(None).fn_lane_pm_rows_enabled(), arch == "gfx1151", "{arch}: unset");
+            assert!(!flags(Some("0")).fn_lane_pm_rows_enabled(), "{arch}: 0");
+            assert_eq!(flags(Some("1")).fn_lane_pm_rows_enabled(), arch == "gfx1151", "{arch}: 1");
+        }
+        assert!(!FeatureFlags::for_test("gfx1151").fn_lane_pm_rows_enabled());
     }
 
     #[test]
@@ -1732,6 +1805,76 @@ mod tests {
         assert!(!flag("gfx1100", None));
         // The unit-test constructor stays on the historical one-tile route.
         assert!(!FeatureFlags::for_test("gfx1201").wmma_batch_tiles);
+    }
+
+    #[test]
+    fn cb_verify_chunk128_defaults_off_and_pm_defaults_on() {
+        let flags = |chunk: Option<&str>, pm: Option<&str>| {
+            FeatureFlags::from_lookup("gfx1201", |name| match (name, chunk, pm) {
+                ("HIPFIRE_CB_VERIFY_CHUNK128", Some(v), _) => Ok(v.to_owned()),
+                ("HIPFIRE_CB_VERIFY_PM", _, Some(v)) => Ok(v.to_owned()),
+                _ => Err(()),
+            })
+        };
+        let default = flags(None, None);
+        assert!(!default.cb_verify_chunk128);
+        assert!(default.cb_verify_pm);
+        assert!(flags(Some("1"), None).cb_verify_chunk128);
+        assert!(!flags(Some("0"), None).cb_verify_chunk128);
+        assert!(!flags(None, Some("0")).cb_verify_pm);
+        assert!(flags(None, Some("1")).cb_verify_pm);
+        assert!(!FeatureFlags::for_test("gfx1201").cb_verify_chunk128);
+    }
+
+    #[test]
+    fn cb_verify_fp8_defaults_off_and_parses() {
+        let flags = |v: Option<&str>| {
+            FeatureFlags::from_lookup("gfx1201", |name| match (name, v) {
+                ("HIPFIRE_CB_VERIFY_FP8", Some(v)) => Ok(v.to_owned()),
+                _ => Err(()),
+            })
+        };
+        assert!(!flags(None).cb_verify_fp8);
+        assert!(flags(Some("1")).cb_verify_fp8);
+        assert!(!flags(Some("0")).cb_verify_fp8);
+        // Independent of the PM F16 family flag and off in the test constructor.
+        assert!(flags(Some("1")).cb_verify_pm);
+        assert!(!FeatureFlags::for_test("gfx1201").cb_verify_fp8);
+        assert!(!FeatureFlags::for_test("gfx1100").cb_verify_fp8);
+    }
+
+    #[test]
+    fn cb_verify_iu4_is_tri_state() {
+        let flags = |v: Option<&str>| {
+            FeatureFlags::from_lookup("gfx1201", |name| match (name, v) {
+                ("HIPFIRE_CB_VERIFY_IU4", Some(v)) => Ok(v.to_owned()),
+                _ => Err(()),
+            })
+        };
+        assert_eq!(flags(None).cb_verify_iu4, None);
+        assert_eq!(flags(Some("1")).cb_verify_iu4, Some(true));
+        assert_eq!(flags(Some("0")).cb_verify_iu4, Some(false));
+        assert_eq!(FeatureFlags::for_test("gfx1201").cb_verify_iu4, None);
+    }
+
+    #[test]
+    fn cb_verify_iu4_load_decision() {
+        let decide = |iu4: Option<bool>, fp8: bool, block: usize| {
+            let mut f = FeatureFlags::for_test("gfx1201");
+            f.cb_verify_iu4 = iu4;
+            f.cb_verify_fp8 = fp8;
+            crate::Gpu::iu4_verify_load_decision(&f, block)
+        };
+        // Default: on exactly at the batching width 8, and FP8 wins it.
+        assert_eq!(decide(None, false, 8), Ok(true));
+        assert_eq!(decide(None, false, 16), Ok(false));
+        assert_eq!(decide(None, true, 8), Ok(false));
+        // Kill switch and forced on, any width.
+        assert_eq!(decide(Some(false), false, 8), Ok(false));
+        assert_eq!(decide(Some(true), false, 16), Ok(true));
+        // Both forced on: refused.
+        assert!(decide(Some(true), true, 8).is_err());
+        assert_eq!(decide(Some(false), true, 8), Ok(false));
     }
 
     #[test]

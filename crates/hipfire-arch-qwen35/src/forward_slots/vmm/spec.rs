@@ -11,50 +11,94 @@
 //! (provision), the verify trunk and head shared with every other Verify
 //! request (forward), per-request accept/repair (commit). Per request
 //! the committed ids and the full state (trunk KV, DeltaNet, MTP head KV,
-//! `prev_hidden`) equal its isolated singleton spec run (greedy).
+//! `prev_hidden`) follow its isolated singleton spec run. Sampled lanes keep
+//! the singleton's request-local MtpRng, generation-only history and window
+//! budget; sampled singleton promotion is not supported by `spec_adopt`.
 
-use super::{Qwen35RequestState, Qwen35VmmStore, VMM_MAP_DEVICE_RESERVE_BYTES};
+use super::{vmm_map_room, Qwen35RequestState, Qwen35VmmStore};
 use crate::mtp_head::{MtpKvMode, Qwen35MtpHead};
 use crate::mtp_spec::cb::{
     mtp_cb_accept, mtp_cb_draft_batched, mtp_cb_verify, MtpCbDraftLane, MtpCbScratch, MtpCbVerified, MtpCbVerifyLane,
 };
 use crate::mtp_spec::MtpDraftOutput;
-use crate::mtp_spec::{prefill_trunk_and_mtp_cache_parts, MtpPrefillTarget, MtpPromptRoute};
+use crate::mtp_spec::{prefill_trunk_and_mtp_cache_parts, sample_from_logits, MtpPrefillTarget, MtpPromptRoute};
 use crate::mtp_speculator::{new_qwen35_mtp_lane_state, Qwen35MtpDrafter};
-use crate::qwen35::{Qwen35Config, Qwen35Scratch, Qwen35Weights};
+use crate::qwen35::{DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use hipfire_runtime::slot_batch::{BatchStepPlan, RequestAdvance, RequestEpoch, RequestRows, RequestStepKind};
 use hipfire_runtime::spec::{SpecRequestConfig, Speculator};
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// The store's MTP engine: its own head copy (KV sized `head_cap`), the
-/// window size `k`, and the shared verify scratch.
+/// window size `k`, the shared verify scratch, and the probed device bytes of
+/// one lane's MTP state (charged by memory admission).
 pub struct VmmSpecEngine {
     head: Qwen35MtpHead,
     k: usize,
     cb: MtpCbScratch,
     route: MtpPromptRoute,
+    lane_bytes: usize,
 }
 
 impl VmmSpecEngine {
     /// `head` loaded with the per-lane context cap; `k` = the singleton
     /// speculator's window (`mtp_k`, clamped like `Qwen35MtpDrafter`);
-    /// `max_lanes` sizes the shared verify scratch.
+    /// `max_lanes * (k + 1)` plans the shared verify scratch rows, clamped to
+    /// the effective chunk cap (63, or up to 128 on the wide verify route with
+    /// `HIPFIRE_CB_VERIFY_CHUNK128`; [`MtpCbScratch::new`]).
+    ///
+    /// One lane's MTP state is probed for the store's memory admission:
+    /// allocated shaped from `template_dn` exactly as a lane is
+    /// ([`new_qwen35_mtp_lane_state`], greedy default request, penalty window
+    /// bound `ar_cap` = the AR `repeat_buf` capacity in ids), the live-byte
+    /// drop (HIP free plus pool-parked) is measured, then it is freed (the
+    /// buffers park in the pool, where the first lane reuses them).
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         gpu: &mut Gpu,
         config: &Qwen35Config,
+        template_dn: &DeltaNetState,
         head: Qwen35MtpHead,
         k: usize,
         max_lanes: usize,
         route: MtpPromptRoute,
+        ar_cap: usize,
     ) -> Result<Self, String> {
         let k = k.clamp(1, 8);
-        match MtpCbScratch::new(gpu, config, max_lanes * (k + 1)) {
-            Ok(cb) => Ok(Self { head, k, cb, route }),
+        let cb = match MtpCbScratch::new(gpu, config, max_lanes * (k + 1)) {
+            Ok(cb) => cb,
             Err(e) => {
                 head.free_gpu(gpu);
-                Err(format!("VMM spec engine: verify scratch: {e}"))
+                return Err(format!("VMM spec engine: verify scratch: {e}"));
+            }
+        };
+        let live = |gpu: &Gpu| gpu.device_mem_info().map(|(f, _)| f + gpu.pool_parked_bytes());
+        let probed = (|| -> Result<usize, String> {
+            let before = live(gpu).map_err(|e| e.to_string())?;
+            let st =
+                new_qwen35_mtp_lane_state(gpu, config, template_dn, &head, k, SpecRequestConfig::default(), ar_cap)?;
+            let after = live(gpu).map_err(|e| e.to_string());
+            st.free_gpu(gpu);
+            Ok(before.saturating_sub(after?))
+        })();
+        match probed {
+            Ok(lane_bytes) => Ok(Self {
+                head,
+                k,
+                cb,
+                route,
+                lane_bytes,
+            }),
+            Err(e) => {
+                let _ = cb.free_gpu(gpu);
+                head.free_gpu(gpu);
+                Err(format!("VMM spec engine: lane footprint probe: {e}"))
             }
         }
+    }
+
+    /// Probed device bytes of one lane's MTP state.
+    pub fn lane_bytes(&self) -> usize {
+        self.lane_bytes
     }
 
     pub fn k(&self) -> usize {
@@ -87,15 +131,15 @@ impl Qwen35VmmStore {
     }
 
     /// Map KV positions `[0, end)` of `epoch` against the shared physical
-    /// budget and the device's free memory (as `provision_step`).
+    /// budget and the device memory a map can use (as `provision_step`).
     pub(super) fn spec_provision(&mut self, gpu: &mut Gpu, epoch: &RequestEpoch, end: usize) -> Result<(), String> {
         let mapped_total = self.mapped_kv_bytes()?;
-        let device_room = gpu
-            .hip
-            .get_vram_info()
-            .map_err(|e| format!("spec provision: VRAM query: {e}"))?
-            .0
-            .saturating_sub(VMM_MAP_DEVICE_RESERVE_BYTES);
+        let device_room = vmm_map_room(
+            gpu.device_mem_info()
+                .map_err(|e| format!("spec provision: VRAM query: {e}"))?
+                .0,
+            gpu.pool_parked_bytes(),
+        );
         let budget = self.kv_budget_bytes.saturating_sub(mapped_total).min(device_room);
         let s = self
             .slots
@@ -117,9 +161,9 @@ impl Qwen35VmmStore {
     /// Make `epoch` a spec lane and fill its prompt by the singleton MTP
     /// prompt prefill (cold: fresh owners, positions from 0), its MTP state
     /// configured with `request` as the singleton speculator would be.
-    /// Returns the first generated id (greedy: trunk argmax at the last
-    /// prompt row) and leaves it as the lane's pending seed. On error the
-    /// lane is poisoned.
+    /// Returns the first generated id (greedy: host argmax; sampled: the
+    /// singleton's unpenalized host sample) and leaves it as the lane's pending
+    /// seed. On error the lane is poisoned.
     #[allow(clippy::too_many_arguments)]
     pub fn spec_prefill(
         &mut self,
@@ -169,14 +213,20 @@ impl Qwen35VmmStore {
             });
             s.mtp = Some(st);
             filled.map_err(|e| format!("spec prefill: {e}"))?;
-            // The singleton drafter's seed: host argmax over the last
-            // prompt row's logits (first maximum wins).
+            // Mirror Qwen35MtpDrafter::mtp_prefill (mtp_speculator.rs:487-501):
+            // the first token is unpenalized, and consumes the SAME MtpRng
+            // subsequently used for drafts, acceptance, residual and bonus.
             let logits = gpu.download_f32(&scratch.logits).map_err(|e| format!("spec prefill: seed logits: {e}"))?;
-            let seed = logits
-                .iter()
-                .enumerate()
-                .fold((0u32, f32::NEG_INFINITY), |(bi, bv), (i, &v)| if v > bv { (i as u32, v) } else { (bi, bv) })
-                .0;
+            let st = s.mtp.as_mut().expect("installed above");
+            let seed = if st.sampling.is_greedy() {
+                logits
+                    .iter()
+                    .enumerate()
+                    .fold((0u32, f32::NEG_INFINITY), |(bi, bv), (i, &v)| if v > bv { (i as u32, v) } else { (bi, bv) })
+                    .0
+            } else {
+                sample_from_logits(&logits, &st.sampling, &mut st.rng).0
+            };
             s.position = prompt.len();
             s.pending_seed = Some(seed);
             s.history.push(seed);
@@ -272,7 +322,8 @@ impl Qwen35VmmStore {
     // A Verify request is tagged by its lane state: `mtp` (the MTP engine) or
     // `dflash` (the DFlash engine). Each tag's lanes run their own draft,
     // shared trunk + head and accept consumer; a step may carry both tags,
-    // each tag's whole lanes packing into its own `<= 63`-row trunk chunks.
+    // each tag's whole lanes packing into its own trunk chunks of at most the
+    // effective cap (`<= 63` rows, or up to 128 on the wide verify route).
 
     fn is_mtp_lane(&self, epoch: &RequestEpoch) -> bool {
         self.request_state(epoch).is_some_and(|s| s.mtp.is_some())
@@ -362,6 +413,9 @@ impl Qwen35VmmStore {
         for (o, &(_, draft_len)) in owners.into_iter().zip(&planned) {
             let Qwen35RequestState { mtp, history, position, pending_seed, spec_draft, .. } =
                 o.expect("checked at provision");
+            // Mirror mtp_speculator.rs:545,566-572: request-budget k and
+            // generated-only emitted history, already including the pending
+            // seed once. mtp_cb_draft rebuilds the penalty window from this.
             lanes.push(MtpCbDraftLane {
                 state: mtp.as_mut().expect("checked at provision"),
                 cur_pos: *position,

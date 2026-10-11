@@ -725,6 +725,21 @@ pub(crate) fn finalize_tool_calls_for_choice(
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum EndpointAdapterKind {
     OpenAiChatCompletions,
+    /// `/v1/messages`: lowered onto chat completions (`serve::anthropic`).
+    AnthropicMessages,
+    /// `/v1/responses`: lowered onto chat completions (`serve::responses`).
+    OpenAiResponses,
+}
+
+impl EndpointAdapterKind {
+    /// The HTTP path this adapter serves.
+    pub(crate) fn endpoint(self) -> &'static str {
+        match self {
+            Self::OpenAiChatCompletions => "/v1/chat/completions",
+            Self::AnthropicMessages => "/v1/messages",
+            Self::OpenAiResponses => "/v1/responses",
+        }
+    }
 }
 
 /// Capability status of an endpoint adapter for non-empty tools requests.
@@ -791,6 +806,11 @@ impl EndpointAdapterRegistry {
         match kind {
             // OpenAI chat completions lowering is present and lossless for ToolCall.
             EndpointAdapterKind::OpenAiChatCompletions => EndpointAdapterStatus::AvailableLossless,
+            // Messages `tool_use` / Responses `function_call` carry the same
+            // canonical ToolCall (id, name, JSON arguments) both ways.
+            EndpointAdapterKind::AnthropicMessages | EndpointAdapterKind::OpenAiResponses => {
+                EndpointAdapterStatus::AvailableLossless
+            }
         }
     }
 }
@@ -799,10 +819,12 @@ pub(crate) fn endpoint_adapter_status(kind: EndpointAdapterKind) -> EndpointAdap
     EndpointAdapterRegistry::status(kind)
 }
 
-/// Gate `/v1/chat/completions` when the request carries a non-empty `tools` array.
-/// Tool-free requests are unchanged. Adapter availability never overrides producer safety.
-pub(crate) fn gate_chat_completions_tools(
+/// Gate a generation endpoint when its lowered chat body carries a non-empty
+/// `tools` array. Tool-free requests are unchanged. Adapter availability never
+/// overrides producer safety.
+pub(crate) fn gate_endpoint_tools(
     body: &serde_json::Value,
+    kind: EndpointAdapterKind,
 ) -> Result<(), EndpointAdapterError> {
     let has_tools = body
         .get("tools")
@@ -833,13 +855,13 @@ pub(crate) fn gate_chat_completions_tools(
             });
         }
     }
-    match endpoint_adapter_status(EndpointAdapterKind::OpenAiChatCompletions) {
+    match endpoint_adapter_status(kind) {
         EndpointAdapterStatus::AvailableLossless => Ok(()),
         EndpointAdapterStatus::Unavailable => Err(EndpointAdapterError::Unavailable {
-            endpoint: "/v1/chat/completions",
+            endpoint: kind.endpoint(),
         }),
         EndpointAdapterStatus::Lossy => Err(EndpointAdapterError::Lossy {
-            endpoint: "/v1/chat/completions",
+            endpoint: kind.endpoint(),
         }),
     }
 }
@@ -1922,9 +1944,9 @@ pub(crate) fn validate_response_format(
             if !js.is_object() {
                 bail_invalid!("response_format.json_schema must be an object");
             }
-            let schema = js
-                .get("schema")
-                .ok_or_else(|| invalid_request!("response_format.json_schema.schema is required"))?;
+            let schema = js.get("schema").ok_or_else(|| {
+                invalid_request!("response_format.json_schema.schema is required")
+            })?;
             if !schema.is_object() {
                 bail_invalid!("response_format.json_schema.schema must be an object");
             }
@@ -3072,9 +3094,13 @@ pub(crate) fn request_image_base64(messages: Option<&serde_json::Value>) -> Resu
                 .find_map(|prefix| url.strip_prefix(prefix))
                 .ok_or_else(|| {
                     if url.starts_with("data:") {
-                        invalid_request!("only base64 PNG and JPEG image_url data URIs are supported")
+                        invalid_request!(
+                            "only base64 PNG and JPEG image_url data URIs are supported"
+                        )
                     } else {
-                        invalid_request!("remote image_url values are unsupported; send a base64 data URI")
+                        invalid_request!(
+                            "remote image_url values are unsupported; send a base64 data URI"
+                        )
                     }
                 })?;
             if payload.is_empty() {
@@ -6427,7 +6453,7 @@ mod tests {
 
         let mutations = AtomicUsize::new(0);
         let mut fire_if_allowed = |body: &serde_json::Value| -> Result<(), EndpointAdapterError> {
-            gate_chat_completions_tools(body)?;
+            gate_endpoint_tools(body, EndpointAdapterKind::OpenAiChatCompletions)?;
             mutations.fetch_add(1, Ordering::SeqCst);
             Ok(())
         };
@@ -6438,10 +6464,16 @@ mod tests {
             "messages": []
         });
 
-        assert_eq!(
-            endpoint_adapter_status(EndpointAdapterKind::OpenAiChatCompletions),
-            EndpointAdapterStatus::AvailableLossless
-        );
+        for kind in [
+            EndpointAdapterKind::OpenAiChatCompletions,
+            EndpointAdapterKind::AnthropicMessages,
+            EndpointAdapterKind::OpenAiResponses,
+        ] {
+            assert_eq!(
+                endpoint_adapter_status(kind),
+                EndpointAdapterStatus::AvailableLossless
+            );
+        }
         fire_if_allowed(&with_tools).expect("lossless adapter allows tools");
         assert_eq!(mutations.load(Ordering::SeqCst), 1);
 
@@ -6493,7 +6525,7 @@ mod tests {
         .to_string();
         assert!(msg.contains("lossy"), "{msg}");
 
-        assert!(gate_chat_completions_tools(&with_tools).is_ok());
+        assert!(gate_endpoint_tools(&with_tools, EndpointAdapterKind::AnthropicMessages).is_ok());
     }
 
     #[test]
@@ -6505,7 +6537,8 @@ mod tests {
             serde_json::json!({ "model": "m", "tools": null, "messages": [] }),
         ];
         for body in &bodies {
-            gate_chat_completions_tools(body).expect("tool-free must bypass adapter capability");
+            gate_endpoint_tools(body, EndpointAdapterKind::OpenAiResponses)
+                .expect("tool-free must bypass adapter capability");
             mutations.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         }
         assert_eq!(
@@ -6517,12 +6550,18 @@ mod tests {
 
     #[test]
     fn endpoint_adapter_registry_covers_all_declared_kinds() {
-        const ALL_KINDS: &[EndpointAdapterKind] = &[EndpointAdapterKind::OpenAiChatCompletions];
+        const ALL_KINDS: &[EndpointAdapterKind] = &[
+            EndpointAdapterKind::OpenAiChatCompletions,
+            EndpointAdapterKind::AnthropicMessages,
+            EndpointAdapterKind::OpenAiResponses,
+        ];
 
         for kind in ALL_KINDS {
             let status = endpoint_adapter_status(*kind);
             match kind {
-                EndpointAdapterKind::OpenAiChatCompletions => {
+                EndpointAdapterKind::OpenAiChatCompletions
+                | EndpointAdapterKind::AnthropicMessages
+                | EndpointAdapterKind::OpenAiResponses => {
                     assert_eq!(status, EndpointAdapterStatus::AvailableLossless);
                 }
             }
@@ -7845,9 +7884,7 @@ mod tests {
             (request_error_status(&error), error.to_string())
         };
         let tools = serde_json::json!([{"type": "function", "function": {"name": "f"}}]);
-        let image = |url: &str| {
-            serde_json::json!({"type": "image_url", "image_url": {"url": url}})
-        };
+        let image = |url: &str| serde_json::json!({"type": "image_url", "image_url": {"url": url}});
         let reasoning = |body: serde_json::Value| -> Result<()> {
             apply_http_reasoning_request(
                 &body,
@@ -7908,7 +7945,10 @@ mod tests {
                 "max_tokens must be between",
                 contract(serde_json::json!({"max_tokens": 0})),
             ),
-            ("n != 1", contract(serde_json::json!({"max_tokens": 8, "n": 2}))),
+            (
+                "n != 1",
+                contract(serde_json::json!({"max_tokens": 8, "n": 2})),
+            ),
             (
                 "temperature must be within",
                 contract(serde_json::json!({"max_tokens": 8, "temperature": 3.0})),

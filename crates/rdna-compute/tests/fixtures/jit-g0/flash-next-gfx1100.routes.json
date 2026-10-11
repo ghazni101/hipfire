@@ -1228,7 +1228,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "0cd00f8a792034825cae902b06af07990e986c5361d679be6053402e5d24a074",
+      "sha256": "be8e88c8ab656edfd8ee1262d123d4febd64c62f9b6ff2dac96f64ea64e7d96b",
       "symbols": [
         "gemm_mq6g256v2_wmma_gfx11_bt8_x4",
         "gemm_mq6g256v2_wmma_gfx11_bt8_x4_bf16out"
@@ -1953,7 +1953,7 @@
       ],
       "scheduler_profile": "default",
       "cache_abi": 6,
-      "sha256": "6bc6a02ece8f4f61080fd53b6cd76028e854a106a43f062f7b6f31de74470ad3",
+      "sha256": "8faaa38f32c59fd62d91d8f5db0abf739f875e57f56c5eef18b6ed83a460754c",
       "symbols": [
         "argmax_f32",
         "bf16_scaled_add_batched_f32",

@@ -232,6 +232,13 @@ pub struct SpecLoadCfg {
     /// `HIPFIRE_DSPARK_ADAPTIVE_BLOCK=0`. Mutually exclusive with the
     /// retained-PM4 verify route (which needs the fixed B=16 shape).
     pub dflash_adaptive_b: Option<bool>,
+    /// DFlash2 proposal width of this load (`speculation.dflash_block`),
+    /// already resolved per serving configuration by
+    /// [`crate::dflash::DflashBlockPolicy::resolve`]. `None` (no daemon
+    /// resolution, e.g. a direct loader caller) =
+    /// [`crate::dflash::DFLASH_BLOCK_UNBATCHED`]. Legacy DFlash drafts keep
+    /// their declared width.
+    pub dflash_block: Option<usize>,
 }
 
 // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes

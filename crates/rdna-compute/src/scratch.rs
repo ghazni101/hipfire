@@ -391,6 +391,15 @@ pub struct ScratchState {
     /// Per-row power-of-two (or unit) scales [N] f32 for MQ4v2 FP8 activations.
     pub mq4v2_fp8_row_scales_scratch: Option<DeviceBuffer>,
     pub mq4v2_fp8_row_scales_scratch_bytes: usize,
+    /// Dedicated FP8 verify activation bytes (`n*k` E4M3, [N,K] row-major) of
+    /// the PeaceMaker FP8 verify family. Never pointer-cached: every
+    /// `fp8_verify_pack_x` repacks. Grown only through
+    /// [`Self::pack_fp8_verify_rows`] behind `scratch_will_grow`.
+    pub fp8_verify_x8_scratch: Option<DeviceBuffer>,
+    pub fp8_verify_x8_scratch_bytes: usize,
+    /// Per-row activation scales (`n` f32) paired with `fp8_verify_x8_scratch`.
+    pub fp8_verify_scales_scratch: Option<DeviceBuffer>,
+    pub fp8_verify_scales_scratch_bytes: usize,
     /// One reusable F2 weight workspace: Wf followed by Rw and Ew. Each
     /// repack overwrites all valid planes before its same-stream GEMM reads them.
     pub fp8_f2_weights: Option<DeviceBuffer>,
@@ -1887,6 +1896,110 @@ impl ScratchState {
         })
     }
 
+    /// FP8 verify activation pre-pass: pack F32 `x_f32` `[n, k]` into the
+    /// dedicated E4M3 + per-row-scale slots with
+    /// `pack_f32_to_fp8_verify_rows_gfx1201` (bytes and scales bit-identical
+    /// to `pack_f32_to_fp8_mq4v2_gfx12` scale_mode 1). Always overwrites; no
+    /// source-pointer cache. The caller owns validation (`n > 0`,
+    /// `k % 256 == 0`, `k <= 32768`, `x_f32` 16-byte aligned) and MUST have
+    /// run the scratch-growth protocol for both slots. Launched through
+    /// `launch_maybe_blob` so capture and replay recording observe it.
+    /// Returns `(x8, scales)` device pointers, valid until the next pack.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn pack_fp8_verify_rows(
+        &mut self,
+        hip: &HipRuntime,
+        compiler: &mut crate::compiler::KernelCompiler,
+        modules: &mut HashMap<String, Module>,
+        functions: &mut HashMap<String, Function>,
+        stream: Option<&Stream>,
+        capture_blobs: &mut Vec<Vec<u8>>,
+        capture_mode: bool,
+        force_blob_path: bool,
+        replay: &mut crate::replay::ReplayController,
+        x_f32: *mut c_void,
+        n: usize,
+        k: usize,
+        row_scale_shift: i32,
+    ) -> HipResult<(*mut c_void, *mut c_void)> {
+        compile_and_load_kernel(
+            compiler,
+            hip,
+            modules,
+            functions,
+            &mut self.route_load,
+            self.pm_decode,
+            "pack_fp8_verify_rows_gfx1201",
+            kernels::PACK_FP8_VERIFY_ROWS_GFX1201_SRC,
+            "pack_f32_to_fp8_verify_rows_gfx1201",
+        )?;
+        let x8_bytes = n * k;
+        let scales_bytes = n * 4;
+        grow_scratch_buffer(
+            hip,
+            &mut self.fp8_verify_x8_scratch,
+            &mut self.fp8_verify_x8_scratch_bytes,
+            x8_bytes,
+        )?;
+        grow_scratch_buffer(
+            hip,
+            &mut self.fp8_verify_scales_scratch,
+            &mut self.fp8_verify_scales_scratch_bytes,
+            scales_bytes,
+        )?;
+        let out_x8 = self.fp8_verify_x8_scratch.as_ref().unwrap().as_ptr();
+        let out_scales = self.fp8_verify_scales_scratch.as_ref().unwrap().as_ptr();
+        let mut in_ptr_m = x_f32;
+        let mut out_x8_m = out_x8;
+        let mut out_scales_m = out_scales;
+        let mut k_val = k as i32;
+        let mut n_val = n as i32;
+        let mut shift_m = row_scale_shift;
+        let mut params: [*mut c_void; 6] = [
+            &mut in_ptr_m as *mut _ as *mut c_void,
+            &mut out_x8_m as *mut _ as *mut c_void,
+            &mut out_scales_m as *mut _ as *mut c_void,
+            &mut k_val as *mut _ as *mut c_void,
+            &mut n_val as *mut _ as *mut c_void,
+            &mut shift_m as *mut _ as *mut c_void,
+        ];
+        let timer = crate::profile::begin_timer(
+            hip,
+            "gemm",
+            "pack_f32_to_fp8_verify_rows_gfx1201",
+            n * k * 4 + x8_bytes + scales_bytes,
+        );
+        let result = launch_maybe_blob(
+            hip,
+            Some(&*compiler),
+            functions,
+            stream,
+            capture_blobs,
+            capture_mode,
+            force_blob_path,
+            Some(replay),
+            "pack_f32_to_fp8_verify_rows_gfx1201",
+            [n as u32, 1, 1],
+            [256, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = KernargBlob::new();
+                b.push_ptr(x_f32);
+                b.push_ptr(out_x8);
+                b.push_ptr(out_scales);
+                b.push_i32(k_val);
+                b.push_i32(n_val);
+                b.push_i32(row_scale_shift);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(hip);
+        }
+        result?;
+        Ok((out_x8, out_scales))
+    }
 
     /// Ensure prefill activations are quantized into a llama.cpp-style
     /// `block_q8_1_mmq` layout. The scratch is ordered by [K/128 block, batch]

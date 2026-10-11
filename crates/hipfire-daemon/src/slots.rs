@@ -1936,6 +1936,18 @@ pub fn validate_load_caps(msg: &serde_json::Value, gpu_arch: &str) -> Option<Str
     {
         return Some("adaptive KV not supported in experimental multi-slot".to_string());
     }
+    // The multi-slot DFlash2 path runs the default proposal width only
+    // (`auto` resolves to it: this route never stages VMM batching).
+    match hipfire_runtime::dflash::DflashBlockPolicy::from_param(params.and_then(|p| p.get("dflash_block"))) {
+        Err(e) => return Some(e),
+        Ok(policy) if policy.resolve(false, 1) != hipfire_runtime::dflash::DFLASH_BLOCK_UNBATCHED => {
+            return Some(format!(
+                "speculation.dflash_block other than {} not supported in experimental multi-slot",
+                hipfire_runtime::dflash::DFLASH_BLOCK_UNBATCHED
+            ));
+        }
+        Ok(_) => {}
+    }
     // The slot engine resolves the full static KV ladder (q8, asym{2,3,4},
     // fwht{2,3,4}) plus the flat 2-byte tiers bf16/f16; fp8 is admitted on
     // exact gfx1201 only (descriptor-aware fp8 write/attend kernels exist
@@ -3138,6 +3150,16 @@ mod tests {
         assert!(validate_load_caps(&m4, "gfx1100").is_some());
         let m5 = json!({"params": {"prefill_compression": "on"}});
         assert!(validate_load_caps(&m5, "gfx1100").is_some());
+    }
+
+    #[test]
+    fn load_caps_admit_only_the_default_dflash_block() {
+        for ok in [json!({"params": {}}), json!({"params": {"dflash_block": 16}}), json!({"params": {"dflash_block": "auto"}})] {
+            assert!(validate_load_caps(&ok, "gfx1100").is_none(), "{ok} must be admitted");
+        }
+        for bad in [json!({"params": {"dflash_block": 8}}), json!({"params": {"dflash_block": 99}})] {
+            assert!(validate_load_caps(&bad, "gfx1100").is_some(), "{bad} must be refused");
+        }
     }
 
     #[test]

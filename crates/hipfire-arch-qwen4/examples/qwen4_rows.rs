@@ -62,6 +62,7 @@ fn main() -> Result<(), String> {
     let backend = hipfire_arch_qwen4::Qwen4KvBackend::automatic(&gpu);
     let mut bundle = Qwen4Bundle::assemble_with_metadata(
         receipt.config,
+        &receipt.manifest.identity.recipe,
         transaction,
         &receipt.placements,
         &mut gpu,

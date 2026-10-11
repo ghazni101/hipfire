@@ -1,0 +1,799 @@
+// SPDX-License-Identifier: Apache-2.0
+// Copyright (c) 2026 Kaden Schutt
+// hipfire — see LICENSE and NOTICE in the project root.
+
+//! Flash-Next exact lanes: AR lanes, and per-lane native MTP lanes when the
+//! staged store carries the MTP head (`serve.batch_spec`, default on;
+//! `serve.batch_spec = false` / `HIPFIRE_SERVE_BATCH_SPEC=0` stages AR lanes
+//! only). Prompt IDs come from `qwen::render_qwen4_prompt`,
+//! also used by `generate_qwen4_ar` and the native MTP singleton. Emission
+//! reuses `generate_ar_with_forward`'s `QwenArSemanticProducer`, incremental
+//! tokenizer decode, raw commit, committed-event, think-budget and done helpers.
+//! Unlike the Qwen35 driver there is no loop guard or tool-markup parser when
+//! tools are absent. A prompt's seed is held until its AR forward completes:
+//! the singleton forwards the token BEFORE committing/classifying it. The
+//! executor's AR pick is the following token, not the token just forwarded.
+//! Each step the driver plans which decoding lanes run (one per row of the
+//! step's row budget), asks the executor for a step-synchronous batched draft
+//! of them (`draft_step`, budget `min(K, tokens left - 1, context left - 1)`,
+//! zero while think-budget tokens are forced), then plans one row (`Ar`: the
+//! pending seed) or `1 + d` rows (`Verify`: `[seed, drafts..]`) per lane. A
+//! lane's advance commits `committed_ids`; the tokens it FORWARDED are the plan
+//! seed followed by `committed_ids` without its last entry (the last is the
+//! next seed), emitted in order through `emit_forwarded`. The first finish
+//! (stop, terminator, think budget, length) ends the lane and drops the rest
+//! of the window; `length` from the executor applies to the last forwarded
+//! token only. A forced think-budget close queued mid-window follows the
+//! window's own tokens. A draft-step failure errors every lane it named. The
+//! done value carries the lane's MTP counters (`mtp`, `mtp_windows`,
+//! `ar_windows`, `mtp_retired`, `mtp_drafts`, `mtp_accepted`).
+//! A running singleton is promoted into a lane when a second request arrives
+//! (`generate_spec` hands a `Qwen4PromotedRequest`, adopted before the loop
+//! under the same AttemptKey; its already-streamed pending seed is not
+//! emitted again). No lane session cache or parking is performed here.
+//! Timing fields measure this execution and are not byte-identical wall-clock
+//! values. `cached_tokens` is zero: S3 uses cold lane state, not singleton
+//! session restore. Content/reasoning bytes and semantic finish classification
+//! use the singleton code; compute-ID identity is the lane executor's oracle.
+
+use crate::ar::*;
+use crate::batch::{drain_qwen_batch_inbox, handoff_started_in_think, is_vmm_batch_request_eligible, Qwen4PromotedRequest};
+use crate::common::{emit_committed_event, fit_max_tokens_if};
+use hipfire_arch_qwen4::lane::LaneStatus;
+use hipfire_arch_qwen4::lane_exec::{LaneDraft, LaneRoute};
+use hipfire_engine::emit::*;
+use hipfire_engine::scheduler::*;
+use hipfire_engine::terminal::*;
+use hipfire_loader::LoadedModel;
+use hipfire_runtime::emit_text::ThinkBudget;
+use hipfire_runtime::slot_batch::{BatchStepPlan, RequestEpoch, RequestRows, RequestStepKind, RowRange};
+use rdna_compute::Gpu;
+use std::collections::{HashSet, VecDeque};
+use std::io::{Stdout, Write};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::time::{Duration, Instant};
+
+const ROUTE: GenerationRoute = GenerationRoute::Qwen4Ar;
+static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
+
+/// The next request epoch of a lane owner: shared by admission and the
+/// singleton promotion, so tags never collide.
+pub(crate) fn next_lane_epoch() -> Result<RequestEpoch, String> {
+    let tag = NEXT_EPOCH.fetch_update(Ordering::Relaxed, Ordering::Relaxed, |n| n.checked_add(1))
+        .map_err(|_| "qwen4 lane epoch exhausted".to_string())?;
+    Ok(RequestEpoch { request_tag: tag, owner_generation: 1 })
+}
+
+struct LaneCtl {
+    epoch: RequestEpoch,
+    slot: usize,
+    semantic: Option<QwenArSemanticProducer>,
+    bytes: Vec<u8>,
+    budget: ThinkBudget,
+    forced: VecDeque<u32>,
+    started_in_think: bool,
+    max_tokens: usize,
+    start: Instant,
+    decode_start: Option<Instant>,
+    prefill_ms: f64,
+    cache: Option<(QwenArCacheAction, Vec<u32>)>,
+    /// A promoted lane's pending seed was already streamed by the singleton:
+    /// its first decode advance does not emit the plan seed again.
+    skip_first_forward: bool,
+}
+
+fn release(model: &mut LoadedModel, ctl: &mut LaneCtl) -> Result<(), String> {
+    if !ctl.epoch.is_admitted() {
+        return Ok(());
+    }
+    model.qwen4_mut().ok_or("qwen4 bundle disappeared")?
+        .release_lane(&ctl.epoch).map_err(|e| e.to_string())?;
+    ctl.epoch.owner_generation = 0;
+    Ok(())
+}
+
+/// The tokens a decode advance forwarded: the plan seed, then every committed
+/// id but the last (the next pending seed). `skip_seed` drops the plan seed
+/// (a promoted lane's was streamed by the singleton).
+fn forwarded_tokens(seed: u32, committed: &[u32], skip_seed: bool) -> Vec<u32> {
+    let window = &committed[..committed.len().saturating_sub(1)];
+    if skip_seed {
+        window.to_vec()
+    } else {
+        std::iter::once(seed).chain(window.iter().copied()).collect()
+    }
+}
+
+/// A promoted request that cannot continue anywhere (its singleton state
+/// already left the resident owners): release its lane and emit one
+/// generation error for the key.
+fn fail_promoted(
+    model: &mut LoadedModel,
+    stdout: &mut Stdout,
+    key: &AttemptKey,
+    admission: BatchGeneration,
+    epoch: &RequestEpoch,
+    message: &str,
+) {
+    let released = model.qwen4_mut().ok_or("qwen4 bundle disappeared".to_string())
+        .and_then(|b| b.release_lane(epoch).map_err(|e| e.to_string()));
+    let _scope = BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
+    emit_generation_error(ROUTE, stdout, Some(&key.id), message, "internal", false, released.is_ok());
+    batch_clear_terminal_at_generation(&key.id, key.attempt_id, admission);
+}
+
+/// Install a promoted singleton as a Running lane under its AttemptKey (no
+/// new `gen_start`). On failure the lane is released and one generation error
+/// is emitted for the key; the request cannot continue anywhere.
+fn adopt_promoted(
+    sched: &mut ContinuousBatchScheduler,
+    model: &mut LoadedModel,
+    controls: &mut [Option<LaneCtl>],
+    stdout: &mut Stdout,
+    promoted: Qwen4PromotedRequest,
+) {
+    let Qwen4PromotedRequest { pending, progress, producer, epoch, slot, seed_emitted, max_tokens } = promoted;
+    let key = pending.key.clone();
+    let admission = pending.admission;
+    let started_in_think = pending.started_in_think;
+    let max_think_tokens = pending.max_think_tokens;
+    let start = progress.created_at;
+    // The request's decode began on the resident singleton at its prefill end,
+    // not at adoption: the done-event decode rate spans the whole decode.
+    let decode_start = progress.prefill_done_at.unwrap_or_else(Instant::now);
+    let prefill_ms = progress.prefill_done_at
+        .map_or(0.0, |t| t.saturating_duration_since(start).as_secs_f64() * 1000.0);
+    let bytes = model.tokenizer.as_ref().map(|tokenizer| {
+        let mut bytes = Vec::new();
+        for &token in &progress.streamed_tokens {
+            tokenizer.decode_token_bytes_into(token, &mut bytes);
+        }
+        bytes
+    });
+    let adopted = bytes.and_then(|bytes| sched.adopt_running(pending, progress).map(|ticket| (ticket, bytes)));
+    let Some((ticket, bytes)) = adopted else {
+        fail_promoted(model, stdout, &key, admission, &epoch,
+            "qwen4 lane promotion failed: no lane or tokenizer for the promoted request");
+        return;
+    };
+    controls[ticket.lane] = Some(LaneCtl {
+        epoch, slot, semantic: Some(producer), bytes, budget: ThinkBudget::new(max_think_tokens),
+        forced: VecDeque::new(), started_in_think, max_tokens, start, decode_start: Some(decode_start),
+        prefill_ms, cache: None, skip_first_forward: seed_emitted,
+    });
+}
+
+fn lane_error(
+    sched: &mut ContinuousBatchScheduler,
+    model: &mut LoadedModel,
+    controls: &mut [Option<LaneCtl>],
+    idx: usize,
+    stdout: &mut Stdout,
+    message: &str,
+    class: &str,
+) -> Result<(), String> {
+    let (key, admission) = match &sched.lanes[idx] {
+        BatchLane::Running(l) | BatchLane::Seeding(l) => (l.key.clone(), l.ticket.admission),
+        BatchLane::AwaitingClient(l) => (l.key.clone(), l.ticket.admission),
+        BatchLane::Empty { .. } => return Ok(()),
+    };
+    let released = controls[idx].as_mut().map_or(Ok(()), |c| release(model, c));
+    let _scope = BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
+    emit_generation_error(ROUTE, stdout, Some(&key.id), message, class, false, released.is_ok());
+    let _ = sched.abort_lane(idx, &key, admission);
+    controls[idx] = None;
+    released
+}
+
+fn cancel_lane(
+    sched: &mut ContinuousBatchScheduler,
+    model: &mut LoadedModel,
+    controls: &mut [Option<LaneCtl>],
+    idx: usize,
+    stdout: &mut Stdout,
+) -> Result<(), String> {
+    let (key, admission, generated) = match &sched.lanes[idx] {
+        BatchLane::Running(l) | BatchLane::Seeding(l) =>
+            (l.key.clone(), l.ticket.admission, l.streamed_tokens.len()),
+        BatchLane::AwaitingClient(l) => (l.key.clone(), l.ticket.admission,
+            l.pending_done.get("tokens").and_then(|v| v.as_u64()).unwrap_or(0) as usize),
+        BatchLane::Empty { .. } => return Ok(()),
+    };
+    if let Some(c) = controls[idx].as_mut() {
+        release(model, c)?;
+    }
+    let _scope = BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
+    emit_generation_cancel(ROUTE, stdout, &key.id, generated);
+    let _ = sched.abort_lane(idx, &key, admission);
+    controls[idx] = None;
+    Ok(())
+}
+
+fn render_request(
+    model: &mut LoadedModel,
+    request: &BatchPendingRequest,
+) -> Result<(Vec<u32>, bool), (String, &'static str)> {
+    if request.max_tokens == 0 {
+        return Err(("max_tokens must be > 0".to_string(), "validation"));
+    }
+    let msg = &request.original_msg;
+    let prompt = hipfire_runtime::tokenizer::maybe_normalize_prompt(
+        msg.get("prompt").and_then(|v| v.as_str()).unwrap_or("Hello"),
+    );
+    let history = hipfire_engine::prompt::parse_generate_messages(msg)
+        .map_err(|e| (format!("invalid messages field: {e}"), "validation"))?;
+    let tools = msg.get("tools").and_then(|v| v.as_array())
+        .filter(|a| !a.is_empty()).map(|a| a.as_slice());
+    let raw_effort = msg.get("reasoning_effort").or_else(|| msg.get("thinking_mode"))
+        .and_then(|v| v.as_str());
+    let (enabled, effort) = hipfire_engine::prompt::qwen_jinja_reasoning(
+        msg.get("thinking_enabled").and_then(|v| v.as_bool()),
+        raw_effort, request.max_think_tokens,
+    );
+    crate::qwen::render_qwen4_prompt(model, crate::qwen::Qwen4PromptRoute::Ar,
+        msg.get("system").and_then(|v| v.as_str()), &prompt,
+        request.assistant_prefix, tools, history.as_deref(), enabled, effort.as_deref())
+}
+
+/// A failed `draft_step`: its error and every lane it named.
+struct DraftFailure {
+    error: String,
+    epochs: Vec<RequestEpoch>,
+}
+
+/// `HIPFIRE_CB_PHASES=1` (developer diagnostic): one `[fn-lane-step]` stderr
+/// line per lane step. `host` is the wall time from the previous step's end
+/// to this plan (terminal decisions, inbox, admission); `plan` holds the
+/// batched draft (one D2H per draft step); `fwd` is provision + forward
+/// (synchronized by the pick download); then `commit` and `emit`. Rows by
+/// kind, decoding/active lanes, the queue and the committed tokens follow.
+struct StepTrace {
+    origin: Instant,
+    last: Instant,
+    step: u64,
+}
+
+impl StepTrace {
+    fn new() -> Option<Self> {
+        let now = Instant::now();
+        hipfire_config::developer_var("HIPFIRE_CB_PHASES").is_ok_and(|v| v.trim() == "1")
+            .then_some(Self { origin: now, last: now, step: 0 })
+    }
+
+    /// `marks`: plan start, forward start, commit start, commit end.
+    fn line(&mut self, marks: [Instant; 4], plan: &BatchStepPlan, tokens: usize, accepted: usize, active: usize, queued: usize) {
+        let now = Instant::now();
+        let ms = |a: Instant, b: Instant| b.saturating_duration_since(a).as_secs_f64() * 1000.0;
+        let (mut pf, mut pf_rows, mut ar, mut ver, mut ver_rows) = (0, 0, 0, 0, 0);
+        for r in &plan.requests {
+            match r.kind {
+                RequestStepKind::Prefill => { pf += 1; pf_rows += r.rows.len; }
+                RequestStepKind::Ar => ar += 1,
+                RequestStepKind::Verify { .. } => { ver += 1; ver_rows += r.rows.len; }
+                RequestStepKind::Forced => {}
+            }
+        }
+        eprintln!("[fn-lane-step] n={} t={:.1} host={:.2} plan={:.2} fwd={:.2} commit={:.2} emit={:.2} active={active} queued={queued} \
+            pf={pf} pf_rows={pf_rows} ar={ar} ver={ver} ver_rows={ver_rows} tokens={tokens} accepted={accepted}",
+            self.step, ms(self.origin, marks[0]), ms(self.last, marks[0]), ms(marks[0], marks[1]), ms(marks[1], marks[2]),
+            ms(marks[2], marks[3]), ms(marks[3], now));
+        self.step += 1;
+        self.last = now;
+    }
+}
+
+/// Build directly rather than using `BatchPlanner::forced_prefill_len`: that
+/// planner charges exact singleton prefill tiles against the AR row budget,
+/// so a tile larger than the budget could never run. Here only decode lanes
+/// use that budget (one lane per budget row; a lane's verify block may carry
+/// more rows); every prefilling owner gets at most one indivisible tile.
+/// `streamed[i]` is the tokens control `i` has streamed so far.
+fn plan_step(
+    model: &mut LoadedModel,
+    gpu: &mut Gpu,
+    controls: &mut [Option<LaneCtl>],
+    streamed: &[usize],
+    row_budget: usize,
+    cursor: &mut usize,
+    max_lanes: usize,
+) -> Result<Result<BatchStepPlan, DraftFailure>, String> {
+    let max_seq = model.max_seq;
+    let bundle = model.qwen4_mut().ok_or("qwen4 bundle disappeared")?;
+    let mut order: Vec<_> = controls.iter().flatten()
+        .filter(|c| c.epoch.is_admitted()).map(|c| (c.slot, c.epoch)).collect();
+    order.sort_by_key(|&(slot, _)| slot);
+    let store = bundle.lanes().ok_or("qwen4 lanes not staged")?;
+    let spec_k = store.spec().map(|s| s.k);
+    let decoding: Vec<_> = order.iter().filter_map(|&(slot, epoch)| {
+        store.lane(&epoch).filter(|l| l.host.status == LaneStatus::Decoding).map(|_| slot)
+    }).collect();
+    let count = decoding.len();
+    let chosen: Vec<_> = (0..count.min(row_budget)).map(|j| decoding[(*cursor + j) % count]).collect();
+    if count != 0 {
+        *cursor = (*cursor + count.min(row_budget)) % count;
+    }
+    for c in controls.iter_mut().flatten().filter(|c| chosen.contains(&c.slot)) {
+        if let Some(token) = c.forced.pop_front() {
+            bundle.force_lane_seed(&c.epoch, token).map_err(|e| e.to_string())?;
+        }
+    }
+    let mut drafts: Vec<LaneDraft> = Vec::new();
+    if let Some(k) = spec_k {
+        let mut requests = Vec::new();
+        for (idx, c) in controls.iter().enumerate() {
+            let Some(c) = c.as_ref().filter(|c| chosen.contains(&c.slot)) else { continue; };
+            let position = bundle.lanes().and_then(|s| s.lane(&c.epoch))
+                .map(|l| l.state.position).ok_or("admitted qwen4 lane disappeared")?;
+            let budget = if c.forced.is_empty() {
+                k.min(c.max_tokens.saturating_sub(streamed[idx]).saturating_sub(1))
+                    .min(max_seq.saturating_sub(position).saturating_sub(1))
+            } else {
+                0
+            };
+            requests.push((c.epoch, budget));
+        }
+        if !requests.is_empty() {
+            let mut executor = bundle.lane_executor().map_err(|e| e.to_string())?;
+            match executor.draft_step(gpu, &requests) {
+                Ok(d) => drafts = d,
+                Err(error) => {
+                    return Ok(Err(DraftFailure { error, epochs: requests.iter().map(|r| r.0).collect() }));
+                }
+            }
+        }
+    }
+    let store = bundle.lanes().ok_or("qwen4 lanes not staged")?;
+    let mut rows = Vec::new();
+    for (slot, epoch) in order {
+        let lane = store.lane(&epoch).ok_or("admitted qwen4 lane disappeared")?;
+        match lane.host.status {
+            LaneStatus::Prefilling => rows.push((slot, epoch, RequestStepKind::Prefill,
+                lane.host.prefilled, 0, Vec::new())),
+            LaneStatus::Decoding if chosen.contains(&slot) => {
+                let position = lane.state.position;
+                match drafts.iter().find(|d| d.epoch == epoch) {
+                    Some(LaneDraft { route: LaneRoute::Batched { .. }, drafts, .. }) => {
+                        if drafts.is_empty() {
+                            return Err("qwen4 batched lane window drafted no tokens".into());
+                        }
+                        rows.push((slot, epoch, RequestStepKind::Verify { draft_len: drafts.len() },
+                            position, 1 + drafts.len(), drafts.clone()));
+                    }
+                    Some(_) => rows.push((slot, epoch, RequestStepKind::Ar, position, 1, Vec::new())),
+                    None if spec_k.is_none() => rows.push((slot, epoch, RequestStepKind::Ar, position, 1, Vec::new())),
+                    None => return Err("qwen4 draft step omitted a planned lane".into()),
+                }
+            }
+            LaneStatus::Decoding => {}
+            LaneStatus::Poisoned => return Err("qwen4 lane poisoned outside a step".into()),
+        }
+    }
+    {
+        let executor = bundle.lane_executor().map_err(|e| e.to_string())?;
+        for (_, epoch, kind, _, len, _) in &mut rows {
+            if *kind == RequestStepKind::Prefill {
+                *len = executor.exact_prefill_chunk_len(epoch)?;
+            }
+        }
+    }
+    let store = bundle.lanes().ok_or("qwen4 lanes not staged")?;
+    let mut plan = BatchStepPlan::default();
+    plan.batch.m_per_slot = vec![0; max_lanes];
+    for (slot, epoch, kind, position, len, drafted) in rows {
+        if len == 0 {
+            return Err("qwen4 exact prefill tile is empty".into());
+        }
+        let lane = store.lane(&epoch).ok_or("admitted qwen4 lane disappeared")?;
+        let begin = plan.batch.tokens.len();
+        if kind == RequestStepKind::Prefill {
+            let end = position.checked_add(len).ok_or("qwen4 tile position overflow")?;
+            let slice = lane.host.prompt.get(position..end).ok_or("qwen4 prefill tile exceeds prompt")?;
+            plan.batch.tokens.extend_from_slice(slice);
+        } else {
+            plan.batch.tokens.push(lane.host.pending_seed.ok_or("decoding lane has no pending seed")?);
+            plan.batch.tokens.extend_from_slice(&drafted);
+        }
+        for j in 0..len {
+            plan.batch.positions.push(i32::try_from(position + j).map_err(|_| "lane position exceeds i32")?);
+            plan.batch.row_slot.push(i32::try_from(slot).map_err(|_| "lane slot exceeds i32")?);
+        }
+        plan.batch.m_per_slot[slot] = len;
+        plan.requests.push(RequestRows { epoch, rows: RowRange { begin, len }, kind });
+        if kind == RequestStepKind::Prefill { plan.prefill_rows += len; } else { plan.decode_rows += len; }
+    }
+    Ok(Ok(plan))
+}
+
+fn emit_forwarded(
+    stdout: &mut Stdout,
+    tokenizer: &hipfire_runtime::tokenizer::Tokenizer,
+    lane: &mut QwenBatchLane,
+    ctl: &mut LaneCtl,
+    token: u32,
+    eos: u32,
+    adv_length: bool,
+) -> Result<Option<bool>, String> {
+    let fed = ctl.bytes.len();
+    tokenizer.decode_token_bytes_into(token, &mut ctl.bytes);
+    let new_bytes = &ctl.bytes[fed..];
+    let elapsed = ctl.start.elapsed().as_millis() as u64;
+    lane.first_token_at.get_or_insert_with(Instant::now);
+    let id = &lane.key.id;
+    let stopped = ctl.semantic.as_mut().ok_or("lane producer missing")?.commit_and_classify(
+        stdout, token,
+        || {
+            let pos = qwen_ar_raw_commit_token(&mut lane.conversation_tokens, &mut lane.streamed_tokens,
+                &mut lane.seq_pos, token, QwenArRawCommitDisposition::ClassifiedVisible);
+            (pos, new_bytes)
+        },
+        |pos, output| emit_committed_event(output, id, token, pos, elapsed),
+    ).map_err(|e| e.to_string())?;
+    if stopped || token == eos || tokenizer.is_terminator(token) {
+        return Ok(Some(false));
+    }
+    match qwen_ar_think_budget_step(&mut ctl.budget, &ctl.bytes, ctl.started_in_think, tokenizer) {
+        QwenArThinkBudgetAction::Continue => {}
+        QwenArThinkBudgetAction::Close(tokens) => ctl.forced.extend(tokens),
+        QwenArThinkBudgetAction::Stop => return Ok(Some(false)),
+    }
+    Ok((lane.streamed_tokens.len() >= ctl.max_tokens || adv_length).then_some(true))
+}
+
+fn finish_lane(
+    sched: &mut ContinuousBatchScheduler,
+    model: &mut LoadedModel,
+    controls: &mut [Option<LaneCtl>],
+    idx: usize,
+    stdout: &mut Stdout,
+    length: bool,
+) -> Result<(), String> {
+    let ctl = controls[idx].as_mut().ok_or("lane control missing")?;
+    let BatchLane::Running(lane) = &sched.lanes[idx] else { return Err("finished lane is not running".into()); };
+    let key = lane.key.clone();
+    let admission = lane.ticket.admission;
+    let _scope = BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
+    let (finish, visible) = ctl.semantic.take().ok_or("lane producer missing")?
+        .finish(stdout, length).map_err(|e| e.to_string())?;
+    let now = Instant::now();
+    let generated = lane.streamed_tokens.len();
+    let total = now.duration_since(ctl.start).as_secs_f64();
+    let decode = ctl.decode_start.map_or(0.0, |t| now.duration_since(t).as_secs_f64());
+    let mut done = qwen_ar_done_value(&key.id, finish.finish_reason, generated,
+        batch_finite_rate(generated, total), lane.prompt_len, ctl.prefill_ms,
+        batch_finite_rate(lane.prompt_len, ctl.prefill_ms / 1000.0),
+        batch_finite_rate(generated, decode), ctl.prefill_ms, 0, "");
+    stage_terminal_tool_calls(&mut done, finish.finish_reason, &finish.wire_tool_calls);
+    attach_continuous_batch_route_evidence(&mut done, sched.lanes.len(), idx, sched.lane_capacity,
+        lane.max_active_lanes.max(1));
+    // Per-stream MTP counters (before `release` drops the lane), under the
+    // singleton's done keys; `mtp_drafts`/`mtp_accepted` are lane-only.
+    if let Some(stats) = model.qwen4().and_then(|b| b.lanes()).and_then(|s| s.lane_spec_stats(&ctl.epoch)) {
+        done["mtp"] = serde_json::json!(true);
+        if stats.windows != 0 || stats.ar_windows != 0 || stats.retired {
+            done["mtp_windows"] = serde_json::json!(stats.windows);
+            done["ar_windows"] = serde_json::json!(stats.ar_windows);
+            done["mtp_retired"] = serde_json::json!(stats.retired);
+            done["mtp_drafts"] = serde_json::json!(stats.drafts);
+            done["mtp_accepted"] = serde_json::json!(stats.accepted);
+        }
+    }
+    let action = qwen_ar_cache_action(&finish, &visible);
+    if action.store {
+        let tokenizer = model.tokenizer.as_ref().ok_or("tokenizer disappeared")?;
+        let im_end = tokenizer.encode("<|im_end|>");
+        let im_end = if im_end.len() == 1 { Some(im_end[0]) } else { None };
+        let nl = tokenizer.encode("\n").into_iter().collect();
+        ctl.cache = Some((action, crate::qwen::qwen_dflash_cache_seq(&lane.streamed_tokens, im_end, &nl)));
+    }
+    release(model, ctl)?;
+    let mut ready = done.clone();
+    ready["type"] = serde_json::json!("commit_ready");
+    if !sched.mark_awaiting_commit(idx, done) {
+        return Err("qwen4 mark_awaiting_commit failed".into());
+    }
+    writeln!(stdout, "{ready}").and_then(|()| stdout.flush()).map_err(|e| e.to_string())
+}
+
+/// Serve concurrently admitted greedy Qwen4 requests using the exact lane
+/// executor. All terminal ownership remains in `ContinuousBatchScheduler`.
+/// `promoted` is a running singleton moved into a lane (`generate_spec`): it
+/// is adopted as a Running lane before the loop and continues from its
+/// pending seed.
+pub fn drive_qwen4_lane_batch(
+    sched: &mut ContinuousBatchScheduler,
+    gpu: &mut Gpu,
+    m: &mut LoadedModel,
+    params: VmmBatchParams,
+    stdout: &mut Stdout,
+    inbox: &mut DaemonInbox,
+    promoted: Option<Qwen4PromotedRequest>,
+) -> Result<(), BatchDriveError> {
+    let setup = m.qwen4().ok_or("lane model is not qwen4").and_then(|bundle| {
+        let store = bundle.lanes().ok_or("qwen4 lanes not staged")?;
+        let (max_lanes, row_budget) = (store.max_lanes(), store.row_budget().min(params.max_batch_tokens));
+        if row_budget == 0 || sched.max_batch > max_lanes {
+            return Err("qwen4 lane scheduler/budget does not match staged store");
+        }
+        Ok((max_lanes, row_budget, bundle.config.eos_token_id))
+    });
+    let (max_lanes, row_budget, eos) = match setup {
+        Ok(setup) => setup,
+        Err(message) => {
+            if let Some(p) = &promoted {
+                fail_promoted(m, stdout, &p.pending.key, p.pending.admission, &p.epoch, message);
+            }
+            return Err(BatchDriveError::Gpu(message.into()));
+        }
+    };
+    let mut controls: Vec<Option<LaneCtl>> = (0..sched.max_batch).map(|_| None).collect();
+    let mut cursor = 0;
+    let mut trace = StepTrace::new();
+    let batch_size = sched.max_batch;
+    // Requests already queued at entry; the promoted lane never passes the
+    // inbox, so it is never handed back to the singleton.
+    let initial: HashSet<_> = sched.inbox.iter().cloned().collect();
+    if let Some(promoted) = promoted {
+        adopt_promoted(sched, m, &mut controls, stdout, promoted);
+    }
+    let result = (|| -> Result<(), String> {
+        loop {
+            // Terminal decisions must not block other lanes' GPU work.
+            for idx in 0..sched.max_batch {
+                let decision = match &sched.lanes[idx] {
+                    BatchLane::AwaitingClient(t) => {
+                        if batch_check_abort(&t.key.id, t.key.attempt_id, t.ticket.admission) || Instant::now() >= t.deadline {
+                            Some(false)
+                        } else if batch_poll_decision(&t.key.id, t.key.attempt_id, t.ticket.admission) == Some(ClientTerminalDecision::Commit) {
+                            Some(true)
+                        } else { None }
+                    }
+                    BatchLane::Running(l) | BatchLane::Seeding(l) if batch_check_abort(&l.key.id, l.key.attempt_id, l.ticket.admission) => Some(false),
+                    _ => None,
+                };
+                match decision {
+                    Some(false) => cancel_lane(sched, m, &mut controls, idx, stdout)?,
+                    Some(true) => {
+                        let BatchLane::AwaitingClient(t) = &sched.lanes[idx] else { unreachable!() };
+                        let key = t.key.clone();
+                        let admission = t.ticket.admission;
+                        let done = t.pending_done.clone();
+                        let _scope = BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
+                        if !sched.commit_lane_retain_terminal(idx, &key, admission) {
+                            lane_error(sched, m, &mut controls, idx, stdout, "qwen4 commit_lane failed", "internal")?;
+                        } else {
+                            if let Some(ctl) = controls[idx].as_mut() {
+                                if let Some((action, tokens)) = ctl.cache.take() {
+                                    let tokenizer = m.tokenizer.as_ref().ok_or("tokenizer disappeared")?;
+                                    qwen_ar_apply_cache_action(|fp, seq| {
+                                        m.asst_turn_cache.insert(fp, crate::qwen::qwen_cached_turn_entry(tokenizer, seq, ctl.started_in_think));
+                                    }, &action, tokens);
+                                }
+                            }
+                            emit_generation_done_value(ROUTE, stdout, &done);
+                            batch_clear_terminal_at_generation(&key.id, key.attempt_id, admission);
+                            controls[idx] = None;
+                        }
+                    }
+                    None => {}
+                }
+            }
+            for key in sched.inbox.iter().cloned().collect::<Vec<_>>() {
+                if let Some(req) = sched.pending.get(&key) {
+                    let admission = req.admission;
+                    if batch_check_abort(&key.id, key.attempt_id, admission) {
+                        let _scope = BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, admission);
+                        emit_generation_start(ROUTE, stdout, &key.id, false);
+                        emit_generation_cancel(ROUTE, stdout, &key.id, 0);
+                        sched.abort_queued(&key, admission);
+                    }
+                }
+            }
+            let tokenizer = m.tokenizer.as_ref().ok_or("tokenizer missing")?;
+            if let Some(barrier) = drain_qwen_batch_inbox(sched, m, batch_size,
+                is_vmm_batch_request_eligible, tokenizer, m.chat_template.as_ref(), ROUTE, stdout, inbox, true)? {
+                inbox.push_front(barrier);
+            }
+            while let Some((key, ticket)) = sched.try_assign_one() {
+                let req = sched.pending.get(&key).cloned().ok_or("assigned request missing")?;
+                if !initial.contains(&key) && sched.inbox.is_empty()
+                    && !controls.iter().flatten().any(|c| c.epoch.is_admitted()) {
+                    inbox.push_front(handoff_started_in_think(sched, ticket.lane, &key, &req, ROUTE)?);
+                    continue;
+                }
+                let rendered = render_request(m, &req);
+                let _scope = BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, ticket.admission);
+                let (prompt, started) = match rendered {
+                    Ok(r) => r,
+                    Err((error, class)) => {
+                        lane_error(sched, m, &mut controls, ticket.lane, stdout, &error, class)?;
+                        continue;
+                    }
+                };
+                let max_tokens = fit_max_tokens_if(req.original_msg.get("max_tokens_fit").and_then(|v| v.as_bool()) == Some(true),
+                    req.max_tokens, prompt.len() + 1, m.max_seq);
+                let required = prompt.len().checked_add(max_tokens).and_then(|n| n.checked_add(1));
+                let refusal = if req.max_tokens == 0 {
+                    Some(("max_tokens must be > 0".to_string(), "validation"))
+                } else if prompt.is_empty() {
+                    Some(("qwen4 AR prompt rendered to zero tokens".to_string(), "validation"))
+                } else if required.is_none_or(|n| n > m.max_seq) {
+                    Some((format!("qwen4 request exceeds context window: prompt={} + max_tokens={} + trailer=1 > max_seq={}", prompt.len(), max_tokens, m.max_seq), "context_length"))
+                } else { None };
+                if let Some((message, class)) = refusal {
+                    lane_error(sched, m, &mut controls, ticket.lane, stdout, &message, class)?;
+                    continue;
+                }
+                let stop = hipfire_runtime::stop_sequence::parse_stop_field(req.original_msg.get("stop")).map_err(|e| e.to_string())?;
+                let epoch = next_lane_epoch()?;
+                let slot = match m.qwen4_mut().ok_or("qwen4 bundle disappeared")?.admit_lane(gpu, epoch, prompt.clone()) {
+                    Ok(slot) => slot,
+                    Err(e) => {
+                        lane_error(sched, m, &mut controls, ticket.lane, stdout, &e.to_string(), "context_length")?;
+                        continue;
+                    }
+                };
+                emit_generation_start(ROUTE, stdout, &key.id, started);
+                // The singleton tools parser maps an empty array to None.
+                let tools = req.original_msg.get("tools").and_then(|v| v.as_array()).is_some_and(|a| !a.is_empty());
+                controls[ticket.lane] = Some(LaneCtl {
+                    epoch, slot, semantic: Some(QwenArSemanticProducer::new_with_tool_protocol(&key.id, started, tools).with_stop(&stop)),
+                    bytes: Vec::new(), budget: ThinkBudget::new(req.max_think_tokens), forced: VecDeque::new(),
+                    started_in_think: started, max_tokens, start: Instant::now(), decode_start: None, prefill_ms: 0.0, cache: None,
+                    skip_first_forward: false,
+                });
+                let BatchLane::Running(lane) = &mut sched.lanes[ticket.lane] else { return Err("assigned lane is not running".into()); };
+                lane.prompt_len = prompt.len();
+                lane.seq_pos = prompt.len();
+                lane.conversation_tokens = prompt;
+            }
+            if sched.active_count() == 0 && sched.inbox.is_empty() { return Ok(()); }
+            let streamed: Vec<usize> = sched.lanes.iter().map(|l| match l {
+                BatchLane::Running(l) | BatchLane::Seeding(l) => l.streamed_tokens.len(),
+                _ => 0,
+            }).collect();
+            let t_plan = Instant::now();
+            let plan = match plan_step(m, gpu, &mut controls, &streamed, row_budget, &mut cursor, max_lanes)? {
+                Ok(plan) => plan,
+                Err(failure) => {
+                    for epoch in &failure.epochs {
+                        if let Some(idx) = controls.iter().position(|c| c.as_ref().is_some_and(|c| c.epoch == *epoch)) {
+                            lane_error(sched, m, &mut controls, idx, stdout,
+                                &format!("qwen4 lane draft failed: {}", failure.error), "gpu")?;
+                        }
+                    }
+                    continue;
+                }
+            };
+            if plan.requests.is_empty() {
+                std::thread::sleep(Duration::from_millis(2));
+                continue;
+            }
+            let t_fwd = Instant::now();
+            let mut t_commit = t_fwd;
+            let stepped = {
+                let bundle = m.qwen4_mut().ok_or("qwen4 bundle disappeared")?;
+                let mut executor = bundle.lane_executor().map_err(|e| e.to_string())?;
+                let result = executor.provision_step(gpu, &plan)
+                    .and_then(|()| executor.forward_step(gpu, &plan))
+                    .and_then(|out| { t_commit = Instant::now(); executor.commit_step(gpu, &plan, out) });
+                if result.is_err() { executor.abort_step(&plan); }
+                result
+            };
+            let t_done = Instant::now();
+            let advances = match stepped {
+                Ok(a) => a,
+                Err(error) => {
+                    for request in &plan.requests {
+                        if let Some(idx) = controls.iter().position(|c| c.as_ref().is_some_and(|c| c.epoch == request.epoch)) {
+                            lane_error(sched, m, &mut controls, idx, stdout, &format!("qwen4 lane step failed: {error}"), "gpu")?;
+                        }
+                    }
+                    continue;
+                }
+            };
+            let decoded = trace.is_some().then(|| advances.iter()
+                .filter(|a| plan.requests.iter().any(|r| r.epoch == a.epoch && r.kind != RequestStepKind::Prefill))
+                .fold((0, 0), |(t, c), a| (t + a.committed_ids.len(), c + a.accepted_drafts)));
+            for advance in advances {
+                let idx = controls.iter().position(|c| c.as_ref().is_some_and(|c| c.epoch == advance.epoch))
+                    .ok_or("qwen4 advance has no request owner")?;
+                let request = plan.requests.iter().find(|r| r.epoch == advance.epoch).ok_or("qwen4 advance not in plan")?;
+                if request.kind == RequestStepKind::Prefill {
+                    if !advance.committed_ids.is_empty() {
+                        let ctl = controls[idx].as_mut().ok_or("lane control missing")?;
+                        ctl.prefill_ms = ctl.start.elapsed().as_secs_f64() * 1000.0;
+                        ctl.decode_start = Some(Instant::now());
+                        if let BatchLane::Running(lane) = &mut sched.lanes[idx] { lane.prefill_done_at = ctl.decode_start; }
+                    }
+                    if advance.finish.as_deref() == Some("length") {
+                        finish_lane(sched, m, &mut controls, idx, stdout, true)?;
+                    }
+                    continue;
+                }
+                // All step participants committed before any bytes are published.
+                if let BatchLane::Running(lane) = &sched.lanes[idx] {
+                    if batch_check_abort(&lane.key.id, lane.key.attempt_id, lane.ticket.admission) {
+                        cancel_lane(sched, m, &mut controls, idx, stdout)?;
+                        continue;
+                    }
+                }
+                // Forwarded tokens: the plan seed, then every committed id but
+                // the last (the next pending seed). One entry for an AR row. A
+                // promoted lane's first plan seed was streamed by the singleton.
+                let skip_seed = controls[idx].as_mut().is_some_and(|c| std::mem::take(&mut c.skip_first_forward));
+                let forwarded = forwarded_tokens(plan.batch.tokens[request.rows.begin], &advance.committed_ids, skip_seed);
+                let length_finish = advance.finish.as_deref() == Some("length");
+                let _scope = match &sched.lanes[idx] {
+                    BatchLane::Running(lane) => BatchAttemptScope::enter_for_generation(
+                        &lane.key.id, lane.key.attempt_id, lane.ticket.admission),
+                    _ => return Err("advanced lane is not running".into()),
+                };
+                if forwarded.is_empty() && length_finish {
+                    // The already-streamed promoted seed was the only forwarded token.
+                    if let Err(error) = finish_lane(sched, m, &mut controls, idx, stdout, true) {
+                        lane_error(sched, m, &mut controls, idx, stdout, &error, "validation")?;
+                    }
+                    continue;
+                }
+                for (i, &token) in forwarded.iter().enumerate() {
+                    let BatchLane::Running(lane) = &mut sched.lanes[idx] else { return Err("advanced lane is not running".into()); };
+                    let tokenizer = m.tokenizer.as_ref().ok_or("tokenizer disappeared")?;
+                    let emitted = emit_forwarded(stdout, tokenizer, lane, controls[idx].as_mut().ok_or("lane control missing")?,
+                        token, eos, length_finish && i + 1 == forwarded.len());
+                    match emitted {
+                        Ok(Some(length)) => {
+                            if let Err(error) = finish_lane(sched, m, &mut controls, idx, stdout, length) {
+                                lane_error(sched, m, &mut controls, idx, stdout, &error, "validation")?;
+                            }
+                            break;
+                        }
+                        Ok(None) => {}
+                        Err(error) => {
+                            lane_error(sched, m, &mut controls, idx, stdout, &error, "validation")?;
+                            break;
+                        }
+                    }
+                }
+            }
+            if let (Some(trace), Some((tokens, accepted))) = (trace.as_mut(), decoded) {
+                let active = controls.iter().flatten().filter(|c| c.epoch.is_admitted()).count();
+                trace.line([t_plan, t_fwd, t_commit, t_done], &plan, tokens, accepted, active, sched.inbox.len());
+            }
+        }
+    })();
+    if let Err(error) = result {
+        let mut cleanup_error = None;
+        for idx in 0..sched.max_batch {
+            if let Err(e) = lane_error(sched, m, &mut controls, idx, stdout, &error, "gpu") { cleanup_error.get_or_insert(e); }
+        }
+        for (key, req) in &sched.pending {
+            let _scope = BatchAttemptScope::enter_for_generation(&key.id, key.attempt_id, req.admission);
+            emit_generation_error(ROUTE, stdout, Some(&key.id), &error, "gpu", false, cleanup_error.is_none());
+        }
+        sched.fail_all_active();
+        return Err(match cleanup_error {
+            Some(e) => BatchDriveError::Poisoned(format!("{error}; lane release failed: {e}")),
+            None => BatchDriveError::Gpu(error),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::forwarded_tokens;
+
+    #[test]
+    fn forwarded_tokens_are_seed_then_all_committed_but_last() {
+        assert_eq!(forwarded_tokens(7, &[8, 9, 10], false), vec![7, 8, 9]);
+        // An AR row commits one id: only the plan seed was forwarded.
+        assert_eq!(forwarded_tokens(7, &[8], false), vec![7]);
+    }
+
+    #[test]
+    fn promoted_first_advance_drops_the_streamed_plan_seed() {
+        assert_eq!(forwarded_tokens(7, &[8, 9, 10], true), vec![8, 9]);
+        assert!(forwarded_tokens(7, &[8], true).is_empty());
+        assert!(forwarded_tokens(7, &[], true).is_empty());
+    }
+}

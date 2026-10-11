@@ -36,7 +36,6 @@ use std::io::{BufRead, Write};
 use std::path::Path;
 use std::sync::{mpsc, Arc, Condvar, Mutex, OnceLock};
 use std::time::{Duration, Instant};
-
 use hipfire_engine::emit::*;
 use hipfire_engine::prompt::*;
 use hipfire_engine::redline::*;
@@ -86,8 +85,8 @@ use gpu_lock::GpuLocks;
 mod request_guards;
 mod slots;
 mod vision_ladder;
+mod weight_host_tenant;
 use vision_ladder::{apply_vision_mode_gate, resolve_vision_ladder};
-
 #[cfg(test)]
 pub(crate) static TERMINAL_TEST_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
     std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
@@ -102,9 +101,7 @@ use hipfire_runtime::spec::{
 /// Must stay aligned with `lm_head_batched` + `prepare_decode_batch_inputs`
 /// in hipfire-arch-qwen35 — unsupported lm_head or F32 embedding must never
 /// advertise `continuous_batch_capable` or enter the batch route.
-
 pub type CaskConfig = hipfire_runtime::loader_api::CaskConfig;
-
 #[allow(dead_code)]
 fn emit_error_no_id(stdout: &mut impl std::io::Write, message: impl std::fmt::Display) {
     emit_uncorrelated_error(stdout, None, &message.to_string(), "internal", false, false);
@@ -118,7 +115,6 @@ struct BatchTerminalCleanup {
     attempt_id: u64,
     admission: Option<BatchGeneration>,
 }
-
 impl Drop for BatchTerminalCleanup {
     fn drop(&mut self) {
         if let Some(admission) = self.admission {
@@ -164,7 +160,6 @@ fn parse_wire_attempt_id(value: Option<&serde_json::Value>) -> Option<u64> {
     }
     None
 }
-
 /// Require a present, nonzero numeric attempt_id on the wire.
 ///
 /// Zero is reserved for uncorrelated control-plane envelopes. It must never
@@ -179,7 +174,6 @@ fn require_wire_attempt_id(value: Option<&serde_json::Value>) -> Result<u64, &'s
         },
     }
 }
-
 /// Announce a generate key only after the command has a valid nonzero attempt.
 ///
 /// `None` means the request is malformed or uses reserved attempt zero and
@@ -201,7 +195,6 @@ fn announce_generate_terminal(
 
 // ── serve-fault-inject (test-only; compiled out of production) ─────────
 // Per-request fault arming lives in hipfire_generate::common::RequestFaultGuard.
-
 #[cfg(feature = "serve-fault-inject")]
 fn write_test_state_snapshot(
     stdout: &mut impl std::io::Write,
@@ -623,7 +616,6 @@ impl ResidentKvDiag {
     }
 }
 
-
 /// Pure gate for the deferred EP (tp>1) load handoff.
 ///
 /// After a new EP model is constructed, the prior model is unloaded. The new
@@ -973,7 +965,7 @@ fn main() {
     else {
         return;
     };
-    let mut gpu_locks = GpuLocks::open().unwrap_or_else(|error| {
+    let (weight_host, mut gpu_locks) = weight_host_tenant::open_locks().unwrap_or_else(|error| {
         eprintln!("FATAL: {error}");
         std::process::exit(1);
     });
@@ -1067,7 +1059,6 @@ fn main() {
     // resident remains loaded.
     let mut resident_kv: Option<ResidentKvDiag> = None;
 
-
     // Background stdin reader. Drains stdin into an mpsc channel so
     // the main loop can pull non-blockingly between messages. Abort /
     // commit control messages are NOT forwarded; the reader handles
@@ -1107,10 +1098,6 @@ fn main() {
                                 attempt_id,
                                 command = kind,
                                 "daemon control command received"
-                            );
-                            eprintln!(
-                                "[daemon-control] received {} for id={} attempt_id={}",
-                                kind, id, attempt_id
                             );
                             apply_terminal_control(kind, id, attempt_id);
                             batch_apply_terminal_control(kind, id, attempt_id);
@@ -1188,6 +1175,11 @@ fn main() {
         };
 
         let msg_type = msg.get("type").and_then(|v| v.as_str()).unwrap_or("");
+        let idle = !batch_scheduler.as_ref().is_some_and(|s| s.active_count() > 0);
+        let quiet = weight_host.is_some() && idle && !matches!(msg_type, "ping" | "diag");
+        if quiet && weight_host_tenant::reconcile_lease(&mut model, &mut gpu) {
+            (resident_kv, batch_scheduler, vmm_batch, continuous_batch_size) = (None, None, None, 1);
+        }
         let request_id = msg.get("id").and_then(|v| v.as_str()).unwrap_or("");
         let command_span = tracing::info_span!(
             "daemon_command",
@@ -1210,6 +1202,11 @@ fn main() {
                 let _ = stdout.flush();
             }
             "load" => {
+                if let Some(refusal) = weight_host_tenant::load_refusal(weight_host.is_some(), &msg) {
+                    emit_uncorrelated_error(&mut stdout, None, &refusal, "validation", false, false);
+                    let _ = stdout.flush();
+                    continue;
+                }
                 // FIX #1 (transactional EP load): the unload of the prior model
                 // is deferred for the EP (tp>1) path until AFTER the new load
                 // succeeds, so a partial EP load failure leaves the prior model
@@ -1249,8 +1246,6 @@ fn main() {
                 if experimental_multi_slot {
                     // Experimental slot backend is an alternate model owner, not a batch-mode switch.
                     // Validate mutually exclusive knobs before any GPU work.
-                    // The initialized GPU's arch rides along so the KV gate
-                    // is exact (fp8 is gfx1201-only at this boundary).
                     if let Some(err) = slots::validate_load_caps(&msg, &gpu.arch) {
                         emit_uncorrelated_error(
                             &mut stdout,
@@ -1724,6 +1719,15 @@ fn main() {
                     .and_then(|v| v.as_bool())
                     .unwrap_or(false);
 
+                let Some(dflash_block) = request_guards::dflash_block(
+                    &mut stdout,
+                    &msg,
+                    parsed_vmm_batch.is_some(),
+                    parsed_continuous_batch_size,
+                ) else {
+                    continue;
+                };
+
                 // Model-free n-gram policy normally arrives as per-load params
                 // resolved by the CLI. Direct protocol clients inherit the
                 // daemon's typed process policy instead of ambient env.
@@ -1776,6 +1780,7 @@ fn main() {
                     mtp: hipfire_config::parse_tri_state(&mtp_mode),
                     mtp_k: Some(mtp_k),
                     dflash_adaptive_b: Some(adaptive_b),
+                    dflash_block: Some(dflash_block),
                 };
 
                 // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
@@ -2119,7 +2124,7 @@ fn main() {
                         cask: Some(&cask),
                         deepseek4_heterogeneous: !matches!(deepseek4_compute_placement, hipfire_config::Deepseek4ComputePlacement::Single),
                         vmm_runtime_available: gpu.vmm_recommended_granularity().is_ok(),
-                        free_vram_bytes: gpu.hip.get_vram_info().ok().map(|(free, _)| free),
+                        free_vram_bytes: gpu.device_mem_info().ok().map(|(free, _)| free),
                         qwen_default_q8: hipfire_loader::admission::qwen_default_q8_enabled(),
                     },
                     qwen4_admission_options,
@@ -2594,7 +2599,7 @@ fn main() {
                                 serde_json::to_string(&card_cap).unwrap(), seq_kv,
                             );
                             let ack = hipfire_generate::batch::vmm_loaded_ack(
-                                ack, &mut m, vmm_batch, staging.slots, staging.row_budget,
+                                ack, &mut m, vmm_batch, staging.slots, staging.row_budget, &gpu,
                             );
                             let _ = writeln!(stdout, "{ack}");
                         }
@@ -3670,7 +3675,11 @@ fn main() {
                     // failing closed. The batch route above still wins when
                     // staged and requested with `serve_continuous_batch`.
                     let vmm_route = hipfire_generate::batch::vmm_route_active(vmm_batch, m);
-                    let batch_eligible = if !singleton_handoff && batch_scheduler.is_some() {
+                    // Qwen4 batches only through its staged fn-lanes route.
+                    let qwen4_batch = hipfire_loader::continuous_batch_route(m.arch_id)
+                        == Some(hipfire_loader::ContinuousBatchRoute::Qwen4);
+                    let qwen4_lanes = qwen4_batch && vmm_route;
+                    let batch_eligible = if !singleton_handoff && batch_scheduler.is_some() && (!qwen4_batch || qwen4_lanes) {
                         hipfire_generate::batch::batch_request_eligible_for_route(
                             vmm_route, &msg, m, continuous_batch_size, serve_continuous_batch, pflash_active, &mut inbox,
                         )
@@ -3688,7 +3697,11 @@ fn main() {
                                 admission,
                             );
                             hipfire_generate::ar::emit_generation_start(
-                                hipfire_generate::ar::GenerationRoute::QwenAr,
+                                if qwen4_lanes {
+                                    hipfire_generate::ar::GenerationRoute::Qwen4Ar
+                                } else {
+                                    hipfire_generate::ar::GenerationRoute::QwenAr
+                                },
                                 &mut stdout,
                                 id,
                                 false,
@@ -3701,7 +3714,13 @@ fn main() {
                         // Render prompt once at admission and store tokens/started flag; do not render twice at lane assignment.
                         let prompt_owned =
                             batch_single_user_content(&msg).unwrap_or_else(|| prompt.to_string());
-                        let (prompt_tokens, started_in_think) = match batch_render_prompt_tokens(
+                        // Qwen4 lanes: the driver renders exactly at assignment (its own
+                        // template path, not the Qwen3.5 batch render); admission defers
+                        // prompt tokens and skips Qwen3.5 length/think validation.
+                        let render = if qwen4_lanes {
+                            Ok((Vec::new(), false))
+                        } else {
+                            batch_render_prompt_tokens(
                             &prompt_owned,
                             system,
                             assistant_prefix,
@@ -3711,7 +3730,8 @@ fn main() {
                             messages_history.as_deref(),
                             enable_thinking_jinja,
                             reasoning_effort_jinja.as_deref(),
-                        ) {
+                        ) };
+                        let (prompt_tokens, started_in_think) = match render {
                             Ok(v) => v,
                             Err(e) => {
                                 emit_batch_admission_error(
@@ -3727,18 +3747,30 @@ fn main() {
                                 continue;
                             }
                         };
-                        if started_in_think && !vmm_route {
+                        // VMM route: a sampled request with no batch lane in its singleton mode at
+                        // this prompt length takes the singleton route before enqueue announces it.
+                        let vmm_singleton_now = vmm_route
+                            && !hipfire_generate::batch::vmm_request_fits_batch(
+                                &msg, m, &sampling, vmm_batch, batch_scheduler.as_ref().map_or(0, |s| s.max_batch),
+                                &gpu.arch, prompt_tokens.len(), max_tokens,
+                            );
+                        if (started_in_think && !vmm_route) || vmm_singleton_now {
                             // Fixed-lane route: think-open prompts are sequential
-                            // barriers. Transfer any pre-latched abort exactly once
-                            // (transfer retires the batch entry and holds a tombstone until singleton cleanup).
+                            // barriers; VMM route: see above. Transfer any
+                            // pre-latched abort exactly once (transfer retires the
+                            // batch entry and holds a tombstone until singleton cleanup).
                             let _ = batch_transfer_abort_to_singleton_and_clear(
                                 id,
                                 gen_attempt_id,
                                 admission,
                             );
+                            if vmm_singleton_now {
+                                // As on the not-eligible path: the sequential producer takes the singleton claim.
+                                batch_scope.rebind_for(gen_attempt_id);
+                            }
                             // Fall through to sequential generate below (do not enqueue).
                         } else {
-                            if prompt_tokens.is_empty() || prompt_tokens.len() >= m.max_seq {
+                            if !qwen4_lanes && (prompt_tokens.is_empty() || prompt_tokens.len() >= m.max_seq) {
                                 emit_batch_admission_error(
                                     &mut stdout,
                                     id,
@@ -3806,7 +3838,7 @@ fn main() {
                                         &mut inbox,
                                     );
                                     apply_batch_drive_result(drive_res, "[batch]", &mut batch_scheduler, &mut continuous_batch_size, &mut batch_poisoned);
-                                } else if arch == 5 || arch == 6 {
+                                } else if arch == 5 || arch == 6 || qwen4_lanes {
                                     let enq_ok = sched.enqueue(pending);
                                     if !enq_ok {
                                         eprintln!(
@@ -3815,7 +3847,9 @@ fn main() {
                                         );
                                         continue;
                                     }
-                                    {
+                                    // Qwen4 lanes announce `Qwen4Ar` from the driver after
+                                    // its exact render (started_in_think is known only then).
+                                    if !qwen4_lanes {
                                         let _scope = BatchAttemptScope::enter_for_generation(
                                             id,
                                             gen_attempt_id,

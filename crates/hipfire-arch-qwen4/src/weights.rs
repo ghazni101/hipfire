@@ -11,9 +11,7 @@
 //! runtime's [`WeightLoadTransaction`] remains the only allocation owner until
 //! this module finalizes handles into [`Qwen4Weights`].
 
-use crate::config::{LayerType, Qwen4Config};
-#[cfg(test)]
-use crate::config::{Qwen4MtpConfig, RecurrentStateDType, SourceDType};
+use crate::config::{LayerType, Qwen4Config, Qwen4FfnConfig, Qwen4PleConfig, Qwen4Profile};
 use hipfire_runtime::external_rows::RowEncoding;
 use hipfire_runtime::model_source::SourceRangeDescriptor;
 #[cfg(test)]
@@ -42,6 +40,9 @@ pub const ROUTED_DOWN_DTYPE: DType = DType::MQ4G128V2;
 pub const PLE_SHARD_ROWS: usize = 2_500_012;
 pub use crate::ple::{PLE_HEAD_COUNT, PLE_ROW_WIDTH};
 pub const PLE_SHARD_COUNT: usize = 128;
+/// Upper bound on the PLE shard tensors a profile may declare, checked before
+/// the manifest allocates anything proportional to the shard count.
+const MAX_PLE_SHARD_TENSORS: usize = 65_536;
 
 /// Packed formats this family's planner recognises.
 ///
@@ -284,6 +285,177 @@ fn qwen4_trunk_target(name: &str, shape: &[usize], requested: DType, trunk_tier:
     }
 }
 
+/// Metadata key naming the recipe a developer artifact was written under.
+/// A Flash-Next artifact's key predates the typed recipe and carries no `id`;
+/// only a synthetic profile reads or requires one.
+pub const RECIPE_METADATA_KEY: &str = "qwen4_recipe";
+/// `id` of [`Qwen4TierRecipe::SyntheticSourceBf16`] in artifact metadata.
+pub const SYNTHETIC_SOURCE_BF16_RECIPE_ID: &str = "synthetic-source-bf16";
+/// `id` of [`Qwen4TierRecipe::SyntheticPacked`] in artifact metadata.
+pub const SYNTHETIC_PACKED_RECIPE_ID: &str = "synthetic-packed";
+
+impl Qwen4TierRecipe {
+    /// Stable artifact-metadata id of a synthetic recipe; `None` for the
+    /// Flash-Next recipe, which is never selected by metadata.
+    pub const fn synthetic_id(&self) -> Option<&'static str> {
+        match self {
+            Self::FlashNextPacked { .. } => None,
+            Self::SyntheticSourceBf16 => Some(SYNTHETIC_SOURCE_BF16_RECIPE_ID),
+            Self::SyntheticPacked => Some(SYNTHETIC_PACKED_RECIPE_ID),
+        }
+    }
+
+    /// The synthetic recipe an artifact-metadata `id` names.
+    pub fn from_synthetic_id(id: &str) -> Option<Self> {
+        match id {
+            SYNTHETIC_SOURCE_BF16_RECIPE_ID => Some(Self::SyntheticSourceBf16),
+            SYNTHETIC_PACKED_RECIPE_ID => Some(Self::SyntheticPacked),
+            _ => None,
+        }
+    }
+}
+
+/// What [`Qwen4TierRecipe::SyntheticPacked`] declares for one tensor, with the
+/// role class and, when the role stays source-exact BF16, the reason.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SyntheticPackDecision {
+    pub dtype: DType,
+    pub class: &'static str,
+    /// Empty when the role is packed.
+    pub reason: &'static str,
+}
+
+/// The synthetic packed recipe's per-role target: the Flash-Next formats at
+/// the role's own reduction width `K` (the last dimension), declared only where
+/// `K` tiles the format and a consumer reads it, BF16 otherwise.
+///
+/// - token embedding: Q8F16 when `K % 32 == 0`;
+/// - language head: MQ6G256V2 when `K % 256 == 0`, else Q8F16 when `K % 32 == 0`;
+/// - trunk attention/GDN projections (rank 2): Q8F16 when `K % 128 == 0`, the
+///   Flash-Next trunk rule, without the `HIPFIRE_QWEN4_TRUNK_TIER` knob;
+/// - dense FFN gate/up/down: Q8F16 when `K % 32 == 0`;
+/// - routed experts: gate/up MQ4G256V2 and down MQ4G128V2, **both or neither**
+///   (the sealed routed route reads the qt44/qt53 pair): packed only when the
+///   hidden width is a multiple of 256 and the expert width of 128;
+/// - everything else (hyper-connection mixers, router, shared expert, PLE
+///   projections, MTP connectors, norms, convolutions) stays BF16 exactly as in
+///   the Flash-Next recipe.
+pub fn synthetic_packed_decision(name: &str, shape: &[usize]) -> SyntheticPackDecision {
+    let k = shape.last().copied().unwrap_or(0);
+    let packed = |dtype: DType, class: &'static str| SyntheticPackDecision {
+        dtype,
+        class,
+        reason: "",
+    };
+    let exact = |class: &'static str, reason: &'static str| SyntheticPackDecision {
+        dtype: DType::BF16,
+        class,
+        reason,
+    };
+    const Q8_BLOCK: &str = "K is not a multiple of the 32-weight Q8F16 block";
+    if shape.len() == 2 && name == QWEN4_LM_HEAD {
+        return if k % 256 == 0 {
+            packed(DType::MQ6G256V2, "language head")
+        } else if k % 32 == 0 {
+            packed(DType::Q8_0, "language head")
+        } else {
+            exact("language head", Q8_BLOCK)
+        };
+    }
+    if shape.len() == 2 && qwen4_q8_dtype(name) {
+        return if k % 32 == 0 {
+            packed(DType::Q8_0, "token embedding")
+        } else {
+            exact("token embedding", Q8_BLOCK)
+        };
+    }
+    if shape.len() == 2 && name.contains(".ple_embedding.ngram_embedding.shard_") {
+        return if synthetic_packed_ple_row_dtype(k) == DType::Q8_0 {
+            packed(DType::Q8_0, "PLE rows")
+        } else {
+            exact("PLE rows", Q8_BLOCK)
+        };
+    }
+    let gate_up = name.ends_with(".experts.gate_up_proj");
+    let down = name.ends_with(".experts.down_proj");
+    if shape.len() == 3 && (gate_up || down) {
+        let class = if gate_up { "routed gate/up" } else { "routed down" };
+        // gate_up is [experts, 2 * intermediate, hidden]; down is
+        // [experts, hidden, intermediate].
+        let (hidden, intermediate) = if gate_up {
+            if shape[1] % 2 != 0 {
+                return exact(class, "stacked gate/up rows are not an even pair");
+            }
+            (shape[2], shape[1] / 2)
+        } else {
+            (shape[1], shape[2])
+        };
+        return if hidden % 256 != 0 {
+            exact(
+                class,
+                "hidden width is not a multiple of the 256-weight MQ4G256V2 group \
+                 (routed gate/up and down pack together)",
+            )
+        } else if intermediate % 128 != 0 {
+            exact(
+                class,
+                "expert intermediate width is not a multiple of the 128-weight MQ4G128V2 group \
+                 (routed gate/up and down pack together)",
+            )
+        } else if gate_up {
+            packed(ROUTED_GATE_UP_DTYPE, class)
+        } else {
+            packed(ROUTED_DOWN_DTYPE, class)
+        };
+    }
+    if shape.len() == 2
+        && !name.contains(".shared_expert.")
+        && name.contains(".mlp.")
+        && (name.ends_with(".mlp.gate_proj.weight")
+            || name.ends_with(".mlp.up_proj.weight")
+            || name.ends_with(".mlp.down_proj.weight"))
+    {
+        return if k % 32 == 0 {
+            packed(DType::Q8_0, "dense FFN")
+        } else {
+            exact("dense FFN", Q8_BLOCK)
+        };
+    }
+    if shape.len() == 2 && (name.contains(".linear_attn.") || name.contains(".self_attn.")) {
+        return if k % 128 == 0 {
+            packed(DType::Q8_0, "trunk projection")
+        } else {
+            exact("trunk projection", "K is not a multiple of 128 (the Flash-Next trunk rule)")
+        };
+    }
+    const KEPT: &str = "the Flash-Next recipe keeps this role source-exact";
+    let class = if name.contains("hyper_connection") {
+        "hyper-connection mixer"
+    } else if name.contains(".shared_expert") {
+        "shared expert"
+    } else if name.ends_with(".mlp.gate.weight") {
+        "router"
+    } else if name.contains(".ple.") {
+        "PLE projection"
+    } else if name.starts_with("mtp.fc_") {
+        "MTP connector"
+    } else {
+        "source-exact parameter"
+    };
+    exact(class, KEPT)
+}
+
+/// Row tier of one synthetic-packed PLE table: Q8F16 rows when the row width
+/// is a multiple of the 32-weight block (the reader's own addressing rule),
+/// BF16 rows otherwise.
+pub fn synthetic_packed_ple_row_dtype(row_width: usize) -> DType {
+    if row_width % 32 == 0 {
+        DType::Q8_0
+    } else {
+        DType::BF16
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Ord, PartialOrd)]
 pub enum TensorRole {
     TokenEmbedding,
@@ -318,6 +490,9 @@ pub enum TensorRole {
     SharedExpertDown,
     RoutedGateUp,
     RoutedDown,
+    DenseFfnGate,
+    DenseFfnUp,
+    DenseFfnDown,
     PleShard,
     PleKey,
     PleValue,
@@ -384,34 +559,125 @@ impl MetadataTensor {
     }
 }
 
+/// The tier recipe a manifest declares its targets and source constraints
+/// under.  It is part of the manifest identity: two manifests with the same
+/// names and shapes but different recipes are different artifacts.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Qwen4TierRecipe {
+    /// The pinned Flash-Next packed recipe: Q8/MQ6 trunk, MQ4 routed experts,
+    /// Q8 embedding, MQ6 head, Q8F16 PLE rows.  `trunk_tier` and `mtp_source`
+    /// are the two producer/loader-shared knobs, resolved once.
+    FlashNextPacked { trunk_tier: DType, mtp_source: bool },
+    /// Developer-only synthetic profiles stay conservative: every tensor is
+    /// declared source-exact BF16 (and BF16 external PLE rows) until a role
+    /// format has an executable consumer, a producer and a proof.  No
+    /// environment knob moves this recipe.
+    SyntheticSourceBf16,
+    /// Developer-only synthetic profiles with the Flash-Next per-role packed
+    /// formats, declared only where a role's reduction width tiles the format
+    /// ([`synthetic_packed_decision`]); every other role stays source-exact
+    /// BF16.  Each role admits exactly the one representation declared for it,
+    /// so an artifact's recipe identity is its bytes, not a negotiation.
+    SyntheticPacked,
+}
+
+/// Profile and recipe identity carried by every manifest.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct Qwen4ManifestIdentity {
+    /// `Qwen4Profile::id()` of the config the manifest was built from.
+    pub profile_id: String,
+    pub developer_only: bool,
+    /// `Qwen4EquationSource::as_str()` of the profile.
+    pub equation_source: &'static str,
+    /// `"dense"` or `"moe"`.
+    pub ffn_kind: &'static str,
+    pub recipe: Qwen4TierRecipe,
+}
+
 /// Pure logical Qwen4 manifest.  No GPU, source, or allocator is touched.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Qwen4Manifest {
+    pub identity: Qwen4ManifestIdentity,
     pub weights: Vec<WeightEntry>,
     pub state: Vec<StateEntry>,
     pub metadata: Vec<MetadataTensor>,
 }
 
+fn positive(name: &str, value: usize) -> Result<usize, WeightError> {
+    if value == 0 {
+        return Err(WeightError::InvalidShape {
+            name: name.to_string(),
+            shape: vec![value],
+        });
+    }
+    Ok(value)
+}
+
+fn checked_product(name: &str, a: usize, b: usize) -> Result<usize, WeightError> {
+    a.checked_mul(b)
+        .ok_or_else(|| WeightError::ShapeOverflow(name.to_string()))
+}
+
 impl Qwen4Manifest {
     /// The declaration both the producer and the loader read.
     ///
-    /// The trunk's packed tier comes from `HIPFIRE_QWEN4_TRUNK_TIER`; the
-    /// source-tier experiment affects only rank-2 MTP records.
+    /// Flash-Next takes its packed tier from `HIPFIRE_QWEN4_TRUNK_TIER`; the
+    /// source-tier experiment affects only rank-2 MTP records.  A synthetic
+    /// developer profile ignores both knobs and declares
+    /// [`Qwen4TierRecipe::SyntheticSourceBf16`].
     pub fn build(config: &Qwen4Config) -> Result<Self, WeightError> {
-        Self::build_with_trunk_tier(
-            config,
-            qwen4_trunk_tier(
-                hipfire_config::developer_var("HIPFIRE_QWEN4_TRUNK_TIER")
-                    .ok()
-                    .as_deref(),
-            ),
-        )
+        let tier = if config.profile.is_flash_next() {
+            Qwen4TierRecipe::FlashNextPacked {
+                trunk_tier: qwen4_trunk_tier(
+                    hipfire_config::developer_var("HIPFIRE_QWEN4_TRUNK_TIER")
+                        .ok()
+                        .as_deref(),
+                ),
+                mtp_source: mtp_source_tier_active(),
+            }
+        } else {
+            Qwen4TierRecipe::SyntheticSourceBf16
+        };
+        Self::build_with_recipe(config, tier)
     }
 
     /// [`Self::build`] against an explicit trunk tier, so the selector's effect
     /// on the declaration is testable without a process-global environment.
+    #[cfg(test)]
     fn build_with_trunk_tier(config: &Qwen4Config, trunk_tier: DType) -> Result<Self, WeightError> {
+        Self::build_with_recipe(
+            config,
+            Qwen4TierRecipe::FlashNextPacked {
+                trunk_tier,
+                mtp_source: mtp_source_tier_active(),
+            },
+        )
+    }
+
+    /// The one inventory generator.  Names, logical shapes, optional PLE/MTP,
+    /// the FFN family and the recipe identity all come from the typed profile
+    /// in `config`; nothing here reintroduces a hard-coded Flash-Next count.
+    pub fn build_with_recipe(
+        config: &Qwen4Config,
+        recipe: Qwen4TierRecipe,
+    ) -> Result<Self, WeightError> {
         config.validate().map_err(WeightError::Config)?;
+        let (packed, trunk_tier, mtp_source) = match &recipe {
+            Qwen4TierRecipe::FlashNextPacked {
+                trunk_tier,
+                mtp_source,
+            } => (true, *trunk_tier, *mtp_source),
+            Qwen4TierRecipe::SyntheticSourceBf16 | Qwen4TierRecipe::SyntheticPacked => {
+                (false, DType::BF16, false)
+            }
+        };
+        let synthetic_packed = matches!(recipe, Qwen4TierRecipe::SyntheticPacked);
+        if packed != config.profile.is_flash_next() {
+            return Err(WeightError::UnsupportedProfile {
+                profile: config.profile.id().to_string(),
+                reason: format!("profile cannot be declared under the {recipe:?} recipe"),
+            });
+        }
         let bf16 = DTypeConstraint::source_exact(DType::BF16);
         // Converted HFQM records may already carry either MQ4G256V2 (qt=44)
         // or MQ4G128V2 (qt=53).  The source checkpoint itself remains BF16.
@@ -421,16 +687,27 @@ impl Qwen4Manifest {
         // The head keeps the trunk's six/eight-bit rungs (artifacts written
         // with its earlier Q8F16 tier keep loading) but not the IU4 trunk's
         // four-bit one: four bits cost +0.014 KLD there.
-        let quant_head = DTypeConstraint::source_from_sources(vec![
-            DType::BF16,
-            DType::Q8_0,
-            DType::MQ6G256V2,
-        ]);
+        let quant_head =
+            DTypeConstraint::source_from_sources(vec![DType::BF16, DType::Q8_0, DType::MQ6G256V2]);
         let model = |name: &str,
                      shape: Vec<usize>,
                      requested_dtype: DType,
                      policy: ShardPolicy,
                      source: &DTypeConstraint| {
+            if !packed {
+                let dtype = if synthetic_packed {
+                    synthetic_packed_decision(name, &shape).dtype
+                } else {
+                    DType::BF16
+                };
+                return WeightEntry::model_with_dtype_constraint(
+                    name,
+                    shape,
+                    dtype,
+                    DTypeConstraint::source_exact(dtype),
+                    policy,
+                );
+            }
             let dtype = qwen4_trunk_target(name, &shape, requested_dtype, trunk_tier);
             let source = if name == QWEN4_LM_HEAD {
                 &quant_head
@@ -451,6 +728,21 @@ impl Qwen4Manifest {
                      requested_dtype: DType,
                      policy: ShardPolicy,
                      source: &DTypeConstraint| {
+            if !packed {
+                let dtype = if synthetic_packed {
+                    synthetic_packed_decision(name, &shape).dtype
+                } else {
+                    DType::BF16
+                };
+                return WeightEntry::layer_with_dtype_constraint(
+                    name,
+                    layer_idx,
+                    shape,
+                    dtype,
+                    DTypeConstraint::source_exact(dtype),
+                    policy,
+                );
+            }
             let dtype = qwen4_trunk_target(name, &shape, requested_dtype, trunk_tier);
             let source = if qwen4_trunk_matrix(name, &shape) {
                 &quant_trunk
@@ -470,41 +762,94 @@ impl Qwen4Manifest {
                 policy,
             )
         };
-        let hidden = config.hidden_size;
-        let hc_wide = config
-            .hc_count
-            .checked_mul(hidden)
-            .ok_or_else(|| WeightError::ShapeOverflow("hyper-connection width".to_string()))?;
+        let mtp_model = |name: &str,
+                         shape: Vec<usize>,
+                         requested_dtype: DType,
+                         policy: ShardPolicy,
+                         source: &DTypeConstraint| {
+            mtp_entry(
+                name,
+                shape,
+                requested_dtype,
+                policy,
+                source,
+                packed,
+                mtp_source,
+                synthetic_packed,
+            )
+        };
+        let mtp_layer = |name: &str,
+                         _layer: usize,
+                         shape: Vec<usize>,
+                         requested_dtype: DType,
+                         policy: ShardPolicy,
+                         source: &DTypeConstraint| {
+            // MTP names live in a separate model namespace, not the trunk's
+            // layer placement scope.  Keep their manifest identity layerless.
+            mtp_entry(
+                name,
+                shape,
+                requested_dtype,
+                policy,
+                source,
+                packed,
+                mtp_source,
+                synthetic_packed,
+            )
+        };
+        let hidden = positive("hidden_size", config.hidden_size)?;
+        let hc_wide = checked_product("hyper-connection width", config.hc_count, hidden)?;
         let hc_rank = config.hc_lowrank;
-        let q_dim = config
-            .num_attention_heads
-            .checked_mul(config.head_dim)
-            .ok_or_else(|| WeightError::ShapeOverflow("QSA q width".to_string()))?;
-        let kv_dim = config
-            .num_key_value_heads
-            .checked_mul(config.head_dim)
-            .ok_or_else(|| WeightError::ShapeOverflow("QSA kv width".to_string()))?;
-        let indexer_qk_dim = (config.indexer_n_heads + config.indexer_kv_heads)
-            .checked_mul(config.indexer_head_dim)
-            .ok_or_else(|| WeightError::ShapeOverflow("QSA indexer width".to_string()))?;
-        let gdn_qk = config
-            .linear_num_key_heads
-            .checked_mul(config.linear_key_head_dim)
-            .ok_or_else(|| WeightError::ShapeOverflow("GDN key width".to_string()))?;
-        let gdn_v = config
-            .linear_num_value_heads
-            .checked_mul(config.linear_value_head_dim)
-            .ok_or_else(|| WeightError::ShapeOverflow("GDN value width".to_string()))?;
+        let q_dim = checked_product("QSA q width", config.num_attention_heads, config.head_dim)?;
+        let kv_dim = checked_product("QSA kv width", config.num_key_value_heads, config.head_dim)?;
+        let indexer_heads = config
+            .indexer_n_heads
+            .checked_add(config.indexer_kv_heads)
+            .ok_or_else(|| WeightError::ShapeOverflow("QSA indexer heads".to_string()))?;
+        let indexer_qk_dim =
+            checked_product("QSA indexer width", indexer_heads, config.indexer_head_dim)?;
+        let gdn_qk = checked_product(
+            "GDN key width",
+            config.linear_num_key_heads,
+            config.linear_key_head_dim,
+        )?;
+        let gdn_v = checked_product(
+            "GDN value width",
+            config.linear_num_value_heads,
+            config.linear_value_head_dim,
+        )?;
         let gdn_qkv = 2usize
             .checked_mul(gdn_qk)
             .and_then(|v| v.checked_add(gdn_v))
             .ok_or_else(|| WeightError::ShapeOverflow("GDN qkv width".to_string()))?;
-        let ple_channels = config
-            .ple_embed_dim
-            .checked_mul(config.hc_count)
-            .ok_or_else(|| WeightError::ShapeOverflow("PLE channel width".to_string()))?;
+        // Absent PLE declares no tensor, metadata record or state at all.
+        let ple = config.ple.as_ref();
+        if let Some(ple) = ple {
+            if ple.shard_count == 0 || ple.shard_count > MAX_PLE_SHARD_TENSORS {
+                return Err(WeightError::InvalidShape {
+                    name: "PLE shard count".to_string(),
+                    shape: vec![ple.shard_count],
+                });
+            }
+        }
+        // PLE channels are the hyper-connection wide width (hidden x branches);
+        // the table embedding width (`embed_dim`) is only the projections' input
+        // columns.  Flash-Next has embed_dim == hidden, so both coincide there.
+        let ple_channels = ple.map(|_| hc_wide);
+        if let Some(mtp) = &config.mtp {
+            if mtp.num_hidden_layers != 1 {
+                return Err(WeightError::Config(format!(
+                    "native MTP inventory declares exactly one layer, got {}",
+                    mtp.num_hidden_layers
+                )));
+            }
+        }
 
-        let mut weights = Vec::with_capacity(1_330);
+        let mut weights = Vec::with_capacity(
+            64usize
+                .saturating_add(config.num_hidden_layers.saturating_mul(32))
+                .saturating_add(ple.map_or(0, |ple| ple.shard_count)),
+        );
         weights.push(
             model(
                 "model.language_model.embed_tokens.weight",
@@ -527,18 +872,21 @@ impl Qwen4Manifest {
         );
         // MTP aliases exactly the input embedding.  The target has no MTP
         // lm_head tensor; the distinct trunk lm_head remains the output head.
-        weights.push(
-            model(
-                "mtp.embed_tokens.weight",
-                vec![config.vocab_size, hidden],
-                DType::BF16,
-                ShardPolicy::Tied {
-                    source: "model.language_model.embed_tokens.weight".to_string(),
-                },
-                &bf16,
-            )
-            .with_placement(PlacementHint::Pin(PinTarget::Embed)),
-        );
+        // A profile without an MTP head declares no alias.
+        if config.mtp.is_some() {
+            weights.push(
+                model(
+                    "mtp.embed_tokens.weight",
+                    vec![config.vocab_size, hidden],
+                    DType::BF16,
+                    ShardPolicy::Tied {
+                        source: "model.language_model.embed_tokens.weight".to_string(),
+                    },
+                    &bf16,
+                )
+                .with_placement(PlacementHint::Pin(PinTarget::Embed)),
+            );
+        }
         // Final HC mixer is the only trunk-level post-layer transform.  Its
         // hc_norm is the final normalization; no invented RMSNorm is added.
         weights.push(
@@ -580,7 +928,7 @@ impl Qwen4Manifest {
                 &prefix,
                 layer_idx,
                 "attn_hyper_connection",
-                hidden,
+                config.hc_count,
                 hc_wide,
                 hc_rank,
                 &bf16,
@@ -591,7 +939,7 @@ impl Qwen4Manifest {
                 &prefix,
                 layer_idx,
                 "mlp_hyper_connection",
-                hidden,
+                config.hc_count,
                 hc_wide,
                 hc_rank,
                 &bf16,
@@ -686,124 +1034,140 @@ impl Qwen4Manifest {
                     );
                 }
             }
-            push_moe_entries(
+            push_ffn_entries(
                 &mut weights,
                 &layer,
                 &prefix,
                 layer_idx,
                 hidden,
-                config,
+                &config.ffn,
                 &bf16,
                 &quant_matrix,
-            );
-            if layer_idx == 1 {
-                push_ple_entries(
-                    &mut weights,
-                    &layer,
-                    &prefix,
-                    layer_idx,
-                    hidden,
-                    ple_channels,
-                    config,
-                    &bf16,
-                );
+            )?;
+            if let (Some(ple), Some(channels)) = (ple, ple_channels) {
+                if ple.layer == layer_idx {
+                    push_ple_entries(
+                        &mut weights,
+                        &layer,
+                        &prefix,
+                        layer_idx,
+                        hidden,
+                        channels,
+                        ple,
+                        packed,
+                        synthetic_packed,
+                        &bf16,
+                    );
+                }
             }
         }
 
-        // Native MTP has one full-attention/MoE/HC layer and no PLE.  Keep the
+        // Native MTP has one full-attention/FFN/HC layer and no PLE.  Keep the
         // source's exact names and shapes; fc_hidden is [H,H] in this
-        // checkpoint even though its consumer widens the activation.
-        weights.push(mtp_model(
-            "mtp.fc_embedding.weight",
-            vec![hidden, hidden],
-            DType::BF16,
-            ShardPolicy::ColumnShard { axis: 0 },
-            &bf16,
-        ));
-        weights.push(mtp_model(
-            "mtp.fc_hidden.weight",
-            vec![hidden, hidden],
-            DType::BF16,
-            ShardPolicy::ColumnShard { axis: 0 },
-            &bf16,
-        ));
-        weights.push(mtp_model(
-            "mtp.pre_fc_norm_embedding.weight",
-            vec![hidden],
-            DType::BF16,
-            ShardPolicy::Replicate,
-            &bf16,
-        ));
-        weights.push(mtp_model(
-            "mtp.pre_fc_norm_hidden.weight",
-            vec![hc_wide],
-            DType::BF16,
-            ShardPolicy::Replicate,
-            &bf16,
-        ));
-        push_mtp_hyper_connection_entries(&mut weights, hc_wide, hc_rank, &bf16);
-        push_hyper_connection_entries(
-            &mut weights,
-            &mtp_layer,
-            "mtp.layers.0",
-            0,
-            "attn_hyper_connection",
-            hidden,
-            hc_wide,
-            hc_rank,
-            &bf16,
-        );
-        push_hyper_connection_entries(
-            &mut weights,
-            &mtp_layer,
-            "mtp.layers.0",
-            0,
-            "mlp_hyper_connection",
-            hidden,
-            hc_wide,
-            hc_rank,
-            &bf16,
-        );
-        push_qsa_entries(
-            &mut weights,
-            &mtp_layer,
-            "mtp.layers.0",
-            0,
-            hidden,
-            q_dim,
-            kv_dim,
-            indexer_qk_dim,
-            config,
-            &bf16,
-        );
-        push_moe_entries(
-            &mut weights,
-            &mtp_layer,
-            "mtp.layers.0",
-            0,
-            hidden,
-            config,
-            &bf16,
-            &quant_matrix,
-        );
+        // checkpoint even though its consumer widens the activation.  A profile
+        // without an MTP head declares none of it.
+        if config.mtp.is_some() {
+            weights.push(mtp_model(
+                "mtp.fc_embedding.weight",
+                vec![hidden, hidden],
+                DType::BF16,
+                ShardPolicy::ColumnShard { axis: 0 },
+                &bf16,
+            ));
+            weights.push(mtp_model(
+                "mtp.fc_hidden.weight",
+                vec![hidden, hidden],
+                DType::BF16,
+                ShardPolicy::ColumnShard { axis: 0 },
+                &bf16,
+            ));
+            weights.push(mtp_model(
+                "mtp.pre_fc_norm_embedding.weight",
+                vec![hidden],
+                DType::BF16,
+                ShardPolicy::Replicate,
+                &bf16,
+            ));
+            weights.push(mtp_model(
+                "mtp.pre_fc_norm_hidden.weight",
+                vec![hc_wide],
+                DType::BF16,
+                ShardPolicy::Replicate,
+                &bf16,
+            ));
+            push_mtp_hyper_connection_entries(&mut weights, &mtp_model, hc_wide, hc_rank, &bf16);
+            push_hyper_connection_entries(
+                &mut weights,
+                &mtp_layer,
+                "mtp.layers.0",
+                0,
+                "attn_hyper_connection",
+                config.hc_count,
+                hc_wide,
+                hc_rank,
+                &bf16,
+            );
+            push_hyper_connection_entries(
+                &mut weights,
+                &mtp_layer,
+                "mtp.layers.0",
+                0,
+                "mlp_hyper_connection",
+                config.hc_count,
+                hc_wide,
+                hc_rank,
+                &bf16,
+            );
+            push_qsa_entries(
+                &mut weights,
+                &mtp_layer,
+                "mtp.layers.0",
+                0,
+                hidden,
+                q_dim,
+                kv_dim,
+                indexer_qk_dim,
+                config,
+                &bf16,
+            );
+            push_ffn_entries(
+                &mut weights,
+                &mtp_layer,
+                "mtp.layers.0",
+                0,
+                hidden,
+                &config.ffn,
+                &bf16,
+                &quant_matrix,
+            )?;
+        }
 
         // These declarations preserve the exact I64 payload identities for
         // the qwen4_ple container.  They are deliberately not WeightEntry
         // values because no GPU tensor or float dtype may represent them.
-        let metadata = vec![
-            MetadataTensor::i64(
-                "model.language_model.layers.1.ple.ple_embedding.layer_multipliers",
-                vec![3],
-            ),
-            MetadataTensor::i64(
-                "model.language_model.layers.1.ple.ple_embedding.ngram_heads_offsets",
-                vec![PLE_HEAD_COUNT],
-            ),
-            MetadataTensor::i64(
-                "model.language_model.layers.1.ple.ple_embedding.ngram_heads_vocab_sizes",
-                vec![PLE_HEAD_COUNT],
-            ),
-        ];
+        let metadata = match ple {
+            Some(ple) => {
+                let base = format!(
+                    "model.language_model.layers.{}.ple.ple_embedding",
+                    ple.layer
+                );
+                vec![
+                    MetadataTensor::i64(
+                        format!("{base}.layer_multipliers"),
+                        vec![ple.multiplier_count],
+                    ),
+                    MetadataTensor::i64(
+                        format!("{base}.ngram_heads_offsets"),
+                        vec![ple.head_count],
+                    ),
+                    MetadataTensor::i64(
+                        format!("{base}.ngram_heads_vocab_sizes"),
+                        vec![ple.head_count],
+                    ),
+                ]
+            }
+            None => Vec::new(),
+        };
 
         let mut state = Vec::new();
         for (layer_idx, kind) in config.layer_types.iter().copied().enumerate() {
@@ -822,11 +1186,25 @@ impl Qwen4Manifest {
                 state.push(StateEntry::new(StateKind::Conv, layer_idx));
             }
         }
-        // PLE is injected at zero-based layer 1 and retains nine rows of
-        // depthwise-convolution history.  StateKind has no family-local name;
-        // the architecture state owner keeps this entry distinct by type.
-        state.push(StateEntry::new(StateKind::Conv, 1));
+        // PLE is injected at its declared layer and retains its depthwise
+        // convolution history.  StateKind has no family-local name; the
+        // architecture state owner keeps this entry distinct by type.  A
+        // profile without PLE declares no PLE state.
+        if let Some(ple) = ple {
+            state.push(StateEntry::new(StateKind::Conv, ple.layer));
+        }
+        let identity = Qwen4ManifestIdentity {
+            profile_id: config.profile.id().to_string(),
+            developer_only: config.profile.developer_only(),
+            equation_source: config.profile.equation_source().as_str(),
+            ffn_kind: match config.ffn {
+                Qwen4FfnConfig::Dense { .. } => "dense",
+                Qwen4FfnConfig::Moe { .. } => "moe",
+            },
+            recipe,
+        };
         Ok(Self {
+            identity,
             weights,
             state,
             metadata,
@@ -851,9 +1229,11 @@ impl Qwen4Manifest {
             .filter(|entry| !entry.residency.is_external())
             .map(|entry| (entry.name.as_str(), entry.layer))
     }
+
     /// Number of source tensor records represented by this text manifest.
-    /// The only non-source record is the tied MTP embedding alias; the three
-    /// exact I64 PLE metadata arrays are counted from `metadata`.
+    /// The only non-source record is the tied MTP embedding alias (absent
+    /// without an MTP head); the exact I64 PLE metadata arrays (absent
+    /// without PLE) are counted from `metadata`.
     pub fn source_tensor_count(&self) -> usize {
         let aliases = self
             .weights
@@ -865,18 +1245,52 @@ impl Qwen4Manifest {
             .saturating_sub(aliases)
             .saturating_add(self.metadata.len())
     }
+
+    /// This manifest without its external PLE n-gram shard tensors.
+    ///
+    /// A sidecar rows file (`hipfire_runtime::ple_sidecar`) supplies the PLE
+    /// rows, so the source file's own shard tensors are neither declared nor
+    /// fulfilled: the base may lack them (a split base) or carry them,
+    /// shadowed and ignored (the monolithic artifact next to a derived q4
+    /// sidecar).  The I64 PLE metadata records stay.  The shards are the
+    /// only external-row entries of a Qwen4 manifest; their count comes from
+    /// the declaration, not a constant.
+    pub fn without_ple_shards(mut self) -> Self {
+        self.weights.retain(|entry| !entry.residency.is_external());
+        self
+    }
 }
 
-fn mtp_model(
+fn mtp_entry(
     name: &str,
     shape: Vec<usize>,
     requested_dtype: DType,
     policy: ShardPolicy,
     source: &DTypeConstraint,
+    packed: bool,
+    mtp_source: bool,
+    synthetic_packed: bool,
 ) -> WeightEntry {
+    // A synthetic profile never takes the Flash-Next tier knobs: its MTP
+    // tensors are source-exact BF16, or the synthetic packed recipe's per-role
+    // decision when that recipe is declared.
+    if !packed {
+        let dtype = if synthetic_packed {
+            synthetic_packed_decision(name, &shape).dtype
+        } else {
+            DType::BF16
+        };
+        return WeightEntry::model_with_dtype_constraint(
+            name,
+            shape,
+            dtype,
+            DTypeConstraint::source_exact(dtype),
+            policy,
+        );
+    }
     // The existing source-tier experiment changes only rank-2 MTP entries;
     // the routed experts are rank-3, and their writer has no BF16 arm.
-    if mtp_source_tier_active() && shape.len() == 2 {
+    if mtp_source && shape.len() == 2 {
         return WeightEntry::model_with_dtype_constraint(
             name,
             shape,
@@ -905,26 +1319,13 @@ fn mtp_model(
     WeightEntry::model_with_dtype_constraint(name, shape, dtype, source, policy)
 }
 
-fn mtp_layer(
-    name: &str,
-    _layer: usize,
-    shape: Vec<usize>,
-    dtype: DType,
-    policy: ShardPolicy,
-    source: &DTypeConstraint,
-) -> WeightEntry {
-    // MTP names live in a separate model namespace, not the trunk's layer
-    // placement scope.  Keep their manifest identity layerless.
-    mtp_model(name, shape, dtype, policy, source)
-}
-
 fn push_hyper_connection_entries<F>(
     weights: &mut Vec<WeightEntry>,
     layer: &F,
     prefix: &str,
     layer_idx: usize,
     name: &str,
-    hidden: usize,
+    hc_count: usize,
     hc_wide: usize,
     hc_rank: usize,
     bf16: &DTypeConstraint,
@@ -935,7 +1336,7 @@ fn push_hyper_connection_entries<F>(
     weights.push(layer(
         &format!("{prefix}.block_inject_weight.weight"),
         layer_idx,
-        vec![4, hc_wide],
+        vec![hc_count, hc_wide],
         DType::BF16,
         ShardPolicy::Replicate,
         bf16,
@@ -964,15 +1365,18 @@ fn push_hyper_connection_entries<F>(
         ShardPolicy::RowShard { axis: 1 },
         bf16,
     ));
-    let _ = hidden;
+    // Final HC mixers (declared separately) have no inject operand.
 }
 
-fn push_mtp_hyper_connection_entries(
+fn push_mtp_hyper_connection_entries<M>(
     weights: &mut Vec<WeightEntry>,
+    mtp_model: &M,
     hc_wide: usize,
     hc_rank: usize,
     bf16: &DTypeConstraint,
-) {
+) where
+    M: Fn(&str, Vec<usize>, DType, ShardPolicy, &DTypeConstraint) -> WeightEntry,
+{
     weights.push(mtp_model(
         "mtp.hyper_connection_mixer.hc_norm.weight",
         vec![hc_wide],
@@ -1077,77 +1481,138 @@ fn push_qsa_entries<F>(
     );
 }
 
-fn push_moe_entries<F>(
+/// The FFN inventory of one layer: the profile's single owner of which tensors
+/// exist.  A dense FFN is three resident nonexpert matrices (gate/up/down) and
+/// nothing else — no router, no expert stacks, no shared selector.  A MoE FFN
+/// is the router and the two routed expert stacks, plus the gated shared
+/// expert only when the profile declares one.
+fn push_ffn_entries<F>(
     weights: &mut Vec<WeightEntry>,
     layer: &F,
     prefix: &str,
     layer_idx: usize,
     hidden: usize,
-    config: &Qwen4Config,
+    ffn: &Qwen4FfnConfig,
     bf16: &DTypeConstraint,
     quant_matrix: &DTypeConstraint,
-) where
+) -> Result<(), WeightError>
+where
     F: Fn(&str, usize, Vec<usize>, DType, ShardPolicy, &DTypeConstraint) -> WeightEntry,
 {
-    let moe = format!("{prefix}.mlp");
-    weights.push(layer(
-        &format!("{moe}.experts.down_proj"),
-        layer_idx,
-        vec![config.num_experts, hidden, config.moe_intermediate_size],
-        ROUTED_DOWN_DTYPE,
-        ShardPolicy::Replicate,
-        quant_matrix,
-    ));
-    weights.push(layer(
-        &format!("{moe}.experts.gate_up_proj"),
-        layer_idx,
-        vec![config.num_experts, 2 * config.moe_intermediate_size, hidden],
-        ROUTED_GATE_UP_DTYPE,
-        ShardPolicy::Replicate,
-        quant_matrix,
-    ));
-    weights.push(layer(
-        &format!("{moe}.gate.weight"),
-        layer_idx,
-        vec![config.num_experts, hidden],
-        DType::BF16,
-        ShardPolicy::Replicate,
-        bf16,
-    ));
-    weights.push(layer(
-        &format!("{moe}.shared_expert.down_proj.weight"),
-        layer_idx,
-        vec![hidden, config.shared_expert_intermediate_size],
-        DType::BF16,
-        ShardPolicy::RowShard { axis: 1 },
-        bf16,
-    ));
-    weights.push(layer(
-        &format!("{moe}.shared_expert.gate_proj.weight"),
-        layer_idx,
-        vec![config.shared_expert_intermediate_size, hidden],
-        DType::BF16,
-        ShardPolicy::ColumnShard { axis: 0 },
-        bf16,
-    ));
-    weights.push(layer(
-        &format!("{moe}.shared_expert.up_proj.weight"),
-        layer_idx,
-        vec![config.shared_expert_intermediate_size, hidden],
-        DType::BF16,
-        ShardPolicy::ColumnShard { axis: 0 },
-        bf16,
-    ));
-    weights.push(layer(
-        &format!("{moe}.shared_expert_gate.weight"),
-        layer_idx,
-        vec![1, hidden],
-        DType::BF16,
-        ShardPolicy::Replicate,
-        bf16,
-    ));
+    let mlp = format!("{prefix}.mlp");
+    match ffn {
+        Qwen4FfnConfig::Dense {
+            intermediate_size, ..
+        } => {
+            let intermediate = positive("dense intermediate_size", *intermediate_size)?;
+            checked_product("dense FFN gate/up elements", intermediate, hidden)?;
+            weights.push(layer(
+                &format!("{mlp}.gate_proj.weight"),
+                layer_idx,
+                vec![intermediate, hidden],
+                DType::BF16,
+                ShardPolicy::ColumnShard { axis: 0 },
+                bf16,
+            ));
+            weights.push(layer(
+                &format!("{mlp}.up_proj.weight"),
+                layer_idx,
+                vec![intermediate, hidden],
+                DType::BF16,
+                ShardPolicy::ColumnShard { axis: 0 },
+                bf16,
+            ));
+            weights.push(layer(
+                &format!("{mlp}.down_proj.weight"),
+                layer_idx,
+                vec![hidden, intermediate],
+                DType::BF16,
+                ShardPolicy::RowShard { axis: 1 },
+                bf16,
+            ));
+        }
+        Qwen4FfnConfig::Moe {
+            num_experts,
+            intermediate_size,
+            shared_intermediate_size,
+            ..
+        } => {
+            let experts = positive("num_experts", *num_experts)?;
+            let intermediate = positive("moe intermediate_size", *intermediate_size)?;
+            let gate_up_rows = checked_product("routed gate_up rows", 2, intermediate)?;
+            checked_product("routed gate_up elements", gate_up_rows, hidden)
+                .and_then(|per_expert| checked_product("routed expert elements", per_expert, experts))?;
+            weights.push(layer(
+                &format!("{mlp}.experts.down_proj"),
+                layer_idx,
+                vec![experts, hidden, intermediate],
+                ROUTED_DOWN_DTYPE,
+                ShardPolicy::Replicate,
+                quant_matrix,
+            ));
+            weights.push(layer(
+                &format!("{mlp}.experts.gate_up_proj"),
+                layer_idx,
+                vec![experts, gate_up_rows, hidden],
+                ROUTED_GATE_UP_DTYPE,
+                ShardPolicy::Replicate,
+                quant_matrix,
+            ));
+            weights.push(layer(
+                &format!("{mlp}.gate.weight"),
+                layer_idx,
+                vec![experts, hidden],
+                DType::BF16,
+                ShardPolicy::Replicate,
+                bf16,
+            ));
+            if let Some(shared) = shared_intermediate_size {
+                let shared = positive("shared expert intermediate_size", *shared)?;
+                weights.push(layer(
+                    &format!("{mlp}.shared_expert.down_proj.weight"),
+                    layer_idx,
+                    vec![hidden, shared],
+                    DType::BF16,
+                    ShardPolicy::RowShard { axis: 1 },
+                    bf16,
+                ));
+                weights.push(layer(
+                    &format!("{mlp}.shared_expert.gate_proj.weight"),
+                    layer_idx,
+                    vec![shared, hidden],
+                    DType::BF16,
+                    ShardPolicy::ColumnShard { axis: 0 },
+                    bf16,
+                ));
+                weights.push(layer(
+                    &format!("{mlp}.shared_expert.up_proj.weight"),
+                    layer_idx,
+                    vec![shared, hidden],
+                    DType::BF16,
+                    ShardPolicy::ColumnShard { axis: 0 },
+                    bf16,
+                ));
+                weights.push(layer(
+                    &format!("{mlp}.shared_expert_gate.weight"),
+                    layer_idx,
+                    vec![1, hidden],
+                    DType::BF16,
+                    ShardPolicy::Replicate,
+                    bf16,
+                ));
+            }
+        }
+    }
+    Ok(())
 }
 
+/// One PLE block.  Every dimension (channel width, conv kernel, shard count,
+/// shard rows, row width, valid rows) comes from the typed [`Qwen4PleConfig`];
+/// the Flash-Next values are that config's canonical instance, not constants
+/// here.  `packed` is the Flash-Next recipe: it ships Q8F16 rows and still
+/// admits BF16 ones.  `synthetic_packed` ships exactly the one tier the row
+/// width allows ([`synthetic_packed_ple_row_dtype`]); any other synthetic recipe
+/// ships and admits BF16 rows only.
 fn push_ple_entries<F>(
     weights: &mut Vec<WeightEntry>,
     layer: &F,
@@ -1155,7 +1620,9 @@ fn push_ple_entries<F>(
     layer_idx: usize,
     hidden: usize,
     ple_channels: usize,
-    config: &Qwen4Config,
+    config: &Qwen4PleConfig,
+    packed: bool,
+    synthetic_packed: bool,
     bf16: &DTypeConstraint,
 ) where
     F: Fn(&str, usize, Vec<usize>, DType, ShardPolicy, &DTypeConstraint) -> WeightEntry,
@@ -1164,7 +1631,7 @@ fn push_ple_entries<F>(
     weights.push(layer(
         &format!("{ple}.conv1d.weight"),
         layer_idx,
-        vec![ple_channels, 1, config.ple_conv_kernel_size],
+        vec![ple_channels, 1, config.conv_kernel_size],
         DType::BF16,
         ShardPolicy::Replicate,
         bf16,
@@ -1172,7 +1639,7 @@ fn push_ple_entries<F>(
     weights.push(layer(
         &format!("{ple}.key_proj.weight"),
         layer_idx,
-        vec![ple_channels, hidden],
+        vec![ple_channels, config.embed_dim],
         DType::BF16,
         ShardPolicy::ColumnShard { axis: 0 },
         bf16,
@@ -1204,7 +1671,7 @@ fn push_ple_entries<F>(
     weights.push(layer(
         &format!("{ple}.value_proj.weight"),
         layer_idx,
-        vec![hidden, hidden],
+        vec![hidden, config.embed_dim],
         DType::BF16,
         ShardPolicy::RowShard { axis: 1 },
         bf16,
@@ -1213,15 +1680,29 @@ fn push_ple_entries<F>(
     // sealed artifact written before the Q8F16 tier carries BF16 rows and must
     // stay loadable, so both tiers are admitted and the reader derives its page
     // and read geometry from whichever one the shard declares.
-    let ple_rows = DTypeConstraint::source_from_sources(vec![DType::Q8_0, DType::BF16]);
-    for shard in 0..PLE_SHARD_COUNT {
+    let (ple_rows, row_dtype, encoding) = if packed {
+        (
+            DTypeConstraint::source_from_sources(vec![DType::Q8_0, DType::BF16]),
+            DType::Q8_0,
+            RowEncoding::Q8F16,
+        )
+    } else if synthetic_packed && synthetic_packed_ple_row_dtype(config.row_width) == DType::Q8_0 {
+        (
+            DTypeConstraint::source_exact(DType::Q8_0),
+            DType::Q8_0,
+            RowEncoding::Q8F16,
+        )
+    } else {
+        (bf16.clone(), DType::BF16, RowEncoding::Bf16)
+    };
+    for shard in 0..config.shard_count {
         let name = format!("{ple}.ple_embedding.ngram_embedding.shard_{shard}.weight");
         weights.push(
             layer(
                 &name,
                 layer_idx,
-                vec![PLE_SHARD_ROWS, PLE_ROW_WIDTH],
-                DType::Q8_0,
+                vec![config.shard_rows, config.row_width],
+                row_dtype,
                 ShardPolicy::Replicate,
                 &ple_rows,
             )
@@ -1231,8 +1712,8 @@ fn push_ple_entries<F>(
             // shard is accepted by the same constraint and validated against its
             // own dtype-derived stride.
             .external_rows(
-                RowEncoding::Q8F16.encoded_row_bytes(PLE_ROW_WIDTH),
-                ple_valid_rows_for_shard(shard),
+                encoding.encoded_row_bytes(config.row_width),
+                config.shard_valid_rows(shard),
             ),
         );
     }
@@ -1312,6 +1793,37 @@ pub struct MoeWeights {
     pub shared_gate_scalar: TensorRef,
 }
 
+/// Dense gated-MLP projections: `down(silu(gate(x)) * up(x))`.
+#[derive(Clone, Debug)]
+pub struct DenseFfnWeights {
+    pub gate: TensorRef,
+    pub up: TensorRef,
+    pub down: TensorRef,
+}
+
+/// The FFN block of one decoder layer (or of the MTP layer).
+#[derive(Clone, Debug)]
+pub enum Qwen4FfnWeights {
+    Dense(DenseFfnWeights),
+    Moe(MoeWeights),
+}
+
+impl Qwen4FfnWeights {
+    pub fn moe(&self) -> Option<&MoeWeights> {
+        match self {
+            Self::Moe(moe) => Some(moe),
+            Self::Dense(_) => None,
+        }
+    }
+
+    pub fn dense(&self) -> Option<&DenseFfnWeights> {
+        match self {
+            Self::Dense(dense) => Some(dense),
+            Self::Moe(_) => None,
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct Qwen4LayerWeights {
     pub layer: usize,
@@ -1321,7 +1833,7 @@ pub struct Qwen4LayerWeights {
     pub attention: Option<QsaWeights>,
     pub gdn: Option<GdnWeights>,
     pub ple: Option<PleWeights>,
-    pub moe: MoeWeights,
+    pub ffn: Qwen4FfnWeights,
 }
 
 #[derive(Clone, Debug)]
@@ -1333,7 +1845,7 @@ pub struct Qwen4MtpWeights {
     pub attn_hyper: HyperConnectionWeights,
     pub mlp_hyper: HyperConnectionWeights,
     pub attention: QsaWeights,
-    pub moe: MoeWeights,
+    pub ffn: Qwen4FfnWeights,
     pub final_hyper: HyperConnectionReadWeights,
 }
 
@@ -1360,16 +1872,27 @@ pub struct Qwen4Weights {
     taken_by_name: HashMap<String, Vec<usize>>,
     pub root: Qwen4RootWeights,
     pub layer_refs: Vec<Qwen4LayerWeights>,
-    pub mtp: Qwen4MtpWeights,
+    /// `Some` iff `config.mtp` is declared.
+    pub mtp: Option<Qwen4MtpWeights>,
 }
 
 impl Qwen4Weights {
+    /// Publish the resident weights of `tx` for `config` under the manifest
+    /// the artifact was admitted with: `recipe` is `Qwen4HfqmArtifact::recipe()`
+    /// (the manifest identity's recipe), so the declaration is rebuilt
+    /// exactly as admission built it instead of from `config` alone.  For
+    /// Flash-Next the recipe is the single `FlashNextPacked` carrying the
+    /// trunk-tier and MTP-source knobs resolved at admission, which is what
+    /// [`Qwen4Manifest::build`] resolved from the same environment before.  A
+    /// recipe the profile cannot be declared under is refused by
+    /// [`Qwen4Manifest::build_with_recipe`].
     pub fn assemble(
         tx: &mut WeightLoadTransaction,
         config: &Qwen4Config,
+        recipe: &Qwen4TierRecipe,
         placements: &[Qwen4Placement],
     ) -> Result<Self, WeightError> {
-        let manifest = Qwen4Manifest::build(config)?;
+        let manifest = assembly_manifest(config, recipe)?;
         let expected = manifest
             .resident_keys()
             .map(|(name, layer)| (name.to_string(), layer))
@@ -1407,7 +1930,11 @@ impl Qwen4Weights {
         }
         let root = build_root_refs(config)?;
         let layer_refs = build_layer_refs(config)?;
-        let mtp = build_mtp_refs(config)?;
+        let mtp = config
+            .mtp
+            .is_some()
+            .then(|| build_mtp_refs(config))
+            .transpose()?;
         Ok(Self {
             manifest,
             taken,
@@ -1539,11 +2066,18 @@ impl Qwen4Weights {
                 if !path.exists() {
                     continue;
                 }
-                let bytes = std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
+                let bytes =
+                    std::fs::read(&path).map_err(|error| format!("{}: {error}", path.display()))?;
                 if k % 256 != 0 || bytes.len() != m * (k / 256) * rdna_compute::MQ4V2_GROUP_BYTES {
-                    return Err(format!("{}: {} bytes is not a {m}x{k} QT44 matrix", path.display(), bytes.len()));
+                    return Err(format!(
+                        "{}: {} bytes is not a {m}x{k} QT44 matrix",
+                        path.display(),
+                        bytes.len()
+                    ));
                 }
-                let mut copy = gpu.upload_raw(&bytes, &[bytes.len()]).map_err(|error| error.to_string())?;
+                let mut copy = gpu
+                    .upload_raw(&bytes, &[bytes.len()])
+                    .map_err(|error| error.to_string())?;
                 copy.dtype = DType::MQ4G256V2;
                 copy
             } else {
@@ -1640,6 +2174,7 @@ fn build_hyper_read_refs(
 fn build_hyper_refs(
     prefix: &str,
     layer: Option<usize>,
+    hc_count: usize,
     hc_wide: usize,
     hc_rank: usize,
 ) -> Result<HyperConnectionWeights, WeightError> {
@@ -1648,7 +2183,7 @@ fn build_hyper_refs(
         format!("{prefix}.block_inject_weight.weight"),
         TensorRole::HyperConnectionBlockInject,
         layer,
-        vec![4, hc_wide],
+        vec![hc_count, hc_wide],
         DType::BF16,
     )?;
     Ok(HyperConnectionWeights {
@@ -1670,19 +2205,20 @@ fn build_layer_refs(config: &Qwen4Config) -> Result<Vec<Qwen4LayerWeights>, Weig
     let gdn_qk = config.linear_num_key_heads * config.linear_key_head_dim;
     let gdn_v = config.linear_num_value_heads * config.linear_value_head_dim;
     let gdn_qkv = 2 * gdn_qk + gdn_v;
-    let ple_channels = config.ple_embed_dim * config.hc_count;
     let mut refs = Vec::with_capacity(config.num_hidden_layers);
     for (layer, kind) in config.layer_types.iter().copied().enumerate() {
         let prefix = format!("model.language_model.layers.{layer}");
         let attn_hyper = build_hyper_refs(
             &format!("{prefix}.attn_hyper_connection"),
             Some(layer),
+            config.hc_count,
             hc_wide,
             hc_rank,
         )?;
         let mlp_hyper = build_hyper_refs(
             &format!("{prefix}.mlp_hyper_connection"),
             Some(layer),
+            config.hc_count,
             hc_wide,
             hc_rank,
         )?;
@@ -1711,18 +2247,23 @@ fn build_layer_refs(config: &Qwen4Config) -> Result<Vec<Qwen4LayerWeights>, Weig
         } else {
             None
         };
-        let ple = if layer == 1 {
-            Some(build_ple_refs(
-                &format!("{prefix}.ple"),
-                Some(layer),
-                hidden,
-                ple_channels,
-                config,
-            )?)
-        } else {
-            None
+        let ple = match &config.ple {
+            Some(ple_config) if ple_config.layer == layer => {
+                let ple_channels = config
+                    .hidden_size
+                    .checked_mul(config.hc_count)
+                    .ok_or_else(|| WeightError::ShapeOverflow("PLE channel width".to_string()))?;
+                Some(build_ple_refs(
+                    &format!("{prefix}.ple"),
+                    Some(layer),
+                    hidden,
+                    ple_channels,
+                    ple_config,
+                )?)
+            }
+            _ => None,
         };
-        let moe = build_moe_refs(&format!("{prefix}.mlp"), Some(layer), hidden, config)?;
+        let ffn = build_ffn_refs(&format!("{prefix}.mlp"), Some(layer), hidden, config)?;
         refs.push(Qwen4LayerWeights {
             layer,
             kind,
@@ -1731,12 +2272,14 @@ fn build_layer_refs(config: &Qwen4Config) -> Result<Vec<Qwen4LayerWeights>, Weig
             attention,
             gdn,
             ple,
-            moe,
+            ffn,
         });
     }
     Ok(refs)
 }
 
+/// Bind the native MTP head; the caller binds it only when `config.mtp` is
+/// declared.
 fn build_mtp_refs(config: &Qwen4Config) -> Result<Qwen4MtpWeights, WeightError> {
     let hidden = config.hidden_size;
     let hc_wide = config.hc_count * hidden;
@@ -1774,8 +2317,20 @@ fn build_mtp_refs(config: &Qwen4Config) -> Result<Qwen4MtpWeights, WeightError> 
             vec![hc_wide],
             DType::BF16,
         )?,
-        attn_hyper: build_hyper_refs("mtp.layers.0.attn_hyper_connection", None, hc_wide, hc_rank)?,
-        mlp_hyper: build_hyper_refs("mtp.layers.0.mlp_hyper_connection", None, hc_wide, hc_rank)?,
+        attn_hyper: build_hyper_refs(
+            "mtp.layers.0.attn_hyper_connection",
+            None,
+            config.hc_count,
+            hc_wide,
+            hc_rank,
+        )?,
+        mlp_hyper: build_hyper_refs(
+            "mtp.layers.0.mlp_hyper_connection",
+            None,
+            config.hc_count,
+            hc_wide,
+            hc_rank,
+        )?,
         attention: build_qsa_refs(
             "mtp.layers.0.self_attn",
             None,
@@ -1785,7 +2340,7 @@ fn build_mtp_refs(config: &Qwen4Config) -> Result<Qwen4MtpWeights, WeightError> 
             indexer_qk_dim,
             config,
         )?,
-        moe: build_moe_refs("mtp.layers.0.mlp", None, hidden, config)?,
+        ffn: build_ffn_refs("mtp.layers.0.mlp", None, hidden, config)?,
         final_hyper: build_hyper_read_refs("mtp.hyper_connection_mixer", None, hc_wide, hc_rank)?,
     })
 }
@@ -1896,7 +2451,7 @@ fn build_ple_refs(
     layer: Option<usize>,
     hidden: usize,
     channels: usize,
-    config: &Qwen4Config,
+    config: &Qwen4PleConfig,
 ) -> Result<PleWeights, WeightError> {
     let tr = |suffix: &str, role: TensorRole, shape: Vec<usize>| {
         TensorRef::new(
@@ -1911,12 +2466,12 @@ fn build_ple_refs(
         conv: tr(
             "conv1d.weight",
             TensorRole::PleConv,
-            vec![channels, 1, config.ple_conv_kernel_size],
+            vec![channels, 1, config.conv_kernel_size],
         )?,
         key: tr(
             "key_proj.weight",
             TensorRole::PleKey,
-            vec![channels, hidden],
+            vec![channels, config.embed_dim],
         )?,
         norm_conv: tr("norm_conv.weight", TensorRole::PleNorm, vec![channels])?,
         norm_key: tr("norm_key.weight", TensorRole::PleNorm, vec![channels])?,
@@ -1924,71 +2479,224 @@ fn build_ple_refs(
         value: tr(
             "value_proj.weight",
             TensorRole::PleValue,
-            vec![hidden, hidden],
+            vec![hidden, config.embed_dim],
         )?,
     })
 }
 
-fn build_moe_refs(
+/// Refuse, before any allocation or placement, every profile the typed
+/// executor cannot run.  Header-only developer inventories are admitted by
+/// `artifact` independently of this executor admission.
+///
+/// * Flash-Next: the pinned shared-expert MoE with PLE and the native MTP head.
+/// * Synthetic developer profiles: only under `cfg(test)` or the
+///   `qwen4-dev-profiles` feature, and only a dense FFN (PLE and MTP optional
+///   at this layer).  A synthetic MoE has no sealed route (see
+///   [`admit_synthetic_profile`]).
+pub(crate) fn admit_executable_profile(config: &Qwen4Config) -> Result<(), WeightError> {
+    let unsupported = |reason: &str| WeightError::UnsupportedProfile {
+        profile: config.profile.id().to_string(),
+        reason: reason.to_string(),
+    };
+    match &config.profile {
+        Qwen4Profile::FlashNext => {
+            if !matches!(
+                &config.ffn,
+                Qwen4FfnConfig::Moe {
+                    shared_intermediate_size: Some(_),
+                    ..
+                }
+            ) {
+                return Err(unsupported(
+                    "the Qwen4 executor binds only the shared-expert MoE FFN",
+                ));
+            }
+            if config.ple.is_none() {
+                return Err(unsupported("the Qwen4 executor requires PLE"));
+            }
+            if config.mtp.is_none() {
+                return Err(unsupported(
+                    "the Qwen4 executor requires the native MTP head",
+                ));
+            }
+            Ok(())
+        }
+        Qwen4Profile::Synthetic(_) => admit_synthetic_profile(config),
+    }
+}
+
+/// The declaration [`Qwen4Weights::assemble`] publishes against: the profile
+/// must be executable, and the manifest is the one `recipe` declares for it
+/// (the admitted artifact's own recipe), never a rebuild from `config` alone.
+fn assembly_manifest(
+    config: &Qwen4Config,
+    recipe: &Qwen4TierRecipe,
+) -> Result<Qwen4Manifest, WeightError> {
+    admit_executable_profile(config)?;
+    Qwen4Manifest::build_with_recipe(config, recipe.clone())
+}
+
+/// Production builds never execute a developer profile.
+#[cfg(not(any(test, feature = "qwen4-dev-profiles")))]
+fn admit_synthetic_profile(config: &Qwen4Config) -> Result<(), WeightError> {
+    Err(WeightError::UnsupportedProfile {
+        profile: config.profile.id().to_string(),
+        reason: "developer profiles execute only in builds with the qwen4-dev-profiles feature"
+            .to_string(),
+    })
+}
+
+#[cfg(any(test, feature = "qwen4-dev-profiles"))]
+fn admit_synthetic_profile(config: &Qwen4Config) -> Result<(), WeightError> {
+    match &config.ffn {
+        Qwen4FfnConfig::Dense { .. } => Ok(()),
+        Qwen4FfnConfig::Moe {
+            num_experts,
+            top_k,
+            shared_intermediate_size: None,
+            ..
+        } => Err(WeightError::UnsupportedProfile {
+            profile: config.profile.id().to_string(),
+            reason: format!(
+                "MoE without a shared expert has no executor (experts={num_experts}, top_k={top_k})"
+            ),
+        }),
+        Qwen4FfnConfig::Moe {
+            num_experts, top_k, ..
+        } => Err(WeightError::UnsupportedProfile {
+            profile: config.profile.id().to_string(),
+            reason: format!(
+                "no sealed MoE route exists for this geometry (experts={num_experts}, top_k={top_k}): \
+                 the canonical qt44/qt53 route pins 512 experts, top-10, hidden 2560 and intermediate 640, \
+                 and there is no BF16 routed-expert route or top-k other than 8/10"
+            ),
+        }),
+    }
+}
+
+/// Bind one FFN block's typed references: dense gate/up/down, or the pinned
+/// shared-expert MoE.
+fn build_ffn_refs(
     prefix: &str,
     layer: Option<usize>,
     hidden: usize,
     config: &Qwen4Config,
-) -> Result<MoeWeights, WeightError> {
+) -> Result<Qwen4FfnWeights, WeightError> {
     let tr = |suffix: &str, role: TensorRole, shape: Vec<usize>, dtype: DType| {
         TensorRef::new(format!("{prefix}.{suffix}"), role, layer, shape, dtype)
     };
-    Ok(MoeWeights {
-        experts_down: tr(
-            "experts.down_proj",
-            TensorRole::RoutedDown,
-            vec![config.num_experts, hidden, config.moe_intermediate_size],
-            ROUTED_DOWN_DTYPE,
-        )?,
-        experts_gate_up: tr(
-            "experts.gate_up_proj",
-            TensorRole::RoutedGateUp,
-            vec![config.num_experts, 2 * config.moe_intermediate_size, hidden],
-            ROUTED_GATE_UP_DTYPE,
-        )?,
-        expert_source_layout: ExpertSourceLayout::PackedFused {
-            gate_up: format!("{prefix}.experts.gate_up_proj"),
-            down: format!("{prefix}.experts.down_proj"),
-            sidecars: Vec::new(),
-        },
-        gate: tr(
-            "gate.weight",
-            TensorRole::Router,
-            vec![config.num_experts, hidden],
-            DType::BF16,
-        )?,
-        shared_down: tr(
-            "shared_expert.down_proj.weight",
-            TensorRole::SharedExpertDown,
-            vec![hidden, config.shared_expert_intermediate_size],
-            DType::BF16,
-        )?,
-        shared_gate: tr(
-            "shared_expert.gate_proj.weight",
-            TensorRole::SharedExpertGate,
-            vec![config.shared_expert_intermediate_size, hidden],
-            DType::BF16,
-        )?,
-        shared_up: tr(
-            "shared_expert.up_proj.weight",
-            TensorRole::SharedExpertUp,
-            vec![config.shared_expert_intermediate_size, hidden],
-            DType::BF16,
-        )?,
-        shared_gate_scalar: tr(
-            "shared_expert_gate.weight",
-            TensorRole::SharedExpertGateScalar,
-            vec![1, hidden],
-            DType::BF16,
-        )?,
-    })
+    match &config.ffn {
+        Qwen4FfnConfig::Dense { intermediate_size } => {
+            let intermediate = *intermediate_size;
+            Ok(Qwen4FfnWeights::Dense(DenseFfnWeights {
+                gate: tr(
+                    "gate_proj.weight",
+                    TensorRole::DenseFfnGate,
+                    vec![intermediate, hidden],
+                    DType::BF16,
+                )?,
+                up: tr(
+                    "up_proj.weight",
+                    TensorRole::DenseFfnUp,
+                    vec![intermediate, hidden],
+                    DType::BF16,
+                )?,
+                down: tr(
+                    "down_proj.weight",
+                    TensorRole::DenseFfnDown,
+                    vec![hidden, intermediate],
+                    DType::BF16,
+                )?,
+            }))
+        }
+        Qwen4FfnConfig::Moe {
+            num_experts,
+            intermediate_size,
+            shared_intermediate_size: Some(shared),
+            ..
+        } => {
+            let (experts, intermediate, shared) = (*num_experts, *intermediate_size, *shared);
+            Ok(Qwen4FfnWeights::Moe(MoeWeights {
+                experts_down: tr(
+                    "experts.down_proj",
+                    TensorRole::RoutedDown,
+                    vec![experts, hidden, intermediate],
+                    ROUTED_DOWN_DTYPE,
+                )?,
+                experts_gate_up: tr(
+                    "experts.gate_up_proj",
+                    TensorRole::RoutedGateUp,
+                    vec![experts, 2 * intermediate, hidden],
+                    ROUTED_GATE_UP_DTYPE,
+                )?,
+                expert_source_layout: ExpertSourceLayout::PackedFused {
+                    gate_up: format!("{prefix}.experts.gate_up_proj"),
+                    down: format!("{prefix}.experts.down_proj"),
+                    sidecars: Vec::new(),
+                },
+                gate: tr(
+                    "gate.weight",
+                    TensorRole::Router,
+                    vec![experts, hidden],
+                    DType::BF16,
+                )?,
+                shared_down: tr(
+                    "shared_expert.down_proj.weight",
+                    TensorRole::SharedExpertDown,
+                    vec![hidden, shared],
+                    DType::BF16,
+                )?,
+                shared_gate: tr(
+                    "shared_expert.gate_proj.weight",
+                    TensorRole::SharedExpertGate,
+                    vec![shared, hidden],
+                    DType::BF16,
+                )?,
+                shared_up: tr(
+                    "shared_expert.up_proj.weight",
+                    TensorRole::SharedExpertUp,
+                    vec![shared, hidden],
+                    DType::BF16,
+                )?,
+                shared_gate_scalar: tr(
+                    "shared_expert_gate.weight",
+                    TensorRole::SharedExpertGateScalar,
+                    vec![1, hidden],
+                    DType::BF16,
+                )?,
+            }))
+        }
+        Qwen4FfnConfig::Moe {
+            shared_intermediate_size: None,
+            ..
+        } => Err(WeightError::UnsupportedProfile {
+            profile: config.profile.id().to_string(),
+            reason: "the Qwen4 executor binds only the shared-expert MoE FFN".to_string(),
+        }),
+    }
 }
 
+/// Whether `name` is one of the [`PLE_SHARD_COUNT`] canonical Flash-Next
+/// n-gram PLE shard tensor names (`..ngram_embedding.shard_{0..127}.weight`,
+/// no leading zeros).
+pub fn is_ple_shard_name(name: &str) -> bool {
+    is_ple_shard_name_within(name, PLE_SHARD_COUNT)
+}
+
+/// Whether `name` is a canonical PLE shard tensor name whose index is below
+/// `shard_count` (the profile's declared [`Qwen4PleConfig::shard_count`]).
+pub fn is_ple_shard_name_within(name: &str, shard_count: usize) -> bool {
+    name.strip_prefix(hipfire_runtime::ple_sidecar::PLE_SHARD_PREFIX)
+        .and_then(|name| name.strip_suffix(hipfire_runtime::ple_sidecar::PLE_SHARD_SUFFIX))
+        .and_then(|digits| {
+            let index = digits.parse::<usize>().ok()?;
+            (index < shard_count && index.to_string() == digits).then_some(index)
+        })
+        .is_some()
+}
+
+/// Valid rows of Flash-Next PLE shard `shard`.  Profile-generic callers use
+/// [`Qwen4PleConfig::shard_valid_rows`].
 pub fn ple_valid_rows_for_shard(shard: usize) -> usize {
     crate::ple::PLE_VALID_ROWS
         .saturating_sub((shard as u64).saturating_mul(PLE_SHARD_ROWS as u64))
@@ -2026,6 +2734,12 @@ pub enum WeightError {
     PleShardCount {
         expected: usize,
         actual: usize,
+    },
+    /// The profile is valid developer inventory (or a different identity) but
+    /// the typed executor has no binder for it.
+    UnsupportedProfile {
+        profile: String,
+        reason: String,
     },
 }
 
@@ -2068,6 +2782,9 @@ impl fmt::Display for WeightError {
             Self::PleShardCount { expected, actual } => {
                 write!(f, "Qwen4 PLE shard count expected {expected}, got {actual}")
             }
+            Self::UnsupportedProfile { profile, reason } => {
+                write!(f, "Qwen4 profile {profile:?} is not executable: {reason}")
+            }
         }
     }
 }
@@ -2084,70 +2801,1048 @@ mod tests {
         assert_eq!(total, 320_001_446);
         assert_eq!(ple_valid_rows_for_shard(127), 2_499_922);
     }
+
+    #[test]
+    fn sidecar_manifest_drops_exactly_the_ple_shards() {
+        let full = Qwen4Manifest::build(&pinned_config()).unwrap();
+        assert_eq!(full.external_entries().count(), PLE_SHARD_COUNT);
+        let trimmed = full.clone().without_ple_shards();
+        assert_eq!(full.weights.len() - trimmed.weights.len(), PLE_SHARD_COUNT);
+        assert_eq!(trimmed.external_entries().count(), 0);
+        assert_eq!(trimmed.metadata, full.metadata);
+        assert_eq!(trimmed.state, full.state);
+        assert_eq!(
+            full.source_tensor_count() - trimmed.source_tensor_count(),
+            PLE_SHARD_COUNT
+        );
+        // Every kept entry is untouched and none is a shard.
+        assert!(trimmed
+            .weights
+            .iter()
+            .all(|entry| !is_ple_shard_name(&entry.name)));
+        assert!(trimmed
+            .weights
+            .iter()
+            .all(|entry| full.weights.contains(entry)));
+    }
+
+    #[test]
+    fn ple_shard_name_predicate_is_canonical() {
+        let name = |index: &str| {
+            format!(
+                "{}{index}{}",
+                hipfire_runtime::ple_sidecar::PLE_SHARD_PREFIX,
+                hipfire_runtime::ple_sidecar::PLE_SHARD_SUFFIX
+            )
+        };
+        assert!(is_ple_shard_name(&name("0")));
+        assert!(is_ple_shard_name(&name("127")));
+        assert!(!is_ple_shard_name(&name("128")));
+        assert!(!is_ple_shard_name(&name("007")));
+        assert!(!is_ple_shard_name(&name("")));
+        assert!(!is_ple_shard_name("model.embed_tokens.weight"));
+    }
     fn pinned_config() -> Qwen4Config {
-        Qwen4Config {
-            architecture_id: 16,
-            model_type: "qwen4_exp".into(),
-            text_model_type: "qwen4_exp_text".into(),
-            dtype: SourceDType::BF16,
-            hidden_size: 2560,
-            vocab_size: 248320,
-            num_hidden_layers: 48,
-            max_position_embeddings: 262144,
-            num_attention_heads: 24,
-            num_key_value_heads: 2,
-            head_dim: 256,
-            partial_rotary_factor: 0.25,
-            rope_theta: 10_000_000.0,
-            attention_bias: false,
-            layer_types: (0..48)
-                .map(|layer| {
-                    if layer % 4 == 3 {
-                        LayerType::FullAttention
-                    } else {
-                        LayerType::LinearAttention
-                    }
-                })
-                .collect(),
-            full_attention_interval: 4,
-            linear_num_key_heads: 16,
-            linear_num_value_heads: 48,
-            linear_key_head_dim: 128,
-            linear_value_head_dim: 128,
-            linear_conv_kernel_dim: 4,
-            recurrent_state_dtype: RecurrentStateDType::F32,
-            indexer_n_heads: 4,
-            indexer_kv_heads: 1,
-            indexer_head_dim: 128,
-            indexer_budget: 2048,
-            indexer_compress_ratio: 4,
-            num_experts: 512,
-            num_experts_per_tok: 10,
-            moe_intermediate_size: 640,
-            shared_expert_intermediate_size: 640,
-            norm_topk_prob: true,
-            output_gate_type: "sigmoid".into(),
-            hc_count: 4,
-            hc_lowrank: 320,
-            ple_layer_ids: vec![2],
-            ple_conv_kernel_size: 4,
-            ple_embed_dim: 2560,
-            split_ngram_parts: 128,
-            heads_per_ngram: 8,
-            ngram_size: 3,
-            ngram_vocab_size_base: 20_000_000,
-            make_ngram_vocab_size_divisible_by: 128,
-            eos_token_id: 248044,
-            tie_word_embeddings: false,
-            mtp_num_hidden_layers: 1,
-            mtp_use_dedicated_embeddings: false,
-            mtp: Qwen4MtpConfig {
-                num_hidden_layers: 1,
-                layer_types: vec![LayerType::FullAttention],
-                hybrid: true,
-                rope_theta: 10_000_000.0,
-            },
+        crate::config::compact_test_config()
+    }
+
+    fn put(
+        out: &mut Vec<WeightEntry>,
+        layer: Option<usize>,
+        name: String,
+        shape: &[usize],
+        dtype: DType,
+        constraint: DTypeConstraint,
+        policy: ShardPolicy,
+    ) {
+        out.push(match layer {
+            Some(layer) => WeightEntry::layer_with_dtype_constraint(
+                &name,
+                layer,
+                shape.to_vec(),
+                dtype,
+                constraint,
+                policy,
+            ),
+            None => WeightEntry::model_with_dtype_constraint(
+                &name,
+                shape.to_vec(),
+                dtype,
+                constraint,
+                policy,
+            ),
+        });
+    }
+
+    fn oracle_bf16() -> DTypeConstraint {
+        DTypeConstraint::source_exact(DType::BF16)
+    }
+
+    fn oracle_q8() -> DTypeConstraint {
+        DTypeConstraint::source_from_sources(vec![DType::BF16, DType::Q8_0])
+    }
+
+    fn oracle_trunk() -> DTypeConstraint {
+        DTypeConstraint::source_from_sources(vec![
+            DType::BF16,
+            DType::Q8_0,
+            DType::MQ6G256V2,
+            DType::MQ4G256V2,
+        ])
+    }
+
+    fn oracle_hc(out: &mut Vec<WeightEntry>, layer: Option<usize>, prefix: &str) {
+        for (suffix, shape, policy) in [
+            (
+                "block_inject_weight.weight",
+                &[4usize, 10240][..],
+                ShardPolicy::Replicate,
+            ),
+            ("hc_norm.weight", &[10240][..], ShardPolicy::Replicate),
+            (
+                "input_mix_weight_down.weight",
+                &[320, 10240][..],
+                ShardPolicy::ColumnShard { axis: 0 },
+            ),
+            (
+                "input_mix_weight_up.weight",
+                &[10240, 320][..],
+                ShardPolicy::RowShard { axis: 1 },
+            ),
+        ] {
+            put(
+                out,
+                layer,
+                format!("{prefix}.{suffix}"),
+                shape,
+                DType::BF16,
+                oracle_bf16(),
+                policy,
+            );
         }
+    }
+
+    fn oracle_qsa(out: &mut Vec<WeightEntry>, layer: Option<usize>, prefix: &str) {
+        let col = ShardPolicy::ColumnShard { axis: 0 };
+        let row = ShardPolicy::RowShard { axis: 1 };
+        let rep = ShardPolicy::Replicate;
+        for (suffix, shape, packed, policy) in [
+            ("indexer.index_qk_proj.weight", &[640usize, 2560][..], true, col.clone()),
+            ("indexer.k_layernorm.weight", &[128][..], false, rep.clone()),
+            ("indexer.q_layernorm.weight", &[128][..], false, rep.clone()),
+            ("k_norm.weight", &[256][..], false, rep.clone()),
+            ("k_proj.weight", &[512, 2560][..], true, col.clone()),
+            ("o_proj.weight", &[2560, 6144][..], true, row),
+            ("q_norm.weight", &[256][..], false, rep),
+            ("q_proj.weight", &[12288, 2560][..], true, col.clone()),
+            ("v_proj.weight", &[512, 2560][..], true, col),
+        ] {
+            let (dtype, constraint) = if packed {
+                (DType::Q8_0, oracle_trunk())
+            } else {
+                (DType::BF16, oracle_bf16())
+            };
+            put(
+                out,
+                layer,
+                format!("{prefix}.self_attn.{suffix}"),
+                shape,
+                dtype,
+                constraint,
+                policy,
+            );
+        }
+    }
+
+    fn oracle_moe(out: &mut Vec<WeightEntry>, layer: Option<usize>, prefix: &str) {
+        let experts = DTypeConstraint::source_from_sources(vec![
+            DType::BF16,
+            DType::MQ4G256V2,
+            DType::MQ4G128V2,
+        ]);
+        let col = ShardPolicy::ColumnShard { axis: 0 };
+        let rep = ShardPolicy::Replicate;
+        let name = |suffix: &str| format!("{prefix}.mlp.{suffix}");
+        put(
+            out,
+            layer,
+            name("experts.down_proj"),
+            &[512, 2560, 640],
+            DType::MQ4G128V2,
+            experts.clone(),
+            rep.clone(),
+        );
+        put(
+            out,
+            layer,
+            name("experts.gate_up_proj"),
+            &[512, 1280, 2560],
+            DType::MQ4G256V2,
+            experts,
+            rep.clone(),
+        );
+        put(
+            out,
+            layer,
+            name("gate.weight"),
+            &[512, 2560],
+            DType::BF16,
+            oracle_bf16(),
+            rep.clone(),
+        );
+        put(
+            out,
+            layer,
+            name("shared_expert.down_proj.weight"),
+            &[2560, 640],
+            DType::BF16,
+            oracle_bf16(),
+            ShardPolicy::RowShard { axis: 1 },
+        );
+        put(
+            out,
+            layer,
+            name("shared_expert.gate_proj.weight"),
+            &[640, 2560],
+            DType::BF16,
+            oracle_bf16(),
+            col.clone(),
+        );
+        put(
+            out,
+            layer,
+            name("shared_expert.up_proj.weight"),
+            &[640, 2560],
+            DType::BF16,
+            oracle_bf16(),
+            col,
+        );
+        put(
+            out,
+            layer,
+            name("shared_expert_gate.weight"),
+            &[1, 2560],
+            DType::BF16,
+            oracle_bf16(),
+            rep,
+        );
+    }
+
+    /// The complete pinned Flash-Next inventory, enumerated from literal names,
+    /// shapes, dtypes, source constraints, shard policies and placements.  No
+    /// tier/recipe helper or config field of this module derives any of it, so
+    /// it is an independent oracle for the profile-owned generator.
+    fn flash_next_oracle() -> Vec<WeightEntry> {
+        let mut out = Vec::new();
+        let head = DTypeConstraint::source_from_sources(vec![
+            DType::BF16,
+            DType::Q8_0,
+            DType::MQ6G256V2,
+        ]);
+        out.push(
+            WeightEntry::model_with_dtype_constraint(
+                "model.language_model.embed_tokens.weight",
+                vec![248320, 2560],
+                DType::Q8_0,
+                oracle_q8(),
+                ShardPolicy::Pin(PinTarget::Embed),
+            )
+            .with_placement(PlacementHint::Pin(PinTarget::Embed)),
+        );
+        out.push(
+            WeightEntry::model_with_dtype_constraint(
+                "lm_head.weight",
+                vec![248320, 2560],
+                DType::MQ6G256V2,
+                head,
+                ShardPolicy::Pin(PinTarget::Output),
+            )
+            .with_placement(PlacementHint::Pin(PinTarget::Output)),
+        );
+        out.push(
+            WeightEntry::model_with_dtype_constraint(
+                "mtp.embed_tokens.weight",
+                vec![248320, 2560],
+                DType::Q8_0,
+                oracle_q8(),
+                ShardPolicy::Tied {
+                    source: "model.language_model.embed_tokens.weight".to_string(),
+                },
+            )
+            .with_placement(PlacementHint::Pin(PinTarget::Embed)),
+        );
+        for (suffix, shape, policy) in [
+            (
+                "hc_norm.weight",
+                &[10240usize][..],
+                ShardPolicy::Pin(PinTarget::Output),
+            ),
+            (
+                "input_mix_weight_down.weight",
+                &[320, 10240][..],
+                ShardPolicy::ColumnShard { axis: 0 },
+            ),
+            (
+                "input_mix_weight_up.weight",
+                &[10240, 320][..],
+                ShardPolicy::RowShard { axis: 1 },
+            ),
+        ] {
+            out.push(
+                WeightEntry::model_with_dtype_constraint(
+                    &format!("model.language_model.hyper_connection_mixer.{suffix}"),
+                    shape.to_vec(),
+                    DType::BF16,
+                    oracle_bf16(),
+                    policy,
+                )
+                .with_placement(PlacementHint::Pin(PinTarget::Output)),
+            );
+        }
+        for layer in 0..48usize {
+            let prefix = format!("model.language_model.layers.{layer}");
+            oracle_hc(&mut out, Some(layer), &format!("{prefix}.attn_hyper_connection"));
+            oracle_hc(&mut out, Some(layer), &format!("{prefix}.mlp_hyper_connection"));
+            if layer % 4 == 3 {
+                oracle_qsa(&mut out, Some(layer), &prefix);
+            } else {
+                let col = ShardPolicy::ColumnShard { axis: 0 };
+                for (suffix, shape, packed, policy) in [
+                    ("A_log", &[48usize][..], false, ShardPolicy::Replicate),
+                    ("conv1d.weight", &[10240, 1, 4][..], false, ShardPolicy::Replicate),
+                    ("dt_bias", &[48][..], false, ShardPolicy::Replicate),
+                    ("in_proj_a.weight", &[48, 2560][..], true, col.clone()),
+                    ("in_proj_b.weight", &[48, 2560][..], true, col.clone()),
+                    ("in_proj_qkv.weight", &[10240, 2560][..], true, col.clone()),
+                    ("in_proj_z.weight", &[6144, 2560][..], true, col),
+                    ("norm.weight", &[128][..], false, ShardPolicy::Replicate),
+                    (
+                        "out_proj.weight",
+                        &[2560, 6144][..],
+                        true,
+                        ShardPolicy::RowShard { axis: 1 },
+                    ),
+                ] {
+                    let (dtype, constraint) = if packed {
+                        (DType::Q8_0, oracle_trunk())
+                    } else {
+                        (DType::BF16, oracle_bf16())
+                    };
+                    put(
+                        &mut out,
+                        Some(layer),
+                        format!("{prefix}.linear_attn.{suffix}"),
+                        shape,
+                        dtype,
+                        constraint,
+                        policy,
+                    );
+                }
+            }
+            oracle_moe(&mut out, Some(layer), &prefix);
+            if layer == 1 {
+                let ple = format!("{prefix}.ple");
+                let col = ShardPolicy::ColumnShard { axis: 0 };
+                for (suffix, shape, policy) in [
+                    ("conv1d.weight", &[10240usize, 1, 4][..], ShardPolicy::Replicate),
+                    ("key_proj.weight", &[10240, 2560][..], col),
+                    ("norm_conv.weight", &[10240][..], ShardPolicy::Replicate),
+                    ("norm_key.weight", &[10240][..], ShardPolicy::Replicate),
+                    ("norm_query.weight", &[10240][..], ShardPolicy::Replicate),
+                    (
+                        "value_proj.weight",
+                        &[2560, 2560][..],
+                        ShardPolicy::RowShard { axis: 1 },
+                    ),
+                ] {
+                    put(
+                        &mut out,
+                        Some(layer),
+                        format!("{ple}.{suffix}"),
+                        shape,
+                        DType::BF16,
+                        oracle_bf16(),
+                        policy,
+                    );
+                }
+                for shard in 0..128usize {
+                    let valid = 320_001_446usize
+                        .saturating_sub(shard * 2_500_012)
+                        .min(2_500_012);
+                    out.push(
+                        WeightEntry::layer_with_dtype_constraint(
+                            &format!("{ple}.ple_embedding.ngram_embedding.shard_{shard}.weight"),
+                            layer,
+                            vec![2_500_012, 160],
+                            DType::Q8_0,
+                            oracle_q8(),
+                            ShardPolicy::Replicate,
+                        )
+                        .external_rows(170, valid),
+                    );
+                }
+            }
+        }
+        let mtp = |out: &mut Vec<WeightEntry>, name: &str, shape: &[usize], policy: ShardPolicy| {
+            put(
+                out,
+                None,
+                name.to_string(),
+                shape,
+                DType::BF16,
+                oracle_bf16(),
+                policy,
+            );
+        };
+        mtp(
+            &mut out,
+            "mtp.fc_embedding.weight",
+            &[2560, 2560],
+            ShardPolicy::ColumnShard { axis: 0 },
+        );
+        mtp(
+            &mut out,
+            "mtp.fc_hidden.weight",
+            &[2560, 2560],
+            ShardPolicy::ColumnShard { axis: 0 },
+        );
+        mtp(
+            &mut out,
+            "mtp.pre_fc_norm_embedding.weight",
+            &[2560],
+            ShardPolicy::Replicate,
+        );
+        mtp(
+            &mut out,
+            "mtp.pre_fc_norm_hidden.weight",
+            &[10240],
+            ShardPolicy::Replicate,
+        );
+        mtp(
+            &mut out,
+            "mtp.hyper_connection_mixer.hc_norm.weight",
+            &[10240],
+            ShardPolicy::Replicate,
+        );
+        mtp(
+            &mut out,
+            "mtp.hyper_connection_mixer.input_mix_weight_down.weight",
+            &[320, 10240],
+            ShardPolicy::ColumnShard { axis: 0 },
+        );
+        mtp(
+            &mut out,
+            "mtp.hyper_connection_mixer.input_mix_weight_up.weight",
+            &[10240, 320],
+            ShardPolicy::RowShard { axis: 1 },
+        );
+        oracle_hc(&mut out, None, "mtp.layers.0.attn_hyper_connection");
+        oracle_hc(&mut out, None, "mtp.layers.0.mlp_hyper_connection");
+        oracle_qsa(&mut out, None, "mtp.layers.0");
+        oracle_moe(&mut out, None, "mtp.layers.0");
+        out
+    }
+
+    /// Flash-Next is an exact profile: the profile-owned generator reproduces
+    /// the pinned inventory entry for entry, in order — names, layer keys,
+    /// logical shapes, target dtypes, source constraints, shard policies,
+    /// placements and external-row residencies — plus the exact state and I64
+    /// metadata inventories and the manifest identity.
+    #[test]
+    fn flash_next_manifest_is_byte_identical_to_the_independent_oracle() {
+        MTP_SOURCE_TIER_OVERRIDE.with(|value| value.set(Some(false)));
+        let built = Qwen4Manifest::build_with_trunk_tier(&pinned_config(), DType::Q8_0);
+        MTP_SOURCE_TIER_OVERRIDE.with(|value| value.set(None));
+        let manifest = built.expect("pinned manifest");
+        let oracle = flash_next_oracle();
+        assert_eq!(manifest.weights.len(), 1323, "weights (1325 source records)");
+        assert_eq!(oracle.len(), manifest.weights.len());
+        for (index, (built, expected)) in manifest.weights.iter().zip(&oracle).enumerate() {
+            assert_eq!(built, expected, "entry {index} {}", expected.name);
+        }
+        let mut state = Vec::new();
+        for layer in 0..48usize {
+            if layer % 4 == 3 {
+                state.push(StateEntry::new(
+                    StateKind::Kv {
+                        quant: "qsa-full-raw-pooled".into(),
+                    },
+                    layer,
+                ));
+            } else {
+                state.push(StateEntry::new(StateKind::Recurrent, layer));
+                state.push(StateEntry::new(StateKind::Conv, layer));
+            }
+        }
+        state.push(StateEntry::new(StateKind::Conv, 1));
+        assert_eq!(manifest.state, state);
+        assert_eq!(manifest.state.len(), 85);
+        let metadata_base = "model.language_model.layers.1.ple.ple_embedding";
+        assert_eq!(
+            manifest.metadata,
+            vec![
+                MetadataTensor::i64(format!("{metadata_base}.layer_multipliers"), vec![3]),
+                MetadataTensor::i64(format!("{metadata_base}.ngram_heads_offsets"), vec![16]),
+                MetadataTensor::i64(format!("{metadata_base}.ngram_heads_vocab_sizes"), vec![16]),
+            ]
+        );
+        assert_eq!(
+            manifest.identity,
+            Qwen4ManifestIdentity {
+                profile_id: "qwen3.8-flash-next".to_string(),
+                developer_only: false,
+                equation_source: "pinned-upstream",
+                ffn_kind: "moe",
+                recipe: Qwen4TierRecipe::FlashNextPacked {
+                    trunk_tier: DType::Q8_0,
+                    mtp_source: false,
+                },
+            }
+        );
+    }
+
+    fn synthetic(ffn: Qwen4FfnConfig, hidden: usize, layers: usize, ple: bool, mtp: bool) -> Qwen4Config {
+        crate::config::synthetic_test_config(ffn, hidden, layers, ple, mtp)
+    }
+
+    fn dense_ffn() -> Qwen4FfnConfig {
+        Qwen4FfnConfig::Dense {
+            intermediate_size: 17_408,
+        }
+    }
+
+    fn small_moe(shared: Option<usize>) -> Qwen4FfnConfig {
+        Qwen4FfnConfig::Moe {
+            num_experts: 8,
+            top_k: 2,
+            intermediate_size: 64,
+            shared_intermediate_size: shared,
+            norm_topk_prob: true,
+        }
+    }
+
+    /// Expected weight count of a synthetic inventory from closed-form per-role
+    /// counts (HC 4+4, GDN 9 or QSA 9, FFN roles, MTP block, PLE block).
+    fn expected_weight_count(config: &Qwen4Config) -> usize {
+        let ffn = match &config.ffn {
+            Qwen4FfnConfig::Dense { .. } => 3,
+            Qwen4FfnConfig::Moe {
+                shared_intermediate_size,
+                ..
+            } => 3 + if shared_intermediate_size.is_some() { 4 } else { 0 },
+        };
+        // embedding, head, final HC mixer (3)
+        let mut count = 5 + config.num_hidden_layers * (8 + 9 + ffn);
+        if config.mtp.is_some() {
+            // alias, fc x2, pre-fc norms x2, mixer x3, HC 8, QSA 9, FFN
+            count += 1 + 4 + 3 + 8 + 9 + ffn;
+        }
+        if let Some(ple) = &config.ple {
+            count += 6 + ple.shard_count;
+        }
+        count
+    }
+
+    fn assert_synthetic_bf16_inventory(config: &Qwen4Config, manifest: &Qwen4Manifest) {
+        assert_eq!(manifest.weights.len(), expected_weight_count(config));
+        assert_eq!(manifest.identity.profile_id, config.profile.id());
+        assert!(manifest.identity.developer_only);
+        assert_eq!(
+            manifest.identity.equation_source,
+            config.profile.equation_source().as_str()
+        );
+        assert_eq!(manifest.identity.recipe, Qwen4TierRecipe::SyntheticSourceBf16);
+        for entry in &manifest.weights {
+            assert_eq!(entry.dtype, DType::BF16, "{} must stay BF16", entry.name);
+            assert!(entry.dtype_constraint.accepts(DType::BF16), "{}", entry.name);
+            for packed in [
+                DType::Q8_0,
+                DType::MQ6G256V2,
+                DType::MQ4G256V2,
+                DType::MQ4G128V2,
+            ] {
+                assert!(
+                    !entry.dtype_constraint.accepts(packed),
+                    "{} must not admit {packed:?} before an executable role proof",
+                    entry.name
+                );
+            }
+        }
+        assert_eq!(
+            manifest.metadata.len(),
+            if config.ple.is_some() { 3 } else { 0 }
+        );
+        assert_eq!(
+            manifest.external_entries().count(),
+            config.ple.as_ref().map_or(0, |ple| ple.shard_count)
+        );
+        let has = |needle: &str| manifest.weights.iter().any(|e| e.name.contains(needle));
+        assert_eq!(has(".ple."), config.ple.is_some());
+        assert_eq!(has("mtp."), config.mtp.is_some());
+        let aliases = manifest
+            .weights
+            .iter()
+            .filter(|entry| matches!(entry.policy, ShardPolicy::Tied { .. }))
+            .count();
+        assert_eq!(aliases, usize::from(config.mtp.is_some()));
+        let recurrent_layers = config
+            .layer_types
+            .iter()
+            .filter(|kind| **kind == LayerType::LinearAttention)
+            .count();
+        let full_layers = config.layer_types.len() - recurrent_layers;
+        assert_eq!(
+            manifest.state.len(),
+            recurrent_layers * 2 + full_layers + usize::from(config.ple.is_some())
+        );
+    }
+
+    #[test]
+    fn dense_64_layer_hidden_5120_inventory_has_only_gate_up_down_roles() {
+        for (ple, mtp) in [(false, false), (true, false), (false, true), (true, true)] {
+            let config = synthetic(dense_ffn(), 5120, 64, ple, mtp);
+            let manifest = Qwen4Manifest::build(&config).expect("dense manifest");
+            assert_synthetic_bf16_inventory(&config, &manifest);
+            assert_eq!(manifest.identity.ffn_kind, "dense");
+            for layer in [0usize, 63] {
+                let name = |role: &str| {
+                    format!("model.language_model.layers.{layer}.mlp.{role}.weight")
+                };
+                for (role, shape) in [
+                    ("gate_proj", [17_408usize, 5120]),
+                    ("up_proj", [17_408, 5120]),
+                    ("down_proj", [5120, 17_408]),
+                ] {
+                    let entry = manifest
+                        .entry(&name(role), Some(layer))
+                        .unwrap_or_else(|| panic!("missing dense {role} at layer {layer}"));
+                    assert_eq!(entry.logical_shape, shape);
+                    assert!(!entry.residency.is_external(), "dense roles are resident");
+                }
+            }
+            for entry in &manifest.weights {
+                for forbidden in [".experts.", "shared_expert", ".mlp.gate.weight"] {
+                    assert!(
+                        !entry.name.contains(forbidden),
+                        "dense profile declared MoE tensor {}",
+                        entry.name
+                    );
+                }
+            }
+            // The wide HC width at hidden 5120 is hc_count * hidden.
+            let mixer = manifest
+                .entry(
+                    "model.language_model.hyper_connection_mixer.hc_norm.weight",
+                    None,
+                )
+                .expect("final HC norm");
+            assert_eq!(mixer.logical_shape, [config.hc_count * 5120]);
+        }
+    }
+
+    #[test]
+    fn absent_ple_and_mtp_leave_no_tensors_metadata_aliases_or_state() {
+        let config = synthetic(dense_ffn(), 5120, 64, false, false);
+        let manifest = Qwen4Manifest::build(&config).expect("manifest");
+        assert!(manifest.metadata.is_empty());
+        assert_eq!(manifest.external_entries().count(), 0);
+        assert!(manifest
+            .weights
+            .iter()
+            .all(|entry| !entry.name.starts_with("mtp.") && !entry.name.contains(".ple.")));
+        assert!(manifest
+            .weights
+            .iter()
+            .all(|entry| !matches!(entry.policy, ShardPolicy::Tied { .. })));
+        assert_eq!(manifest.source_tensor_count(), manifest.weights.len());
+        let full = Qwen4Manifest::build(&synthetic(dense_ffn(), 5120, 64, true, true))
+            .expect("full manifest");
+        assert_eq!(full.state.len(), manifest.state.len() + 1, "PLE conv state");
+        assert!(full.source_tensor_count() > manifest.source_tensor_count());
+    }
+
+    #[test]
+    fn small_moe_inventory_with_and_without_a_shared_expert() {
+        for shared in [Some(64usize), None] {
+            let config = synthetic(small_moe(shared), 256, 4, true, true);
+            let manifest = Qwen4Manifest::build(&config).expect("small moe manifest");
+            assert_synthetic_bf16_inventory(&config, &manifest);
+            assert_eq!(manifest.identity.ffn_kind, "moe");
+            let layer = |role: &str| format!("model.language_model.layers.0.mlp.{role}");
+            let expert = manifest
+                .entry(&layer("experts.gate_up_proj"), Some(0))
+                .expect("routed gate_up");
+            assert_eq!(expert.logical_shape, [8, 128, 256]);
+            let down = manifest
+                .entry(&layer("experts.down_proj"), Some(0))
+                .expect("routed down");
+            assert_eq!(down.logical_shape, [8, 256, 64]);
+            assert_eq!(
+                manifest.entry(&layer("gate.weight"), Some(0)).unwrap().logical_shape,
+                [8, 256]
+            );
+            for role in [
+                "shared_expert.gate_proj.weight",
+                "shared_expert.up_proj.weight",
+                "shared_expert.down_proj.weight",
+                "shared_expert_gate.weight",
+            ] {
+                assert_eq!(
+                    manifest.entry(&layer(role), Some(0)).is_some(),
+                    shared.is_some(),
+                    "{role}"
+                );
+            }
+            assert!(manifest
+                .entry(&layer("gate_proj.weight"), Some(0))
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn ple_shard_inventory_follows_the_typed_geometry() {
+        let config = synthetic(small_moe(Some(64)), 256, 4, true, false);
+        let ple = config.ple.clone().expect("synthetic PLE");
+        let manifest = Qwen4Manifest::build(&config).expect("manifest");
+        let shards = manifest.external_entries().collect::<Vec<_>>();
+        assert_eq!(shards.len(), ple.shard_count);
+        let mut total_valid = 0usize;
+        for (index, entry) in shards.iter().enumerate() {
+            assert_eq!(entry.layer, Some(ple.layer));
+            assert_eq!(entry.logical_shape, [ple.shard_rows, ple.row_width]);
+            let WeightResidency::ExternalRows {
+                row_bytes,
+                valid_rows,
+            } = entry.residency
+            else {
+                panic!("PLE shard must be external rows");
+            };
+            assert_eq!(row_bytes, RowEncoding::Bf16.encoded_row_bytes(ple.row_width));
+            assert_eq!(valid_rows, ple.shard_valid_rows(index));
+            total_valid += valid_rows;
+        }
+        assert_eq!(total_valid as u64, ple.valid_rows);
+        let base = format!("model.language_model.layers.{}.ple.ple_embedding", ple.layer);
+        assert_eq!(
+            manifest.metadata,
+            vec![
+                MetadataTensor::i64(format!("{base}.layer_multipliers"), vec![ple.multiplier_count]),
+                MetadataTensor::i64(format!("{base}.ngram_heads_offsets"), vec![ple.head_count]),
+                MetadataTensor::i64(
+                    format!("{base}.ngram_heads_vocab_sizes"),
+                    vec![ple.head_count]
+                ),
+            ]
+        );
+        let trimmed = manifest.clone().without_ple_shards();
+        assert_eq!(trimmed.external_entries().count(), 0);
+        assert_eq!(manifest.weights.len() - trimmed.weights.len(), ple.shard_count);
+        assert!(is_ple_shard_name_within(
+            &shards[0].name.replace(&format!("layers.{}.", ple.layer), "layers.1."),
+            ple.shard_count
+        ) || ple.layer != 1);
+    }
+
+    #[test]
+    fn recipe_and_profile_must_agree_and_synthetic_ignores_tier_environment() {
+        let synthetic_config = synthetic(small_moe(Some(64)), 256, 4, false, false);
+        let error = Qwen4Manifest::build_with_recipe(
+            &synthetic_config,
+            Qwen4TierRecipe::FlashNextPacked {
+                trunk_tier: DType::MQ6G256V2,
+                mtp_source: false,
+            },
+        )
+        .unwrap_err();
+        assert!(matches!(error, WeightError::UnsupportedProfile { .. }), "{error}");
+        let error = Qwen4Manifest::build_with_recipe(
+            &pinned_config(),
+            Qwen4TierRecipe::SyntheticSourceBf16,
+        )
+        .unwrap_err();
+        assert!(matches!(error, WeightError::UnsupportedProfile { .. }), "{error}");
+        // The MTP source-tier switch and the trunk tier do not move a
+        // synthetic recipe.
+        MTP_SOURCE_TIER_OVERRIDE.with(|value| value.set(Some(true)));
+        let built = Qwen4Manifest::build(&synthetic(small_moe(Some(64)), 256, 4, false, true));
+        MTP_SOURCE_TIER_OVERRIDE.with(|value| value.set(None));
+        let manifest = built.expect("synthetic manifest");
+        assert_eq!(manifest.identity.recipe, Qwen4TierRecipe::SyntheticSourceBf16);
+        assert!(manifest.weights.iter().all(|entry| entry.dtype == DType::BF16));
+    }
+
+    /// PLE channels are `hc_count * hidden` and the key/value projections read
+    /// `embed_dim` columns: with hidden 5120 and a 16-wide embedding the conv
+    /// and norms are 10240 wide, key is [10240, 16] and value is [5120, 16]
+    /// (the S0 dense-5120 source shapes).  Flash-Next (embed == hidden) keeps
+    /// [10240, 2560] / [2560, 2560], asserted by the FN oracle.
+    #[test]
+    fn ple_channels_follow_hidden_and_projections_follow_embed_dim() {
+        let config = synthetic(dense_ffn(), 5120, 64, true, false);
+        let ple = config.ple.clone().expect("PLE");
+        assert_ne!(ple.embed_dim, config.hidden_size, "mixed hidden/embed fixture");
+        let channels = config.hc_count * config.hidden_size;
+        let manifest = Qwen4Manifest::build(&config).expect("manifest");
+        let shape = |suffix: &str| {
+            manifest
+                .entry(
+                    &format!("model.language_model.layers.{}.ple.{suffix}", ple.layer),
+                    Some(ple.layer),
+                )
+                .unwrap_or_else(|| panic!("missing {suffix}"))
+                .logical_shape
+                .clone()
+        };
+        assert_eq!(shape("conv1d.weight"), [channels, 1, ple.conv_kernel_size]);
+        assert_eq!(shape("key_proj.weight"), [channels, ple.embed_dim]);
+        assert_eq!(shape("value_proj.weight"), [config.hidden_size, ple.embed_dim]);
+        for norm in ["norm_conv.weight", "norm_key.weight", "norm_query.weight"] {
+            assert_eq!(shape(norm), [channels], "{norm}");
+        }
+    }
+
+    /// The HC inject operand has `hc_count` rows (not a literal 4): a
+    /// synthetic profile with `hc_count = 2` declares `[2, wide]` for the
+    /// attention and FFN connections of every layer and of the MTP layer,
+    /// and the final mixers (trunk and MTP) declare no inject operand at all.
+    #[test]
+    fn hyper_connection_inject_rows_follow_hc_count() {
+        let config = synthetic(small_moe(Some(64)), 256, 4, false, true);
+        assert_eq!(config.hc_count, 2, "fixture must exercise a non-FN count");
+        let wide = config.hc_count * config.hidden_size;
+        let manifest = Qwen4Manifest::build(&config).expect("manifest");
+        let mut injects = 0usize;
+        for entry in &manifest.weights {
+            if entry.name.ends_with(".block_inject_weight.weight") {
+                assert_eq!(entry.logical_shape, [config.hc_count, wide], "{}", entry.name);
+                injects += 1;
+            }
+        }
+        // attention + FFN per trunk layer, plus attention + FFN for MTP.
+        assert_eq!(injects, 2 * config.num_hidden_layers + 2);
+        for name in [
+            "model.language_model.hyper_connection_mixer.block_inject_weight.weight",
+            "mtp.hyper_connection_mixer.block_inject_weight.weight",
+        ] {
+            assert!(manifest.entry(name, None).is_none(), "{name}");
+        }
+        for (name, layer) in [
+            ("model.language_model.layers.1.mlp_hyper_connection", Some(1)),
+            ("mtp.layers.0.attn_hyper_connection", None),
+        ] {
+            let shape = |suffix: &str| {
+                manifest
+                    .entry(&format!("{name}.{suffix}"), layer)
+                    .unwrap_or_else(|| panic!("{name}.{suffix}"))
+                    .logical_shape
+                    .clone()
+            };
+            assert_eq!(shape("hc_norm.weight"), [wide]);
+            assert_eq!(shape("input_mix_weight_down.weight"), [config.hc_lowrank, wide]);
+            assert_eq!(shape("input_mix_weight_up.weight"), [wide, config.hc_lowrank]);
+        }
+    }
+
+    #[test]
+    fn ffn_shape_overflow_is_an_error_not_a_panic() {
+        let layer = |name: &str,
+                     layer_idx: usize,
+                     shape: Vec<usize>,
+                     dtype: DType,
+                     policy: ShardPolicy,
+                     source: &DTypeConstraint| {
+            WeightEntry::layer_with_dtype_constraint(
+                name,
+                layer_idx,
+                shape,
+                dtype,
+                source.clone(),
+                policy,
+            )
+        };
+        let bf16 = oracle_bf16();
+        let quant = qwen4_quant_source();
+        let mut weights = Vec::new();
+        for ffn in [
+            Qwen4FfnConfig::Dense {
+                intermediate_size: usize::MAX,
+            },
+            Qwen4FfnConfig::Moe {
+                num_experts: 8,
+                top_k: 2,
+                intermediate_size: usize::MAX / 2 + 1,
+                shared_intermediate_size: None,
+                norm_topk_prob: true,
+            },
+            Qwen4FfnConfig::Moe {
+                num_experts: usize::MAX,
+                top_k: 2,
+                intermediate_size: 2,
+                shared_intermediate_size: None,
+                norm_topk_prob: true,
+            },
+        ] {
+            let error = push_ffn_entries(&mut weights, &layer, "p", 0, 4096, &ffn, &bf16, &quant)
+                .expect_err("overflowing FFN geometry must be refused");
+            assert!(matches!(error, WeightError::ShapeOverflow(_)), "{error}");
+        }
+        assert!(weights.is_empty(), "nothing is declared past a refusal");
+        let error = push_ffn_entries(
+            &mut weights,
+            &layer,
+            "p",
+            0,
+            4096,
+            &Qwen4FfnConfig::Dense { intermediate_size: 0 },
+            &bf16,
+            &quant,
+        )
+        .expect_err("a zero-width FFN is refused");
+        assert!(matches!(error, WeightError::InvalidShape { .. }), "{error}");
+    }
+
+    #[test]
+    fn executor_admits_flash_next_and_dense_and_refuses_synthetic_moe() {
+        admit_executable_profile(&pinned_config()).expect("Flash-Next is executable");
+        for config in [
+            synthetic(dense_ffn(), 5120, 64, true, true),
+            synthetic(dense_ffn(), 256, 4, false, false),
+        ] {
+            admit_executable_profile(&config).expect("dense developer profile is executable");
+        }
+        for shared in [Some(64), None] {
+            let config = synthetic(small_moe(shared), 256, 4, true, true);
+            let error = admit_executable_profile(&config).unwrap_err();
+            let WeightError::UnsupportedProfile { profile, reason } = &error else {
+                panic!("{error}");
+            };
+            assert_eq!(profile, config.profile.id());
+            assert!(
+                reason.contains("experts=") && reason.contains("top_k="),
+                "{reason}"
+            );
+            if shared.is_some() {
+                assert!(reason.contains("no sealed MoE route"), "{reason}");
+            }
+        }
+    }
+
+    #[test]
+    fn assembly_declares_the_admitted_recipes_manifest() {
+        // A packed synthetic artifact is declared packed, not as the
+        // profile's default source-exact manifest `build` returns.
+        let config = synthetic(dense_ffn(), 5120, 64, true, true);
+        let default = Qwen4Manifest::build(&config).expect("default manifest");
+        assert_eq!(
+            default.identity.recipe,
+            Qwen4TierRecipe::SyntheticSourceBf16
+        );
+        let packed = Qwen4Manifest::build_with_recipe(&config, Qwen4TierRecipe::SyntheticPacked)
+            .expect("packed manifest");
+        let assembled = assembly_manifest(&config, &packed.identity.recipe).expect("assembly");
+        assert_eq!(assembled, packed);
+        assert_eq!(assembled.identity.recipe, Qwen4TierRecipe::SyntheticPacked);
+        assert_ne!(
+            assembled.weights, default.weights,
+            "the packed recipe declares packed formats"
+        );
+        // Same tensors, so the placement set is unchanged by the recipe.
+        assert_eq!(
+            assembled.resident_keys().collect::<Vec<_>>(),
+            default.resident_keys().collect::<Vec<_>>()
+        );
+        // The source-exact recipe reproduces `build` exactly.
+        let source = assembly_manifest(&config, &default.identity.recipe).expect("source assembly");
+        assert_eq!(source, default);
+        // A recipe the profile cannot be declared under is refused.
+        let flash_next = Qwen4TierRecipe::FlashNextPacked {
+            trunk_tier: DType::Q8_0,
+            mtp_source: false,
+        };
+        let error = assembly_manifest(&config, &flash_next).unwrap_err();
+        assert!(
+            matches!(error, WeightError::UnsupportedProfile { .. }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn flash_next_assembly_manifest_is_exactly_the_default_build() {
+        // The recipe admission recorded (carrying the trunk-tier and
+        // MTP-source knobs) rebuilds the manifest `Qwen4Manifest::build`
+        // declares, tier overrides included.
+        let config = pinned_config();
+        let built = Qwen4Manifest::build(&config).expect("pinned manifest");
+        let assembled = assembly_manifest(&config, &built.identity.recipe).expect("assembly");
+        assert_eq!(assembled, built);
+        for tier in [DType::Q8_0, DType::MQ6G256V2] {
+            let tiered = Qwen4Manifest::build_with_trunk_tier(&config, tier).expect("tiered");
+            let assembled =
+                assembly_manifest(&config, &tiered.identity.recipe).expect("tiered assembly");
+            assert_eq!(assembled, tiered);
+            assert_eq!(
+                assembled.resident_keys().collect::<Vec<_>>(),
+                built.resident_keys().collect::<Vec<_>>()
+            );
+        }
+        // A synthetic recipe cannot declare Flash-Next.
+        let error = assembly_manifest(&config, &Qwen4TierRecipe::SyntheticPacked).unwrap_err();
+        assert!(
+            matches!(error, WeightError::UnsupportedProfile { .. }),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn assembly_refuses_a_synthetic_moe_with_the_executor_text() {
+        let config = synthetic(small_moe(Some(64)), 256, 4, true, true);
+        let error = assembly_manifest(&config, &Qwen4TierRecipe::SyntheticSourceBf16).unwrap_err();
+        let WeightError::UnsupportedProfile { reason, .. } = &error else {
+            panic!("{error}");
+        };
+        assert!(reason.contains("no sealed MoE route"), "{reason}");
+    }
+
+    #[test]
+    fn dense_binders_follow_the_profile_geometry() {
+        let config = synthetic(dense_ffn(), 256, 4, true, true);
+        let Qwen4FfnConfig::Dense { intermediate_size } = config.ffn else {
+            panic!("dense profile");
+        };
+        let manifest = Qwen4Manifest::build(&config).expect("dense manifest");
+        let layers = build_layer_refs(&config).expect("dense layer refs");
+        let mtp = build_mtp_refs(&config).expect("dense mtp refs");
+        let check = |reference: &TensorRef| {
+            let entry = manifest
+                .entry(&reference.name, reference.layer)
+                .unwrap_or_else(|| panic!("manifest lacks {}", reference.name));
+            assert_eq!(entry.logical_shape, reference.shape, "{}", reference.name);
+        };
+        for layer in &layers {
+            let dense = layer.ffn.dense().expect("dense FFN binding");
+            assert!(layer.ffn.moe().is_none());
+            assert_eq!(
+                dense.gate.shape,
+                vec![intermediate_size, config.hidden_size]
+            );
+            assert_eq!(
+                dense.down.shape,
+                vec![config.hidden_size, intermediate_size]
+            );
+            for reference in [&dense.gate, &dense.up, &dense.down] {
+                check(reference);
+            }
+            check(&layer.mlp_hyper.block_inject);
+            assert_eq!(
+                layer.mlp_hyper.block_inject.shape,
+                vec![config.hc_count, config.hc_count * config.hidden_size]
+            );
+        }
+        let dense = mtp.ffn.dense().expect("dense MTP FFN binding");
+        for reference in [&dense.gate, &dense.up, &dense.down] {
+            check(reference);
+        }
+        check(&mtp.mlp_hyper.block_inject);
     }
 
     #[test]
@@ -2271,7 +3966,8 @@ mod tests {
         }
 
         let layers = build_layer_refs(&config).expect("Qwen4 layer references");
-        match &layers[0].moe.expert_source_layout {
+        let moe = layers[0].ffn.moe().expect("Flash-Next binds the MoE FFN");
+        match &moe.expert_source_layout {
             ExpertSourceLayout::PackedFused {
                 gate_up,
                 down,

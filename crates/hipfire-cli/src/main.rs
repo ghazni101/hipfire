@@ -16,8 +16,8 @@ use hipfire_client::{
 use hipfire_config::{
     apply_config_profile, canonical_config_key, create_config_profile, developer_env_for_key,
     field, fields, is_developer_key, load_catalog, load_env_layer, load_global, resolve,
-    write_catalog_toml, write_global_toml, CatalogFormat, ConfigFormat, ConfigLayer, ConfigPaths,
-    ConfigSource, NamedLayer, ValueRule, CONFIG_SCHEMA_VERSION,
+    unknown_key, write_catalog_toml, write_global_toml, CatalogFormat, ConfigFormat, ConfigLayer,
+    ConfigPaths, ConfigSource, NamedLayer, ValueRule, CONFIG_SCHEMA_VERSION,
 };
 use hipfire_registry::{
     load as load_registry, LoadedRegistry, ModelEntry, RegistryPaths, RegistrySource, RegistryV1,
@@ -50,8 +50,9 @@ use std::{
 
 mod bench_concurrency;
 mod bench_power;
-mod serve;
 mod kernel_pack;
+mod ple;
+mod serve;
 mod setup;
 use crate::serve::complete::next_attempt_id;
 use crate::serve::http::request_id;
@@ -100,6 +101,7 @@ pub(crate) struct Cli {
 
 #[derive(Subcommand, Debug)]
 pub(crate) enum Commands {
+    /// View or change settings (global or per-model); no arguments opens the TUI.
     Config(ConfigArgs),
     /// Inspect or refresh the signed-model-registry migration surface.
     Registry(RegistryArgs),
@@ -145,6 +147,8 @@ pub(crate) enum Commands {
     Stop(StopArgs),
     /// Stop and start the native HTTP service.
     Restart(ServeArgs),
+    /// Derive or split the Flash-Next PLE row sidecars (`<model>.ple-q4`, `<base>.ple-q8`).
+    Ple(ple::PleArgs),
 }
 
 #[derive(Args, Debug)]
@@ -396,6 +400,11 @@ pub(crate) struct PullArgs {
     /// Replace an existing target after downloading and verifying a new copy.
     #[arg(long)]
     force: bool,
+    /// Which PLE row sidecar a split model pulls next to its base: `auto`
+    /// (memory.ple_format, else q4 on gfx1151 and q8 elsewhere), `q4`, `q8`,
+    /// `all`, or `none` (fetched on first load).
+    #[arg(long, value_enum, default_value_t = ple::PleSelection::Auto)]
+    ple: ple::PleSelection,
 }
 
 #[derive(Args, Debug)]
@@ -453,6 +462,10 @@ struct RunArgs {
     /// Tensor/expert-parallel degree for this model load (same admission as `serve --tp` / `bench --tp`).
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=64))]
     tp: Option<u64>,
+    /// KV context (`max_seq`) for this model load, within the `memory.max_seq`
+    /// bounds; overrides the configured/automatic context.
+    #[arg(long, value_parser = parse_max_seq_arg, value_name = "N")]
+    max_seq: Option<u64>,
     /// Select one speculative mechanism: off, auto, ngram, dflash, mtp, or dspark.
     #[arg(long = "spec", alias = "speculation")]
     speculation: Option<String>,
@@ -584,9 +597,10 @@ pub(crate) struct BenchArgs {
     ctx: Vec<usize>,
     #[arg(long, default_value_t = 128)]
     tg: usize,
-    /// Generated tokens per standard-bench measurement run.
-    #[arg(long, default_value_t = 128)]
-    max_tokens: usize,
+    /// Generated tokens per measured request: default 128 on the standard
+    /// bench, 256 on the `--concurrency` `steady` shape.
+    #[arg(long)]
+    max_tokens: Option<usize>,
     #[arg(long)]
     sustained_tg: Option<usize>,
     #[arg(long, value_delimiter = ',', default_value = "128,8192")]
@@ -622,17 +636,37 @@ pub(crate) struct BenchArgs {
     /// Pair this with `--max-tokens` large enough for the span to close.
     #[arg(long = "reasoning-on")]
     reasoning_on: bool,
-    /// Sweep concurrent stream counts, e.g. `1,2,3,4`. Absent leaves bench
-    /// on its single-stream path, unchanged.
+    /// Sweep closed-loop concurrency levels, e.g. `1,2,4,8`: at each level K,
+    /// K client lanes drain the shape's N requests. Absent leaves bench on
+    /// its single-stream path, unchanged.
     #[arg(long)]
     concurrency: Option<String>,
-    /// Which backend to drive: slots (multi-slot engine), noslots (sequential
-    /// daemon baseline), batch (beta continuous batching), or both.
+    /// Which backend to drive: slots (multi-slot engine), noslots (one
+    /// request at a time, lanes queue), batch (the VMM continuous-batching
+    /// route of `hipfire serve` with `serve.vmm_batch`), or both (all three).
     #[arg(long, value_parser = ["slots", "noslots", "batch", "both"], default_value = "both")]
     backend: String,
-    /// Which workload arm to run: stateless, multiturn, or both.
+    /// Which workload arm to run: stateless, multiturn (two-turn chats, the
+    /// follow-up sent on the same lane), or both.
     #[arg(long, value_parser = ["stateless", "multiturn", "both"], default_value = "both")]
     workload: String,
+    /// `--concurrency` request population: `steady` (64 long-answer code
+    /// prompts, fixed --max-tokens, greedy) or `betterbench` (BetterBench
+    /// 0.6.0's concurrency workload over --bb-corpus).
+    #[arg(long, value_parser = ["steady", "betterbench"], default_value = "steady")]
+    bench_shape: String,
+    /// BetterBench corpus directory (`*.jsonl` per category) for
+    /// `--bench-shape betterbench`.
+    #[arg(long, value_name = "DIR")]
+    bb_corpus: Option<PathBuf>,
+    /// `--concurrency` measured requests per sample (default 64 `steady`,
+    /// 48 `betterbench`); request i is prompt i modulo the shape's list.
+    #[arg(long, value_name = "N")]
+    num_prompts: Option<usize>,
+    /// `--concurrency` sampling temperature (default 0 `steady`, 0.7
+    /// `betterbench`).
+    #[arg(long)]
+    temperature: Option<f64>,
     /// Prompt words for the standard benchmark.
     #[arg(num_args = 0..)]
     prompt: Vec<String>,
@@ -640,6 +674,13 @@ pub(crate) struct BenchArgs {
     /// no trimming). Mutually exclusive with positional PROMPT words.
     #[arg(long, conflicts_with = "prompt")]
     prompt_file: Option<PathBuf>,
+}
+
+impl BenchArgs {
+    /// `--max-tokens` on the standard (single-stream) bench, default 128.
+    fn standard_max_tokens(&self) -> usize {
+        self.max_tokens.unwrap_or(128)
+    }
 }
 
 #[derive(Args, Debug)]
@@ -741,6 +782,19 @@ pub(crate) struct ServeArgs {
     /// Tensor/expert-parallel degree.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=64))]
     tp: Option<u64>,
+    /// Speculation mode for models loaded by this service: off, auto, ngram,
+    /// dflash, mtp, or dspark. Overrides `speculation.mode` and per-model
+    /// speculation settings; `--spec off` disables MTP/DFlash.
+    #[arg(
+        long = "spec",
+        alias = "speculation",
+        value_parser = ["off", "auto", "ngram", "dflash", "mtp", "dspark"]
+    )]
+    speculation: Option<String>,
+    /// KV context (`max_seq`) for models loaded by this service, within the
+    /// `memory.max_seq` bounds; overrides the configured/automatic context.
+    #[arg(long, value_parser = parse_max_seq_arg, value_name = "N")]
+    max_seq: Option<u64>,
     /// Maximum concurrent eligible batched lanes; 1 preserves sequential behavior.
     #[arg(long, value_parser = clap::value_parser!(u64).range(1..=256))]
     continuous_batch_size: Option<u64>,
@@ -804,6 +858,24 @@ fn run() -> Result<()> {
             argument
         }
     }));
+    // Print-only commands die quietly on a closed stdout (`hipfire list -r |
+    // head -1`) like any Unix filter instead of panicking in `println!`.
+    // Commands that drive a daemon, server or child over pipes keep Rust's
+    // ignored SIGPIPE so a dead peer is an EPIPE error, not a silent exit.
+    if matches!(
+        cli.command,
+        Some(
+            Commands::List(_)
+                | Commands::Registry(_)
+                | Commands::Config(_)
+                | Commands::Ps(_)
+                | Commands::Version(_)
+                | Commands::Rm(_)
+        )
+    ) {
+        // SAFETY: restores the default disposition before any thread starts.
+        unsafe { libc::signal(libc::SIGPIPE, libc::SIG_DFL) };
+    }
     let paths = Paths::discover();
     match cli.command {
         None => launch_tui(&paths, &[]),
@@ -812,6 +884,7 @@ fn run() -> Result<()> {
         Some(Commands::Registry(args)) => registry_command(&paths, args),
         Some(Commands::List(args)) => list_command(&paths, args),
         Some(Commands::Pull(args)) => pull_command(&paths, args),
+        Some(Commands::Ple(args)) => ple::ple_command(&paths, args),
         Some(Commands::Rm(args)) => rm_command(&paths, args),
         Some(Commands::Diag(output)) => diag_command(&paths, output),
         Some(Commands::Ps(output)) => ps_command(&paths, output),
@@ -956,8 +1029,7 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
         }
         ConfigAction::Get { key, output } => {
             let (_, resolved) = resolved_global(paths, true)?;
-            let canonical = canonical_config_key(&key)
-                .ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+            let canonical = canonical_config_key(&key).ok_or_else(|| unknown_key(&key))?;
             let schema = field(&canonical);
             let value = resolved
                 .get(&canonical)
@@ -981,8 +1053,7 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
             let mut loaded = load_global(&paths.config)?;
             loaded.layer.set_cli(&key, &value)?;
             write_global_toml(&paths.config, &loaded.layer)?;
-            let canonical = canonical_config_key(&key)
-                .ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+            let canonical = canonical_config_key(&key).ok_or_else(|| unknown_key(&key))?;
             let value = loaded
                 .layer
                 .get(&canonical)
@@ -1000,8 +1071,7 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
         ConfigAction::Reset { key } => {
             let mut loaded = load_global(&paths.config)?;
             if let Some(key) = key {
-                let canonical = canonical_config_key(&key)
-                    .ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+                let canonical = canonical_config_key(&key).ok_or_else(|| unknown_key(&key))?;
                 let existed = loaded.layer.remove(&canonical)?.is_some();
                 write_global_toml(&paths.config, &loaded.layer)?;
                 if existed {
@@ -1017,8 +1087,7 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
         }
         ConfigAction::Explain { key, output } => {
             let (loaded, resolved) = resolved_global(paths, true)?;
-            let canonical = canonical_config_key(&key)
-                .ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+            let canonical = canonical_config_key(&key).ok_or_else(|| unknown_key(&key))?;
             let value = resolved
                 .get(&canonical)
                 .ok_or_else(|| anyhow!("configuration key '{canonical}' is not set"))?;
@@ -1070,8 +1139,7 @@ fn config_command(paths: &Paths, args: ConfigArgs) -> Result<()> {
                 }
                 return Ok(());
             }
-            let schema = field(&canonical)
-                .ok_or_else(|| anyhow!("unknown configuration key '{canonical}'"))?;
+            let schema = field(&canonical).ok_or_else(|| unknown_key(&canonical))?;
             if output.json {
                 println!(
                     "{}",
@@ -1341,7 +1409,7 @@ fn model_config_command(
                 bail!("developer configuration is global process policy; omit the model argument");
             }
             let resolved = resolved_for_model(paths, model_name, tag.as_deref(), entry)?;
-            let schema = field(&key).ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+            let schema = field(&key).ok_or_else(|| unknown_key(&key))?;
             let value = resolved
                 .get(schema.key)
                 .ok_or_else(|| anyhow!("configuration key '{}' is not set", schema.key))?;
@@ -1381,8 +1449,7 @@ fn model_config_command(
                     record.registry_tag = tag.clone();
                 }
                 record.overrides.set_cli(&key, &value)?;
-                let schema =
-                    field(&key).ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+                let schema = field(&key).ok_or_else(|| unknown_key(&key))?;
                 let saved = record
                     .overrides
                     .get(schema.key)
@@ -1413,8 +1480,7 @@ fn model_config_command(
                 anyhow!("model '{model_name}' has no catalog entry for id '{id}'")
             })?;
             if let Some(key) = key {
-                let schema =
-                    field(&key).ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+                let schema = field(&key).ok_or_else(|| unknown_key(&key))?;
                 let existed = record.overrides.remove(schema.key)?.is_some();
                 if existed {
                     println!("{id} {} override removed", schema.key);
@@ -1433,7 +1499,7 @@ fn model_config_command(
                 bail!("developer configuration is global process policy; omit the model argument");
             }
             let resolved = resolved_for_model(paths, model_name, tag.as_deref(), entry)?;
-            let schema = field(&key).ok_or_else(|| anyhow!("unknown configuration key '{key}'"))?;
+            let schema = field(&key).ok_or_else(|| unknown_key(&key))?;
             let value = resolved
                 .get(schema.key)
                 .ok_or_else(|| anyhow!("configuration key '{}' is not set", schema.key))?;
@@ -1563,7 +1629,7 @@ fn registry_command(paths: &Paths, args: RegistryArgs) -> Result<()> {
                     let (canonical, entry) = loaded
                         .registry
                         .model(&tag)
-                        .ok_or_else(|| anyhow!("unknown model '{tag}'"))?;
+                        .ok_or_else(|| unknown_model_error(&loaded.registry, &tag))?;
                     if output.json {
                         println!(
                             "{}",
@@ -1669,7 +1735,7 @@ fn list_command(paths: &Paths, args: ListArgs) -> Result<()> {
         return Ok(());
     }
     if local.is_empty() {
-        println!("No local models. Pull one:\n  hipfire pull qwen3.6:35b-a3b-mq4r");
+        println!("No local models. Pull one:\n  hipfire pull qwen3.5:4b");
     } else {
         println!("Local models:\n");
         for model in &local {
@@ -1822,7 +1888,7 @@ pub(crate) fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
     let (tag, entry) = loaded
         .registry
         .model(&args.model)
-        .ok_or_else(|| anyhow!("unknown model '{}'", args.model))?;
+        .ok_or_else(|| unknown_model_error(&loaded.registry, &args.model))?;
     if entry.repo.is_empty() {
         bail!(
             "cannot pull {tag}: registry entry is local-only; place {} in {}",
@@ -1833,7 +1899,11 @@ pub(crate) fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
     fs::create_dir_all(&paths.models)
         .with_context(|| format!("failed to create {}", paths.models.display()))?;
     let destination = paths.models.join(&entry.file);
-    let migrated = if args.force { None } else { migrate_flash_next_xts(paths, entry)? };
+    let migrated = if args.force {
+        None
+    } else {
+        migrate_flash_next_xts(paths, entry)?
+    };
     let needs_base = if args.force {
         true
     } else if let Some(path) = migrated {
@@ -1850,6 +1920,9 @@ pub(crate) fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
     } else {
         true
     };
+    let ple_plan = entry
+        .has_ple_sidecars()
+        .then(|| ple::announce_pull_plan(paths, &loaded.registry, entry, args.ple, !needs_base));
     if needs_base {
         let url = artifact_url(entry, &entry.file);
         eprintln!("Pulling {tag} ({:.2} GB)...", entry.size_gb);
@@ -1862,10 +1935,29 @@ pub(crate) fn pull_command(paths: &Paths, args: PullArgs) -> Result<()> {
         )?;
         if entry.is_flash_next_xts() {
             // The download has already verified the canonical payload.
-            let legacy = paths.models.join(hipfire_registry::FLASH_NEXT_XTS_LEGACY_FILE);
-            if install_verified_link(&destination, &legacy)? && !same_installed_file(&destination, &legacy) {
-                verified_metadata(&legacy, entry.sha256.as_deref().expect("pinned digest"), entry.size_bytes.expect("pinned size"))?;
+            let legacy = paths
+                .models
+                .join(hipfire_registry::FLASH_NEXT_XTS_LEGACY_FILE);
+            if install_verified_link(&destination, &legacy)?
+                && !same_installed_file(&destination, &legacy)
+            {
+                verified_metadata(
+                    &legacy,
+                    entry.sha256.as_deref().expect("pinned digest"),
+                    entry.size_bytes.expect("pinned size"),
+                )?;
             }
+        }
+    }
+    if let Some(plan) = &ple_plan {
+        for (format, sidecar) in &plan.sidecars {
+            ple::fetch_ple_sidecar(
+                entry,
+                *format,
+                sidecar,
+                &paths.models.join(&sidecar.file),
+                args.force,
+            )?;
         }
     }
     for (label, sidecar) in [
@@ -2103,6 +2195,12 @@ fn rm_with_registry(paths: &Paths, registry: &RegistryV1, args: RmArgs) -> Resul
     let path = find_model_path(paths, registry, &args.model)
         .unwrap_or_else(|| paths.models.join(&args.model));
     if !path.is_file() {
+        if let Some((tag, _)) = registry.model(&args.model) {
+            bail!("{tag} is not downloaded; nothing to remove");
+        }
+        if !args.model.contains(std::path::MAIN_SEPARATOR) {
+            return Err(unknown_model_error(registry, &args.model));
+        }
         bail!("model not found: {}", path.display());
     }
     let mut targets = BTreeSet::from([path.clone()]);
@@ -2268,6 +2366,13 @@ fn rm_with_registry(paths: &Paths, registry: &RegistryV1, args: RmArgs) -> Resul
             );
         }
     }
+    // The PLE row sidecars (and their hot-row packs) ride with the model file
+    // that was resolved, whichever layout it is.
+    targets.extend(
+        ple::ple_sidecar_paths(&path)
+            .into_iter()
+            .filter(|sidecar| sidecar.is_file()),
+    );
     if let Some((file, _)) = kept_mtp.as_ref() {
         // The stem sweep matched the shared head beside the trunk; keep it.
         let kept = paths.models.join(file);
@@ -2324,13 +2429,20 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
                 PullArgs {
                     model: args.model.clone(),
                     force: false,
+                    ple: ple::PleSelection::Auto,
                 },
             )?;
             // pull already verified either the downloaded canonical or legacy fallback.
             model_path = find_model_path(paths, registry, &args.model);
         }
     }
-    let model_path = model_path.ok_or_else(|| anyhow!("model not found: {}", args.model))?;
+    let model_path = model_path.ok_or_else(|| {
+        anyhow!(
+            "model not found: {}{}",
+            args.model,
+            model_suggestions(registry, &args.model)
+        )
+    })?;
     if let Some(image) = &args.image {
         if !image.is_file() {
             bail!("image not found: {}", image.display());
@@ -2387,7 +2499,7 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         args.prompt.join(" ")
     };
     let host = config_string(&resolved, "serve.host")?;
-    let port = config_u64(&resolved, "serve.port")? as u16;
+    let port = serve_probe_port(paths, config_u64(&resolved, "serve.port")? as u16);
     let force_local = run_should_force_local(&args);
     if !force_local && service_ready(&host, port, Duration::from_millis(150)) {
         return run_via_http(
@@ -2408,13 +2520,25 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
             args.stats,
         );
     }
+    ple::ensure_ple_sidecar(
+        registry,
+        entry,
+        canonical.as_deref(),
+        &model_path,
+        ple::request_from_config(&resolved),
+        true,
+    )?;
 
     let daemon = find_daemon(paths).ok_or_else(|| {
         anyhow!("daemon binary not found; build `cargo build --release -p hipfire-daemon`")
     })?;
     let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
-    let mut engine =
-        Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config, Some(&model_path))?;
+    let mut engine = Engine::spawn_configured(
+        &daemon,
+        &BTreeMap::new(),
+        &process_config,
+        Some(&model_path),
+    )?;
     engine.ping()?;
     let mut params = load_params(
         &resolved,
@@ -2437,6 +2561,10 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
     // daemon takes the EP/dense-TP route instead of the single-GPU one.
     if let Some(tp) = args.tp.filter(|&tp| tp > 1) {
         params["tp"] = serde_json::json!(tp);
+    }
+    // `--max-seq` replaces any configured value, exactly as `bench --max-seq`.
+    if let Some(max_seq) = args.max_seq {
+        params["max_seq"] = serde_json::json!(max_seq);
     }
     apply_speculation_selector(&mut params, &selector)?;
     // Final effective selector wins: re-project inherited draft only when DFlash
@@ -2570,15 +2698,26 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
 
     let mut content = String::new();
     let stream = !args.no_stream && !args.json;
+    // End the streamed answer's line at `commit_ready`, before the commit is
+    // sent, so later daemon stderr never lands on the answer's line.
+    let mut line_ended = false;
     let done = engine.generate(&request, |event| {
-        if event.get("type").and_then(serde_json::Value::as_str) == Some("token") {
-            if let Some(text) = event.get("text").and_then(serde_json::Value::as_str) {
-                content.push_str(text);
-                if stream {
-                    print!("{text}");
-                    std::io::stdout().flush()?;
+        match event.get("type").and_then(serde_json::Value::as_str) {
+            Some("token") => {
+                if let Some(text) = event.get("text").and_then(serde_json::Value::as_str) {
+                    content.push_str(text);
+                    if stream {
+                        print!("{text}");
+                        std::io::stdout().flush()?;
+                    }
                 }
             }
+            Some("commit_ready") if stream && !line_ended => {
+                println!();
+                std::io::stdout().flush()?;
+                line_ended = true;
+            }
+            _ => {}
         }
         Ok(())
     })?;
@@ -2594,11 +2733,17 @@ fn run_command(paths: &Paths, args: RunArgs) -> Result<()> {
         );
     } else if args.no_stream {
         println!("{content}");
-    } else {
+    } else if !line_ended {
         println!();
     }
     if args.stats && !args.json {
-        eprintln!("{}", format_run_stats(done.get("tokens").and_then(serde_json::Value::as_u64), &done));
+        eprintln!(
+            "{}",
+            format_run_stats(
+                done.get("tokens").and_then(serde_json::Value::as_u64),
+                &done
+            )
+        );
     }
     let _ = engine.unload();
     Ok(())
@@ -2700,6 +2845,7 @@ fn img_command(paths: &Paths, args: ImgArgs) -> Result<()> {
                 PullArgs {
                     model: args.model.clone(),
                     force: false,
+                    ple: ple::PleSelection::Auto,
                 },
             )?;
             model_path = Some(paths.models.join(&entry.file));
@@ -2722,8 +2868,12 @@ fn img_command(paths: &Paths, args: ImgArgs) -> Result<()> {
         anyhow!("daemon binary not found; build `cargo build --release -p hipfire-daemon`")
     })?;
     let process_config = hipfire_config::ProcessConfig::from_resolved(&resolved)?;
-    let engine =
-        Engine::spawn_configured(&daemon, &BTreeMap::new(), &process_config, Some(&model_path))?;
+    let engine = Engine::spawn_configured(
+        &daemon,
+        &BTreeMap::new(),
+        &process_config,
+        Some(&model_path),
+    )?;
     engine.ping()?;
     let _loaded = engine.load(&model_path, serde_json::json!({}))?;
     let mut request = serde_json::json!({
@@ -2819,6 +2969,7 @@ pub(crate) fn run_should_force_local(args: &RunArgs) -> bool {
         || args.kv_v.is_some()
         || args.kv_backend.is_some()
         || args.tp.is_some_and(|tp| tp > 1)
+        || args.max_seq.is_some()
         || args.head.is_some()
         || args.speculation.is_some()
         || args.model_draft.is_some()
@@ -2829,17 +2980,31 @@ pub(crate) fn run_should_force_local(args: &RunArgs) -> bool {
 
 fn format_run_stats(tokens: Option<u64>, timings: &serde_json::Value) -> String {
     let metric = |key: &str, precision: usize| {
-        timings.get(key).and_then(serde_json::Value::as_f64)
+        timings
+            .get(key)
+            .and_then(serde_json::Value::as_f64)
             .filter(|value| value.is_finite() && *value >= 0.0)
             .map(|value| format!("{value:.precision$}"))
             .unwrap_or_else(|| "n/a".to_owned())
     };
-    let mut footer = format!("[stats] tokens={} decode={} tok/s ttft={} ms",
-        tokens.map(|value| value.to_string()).unwrap_or_else(|| "n/a".to_owned()),
-        metric("decode_tok_s", 2), metric("ttft_ms", 1));
+    let mut footer = format!(
+        "[stats] tokens={} decode={} tok/s ttft={} ms",
+        tokens
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "n/a".to_owned()),
+        metric("decode_tok_s", 2),
+        metric("ttft_ms", 1)
+    );
     let routes = ["dflash", "mtp", "mtp_ngram"];
-    let has_route = routes.iter().any(|key| timings.get(key).and_then(serde_json::Value::as_bool).is_some());
-    let speculative = routes.iter().any(|key| timings.get(key).and_then(serde_json::Value::as_bool) == Some(true));
+    let has_route = routes.iter().any(|key| {
+        timings
+            .get(key)
+            .and_then(serde_json::Value::as_bool)
+            .is_some()
+    });
+    let speculative = routes
+        .iter()
+        .any(|key| timings.get(key).and_then(serde_json::Value::as_bool) == Some(true));
     if (!has_route || speculative) && timings.get("tau").is_some_and(|value| !value.is_null()) {
         footer.push_str(&format!(" tau={}", metric("tau", 2)));
     }
@@ -2904,10 +3069,15 @@ fn run_via_http(
         } else {
             println!("{content}");
             if stats {
-                eprintln!("{}", format_run_stats(
-                    response.pointer("/usage/completion_tokens").and_then(serde_json::Value::as_u64),
-                    &response["timings"],
-                ));
+                eprintln!(
+                    "{}",
+                    format_run_stats(
+                        response
+                            .pointer("/usage/completion_tokens")
+                            .and_then(serde_json::Value::as_u64),
+                        &response["timings"],
+                    )
+                );
             }
         }
         return Ok(());
@@ -2930,7 +3100,9 @@ fn run_via_http(
                     timings = value.unwrap_or(serde_json::Value::Null);
                 }
                 OpenAiSseEvent::Usage { usage } if stats => {
-                    tokens = usage.get("completion_tokens").and_then(serde_json::Value::as_u64);
+                    tokens = usage
+                        .get("completion_tokens")
+                        .and_then(serde_json::Value::as_u64);
                 }
                 _ => {}
             }
@@ -2982,6 +3154,8 @@ fn chat_command(paths: &Paths, args: ChatArgs) -> Result<()> {
             vision: None,
             idle_timeout: None,
             tp: None,
+            speculation: None,
+            max_seq: None,
             continuous_batch_size: None,
             foreground_child: false,
             ui: false,
@@ -3083,6 +3257,17 @@ pub(crate) fn resolved_for_model(
     entry: Option<&ModelEntry>,
 ) -> Result<hipfire_config::ResolvedConfig> {
     let loaded = load_global(&paths.config)?;
+    // config.toml warnings name retired keys the load ignored. serve resolves
+    // per model load, so report them once per process; legacy JSON migration
+    // notes stay with the `config` commands.
+    if loaded.format == ConfigFormat::Toml {
+        static REPORTED: std::sync::Once = std::sync::Once::new();
+        REPORTED.call_once(|| {
+            for warning in &loaded.warnings {
+                eprintln!("warning: {warning}");
+            }
+        });
+    }
     let mut layers = Vec::new();
     if let (Some(tag), Some(entry)) = (tag, entry) {
         layers.push(NamedLayer {
@@ -3191,10 +3376,12 @@ pub(crate) fn registry_entry_for_path<'registry>(
         let canonical_input = fs::canonicalize(candidate).ok()?;
         return registry.models.iter().find_map(|(tag, entry)| {
             let installed = paths.models.join(&entry.file);
-            let legacy = paths.models.join(hipfire_registry::FLASH_NEXT_XTS_LEGACY_FILE);
+            let legacy = paths
+                .models
+                .join(hipfire_registry::FLASH_NEXT_XTS_LEGACY_FILE);
             (same_installed_file(&installed, &canonical_input)
                 || (entry.is_flash_next_xts() && same_installed_file(&legacy, &canonical_input)))
-                .then(|| (tag.as_str(), entry))
+            .then(|| (tag.as_str(), entry))
         });
     }
     registry.model(input)
@@ -3208,47 +3395,85 @@ pub(crate) fn same_installed_file(a: &Path, b: &Path) -> bool {
 }
 
 /// Fallible pinned migration stays outside generic, cheap local discovery.
-pub(crate) fn resolve_model_path(paths: &Paths, registry: &RegistryV1, model: &str) -> Result<Option<PathBuf>> {
+pub(crate) fn resolve_model_path(
+    paths: &Paths,
+    registry: &RegistryV1,
+    model: &str,
+) -> Result<Option<PathBuf>> {
     let explicit = Path::new(model);
     let catalog_path = load_catalog(&paths.config).ok().is_some_and(|catalog| {
-        catalog.catalog.model(model).is_some_and(|(_, record)| record.path.as_ref().is_some_and(|path| path.is_file()))
+        catalog
+            .catalog
+            .model(model)
+            .is_some_and(|(_, record)| record.path.as_ref().is_some_and(|path| path.is_file()))
     });
     if !explicit.is_file() && !model.contains('/') && !model.contains('\\') && !catalog_path {
-        if let Some((_, entry)) = registry.model(model).filter(|(_, entry)| entry.is_flash_next_xts()) {
-            return migrate_flash_next_xts(paths, entry);
+        if let Some((_, entry)) = registry.model(model) {
+            if entry.is_flash_next_xts() {
+                return migrate_flash_next_xts(paths, entry);
+            }
+            // The split base is absent: verify (and link the legacy spelling of)
+            // the pinned monolithic it was cut from, exactly as its own tag does.
+            if entry.has_ple_sidecars() && !paths.models.join(&entry.file).is_file() {
+                if let Some((_, sibling)) = registry
+                    .monolithic_sibling(entry)
+                    .filter(|(_, sibling)| sibling.is_flash_next_xts())
+                {
+                    if let Some(path) = migrate_flash_next_xts(paths, sibling)? {
+                        return Ok(Some(path));
+                    }
+                }
+            }
         }
     }
     Ok(find_model_path(paths, registry, model))
 }
 
 fn migrate_flash_next_xts(paths: &Paths, entry: &ModelEntry) -> Result<Option<PathBuf>> {
-    if !entry.is_flash_next_xts() { return Ok(None); }
+    if !entry.is_flash_next_xts() {
+        return Ok(None);
+    }
     migrate_verified_artifact(
-        &paths.models.join(hipfire_registry::FLASH_NEXT_XTS_LEGACY_FILE),
-        &paths.models.join(hipfire_registry::FLASH_NEXT_XTS_CANONICAL_FILE),
+        &paths
+            .models
+            .join(hipfire_registry::FLASH_NEXT_XTS_LEGACY_FILE),
+        &paths
+            .models
+            .join(hipfire_registry::FLASH_NEXT_XTS_CANONICAL_FILE),
         entry.sha256.as_deref().expect("pinned digest"),
         entry.size_bytes.expect("pinned size"),
     )
 }
 
 fn same_artifact_metadata(a: &fs::Metadata, b: &fs::Metadata) -> bool {
-    #[cfg(unix)] {
+    #[cfg(unix)]
+    {
         use std::os::unix::fs::MetadataExt;
-        a.dev() == b.dev() && a.ino() == b.ino() && a.len() == b.len()
-            && a.mtime() == b.mtime() && a.mtime_nsec() == b.mtime_nsec()
+        a.dev() == b.dev()
+            && a.ino() == b.ino()
+            && a.len() == b.len()
+            && a.mtime() == b.mtime()
+            && a.mtime_nsec() == b.mtime_nsec()
     }
-    #[cfg(not(unix))] { a.len() == b.len() && a.modified().ok() == b.modified().ok() }
+    #[cfg(not(unix))]
+    {
+        a.len() == b.len() && a.modified().ok() == b.modified().ok()
+    }
 }
 
 fn verified_metadata(path: &Path, digest: &str, size: u64) -> Result<(fs::File, fs::Metadata)> {
     let mut file = fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
     let before = file.metadata()?;
-    if !before.is_file() || before.len() != size { bail!("size mismatch: {}", path.display()); }
+    if !before.is_file() || before.len() != size {
+        bail!("size mismatch: {}", path.display());
+    }
     let mut hasher = Sha256::new();
     let mut buffer = vec![0u8; 1024 * 1024];
     loop {
         let n = file.read(&mut buffer)?;
-        if n == 0 { break; }
+        if n == 0 {
+            break;
+        }
         hasher.update(&buffer[..n]);
     }
     if !format!("{:x}", hasher.finalize()).eq_ignore_ascii_case(digest) {
@@ -3270,7 +3495,8 @@ fn install_verified_link(source: &Path, destination: &Path) -> Result<bool> {
         Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => return Ok(true),
         Err(_) => {}
     }
-    #[cfg(unix)] {
+    #[cfg(unix)]
+    {
         let target = fs::canonicalize(source)?;
         match std::os::unix::fs::symlink(target, destination) {
             Ok(()) => return Ok(true),
@@ -3281,7 +3507,12 @@ fn install_verified_link(source: &Path, destination: &Path) -> Result<bool> {
     Ok(false)
 }
 
-fn migrate_verified_artifact(old: &Path, canonical: &Path, digest: &str, size: u64) -> Result<Option<PathBuf>> {
+fn migrate_verified_artifact(
+    old: &Path,
+    canonical: &Path,
+    digest: &str,
+    size: u64,
+) -> Result<Option<PathBuf>> {
     match fs::symlink_metadata(canonical) {
         Ok(_) => {
             verified_metadata(canonical, digest, size)?;
@@ -3330,9 +3561,28 @@ pub(crate) fn find_model_path(
             }
         }
     }
-    if let Some((_, entry)) = registry.model(model).filter(|(_, entry)| entry.is_flash_next_xts()) {
-        return [entry.file.as_str(), hipfire_registry::FLASH_NEXT_XTS_LEGACY_FILE]
-            .into_iter().map(|file| paths.models.join(file)).find(|path| path.is_file());
+    if let Some((_, entry)) = registry
+        .model(model)
+        .filter(|(_, entry)| entry.is_flash_next_xts())
+    {
+        return [
+            entry.file.as_str(),
+            hipfire_registry::FLASH_NEXT_XTS_LEGACY_FILE,
+        ]
+        .into_iter()
+        .map(|file| paths.models.join(file))
+        .find(|path| path.is_file());
+    }
+    if let Some((_, entry)) = registry
+        .model(model)
+        .filter(|(_, entry)| entry.has_ple_sidecars())
+    {
+        // A split tag serves its base, else the grandfathered monolithic it was
+        // cut from, so nobody is forced to re-download after the registry switch.
+        return ple::split_model_files(registry, entry)
+            .iter()
+            .map(|file| paths.models.join(file))
+            .find(|path| path.is_file());
     }
     // An exact on-disk spelling outranks a registry alias that would rewrite it.
     // The registry maps a model NAME to its canonical FILE, which is what makes
@@ -3599,6 +3849,12 @@ pub(crate) fn load_params(
         "dflash_mode": config_string(resolved, "speculation.dflash")?,
         "vision_mode": config_string(resolved, "vision.mode")?,
         "dflash_adaptive_b": config_bool(resolved, "speculation.dflash_adaptive_b")?,
+        // `auto` or a fixed width (schema-validated); the daemon resolves
+        // `auto` against the route it actually stages.
+        "dflash_block": match config_value(resolved, "speculation.dflash_block")? {
+            hipfire_config::ConfigValue::Integer(b) => serde_json::json!(b),
+            _ => serde_json::json!("auto"),
+        },
         "mtp_mode": config_string(resolved, "speculation.mtp")?,
         "mtp_k": config_u64(resolved, "speculation.mtp_k")?,
         "ngram_draft": matches!(config_string(resolved, "speculation.ngram")?.as_str(), "on" | "auto"),
@@ -3696,7 +3952,7 @@ pub(crate) fn load_params(
 /// really lives, not the models directory the draft was pulled into — then
 /// next to the target. An explicit draft always wins; a final `off` never
 /// carries a draft (`project_dflash_draft` strips it) and returns early.
-fn resolve_dflash_sidecar(
+pub(crate) fn resolve_dflash_sidecar(
     params: &mut serde_json::Value,
     entry: Option<&ModelEntry>,
     models_dir: &Path,
@@ -3716,7 +3972,7 @@ fn resolve_dflash_sidecar(
     let Some(sidecar) = entry.and_then(|entry| entry.dflash.as_ref()) else {
         if params["dflash_mode"].as_str() == Some("on") && model_path.is_file() {
             bail!(
-                "DFlash draft required (dflash_mode=on) but {} is not a registry-managed artifact; pass developer.dflash_draft or use the registry tag",
+                "DFlash needs a draft model: {} is not a registry-managed artifact; add --model-draft <draft.hfq>, or run the model by its registry tag (which pairs its draft)",
                 model_path.display()
             );
         }
@@ -3970,7 +4226,10 @@ fn developer_dflash_draft(resolved: &hipfire_config::ResolvedConfig) -> Option<&
     }
 }
 
-fn apply_speculation_selector(params: &mut serde_json::Value, selector: &str) -> Result<()> {
+pub(crate) fn apply_speculation_selector(
+    params: &mut serde_json::Value,
+    selector: &str,
+) -> Result<()> {
     match selector {
         "off" => {
             params["dflash_mode"] = serde_json::json!("off");
@@ -4859,7 +5118,7 @@ fn scan_auxiliary_processes() -> (Vec<ProcessRecord>, Vec<ProcessRecord>) {
 fn ps_command(paths: &Paths, output: OutputArgs) -> Result<()> {
     let (_, resolved) = resolved_global(paths, true)?;
     let host = config_string(&resolved, "serve.host")?;
-    let port = config_u64(&resolved, "serve.port")? as u16;
+    let port = serve_probe_port(paths, config_u64(&resolved, "serve.port")? as u16);
     let pid_path = paths.root.join("serve.pid");
     let pid_record = fs::read_to_string(&pid_path)
         .ok()
@@ -5124,7 +5383,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
             .unwrap_or("unknown")
     );
     eprintln!("  runs:   {}", args.runs);
-    eprintln!("  max_tokens: {}", args.max_tokens);
+    eprintln!("  max_tokens: {}", args.standard_max_tokens());
     eprintln!("  prompt_md5: {prompt_md5}");
     eprintln!("  prompt_chars: {prompt_chars}");
     print_bench_max_seq(&max_seq, &loaded);
@@ -5169,7 +5428,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
             let done = bench_generate_with_reasoning(
                 &mut engine,
                 &prompt,
-                args.max_tokens as u64,
+                args.standard_max_tokens() as u64,
                 args.reasoning_on,
             )?;
             power_runs.push(sampler.finish());
@@ -5214,7 +5473,10 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
             .and_then(bench_prompt_warning)
             .into_iter()
             .chain(bench_power::throttle_warning(&power_runs))
-            .chain(bench_spec_warning(args.speculation.as_deref(), &spec_routes))
+            .chain(bench_spec_warning(
+                args.speculation.as_deref(),
+                &spec_routes,
+            ))
             .collect();
         if let Some(tokens) = prompt_tokens {
             eprintln!("  prompt_tokens: {tokens}");
@@ -5230,7 +5492,7 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
                 "gpu": post_diag,
                 "vram_free_before_mb": pre_diag.get("vram_free_mb"),
                 "max_seq": max_seq_json,
-                "max_tokens": args.max_tokens,
+                "max_tokens": args.standard_max_tokens(),
                 "runs": args.runs,
                 "batch": 1,
                 "prompt_tokens": prompt_tokens,
@@ -5262,12 +5524,12 @@ fn bench_command(paths: &Paths, args: BenchArgs) -> Result<()> {
     }
 }
 
-/// Concurrency sweep across both concurrent backends. Only reached when
-/// `--concurrency` is given; the single-stream path above is untouched.
+/// Closed-loop concurrency sweep (see `bench_concurrency`). Only reached
+/// when `--concurrency` is given; the single-stream path above is untouched.
 fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Result<()> {
     use crate::bench_concurrency::{
-        parse_concurrency, render_table, sweep_backend, BackendSel, ConcurrencyBackend,
-        DaemonDriver, Point, SequentialDriver, SlotDriver, WorkloadSel,
+        betterbench_workload, parse_concurrency, render_table, steady_workload, sweep_backend,
+        BackendSel, BenchShape, Driver, Point, WorkloadSel, STEADY_DEFAULT_MAX_TOKENS,
     };
 
     let points = parse_concurrency(spec)?;
@@ -5283,48 +5545,94 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
         "multiturn" => vec![WorkloadSel::Multiturn],
         _ => vec![WorkloadSel::Stateless, WorkloadSel::Multiturn],
     };
+    let shape = match args.bench_shape.as_str() {
+        "betterbench" => BenchShape::BetterBench,
+        _ => BenchShape::Steady,
+    };
+    let mut workload = match shape {
+        BenchShape::Steady => {
+            if args.bb_corpus.is_some() {
+                bail!("--bb-corpus needs --bench-shape betterbench");
+            }
+            let max_tokens = args
+                .max_tokens
+                .map_or(STEADY_DEFAULT_MAX_TOKENS, |n| n as u64);
+            steady_workload(args.num_prompts, max_tokens)?
+        }
+        BenchShape::BetterBench => {
+            if args.max_tokens.is_some() {
+                bail!(
+                    "--max-tokens does not apply to --bench-shape betterbench: \
+                     every corpus prompt carries its own max_tokens"
+                );
+            }
+            let dir = args.bb_corpus.as_deref().ok_or_else(|| {
+                anyhow!("--bench-shape betterbench needs --bb-corpus <BetterBench corpus dir>")
+            })?;
+            betterbench_workload(dir, args.num_prompts)?
+        }
+    };
+    if let Some(t) = args.temperature {
+        workload.sampling.temperature = t;
+    }
+    // The load-time knobs `hipfire serve` reads from the same configuration:
+    // its default system prompt and the VMM batch route parameters.
+    let registry = load_registry(&paths.registry).registry;
+    let (tag, entry) = registry_entry_for_path(paths, &registry, &args.model)
+        .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry.clone())))
+        .unwrap_or((None, None));
+    let resolved = resolved_for_model(paths, &args.model, tag.as_deref(), entry.as_ref())?;
+    if let Some(system) = request_string(&resolved, "prompt.system", None)? {
+        workload.inject_system(&system);
+    }
 
-    eprintln!("hipfire bench — concurrency sweep");
+    eprintln!("hipfire bench — concurrency sweep (closed loop)");
     eprintln!("  model:       {}", args.model);
     eprintln!("  concurrency: {points:?}");
     eprintln!("  runs/point:  {}", args.runs);
-    eprintln!("  max_tokens:  {}", args.max_tokens);
+    eprintln!(
+        "  shape:       {} ({} requests/sample, source md5 {}, {} warmup requests of {} tokens/sample)",
+        shape.label(),
+        workload.measure.len(),
+        workload.source_md5,
+        workload.warmup.len(),
+        crate::bench_concurrency::WARMUP_TOKENS,
+    );
+    if shape == BenchShape::Steady {
+        eprintln!("  max_tokens:  {}", workload.measure[0].max_tokens);
+    }
+    eprintln!("  sampling:    {:?}", workload.sampling);
 
     let mut out: Vec<Point> = Vec::new();
 
-    // The two backends run STRICTLY SEQUENTIALLY, and the scope below is what
-    // enforces it. Each holds a full copy of the model's weights -- 18.7 GB for
-    // a 35B-A3B mq4r -- so overlapping them doubles resident footprint. On a
-    // box with no swap that is not "slower", it is an OOM kill. `SlotEngine`'s
-    // Drop closes its channel and joins the worker thread that owns the Gpu,
-    // weights and KV arenas, so leaving this scope is what actually frees the
-    // first model before the daemon loads the second.
+    // The backends run STRICTLY SEQUENTIALLY, and the scopes below enforce
+    // it. Each holds a full copy of the model's weights -- 18.7 GB for a
+    // 35B-A3B mq4r -- so overlapping them doubles resident footprint. On a
+    // box with no swap that is not "slower", it is an OOM kill. Dropping a
+    // driver drops its engine, which stops that daemon before the next loads.
     if matches!(backend_sel, BackendSel::Slots | BackendSel::Both) {
         preflight_headroom_for_model(paths, &args.model)?;
         let mut slot_args = args.clone();
         slot_args.concurrency = None;
-        // 2048-token slots, not the serve default of 8192: the sweep's prompts
-        // are one short turn and --max-tokens is small, so a larger arena buys
-        // nothing and multiplies per-slot KV by four.
+        // Small per-slot arenas, not the serve default of 8192: the steady
+        // shape's turns stay under 1K tokens and BetterBench's under 4K, and a
+        // larger arena multiplies per-slot KV for nothing.
+        let slot_ctx = match shape {
+            BenchShape::Steady => 2048,
+            BenchShape::BetterBench => 4096,
+        };
         let (engine, loaded, _, _, _, max_seq) =
-            open_bench_engine_slots(paths, &slot_args, max_k, 2048)?;
+            open_bench_engine_slots(paths, &slot_args, max_k, slot_ctx)?;
         print_bench_max_seq(&max_seq, &loaded);
         let slot_capable = loaded
             .get("experimental_multi_slot")
             .and_then(serde_json::Value::as_bool)
             .unwrap_or(false);
-        match SlotDriver::start(engine, max_k, slot_capable) {
+        match Driver::slots(engine, max_k, slot_capable, args.reasoning_on) {
             Ok(mut d) => {
                 eprintln!("  slots backend up ({max_k} slots)");
-                let r = sweep_backend(
-                    &mut d as &mut dyn ConcurrencyBackend,
-                    &arms,
-                    &points,
-                    args.runs,
-                    args.max_tokens as u64,
-                    &mut out,
-                );
-                // Free the weights before the batch backend loads its own copy,
+                let r = sweep_backend(&mut d, &workload, &arms, &points, args.runs, &mut out);
+                // Free the weights before the next backend loads its own copy,
                 // even on the error path.
                 drop(d);
                 r?;
@@ -5334,9 +5642,9 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
         }
     }
 
-    // No-slots baseline: k requests one after another through the ordinary
-    // daemon path. Runs after the slots engine has been dropped, so only one
-    // copy of the weights is ever resident.
+    // No-batching baseline: the daemon serves one request at a time and the
+    // other lanes queue client-side, as `hipfire serve` queues them with
+    // batching off.
     if matches!(backend_sel, BackendSel::Sequential | BackendSel::Both) {
         preflight_headroom_for_model(paths, &args.model)?;
         let mut seq_args = args.clone();
@@ -5344,16 +5652,9 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
         let (engine, loaded, _, _, _, max_seq) =
             open_bench_engine(paths, &seq_args, None, &BenchLoadOpts::default())?;
         print_bench_max_seq(&max_seq, &loaded);
-        let mut d = SequentialDriver::start(engine, max_k)?;
-        eprintln!("  noslots backend up (sequential daemon path)");
-        let r = sweep_backend(
-            &mut d as &mut dyn ConcurrencyBackend,
-            &arms,
-            &points,
-            args.runs,
-            args.max_tokens as u64,
-            &mut out,
-        );
+        let mut d = Driver::sequential(engine, max_k, args.reasoning_on);
+        eprintln!("  noslots backend up (one request at a time)");
+        let r = sweep_backend(&mut d, &workload, &arms, &points, args.runs, &mut out);
         drop(d);
         r?;
     }
@@ -5362,30 +5663,30 @@ fn bench_concurrency_command(paths: &Paths, args: &BenchArgs, spec: &str) -> Res
         preflight_headroom_for_model(paths, &args.model)?;
         let mut batch_args = args.clone();
         batch_args.concurrency = None;
+        // The VMM route needs at least two lanes; a lone request at k=1
+        // takes the singleton route either way, as it does under serve.
+        let lanes = max_k.max(2);
+        let vmm = crate::serve::VmmBatchFlags::from_config(&resolved)?;
+        let vmm_params = vmm.load_params(config_u64(&resolved, "serve.max_batch_tokens")?);
         let (engine, loaded, _, _, _, max_seq) =
-            open_bench_engine_batched(paths, &batch_args, max_k)?;
+            open_bench_engine_batched(paths, &batch_args, lanes, vmm_params)?;
         print_bench_max_seq(&max_seq, &loaded);
-        let capable = loaded
-            .get("continuous_batch_capable")
-            .and_then(serde_json::Value::as_bool)
-            .unwrap_or(false);
-        match DaemonDriver::start(engine, max_k, capable) {
+        match Driver::batch(engine, max_k, &loaded, args.reasoning_on) {
             Ok(mut d) => {
-                eprintln!("  batch backend up (continuous_batch_size={max_k})");
-                sweep_backend(
-                    &mut d as &mut dyn ConcurrencyBackend,
-                    &arms,
-                    &points,
-                    args.runs,
-                    args.max_tokens as u64,
-                    &mut out,
-                )?;
+                let field = |key: &str| loaded.get(key).cloned().unwrap_or_default();
+                eprintln!(
+                    "  batch backend up (VMM route, continuous_batch_size={lanes}, exact={}, spec_mode={}, row_budget={})",
+                    field("continuous_batch_exact"),
+                    field("continuous_batch_spec_mode"),
+                    field("continuous_batch_row_budget"),
+                );
+                sweep_backend(&mut d, &workload, &arms, &points, args.runs, &mut out)?;
             }
             Err(e) => eprintln!("  batch backend unavailable: {e}"),
         }
     }
 
-    println!("{}", render_table(&out));
+    println!("{}", render_table(&out, shape));
     Ok(())
 }
 
@@ -5440,20 +5741,23 @@ fn preflight_headroom_for_model(paths: &Paths, model: &str) -> Result<()> {
     Ok(())
 }
 
-/// `open_bench_engine`, but loading with `continuous_batch_size` set so the
-/// daemon allocates batch lanes and advertises `continuous_batch_capable`.
-/// The value is fixed per load, which is why the sweep holds it at max.
+/// `open_bench_engine`, loading the VMM continuous-batching route the way
+/// `hipfire serve` does with `serve.vmm_batch` on: `continuous_batch_size`
+/// lanes plus the `serve_vmm_batch` parameter object. Without the latter the
+/// daemon would batch on the legacy fixed-slot route serve never runs. The
+/// lane count is fixed per load, which is why the sweep holds it at max.
 fn open_bench_engine_batched(
     paths: &Paths,
     args: &BenchArgs,
     batch_size: usize,
+    vmm_batch: serde_json::Value,
 ) -> Result<BenchEngine> {
     open_bench_engine(
         paths,
         args,
         None,
         &BenchLoadOpts {
-            continuous_batch: Some(batch_size),
+            continuous_batch: Some((batch_size, vmm_batch)),
             ..Default::default()
         },
     )
@@ -5662,7 +5966,8 @@ fn print_bench_max_seq(max_seq: &BenchMaxSeq, loaded: &serde_json::Value) {
 #[derive(Default)]
 struct BenchLoadOpts {
     multi_slot: Option<(usize, usize)>,
-    continuous_batch: Option<usize>,
+    /// `continuous_batch_size` and the `serve_vmm_batch` load parameter.
+    continuous_batch: Option<(usize, serde_json::Value)>,
 }
 
 fn open_bench_engine(
@@ -5682,6 +5987,7 @@ fn open_bench_engine(
             PullArgs {
                 model: args.model.clone(),
                 force: false,
+                ple: ple::PleSelection::Auto,
             },
         )?;
         // Do not hash a payload twice after a verified pull.
@@ -5689,6 +5995,14 @@ fn open_bench_engine(
     }
     let path = path.ok_or_else(|| anyhow!("model not found: {}", args.model))?;
     let resolved = resolved_for_model(paths, &args.model, tag.as_deref(), entry.as_ref())?;
+    ple::ensure_ple_sidecar(
+        &registry,
+        entry.as_ref(),
+        tag.as_deref(),
+        &path,
+        ple::request_from_config(&resolved),
+        true,
+    )?;
     let run_need = (args.matrix || args.redline).then(|| {
         bench_matrix_seq_need(
             &args.pp,
@@ -5766,8 +6080,9 @@ fn open_bench_engine(
             }
         }
     }
-    if let Some(n) = load_opts.continuous_batch {
-        params["continuous_batch_size"] = serde_json::json!(n as u64);
+    if let Some((n, vmm_batch)) = &load_opts.continuous_batch {
+        params["continuous_batch_size"] = serde_json::json!(*n as u64);
+        params["serve_vmm_batch"] = vmm_batch.clone();
     }
     if let Some(tp) = args.tp.filter(|&tp| tp > 1) {
         params["tp"] = serde_json::json!(tp);
@@ -6244,7 +6559,7 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             pp: vec![128],
             ctx: vec![128],
             tg: 1,
-            max_tokens: 128,
+            max_tokens: None,
             sustained_tg: None,
             sustained_ctx: vec![128],
             warmups: 1,
@@ -6259,6 +6574,10 @@ fn profile_command(paths: &Paths, args: ProfileArgs) -> Result<()> {
             concurrency: None,
             backend: "both".to_owned(),
             workload: "both".to_owned(),
+            bench_shape: "steady".to_owned(),
+            bb_corpus: None,
+            num_prompts: None,
+            temperature: None,
             prompt: Vec::new(),
             prompt_file: None,
         };
@@ -7373,7 +7692,9 @@ fn quantize_command(paths: &Paths, mut args: QuantizeArgs) -> Result<()> {
 
 // lifecycle: deprecated since 0.4.0, removal 0.5.0 — CASK/TriAttention KV eviction is unsupported research; use compact kv_cache modes
 fn sidecar_command(paths: &Paths, args: SidecarArgs) -> Result<()> {
-    eprintln!("warning: CASK is deprecated and will be removed in 0.5.0; not supported (sidecar-gen)");
+    eprintln!(
+        "warning: CASK is deprecated and will be removed in 0.5.0; not supported (sidecar-gen)"
+    );
     if !(1..=1_000_000).contains(&args.max_tokens) {
         bail!("--max-tokens must be between 1 and 1000000");
     }
@@ -7765,6 +8086,222 @@ fn find_daemon_in(paths: &Paths, workspace: &std::path::Path, windows: bool) -> 
     candidates.into_iter().find(|path| path.is_file())
 }
 
+/// The hipfire home a process runs under, read from its environment with the
+/// `ConfigPaths::discover` rule (`HIPFIRE_HOME`, else `$HOME/.hipfire`).
+/// `None` when the environment is unreadable (another user's process).
+fn process_hipfire_home(pid: u32) -> Option<PathBuf> {
+    use std::os::unix::ffi::OsStrExt;
+    let environ = fs::read(format!("/proc/{pid}/environ")).ok()?;
+    let mut hipfire_home = None;
+    let mut home = None;
+    for var in environ.split(|byte| *byte == 0) {
+        if let Some(value) = var.strip_prefix(b"HIPFIRE_HOME=") {
+            hipfire_home = Some(PathBuf::from(std::ffi::OsStr::from_bytes(value)));
+        } else if let Some(value) = var.strip_prefix(b"HOME=") {
+            home = Some(PathBuf::from(std::ffi::OsStr::from_bytes(value)));
+        }
+    }
+    hipfire_home.or_else(|| home.map(|home| home.join(".hipfire")))
+}
+
+fn same_file_path(a: &Path, b: &Path) -> bool {
+    match (fs::canonicalize(a), fs::canonicalize(b)) {
+        (Ok(a), Ok(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// A live (non-zombie) process whose `argv[0]` is `daemon` (this install's
+/// daemon binary) and whose hipfire home is `root`.
+fn is_install_daemon(pid: u32, daemon: &Path, root: &Path) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    let Ok(cmdline) = fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    let argv0 = cmdline.split(|byte| *byte == 0).next().unwrap_or_default();
+    !argv0.is_empty()
+        && same_file_path(Path::new(std::ffi::OsStr::from_bytes(argv0)), daemon)
+        && process_hipfire_home(pid).is_some_and(|home| same_file_path(&home, root))
+}
+
+fn process_gone(pid: u32) -> bool {
+    match fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // The state follows the parenthesised command name; `Z` is a zombie.
+        Ok(stat) => stat
+            .rsplit_once(") ")
+            .is_some_and(|(_, rest)| rest.starts_with('Z')),
+        Err(_) => true,
+    }
+}
+
+/// PIDs this install may own a daemon under: the daemon pidfiles
+/// (`daemon*.pid` in the home and in `$HOME/.hipfire`, where the daemon writes
+/// them), the GPU-lock holders, and the children of the recorded serve PID.
+/// Every candidate is still verified by [`is_install_daemon`].
+fn install_daemon_candidates(paths: &Paths) -> BTreeSet<u32> {
+    let mut candidates = BTreeSet::new();
+    let first_pid = |raw: &str| raw.split_whitespace().next()?.parse::<u32>().ok();
+    let mut pid_dirs = vec![paths.root.clone()];
+    if let Some(home) = env::var_os("HOME") {
+        pid_dirs.push(PathBuf::from(home).join(".hipfire"));
+    }
+    let lock_dirs = match env::var_os("HIPFIRE_LOCK_DIR") {
+        Some(dir) => vec![PathBuf::from(dir)],
+        None => vec![
+            PathBuf::from("/run/lock/hipfire"),
+            PathBuf::from("/tmp/hipfire-locks"),
+        ],
+    };
+    let scan = |dir: &Path, prefix: &str, suffix: &str, out: &mut BTreeSet<u32>| {
+        let Ok(entries) = fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(prefix) && name.ends_with(suffix) {
+                if let Some(pid) = fs::read_to_string(entry.path())
+                    .ok()
+                    .and_then(|raw| first_pid(&raw))
+                {
+                    out.insert(pid);
+                }
+            }
+        }
+    };
+    for dir in &pid_dirs {
+        scan(dir, "daemon", ".pid", &mut candidates);
+    }
+    for dir in &lock_dirs {
+        scan(dir, "gpu-", ".lock", &mut candidates);
+    }
+    if let Some(serve) = fs::read_to_string(paths.root.join("serve.pid"))
+        .ok()
+        .and_then(|raw| parse_pid_record(&raw))
+    {
+        if let Ok(tasks) = fs::read_dir(format!("/proc/{}/task", serve.pid)) {
+            for task in tasks.flatten() {
+                if let Ok(children) = fs::read_to_string(task.path().join("children")) {
+                    candidates.extend(
+                        children
+                            .split_whitespace()
+                            .filter_map(|pid| pid.parse::<u32>().ok()),
+                    );
+                }
+            }
+        }
+    }
+    candidates
+}
+
+/// `stop --force`: stop only this install's daemon processes — candidates from
+/// its pidfiles/GPU locks whose `argv[0]` is this install's daemon binary and
+/// whose hipfire home is this home. SIGTERM, then SIGKILL after 5 s for the
+/// ones still running (re-verified first). Returns the signalled PIDs.
+pub(crate) fn reap_install_daemons(paths: &Paths) -> Result<Vec<u32>> {
+    let Some(daemon) = find_daemon(paths) else {
+        return Ok(Vec::new());
+    };
+    let own = std::process::id();
+    let targets = install_daemon_candidates(paths)
+        .into_iter()
+        .filter(|&pid| pid != own && is_install_daemon(pid, &daemon, &paths.root))
+        .collect::<Vec<_>>();
+    for &pid in &targets {
+        // SAFETY: plain kill(2) on a verified positive PID.
+        unsafe { libc::kill(pid as libc::pid_t, libc::SIGTERM) };
+    }
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while Instant::now() < deadline && !targets.iter().all(|&pid| process_gone(pid)) {
+        thread::sleep(Duration::from_millis(100));
+    }
+    for &pid in &targets {
+        if !process_gone(pid) && is_install_daemon(pid, &daemon, &paths.root) {
+            eprintln!("daemon PID {pid} ignored SIGTERM for 5 s; sending SIGKILL");
+            // SAFETY: as above, re-verified immediately before signalling.
+            unsafe { libc::kill(pid as libc::pid_t, libc::SIGKILL) };
+        }
+    }
+    Ok(targets)
+}
+
+/// Something accepts TCP connections on `host:port`.
+pub(crate) fn port_in_use(host: &str, port: u16) -> bool {
+    use std::net::ToSocketAddrs;
+    (host, port).to_socket_addrs().is_ok_and(|mut addrs| {
+        addrs.any(|addr| {
+            std::net::TcpStream::connect_timeout(&addr, Duration::from_millis(300)).is_ok()
+        })
+    })
+}
+
+/// Port of the running serve: the live `serve.pid` record's port (a serve
+/// started with a host:port positional or `-d` on another port), else
+/// `serve.port`.
+fn serve_probe_port(paths: &Paths, configured: u16) -> u16 {
+    fs::read_to_string(paths.root.join("serve.pid"))
+        .ok()
+        .and_then(|raw| parse_pid_record(&raw))
+        .filter(|record| Path::new(&format!("/proc/{}", record.pid)).exists())
+        .and_then(|record| record.port)
+        .unwrap_or(configured)
+}
+
+/// Levenshtein distance over chars.
+fn edit_distance(a: &str, b: &str) -> usize {
+    let b = b.chars().collect::<Vec<_>>();
+    let mut row = (0..=b.len()).collect::<Vec<_>>();
+    for (i, ca) in a.chars().enumerate() {
+        let mut diagonal = row[0];
+        row[0] = i + 1;
+        for (j, cb) in b.iter().enumerate() {
+            let above = row[j + 1];
+            row[j + 1] = (above + 1)
+                .min(row[j] + 1)
+                .min(diagonal + usize::from(ca != *cb));
+            diagonal = above;
+        }
+    }
+    row[b.len()]
+}
+
+/// Up to three registry tags/aliases close to `input` (case-insensitive edit
+/// distance), then a pointer to the full list. Empty for path-like input.
+fn model_suggestions(registry: &RegistryV1, input: &str) -> String {
+    if input.contains(std::path::MAIN_SEPARATOR) {
+        return String::new();
+    }
+    let needle = input.to_lowercase();
+    let limit = (needle.chars().count() / 4).max(2);
+    let mut close = registry
+        .models
+        .keys()
+        .chain(registry.aliases.keys())
+        .map(|tag| (edit_distance(&needle, &tag.to_lowercase()), tag.as_str()))
+        .filter(|(distance, _)| *distance <= limit)
+        .collect::<Vec<_>>();
+    close.sort_unstable();
+    close.dedup_by(|a, b| a.1 == b.1);
+    let mut message = String::new();
+    if !close.is_empty() {
+        let tags = close
+            .iter()
+            .take(3)
+            .map(|(_, tag)| *tag)
+            .collect::<Vec<_>>();
+        message.push_str(&format!("\n  did you mean: {}?", tags.join(", ")));
+    }
+    message.push_str("\n  see: hipfire list -r");
+    message
+}
+
+fn unknown_model_error(registry: &RegistryV1, input: &str) -> anyhow::Error {
+    anyhow!(
+        "unknown model '{input}'{}",
+        model_suggestions(registry, input)
+    )
+}
+
 pub(crate) fn request_f64(
     resolved: &hipfire_config::ResolvedConfig,
     key: &str,
@@ -7902,6 +8439,8 @@ fn registry_sidecar_files(registry: &RegistryV1) -> BTreeSet<&str> {
                 entry.vae.as_ref(),
                 entry.dflash.as_ref(),
                 entry.vision.as_ref(),
+                entry.ple_q4.as_ref(),
+                entry.ple_q8.as_ref(),
             ]
             .into_iter()
             .flatten()
@@ -7918,7 +8457,8 @@ fn registry_sidecar_files(registry: &RegistryV1) -> BTreeSet<&str> {
 /// from `MODEL_SUFFIXES` (`qwen3.8-27b.mq3-xt`, `-pro`, `.bq1`, `.tq2`), and a
 /// suffix-only test hides exactly those models.
 pub(crate) fn is_listable_model_file(name: &str, registry: &RegistryV1) -> bool {
-    is_model_file(name) || registry.models.values().any(|entry| entry.file == name)
+    !ple::is_ple_sidecar_name(name)
+        && (is_model_file(name) || registry.models.values().any(|entry| entry.file == name))
 }
 
 /// True when `name` can actually serve a completion, as opposed to merely
@@ -7945,7 +8485,7 @@ pub(crate) fn is_listable_model_file(name: &str, registry: &RegistryV1) -> bool 
 /// [`HfqFile::probe_arch_id`] reports a [`SERVE_TRUNK_ARCH_IDS`] id. The
 /// registry cannot answer for it — the catalog only knows the files it ships.
 pub(crate) fn is_standalone_model(path: &Path, name: &str, registry: &RegistryV1) -> bool {
-    if registry_sidecar_files(registry).contains(name) {
+    if ple::is_ple_sidecar_name(name) || registry_sidecar_files(registry).contains(name) {
         return false;
     }
     if !is_listable_model_file(name, registry) {
@@ -8031,6 +8571,12 @@ fn config_rule_json(rule: ValueRule) -> serde_json::Value {
         ValueRule::KvBackend => {
             serde_json::json!({ "type": "string", "enum": ["legacy", "vmm"] })
         }
+        ValueRule::AutoInteger { min, max } => serde_json::json!({
+            "type": ["integer", "string"],
+            "enum": ["auto"],
+            "minimum": min,
+            "maximum": max,
+        }),
         ValueRule::AutoBool => serde_json::json!({
             "type": ["boolean", "string"],
             "enum": [true, false, "auto"],
@@ -8076,6 +8622,7 @@ fn config_rule_label(rule: ValueRule) -> &'static str {
         ValueRule::Enum(_) => "enum",
         ValueRule::KvBackend => "kv-backend",
         ValueRule::AutoBool => "auto-bool",
+        ValueRule::AutoInteger { .. } => "auto|integer",
         ValueRule::NullableString => "string|null",
         ValueRule::NullableEnum(_) => "enum|null",
         ValueRule::NullableInteger { .. } => "integer|null",
@@ -8140,19 +8687,44 @@ mod tests {
     }
     #[test]
     fn run_stats_are_authoritative_and_missing_is_not_wall_rate() {
-        assert_eq!(format_run_stats(Some(256), &serde_json::json!({
-            "decode_tok_s":123.3, "ttft_ms":42.1, "tau":7.15, "dflash":true
-        })), "[stats] tokens=256 decode=123.30 tok/s ttft=42.1 ms tau=7.15");
-        assert_eq!(format_run_stats(None, &serde_json::json!({"tok_s":99.0})),
-            "[stats] tokens=n/a decode=n/a tok/s ttft=n/a ms");
-        assert_eq!(format_run_stats(Some(0), &serde_json::json!({"decode_tok_s":-1,"ttft_ms":null,"tau":"bad"})),
-            "[stats] tokens=0 decode=n/a tok/s ttft=n/a ms tau=n/a");
-        assert_eq!(format_run_stats(None, &serde_json::json!({
-            "decode_tok_s": f64::INFINITY, "ttft_ms": f64::NAN
-        })), "[stats] tokens=n/a decode=n/a tok/s ttft=n/a ms");
-        assert_eq!(format_run_stats(Some(1), &serde_json::json!({
-            "tau":1, "dflash":false, "mtp":false
-        })), "[stats] tokens=1 decode=n/a tok/s ttft=n/a ms");
+        assert_eq!(
+            format_run_stats(
+                Some(256),
+                &serde_json::json!({
+                    "decode_tok_s":123.3, "ttft_ms":42.1, "tau":7.15, "dflash":true
+                })
+            ),
+            "[stats] tokens=256 decode=123.30 tok/s ttft=42.1 ms tau=7.15"
+        );
+        assert_eq!(
+            format_run_stats(None, &serde_json::json!({"tok_s":99.0})),
+            "[stats] tokens=n/a decode=n/a tok/s ttft=n/a ms"
+        );
+        assert_eq!(
+            format_run_stats(
+                Some(0),
+                &serde_json::json!({"decode_tok_s":-1,"ttft_ms":null,"tau":"bad"})
+            ),
+            "[stats] tokens=0 decode=n/a tok/s ttft=n/a ms tau=n/a"
+        );
+        assert_eq!(
+            format_run_stats(
+                None,
+                &serde_json::json!({
+                    "decode_tok_s": f64::INFINITY, "ttft_ms": f64::NAN
+                })
+            ),
+            "[stats] tokens=n/a decode=n/a tok/s ttft=n/a ms"
+        );
+        assert_eq!(
+            format_run_stats(
+                Some(1),
+                &serde_json::json!({
+                    "tau":1, "dflash":false, "mtp":false
+                })
+            ),
+            "[stats] tokens=1 decode=n/a tok/s ttft=n/a ms"
+        );
     }
 
     #[test]
@@ -8176,10 +8748,15 @@ mod tests {
                 result
             }));
         }
-        for join in joins { assert_eq!(join.join().unwrap().unwrap(), Some(new.clone())); }
+        for join in joins {
+            assert_eq!(join.join().unwrap().unwrap(), Some(new.clone()));
+        }
         assert!(same_installed_file(&old, &new));
         assert_eq!(fs::read(&sidecar).unwrap(), b"preserved");
-        assert_eq!(migrate_verified_artifact(&old, &new, &digest, bytes.len() as u64).unwrap(), Some(new.clone()));
+        assert_eq!(
+            migrate_verified_artifact(&old, &new, &digest, bytes.len() as u64).unwrap(),
+            Some(new.clone())
+        );
         fs::remove_file(&new).unwrap();
         fs::write(&old, vec![b'x'; bytes.len()]).unwrap();
         assert!(migrate_verified_artifact(&old, &new, &digest, bytes.len() as u64).is_err());
@@ -8201,7 +8778,10 @@ mod tests {
         fs::write(&external, b"fixture").unwrap();
         std::os::unix::fs::symlink(&external, &old).unwrap();
         let digest = format!("{:x}", Sha256::digest(b"fixture"));
-        assert_eq!(migrate_verified_artifact(&old, &new, &digest, 7).unwrap(), Some(new.clone()));
+        assert_eq!(
+            migrate_verified_artifact(&old, &new, &digest, 7).unwrap(),
+            Some(new.clone())
+        );
         assert!(fs::symlink_metadata(&old).unwrap().file_type().is_symlink());
         assert_eq!(fs::read(new).unwrap(), b"fixture");
         fs::remove_dir_all(paths.root).unwrap();
@@ -8214,11 +8794,18 @@ mod tests {
         fs::write(&old, b"fixture").unwrap();
         let unavailable = paths.root.join("missing-parent/canonical");
         let digest = format!("{:x}", Sha256::digest(b"fixture"));
-        assert_eq!(migrate_verified_artifact(&old, &unavailable, &digest, 7).unwrap(), Some(old.clone()));
-        #[cfg(target_os = "linux")] {
+        assert_eq!(
+            migrate_verified_artifact(&old, &unavailable, &digest, 7).unwrap(),
+            Some(old.clone())
+        );
+        #[cfg(target_os = "linux")]
+        {
             // procfs does not permit arbitrary new links even for root.
             let read_only = Path::new("/proc").join(paths.root.file_name().unwrap());
-            assert_eq!(migrate_verified_artifact(&old, &read_only, &digest, 7).unwrap(), Some(old.clone()));
+            assert_eq!(
+                migrate_verified_artifact(&old, &read_only, &digest, 7).unwrap(),
+                Some(old.clone())
+            );
             assert_eq!(fs::read(&old).unwrap(), b"fixture");
         }
         let registry = hipfire_registry::bundled().unwrap();
@@ -8227,7 +8814,10 @@ mod tests {
         let rtn = paths.models.join("qwen3.8-flash-next.mq4");
         fs::write(&rtn, b"historical RTN").unwrap();
         assert_eq!(migrate_flash_next_xts(&paths, entry).unwrap(), None);
-        assert_eq!(resolve_model_path(&paths, &registry, "qwen3.8:flash-next").unwrap(), None);
+        assert_eq!(
+            resolve_model_path(&paths, &registry, "qwen3.8:flash-next").unwrap(),
+            None
+        );
         let (_, rtn_entry) = registry.model("qwen3.8:flash-next-rtn-asym").unwrap();
         assert!(!rtn_entry.is_flash_next_xts());
         assert_eq!(migrate_flash_next_xts(&paths, rtn_entry).unwrap(), None);
@@ -8241,7 +8831,9 @@ mod tests {
         let paths = test_paths("migration-cross-device");
         fs::create_dir_all(&paths.models).unwrap();
         let shared = Path::new("/dev/shm");
-        if !shared.is_dir() || fs::metadata(shared).unwrap().dev() == fs::metadata(&paths.root).unwrap().dev() {
+        if !shared.is_dir()
+            || fs::metadata(shared).unwrap().dev() == fs::metadata(&paths.root).unwrap().dev()
+        {
             fs::remove_dir_all(paths.root).unwrap();
             return;
         }
@@ -8249,14 +8841,18 @@ mod tests {
         fs::write(&old, b"fixture").unwrap();
         let canonical = shared.join(paths.root.file_name().unwrap());
         let digest = format!("{:x}", Sha256::digest(b"fixture"));
-        assert_eq!(migrate_verified_artifact(&old, &canonical, &digest, 7).unwrap(), Some(canonical.clone()));
-        assert!(fs::symlink_metadata(&canonical).unwrap().file_type().is_symlink());
+        assert_eq!(
+            migrate_verified_artifact(&old, &canonical, &digest, 7).unwrap(),
+            Some(canonical.clone())
+        );
+        assert!(fs::symlink_metadata(&canonical)
+            .unwrap()
+            .file_type()
+            .is_symlink());
         assert!(same_installed_file(&old, &canonical));
         fs::remove_file(canonical).unwrap();
         fs::remove_dir_all(paths.root).unwrap();
     }
-
-
 
     fn idle_test_meta() -> ServeMeta {
         ServeMeta {
@@ -10283,6 +10879,78 @@ mod tests {
     }
 
     #[test]
+    fn unknown_model_suggests_close_tags_and_list() {
+        let registry = rm_test_registry(&[
+            ("qwen3.5:4b", "qwen3.5-4b.mq4", None),
+            ("qwen3.5:9b", "qwen3.5-9b.mq4", None),
+            ("qwen3.8:27b-mq4", "qwen3.8-27b.mq4", None),
+        ]);
+        let message = unknown_model_error(&registry, "qwen3.5:4bb").to_string();
+        assert!(
+            message.starts_with("unknown model 'qwen3.5:4bb'"),
+            "{message}"
+        );
+        assert!(message.contains("did you mean: qwen3.5:4b"), "{message}");
+        assert!(message.ends_with("see: hipfire list -r"), "{message}");
+        let message = unknown_model_error(&registry, "QWEN35:4B").to_string();
+        assert!(message.contains("did you mean: qwen3.5:4b"), "{message}");
+        let message = unknown_model_error(&registry, "llama3:8b").to_string();
+        assert!(!message.contains("did you mean"), "{message}");
+        assert!(message.contains("see: hipfire list -r"), "{message}");
+        assert_eq!(edit_distance("kitten", "sitting"), 3);
+    }
+
+    #[test]
+    fn rm_of_known_tag_not_downloaded_says_so() {
+        let paths = test_paths("rm-not-downloaded");
+        fs::create_dir_all(&paths.models).unwrap();
+        let registry = rm_test_registry(&[("qwen3.8:27b", "qwen3.8-27b.mq4", None)]);
+        let rm = |model: &str| {
+            rm_with_registry(
+                &paths,
+                &registry,
+                RmArgs {
+                    model: model.into(),
+                    yes: true,
+                },
+            )
+            .unwrap_err()
+            .to_string()
+        };
+        assert_eq!(
+            rm("qwen3.8:27b"),
+            "qwen3.8:27b is not downloaded; nothing to remove"
+        );
+        assert!(rm("qwen3.8:27bb").contains("did you mean: qwen3.8:27b"));
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn serve_and_run_accept_spec_and_max_seq() {
+        let parsed =
+            Cli::try_parse_from(["hipfire", "serve", "--spec", "off", "--max-seq", "8192"])
+                .unwrap();
+        let Some(Commands::Serve(args)) = parsed.command else {
+            panic!("expected serve command")
+        };
+        assert_eq!(args.speculation.as_deref(), Some("off"));
+        assert_eq!(args.max_seq, Some(8192));
+        assert!(Cli::try_parse_from(["hipfire", "serve", "--spec", "bogus"]).is_err());
+        assert!(Cli::try_parse_from(["hipfire", "serve", "--max-seq", "1"]).is_err());
+        let parsed =
+            Cli::try_parse_from(["hipfire", "run", "qwen3.5:4b", "--max-seq", "4096", "hi"])
+                .unwrap();
+        let Some(Commands::Run(args)) = parsed.command else {
+            panic!("expected run command")
+        };
+        assert_eq!(args.max_seq, Some(4096));
+        assert!(
+            run_should_force_local(&args),
+            "--max-seq needs a local load"
+        );
+    }
+
+    #[test]
     fn rm_keeps_shared_dflash_sidecar_while_sibling_target_present() {
         // The hw-gate regression on PR #686: `qwen3.8:27b`, `qwen3.8:27b-mq4-pro`,
         // and `qwen3.8:27b-mq4-xt` all declare `qwen38-27b-dflash-mq4.hfq`.
@@ -10837,7 +11505,7 @@ mod tests {
             message.contains("not a registry-managed artifact"),
             "{message}"
         );
-        assert!(message.contains("developer.dflash_draft"), "{message}");
+        assert!(message.contains("--model-draft"), "{message}");
         let resolved = resolved_with_dflash_mode("auto", None);
         let params = load_params(
             &resolved,
@@ -10928,6 +11596,9 @@ mod tests {
             }
         }
 
+        // `HIPFIRE_HF_BASE` is process-global: the pull tests point it at
+        // their local servers under the same lock.
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
         let _hf_base = EnvRestore("HIPFIRE_HF_BASE", env::var_os("HIPFIRE_HF_BASE"));
         let _hf_endpoint = EnvRestore("HF_ENDPOINT", env::var_os("HF_ENDPOINT"));
         let registry = hipfire_registry::bundled().unwrap();
@@ -12299,14 +12970,13 @@ mod tests {
                     engine,
                     paths: paths.clone(),
                     registry,
-                    vmm_batch: crate::serve::VmmBatchFlags::default(),
                     current_path: None,
                     current_arch: None,
                     current_reasoning_contract: ReasoningContract::Unsupported,
                     current_reasoning_effort_native: false,
                     current_reasoning_efforts: Vec::new(),
                     continuous_batch_capable: false,
-                    continuous_batch_vmm: false,
+                    continuous_batch_history: false,
                     current_max_seq: 0,
                     cache_capable: false,
                     kv_override: None,
@@ -12315,7 +12985,10 @@ mod tests {
                     kv_backend_override: None,
                     vision_override: None,
                     tp: None,
+                    speculation_override: None,
+                    max_seq_override: None,
                     continuous_batch_size: 1,
+                    vmm_batch: crate::serve::VmmBatchFlags::default(),
                     multi_slot_enabled: false,
                     multi_slot_slots: 4,
                     multi_slot_ctx: 8192,
@@ -12619,7 +13292,11 @@ mod tests {
         assert_eq!(status, 200, "{text}");
         let health = serve_health(h.port()).1;
         assert_eq!(health["model"], serde_json::json!(h.model()));
-        assert_eq!(health["n_ctx"], serde_json::json!(4096), "the load ack's max_seq");
+        assert_eq!(
+            health["n_ctx"],
+            serde_json::json!(4096),
+            "the load ack's max_seq"
+        );
 
         fs::write(h.paths.models.join("t20-load-fail.hfq"), b"x").unwrap();
         let mut bad = h.base_body("t11-stop-text", false);
@@ -12628,12 +13305,18 @@ mod tests {
         assert_ne!(status, 200, "{text}");
         let health = serve_health(h.port()).1;
         assert!(health["model"].is_null());
-        assert!(health["n_ctx"].is_null(), "no context is advertised with nothing resident");
+        assert!(
+            health["n_ctx"].is_null(),
+            "no context is advertised with nothing resident"
+        );
 
         let (status, _, text) = post_status(h.port(), &h.base_body("t11-stop-text", false));
         assert_eq!(status, 200, "{text}");
         let loads = Task11HttpHarness::ops_of_type(&h.read_requests_log(), "load").len();
-        assert_eq!(loads, 3, "initial load, failed switch, reload of the old model");
+        assert_eq!(
+            loads, 3,
+            "initial load, failed switch, reload of the old model"
+        );
     }
 
     /// A daemon that exits (crash, or a sticky GPU fault after which it exits
@@ -12662,7 +13345,10 @@ mod tests {
     #[test]
     fn serve_health_is_unhealthy_until_the_daemon_is_back() {
         let h = Task11HttpHarness::spawn("respawn-health");
-        assert_eq!(post_status(h.port(), &h.base_body("t11-stop-text", false)).0, 200);
+        assert_eq!(
+            post_status(h.port(), &h.base_body("t11-stop-text", false)).0,
+            200
+        );
         let daemon = {
             let mut runtime = h.shared.runtime.lock().unwrap();
             std::mem::replace(
@@ -12684,7 +13370,10 @@ mod tests {
         assert_eq!(status, 200);
         assert_eq!(health["status"], "ok");
         assert_eq!(health["model"], serde_json::json!(h.model()));
-        assert_eq!(post_status(h.port(), &h.base_body("t11-stop-text", false)).0, 200);
+        assert_eq!(
+            post_status(h.port(), &h.base_body("t11-stop-text", false)).0,
+            200
+        );
         // The supervisor reloaded the model; the request did not load again.
         let loads = Task11HttpHarness::ops_of_type(&h.read_requests_log(), "load").len();
         assert_eq!(loads, 2);
@@ -12778,8 +13467,7 @@ mod tests {
         let choice = &json["choices"][0];
         assert_eq!(choice["finish_reason"], "tool_calls", "{text}");
         assert_eq!(
-            choice["message"]["tool_calls"][0]["function"]["name"],
-            "read_file",
+            choice["message"]["tool_calls"][0]["function"]["name"], "read_file",
             "{text}"
         );
     }
@@ -12965,10 +13653,17 @@ mod tests {
     /// Raw non-stream POST; returns HTTP status and body bytes (no client parse).
     #[cfg(unix)]
     fn raw_nonstream_post(port: u16, body: &serde_json::Value) -> (u16, Vec<u8>) {
+        raw_post(port, "/v1/chat/completions", body)
+    }
+
+    /// Raw `POST path` with `Connection: close`: HTTP status and the
+    /// de-chunked body (a whole SSE stream for streaming requests).
+    #[cfg(unix)]
+    fn raw_post(port: u16, path: &str, body: &serde_json::Value) -> (u16, Vec<u8>) {
         use std::net::TcpStream;
         let payload = body.to_string();
         let request = format!(
-            "POST /v1/chat/completions HTTP/1.1\r\n\
+            "POST {path} HTTP/1.1\r\n\
              Host: 127.0.0.1:{port}\r\n\
              Content-Type: application/json\r\n\
              Content-Length: {}\r\n\
@@ -13031,6 +13726,395 @@ mod tests {
             remaining = &remaining[size + 2..];
         }
         (status, decoded)
+    }
+
+    /// `(event, data)` pairs of a named-event SSE body (keepalives skipped).
+    #[cfg(unix)]
+    fn named_sse_events(bytes: &[u8]) -> Vec<(String, serde_json::Value)> {
+        String::from_utf8(bytes.to_vec())
+            .expect("SSE body is UTF-8")
+            .split("\n\n")
+            .filter(|frame| !frame.trim().is_empty() && !frame.starts_with(':'))
+            .map(|frame| {
+                let mut event = None;
+                let mut data = None;
+                for line in frame.lines() {
+                    if let Some(name) = line.strip_prefix("event: ") {
+                        event = Some(name.to_owned());
+                    } else if let Some(json) = line.strip_prefix("data: ") {
+                        data = Some(serde_json::from_str(json).expect("SSE data is JSON"));
+                    }
+                }
+                (
+                    event.unwrap_or_else(|| panic!("frame without event: {frame}")),
+                    data.unwrap_or_else(|| panic!("frame without data: {frame}")),
+                )
+            })
+            .collect()
+    }
+
+    /// The last `generate` the fake daemon received, minus its per-request
+    /// wire ids, so two HTTP requests can be compared as daemon requests.
+    #[cfg(unix)]
+    fn last_generate_without_ids(h: &Task11HttpHarness) -> serde_json::Value {
+        let log = h.read_requests_log();
+        let mut generate = (*Task11HttpHarness::ops_of_type(&log, "generate")
+            .last()
+            .expect("a generate reached the daemon"))
+        .clone();
+        let obj = generate.as_object_mut().unwrap();
+        obj.remove("id");
+        obj.remove("attempt_id");
+        generate
+    }
+
+    /// A Messages or Responses request reaches the daemon as exactly the
+    /// generate its chat-completions twin sends: same messages, sampling,
+    /// stops and reasoning controls. Admission, batching eligibility and the
+    /// session cache all key on that request, so they behave identically.
+    #[cfg(unix)]
+    #[test]
+    fn messages_and_responses_reach_the_daemon_as_their_chat_twin() {
+        let h = Task11HttpHarness::spawn("adapter-twins");
+        let chat = serde_json::json!({
+            "model": h.model(),
+            "max_tokens": 64,
+            "messages": [
+                { "role": "system", "content": "Be brief." },
+                { "role": "user", "content": "t11-stop-text please" },
+            ],
+            "stop": ["END"],
+            "temperature": 0.2,
+            "top_k": 20,
+            "thinking": { "type": "disabled" },
+        });
+        assert_eq!(raw_post(h.port(), "/v1/chat/completions", &chat).0, 200);
+        let chat_generate = last_generate_without_ids(&h);
+
+        let messages = serde_json::json!({
+            "model": h.model(),
+            "max_tokens": 64,
+            "system": "Be brief.",
+            "messages": [{ "role": "user", "content": [{ "type": "text", "text": "t11-stop-text please" }] }],
+            "stop_sequences": ["END"],
+            "temperature": 0.2,
+            "top_k": 20,
+        });
+        assert_eq!(raw_post(h.port(), "/v1/messages", &messages).0, 200);
+        assert_eq!(last_generate_without_ids(&h), chat_generate);
+
+        let mut chat_effort = chat.clone();
+        chat_effort.as_object_mut().unwrap().remove("thinking");
+        chat_effort["reasoning_effort"] = serde_json::json!("low");
+        assert_eq!(
+            raw_post(h.port(), "/v1/chat/completions", &chat_effort).0,
+            200
+        );
+        let chat_generate = last_generate_without_ids(&h);
+        let responses = serde_json::json!({
+            "model": h.model(),
+            "max_output_tokens": 64,
+            "instructions": "Be brief.",
+            "input": [{ "role": "user", "content": [{ "type": "input_text", "text": "t11-stop-text please" }] }],
+            "stop": ["END"],
+            "temperature": 0.2,
+            "top_k": 20,
+            "reasoning": { "effort": "low" },
+        });
+        assert_eq!(raw_post(h.port(), "/v1/responses", &responses).0, 200);
+        assert_eq!(last_generate_without_ids(&h), chat_generate);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn anthropic_messages_nonstream_and_stream_shapes() {
+        let h = Task11HttpHarness::spawn("anthropic-messages");
+        let body = serde_json::json!({
+            "model": h.model(),
+            "max_tokens": 64,
+            "thinking": { "type": "enabled", "budget_tokens": 1024 },
+            "messages": [{ "role": "user", "content": "t21-think-text please" }],
+        });
+        let (status, bytes) = raw_post(h.port(), "/v1/messages", &body);
+        let message: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, 200, "{message}");
+        assert_eq!(message["type"], "message");
+        assert_eq!(message["role"], "assistant");
+        assert!(message["id"].as_str().unwrap().starts_with("msg_"));
+        assert_eq!(
+            message["content"],
+            serde_json::json!([
+                { "type": "thinking", "thinking": "plan it", "signature": "" },
+                { "type": "text", "text": "answer text" },
+            ])
+        );
+        assert_eq!(message["stop_reason"], "end_turn");
+        assert_eq!(
+            message["usage"],
+            serde_json::json!({ "input_tokens": 9, "cache_creation_input_tokens": 0,
+                                "cache_read_input_tokens": 2, "output_tokens": 5 })
+        );
+
+        let mut stream_body = body.clone();
+        stream_body["stream"] = serde_json::json!(true);
+        let (status, bytes) = raw_post(h.port(), "/v1/messages", &stream_body);
+        assert_eq!(status, 200);
+        let events = named_sse_events(&bytes);
+        let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_stop",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+        let thinking: String = events
+            .iter()
+            .filter_map(|(_, data)| data.pointer("/delta/thinking").and_then(|t| t.as_str()))
+            .collect();
+        let text: String = events
+            .iter()
+            .filter_map(|(_, data)| data.pointer("/delta/text").and_then(|t| t.as_str()))
+            .collect();
+        assert_eq!(
+            (thinking.as_str(), text.as_str()),
+            ("plan it", "answer text")
+        );
+        assert_eq!(events[9].1["delta"]["stop_reason"], "end_turn");
+        assert_eq!(events[9].1["usage"]["output_tokens"], 5);
+
+        // Errors keep the Anthropic shape and the chat route's status mapping.
+        let (status, bytes) = raw_post(
+            h.port(),
+            "/v1/messages",
+            &serde_json::json!({ "model": h.model(), "messages": [] }),
+        );
+        let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, 400);
+        assert_eq!(error["type"], "error");
+        assert_eq!(error["error"]["type"], "invalid_request_error");
+        let mut unknown = body.clone();
+        unknown["model"] = serde_json::json!("qwen3.5:0.8b");
+        let (status, bytes) = raw_post(h.port(), "/v1/messages", &unknown);
+        let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, 404);
+        assert_eq!(error["error"]["type"], "not_found_error");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn anthropic_messages_tool_use_round_trip() {
+        let h = Task11HttpHarness::spawn("anthropic-tools");
+        let tools = serde_json::json!([{
+            "name": "read_file",
+            "description": "read a file",
+            "input_schema": { "type": "object", "properties": { "path": { "type": "string" } } },
+        }]);
+        let first = serde_json::json!({
+            "model": h.model(),
+            "max_tokens": 64,
+            "tools": tools,
+            "messages": [{ "role": "user", "content": "t11-mixed-tool please" }],
+        });
+        let (status, bytes) = raw_post(h.port(), "/v1/messages", &first);
+        let message: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, 200, "{message}");
+        assert_eq!(message["stop_reason"], "tool_use");
+        let content = message["content"].as_array().unwrap();
+        assert_eq!(
+            content[0],
+            serde_json::json!({ "type": "text", "text": "I'll look that up." })
+        );
+        assert_eq!(content[1]["type"], "tool_use");
+        assert_eq!(content[1]["name"], "read_file");
+        assert_eq!(
+            content[1]["input"],
+            serde_json::json!({ "path": "mixed.rs" })
+        );
+        let tool_id = content[1]["id"].as_str().unwrap().to_owned();
+
+        let mut stream_body = first.clone();
+        stream_body["stream"] = serde_json::json!(true);
+        let (status, bytes) = raw_post(h.port(), "/v1/messages", &stream_body);
+        assert_eq!(status, 200);
+        let events = named_sse_events(&bytes);
+        let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+        assert_eq!(events[4].1["content_block"]["type"], "tool_use");
+        assert_eq!(events[4].1["index"], 1);
+        assert_eq!(
+            events[5].1["delta"],
+            serde_json::json!({ "type": "input_json_delta", "partial_json": "{\"path\":\"mixed.rs\"}" })
+        );
+        assert_eq!(events[7].1["delta"]["stop_reason"], "tool_use");
+
+        // Send the tool result back: the daemon gets the chat tool turn.
+        let second = serde_json::json!({
+            "model": h.model(),
+            "max_tokens": 64,
+            "tools": tools,
+            "messages": [
+                { "role": "user", "content": "t11-mixed-tool please" },
+                { "role": "assistant", "content": message["content"] },
+                { "role": "user", "content": [{ "type": "tool_result", "tool_use_id": tool_id, "content": "fn main() {}" }] },
+            ],
+        });
+        assert_eq!(raw_post(h.port(), "/v1/messages", &second).0, 200);
+        let generate = last_generate_without_ids(&h);
+        let sent = generate["messages"].as_array().unwrap();
+        assert_eq!(sent[1]["role"], "assistant");
+        assert_eq!(sent[1]["tool_calls"][0]["name"], "read_file");
+        assert_eq!(
+            sent[1]["tool_calls"][0]["arguments"],
+            serde_json::json!({ "path": "mixed.rs" })
+        );
+        assert_eq!(sent[1]["tool_calls"][0]["id"], serde_json::json!(tool_id));
+        assert_eq!(sent[2]["role"], "tool");
+        assert_eq!(sent[2]["content"], "fn main() {}");
+        assert_eq!(sent[2]["tool_call_id"], serde_json::json!(tool_id));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn openai_responses_shapes_and_function_call_round_trip() {
+        let h = Task11HttpHarness::spawn("openai-responses");
+        let body = serde_json::json!({
+            "model": h.model(),
+            "input": "t21-think-text please",
+            "max_output_tokens": 64,
+        });
+        let (status, bytes) = raw_post(h.port(), "/v1/responses", &body);
+        let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, 200, "{response}");
+        assert_eq!(response["object"], "response");
+        assert_eq!(response["status"], "completed");
+        assert!(response["id"].as_str().unwrap().starts_with("resp_"));
+        let output = response["output"].as_array().unwrap();
+        assert_eq!(output[0]["type"], "reasoning");
+        assert_eq!(output[0]["content"][0]["text"], "plan it");
+        assert_eq!(output[1]["type"], "message");
+        assert_eq!(output[1]["content"][0]["text"], "answer text");
+        assert_eq!(
+            response["usage"],
+            serde_json::json!({ "input_tokens": 11, "input_tokens_details": { "cached_tokens": 2 },
+                                "output_tokens": 5, "total_tokens": 16 })
+        );
+
+        let mut stream_body = body.clone();
+        stream_body["stream"] = serde_json::json!(true);
+        let (status, bytes) = raw_post(h.port(), "/v1/responses", &stream_body);
+        assert_eq!(status, 200);
+        let events = named_sse_events(&bytes);
+        let names: Vec<&str> = events.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.reasoning_text.delta",
+                "response.reasoning_text.delta",
+                "response.reasoning_text.done",
+                "response.output_item.done",
+                "response.output_item.added",
+                "response.content_part.added",
+                "response.output_text.delta",
+                "response.output_text.delta",
+                "response.output_text.done",
+                "response.content_part.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+        for (seq, (_, data)) in events.iter().enumerate() {
+            assert_eq!(data["sequence_number"], serde_json::json!(seq));
+        }
+        assert_eq!(events[11].1["text"], "answer text");
+
+        let tools = serde_json::json!([{
+            "type": "function",
+            "name": "read_file",
+            "description": "read a file",
+            "parameters": { "type": "object", "properties": { "path": { "type": "string" } } },
+        }]);
+        let call = serde_json::json!({ "model": h.model(), "input": "t11-pure-tool please", "tools": tools });
+        let (status, bytes) = raw_post(h.port(), "/v1/responses", &call);
+        let response: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, 200, "{response}");
+        let output = response["output"].as_array().unwrap();
+        assert_eq!(output.len(), 1);
+        assert_eq!(output[0]["type"], "function_call");
+        assert_eq!(output[0]["name"], "read_file");
+        assert_eq!(output[0]["arguments"], "{\"path\":\"a.rs\"}");
+        let call_id = output[0]["call_id"].as_str().unwrap().to_owned();
+
+        let mut stream_call = call.clone();
+        stream_call["stream"] = serde_json::json!(true);
+        let (status, bytes) = raw_post(h.port(), "/v1/responses", &stream_call);
+        assert_eq!(status, 200);
+        let names: Vec<String> = named_sse_events(&bytes)
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(
+            names,
+            [
+                "response.created",
+                "response.in_progress",
+                "response.output_item.added",
+                "response.function_call_arguments.delta",
+                "response.function_call_arguments.done",
+                "response.output_item.done",
+                "response.completed",
+            ]
+        );
+
+        let mut input =
+            vec![serde_json::json!({ "role": "user", "content": "t11-pure-tool please" })];
+        input.extend(output.iter().cloned());
+        input.push(serde_json::json!({ "type": "function_call_output", "call_id": call_id, "output": "fn main() {}" }));
+        let round_trip = serde_json::json!({ "model": h.model(), "input": input, "tools": tools });
+        assert_eq!(raw_post(h.port(), "/v1/responses", &round_trip).0, 200);
+        let generate = last_generate_without_ids(&h);
+        let sent = generate["messages"].as_array().unwrap();
+        assert_eq!(
+            sent[1]["tool_calls"][0]["arguments"],
+            serde_json::json!({ "path": "a.rs" })
+        );
+        assert_eq!(sent[1]["tool_calls"][0]["id"], serde_json::json!(call_id));
+        assert_eq!(sent[2]["role"], "tool");
+        assert_eq!(sent[2]["tool_call_id"], serde_json::json!(call_id));
+
+        let (status, bytes) = raw_post(
+            h.port(),
+            "/v1/responses",
+            &serde_json::json!({ "model": h.model(), "input": "x", "previous_response_id": "resp_1" }),
+        );
+        let error: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(status, 400);
+        assert_eq!(error["error"]["type"], "invalid_request_error");
     }
 
     /// Write a non-stream request and return the live TCP stream without reading status.
@@ -13483,7 +14567,10 @@ mod tests {
             bench_generate_request_reasoning("p", 128, false),
             bench_generate_request_reasoning("p", 128, true),
         ] {
-            assert_eq!(req.get("repeat_penalty").and_then(|v| v.as_f64()), Some(1.0));
+            assert_eq!(
+                req.get("repeat_penalty").and_then(|v| v.as_f64()),
+                Some(1.0)
+            );
         }
     }
 
@@ -13522,7 +14609,7 @@ mod tests {
             pp: vec![128],
             ctx: vec![128],
             tg: 128,
-            max_tokens: 128,
+            max_tokens: None,
             sustained_tg: None,
             sustained_ctx: vec![128],
             warmups: 1,
@@ -13537,6 +14624,10 @@ mod tests {
             concurrency: None,
             backend: "both".to_owned(),
             workload: "both".to_owned(),
+            bench_shape: "steady".to_owned(),
+            bb_corpus: None,
+            num_prompts: None,
+            temperature: None,
             prompt,
             prompt_file,
         }
@@ -14419,6 +15510,7 @@ mod tests {
             head: Some("q4k".into()),
             kv_backend: None,
             tp: None,
+            max_seq: None,
             speculation: None,
             model_draft: None,
             vision: None,
@@ -14694,6 +15786,7 @@ mod tests {
             PullArgs {
                 model: "test-model".into(),
                 force: false,
+                ple: ple::PleSelection::Auto,
             },
         )
         .unwrap();
@@ -14765,6 +15858,7 @@ mod tests {
             PullArgs {
                 model: "test-model".into(),
                 force: false,
+                ple: ple::PleSelection::Auto,
             },
         )
         .unwrap();
@@ -15348,5 +16442,439 @@ mod tests {
         drop(early);
         let (status, _, _) = raw_chat_post(port, &harness.base_body("t11-stop-text", false));
         assert_eq!(status, 200);
+    }
+
+    // ---- PLE split layout: pull, on-demand, tag fallback, rm, listings --------
+
+    fn ple_sha(data: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        format!("{:x}", Sha256::digest(data))
+    }
+
+    /// Serves exactly `files.len()` requests, matching the LAST path segment
+    /// exactly (the shared `tiny_http_server` matches substrings, which cannot
+    /// tell `x-base.mq4` from `x-base.mq4.ple-q8`).
+    fn exact_http_server(
+        files: std::collections::HashMap<String, Vec<u8>>,
+    ) -> (String, std::thread::JoinHandle<()>) {
+        use std::net::TcpListener;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://127.0.0.1:{}", listener.local_addr().unwrap().port());
+        let expected = files.len();
+        let handle = std::thread::spawn(move || {
+            for _ in 0..expected {
+                let (mut stream, _) = listener.accept().unwrap();
+                let _ = stream.set_read_timeout(Some(Duration::from_secs(2)));
+                let mut buf = [0u8; 4096];
+                let n = stream.read(&mut buf).unwrap_or(0);
+                let request = String::from_utf8_lossy(&buf[..n]).into_owned();
+                let target = request
+                    .split_whitespace()
+                    .nth(1)
+                    .and_then(|path| path.rsplit('/').next())
+                    .unwrap_or_default()
+                    .to_owned();
+                match files.get(&target) {
+                    Some(data) => {
+                        let header = format!(
+                            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                            data.len()
+                        );
+                        let _ = stream.write_all(header.as_bytes());
+                        let _ = stream.write_all(data);
+                    }
+                    None => {
+                        let _ = stream.write_all(
+                            b"HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+                        );
+                    }
+                }
+                let _ = stream.flush();
+            }
+        });
+        (base, handle)
+    }
+
+    const PLE_BASE: &[u8] = b"split-base-bytes";
+    const PLE_Q8: &[u8] = b"q8-rows-bytes";
+    const PLE_Q4: &[u8] = b"q4-rows";
+
+    /// `split-model` is the split entry (base + both slots); `split-model:mono`
+    /// is its non-pinned monolithic sibling.
+    fn split_registry_raw() -> String {
+        format!(
+            r#"{{
+            "schema_version":1,
+            "generated_at":"2099-01-01T00:00:00Z",
+            "models":{{
+                "split-model":{{
+                    "repo":"test/repo","file":"split-model-base.mq4","size_gb":0.001,
+                    "min_vram_gb":1,"desc":"x","sha256":"{}","size_bytes":{},
+                    "ple_q8":{{"file":"split-model-base.mq4.ple-q8","sha256":"{}","size_bytes":{}}},
+                    "ple_q4":{{"file":"split-model-base.mq4.ple-q4","sha256":"{}","size_bytes":{}}}
+                }},
+                "split-model:mono":{{
+                    "repo":"test/repo","file":"split-model.mq4","size_gb":0.001,
+                    "min_vram_gb":1,"desc":"x"
+                }}
+            }},
+            "aliases":{{}}
+        }}"#,
+            ple_sha(PLE_BASE),
+            PLE_BASE.len(),
+            ple_sha(PLE_Q8),
+            PLE_Q8.len(),
+            ple_sha(PLE_Q4),
+            PLE_Q4.len(),
+        )
+    }
+
+    #[test]
+    fn pull_downloads_the_base_and_only_the_selected_ple_sidecars() {
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let cases = [
+            (ple::PleSelection::Q8, false, true),
+            (ple::PleSelection::Q4, true, false),
+            (ple::PleSelection::All, true, true),
+            (ple::PleSelection::Skip, false, false),
+        ];
+        for (index, (selection, want_q4, want_q8)) in cases.into_iter().enumerate() {
+            let paths = test_paths(&format!("ple-pull-{index}"));
+            write_test_registry_cache(&paths, &split_registry_raw());
+            let mut files = std::collections::HashMap::new();
+            files.insert("split-model-base.mq4".to_owned(), PLE_BASE.to_vec());
+            if want_q8 {
+                files.insert("split-model-base.mq4.ple-q8".to_owned(), PLE_Q8.to_vec());
+            }
+            if want_q4 {
+                files.insert("split-model-base.mq4.ple-q4".to_owned(), PLE_Q4.to_vec());
+            }
+            let (base, handle) = exact_http_server(files);
+            let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+            pull_command(
+                &paths,
+                PullArgs {
+                    model: "split-model".into(),
+                    force: false,
+                    ple: selection,
+                },
+            )
+            .unwrap();
+            handle.join().unwrap();
+            let models = &paths.models;
+            assert_eq!(
+                fs::read(models.join("split-model-base.mq4")).unwrap(),
+                PLE_BASE
+            );
+            assert_eq!(
+                fs::read(models.join("split-model-base.mq4.ple-q8")).ok(),
+                want_q8.then(|| PLE_Q8.to_vec()),
+                "{selection:?}"
+            );
+            assert_eq!(
+                fs::read(models.join("split-model-base.mq4.ple-q4")).ok(),
+                want_q4.then(|| PLE_Q4.to_vec()),
+                "{selection:?}"
+            );
+            fs::remove_dir_all(&paths.root).unwrap();
+        }
+    }
+
+    #[test]
+    fn pull_rejects_a_ple_sidecar_that_fails_verification() {
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let paths = test_paths("ple-pull-corrupt");
+        write_test_registry_cache(&paths, &split_registry_raw());
+        let mut files = std::collections::HashMap::new();
+        files.insert("split-model-base.mq4".to_owned(), PLE_BASE.to_vec());
+        files.insert(
+            "split-model-base.mq4.ple-q8".to_owned(),
+            b"tampered-rows".to_vec(),
+        );
+        let (base, handle) = exact_http_server(files);
+        let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        let error = pull_command(
+            &paths,
+            PullArgs {
+                model: "split-model".into(),
+                force: false,
+                ple: ple::PleSelection::Q8,
+            },
+        )
+        .unwrap_err();
+        handle.join().unwrap();
+        assert!(format!("{error:#}").contains("mismatch"), "{error:#}");
+        assert!(
+            !paths.models.join("split-model-base.mq4.ple-q8").exists(),
+            "a failed verification must not leave the sidecar installed"
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn on_demand_downloads_the_selected_sidecar_once_and_leaves_usable_files_alone() {
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let paths = test_paths("ple-on-demand");
+        fs::create_dir_all(&paths.models).unwrap();
+        let registry = RegistryV1::parse(&split_registry_raw(), "ple on-demand").unwrap();
+        let (tag, entry) = registry.model("split-model").unwrap();
+        let model = paths.models.join(&entry.file);
+        fs::write(&model, PLE_BASE).unwrap();
+        let q8 = paths.models.join("split-model-base.mq4.ple-q8");
+        let q4 = paths.models.join("split-model-base.mq4.ple-q4");
+
+        // q8 requested and absent: one verified download.
+        let mut files = std::collections::HashMap::new();
+        files.insert("split-model-base.mq4.ple-q8".to_owned(), PLE_Q8.to_vec());
+        let (base, handle) = exact_http_server(files);
+        let _hf = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        DOWNLOAD_INVOCATIONS.with(|count| count.set(0));
+        ple::ensure_ple_sidecar(
+            &registry,
+            Some(entry),
+            Some(tag),
+            &model,
+            hipfire_config::memory::PleFormatRequest::Q8,
+            true,
+        )
+        .unwrap();
+        handle.join().unwrap();
+        assert_eq!(fs::read(&q8).unwrap(), PLE_Q8);
+        DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 1));
+
+        // Present now: q8 and q4 requests, and auto, download nothing (no server).
+        for request in [
+            hipfire_config::memory::PleFormatRequest::Q8,
+            hipfire_config::memory::PleFormatRequest::Q4,
+            hipfire_config::memory::PleFormatRequest::Auto,
+        ] {
+            ple::ensure_ple_sidecar(&registry, Some(entry), Some(tag), &model, request, true)
+                .unwrap();
+        }
+        DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 1));
+        assert!(
+            !q4.exists(),
+            "q4 is derived locally from the q8 rows, never downloaded"
+        );
+
+        // q4 requested with neither file present: the q4 sidecar is fetched.
+        fs::remove_file(&q8).unwrap();
+        let mut files = std::collections::HashMap::new();
+        files.insert("split-model-base.mq4.ple-q4".to_owned(), PLE_Q4.to_vec());
+        let (base, handle) = exact_http_server(files);
+        let _hf2 = EnvGuard::set("HIPFIRE_HF_BASE", &base);
+        ple::ensure_ple_sidecar(
+            &registry,
+            Some(entry),
+            Some(tag),
+            &model,
+            hipfire_config::memory::PleFormatRequest::Q4,
+            true,
+        )
+        .unwrap();
+        handle.join().unwrap();
+        assert_eq!(fs::read(&q4).unwrap(), PLE_Q4);
+        assert!(!q8.exists());
+        DOWNLOAD_INVOCATIONS.with(|count| assert_eq!(count.get(), 2));
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn split_tag_serves_a_local_monolithic_instead_of_forcing_a_download() {
+        let paths = test_paths("ple-tag-fallback");
+        fs::create_dir_all(&paths.models).unwrap();
+        let registry = RegistryV1::parse(&split_registry_raw(), "ple fallback").unwrap();
+        assert_eq!(
+            resolve_model_path(&paths, &registry, "split-model").unwrap(),
+            None
+        );
+        assert_eq!(find_model_path(&paths, &registry, "split-model"), None);
+
+        let mono = paths.models.join("split-model.mq4");
+        fs::write(&mono, b"monolithic").unwrap();
+        assert_eq!(
+            resolve_model_path(&paths, &registry, "split-model").unwrap(),
+            Some(mono.clone()),
+            "the split tag falls back to the local monolithic sibling"
+        );
+        // The sibling's own tag is unaffected.
+        assert_eq!(
+            resolve_model_path(&paths, &registry, "split-model:mono").unwrap(),
+            Some(mono.clone())
+        );
+
+        // Once the split base is installed it wins.
+        let base = paths.models.join("split-model-base.mq4");
+        fs::write(&base, PLE_BASE).unwrap();
+        assert_eq!(
+            resolve_model_path(&paths, &registry, "split-model").unwrap(),
+            Some(base.clone())
+        );
+        assert_eq!(
+            find_model_path(&paths, &registry, "split-model"),
+            Some(base)
+        );
+        // The split tag never fuzzy-matches an unrelated local file.
+        fs::remove_file(paths.models.join("split-model-base.mq4")).unwrap();
+        fs::remove_file(&mono).unwrap();
+        fs::write(paths.models.join("split-model.mq4r"), b"other tier").unwrap();
+        assert_eq!(
+            resolve_model_path(&paths, &registry, "split-model").unwrap(),
+            None
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn split_tag_verifies_the_pinned_monolithic_like_its_own_tag() {
+        let paths = test_paths("ple-tag-fallback-pinned");
+        fs::create_dir_all(&paths.models).unwrap();
+        let raw = r#"{
+            "schema_version":1,
+            "generated_at":"2099-01-01T00:00:00Z",
+            "models":{
+                "qwen3.8:flash-next":{
+                    "repo":"hipfire-models/qwen3.8-flash-next",
+                    "file":"qwen3.8-flash-next-base.mq4-xts","size_gb":70.9,"min_vram_gb":8,"desc":"split",
+                    "ple_q8":{"file":"qwen3.8-flash-next-base.mq4-xts.ple-q8"}
+                },
+                "qwen3.8:flash-next-mq4-xts":{
+                    "repo":"hipfire-models/qwen3.8-flash-next",
+                    "file":"qwen3.8-flash-next.mq4-xts","size_gb":125.29,"min_vram_gb":8,"desc":"pin",
+                    "sha256":"8b15b6fede7d7c5bfed0db4720a8295bedda51bc93e545fa242bd50d0f200972",
+                    "size_bytes":125288544792
+                }
+            },
+            "aliases":{}
+        }"#;
+        let registry = RegistryV1::parse(raw, "ple pinned").unwrap();
+        assert_eq!(
+            resolve_model_path(&paths, &registry, "qwen3.8:flash-next").unwrap(),
+            None
+        );
+        // A wrong-size file under either grandfathered spelling is a verification
+        // error (never silently served), exactly as for the monolithic tag.
+        for name in [
+            "qwen3.8-flash-next.mq4-xts",
+            hipfire_registry::FLASH_NEXT_XTS_LEGACY_FILE,
+        ] {
+            let path = paths.models.join(name);
+            fs::write(&path, b"not the pinned bytes").unwrap();
+            let error = resolve_model_path(&paths, &registry, "qwen3.8:flash-next")
+                .unwrap_err()
+                .to_string();
+            assert!(error.contains("size mismatch"), "{name}: {error}");
+            fs::remove_file(&path).unwrap();
+        }
+        // With the split base installed the monolithic is never touched.
+        fs::write(
+            paths.models.join("qwen3.8-flash-next.mq4-xts"),
+            b"not the pinned bytes",
+        )
+        .unwrap();
+        let base = paths.models.join("qwen3.8-flash-next-base.mq4-xts");
+        fs::write(&base, b"base").unwrap();
+        assert_eq!(
+            resolve_model_path(&paths, &registry, "qwen3.8:flash-next").unwrap(),
+            Some(base)
+        );
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn rm_removes_ple_sidecars_with_either_layout() {
+        let _env_lock = TEST_ENV_LOCK.lock().unwrap();
+        let _reg = EnvGuard::set("HIPFIRE_REGISTRY_URL", "https://example.com/test.json");
+        let paths = test_paths("ple-rm");
+        write_test_registry_cache(&paths, &split_registry_raw());
+        fs::create_dir_all(&paths.models).unwrap();
+        let split_files = [
+            "split-model-base.mq4",
+            "split-model-base.mq4.ple-q4",
+            "split-model-base.mq4.ple-q8",
+            "split-model-base.mq4.ple-q4.plehotrows",
+            "split-model-base.mq4.ple-q8.plehotrows",
+            "split-model-base.mq4.plehot",
+        ];
+        for file in split_files {
+            fs::write(paths.models.join(file), b"x").unwrap();
+        }
+        fs::write(paths.models.join("untouched.mq4"), b"x").unwrap();
+        rm_command(
+            &paths,
+            RmArgs {
+                model: "split-model".into(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        for file in split_files {
+            assert!(!paths.models.join(file).exists(), "{file} must be removed");
+        }
+        assert!(paths.models.join("untouched.mq4").exists());
+
+        // A monolithic served under the split tag takes its derived q4 with it.
+        for file in ["split-model.mq4", "split-model.mq4.ple-q4"] {
+            fs::write(paths.models.join(file), b"x").unwrap();
+        }
+        rm_command(
+            &paths,
+            RmArgs {
+                model: "split-model".into(),
+                yes: true,
+            },
+        )
+        .unwrap();
+        assert!(!paths.models.join("split-model.mq4").exists());
+        assert!(!paths.models.join("split-model.mq4.ple-q4").exists());
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
+    #[test]
+    fn ple_sidecars_are_never_listed_or_served_as_models() {
+        let paths = test_paths("ple-listing");
+        fs::create_dir_all(&paths.models).unwrap();
+        let registry = RegistryV1::parse(&split_registry_raw(), "ple listing").unwrap();
+        let sidecars = [
+            "split-model-base.mq4.ple-q4",
+            "split-model-base.mq4.ple-q8",
+            "split-model-base.mq4.plehot",
+            "split-model-base.mq4.plehotrows",
+            "split-model-base.mq4.ple-q8.plehotrows",
+            "split-model.mq4.ple-q4",
+            "unregistered-base.mq4.ple-q8",
+        ];
+        for name in sidecars {
+            assert!(!is_listable_model_file(name, &registry), "{name}");
+            assert!(
+                !is_standalone_model(&paths.models.join(name), name, &registry),
+                "{name}"
+            );
+        }
+        for name in ["split-model-base.mq4", "split-model.mq4"] {
+            assert!(is_listable_model_file(name, &registry), "{name}");
+            assert!(
+                is_standalone_model(&paths.models.join(name), name, &registry),
+                "{name}"
+            );
+        }
+        for name in sidecars
+            .iter()
+            .chain(&["split-model-base.mq4", "split-model.mq4"])
+        {
+            fs::write(paths.models.join(name), b"x").unwrap();
+        }
+        let mut listed: Vec<String> = local_model_paths(&paths, &registry)
+            .unwrap()
+            .iter()
+            .filter_map(|path| path.file_name()?.to_str().map(str::to_owned))
+            .collect();
+        listed.sort();
+        assert_eq!(listed, ["split-model-base.mq4", "split-model.mq4"]);
+        assert!(registry_sidecar_files(&registry).contains("split-model-base.mq4.ple-q8"));
+        assert!(registry_sidecar_files(&registry).contains("split-model-base.mq4.ple-q4"));
+        fs::remove_dir_all(&paths.root).unwrap();
     }
 }

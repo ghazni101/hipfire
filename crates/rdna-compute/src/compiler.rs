@@ -1218,20 +1218,36 @@ impl KernelCompiler {
         if !source.is_file() {
             return;
         }
-        let request = ExistingCodeObjectRequest::new(&source, artifact, &self.arch)
+        if let Err(error) = self.certify_radiowave(name, &source, artifact, &manifest) {
+            eprintln!(
+                "  WARNING: {name}: Radiowave could not certify existing cache artifact: {error}"
+            );
+        }
+    }
+
+    /// Radiowave-certify `artifact`, compiled from `source` by this compiler,
+    /// into `manifest`: the inspection the runtime attaches to its own cache
+    /// entries, for offline packagers that ship the manifest beside the object.
+    pub fn certify_radiowave(
+        &self,
+        name: &str,
+        source: &Path,
+        artifact: &Path,
+        manifest: &Path,
+    ) -> Result<(), String> {
+        let request = ExistingCodeObjectRequest::new(source, artifact, &self.arch)
             .hipcc(&self.hipcc_bin)
             .command(vec![
                 self.hipcc_bin.display().to_string(),
                 "hipfire-kernel-cache".to_owned(),
                 name.to_owned(),
             ])
-            .manifest(&manifest)
+            .manifest(manifest)
             .scheduler_profile(self.scheduler_profile_for(name));
-        if let Err(error) = radiowave::Compiler.certify_existing(&request) {
-            eprintln!(
-                "  WARNING: {name}: Radiowave could not certify existing cache artifact: {error}"
-            );
-        }
+        radiowave::Compiler
+            .certify_existing(&request)
+            .map(|_| ())
+            .map_err(|error| error.to_string())
     }
 
     /// Compile a HIP kernel source string. Returns path to .hsaco file.

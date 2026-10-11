@@ -122,7 +122,7 @@ pub(crate) fn router_projection(
 ) -> Result<(), DispatchError> {
     require_geometry(p)?;
     // Projected by the shared gate/up stage's launch instead.
-    if router_with_shared(p) || router_shares_f16(gpu, p) {
+    if router_with_shared(gpu, p) || router_shares_f16(gpu, p) {
         return Ok(());
     }
     batch_projection(
@@ -138,8 +138,8 @@ pub(crate) fn router_projection(
 /// bitwise each projection's own) projects the router together with the
 /// all-BF16 shared selector/gate/up in one launch (the shared gate/up stage,
 /// which the route always runs right after the router stage).
-fn router_with_shared(p: &MoePrefillParams<'_>) -> bool {
-    p.batch_size <= 8
+fn router_with_shared(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
+    gpu.route_rows(p.batch_size) <= 8
         && p.prelude.router.dtype == DType::BF16
         && p.prelude.shared.as_ref().is_some_and(|shared| {
             [
@@ -159,7 +159,7 @@ fn router_with_shared(p: &MoePrefillParams<'_>) -> bool {
 /// of `x_norm_batch` instead of converting it a second time.
 fn router_shares_f16(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
     let router = &p.prelude.router;
-    p.batch_size > 8
+    gpu.route_rows(p.batch_size) > 8
         && p.x_norm_batch.dtype == DType::F32
         && router.dtype == DType::BF16
         && gpu.qwen4_f16_wmma_applies(router.buf, router.k, p.batch_size)
@@ -178,11 +178,55 @@ fn router_shares_f16(gpu: &Gpu, p: &MoePrefillParams<'_>) -> bool {
         })
 }
 
+/// Whether this call's shared expert runs the fused gate/up PeaceMaker launch
+/// (`HIPFIRE_QWEN4_SHARED_GU_PM`, [`Gpu::qwen4_shared_gu_pm_applies`]): the
+/// router and selector on the shared F16 conversion ([`router_shares_f16`]),
+/// the BF16 recipe, a BF16 shared down on the F16 WMMA route (which then
+/// reads the F16 hidden the launch leaves in `rotated`'s bytes), and not path
+/// 2's fused unscatter activation, which reads the F32 gate/up outputs this
+/// route does not produce. The one decision of the gate/up, activation and
+/// down stages: it depends only on the call's operands and the device.
+fn shared_gu_pm(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
+    router_shares_f16(gpu, p)
+        && p.recipe.bf16_round_trip()
+        && !(use_path2 && shared_in_unscatter(gpu, p))
+        && p.prelude.shared.as_ref().is_some_and(|shared| {
+            let w = &shared.weights;
+            w.gate.m == shared.intermediate
+                && w.up.m == shared.intermediate
+                && w.up.k == w.gate.k
+                && w.down.dtype == DType::BF16
+                && w.down.k == shared.intermediate
+                && gpu.qwen4_f16_wmma_applies(w.down.buf, w.down.k, p.batch_size)
+                && gpu.qwen4_shared_gu_pm_applies(w.gate.buf, w.up.buf, w.gate.m, w.gate.k, p.batch_size)
+        })
+}
+
+/// The shared down GEMM's input tensor: the F16 hidden the fused gate/up left in
+/// `rotated`'s bytes ([`shared_gu_pm`]), else the F32 activation.
+fn shared_down_input(
+    gpu: &Gpu,
+    p: &MoePrefillParams<'_>,
+    use_path2: bool,
+    rotated: &GpuTensor,
+    intermediate: usize,
+) -> GpuTensor {
+    if shared_gu_pm(gpu, p, use_path2) {
+        rotated.prefix_as_f16(p.batch_size * intermediate)
+    } else {
+        rotated.shallow_clone()
+    }
+}
+
 /// Shared selector and gate/up are ordinary batched projections.  This is the
 /// typed route's BF16 exception to the generic MoE prefill table: the common
 /// family remains fail-closed for QT53 while this exact route uses the native
 /// BF16 XF32 GEMM launcher.
-pub(crate) fn shared_gate_up(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<(), DispatchError> {
+pub(crate) fn shared_gate_up(
+    gpu: &mut Gpu,
+    p: &MoePrefillParams<'_>,
+    use_path2: bool,
+) -> Result<(), DispatchError> {
     require_geometry(p)?;
     let shared = p
         .prelude
@@ -190,7 +234,7 @@ pub(crate) fn shared_gate_up(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<
         .as_ref()
         .ok_or_else(|| DispatchError::Hip("grouped prefill shared weights missing".into()))?;
     let weights = &shared.weights;
-    if router_with_shared(p) {
+    if router_with_shared(gpu, p) {
         // All read the natural activation: one launch (one F16 conversion).
         super::layer_ops::project_weights(
             gpu,
@@ -205,9 +249,33 @@ pub(crate) fn shared_gate_up(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<
             ],
         )?;
     } else if router_shares_f16(gpu, p) {
+        let router = &p.prelude.router;
+        if shared_gu_pm(gpu, p, use_path2) {
+            // The router and selector groups (their own launches, off one F16
+            // conversion), then the gate/up GEMMs, the BF16-recipe activation
+            // (selector sigmoid in place) and the hidden's F16 conversion as ONE
+            // PeaceMaker launch, the F16 hidden left in `rotated`'s bytes.
+            let hidden = shared.rotated.prefix_as_f16(p.batch_size * shared.intermediate);
+            let launched = hip(gpu.gemm_bf16_xf32_f16_wmma_qwen4_shared_gu_pm(
+                (router.buf, p.prelude.router_logits, router.m),
+                (weights.selector.buf, shared.scalar, weights.selector.m),
+                weights.gate.buf,
+                weights.up.buf,
+                &hidden,
+                p.x_norm_batch,
+                weights.gate.m,
+                router.k,
+                p.batch_size,
+            ))?;
+            if !launched {
+                return Err(DispatchError::Hip(
+                    "qt44/qt53 router + shared fused gate/up PM route did not apply".into(),
+                ));
+            }
+            return Ok(());
+        }
         // The router group first (its own launches, as `router_projection`
         // would issue them), then the shared group, off one F16 conversion.
-        let router = &p.prelude.router;
         let launched = hip(gpu.gemm_bf16_xf32_f16_wmma_qwen4_groups(
             &[
                 &[(router.buf, p.prelude.router_logits, router.m)],
@@ -300,6 +368,10 @@ pub(crate) fn shared_activation(
     if use_path2 && shared_in_unscatter(gpu, p) {
         return Ok(());
     }
+    // The fused shared gate/up already left the activation (and the sigmoid selector).
+    if shared_gu_pm(gpu, p, use_path2) {
+        return Ok(());
+    }
     let shared = p
         .prelude
         .shared
@@ -338,7 +410,11 @@ pub(crate) fn shared_activation(
 
 /// Fold the shared expert into the residual at the recipe's chosen placement,
 /// applying the selector sigmoid exactly once.
-pub(crate) fn shared_down(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<(), DispatchError> {
+pub(crate) fn shared_down(
+    gpu: &mut Gpu,
+    p: &MoePrefillParams<'_>,
+    use_path2: bool,
+) -> Result<(), DispatchError> {
     require_geometry(p)?;
     let shared = p
         .prelude
@@ -347,9 +423,11 @@ pub(crate) fn shared_down(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<(),
         .ok_or_else(|| DispatchError::Hip("grouped prefill shared weights missing".into()))?;
     let down = &shared.weights.down;
     let target = p.routed_out.unwrap_or(p.x_batch);
+    // The fused shared gate/up leaves the activation as F16 in `rotated`'s bytes.
+    let hidden = shared_down_input(gpu, p, use_path2, shared.rotated, shared.intermediate);
     if down.dtype == DType::BF16 && p.recipe.bf16_round_trip()
         && hip(gpu.qwen4_shared_down_bf16_epi(
-            down.buf, shared.rotated, target, shared.scalar,
+            down.buf, &hidden, target, shared.scalar,
             down.m, down.k, p.batch_size,
         ))?
     {
@@ -361,7 +439,14 @@ pub(crate) fn shared_down(gpu: &mut Gpu, p: &MoePrefillParams<'_>) -> Result<(),
             // The shared activation is already in the basis consumed by this
             // projection (G128 for QT53); the BF16 storage boundary, if any,
             // was applied by the recipe before this launch.
-            batch_projection(gpu, down, shared.rotated, &out, p.batch_size)?;
+            if hidden.dtype == DType::F16 {
+                // The fused F16 hidden (BF16 down on the F16 WMMA route, see
+                // `shared_gu_pm`): the GEMM `batch_projection` would launch off
+                // the F32 activation's conversion, minus the conversion.
+                hip(gpu.gemm_bf16_xf16_f16_wmma(down.buf, &hidden, &out, down.m, down.k, p.batch_size))?;
+            } else {
+                batch_projection(gpu, down, &hidden, &out, p.batch_size)?;
+            }
         }
         _ => {
             return Err(DispatchError::UnsupportedVariant {
@@ -471,6 +556,7 @@ pub(crate) fn shared_down_hc(
     gpu: &mut Gpu,
     p: &MoePrefillParams<'_>,
     hc: &HcSharedDown,
+    use_path2: bool,
 ) -> Result<bool, DispatchError> {
     require_geometry(p)?;
     let Some(shared) = p.prelude.shared.as_ref() else {
@@ -487,12 +573,13 @@ pub(crate) fn shared_down_hc(
         return Ok(false);
     }
     if let Some(next) = &hc.row_fold {
-        shared_down_row_fold(gpu, p, hc, next)?;
+        shared_down_row_fold(gpu, p, hc, next, use_path2)?;
         return Ok(true);
     }
+    let hidden = shared_down_input(gpu, p, use_path2, shared.rotated, shared.intermediate);
     hip(gpu.gemm_bf16_xf32_f16_wmma_qwen4_hcsd(
         down.buf,
-        shared.rotated,
+        &hidden,
         down.m,
         down.k,
         p.batch_size,
@@ -581,6 +668,7 @@ fn shared_down_row_fold(
     p: &MoePrefillParams<'_>,
     hc: &HcSharedDown,
     next: &HcRowFoldNext,
+    use_path2: bool,
 ) -> Result<(), DispatchError> {
     let shared = p
         .prelude
@@ -589,13 +677,14 @@ fn shared_down_row_fold(
         .ok_or_else(|| DispatchError::Hip("grouped prefill shared weights missing".into()))?;
     let down = &shared.weights.down;
     let target = p.routed_out.unwrap_or(p.x_batch);
+    let hidden = shared_down_input(gpu, p, use_path2, shared.rotated, shared.intermediate);
     // The next read's F16 row lives in the shared F16 scratch, which the
     // shared-down GEMM's own F16 input also uses (it is dead by the time the
     // row kernel writes): size it first so nothing reallocates under the GEMM.
     let x16 = hip(gpu.qwen4_f16_x_scratch(hc.rows * 4 * hc.hidden))?;
     hip(gpu.gemm_bf16_xf32_f16_wmma_qwen4_bf16st(
         down.buf,
-        shared.rotated,
+        &hidden,
         down.m,
         down.k,
         p.batch_size,
@@ -915,7 +1004,7 @@ pub(crate) fn activation(
 /// faster.  Its per-slot dot is the grouped kernel's (bitwise), combined in
 /// slot order.
 fn indexed_down(gpu: &Gpu, p: &MoePrefillParams<'_>, use_path2: bool) -> bool {
-    use_path2 && p.batch_size <= 8 && !down_wmma(gpu, p)
+    use_path2 && gpu.route_rows(p.batch_size) <= 8 && !down_wmma(gpu, p)
 }
 
 /// Release the stage immediately after the routed down, before combine.

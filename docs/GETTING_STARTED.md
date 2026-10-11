@@ -136,12 +136,13 @@ restore kernels on a machine without hipcc.
 
 Maintainers: the tag-triggered `release-kernel-packs` workflow
 (`.github/workflows/release.yml`) builds every arch in a ROCm dev image and
-attaches the assets to the release. The default image,
-`rocm/dev-ubuntu-26.04:10.0.0-full`, carries the same ROCm 10.0.0 packages
-(HIP 7.15.26333) as the project's GPU hosts, so its packs admit ROCm
-[10.0, 11.0) and install on hosts with that hipcc. A pack only installs where
-the local hipcc, if any, is the build that compiled it; hosts on another ROCm
-compile locally. Repository variables choose another image
+attaches the assets to the release. The default image is
+`docker.io/rocm/dev-ubuntu-26.04:10.1.0-full@sha256:4f5ed1bf6532a4b9920400401b0ad0f706af356dae61e40afefbfd6c8073f0ce`
+(ROCm 10.1.0 packages `10.1.0-3`, HIP 7.16.26385, clang 24), so its packs admit
+ROCm [10.1, 11.0). A pack only installs where the local hipcc, if any, is the
+build that compiled it: a host whose hipcc differs (for example ROCm 10.0)
+compiles locally, while a host with no compiler accepts an admitted pack.
+Repository variables choose another image
 (`HIPFIRE_ROCM_IMAGE`) and, optionally, a wider admitted range
 (`HIPFIRE_PACK_ROCM_MIN` and `HIPFIRE_PACK_ROCM_MAX_EXCLUSIVE`, set both). To
 publish from a local toolchain instead:
@@ -294,7 +295,7 @@ narrower than WSL2 on the same card. Known limits:
 ```bash
 git clone https://github.com/warpfront/hipfire
 cd hipfire
-cargo build --release --features deltanet --example daemon -p hipfire-runtime
+cargo build --release -p hipfire-daemon
 cargo build --release -p hipfire-cli
 cargo build --release -p hipfire-quantize
 # optional TUI:
@@ -361,6 +362,8 @@ under `refs/hipfire/backups/` and stashes dirty files with a recoverable
 hipfire pull qwen3.5:4b
 hipfire run  qwen3.5:4b "Explain FFT in one line"
 ```
+
+Which tag fits your card: [PICK-A-MODEL.md](PICK-A-MODEL.md).
 
 - `pull` downloads the registry artifact into `~/.hipfire/models/` (and published sidecars when the registry entry lists them).
 - `run` accepts a registry tag, alias, or path. **Recognized registry tags that are not local yet are auto-pulled** (can be multi-GB). Unresolved tags, aliases, or paths error with a `pull` / `list --remote` hint — they do not download.
@@ -453,7 +456,7 @@ regression.
 | Model not found | `hipfire list` / `hipfire list -r`; `hipfire pull <tag>` |
 | Port in use / stale serve | `hipfire ps`; `hipfire stop --force`; check `~/.hipfire/serve.pid` and (detached only) `serve.log` |
 | Draft pulled but no speedup | Expected: `dflash_mode` defaults to **off** |
-| Truncated answers on thinking models | Raise `max_tokens` / `thinking_budget`; see [MODELS.md](MODELS.md) thinking section |
+| Truncated answers, or empty `content` from an OpenAI client, on thinking models | `max_tokens` covers the `<think>` span too: raise `max_tokens` / `thinking_budget`, or send `"chat_template_kwargs": {"enable_thinking": false}` (see [SERVE.md](SERVE.md)); [MODELS.md](MODELS.md) thinking section |
 
 ```bash
 hipfire diag
@@ -464,6 +467,7 @@ tail -f ~/.hipfire/serve.log
 
 | Doc | When |
 |---|---|
+| [PICK-A-MODEL.md](PICK-A-MODEL.md) | Which tag and speculation setting for your VRAM |
 | [CLI.md](CLI.md) | Every subcommand and flag surface |
 | [CHAT.md](CHAT.md) | Interactive chat, thinking display, daemon attach |
 | [SERVE.md](SERVE.md) | OpenAI-compatible HTTP |

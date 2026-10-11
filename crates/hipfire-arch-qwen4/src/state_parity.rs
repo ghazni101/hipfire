@@ -673,7 +673,9 @@ fn mutate_target(gpu: &mut Gpu, state: &mut Qwen4State) -> Result<(), String> {
         write_scalar_f32(gpu, &layer.partial_values, 94.0)?;
         write_scalar_i32(gpu, &layer.selected_indices, -93)?;
     }
-    write_scalar_f32(gpu, &state.ple_conv, 95.0)?;
+    if let Some(ple_conv) = &state.ple_conv {
+        write_scalar_f32(gpu, ple_conv, 95.0)?;
+    }
     write_scalar_f32(gpu, &state.hyper_feedback, 96.0)
 }
 
@@ -775,7 +777,9 @@ fn target_families(
     for (name, family) in qsa_families {
         families.insert(name.into(), family.finish());
     }
-    families.insert("ple_conv".into(), tensor(gpu, &state.ple_conv)?);
+    if let Some(ple_conv) = &state.ple_conv {
+        families.insert("ple_conv".into(), tensor(gpu, ple_conv)?);
+    }
     families.insert("hyper_feedback".into(), tensor(gpu, &state.hyper_feedback)?);
     families.insert("metadata".into(), metadata.finish());
     Ok(families)
@@ -1283,7 +1287,7 @@ fn dirty_qwen4_moe_scratch(gpu: &mut Gpu, scratch: &Qwen4GpuForwardScratch) -> R
         &scratch.moe_gate,
         &scratch.moe_up,
         &scratch.moe_hidden,
-        &scratch.moe_output,
+        &scratch.ffn_output,
         &scratch.moe_gate_batch,
         &scratch.moe_up_batch,
         &scratch.moe_rot_batch,
@@ -1548,6 +1552,7 @@ fn run_profile_inner(
     let backend = Qwen4KvBackend::automatic(&gpu);
     let mut bundle = crate::bundle::Qwen4Bundle::assemble_with_metadata(
         config.clone(),
+        &manifest.identity.recipe,
         transaction,
         &placements,
         &mut gpu,
@@ -1647,7 +1652,10 @@ fn run_profile_inner(
     let execution_result = (|| -> Result<Value, String> {
         qwen4_profile_reset();
         launch_counters::reset();
-        let ple_before = bundle.ple_rows().cache_stats();
+        let ple_before = bundle
+            .ple_rows()
+            .ok_or("qwen4 profile: the bundle has no PLE rows")?
+            .cache_stats();
         let target_started = Instant::now();
         dirty_profile_target_moe_reuse(&mut gpu, &bundle)?;
         let target_token = bundle
@@ -1657,7 +1665,10 @@ fn run_profile_inner(
         let target_hip = hip_counter_snapshot();
         let target_internal = qwen4_profile_stats_json(qwen4_profile_snapshot());
         let target_sealed = sealed_moe_profile_evidence(&target_internal, true)?;
-        let target_ple_after = bundle.ple_rows().cache_stats();
+        let target_ple_after = bundle
+            .ple_rows()
+            .ok_or("qwen4 profile: the bundle has no PLE rows")?
+            .cache_stats();
         let target_d2h = target_hip
             .get("memcpy_dtoh")
             .cloned()
@@ -1832,6 +1843,7 @@ pub fn run_state_parity(
     let backend = Qwen4KvBackend::automatic(&gpu);
     let mut bundle = crate::bundle::Qwen4Bundle::assemble_with_metadata(
         config.clone(),
+        &manifest.identity.recipe,
         transaction,
         &placements,
         &mut gpu,
@@ -2177,6 +2189,7 @@ pub fn run_mtp_fill_digest(
     let warm = warm_chunks > 0;
     let mut bundle = crate::bundle::Qwen4Bundle::assemble_with_metadata(
         config.clone(),
+        &manifest.identity.recipe,
         transaction,
         &placements,
         &mut gpu,
@@ -2546,9 +2559,19 @@ pub fn run_mtp_takeover_fill_oracle(
                 append(&mut target, tensor, count)?;
             }
         }
-        append(&mut target, &bundle.state.ple_conv, bundle.state.ple_conv.numel())?;
-        append(&mut target, &bundle.state.hyper_feedback, bundle.state.hyper_feedback.numel())?;
-        let state = bundle.mtp.as_ref().ok_or("missing MTP head")?.parity_state();
+        if let Some(ple_conv) = &bundle.state.ple_conv {
+            append(&mut target, ple_conv, ple_conv.numel())?;
+        }
+        append(
+            &mut target,
+            &bundle.state.hyper_feedback,
+            bundle.state.hyper_feedback.numel(),
+        )?;
+        let state = bundle
+            .mtp
+            .as_ref()
+            .ok_or("missing MTP head")?
+            .parity_state();
         let meta = state.parity_metadata();
         let buffers = state.parity_buffers();
         for (tensor, count) in [
@@ -2651,9 +2674,17 @@ pub fn run_mtp_takeover_fill_oracle(
     let format = crate::state::Qwen4StateFormat::F32;
     let backend = Qwen4KvBackend::automatic(&gpu);
     let mut bundle = Qwen4Bundle::assemble_with_metadata(
-        receipt.config, transaction, &receipt.placements, &mut gpu, max_seq,
-        receipt.ple, format, backend,
-    ).map_err(|error| error.to_string())?;
+        receipt.config,
+        &receipt.manifest.identity.recipe,
+        transaction,
+        &receipt.placements,
+        &mut gpu,
+        max_seq,
+        receipt.ple,
+        format,
+        backend,
+    )
+    .map_err(|error| error.to_string())?;
     // Longer than the entire oracle history: the armed pool is provably
     // empty/missing. Explicit takeovers supply the hit spans under test.
     let mut drafter = Qwen4MtpDrafter::new(3, max_seq, None).with_ngram(Some(NgramModConfig {

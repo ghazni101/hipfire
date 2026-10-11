@@ -7711,6 +7711,18 @@ pub(crate) const CPU_SAMPLE_LEGACY_POOL: usize = 20;
 /// `sample_top_p` kernel's gather budget, so CPU and GPU honour the same range.
 pub(crate) const CPU_SAMPLE_WIDE_POOL: usize = 64;
 
+/// The candidate cap [`sample_top_k_p`] draws from for a request `top_k`:
+/// absent → 20, `0` → 64, `k` → `min(k, 64)`. A sampled speculative verifier
+/// reproduces AR by truncating to this many top candidates, then applying
+/// min_p and the nucleus over their own mass.
+pub fn ar_candidate_cap(top_k: Option<u32>) -> usize {
+    match top_k {
+        None => CPU_SAMPLE_LEGACY_POOL,
+        Some(0) => CPU_SAMPLE_WIDE_POOL,
+        Some(k) => (k as usize).min(CPU_SAMPLE_WIDE_POOL),
+    }
+}
+
 /// Top-20 nucleus sampler (temperature + top_p). Byte-identical to
 /// [`sample_top_k_p`] with `top_k = None, min_p = None`.
 pub fn sample_top_p(logits: &[f32], temperature: f32, top_p: f32) -> u32 {

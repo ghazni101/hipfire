@@ -5,14 +5,14 @@
 //! DFlash lanes of the VMM continuous-batching store.
 //!
 //! A DFlash lane is a request decoded exactly like the singleton DFlash route
-//! (`DflashSpeculator`, fixed block, greedy chain): its prompt is filled by
-//! the singleton DFlash prompt seed on the request's own KV/DeltaNet, then
-//! every decode window is a `RequestStepKind::Verify` request of an executor
-//! step — per-request draft (provision), the ChainVerify trunk and head shared
-//! with the other DFlash Verify lanes (forward), per-request greedy accept
-//! and state commit (commit). Per request the committed ids and the full
-//! state (trunk KV, DeltaNet, draft K/V, hidden ring, thlog) equal its
-//! isolated singleton DFlash run.
+//! (`DflashSpeculator`, fixed-block greedy or FAST_SAMPLE selector chain):
+//! its prompt is filled by the singleton DFlash prompt seed on the request's
+//! own KV/DeltaNet, then every decode window is a `RequestStepKind::Verify`
+//! executor request — per-request draft (provision), shared ChainVerify trunk
+//! (forward), singleton accept and state commit (commit). Sampled proposal,
+//! target rows and u64 RNG are private; its Product head uses singleton b.
+//! Per request the committed ids and full state (trunk KV, DeltaNet, draft K/V,
+//! hidden ring, thlog) equal its isolated singleton DFlash run.
 //!
 //! Window budget is DFlash's: with remaining output budget `E >= 1` the
 //! window is `B = min(block, max(E, 2))` rows and `max_accept = E - 1`
@@ -31,24 +31,70 @@ use crate::dflash_cb::{
 };
 use crate::dflash_spec::{
     dflash_prefill_lane_parts, dflash_repair_terminal_prefix_parts, new_dflash_lane_state,
-    release_shared_dflash_weights, DflashLaneSnapshot, DflashVmmAssets, DflashWindowMark,
+    release_shared_dflash_weights, DflashCheckpointPolicy, DflashLaneSnapshot, DflashOwnerKind,
+    DflashVmmAssets, DflashWindowMark,
 };
-use crate::qwen35::prefill::multi::MULTI_CHUNK_MAX_ROWS;
-use crate::qwen35::{Qwen35Config, Qwen35Scratch, Qwen35Weights};
+use crate::qwen35::prefill::multi::{multi_chunk_pack_cap, MULTI_CHUNK_MAX_LANE_ROWS};
+use crate::qwen35::{DeltaNetState, Qwen35Config, Qwen35Scratch, Qwen35Weights};
 use crate::speculative::{
-    dflash_greedy_accept_commit_parts, DeltaNetSnapshot, DflashCbDraft, DflashTargetParts, DflashVerifyOutput,
+    dflash_commit_decision_parts, dflash_eager_hip_verify_receipt, dflash_greedy_accept_commit_parts,
+    dflash_sampled_accept_rows, DeltaNetSnapshot, DflashCbDraft, DflashSampledDraft,
+    DflashTargetParts, DflashVerifyOutput,
 };
 use hip_bridge::HipError;
 use hipfire_runtime::slot_batch::{BatchStepPlan, RequestAdvance, RequestEpoch, RequestRows, RequestStepKind};
 use hipfire_runtime::spec::{PrefillOutcome, SpecRequestConfig};
 use rdna_compute::Gpu;
 
+/// Who can read a VMM DFlash lane's DeltaNet checkpoints (the divergent-render
+/// resume snapshots a singleton prefill takes every `interval` rows).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct DflashLaneCheckpointReaders {
+    /// A finished lane's conversation is kept for prompt-cache reuse, which
+    /// resumes from a checkpoint.
+    pub conversation_reuse: bool,
+    /// A lane-side rewind/resume restores a checkpoint.
+    pub rewind: bool,
+}
+
+impl DflashLaneCheckpointReaders {
+    /// Some lane-side code reads the checkpoints.
+    pub const fn any(self) -> bool {
+        self.conversation_reuse || self.rewind
+    }
+}
+
+/// Nothing on the lane side reads a lane's checkpoints, so lanes take none
+/// (each one is a whole DeltaNet snapshot of device memory):
+/// * spec lanes are never `keep_conversations` lanes (`batch.rs`:
+///   `keep = keep_conversations && spec_pick.is_none()`), so no conversation
+///   cache resumes from them;
+/// * no lane rewind/resume API exists (`rewind_to` is a singleton
+///   `Speculator` method; the lane's terminal repair restores the pre-window
+///   `target_snap`, not a checkpoint).
+/// Flip a field only together with the code that reads the checkpoints.
+pub const DFLASH_LANE_CHECKPOINT_READERS: DflashLaneCheckpointReaders =
+    DflashLaneCheckpointReaders { conversation_reuse: false, rewind: false };
+
 /// The store's DFlash engine: the shared draft-weight assets (one resident
 /// draft, a counted `Arc` reference) and the shared verify scratch (trunk row
-/// scratch + ONE head scratch, `<= 63` rows). Lane state is per request.
+/// scratch + ONE head scratch, sized to this target's effective row cap: 63,
+/// or up to 128 when the wide verify route is admitted for it) plus the ONE
+/// shared draft scratch, which also owns the FWHT rotation buffers that every
+/// lane borrows per draft call (lanes are allocated without them and without
+/// a `prefill_batch`; see `DflashOwnerKind::VmmLane`). Lane state is per
+/// request.
 pub struct VmmDflashEngine {
     assets: DflashVmmAssets,
     cb: DflashCbScratch,
+    /// Checkpoint cadence of a lane: the singleton's resolved policy with
+    /// resume cleared while [`DFLASH_LANE_CHECKPOINT_READERS`] has no reader.
+    lane_checkpoint: DflashCheckpointPolicy,
+    /// Device bytes of one lane's DFlash state (`new_dflash_lane_state` with
+    /// `DflashOwnerKind::VmmLane`), probed at staging.
+    lane_bytes: usize,
+    /// Device bytes of one DeltaNet checkpoint snapshot, probed at staging.
+    snapshot_bytes: usize,
 }
 
 // SAFETY: like every GPU owner in the store (`DeviceBuffer` is `Send`), the
@@ -63,7 +109,10 @@ unsafe impl Send for VmmDflashEngine {}
 pub struct VmmDflashReceipt {
     /// Configured (full) verify block, e.g. 16.
     pub block_size: usize,
-    /// Rows one shared trunk chunk can hold (`<= 63`, the exactness ceiling).
+    /// Rows one shared trunk chunk can hold: this target's effective cap
+    /// (`<= 63`, the exactness ceiling of the product route, or up to 128
+    /// when the exact wide verify route is admitted for the target), which is
+    /// also what the shared scratch allocates.
     pub chunk_row_limit: usize,
     /// Logical context cap of the resolved singleton draft policy.
     pub ctx_capacity: usize,
@@ -77,13 +126,17 @@ fn refuse_engine<T>(gpu: &mut Gpu, assets: DflashVmmAssets, why: String) -> Resu
 impl VmmDflashEngine {
     /// Build the engine over `assets` (`LoadedModel`'s singleton descriptor;
     /// the draft weights are shared, never reloaded). `max_rows` is the
-    /// store's planned trunk row capacity; one chunk holds `min(max_rows, 63)`
-    /// rows and must hold a full configured block. Consumes `assets`: on
-    /// every refusal the asset reference is released (the last owner frees
-    /// the raw weights) and nothing is allocated.
+    /// store's planned trunk row capacity; one chunk holds this target's
+    /// effective cap of it ([`multi_chunk_pack_cap`]: `<= 63`, or up to 128
+    /// only when the wide verify route is admitted for `weights`) and must
+    /// hold a full configured block. Consumes `assets`: on every refusal the
+    /// asset reference is released (the last owner frees the raw weights)
+    /// and nothing is allocated.
     pub fn new(
         gpu: &mut Gpu,
+        weights: &Qwen35Weights,
         config: &Qwen35Config,
+        template_dn: &DeltaNetState,
         assets: DflashVmmAssets,
         max_rows: usize,
     ) -> Result<Self, String> {
@@ -94,10 +147,12 @@ impl VmmDflashEngine {
         if config.num_experts > 0 {
             return refuse_engine(gpu, assets, "MoE targets are not admitted".into());
         }
-        if !(2..=MULTI_CHUNK_MAX_ROWS).contains(&block) {
-            return refuse_engine(gpu, assets, format!("block {block} outside 2..={MULTI_CHUNK_MAX_ROWS}"));
+        // A lone request is the singleton's own route: at most 63 rows, whatever
+        // the aggregate cap (a 64+-row window would be the quantized route).
+        if !(2..=MULTI_CHUNK_MAX_LANE_ROWS).contains(&block) {
+            return refuse_engine(gpu, assets, format!("block {block} outside 2..={MULTI_CHUNK_MAX_LANE_ROWS}"));
         }
-        let rows = max_rows.min(MULTI_CHUNK_MAX_ROWS);
+        let rows = multi_chunk_pack_cap(gpu, weights, config, max_rows);
         if rows < block {
             return refuse_engine(gpu, assets, format!("{max_rows} planned rows cannot hold one {block}-row block"));
         }
@@ -112,19 +167,96 @@ impl VmmDflashEngine {
             let why = format!("context capacity {} < block {block}", assets.ctx_capacity);
             return refuse_engine(gpu, assets, why);
         }
-        let mut cb = match DflashCbScratch::new(gpu, config, rows) {
+        let mut cb = match DflashCbScratch::new(gpu, weights, config, rows) {
             Ok(cb) => cb,
             Err(e) => return refuse_engine(gpu, assets, format!("verify scratch: {e}")),
         };
-        // The batched draft's row scratch is part of the engine's footprint
-        // (a step never allocates); skipped under the kill switch.
-        if *DRAFT_BATCH_ON {
-            if let Err(e) = cb.reserve_draft(gpu, &assets.draft_config) {
-                let _ = cb.free_gpu(gpu);
-                return refuse_engine(gpu, assets, format!("draft batch scratch: {e}"));
-            }
+        // The shared draft scratch is part of the engine's footprint (a step
+        // never allocates). It is ALWAYS reserved, also under the batched-draft
+        // kill switch: it owns the FWHT rotation buffers every lane (which
+        // allocates none) borrows for its own draft/backfill GEMMs.
+        if let Err(e) = cb.reserve_draft(gpu, &assets.draft_config) {
+            let _ = cb.free_gpu(gpu);
+            return refuse_engine(gpu, assets, format!("draft batch scratch: {e}"));
         }
-        Ok(Self { assets, cb })
+        // Probe one lane's footprint (lane state, one checkpoint snapshot)
+        // for the store's memory admission: allocate both shaped from the
+        // resident DeltaNet state, measure the live-byte drop (HIP free plus
+        // pool-parked), free them. The freed buffers park in the pool, where
+        // the first lane reuses them.
+        let live = |gpu: &Gpu| gpu.device_mem_info().map(|(f, _)| f + gpu.pool_parked_bytes());
+        let probed = (|| -> Result<(usize, usize), String> {
+            let before = live(gpu).map_err(|e| e.to_string())?;
+            let df = new_dflash_lane_state(gpu, &assets, config, template_dn, DflashOwnerKind::VmmLane)?;
+            let mid = live(gpu).map_err(|e| e.to_string());
+            let snap = DeltaNetSnapshot::new_for(gpu, template_dn);
+            let after = live(gpu).map_err(|e| e.to_string());
+            df.free_gpu(gpu);
+            let snap = snap.map_err(|e| format!("snapshot: {e}"))?;
+            snap.free_gpu(gpu);
+            let (mid, after) = (mid?, after?);
+            Ok((before.saturating_sub(mid), mid.saturating_sub(after)))
+        })();
+        let (lane_bytes, snapshot_bytes) = match probed {
+            Ok(p) => p,
+            Err(e) => {
+                let _ = cb.free_gpu(gpu);
+                return refuse_engine(gpu, assets, format!("lane footprint probe: {e}"));
+            }
+        };
+        let mut lane_checkpoint = assets.checkpoint;
+        lane_checkpoint.resume_enabled &= DFLASH_LANE_CHECKPOINT_READERS.any();
+        Ok(Self {
+            assets,
+            cb,
+            lane_checkpoint,
+            lane_bytes,
+            snapshot_bytes,
+        })
+    }
+
+    /// Probed device bytes of one lane's DFlash state.
+    pub fn lane_bytes(&self) -> usize {
+        self.lane_bytes
+    }
+
+    /// Probed device bytes of one DeltaNet checkpoint snapshot.
+    pub fn snapshot_bytes(&self) -> usize {
+        self.snapshot_bytes
+    }
+
+    /// Checkpoint cadence lanes prefill with (and carry as `policy`): the
+    /// singleton's resolved cadence, with resume off while nothing on the
+    /// lane side reads checkpoints ([`DFLASH_LANE_CHECKPOINT_READERS`]).
+    pub fn lane_checkpoint_policy(&self) -> DflashCheckpointPolicy {
+        self.lane_checkpoint
+    }
+
+    /// Upper bound on the DeltaNet checkpoints a `prompt_len`-row lane prefill
+    /// takes under the lane checkpoint policy
+    /// ([`Self::lane_checkpoint_policy`]; none when resume is off, at most
+    /// `cap`). The real count follows the seed's outer chunk plan
+    /// (`crate::speculative::dflash_seed_checkpoint_count`), whose ceiling is memory-admitted
+    /// when the lane's prefill starts. `min_ceiling` is a lower bound on that
+    /// ceiling (see `Qwen35VmmStore::admission_check`); the count is not
+    /// monotone in the ceiling, so the bound is the maximum over `min_ceiling`
+    /// and every staged rung above it (`crate::speculative::dflash_seed_checkpoint_bound`).
+    pub fn checkpoint_bound(&self, prompt_len: usize, min_ceiling: usize) -> usize {
+        let p = self.lane_checkpoint_policy();
+        if !p.resume_enabled {
+            return 0;
+        }
+        crate::speculative::dflash_seed_checkpoint_bound(prompt_len, min_ceiling, p.interval, p.cap)
+    }
+
+    /// Old whole-prompt bound (one checkpoint per `interval` rows, at most
+    /// `cap`): used only when the seed's chunk ceiling cannot be queried.
+    pub fn checkpoint_bound_unplanned(&self, prompt_len: usize) -> usize {
+        let p = self.lane_checkpoint_policy();
+        if !p.resume_enabled {
+            return 0;
+        }
+        prompt_len.div_ceil(p.interval.max(1)).min(p.cap)
     }
 
     /// Fixed configured block (e.g. 16).
@@ -138,7 +270,13 @@ impl VmmDflashEngine {
         self.assets.ctx_capacity
     }
 
-    /// Rows one shared trunk chunk holds (`<= 63`).
+    /// Sampled lanes use the production fixed-block DFlash2 selector chain.
+    /// Other draft laws remain on their singleton route.
+    pub fn supports_sampled(&self) -> bool {
+        self.assets.fixed_chain && self.assets.weights.has_candidate_selector()
+    }
+
+    /// Rows one shared trunk chunk holds (the effective cap, `<= 63` or up to 128).
     pub fn max_rows(&self) -> usize {
         self.cb.max_rows()
     }
@@ -157,12 +295,32 @@ impl VmmDflashEngine {
         self.cb.keep_lane_rows = keep;
     }
 
+    /// Run `f` over `df` (a lane's draft state, allocated without FWHT
+    /// rotation buffers) with the engine's shared rotation buffers lent to its
+    /// draft scratch, and take them back before returning, whatever `f`
+    /// returns (no `?` between lend and reclaim). `Err` only when the lend
+    /// itself failed (nothing was lent, `f` did not run). Exact: see
+    /// [`DflashCbScratch::lend_mq`].
+    fn with_lent_mq<R>(
+        &mut self,
+        df: &mut crate::dflash_spec::DflashState,
+        f: impl FnOnce(&DflashVmmAssets, &mut crate::dflash_spec::DflashState) -> R,
+    ) -> Result<R, String> {
+        let lent = self
+            .cb
+            .lend_mq(&mut df.draft_scratch)
+            .map_err(|e| format!("lend rotation scratch: {e}"))?;
+        let r = f(&self.assets, df);
+        self.cb.reclaim_mq(&mut df.draft_scratch, lent);
+        Ok(r)
+    }
+
     /// Free the shared scratch and release the asset reference. Every lane
     /// must have been freed first (the last owner of the draft weights frees
     /// them, whichever of lanes / engine / singleton that is).
     pub fn free_gpu(self, gpu: &mut Gpu) {
         let _ = gpu.hip.device_synchronize();
-        let VmmDflashEngine { assets, cb } = self;
+        let VmmDflashEngine { assets, cb, .. } = self;
         let _ = cb.free_gpu(gpu);
         release_shared_dflash_weights(gpu, assets.weights);
     }
@@ -187,8 +345,8 @@ impl Qwen35VmmStore {
     /// Make `epoch` a DFlash lane and fill its prompt by the singleton DFlash
     /// prompt seed (cold: fresh owners, positions from 0) on the request's own
     /// KV/DeltaNet. The lane's snapshot/DeltaNet-sized buffers come from the
-    /// REQUEST's own `DeltaNetState`. Returns `Ready { first_token }` (greedy
-    /// host argmax of the last prompt row's logits) and leaves it as the
+    /// REQUEST's own `DeltaNetState`. Returns `Ready { first_token }` using the
+    /// singleton first-token policy and leaves it as the
     /// lane's pending seed (also pushed to `history`) at position
     /// `prompt.len()`; `Aborted` leaves the lane fresh (position 0, no DFlash
     /// state — the caller retires it). A failure poisons the lane; the lane
@@ -209,12 +367,15 @@ impl Qwen35VmmStore {
             return Err("dflash prefill during an uncommitted step".into());
         }
         let engine = self.dflash_engine.as_ref().ok_or("dflash prefill: no DFlash engine staged")?;
+        if request.temp > 1e-6 && (!engine.supports_sampled() || !gpu.flags.dflash_fast_sample) {
+            return Err("dflash prefill: sampled lanes require FAST_SAMPLE selector chain".into());
+        }
         if prompt.is_empty() || prompt.len() >= engine.ctx_capacity() {
             return Err(format!("dflash prefill: prompt {} outside 1..{}", prompt.len(), engine.ctx_capacity()));
         }
         self.spec_provision(gpu, epoch, prompt.len())?;
         let Self { slots, dflash_engine, .. } = self;
-        let engine = dflash_engine.as_ref().expect("checked above");
+        let engine = dflash_engine.as_mut().expect("checked above");
         let s = slots
             .iter_mut()
             .flatten()
@@ -224,10 +385,32 @@ impl Qwen35VmmStore {
             return Err("dflash prefill: lane is not fresh".into());
         }
         let r = (|| -> Result<PrefillOutcome, String> {
-            let mut df = new_dflash_lane_state(gpu, &engine.assets, config, &s.dn)
+            let lane_policy = engine.lane_checkpoint;
+            let df = new_dflash_lane_state(gpu, &engine.assets, config, &s.dn, DflashOwnerKind::VmmLane)
                 .map_err(|e| format!("dflash prefill: lane state: {e}"))?;
-            let mut checkpoints: Vec<(usize, DeltaNetSnapshot)> = Vec::new();
-            let outcome = {
+            // Configure the private u64 stream before the first-token draw.
+            // This lane survives prefill; no post-prefill constructor reseeds it.
+            let mut lane = DflashVmmLaneState::cold(
+                df,
+                Vec::new(),
+                lane_policy,
+                prompt.len(),
+                &request,
+            );
+            let cfg = lane.sample_cfg();
+            if cfg.temp > 1e-6 {
+                let b = lane.df.block_size;
+                lane.sampled_draft = Some(DflashSampledDraft::new(b, config.vocab_size));
+                lane.sampled_target.probs.reserve(b * config.vocab_size);
+                lane.sampled_target.tau.reserve(b);
+                lane.sampled_target.z.reserve(b);
+                lane.sample_scratch.reserve(config.vocab_size);
+            }
+            // The lane owns no FWHT rotation buffers: the engine lends its
+            // own for the prompt prefill (the draft backfill GEMMs) and
+            // takes them back on every path.
+            let DflashVmmLaneState { df: lane_df, checkpoints, rng_state, sample_scratch, .. } = &mut lane;
+            let outcome = engine.with_lent_mq(lane_df, |assets, df| {
                 let mut target = DflashTargetParts {
                     weights,
                     config,
@@ -235,28 +418,32 @@ impl Qwen35VmmStore {
                     dn_state: &mut s.dn,
                     scratch,
                 };
-                dflash_prefill_lane_parts(gpu, &mut target, &engine.assets, &mut df, &mut checkpoints, prompt, abort)
+                dflash_prefill_lane_parts(
+                    gpu, &mut target, assets, lane_policy, df, checkpoints,
+                    prompt, cfg, rng_state, sample_scratch, abort,
+                )
+            });
+            let outcome = match outcome {
+                Ok(o) => o,
+                Err(e) => {
+                    lane.free_gpu(gpu);
+                    return Err(format!("dflash prefill: {e}"));
+                }
             };
             match outcome {
                 Ok(PrefillOutcome::Ready { first_token }) => {
-                    s.dflash = Some(DflashVmmLaneState::cold(
-                        df,
-                        checkpoints,
-                        engine.assets.checkpoint,
-                        prompt.len(),
-                        &request,
-                    ));
+                    s.dflash = Some(lane);
                     s.position = prompt.len();
                     s.pending_seed = Some(first_token);
                     s.history.push(first_token);
                     Ok(PrefillOutcome::Ready { first_token })
                 }
                 Ok(PrefillOutcome::Aborted) => {
-                    free_lane_parts(gpu, df, checkpoints);
+                    lane.free_gpu(gpu);
                     Ok(PrefillOutcome::Aborted)
                 }
                 Err(e) => {
-                    free_lane_parts(gpu, df, checkpoints);
+                    lane.free_gpu(gpu);
                     Err(format!("dflash prefill: {e}"))
                 }
             }
@@ -277,7 +464,12 @@ impl Qwen35VmmStore {
     /// `DeltaNetState` (a promoted request's pooled DN tensors can be larger
     /// than the resident one's; `save_from` copies by tensor size) and the
     /// last-window mark (the previous window's snapshot was in the old
-    /// sizing). Consumes `snapshot` on success and on every error.
+    /// sizing). The singleton's own FWHT rotation buffers and verify
+    /// `prefill_batch` are freed (`shed_vmm_lane_scratch`: lanes borrow the
+    /// engine's), and its checkpoints are freed and its cadence replaced by
+    /// the lane policy while no lane-side reader exists
+    /// ([`DFLASH_LANE_CHECKPOINT_READERS`]). Consumes `snapshot` on success
+    /// and on every error.
     pub fn dflash_adopt(
         &mut self,
         gpu: &mut Gpu,
@@ -331,6 +523,22 @@ impl Qwen35VmmStore {
                 engine.ctx_capacity()
             ));
         }
+        // Validation is complete. The promoted lane arrives with the
+        // singleton's own rotation buffers and `prefill_batch` (a lane needs
+        // neither: it borrows the engine's rotation buffers per draft call and
+        // verifies on the shared trunk scratch): free them.
+        lane.df
+            .shed_vmm_lane_scratch(gpu)
+            .map_err(|e| format!("dflash adopt: {e}"))?;
+        // Lanes take no checkpoints while nothing on the lane side reads them
+        // (`DFLASH_LANE_CHECKPOINT_READERS`): the promoted ones are dead.
+        let lane_policy = engine.lane_checkpoint;
+        if !lane_policy.resume_enabled {
+            for (_, snap) in lane.checkpoints.drain(..) {
+                snap.free_gpu(gpu);
+            }
+        }
+        lane.policy = lane_policy;
         let fresh = DeltaNetSnapshot::new_for(gpu, &s.dn).map_err(|e| format!("dflash adopt: DeltaNet snapshot: {e}"))?;
         std::mem::replace(&mut lane.df.target_snap, fresh).free_gpu(gpu);
         lane.last_window = None;
@@ -508,12 +716,13 @@ impl Qwen35VmmStore {
         Ok(())
     }
 
-    /// Provision: the greedy draft of every planned DFlash Verify lane on its
-    /// own draft state (epoch-tagged: the draft and its thlog mark are held
-    /// until commit/abort). Full-block lanes are drafted together through one
+    /// Provision: the singleton draft of every planned DFlash Verify lane on
+    /// its own state (epoch-tagged: draft, q and thlog mark wait until commit).
+    /// Greedy full-block lanes are drafted together through one
     /// draft-model forward and one shared lm-head ([`dflash_cb_draft`]; kill
     /// switch `HIPFIRE_CB_DFLASH_DRAFT_BATCH=0` drafts lane by lane with the
-    /// singleton call), byte-identical per lane. Touches only uncommitted
+    /// singleton call), byte-identical per lane. Sampled lanes use the singleton
+    /// selector forward/scorer per lane. Touches only uncommitted
     /// drafter state (projection watermarks, draft K/V of the window), never
     /// target state.
     pub(super) fn dflash_draft_planned(
@@ -598,8 +807,10 @@ impl Qwen35VmmStore {
     }
 
     /// Forward: every planned DFlash Verify lane through the shared ChainVerify
-    /// trunk (whole lanes in `<= 63`-row chunks) and ONE head + argmax + D2H
-    /// per chunk ([`dflash_cb_verify`]). Picks wait in each lane for commit.
+    /// trunk (whole lanes in chunks of at most the effective cap: `<= 63` rows,
+    /// or up to 128 when the wide verify route is admitted for the target) and
+    /// greedy shared head or sampled private Product heads ([`dflash_cb_verify`]).
+    /// Picks and exact normalized target receipts wait on each lane for commit.
     pub(super) fn dflash_verify_planned(
         &mut self,
         gpu: &mut Gpu,
@@ -648,10 +859,10 @@ impl Qwen35VmmStore {
         r
     }
 
-    /// Commit one verified DFlash window: the singleton greedy accept
-    /// consumer (`dflash_greedy_accept_commit_parts`: `eos=None` accept,
-    /// pre-commit `max_accept` clamp, hidden scatter/thlog append, snapshot
-    /// replay) over the lane's picks, then publish its window — position
+    /// Commit one verified DFlash window: singleton greedy prefix/clamp or
+    /// sampled host rejection over the genuine selector q and target rows,
+    /// followed by shared hidden scatter/thlog append and snapshot/tape repair.
+    /// Publish its window — position
     /// `+= accepted + 1`, pending seed = bonus, history `+= committed[1..]` —
     /// and keep the window mark for terminal-prefix repair.
     pub(super) fn dflash_commit_verify(
@@ -692,7 +903,22 @@ impl Qwen35VmmStore {
                 scratch,
             };
             let t0 = phase_start(gpu);
-            let r = dflash_greedy_accept_commit_parts(gpu, &mut target, &mut lane.df, &draft, &verified);
+            let r = if lane.sample_temp > 1e-6 {
+                let cfg = lane.sample_cfg();
+                let proposal = lane.sampled_draft.as_ref()
+                    .ok_or("commit_step: sampled DFlash verify without its proposal")?;
+                let decision = dflash_sampled_accept_rows(
+                    &draft.verify_tokens, proposal, Some(&lane.sampled_target), &[],
+                    config.vocab_size, cfg, draft.max_accept, &mut lane.rng_state,
+                    &mut lane.sample_scratch,
+                );
+                let receipt = dflash_eager_hip_verify_receipt(
+                    gpu, &target, &lane.df, draft.verify_tokens.len(),
+                );
+                dflash_commit_decision_parts(gpu, &mut target, &mut lane.df, &draft, decision, receipt)
+            } else {
+                dflash_greedy_accept_commit_parts(gpu, &mut target, &mut lane.df, &draft, &verified)
+            };
             phase_end(gpu, 2, t0);
             r.map_err(|e| format!("commit_step: DFlash accept: {e}"))?
         };
@@ -780,13 +1006,5 @@ fn phase_end(gpu: &mut Gpu, i: usize, t0: Option<std::time::Instant>) {
             v / vn.max(1) as f64,
             a / vn.max(1) as f64
         );
-    }
-}
-
-/// Free a lane's owners that never became a [`DflashVmmLaneState`].
-fn free_lane_parts(gpu: &mut Gpu, df: crate::dflash_spec::DflashState, checkpoints: Vec<(usize, DeltaNetSnapshot)>) {
-    df.free_gpu(gpu);
-    for (_, snap) in checkpoints {
-        snap.free_gpu(gpu);
     }
 }

@@ -2943,7 +2943,7 @@ pub fn generate_dflash(
     // DFlash is single-turn by construction — `seq_pos` is reset to 0
     // below before seed_target_hidden_from_prompt runs — so we never
     // need to guard on `seq_pos == 0` here.
-    let tokenizer = m.tokenizer.as_ref().unwrap();
+    let is_qwen4 = m.qwen4().is_some();
     // LFM2.5 (arch_id 11) REQUIRES its embedded Jinja chat_template — the
     // hand-rolled Plain ChatML path omits LFM2's `<|startoftext|>` BOS and
     // produces garbage. Force jinja on for arch 11 (Plain only if the .hfq
@@ -2961,7 +2961,32 @@ pub fn generate_dflash(
         assistant_prefix,
         hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
     );
-    let prompt_tokens: Vec<u32> = if try_jinja {
+    let prompt_tokens: Vec<u32> = if is_qwen4 {
+        // Cold stage of the shared Qwen4 render; the history stage runs after
+        // the context-fit checks, where the cache plan used to render it.
+        match render_qwen4_prompt_cold(
+            m,
+            Qwen4PromptRoute::Mtp,
+            system_prompt,
+            prompt,
+            assistant_prefix,
+            tools,
+            messages_history,
+            enable_thinking,
+            reasoning_effort,
+        ) {
+            Ok((tokens, opens_think)) => {
+                started_in_think = opens_think;
+                tokens
+            }
+            Err((message, kind)) => {
+                emit_active_attempt_error(stdout, Some(id), &message, kind, false, false);
+                let _ = stdout.flush();
+                return true;
+            }
+        }
+    } else if try_jinja {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
         let template = m.chat_template.as_ref().unwrap();
         let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
             tokenizer,
@@ -3039,6 +3064,7 @@ pub fn generate_dflash(
             }
         }
     } else {
+        let tokenizer = m.tokenizer.as_ref().unwrap();
         hipfire_runtime::prompt_frame::ChatFrame {
             tokenizer,
             system: system_prompt,
@@ -3048,6 +3074,7 @@ pub fn generate_dflash(
         }
         .build()
     };
+    let tokenizer = m.tokenizer.as_ref().unwrap();
 
     // `im_end_token` is still needed downstream for the EOS check.
     let im_end = tokenizer.encode("<|im_end|>");
@@ -3119,7 +3146,6 @@ pub fn generate_dflash(
     // spliced stream byte-matches the end-of-turn bake. Divergence (edited
     // history, roundtrip-unstable text) lands on the checkpoint-resume path —
     // worst case equals today's cold prefill, never wrong tokens.
-    let is_qwen4 = m.qwen4().is_some();
     let qwen4_native_mtp = is_qwen4 && spec_name == "mtp";
     // Qwen4's shared history planner only renders; its native MTP route plans
     // reuse separately through the session cache. Other Qwen4 speculators are cold.
@@ -3143,6 +3169,31 @@ pub fn generate_dflash(
         .as_deref()
         != Some("0")
         && m.eviction.is_none();
+    // Qwen4 history stage of the shared canonical render, after the cold-length
+    // fit checks above (same order as the former cache-plan stage).
+    let prompt_tokens: Vec<u32> = if is_qwen4 {
+        match render_qwen4_prompt_history(
+            m,
+            Qwen4PromptRoute::Mtp,
+            system_prompt,
+            prompt,
+            assistant_prefix,
+            tools,
+            messages_history,
+            enable_thinking,
+            reasoning_effort,
+            prompt_tokens,
+        ) {
+            Ok(tokens) => tokens,
+            Err((message, kind)) => {
+                emit_active_attempt_error(stdout, Some(id), &message, kind, false, false);
+                let _ = stdout.flush();
+                return true;
+            }
+        }
+    } else {
+        prompt_tokens
+    };
     // Qwen4 renders canonical history here, but only the session cache plans
     // device reuse. Other families retain their conversation/checkpoint plan.
     let (conversation_tokens, dflash_ckpt_positions): (&[u32], Vec<usize>) = if is_qwen4 {
@@ -3161,7 +3212,9 @@ pub fn generate_dflash(
         && m.eviction.is_none()
         && pflash_bypass_reason.is_none()
         && !conversation_tokens.is_empty();
-    let cache_plan: Option<PromptCachePlan> = if try_jinja {
+    let cache_plan: Option<PromptCachePlan> = if is_qwen4 {
+        None
+    } else if try_jinja {
         if let Some(hist) = messages_history {
             let tok = m.tokenizer.as_ref().unwrap();
             let template = m.chat_template.as_ref().unwrap();
@@ -4498,10 +4551,75 @@ pub fn generate_spec(
         // pending seed is emitted, not yet fed), a serve-batched peer is
         // waiting and the daemon granted a permit: discard the draft state,
         // keep the seed, and continue this request as exact batched AR in
-        // the VMM driver instead of making the peer wait.
+        // the VMM driver instead of making the peer wait. Greedy requests
+        // only: this path reseeds and substitutes AR, which a sampled
+        // speculative request must never undergo.
         if promo_shape_ok && pending_seed_committable && semantic_stop.is_none() && m.eviction.is_none() {
-            if let Some(permit) = crate::batch::promotion_permit()
-                .filter(|_| crate::batch::promotion_wanted(generated))
+            // Qwen4 (Flash-Next): the running singleton moves into an exact
+            // lane — trunk/head/draft states and the drafter's pending hidden
+            // — and the daemon drives it in `drive_qwen4_lane_batch`.
+            let qwen4_lanes = slot
+                .as_any_mut()
+                .downcast_mut::<hipfire_arch_qwen4::bundle::Qwen4Bundle>()
+                .is_some_and(|b| b.lanes().is_some());
+            if qwen4_lanes {
+                if let Some(permit) = crate::batch::promotion_permit()
+                    .filter(|p| p.sampling.temp <= 0.0 && crate::batch::promotion_wanted(generated))
+                {
+                    let promoted = {
+                        let drafter = spec
+                            .drafter_any_mut()
+                            .and_then(|a| a.downcast_mut::<hipfire_arch_qwen4::mtp_spec::Qwen4MtpDrafter>())
+                            .map(|d| &*d);
+                        match slot.as_any_mut().downcast_mut::<hipfire_arch_qwen4::bundle::Qwen4Bundle>() {
+                            Some(bundle) => crate::batch::promote_qwen4_singleton(
+                                gpu,
+                                bundle,
+                                drafter,
+                                crate::batch::Qwen4Boundary {
+                                    id,
+                                    permit,
+                                    tokenizer,
+                                    started_in_think: promo_started_in_think,
+                                    prompt_tokens: &prompt_tokens,
+                                    emitted: &emitted,
+                                    position,
+                                    seed_token,
+                                    max_tokens,
+                                    created_at: t0,
+                                    prefill_done_at: t_prefill,
+                                },
+                            ),
+                            None => Err("spec target is not a qwen4 bundle".to_string()),
+                        }
+                    };
+                    match promoted {
+                        Ok(promoted) => {
+                            // The resident state moved into the lane: host
+                            // caches and the drafter's request state belong to
+                            // it, so drop them (the guard restores the bundle).
+                            m.seq_pos = 0;
+                            m.conversation_tokens.clear();
+                            m.asst_turn_cache.clear();
+                            free_checkpoints(&mut m.prefill_checkpoints, gpu);
+                            free_checkpoints(&mut m.dflash_checkpoints, gpu);
+                            if let Err(e) = spec.reset(gpu) {
+                                eprintln!("[fn-lanes-promote] speculator reset after promotion: {e}");
+                            }
+                            crate::common::fail_closed_invalidate_graphs_and_replay(gpu);
+                            gpu.replay.rearm_after_layout_growth();
+                            eprintln!(
+                                "[fn-lanes-promote] id={id} promoted at generated={generated} position={position}"
+                            );
+                            crate::batch::put_promoted_qwen4(promoted);
+                            drop(guard);
+                            return None;
+                        }
+                        Err(e) => eprintln!("[fn-lanes-promote] id={id} stays on spec: {e}"),
+                    }
+                }
+            } else if let Some(permit) = crate::batch::promotion_permit()
+                .filter(|p| p.sampling.temp <= 0.0 && crate::batch::promotion_wanted(generated))
             {
                 let attempt = hipfire_engine::terminal::active_attempt_id();
                 let rng_state = request_seed_for(&AttemptKey::new(id, attempt), permit.client_seed);
@@ -4526,13 +4644,15 @@ pub fn generate_spec(
                         // A DFlash drafter's lane (draft K/V, hidden ring,
                         // checkpoints, cursors) moves into the batch lane.
                         // Capture BEFORE the irreversible target transfer
-                        // below; a refused promotion restores it.
+                        // below; a refused promotion restores it. The
+                        // singleton is left vacant (no replacement lane
+                        // state is allocated; its next prefill rebuilds it).
                         let df_snap = if permit.dflash_lane {
                             match spec
                                 .drafter_any_mut()
                                 .and_then(|a| a.downcast_mut::<hipfire_arch_qwen35::dflash_spec::DflashSpeculator>())
                             {
-                                Some(df) => match df.take_vmm_lane(gpu, &ms.config, &ms.dn_state, position) {
+                                Some(df) => match df.take_vmm_lane(gpu, position) {
                                     Ok(snap) => Some(snap),
                                     Err(e) => {
                                         eprintln!("[vmm-promote] id={id} no DFlash lane state ({e}); continues as AR");
@@ -8373,6 +8493,264 @@ mod pp_forward_order_tests {
     }
 }
 
+/// Which Qwen4 singleton route a prompt is rendered for. The two routes build
+/// byte-identical prompts on success; they differ only in how a render or
+/// cached-history failure is handled and reported.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Qwen4PromptRoute {
+    /// `generate_qwen4_ar`: Jinja render failure is a fail-closed validation
+    /// error; a cached-history build failure is an error only under
+    /// `reasoning_effort`, else the cold render is used.
+    Ar,
+    /// Native Qwen4 MTP (`generate_dflash`): Jinja render failure falls back to
+    /// the Plain `ChatFrame` unless `reasoning_effort` is set (then validation
+    /// error); cached-history failure as for `Ar`.
+    Mtp,
+}
+
+/// `HIPFIRE_JINJA_CHAT` gate shared by the Qwen4 prompt stages: Jinja (default)
+/// when the model carries a chat template, else the Plain `ChatFrame`.
+fn qwen4_jinja_enabled() -> bool {
+    hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
+        .ok()
+        .as_deref()
+        != Some("0")
+}
+
+/// Stage 1 of the canonical Qwen4 singleton prompt: the cold render. Jinja
+/// (`render_messages` when tools/history are present, else `render`) encoded to
+/// ids, with `started_in_think` taken from the rendered tail; or the Plain
+/// `ChatFrame` when Jinja is off / no template. Failure policy follows `route`
+/// (see [`Qwen4PromptRoute`]). On the `Ar` route with Jinja off and history the
+/// cold ids are empty because stage 2 plans the whole history render itself.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_qwen4_prompt_cold(
+    m: &LoadedModel,
+    route: Qwen4PromptRoute,
+    system_prompt: Option<&str>,
+    prompt: &str,
+    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    enable_thinking: bool,
+    reasoning_effort: Option<&str>,
+) -> Result<(Vec<u32>, bool), (String, &'static str)> {
+    let mut started_in_think = matches!(
+        assistant_prefix,
+        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
+    );
+    let tokenizer = m.tokenizer.as_ref().unwrap();
+    let cold = if let Some(template) = m.chat_template.as_ref().filter(|_| qwen4_jinja_enabled()) {
+        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+            tokenizer,
+            template,
+            system: system_prompt,
+            user: prompt,
+            enable_thinking,
+            bos_token: None,
+            reasoning_strength: None,
+            reasoning_effort,
+        };
+        let rendered = if tools.is_some() || messages_history.is_some() {
+            let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
+            let messages = match messages_history {
+                Some(messages) => messages,
+                None => {
+                    let mut value = Vec::new();
+                    if let Some(system) = system_prompt {
+                        value.push(hipfire_runtime::prompt_frame::Message {
+                            role: hipfire_runtime::prompt_frame::Role::System,
+                            content: system.to_string(),
+                            reasoning_content: None,
+                            name: None,
+                            rendered_name: None,
+                            tool_calls: Vec::new(),
+                            tool_call_id: None,
+                            tool_plan: String::new(),
+                        });
+                    }
+                    value.push(hipfire_runtime::prompt_frame::Message {
+                        role: hipfire_runtime::prompt_frame::Role::User,
+                        content: prompt.to_string(),
+                        reasoning_content: None,
+                        name: None,
+                        rendered_name: None,
+                        tool_calls: Vec::new(),
+                        tool_call_id: None,
+                        tool_plan: String::new(),
+                    });
+                    synthesized = value;
+                    &synthesized
+                }
+            };
+            frame.render_messages(messages, tools, None)
+        } else {
+            frame.render()
+        };
+        match rendered {
+            Ok(rendered) => {
+                started_in_think = render_tail_opens_think(&rendered);
+                tokenizer.encode(&rendered)
+            }
+            Err(error) => match route {
+                Qwen4PromptRoute::Ar => {
+                    return Err((format!("qwen4 Jinja render failed: {error}"), "validation"));
+                }
+                Qwen4PromptRoute::Mtp => {
+                    if reasoning_effort.is_some() {
+                        return Err((format!("DFlash jinja render: {error}"), "validation"));
+                    }
+                    eprintln!("[daemon] jinja render failed ({error}) — falling back to Plain");
+                    hipfire_runtime::prompt_frame::ChatFrame {
+                        tokenizer,
+                        system: system_prompt,
+                        user: prompt,
+                        assistant_prefix,
+                        raw: false,
+                    }
+                    .build()
+                }
+            },
+        }
+    } else if route == Qwen4PromptRoute::Ar && messages_history.is_some() {
+        Vec::new()
+    } else {
+        hipfire_runtime::prompt_frame::ChatFrame {
+            tokenizer,
+            system: system_prompt,
+            user: prompt,
+            assistant_prefix,
+            raw: false,
+        }
+        .build()
+    };
+    Ok((cold, started_in_think))
+}
+
+/// Stage 2: the canonical conversation. Without history it is `cold` itself.
+/// With history, Jinja splices the emitted assistant token ids
+/// (`qwen_jinja_cached_history_tokens`, same machinery + cache for both routes)
+/// instead of re-encoding decoded history text, so both Qwen4 modes build
+/// byte-identical turn-N prompts; a splice failure is an error only under
+/// `reasoning_effort`, else `cold` is kept. Without Jinja, history is planned
+/// by `plan_prompt_cache` (cache disabled, empty conversation) and its
+/// `rendered` stream is the prompt. Qwen4 never reuses the LCP conversation plan.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_qwen4_prompt_history(
+    m: &mut LoadedModel,
+    route: Qwen4PromptRoute,
+    system_prompt: Option<&str>,
+    prompt: &str,
+    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    enable_thinking: bool,
+    reasoning_effort: Option<&str>,
+    cold: Vec<u32>,
+) -> Result<Vec<u32>, (String, &'static str)> {
+    let Some(hist) = messages_history else {
+        return Ok(cold);
+    };
+    let tokenizer = m.tokenizer.as_ref().unwrap();
+    if let Some(template) = m.chat_template.as_ref().filter(|_| qwen4_jinja_enabled()) {
+        let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
+            tokenizer,
+            template,
+            system: system_prompt,
+            user: prompt,
+            enable_thinking,
+            bos_token: None,
+            reasoning_strength: None,
+            reasoning_effort,
+        };
+        let (label, error_prefix, log_name) = match route {
+            Qwen4PromptRoute::Ar => ("qwen4-ar", "qwen4 AR qwen-cache jinja build", "qwen4 AR"),
+            Qwen4PromptRoute::Mtp => ("dflash", "DFlash qwen-cache jinja build", "DFlash"),
+        };
+        match qwen_jinja_cached_history_tokens(
+            &frame,
+            &mut m.asst_turn_cache,
+            &cold,
+            hist,
+            tools,
+            label,
+            Some(&m.conversation_tokens),
+        ) {
+            Ok(spliced) => Ok(spliced),
+            Err(e) => {
+                if reasoning_effort.is_some() {
+                    return Err((format!("{error_prefix}: {e}"), "validation"));
+                }
+                eprintln!(
+                    "[qwen-cache] {log_name} jinja cached-history build failed ({e}) — cold render"
+                );
+                Ok(cold)
+            }
+        }
+    } else {
+        Ok(plan_prompt_cache(
+            tokenizer,
+            &mut m.asst_turn_cache,
+            &[],
+            false,
+            system_prompt,
+            prompt,
+            assistant_prefix,
+            qwen_history_tool_render(&m.model_path),
+            hist,
+            true,
+            &[],
+            false,
+        )
+        .rendered)
+    }
+}
+
+/// Canonical Qwen4 singleton prompt for `generate_qwen4_ar` and the lane batch
+/// driver (route `Ar`): [`render_qwen4_prompt_cold`] then
+/// [`render_qwen4_prompt_history`]. Returns the full prompt ids and
+/// `started_in_think`. The error pair is `(message, error_kind)` for
+/// `emit_active_attempt_error` (always `"validation"`). An empty prompt is NOT
+/// checked here. `generate_dflash` (native MTP) calls the two stages separately
+/// because its context-fit checks run between them on the cold ids.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn render_qwen4_prompt(
+    m: &mut LoadedModel,
+    route: Qwen4PromptRoute,
+    system_prompt: Option<&str>,
+    prompt: &str,
+    assistant_prefix: hipfire_runtime::prompt_frame::AssistantPrefix,
+    tools: Option<&[serde_json::Value]>,
+    messages_history: Option<&[hipfire_runtime::prompt_frame::Message]>,
+    enable_thinking: bool,
+    reasoning_effort: Option<&str>,
+) -> Result<(Vec<u32>, bool), (String, &'static str)> {
+    let (cold, started_in_think) = render_qwen4_prompt_cold(
+        m,
+        route,
+        system_prompt,
+        prompt,
+        assistant_prefix,
+        tools,
+        messages_history,
+        enable_thinking,
+        reasoning_effort,
+    )?;
+    let tokens = render_qwen4_prompt_history(
+        m,
+        route,
+        system_prompt,
+        prompt,
+        assistant_prefix,
+        tools,
+        messages_history,
+        enable_thinking,
+        reasoning_effort,
+        cold,
+    )?;
+    Ok((tokens, started_in_think))
+}
+
 /// Single-GPU Qwen4 AR producer.
 ///
 /// Qwen4 owns a hybrid GDN/QSA state machine rather than a Qwen3.5
@@ -8443,152 +8821,23 @@ pub fn generate_qwen4_ar(
     // silently selecting another producer.
     let _ = think_mode;
 
-    let mut started_in_think = matches!(
+    let (prompt_tokens, started_in_think) = match render_qwen4_prompt(
+        m,
+        Qwen4PromptRoute::Ar,
+        system_prompt,
+        prompt,
         assistant_prefix,
-        hipfire_runtime::prompt_frame::AssistantPrefix::OpenThink
-    );
-    // `rendered` is the full canonical prompt; `history_plan` is already the
-    // finished plan when the non-Jinja history render planned it itself.
-    let (rendered, history_plan): (Vec<u32>, Option<PromptCachePlan>) = {
-        let tokenizer = m.tokenizer.as_ref().unwrap();
-        let jinja_enabled = hipfire_config::developer_var("HIPFIRE_JINJA_CHAT")
-            .ok()
-            .as_deref()
-            != Some("0");
-        if let Some(template) = m.chat_template.as_ref().filter(|_| jinja_enabled) {
-            let frame = hipfire_runtime::prompt_frame::JinjaChatFrame {
-                tokenizer,
-                template,
-                system: system_prompt,
-                user: prompt,
-                enable_thinking,
-                bos_token: None,
-                reasoning_strength: None,
-                reasoning_effort,
-            };
-            let rendered = if tools.is_some() || messages_history.is_some() {
-                let synthesized: Vec<hipfire_runtime::prompt_frame::Message>;
-                let messages = match messages_history {
-                    Some(messages) => messages,
-                    None => {
-                        let mut value = Vec::new();
-                        if let Some(system) = system_prompt {
-                            value.push(hipfire_runtime::prompt_frame::Message {
-                                role: hipfire_runtime::prompt_frame::Role::System,
-                                content: system.to_string(),
-                                reasoning_content: None,
-                                name: None,
-                                rendered_name: None,
-                                tool_calls: Vec::new(),
-                                tool_call_id: None,
-                                tool_plan: String::new(),
-                            });
-                        }
-                        value.push(hipfire_runtime::prompt_frame::Message {
-                            role: hipfire_runtime::prompt_frame::Role::User,
-                            content: prompt.to_string(),
-                            reasoning_content: None,
-                            name: None,
-                            rendered_name: None,
-                            tool_calls: Vec::new(),
-                            tool_call_id: None,
-                            tool_plan: String::new(),
-                        });
-                        synthesized = value;
-                        &synthesized
-                    }
-                };
-                frame.render_messages(messages, tools, None)
-            } else {
-                frame.render()
-            };
-            match rendered {
-                Ok(rendered) => {
-                    started_in_think = render_tail_opens_think(&rendered);
-                    let cold = tokenizer.encode(&rendered);
-                    // Multi-turn: splice the emitted assistant token IDs
-                    // (same machinery + cache as the MTP route) instead of
-                    // re-encoding the decoded history text, so both Qwen4
-                    // modes build byte-identical turn-N prompts.
-                    let tokens = match messages_history {
-                        Some(hist) => match qwen_jinja_cached_history_tokens(
-                            &frame,
-                            &mut m.asst_turn_cache,
-                            &cold,
-                            hist,
-                            tools,
-                            "qwen4-ar",
-                            Some(&m.conversation_tokens),
-                        ) {
-                            Ok(spliced) => spliced,
-                            Err(e) => {
-                                if reasoning_effort.is_some() {
-                                    emit_active_attempt_error(
-                                        stdout,
-                                        Some(id),
-                                        &format!("qwen4 AR qwen-cache jinja build: {e}"),
-                                        "validation",
-                                        false,
-                                        false,
-                                    );
-                                    return;
-                                }
-                                eprintln!(
-                                    "[qwen-cache] qwen4 AR jinja cached-history build failed ({e}) — cold render"
-                                );
-                                cold
-                            }
-                        },
-                        None => cold,
-                    };
-                    (tokens, None)
-                }
-                Err(error) => {
-                    emit_active_attempt_error(
-                        stdout,
-                        Some(id),
-                        &format!("qwen4 Jinja render failed: {error}"),
-                        "validation",
-                        false,
-                        false,
-                    );
-                    return;
-                }
-            }
-        } else {
-            match messages_history {
-                Some(hist) => {
-                    let plan = plan_prompt_cache(
-                        tokenizer,
-                        &mut m.asst_turn_cache,
-                        &[],
-                        false,
-                        system_prompt,
-                        prompt,
-                        assistant_prefix,
-                        qwen_history_tool_render(&m.model_path),
-                        hist,
-                        true,
-                        &[],
-                        false,
-                    );
-                    (Vec::new(), Some(plan))
-                }
-                None => (
-                    hipfire_runtime::prompt_frame::ChatFrame {
-                        tokenizer,
-                        system: system_prompt,
-                        user: prompt,
-                        assistant_prefix,
-                        raw: false,
-                    }
-                    .build(),
-                    None,
-                ),
-            }
+        tools,
+        messages_history,
+        enable_thinking,
+        reasoning_effort,
+    ) {
+        Ok(rendered) => rendered,
+        Err((message, kind)) => {
+            emit_active_attempt_error(stdout, Some(id), &message, kind, false, false);
+            return;
         }
     };
-    let prompt_tokens = history_plan.map_or(rendered, |plan| plan.rendered);
     if prompt_tokens.is_empty() {
         emit_active_attempt_error(
             stdout,

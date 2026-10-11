@@ -1812,7 +1812,7 @@ impl Gpu {
         // `HIPFIRE_QWEN4_ROUTER_FAST` (exact gfx1151 / gfx1201): eager batched calls take
         // the wave-per-token kernel, bytewise the same outputs; decode (one
         // token), recording and graph capture keep the incumbent symbol.
-        let fast = tokens > 1
+        let fast = self.route_rows(tokens) > 1
             && self.flags.qwen4_router_fast_enabled()
             && !self.replay.is_recording()
             && !self.graphs.capture_mode;
@@ -2788,7 +2788,7 @@ impl Gpu {
         self.arch_caps.has_wmma_w32()
             && m == 2560
             && k == 640
-            && x_src_rows >= 10 * crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
+            && self.route_rows(x_src_rows) >= 10 * crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
             && *crate::gemm::QWEN4_F16_WMMA
     }
 

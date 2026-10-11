@@ -17,6 +17,8 @@ use crate::{
     DeviceBuffer, HipError, HipMemAccessDesc, HipMemAllocationProp, HipMemGenericAllocationHandle,
     HipResult, HipRuntime, HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED,
 };
+use crate::ffi::{HipMemLocation, HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM};
+use std::os::fd::{BorrowedFd, OwnedFd};
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::ffi::c_void;
@@ -436,6 +438,28 @@ fn take_fault(kind: VmmFaultKind) -> Option<HipError> {
     })
 }
 
+/// Lifecycle/protection class of a [`VmmArena`]. `Default` is the unchanged
+/// private (KV/weights) arena; the others only come from the shared-weight
+/// constructors and reject the multi-mapping/granule-sharing APIs.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum VmmArenaKind {
+    /// Ordinary private read-write arena.
+    Default,
+    /// Exportable (POSIX FD) arena still under construction: RW, single physical allocation.
+    ExportBuilding,
+    /// Exportable arena after [`VmmArena::publish_read_only`]: owner access is RO.
+    ExportPublished,
+    /// Arena mapping an imported POSIX-FD allocation: always RO.
+    ImportedReadOnly,
+}
+
+fn allocation_prop(kind: VmmArenaKind, device: i32) -> HipMemAllocationProp {
+    match kind {
+        VmmArenaKind::Default => HipMemAllocationProp::device_pinned(device),
+        _ => HipMemAllocationProp::device_pinned_posix_fd(device),
+    }
+}
+
 #[derive(Debug)]
 struct VmmSegment {
     offset: usize,
@@ -459,6 +483,7 @@ pub struct VmmArena {
     releasing: bool,
     /// True once any mapping succeeded; a never-mapped VA may adopt a shared prefix.
     ever_mapped: bool,
+    kind: VmmArenaKind,
 }
 
 // SAFETY: VmmArena holds a device VA base and opaque HIP allocation handles that
@@ -469,6 +494,158 @@ unsafe impl Send for VmmArena {}
 
 impl VmmArena {
     pub fn reserve(hip: &HipRuntime, owner_device: i32, requested_bytes: usize) -> HipResult<Self> {
+        Self::reserve_kind(
+            hip,
+            owner_device,
+            requested_bytes,
+            VmmArenaKind::Default,
+            false,
+        )
+    }
+
+    /// Reserve an arena whose single physical allocation is created exportable
+    /// as a POSIX FD (`requestedHandleTypes = POSIX_FD`). The caller maps it
+    /// with exactly one [`Self::map_next`] of [`Self::reserved_bytes`] (owner
+    /// device access only; a second mapping is refused), fills it while the
+    /// arena is read-write, synchronizes, calls [`Self::publish_read_only`],
+    /// then [`Self::export_posix`]. Retirement/release behave like [`Self::reserve`].
+    pub fn reserve_exportable(
+        hip: &HipRuntime,
+        device: i32,
+        bytes: usize,
+    ) -> HipResult<Self> {
+        Self::reserve_kind(hip, device, bytes, VmmArenaKind::ExportBuilding, false)
+    }
+
+    /// Import a POSIX-FD physical allocation exported by [`Self::export_posix`]
+    /// and map it read-only at offset zero of a fresh reservation on `device`
+    /// (the owner device; no peer access). `physical_bytes` must be the
+    /// exporter's physical size, a non-zero multiple of this device's
+    /// allocation granularity. `fd` is borrowed: it is not consumed or closed.
+    /// The arena is read-only for its whole life and must be released with
+    /// [`Self::release`]. On failure nothing is returned to retry: the VA is
+    /// retired, and a handle whose release failed stays in the granule table
+    /// pending [`retry_pending_granule_releases`].
+    pub fn import_posix(
+        hip: &HipRuntime,
+        device: i32,
+        fd: BorrowedFd<'_>,
+        physical_bytes: usize,
+    ) -> HipResult<Self> {
+        let mut arena = Self::reserve_kind(
+            hip,
+            device,
+            physical_bytes,
+            VmmArenaKind::ImportedReadOnly,
+            true,
+        )?;
+        let handle = match hip.mem_import_posix(fd) {
+            Ok(handle) => handle,
+            Err(err) => return Err(arena.abort_import(hip, None, false, err)),
+        };
+        let base = arena.base;
+        let size = arena.reserved_bytes;
+        let mapped = take_fault(VmmFaultKind::Map).map_or_else(
+            // SAFETY: `base..+size` is the fresh, unmapped reservation of this
+            // arena; `size` equals the imported allocation's physical size
+            // (caller contract) and `handle` is a live imported handle owned here.
+            || unsafe { hip.mem_map(base, size, handle) },
+            Err,
+        );
+        if let Err(err) = mapped {
+            return Err(arena.abort_import(hip, Some(handle), false, err));
+        }
+        let access = [HipMemAccessDesc::read_only_device(device)];
+        let access_set = take_fault(VmmFaultKind::AccessReset).map_or_else(
+            // SAFETY: `base..+size` was just mapped above; the only descriptor
+            // is the owner device, read-only.
+            || unsafe { hip.mem_set_access(base, size, &access) },
+            Err,
+        );
+        if let Err(err) = access_set {
+            return Err(arena.abort_import(hip, Some(handle), true, err));
+        }
+        arena.segments.push(VmmSegment {
+            offset: 0,
+            size,
+            handle: Some(handle),
+            granule: None,
+            mapped: true,
+        });
+        arena.mapped_bytes = size;
+        arena.ever_mapped = true;
+        Ok(arena)
+    }
+
+    /// Failure cleanup for [`Self::import_posix`]: undo what was done, retire
+    /// the reservation (VA is never freed), and keep any handle that could not
+    /// be released owned by the granule table. Returns the error to report.
+    fn abort_import(
+        mut self,
+        hip: &HipRuntime,
+        handle: Option<HipMemGenericAllocationHandle>,
+        mapped: bool,
+        err: HipError,
+    ) -> HipError {
+        let size = self.reserved_bytes;
+        let mut cleanup: Option<HipError> = None;
+        if let Some(handle) = handle {
+            let mut unmapped = !mapped;
+            if mapped {
+                let result = match take_fault(VmmFaultKind::Unmap) {
+                    Some(fault) => Err(fault),
+                    // SAFETY: `base..+size` was mapped by `import_posix` and
+                    // never used by a kernel (arena not yet returned).
+                    None => unsafe { hip.mem_unmap(self.base, size) },
+                };
+                match result {
+                    Ok(()) => unmapped = true,
+                    Err(unmap_err) => cleanup = Some(unmap_err),
+                }
+            }
+            if unmapped {
+                let result = match take_fault(VmmFaultKind::Release) {
+                    Some(fault) => Err(fault),
+                    // SAFETY: no mapped range references `handle`; it is owned here.
+                    None => unsafe { hip.mem_release(handle) },
+                };
+                if let Err(release_err) = result {
+                    // Pending release: counted live, retried by
+                    // `retry_pending_granule_releases`.
+                    let mut table = granule_table();
+                    let id = table.register(handle as usize, size);
+                    let _ = table.drop_lease(id, &mut |_| Err(release_err.clone()));
+                    cleanup = Some(release_err);
+                }
+            } else {
+                // Still mapped: cannot release; leaked but accounted as live.
+                granule_table().register(handle as usize, size);
+            }
+        }
+        retired_va().retire(self.reserved_bytes);
+        self.base = std::ptr::null_mut();
+        self.reserved_bytes = 0;
+        match cleanup {
+            None => err,
+            Some(cleanup) => HipError::new(
+                0,
+                &format!(
+                    "{err}; imported VMM cleanup also failed: {cleanup}; reservation retired"
+                ),
+            ),
+        }
+    }
+
+    /// Shared reserve path. `exact_granules` additionally requires
+    /// `requested_bytes` to be a non-zero multiple of the allocation
+    /// granularity (imports map a whole physical allocation).
+    fn reserve_kind(
+        hip: &HipRuntime,
+        owner_device: i32,
+        requested_bytes: usize,
+        kind: VmmArenaKind,
+        exact_granules: bool,
+    ) -> HipResult<Self> {
         if requested_bytes == 0 {
             return Err(HipError::new(
                 0,
@@ -484,13 +661,26 @@ impl VmmArena {
         }
 
         hip.set_device(owner_device)?;
-        let prop = HipMemAllocationProp::device_pinned(owner_device);
-        let granularity =
-            hip.mem_get_allocation_granularity(&prop, HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED)?;
+        let prop = allocation_prop(kind, owner_device);
+        let granularity_option = match kind {
+            VmmArenaKind::Default => HIP_MEM_ALLOCATION_GRANULARITY_RECOMMENDED,
+            // Exportable/imported owners use minimum rounding so small owners
+            // do not pay recommended-granularity padding.
+            _ => HIP_MEM_ALLOCATION_GRANULARITY_MINIMUM,
+        };
+        let granularity = hip.mem_get_allocation_granularity(&prop, granularity_option)?;
         if granularity == 0 {
             return Err(HipError::new(
                 0,
                 "HIP returned zero VMM allocation granularity",
+            ));
+        }
+        if exact_granules && !requested_bytes.is_multiple_of(granularity) {
+            return Err(HipError::new(
+                0,
+                &format!(
+                    "VMM physical size {requested_bytes} must be a multiple of granularity {granularity}"
+                ),
             ));
         }
         let reserved_bytes = round_up(requested_bytes, granularity)?;
@@ -507,6 +697,7 @@ impl VmmArena {
             access_devices: vec![owner_device],
             releasing: false,
             ever_mapped: false,
+            kind,
         })
     }
 
@@ -559,6 +750,29 @@ impl VmmArena {
                 0,
                 "VMM arena is releasing or already released",
             ));
+        }
+        match self.kind {
+            VmmArenaKind::Default => {}
+            VmmArenaKind::ExportBuilding => {
+                if !self.segments.is_empty() {
+                    return Err(HipError::new(
+                        0,
+                        "exportable VMM arena holds exactly one physical allocation",
+                    ));
+                }
+                if access_devices.iter().any(|&device| device != self.owner_device) {
+                    return Err(HipError::new(
+                        0,
+                        "exportable VMM arena grants access to its owner device only",
+                    ));
+                }
+            }
+            VmmArenaKind::ExportPublished | VmmArenaKind::ImportedReadOnly => {
+                return Err(HipError::new(
+                    0,
+                    "read-only (published or imported) VMM arena cannot be remapped",
+                ));
+            }
         }
         if size == 0 || !size.is_multiple_of(self.granularity) {
             return Err(HipError::new(
@@ -619,7 +833,7 @@ impl VmmArena {
             .collect();
 
         hip.set_device(self.owner_device)?;
-        let prop = HipMemAllocationProp::device_pinned(self.owner_device);
+        let prop = allocation_prop(self.kind, self.owner_device);
         let handle = hip.mem_create(size, &prop)?;
         let address = offset_ptr(self.base, self.mapped_bytes);
         // SAFETY: `address` is base+mapped_bytes within the live reserved VA;
@@ -775,6 +989,12 @@ impl VmmArena {
             return Err(HipError::new(
                 0,
                 "VMM arena is releasing or already released",
+            ));
+        }
+        if self.kind != VmmArenaKind::Default {
+            return Err(HipError::new(
+                0,
+                "exportable/imported VMM arenas do not support granule sharing",
             ));
         }
         if bytes == 0 {
@@ -991,6 +1211,12 @@ impl VmmArena {
                 "VMM arena is releasing or already released",
             ));
         }
+        if self.kind != VmmArenaKind::Default {
+            return Err(HipError::new(
+                0,
+                "exportable/imported VMM arenas do not support granule mapping",
+            ));
+        }
         Ok(())
     }
 
@@ -1139,6 +1365,94 @@ impl VmmArena {
             self.base,
             logical_bytes.min(self.mapped_bytes),
         ))
+    }
+
+    /// True once the arena is read-only for its owner device (published
+    /// exportable arena, or an imported arena).
+    pub fn is_read_only(&self) -> bool {
+        matches!(
+            self.kind,
+            VmmArenaKind::ExportPublished | VmmArenaKind::ImportedReadOnly
+        )
+    }
+
+    /// Make the exportable arena immutable: synchronize the owner device, then
+    /// switch the owner mapping from read-write to read-only
+    /// (`hipMemSetAccess` over the whole mapping). Construction (`map_next`)
+    /// is RW only; after this call `map_next` is refused and mapping access
+    /// can no longer be written. Idempotent once published; on failure the
+    /// arena stays in its construction state (still releasable).
+    pub fn publish_read_only(&mut self, hip: &HipRuntime) -> HipResult<()> {
+        match self.kind {
+            VmmArenaKind::ExportPublished => return Ok(()),
+            VmmArenaKind::ExportBuilding => {}
+            _ => {
+                return Err(HipError::new(
+                    0,
+                    "publish_read_only requires an arena from reserve_exportable",
+                ))
+            }
+        }
+        self.ensure_published_state()?;
+        hip.set_device(self.owner_device)?;
+        hip.device_synchronize()?;
+        let access = [HipMemAccessDesc::read_only_device(self.owner_device)];
+        take_fault(VmmFaultKind::AccessReset).map_or_else(
+            // SAFETY: `base..+mapped_bytes` is the arena's single mapped
+            // allocation (checked by `ensure_published_state`); only the owner
+            // device is listed, read-only; the device was synchronized above.
+            || unsafe { hip.mem_set_access(self.base, self.mapped_bytes, &access) },
+            Err,
+        )?;
+        self.kind = VmmArenaKind::ExportPublished;
+        Ok(())
+    }
+
+    /// Export the published arena's physical allocation as a new POSIX FD
+    /// (an independent reference; the caller owns it and may call this more
+    /// than once). Requires [`Self::publish_read_only`] first.
+    pub fn export_posix(&self, hip: &HipRuntime) -> HipResult<OwnedFd> {
+        if self.kind != VmmArenaKind::ExportPublished {
+            return Err(HipError::new(
+                0,
+                "export_posix requires a published exportable VMM arena",
+            ));
+        }
+        self.ensure_published_state()?;
+        let handle = self.segments[0].handle.ok_or_else(|| {
+            HipError::new(0, "exportable VMM arena has no physical allocation handle")
+        })?;
+        hip.mem_export_posix(handle)
+    }
+
+    /// Query the owner device's access flags on this arena's mapping
+    /// (`hipMemGetAccess`; `HIP_MEM_ACCESS_FLAGS_PROT_*`). Optional symbol:
+    /// errors if the runtime lacks it. Sharing never depends on this call.
+    pub fn owner_access_flags(&self, hip: &HipRuntime) -> HipResult<u32> {
+        if self.releasing || self.is_released() {
+            return Err(HipError::new(
+                0,
+                "cannot query access of a releasing or released VMM arena",
+            ));
+        }
+        hip.mem_get_access(&HipMemLocation::device(self.owner_device), self.base)
+    }
+
+    /// Exportable arena must be live with exactly one fully mapped allocation.
+    fn ensure_published_state(&self) -> HipResult<()> {
+        if self.releasing || self.is_released() {
+            return Err(HipError::new(
+                0,
+                "VMM arena is releasing or already released",
+            ));
+        }
+        if self.segments.len() != 1 || !self.segments[0].mapped || self.mapped_bytes == 0 {
+            return Err(HipError::new(
+                0,
+                "exportable VMM arena must hold exactly one mapped physical allocation",
+            ));
+        }
+        Ok(())
     }
 
     /// Unmap every segment and release every physical handle. The VA range is
@@ -1315,6 +1629,7 @@ mod tests {
             access_devices: vec![0],
             releasing: false,
             ever_mapped: true,
+            kind: VmmArenaKind::Default,
         }
     }
 

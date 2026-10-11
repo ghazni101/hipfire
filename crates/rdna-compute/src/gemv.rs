@@ -70,6 +70,14 @@ mod awq_rcp_planes_tests {
 }
 static GFX942_ROTATE_LIVE_VALIDATED: AtomicBool = AtomicBool::new(false);
 
+/// `HIPFIRE_QWEN4_MQ4_ROWS_PM` (on unless `0`) runs the few-row MQ4G256V2
+/// projections ([`Gpu::gemv_mq4g256v2_rows_x4`]) of exact gfx1151 / gfx1201 from the
+/// embedded PeaceMaker image (`kernels::MQ4_ROWS_X4_PM_GFX1151` /
+/// `MQ4_ROWS_X4_PM_GFX1201`); `0` runs the per-row `gemv_mq4g256v2` launches (same
+/// bytes, slower). Read once.
+static QWEN4_MQ4_ROWS_PM: LazyLock<bool> =
+    LazyLock::new(|| hipfire_config::developer_bool("HIPFIRE_QWEN4_MQ4_ROWS_PM", true));
+
 fn gfx942_rotate_live_validation_enabled() -> bool {
     hipfire_config::developer_var("HIPFIRE_GFX942_ROTATE_VALIDATE_LIVE")
         .ok()
@@ -18524,6 +18532,9 @@ impl Gpu {
                 "gemv_q8_0_k8_rows needs K % 256 == 0 and 1..=8 rows",
             ));
         }
+        if self.lane_rows_pm_enabled() && crate::lane_rows_pm::q8_k8_admits(m, k, rows) {
+            return self.gemv_q8_0_k8_xbatch_pm(weight, x, y, m, k, hc_act_scale, rows);
+        }
         self.bind_thread()?;
         let func = FUNCS[rows - 2];
         self.ensure_kernel("qwen4_gemv_q8_0", kernels::QWEN4_GEMV_Q8_0_SRC, func)?;
@@ -18700,6 +18711,12 @@ impl Gpu {
     ) -> HipResult<()> {
         if !self.gemv_q8_0_staged_rows_supported(k, rows) {
             return Err(hip_bridge::HipError::new(1, "gemv_q8_0_staged_rows shape"));
+        }
+        if (2..=8).contains(&rows)
+            && self.lane_rows_pm_enabled()
+            && crate::lane_rows_pm::q8_k320_admits(m, k, rows)
+        {
+            return self.gemv_q8_0_k320_xbatch_pm(a_raw, x, y, m, rows);
         }
         self.bind_thread()?;
         if k != 2560 && k != 320 {
@@ -19247,6 +19264,11 @@ impl Gpu {
                 "MQ6 F32 rows x4 needs 2..=8 rows, K % 256 == 0",
             ));
         }
+        if self.lane_rows_pm_enabled()
+            && crate::lane_rows_pm::mq6_x4_admits(parts.map(|(_, _, m)| m), k, rows)
+        {
+            return self.gemv_mq6g256v2_x4_xbatch_pm(parts, x, k, rows);
+        }
         let func = FUNCS[rows - 2];
         self.bind_thread()?;
         self.ensure_kernel(
@@ -19294,6 +19316,140 @@ impl Gpu {
                 b
             },
         )
+    }
+
+    /// MQ4G256V2 few-row (2..=8 activation rows, MTP verify) projections of up
+    /// to four matrices that read the same rotated `[rows, k]` F32 `x`, in one
+    /// launch. `parts` are `(weights, y, m)`; unused slots carry `m == 0` (any
+    /// tensors) and `y` is `[rows, m]` per part. Each output element is bitwise
+    /// the AR singleton [`Gpu::gemv_mq4g256v2`] on that activation row.
+    ///
+    /// On exact gfx1151 / gfx1201 this runs the embedded PeaceMaker image
+    /// `kernels/mq4_rows_x4_pm_gfx{1151,1201}.hxaco` (grid
+    /// `[sum(ceil(m_i / 2)), 1, 1]`, block 32, one weight-row pair per
+    /// workgroup, each group dequantized once for all rows) unless
+    /// `HIPFIRE_QWEN4_MQ4_ROWS_PM=0`; otherwise (and on other arches) it is
+    /// the per-part per-row `gemv_mq4g256v2` loop, exact by definition.
+    pub fn gemv_mq4g256v2_rows_x4(
+        &mut self,
+        parts: [(&GpuTensor, &GpuTensor, usize); 4],
+        x: &GpuTensor,
+        k: usize,
+        rows: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let bad = |msg: &str| Err(hip_bridge::HipError::new(1, msg));
+        if !(1..=8).contains(&rows) || k == 0 || !k.is_multiple_of(256) || k > i32::MAX as usize {
+            return bad("MQ4 rows x4 needs 1..=8 rows, K > 0, K % 256 == 0");
+        }
+        let fits = |n: Option<usize>| n.is_some_and(|n| n <= u32::MAX as usize);
+        let x_bytes = rows.checked_mul(k).and_then(|n| n.checked_mul(4));
+        if x.dtype != DType::F32 || !fits(x_bytes) || x.buf.size() < x_bytes.unwrap_or(usize::MAX) {
+            return bad("MQ4 rows x4 needs an F32 x of rows*k elements within 32-bit byte offsets");
+        }
+        let mut blocks = 0usize;
+        for &(w, y, m) in &parts {
+            if m == 0 {
+                continue;
+            }
+            let w_bytes = m.checked_mul(k / 256).and_then(|n| n.checked_mul(136));
+            let y_bytes = rows.checked_mul(m).and_then(|n| n.checked_mul(4));
+            if m > i32::MAX as usize
+                || y.dtype != DType::F32
+                || !fits(w_bytes)
+                || !fits(y_bytes)
+                || w.buf.size() < w_bytes.unwrap_or(usize::MAX)
+                || y.buf.size() < y_bytes.unwrap_or(usize::MAX)
+            {
+                return bad("MQ4 rows x4 part needs m <= i32::MAX, F32 y, tensors covering the weights and [rows, m] within 32-bit byte offsets");
+            }
+            blocks += m.div_ceil(2);
+        }
+        if blocks == 0 {
+            return bad("MQ4 rows x4 needs at least one part with m > 0");
+        }
+        let pm = if !*QWEN4_MQ4_ROWS_PM {
+            None
+        } else {
+            match self.arch.as_str() {
+                "gfx1151" => Some((
+                    "mq4_rows_x4_pm_gfx1151",
+                    kernels::MQ4_ROWS_X4_PM_GFX1151,
+                    "gemv_mq4g256v2_rows_x4_pm_gfx1151",
+                )),
+                "gfx1201" => Some((
+                    "mq4_rows_x4_pm_gfx1201",
+                    kernels::MQ4_ROWS_X4_PM_GFX1201,
+                    "gemv_mq4g256v2_rows_x4_pm_gfx1201",
+                )),
+                _ => None,
+            }
+        };
+        let Some((module, image, symbol)) = pm else {
+            for (w, y, m) in parts {
+                if m == 0 {
+                    continue;
+                }
+                for r in 0..rows {
+                    let xr = x.sub_offset(r * k, k);
+                    let yr = y.sub_offset(r * m, m);
+                    self.gemv_mq4g256v2(w, &xr, &yr, m, k)?;
+                }
+            }
+            return Ok(());
+        };
+        self.ensure_embedded_kernel(module, image, symbol)?;
+        let a = parts.map(|(w, _, _)| w.buf.as_ptr());
+        let y = parts.map(|(_, y, _)| y.buf.as_ptr());
+        let m = parts.map(|(_, _, m)| m as i32);
+        let x_ptr = x.buf.as_ptr();
+        let k_val = k as i32;
+        let b_val = rows as i32;
+        let mut params: Vec<*mut c_void> = Vec::with_capacity(14);
+        for p in &a {
+            params.push(p as *const _ as *mut c_void);
+        }
+        params.push(&x_ptr as *const _ as *mut c_void);
+        for p in &y {
+            params.push(p as *const _ as *mut c_void);
+        }
+        for v in &m {
+            params.push(v as *const _ as *mut c_void);
+        }
+        params.push(&k_val as *const _ as *mut c_void);
+        params.push(&b_val as *const _ as *mut c_void);
+        let bytes = parts.iter().fold(x_bytes.unwrap_or(0), |acc, &(_, _, m)| {
+            acc.saturating_add(m.saturating_mul(k / 256).saturating_mul(136))
+                .saturating_add(rows.saturating_mul(m).saturating_mul(4))
+        });
+        let timer = crate::profile::begin_timer(&self.hip, "gemv", symbol, bytes);
+        let result = self.launch_maybe_blob(
+            symbol,
+            [blocks as u32, 1, 1],
+            [32, 1, 1],
+            0,
+            &mut params,
+            || {
+                let mut b = hip_bridge::KernargBlob::new();
+                for p in a {
+                    b.push_ptr(p);
+                }
+                b.push_ptr(x_ptr);
+                for p in y {
+                    b.push_ptr(p);
+                }
+                for v in m {
+                    b.push_i32(v);
+                }
+                b.push_i32(k_val);
+                b.push_i32(b_val);
+                b
+            },
+        );
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
     }
 
     /// [`Gpu::gemv_bf16_xf32_x4`] over `rows` (2..=8) activation rows: x is
@@ -21176,6 +21332,9 @@ impl Gpu {
                 1,
                 "MQ6 F32 rows tensor view too small",
             ));
+        }
+        if self.lane_rows_pm_enabled() && crate::lane_rows_pm::mq6_admits(m, k, rows) {
+            return self.gemv_mq6g256v2_xbatch_pm(a_raw, x, y, m, k, rows);
         }
         self.bind_thread()?;
         self.ensure_kernel(

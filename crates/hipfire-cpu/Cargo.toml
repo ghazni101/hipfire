@@ -11,3 +11,4 @@ rayon.workspace = true
 [dev-dependencies]
 # Oracle for the f16 widening in `quant` (the canonical decoder uses this crate).
 half.workspace = true
+proptest.workspace = true

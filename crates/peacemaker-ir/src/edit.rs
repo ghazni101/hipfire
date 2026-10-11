@@ -39,7 +39,7 @@ use thiserror::Error;
 
 use crate::cfg::{Arena, Block, BlockId, Body, InstId, Terminator};
 use crate::effects::{preserved_vgpr_destination, Control, Effects, ImplicitSet};
-use crate::inst::{Abi, Arch, Form, FormFields, Inst, Kernel, Program, SymbolId, UserSgprRole, ValidateError, Wave};
+use crate::inst::{Abi, Arch, EntryCell, Form, FormFields, Inst, Kernel, Program, SymbolId, ValidateError, Wave};
 use crate::lds::AddrFact;
 use crate::metadata::Kernarg;
 use crate::operand::{DelayAluHint, ImmField, Msg, Operand, Special};
@@ -289,7 +289,7 @@ fn analyze_at(program: Program, kernel: &SymbolId, revision: u32) -> Result<Anal
     let hazards = passes::hazards::analyze(body, arch, kern.wave).map_err(|e| fail("hazards", &e))?;
     let lds = passes::lds::analyze(body, arch).map_err(|e| fail("lds", &e))?;
     let barriers = passes::barriers::analyze(body, arch).map_err(|e| fail("barriers", &e))?;
-    let lds_fixed = match &kern.abi { Abi::Hsa { descriptor, .. } => descriptor.group_segment_fixed_size, Abi::Raw { lds_bytes, .. } => *lds_bytes };
+    let lds_fixed = match &kern.abi { Abi::Hsa { descriptor, .. } => descriptor.group_segment_fixed_size, Abi::Raw(raw) => raw.resources.lds_bytes };
     let summary = passes::resources::summarize(body, arch, kern.wave, lds_fixed);
     let mut obligations = replay.obligations;
     obligations.extend(hazards.obligations);
@@ -317,15 +317,41 @@ fn analyze_at(program: Program, kernel: &SymbolId, revision: u32) -> Result<Anal
         }
         let missing = missing.minus(&partial);
         if !missing.is_empty() {
-            obligations.push(Obligation {
-                kind: ObligationKind::Definedness, insts: vec![id], rule_id: "definedness-entry".into(),
-                text: format!("reads {} without a definition on every path from the kernel entry (ABI entry table)", bits_names(&missing)),
-            });
+            obligations.push(entry_obligation(id, &missing));
         }
     }
     obligations.extend(abi_obligations(kern, &summary));
     let kernargs = passes::kernargs::analyze(kern, arch);
     Ok(Analyzed { program, facts: Facts { waits: replay.facts, lds: lds.facts, resources: vec![summary], kernargs }, obligations, revision })
+}
+
+/// Reads in `kernel` that no path from the declared entry state defines (the
+/// `definedness-entry` obligations of [`analyze`], without the other analyses). Blocks must be
+/// built. Used by importers that must reject an entry contract the code outruns.
+pub fn entry_undefined(program: &Program, kernel: &SymbolId) -> Result<Vec<Obligation>, EditError> {
+    program.validate()?;
+    let k = kernel_index(program, kernel)?;
+    let arch = program.target.arch;
+    let kern = &program.kernels[k];
+    let body = &kern.body;
+    let flow = Flow::new(body, arch, kern.wave)?;
+    let (def_in, _) = flow.defined(entry_seed(kern, arch)?);
+    let mut out = Vec::new();
+    for p in 0..flow.n {
+        let id = flow.ids[p];
+        let inst = body.insts.get(id).ok_or(EditError::UnknownInst(id))?;
+        let missing = flow.acc[p].reads.minus(&def_in[p]);
+        let missing = missing.minus(&partial_undefined(arch, inst, &missing));
+        if !missing.is_empty() { out.push(entry_obligation(id, &missing)); }
+    }
+    Ok(out)
+}
+
+fn entry_obligation(id: InstId, missing: &Bits) -> Obligation {
+    Obligation {
+        kind: ObligationKind::Definedness, insts: vec![id], rule_id: "definedness-entry".into(),
+        text: format!("reads {} without a definition on every path from the kernel entry (ABI entry table)", bits_names(missing)),
+    }
 }
 
 fn abi_obligations(kern: &Kernel, summary: &crate::state::ResourceSummary) -> Vec<Obligation> {
@@ -708,7 +734,31 @@ fn partial_undefined(arch: Arch, inst: &Inst, missing: &Bits) -> Bits {
 }
 
 
-/// HSA ABI entry table (core.md §6.2): the only locations defined at entry.
+/// Storage dword of an entry cell in the flow-state numbering.
+fn entry_cell_dword(cell: EntryCell) -> usize {
+    match cell {
+        EntryCell::Vgpr(n) => usize::from(n),
+        EntryCell::Sgpr(n) => S0 + usize::from(n),
+        EntryCell::Ttmp(n) => T0 + usize::from(n),
+        EntryCell::VccLo => VCC_LO,
+        EntryCell::VccHi => VCC_HI,
+        EntryCell::ExecLo => EXEC_LO,
+        EntryCell::ExecHi => EXEC_HI,
+        EntryCell::Scc => SCC,
+        EntryCell::M0 => M0,
+        EntryCell::FlatScratch => OTHER0,
+        EntryCell::SrcSharedBase => OTHER0 + 1,
+        EntryCell::SrcSharedLimit => OTHER0 + 2,
+        EntryCell::SrcPrivateBase => OTHER0 + 3,
+        EntryCell::SrcPrivateLimit => OTHER0 + 4,
+        EntryCell::Pc => OTHER0 + 5,
+        EntryCell::Hwreg => OTHER0 + 6,
+    }
+}
+
+/// Locations defined at entry. HSA: the descriptor's ABI entry table (core.md §6.2). Raw:
+/// exactly the declared entry facts plus MODE (defined because the FP state is declared);
+/// nothing else, in particular no EXEC, VCC, M0, SCC, flat-scratch/aperture or hwreg state.
 fn entry_seed(kern: &Kernel, arch: Arch) -> Result<Bits, EditError> {
     if !matches!(arch, Arch::Gfx1100 | Arch::Gfx1151 | Arch::Gfx1201) { return Err(EditError::Unsupported(format!("no ABI entry table for {arch:?}"))); }
     let mut seed = Bits::default();
@@ -731,11 +781,11 @@ fn entry_seed(kern: &Kernel, arch: Arch) -> Result<Bits, EditError> {
             let rsrc2 = descriptor.compute_pgm_rsrc2.0;
             (user, rsrc2 >> 7 & 1 != 0, rsrc2 >> 8 & 3 != 0)
         }
-        Abi::Raw { user_sgprs, .. } => {
-            let user = user_sgprs.iter().map(|role| match role {
-                UserSgprRole::PrivateSegmentBuffer => 4, UserSgprRole::PrivateSegmentSize => 1, _ => 2,
-            }).sum();
-            (user, true, true)
+        Abi::Raw(raw) => {
+            let cells = raw.entry_cells().map_err(|e| EditError::Unsupported(format!("raw entry facts: {e}")))?;
+            for (cell, _) in cells { seed.dword(entry_cell_dword(cell)); }
+            seed.dword(MODE);
+            return Ok(seed);
         }
     };
     for s in 0..user.min(106) { seed.dword(S0 + s); }

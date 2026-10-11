@@ -28,7 +28,7 @@
 //! (`launch_maybe_blob`). The pointer tables are owned by the caller.
 
 use crate::dispatch::Gpu;
-use hip_bridge::{HipResult, KernargBlob};
+use hip_bridge::{DeviceBuffer, HipError, HipResult, KernargBlob};
 use std::ffi::c_void;
 
 /// Preamble kernel source.
@@ -137,11 +137,97 @@ pub fn table_bytes<T: Copy>(rows: &[T]) -> &[u8] {
     unsafe { std::slice::from_raw_parts(rows.as_ptr() as *const u8, std::mem::size_of_val(rows)) }
 }
 
+/// Shape of one multi-layer replay scratch: four F32 regions (q, k, v and the
+/// dead recurrence output) of `n_layers * rows * v_dim` elements each. It is
+/// the key of `Gpu::dflash_gdn_replay_scratch`: every armed `GdnTape` with the
+/// same shape shares one buffer; different shapes (another model, a different
+/// `rows` cap) get their own entry.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct GdnReplayScratchShape {
+    pub n_layers: usize,
+    pub rows: usize,
+    pub v_dim: usize,
+}
+
+impl GdnReplayScratchShape {
+    /// Bytes of one region.
+    pub fn region_bytes(&self) -> usize {
+        self.n_layers * self.rows * self.v_dim * std::mem::size_of::<f32>()
+    }
+}
+
+/// Railgun E0: one entry of `Gpu::dflash_gdn_replay_scratch`, the
+/// multi-layer replay's q/k/v/out scratch shared by every armed `GdnTape` of
+/// its [`GdnReplayScratchShape`] on this `Gpu` (each tape arms at
+/// construction, so a per-tape copy would cost every lane ~75 MB on the 27B
+/// whether or not it ever replays). Drained by `Gpu::invalidate_weight_caches`
+/// (model unload), like `fp16_shadow_cache`. Sharing is sound because of
+/// three invariants, each held per entry:
+///
+/// 1. **One stream at a time.** Every replay launches on `Gpu::active_stream`:
+///    `launch_replay_pre_ml` / `launch_gdn_q8_fast_ml` (this file, `:438`,
+///    `:543`) go through `Gpu::launch_maybe_blob` (`dispatch.rs:2898`), which
+///    launches on `self.active_stream`. The DFlash, MTP and VMM
+///    continuous-batching paths create that stream once per `Gpu` and never
+///    swap it (`hipfire-arch-qwen35/src/dflash_cb.rs:235`, `mtp_cb.rs:100`,
+///    `speculative.rs:4120`); the only swaps are the per-rank devices of
+///    `hipfire-runtime/src/multi_gpu.rs:3300`/`:3359`, each a separate `Gpu`
+///    with its own scratch, and the MTP snapshot-overlap side stream
+///    (`mtp_spec.rs:518`) only copies snapshots. Belt and braces:
+///    [`Gpu::dflash_gdn_replay_scratch_order`] runs before every replay and
+///    replay-graph launch and, when the stream differs from the entry's
+///    previous replay, drains the device first (refused inside a capture).
+/// 2. **Pointer lifetime.** The address is baked into each tape's tables and,
+///    through them, into any `HIPFIRE_REPLAY_GRAPH` capture
+///    (`graph.rs:487` `begin_replay_graph_capture`, from
+///    `hipfire-arch-qwen35/src/speculative.rs:2260` `GdnTape::replay_gdn`).
+///    An entry is released only when no armed tape holds it (`refs == 0`)
+///    AND `GraphState::replay_graph_count() == 0` (`graph.rs:550`), and its
+///    buffer never moves while it exists. Unload drains every entry; a tape
+///    that outlives it fails loudly at its next replay
+///    ([`Gpu::dflash_gdn_replay_scratch_order`] checks the entry still holds
+///    the tape's base) instead of writing freed memory; unload also destroys
+///    every replay graph (`Gpu::invalidate_graph_state`). Redline / railgun
+///    PM4 recordings never contain the route: [`Gpu::gdn_replay_ml_eligible`]
+///    (`:231`) requires `!replay.is_recording()` (`:240`).
+/// 3. **No cross-replay reads.** Within one replay the preamble writes q/k/v
+///    for every (layer, step < n_steps)
+///    (`kernels/src/dflash_gdn_replay_pre_ml.hip:154`, `:155`, `:171`) before
+///    the recurrence reads exactly those rows, and the recurrence's `out` is
+///    never read; nothing outside the two launches touches the buffer. So no
+///    replay observes another tape's (or its own earlier) contents.
+pub(crate) struct GdnReplaySharedScratch {
+    buf: DeviceBuffer,
+    refs: usize,
+    /// Raw handle of the stream of the last ordered replay (null = default).
+    last_stream: Option<usize>,
+}
+
 impl Gpu {
-    /// Host-side eligibility shared by both launchers: exact gfx1201, the
-    /// `HIPFIRE_GDN_REPLAY_ML_OFF` opt-out, no open Redline recording, the
-    /// fast (single-end requant) GDN kernel, head_dim 128, GQA divisibility,
-    /// and 1 <= n_steps <= 16.
+    /// Process-static part of [`Self::gdn_replay_ml_eligible`]: exact
+    /// gfx1201, the `HIPFIRE_GDN_REPLAY_ML_OFF` opt-out, the fast
+    /// (single-end requant) GDN kernel, head_dim 128 and GQA divisibility.
+    /// A replay tape arms its multi-layer tables at construction iff this
+    /// holds, so the replay route never depends on later memory pressure.
+    pub fn gdn_replay_ml_supported(
+        &self,
+        n_v_heads: usize,
+        n_key_heads: usize,
+        key_head_dim: usize,
+        value_head_dim: usize,
+    ) -> bool {
+        self.arch_caps.is_gfx1201()
+            && !self.flags.gdn_replay_ml_off
+            && !crate::norm::dn_requant_per_token()
+            && key_head_dim == DFLASH_GDN_REPLAY_HEAD_DIM
+            && value_head_dim == DFLASH_GDN_REPLAY_HEAD_DIM
+            && n_key_heads > 0
+            && n_v_heads % n_key_heads == 0
+    }
+
+    /// Host-side eligibility shared by both launchers:
+    /// [`Self::gdn_replay_ml_supported`], no open Redline recording, and
+    /// 1 <= n_steps <= 16.
     pub fn gdn_replay_ml_eligible(
         &self,
         n_v_heads: usize,
@@ -150,14 +236,8 @@ impl Gpu {
         value_head_dim: usize,
         n_steps: usize,
     ) -> bool {
-        self.arch_caps.is_gfx1201()
-            && !self.flags.gdn_replay_ml_off
+        self.gdn_replay_ml_supported(n_v_heads, n_key_heads, key_head_dim, value_head_dim)
             && !self.replay.is_recording()
-            && !crate::norm::dn_requant_per_token()
-            && key_head_dim == DFLASH_GDN_REPLAY_HEAD_DIM
-            && value_head_dim == DFLASH_GDN_REPLAY_HEAD_DIM
-            && n_key_heads > 0
-            && n_v_heads % n_key_heads == 0
             && (1..=DFLASH_GDN_REPLAY_MAX_STEPS).contains(&n_steps)
     }
 
@@ -190,6 +270,103 @@ impl Gpu {
             GATED_DELTA_NET_Q8_FAST_ML_FROM_SRC,
             GATED_DELTA_NET_Q8_FAST_ML_FROM_SYMBOL,
         )
+    }
+
+    /// Acquire the shared multi-layer replay scratch of `shape`
+    /// ([`GdnReplaySharedScratch`]) for one armed tape and return its base:
+    /// the existing entry (one more holder) or a new one. Allocation failure
+    /// is an error, so the tape is refused at construction.
+    pub fn dflash_gdn_replay_scratch_acquire(
+        &mut self,
+        shape: GdnReplayScratchShape,
+    ) -> HipResult<*mut c_void> {
+        self.bind_thread()?;
+        if let Some(s) = self.dflash_gdn_replay_scratch.get_mut(&shape) {
+            s.refs += 1;
+            return Ok(s.buf.as_ptr());
+        }
+        let buf = self.pool.alloc(&self.hip, 4 * shape.region_bytes())?;
+        let ptr = buf.as_ptr();
+        self.dflash_gdn_replay_scratch.insert(
+            shape,
+            GdnReplaySharedScratch {
+                buf,
+                refs: 1,
+                last_stream: None,
+            },
+        );
+        Ok(ptr)
+    }
+
+    /// Drop one holder of the `shape` entry acquired at `base`. The entry
+    /// returns to the pool once no tape holds it and no replay graph can
+    /// reference it; otherwise it stays at its address until unload. A
+    /// holder whose entry was already drained (unload) is a no-op.
+    pub fn dflash_gdn_replay_scratch_release(&mut self, shape: GdnReplayScratchShape, base: *mut c_void) {
+        // bind_thread: skip — bookkeeping; the buffer goes to the pool, no device call.
+        let Some(s) = self.dflash_gdn_replay_scratch.get_mut(&shape) else {
+            return;
+        };
+        if s.buf.as_ptr() != base {
+            return;
+        }
+        s.refs = s.refs.saturating_sub(1);
+        if s.refs == 0 && self.graphs.replay_graph_count() == 0 {
+            if let Some(old) = self.dflash_gdn_replay_scratch.remove(&shape) {
+                self.pool.free(old.buf);
+            }
+        }
+    }
+
+    /// Check and stream-order the `shape` entry before a replay that uses
+    /// it at `base` (invariants 1 and 2 of [`GdnReplaySharedScratch`]): the
+    /// entry must still hold `base` (a tape that outlived an unload fails
+    /// here, before any launch), and a replay on a different stream than the
+    /// entry's previous one first drains the device, which is refused while
+    /// a graph capture is open.
+    pub fn dflash_gdn_replay_scratch_order(
+        &mut self,
+        shape: GdnReplayScratchShape,
+        base: *mut c_void,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let stream = self.active_stream.as_ref().map_or(0, |s| s.as_raw() as usize);
+        let capturing = self.graphs.capture_mode;
+        let last = match self.dflash_gdn_replay_scratch.get(&shape) {
+            Some(s) if s.buf.as_ptr() == base => s.last_stream,
+            _ => {
+                return Err(HipError::new(
+                    0,
+                    "shared GDN replay scratch was drained under a live tape (tape outlived unload)",
+                ));
+            }
+        };
+        match last {
+            Some(last) if last == stream => return Ok(()),
+            Some(_) if capturing => {
+                return Err(HipError::new(
+                    0,
+                    "shared GDN replay scratch: stream changed inside a graph capture",
+                ));
+            }
+            Some(_) => self.hip.device_synchronize()?,
+            None => {}
+        }
+        if let Some(s) = self.dflash_gdn_replay_scratch.get_mut(&shape) {
+            s.last_stream = Some(stream);
+        }
+        Ok(())
+    }
+
+    /// Return every shared replay scratch entry to the pool (model unload,
+    /// via `invalidate_weight_caches`). Tapes still holding one fail loudly
+    /// at their next replay.
+    pub(crate) fn drain_dflash_gdn_replay_scratch(&mut self) {
+        let entries: Vec<GdnReplaySharedScratch> =
+            self.dflash_gdn_replay_scratch.drain().map(|(_, s)| s).collect();
+        for s in entries {
+            self.pool.free(s.buf);
+        }
     }
 
     /// Conv1d + QK norm + interleave for `n_layers` table rows in one launch.

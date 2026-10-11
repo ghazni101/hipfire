@@ -11,7 +11,11 @@ use clap::Parser;
 #[command(
     name = "hipfire-quantize",
     version,
-    about = "Quantize Hugging Face safetensors (or deprecated GGUF weights) into Hipfire HFQ"
+    about = "Quantize Hugging Face safetensors (or deprecated GGUF weights) into Hipfire HFQ",
+    after_help = "SUBCOMMANDS:\n  ple-hot-rank  Rank Qwen4 PLE rows over a corpus and write the <model>.plehot \
+                  hot-row sidecar (run `hipfire-quantize ple-hot-rank --help`)\n  \
+                  ple-hot-pack  Cut the <model>.plehotrows hot-row pack from a model and its \
+                  .plehot sidecar (run `hipfire-quantize ple-hot-pack --help`)"
 )]
 pub(crate) struct QuantizeArgs {
     /// Hugging Face model directory or model ID. A GGUF weight file is
@@ -30,7 +34,8 @@ pub(crate) struct QuantizeArgs {
 
     /// Produce the native Qwen4/Qwen3.8-Flash-Next streaming artifact.  This
     /// transactional path always includes typed PLE metadata, all PLE shards,
-    /// and native MTP experts; legacy recipe flags are ignored.
+    /// and native MTP experts.  It reads no legacy recipe flags: imatrix, AWQ,
+    /// symmetric-requant, tier and Hessian controls are refused, not ignored.
     #[arg(long, conflicts_with = "flux_pipe")]
     pub qwen4_flash_next: bool,
     /// Explicit non-production bounded fixture mode for exercising the full
@@ -39,6 +44,18 @@ pub(crate) struct QuantizeArgs {
     #[arg(long, value_name = "MODE", default_value = "production",
           value_parser = ["production", "compact-fixture"])]
     pub qwen4_component_mode: String,
+    /// Developer-only (build feature `qwen4-dev-profiles`): produce a COMPLETE
+    /// tiny local Qwen4 checkpoint from a local safetensors directory whose
+    /// config.json carries a `hipfire_profile` developer marker.
+    /// `source-exact` stores every tensor as its BF16 source bytes; `packed`
+    /// quantizes each role to the format its runtime consumer supports.  The
+    /// pinned Flash-Next production profile and `hf://` inputs are refused.
+    /// Exclusive with `--qwen4-flash-next` and `--qwen4-component-mode`.
+    #[cfg(feature = "qwen4-dev-profiles")]
+    #[arg(long, value_name = "ENCODING",
+          conflicts_with_all = ["qwen4_flash_next", "qwen4_component_mode", "flux_pipe"],
+          value_parser = ["source-exact", "packed"])]
+    pub qwen4_dev_tiny: Option<String>,
 
     /// Destination HFQ file.
     #[arg(long, value_name = "PATH")]
@@ -321,6 +338,9 @@ pub(crate) enum Route {
     Flux,
     /// `--qwen4-flash-next` streaming artifact.
     Qwen4,
+    /// `--qwen4-dev-tiny` complete developer tiny checkpoint (feature-gated).
+    #[cfg(feature = "qwen4-dev-profiles")]
+    Qwen4DevTiny,
     /// `--mq{4,3,2}v2-final-codes` import into an existing HFQ.
     FinalCodes,
     /// `--format maple|ds4-dense-e8soa-overlay|ds4-dspark-e8soa|qwen3-dspark-q8`.
@@ -335,16 +355,24 @@ pub(crate) enum Route {
 
 use Route::*;
 
+#[cfg(not(feature = "qwen4-dev-profiles"))]
 const EVERY: &[Route] = &[Flux, Qwen4, FinalCodes, EarlySpecial, Gguf, ReapOverlay, Main];
+#[cfg(feature = "qwen4-dev-profiles")]
+const EVERY: &[Route] = &[Flux, Qwen4, Qwen4DevTiny, FinalCodes, EarlySpecial, Gguf, ReapOverlay, Main];
 
 /// Clap argument id → the routes that read it. Every argument of
 /// [`QuantizeArgs`] must appear (enforced by a test).
 pub(crate) const FLAG_ROUTES: &[(&str, &[Route])] = &[
+    #[cfg(not(feature = "qwen4-dev-profiles"))]
     ("input", &[Qwen4, FinalCodes, EarlySpecial, Gguf, ReapOverlay, Main]),
+    #[cfg(feature = "qwen4-dev-profiles")]
+    ("input", &[Qwen4, Qwen4DevTiny, FinalCodes, EarlySpecial, Gguf, ReapOverlay, Main]),
     ("output", EVERY),
     ("threads", EVERY),
     ("qwen4_flash_next", &[Qwen4]),
     ("qwen4_component_mode", &[Qwen4]),
+    #[cfg(feature = "qwen4-dev-profiles")]
+    ("qwen4_dev_tiny", &[Qwen4DevTiny]),
     ("format", &[EarlySpecial, Gguf, Main]),
     ("head_quant", &[EarlySpecial]),
     ("head_only", &[EarlySpecial]),
@@ -358,10 +386,12 @@ pub(crate) const FLAG_ROUTES: &[(&str, &[Route])] = &[
     ("reap_bake", &[Main]),
     ("reap_out", &[ReapOverlay, Main]),
     ("reap_arch", &[ReapOverlay, Main]),
-    // Qwen4 reads these once the symmetric requant lands on that path.
-    ("imatrix", &[Qwen4, Main]),
-    ("awq_alpha", &[Qwen4, Main]),
-    ("mq4v2_symmetric", &[Qwen4, Main]),
+    // The Qwen4 producers read none of the legacy recipe controls: their
+    // quantization recipe is fixed by the artifact profile.  Do not list a
+    // flag for a Qwen4 route until `crate::qwen4` actually reads it.
+    ("imatrix", &[Main]),
+    ("awq_alpha", &[Main]),
+    ("mq4v2_symmetric", &[Main]),
     ("hessian_dir", &[Main]),
     ("tier_ratio", &[Main]),
     ("q8_router", &[Main]),
@@ -398,6 +428,8 @@ fn route_label(route: Route) -> &'static str {
     match route {
         Flux => "--flux-pipe",
         Qwen4 => "--qwen4-flash-next",
+        #[cfg(feature = "qwen4-dev-profiles")]
+        Qwen4DevTiny => "--qwen4-dev-tiny",
         FinalCodes => "--mq*v2-final-codes",
         EarlySpecial => "this --format",
         Gguf => "GGUF weight input",
@@ -481,5 +513,71 @@ mod route_tests {
             Main,
         )
         .unwrap();
+    }
+
+    #[test]
+    fn qwen4_refuses_legacy_recipe_flags_it_never_reads() {
+        for (flag, value) in [("--imatrix", "x"), ("--awq-alpha", "0.5")] {
+            let argv = ["--qwen4-flash-next", "--input", "i", "--output", "o", flag, value];
+            let err = reject_unreachable(&matches(&argv), Qwen4).unwrap_err();
+            assert!(err.starts_with(&format!("{flag} has no effect")), "{flag}: {err}");
+        }
+        for flag in ["--mq4v2-symmetric", "--awq", "--hessian-dir"] {
+            let argv: &[&str] = if flag == "--hessian-dir" {
+                &["--qwen4-flash-next", "--input", "i", "--output", "o", flag, "d"]
+            } else {
+                &["--qwen4-flash-next", "--input", "i", "--output", "o", flag]
+            };
+            let err = reject_unreachable(&matches(argv), Qwen4).unwrap_err();
+            assert!(err.starts_with(&format!("{flag} has no effect")), "{flag}: {err}");
+        }
+        reject_unreachable(
+            &matches(&["--qwen4-flash-next", "--input", "i", "--output", "o", "--qwen4-component-mode", "compact-fixture"]),
+            Qwen4,
+        )
+        .unwrap();
+    }
+
+    #[cfg(feature = "qwen4-dev-profiles")]
+    #[test]
+    fn qwen4_dev_tiny_reads_only_its_encoding() {
+        for encoding in ["source-exact", "packed"] {
+            let argv = ["--qwen4-dev-tiny", encoding, "--input", "i", "--output", "o"];
+            reject_unreachable(&matches(&argv), Qwen4DevTiny).unwrap();
+            let argv = ["--qwen4-dev-tiny", encoding, "--input", "i", "--output", "o", "--imatrix", "x"];
+            let err = reject_unreachable(&matches(&argv), Qwen4DevTiny).unwrap_err();
+            assert!(err.starts_with("--imatrix has no effect"), "{err}");
+        }
+        // FN-only and recipe controls never ride along with the developer route.
+        let argv = ["--qwen4-dev-tiny", "packed", "--input", "i", "--output", "o", "--tier", "xt"];
+        let err = reject_unreachable(&matches(&argv), Qwen4DevTiny).unwrap_err();
+        assert!(err.starts_with("--tier has no effect"), "{err}");
+        // The encoding is meaningless for the FN route.
+        let argv = ["--qwen4-flash-next", "--input", "i", "--output", "o"];
+        reject_unreachable(&matches(&argv), Qwen4).unwrap();
+        let err = reject_unreachable(
+            &matches(&["--qwen4-dev-tiny", "packed", "--input", "i", "--output", "o"]),
+            Qwen4,
+        )
+        .unwrap_err();
+        assert!(err.starts_with("--qwen4-dev-tiny has no effect"), "{err}");
+    }
+
+    #[cfg(feature = "qwen4-dev-profiles")]
+    #[test]
+    fn qwen4_dev_tiny_is_exclusive_with_fn_route_flags() {
+        for extra in [
+            &["--qwen4-flash-next"][..],
+            &["--qwen4-component-mode", "compact-fixture"][..],
+        ] {
+            let mut argv = vec!["--qwen4-dev-tiny", "packed", "--input", "i", "--output", "o"];
+            argv.extend_from_slice(extra);
+            assert!(
+                QuantizeArgs::command()
+                    .try_get_matches_from(std::iter::once("hipfire-quantize").chain(argv))
+                    .is_err(),
+                "{extra:?}"
+            );
+        }
     }
 }

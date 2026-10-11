@@ -142,6 +142,12 @@ fn operand(arch: Arch, name: &str, bits: u16, code: u32, literal: Option<u32>, r
         }
         return Ok(Operand::Reg(r));
     }
+    // SRC_SCC (253) is a precise 32-bit scalar source; it is never a destination
+    // (SDST is 7-bit and the 8-bit VOP3 compare destination is rejected by `select`).
+    if code == 253 {
+        if matches!(form, Form::Sop1 | Form::Sop2 | Form::Sopc) && bits == 32 { return Ok(Operand::Special(Special::Scc)); }
+        return Err(reject("SCC source selector 0xfd is decoded only for 32-bit SOP1/SOP2/SOPC sources"));
+    }
     let src=select(code, width, false, literal)?;
     if bits == 16 {
         if let Operand::Reg(r) = &src {
@@ -182,6 +188,8 @@ fn encoded_operand(arch: Arch, name: &str, bits: u16, op: &Operand, form: Form) 
         }
         ("VDST", Operand::Special(s)) if form == Form::Vop3 => selector(&Operand::Special(*s), (bits/32).max(1) as u8),
         ("VDST" | "SRC0", Operand::Half(r, _)) => Ok(if name=="VDST" { u32::from(r.base) } else { u32::from(r.base) + 256 }),
+        (n, Operand::Special(Special::Scc)) if n.starts_with("SSRC") && bits == 32
+            && matches!(form, Form::Sop1 | Form::Sop2 | Form::Sopc) => Ok(253),
         (_, _) => selector(op, (bits / 32).max(1) as u8),
     }
 }
@@ -395,8 +403,14 @@ pub fn decode_for(arch: Arch, words: &[u32]) -> Result<(Inst, usize), DecodeErro
     if matches!(row.form,Form::Vmem(_)) {
         let off=field_value(arch, "IOFFSET", row, words);
         if off!=0 {
-            let bits = if arch == Arch::Gfx1201 { 24 } else if row.form == Form::Vmem(crate::inst::VmemForm::Buffer) { 12 } else { 13 };
-            operands.push(Operand::Imm(ImmField::VmemOffset(((off << (32-bits)) as i32) >> (32-bits))));
+            // gfx11 MUBUF OFFSET is an unsigned 12-bit byte offset (0..=4095);
+            // FLAT/GLOBAL/SCRATCH (13-bit) and gfx12 (24-bit) offsets are signed.
+            if arch != Arch::Gfx1201 && row.form == Form::Vmem(crate::inst::VmemForm::Buffer) {
+                operands.push(Operand::Imm(ImmField::VmemOffset(off as i32)));
+            } else {
+                let bits = if arch == Arch::Gfx1201 { 24 } else { 13 };
+                operands.push(Operand::Imm(ImmField::VmemOffset(((off << (32-bits)) as i32) >> (32-bits))));
+            }
         }
         if row.form == Form::Vmem(crate::inst::VmemForm::Buffer) && field_value(arch, "OFFEN", row, words)==1 {
             operands.push(Operand::Vmem(VmemToken::Offen));
@@ -1137,6 +1151,93 @@ mod tests {
                 let slot = inst.operands.iter().position(|o| *o == Operand::Reg(addr)).unwrap();
                 inst.operands[slot] = Operand::Reg(RegRef { len: 3 - width, ..addr });
                 assert!(encode_for(arch, &inst).is_err());
+            }
+        }
+    }
+}
+
+/// MQ4 RADV/ACO gfx1201 binary (full5476/executable5456, SHA d860d885...a680) scalar gaps,
+/// disassembled from the raw words by ROCm llvm-mc; opcodes cross-checked against Mesa
+/// 60e95b7 `aco_opcodes.py` (s_bfm_b32 gfx11+ = 0x2a, defs U32 only; s_cmp_lg_i32 = 0x01, defs SCC).
+#[cfg(test)]
+mod aco_pilot_scalar_tests {
+    use super::*;
+    use crate::effects::ImplicitSet;
+
+    fn pinned(words: &[u32]) -> Inst {
+        let (inst, used) = decode(words).unwrap();
+        assert_eq!(used, words.len());
+        assert_eq!(encode(&inst).unwrap().as_slice(), words);
+        // Re-derive from typed fields alone; no decoded provenance participates.
+        let rebuilt = Inst::from_parts(Arch::Gfx1201, inst.op, inst.form, inst.fields.clone(),
+            inst.operands.clone(), inst.mods.clone(), inst.literal, Provenance::default()).unwrap();
+        assert_eq!(encode(&rebuilt).unwrap().as_slice(), words);
+        inst
+    }
+    fn s20() -> Operand { Operand::Reg(RegRef { kind: Kind::S, base: 20, len: 1 }) }
+
+    /// `s_mov_b32 s20, src_scc` (offset 164): SCC is a read of the implicit SCC bit, not a register.
+    #[test]
+    fn s_mov_b32_src_scc_is_a_precise_scc_read() {
+        let inst = pinned(&[0xbe94_00fd]);
+        assert_eq!(inst.op.name(Arch::Gfx1201), Some("s_mov_b32"));
+        assert_eq!(inst.operands.as_slice(), &[s20(), Operand::Special(Special::Scc)]);
+        assert_eq!(inst.effects.defs.as_slice(), &[RegRef { kind: Kind::S, base: 20, len: 1 }]);
+        assert!(inst.effects.uses.is_empty());
+        assert_eq!(inst.effects.implicit.reads, ImplicitSet::SCC);
+        assert_eq!(inst.effects.implicit.writes, 0);
+        assert_eq!(inst.text(Arch::Gfx1201).unwrap(), "s_mov_b32 s20, scc");
+    }
+    #[test]
+    fn scc_selector_is_a_32_bit_scalar_source_only() {
+        // SCC cannot be a destination: the typed operand does not encode as SDST.
+        let (mov, _) = decode(&[0xbe94_0080]).unwrap();
+        let as_dest = Inst::from_parts(Arch::Gfx1201, mov.op, mov.form, FormFields::None,
+            smallvec::smallvec![Operand::Special(Special::Scc), s20()], Modifiers::default(), None, Provenance::default()).unwrap();
+        assert!(encode(&as_dest).is_err());
+        // The 8-bit VOP3 compare destination field never decodes selector 0xfd as SCC.
+        let e = decode(&[0xd44a_00fd, 0x0202_0e80]).unwrap_err().to_string();
+        assert!(e.contains("unknown source selector 0xfd"), "{e}");
+        // Not witnessed outside SOP1/SOP2/SOPC 32-bit sources: refused, not guessed.
+        let e = decode(&[0x7e00_02fd]).unwrap_err().to_string(); // v_mov_b32_e32 v0, src_scc
+        assert!(e.contains("SCC source selector"), "{e}");
+    }
+    /// `s_bfm_b32 vcc_lo, 16, 0` (offsets 1044/3168/3916/4648): explicit VCC_LO destination,
+    /// no SCC effect (Mesa defines only the U32 result).
+    #[test]
+    fn s_bfm_b32_vcc_lo_defines_vcc_without_scc() {
+        let inst = pinned(&[0x956a_8090]);
+        assert_eq!(inst.op.name(Arch::Gfx1201), Some("s_bfm_b32"));
+        assert_eq!(inst.form, Form::Sop2);
+        assert_eq!(inst.operands.as_slice(), &[Operand::Special(Special::VccLo),
+            Operand::Inline(InlineConst::Integer(16)), Operand::Inline(InlineConst::Integer(0))]);
+        assert!(inst.effects.defs.is_empty() && inst.effects.uses.is_empty());
+        assert_eq!(inst.effects.implicit.writes, ImplicitSet::VCC);
+        assert_eq!(inst.effects.implicit.reads, 0);
+        // An ordinary SGPR destination has no implicit effect at all.
+        let inst = pinned(&[0x9514_8090]); // s_bfm_b32 s20, 16, 0
+        assert_eq!(inst.effects.defs.as_slice(), &[RegRef { kind: Kind::S, base: 20, len: 1 }]);
+        assert_eq!((inst.effects.implicit.reads, inst.effects.implicit.writes), (0, 0));
+    }
+    /// `s_cmp_lg_i32 s20, 0` (offset 5320): SOPC compare writes SCC and reads only its sources.
+    #[test]
+    fn s_cmp_lg_i32_writes_scc() {
+        let inst = pinned(&[0xbf01_8014]);
+        assert_eq!(inst.op.name(Arch::Gfx1201), Some("s_cmp_lg_i32"));
+        assert_eq!(inst.form, Form::Sopc);
+        assert_eq!(inst.operands.as_slice(), &[s20(), Operand::Inline(InlineConst::Integer(0))]);
+        assert!(inst.effects.defs.is_empty());
+        assert_eq!(inst.effects.uses.as_slice(), &[RegRef { kind: Kind::S, base: 20, len: 1 }]);
+        assert_eq!(inst.effects.implicit.writes, ImplicitSet::SCC);
+        assert_eq!(inst.effects.implicit.reads, 0);
+    }
+    /// The new rows exist only in the gfx1201 table; targets without a row reject table-gated.
+    #[test]
+    fn new_rows_are_gated_to_the_gfx1201_table() {
+        for words in [[0x956a_8090u32], [0xbf01_8014]] {
+            for arch in [Arch::Gfx1100, Arch::Gfx1151, Arch::Gfx1030] {
+                let e = decode_for(arch, &words).unwrap_err().to_string();
+                assert!(e.contains("undefined"), "{arch:?} {words:08x?}: {e}");
             }
         }
     }

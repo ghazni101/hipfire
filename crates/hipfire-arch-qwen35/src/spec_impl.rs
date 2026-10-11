@@ -285,9 +285,10 @@ impl SpecTarget for ModelSlot {
         .map_err(|e| e.to_string())?;
         let vocab = self.config.vocab_size;
         let b = block.len();
-        // top_p of 0.0 means "disabled" upstream → 1.0 (no nucleus). top_k is
-        // folded into the GPU kernel's tau alongside top_p. min_p is routed to AR
-        // by the dispatch, so it is never set on this path.
+        // top_p of 0.0 means "disabled" upstream → 1.0 (no nucleus). `top_k` is
+        // the AR candidate cap; the kernel's tau/Z encode AR's law (top_k pool,
+        // then the nucleus over its mass). min_p is routed to AR by the
+        // dispatch, so it is never set on this path.
         let top_p_eff = if top_p > 0.0 { top_p.min(1.0) } else { 1.0 };
         let logits_batch = s.verify_scratch.logits.sub_offset(0, b * vocab);
         let probs_gpu = gpu

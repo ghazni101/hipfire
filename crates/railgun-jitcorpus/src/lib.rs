@@ -17,9 +17,15 @@
 //! configuration. `build` compiles each module with the runtime's hipcc argv
 //! on this host, certifies the object with `railgun-cert`, and writes a
 //! versioned, per-build-host corpus (`railgun_corpus` layout) whose pack
-//! directories the runtime can load verbatim. `check` is the CI gate: every
-//! node of every node set must resolve, under the runtime's current JIT key,
-//! to a record with a verified receipt.
+//! directories the runtime can load verbatim. On gfx1201 the product default
+//! loads embedded PeaceMaker twin images
+//! (`rdna_compute::pm_decode_twins`) instead of the hipcc objects of some
+//! modules, so `build` also certifies each planned arch's twins against their
+//! radiowave and records them (`origin: pm_native`, keyed by image digest,
+//! under `native/<arch>/`, never in the pack). `check` is the CI gate: every
+//! node of every node set must resolve, under the runtime's current key
+//! (packaging key for hipcc modules, image digest for twins), to a record
+//! with a verified receipt.
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -27,11 +33,11 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 
 use hipfire_config::{ConfigLayer, ProcessConfig, CONFIG_SCHEMA_VERSION};
 use railgun_corpus::{
-    sha256_hex, BuildHost, CorpusIndex, CorpusRecord, JitCorpus, KernelVerdict, MissingNode, NodeRecord, ProgramNode, ProgramRecord,
-    RejectedObject, ToolchainPin, CORPUS_INDEX, CORPUS_SCHEMA, CORPUS_VERSION,
+    sha256_hex, ArtifactKey, BuildHost, CorpusIndex, CorpusRecord, JitCorpus, KernelVerdict, MissingNode, NodeRecord, ObjectOrigin,
+    ProgramNode, ProgramRecord, RejectedObject, ToolchainPin, CORPUS_INDEX, CORPUS_SCHEMA, CORPUS_VERSION,
 };
 use rdna_compute::kernel_registry::{self, KernelEntry};
-use rdna_compute::{FeatureFlags, KernelCompiler};
+use rdna_compute::{pm_decode_twins, FeatureFlags, KernelCompiler};
 use serde::{Deserialize, Serialize};
 
 pub const PROGRAMS_JSON: &str = include_str!("../programs.json");
@@ -132,10 +138,19 @@ pub fn install_product_defaults() -> Result<()> {
     }
 }
 
+fn product_flags(arch: &str) -> FeatureFlags {
+    FeatureFlags::from_process_config(arch, &product_config())
+}
+
 /// `FeatureFlags::hipcc_extra_flags` under the product defaults: the
 /// process-global extra flags every JIT compile on `arch` carries.
 pub fn default_extra_flags(arch: &str) -> String {
-    FeatureFlags::from_process_config(arch, &product_config()).hipcc_extra_flags
+    product_flags(arch).hipcc_extra_flags
+}
+
+/// Lowercase hex of a SHA-256 digest.
+fn hex(digest: &[u8; 32]) -> String {
+    digest.iter().map(|b| format!("{b:02x}")).collect()
 }
 
 /// The modules one arch's programs need, as registry entries.
@@ -143,6 +158,9 @@ pub struct ArchPlan {
     pub arch: String,
     pub extra_flags: String,
     pub entries: Vec<KernelEntry>,
+    /// The embedded PeaceMaker twins the product default loads instead of the
+    /// hipcc objects of some `entries` (`pm_decode_twins::pm_decode_module`).
+    pub twins: Vec<&'static pm_decode_twins::NativeKernelBundle>,
 }
 
 /// Resolve every node of every node set on `arch` to its registry entry.
@@ -173,8 +191,21 @@ pub fn plan(inventory: &Inventory, arch: &str) -> Result<ArchPlan> {
     if !errors.is_empty() {
         return Err(errors.join("\n"));
     }
-    let entries = all.into_iter().filter(|e| needed.contains(e.module)).collect();
-    Ok(ArchPlan { arch: arch.to_owned(), extra_flags, entries })
+    let entries: Vec<KernelEntry> = all.into_iter().filter(|e| needed.contains(e.module)).collect();
+    let pm_decode = product_flags(arch).pm_decode;
+    let mut twins = Vec::new();
+    for entry in &entries {
+        let Some(twin) = pm_decode_twins::pm_decode_module(arch, pm_decode, entry.module) else { continue };
+        twin.verify_image().map_err(|e| format!("{arch}: {e}"))?;
+        let source_sha256 = sha256_hex(entry.source().as_bytes());
+        if hex(&twin.source_sha256) != source_sha256 {
+            return Err(format!(
+                "{arch}: pm_decode twin {}: registry source sha256 {source_sha256} is not the twin's accepted {}; the runtime refuses to load the twin under that source",
+                entry.module, hex(&twin.source_sha256)));
+        }
+        twins.push(twin);
+    }
+    Ok(ArchPlan { arch: arch.to_owned(), extra_flags, entries, twins })
 }
 
 /// The archs the inventory covers, in first-seen order.
@@ -193,18 +224,32 @@ pub fn archs(inventory: &Inventory) -> Vec<String> {
 pub struct ProgramKeys {
     pub id: String,
     pub arch: String,
-    /// `(symbol, module, packaging_key)`.
-    pub nodes: Vec<(String, String, String)>,
+    /// `(symbol, module, key)`.
+    pub nodes: Vec<(String, String, NodeKey)>,
 }
 
-/// Key every node set's nodes with `KernelCompiler::packaging_hash_for` over
-/// the registry's current source and recipe (no compiler needed).
+/// How the runtime's current configuration identifies the object a node loads.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NodeKey {
+    /// Compiled by hipcc: `KernelCompiler::packaging_hash_for` over the registry source and recipe.
+    Hipcc(String),
+    /// An embedded PeaceMaker twin image: the SHA-256 of the image the runtime loads.
+    Native { artifact_sha256: String },
+}
+
+/// Key every node set's nodes with the object the runtime loads under the
+/// product defaults: the embedded twin's image digest where the module has
+/// one, else `KernelCompiler::packaging_hash_for` over the registry's current
+/// source and recipe (no compiler needed).
 pub fn current_program_keys(inventory: &Inventory) -> Result<Vec<ProgramKeys>> {
     let mut out = Vec::new();
     for arch in archs(inventory) {
         let plan = plan(inventory, &arch)?;
-        let keys: BTreeMap<&str, String> = plan.entries.iter()
-            .map(|e| (e.module, KernelCompiler::packaging_hash_for(&arch, e.module, e.source(), &plan.extra_flags)))
+        let keys: BTreeMap<&str, NodeKey> = plan.entries.iter()
+            .map(|e| (e.module, match plan.twins.iter().find(|t| t.module == e.module) {
+                Some(twin) => NodeKey::Native { artifact_sha256: hex(&twin.image_sha256) },
+                None => NodeKey::Hipcc(KernelCompiler::packaging_hash_for(&arch, e.module, e.source(), &plan.extra_flags)),
+            }))
             .collect();
         for set in inventory.node_sets().iter().filter(|s| s.arch == arch) {
             let nodes = set.nodes.iter().map(|(s, m)| (s.clone(), m.clone(), keys[m.as_str()].clone())).collect();
@@ -235,16 +280,34 @@ pub fn check(corpus: &JitCorpus, programs: &[ProgramKeys]) -> Vec<Coverage> {
         let mut missing = Vec::new();
         let mut resolved: Vec<(&str, String, &CorpusRecord)> = Vec::new();
         for (symbol, module, key) in &program.nodes {
-            let Some(record) = corpus.record_for_module(&program.arch, module, key) else {
-                let rejected = corpus.index().rejected.iter()
-                    .find(|r| r.arch == program.arch && &r.module == module && &r.packaging_key == key);
-                missing.push(match rejected {
-                    Some(r) => MissingNode { symbol: symbol.clone(), artifact_sha256: r.artifact_sha256.clone(),
-                        reason: format!("railgun-cert rejected {module}: {}", r.reason) },
-                    None => MissingNode { symbol: symbol.clone(), artifact_sha256: String::new(),
-                        reason: format!("no record for module {module} under the runtime's current key {key}") },
-                });
-                continue;
+            let found = match key {
+                NodeKey::Hipcc(packaging_key) => corpus.record_for_module(&program.arch, module, packaging_key).ok_or_else(|| {
+                    match corpus.index().rejected.iter()
+                        .find(|r| r.origin == ObjectOrigin::Hipcc && r.arch == program.arch && &r.module == module && &r.packaging_key == packaging_key)
+                    {
+                        Some(r) => MissingNode { symbol: symbol.clone(), artifact_sha256: r.artifact_sha256.clone(),
+                            reason: format!("railgun-cert rejected {module}: {}", r.reason) },
+                        None => MissingNode { symbol: symbol.clone(), artifact_sha256: String::new(),
+                            reason: format!("no record for module {module} under the runtime's current key {packaging_key}") },
+                    }
+                }),
+                NodeKey::Native { artifact_sha256 } => {
+                    let key = ArtifactKey { arch: &program.arch, toolchain_pin: &pin, artifact_sha256 };
+                    corpus.record(&key).filter(|r| r.origin == ObjectOrigin::PmNative && &r.module == module).ok_or_else(|| {
+                        let reason = match corpus.rejection(&program.arch, artifact_sha256) {
+                            Some(r) => format!("railgun-cert rejected pm_native twin {module}: {}", r.reason),
+                            None => format!("no pm_native record for twin {module} image {}", &artifact_sha256[..artifact_sha256.len().min(16)]),
+                        };
+                        MissingNode { symbol: symbol.clone(), artifact_sha256: artifact_sha256.clone(), reason }
+                    })
+                }
+            };
+            let record = match found {
+                Ok(record) => record,
+                Err(node) => {
+                    missing.push(node);
+                    continue;
+                }
             };
             let object = corpus.root().join(&record.object);
             match std::fs::read(&object) {
@@ -285,6 +348,8 @@ struct Compiled {
     object: Vec<u8>,
     /// Err: the certifier rejected the object (it ships without a record).
     receipt: Result<railgun_cert::Receipt>,
+    /// The Radiowave manifest the runtime reads beside a packaged object.
+    radiowave_json: String,
     headers: BTreeSet<String>,
 }
 
@@ -347,7 +412,13 @@ fn compile_and_certify(compiler: &KernelCompiler, entry: &KernelEntry, dir: &Pat
     let _ = std::fs::remove_file(&obj);
     compiler.compile_to_paths(entry.module, entry.source(), &src, &obj).map_err(|e| format!("{}: {e}", entry.module))?;
     let object = std::fs::read(&obj).map_err(|e| format!("{}: {e}", obj.display()))?;
-    let receipt = railgun_cert::certify(&object, None).map_err(|e| e.to_string());
+    // Without the manifest Redline types the launch with no resource effects and
+    // keeps a wait + acquire railgun's certified facts prove unneeded.
+    let manifest = dir.join(format!("{}.radiowave.json", entry.module));
+    let _ = std::fs::remove_file(&manifest);
+    compiler.certify_radiowave(entry.module, &src, &obj, &manifest).map_err(|e| format!("{}: radiowave: {e}", entry.module))?;
+    let radiowave_json = std::fs::read_to_string(&manifest).map_err(|e| format!("{}: {e}", manifest.display()))?;
+    let receipt = railgun_cert::certify(&object, Some(&radiowave_json)).map_err(|e| e.to_string());
     if let Ok(receipt) = &receipt {
         let missing: Vec<&str> = entry.symbols.iter().copied().filter(|s| !receipt.railgun.kernels.iter().any(|k| k.symbol == *s)).collect();
         if !missing.is_empty() {
@@ -355,7 +426,7 @@ fn compile_and_certify(compiler: &KernelCompiler, entry: &KernelEntry, dir: &Pat
         }
     }
     let headers = headers(&compiler.jit_argv(entry.module, entry.source(), &src, &obj), compiler.rocm_env_root())?;
-    Ok(Compiled { object, receipt, headers })
+    Ok(Compiled { object, receipt, radiowave_json, headers })
 }
 
 fn git_revision() -> String {
@@ -363,7 +434,9 @@ fn git_revision() -> String {
     let git = |args: &[&str]| Command::new("git").arg("-C").arg(dir).args(args).output().ok()
         .filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).trim().to_owned());
     let head = git(&["rev-parse", "HEAD"]).unwrap_or_else(|| "unknown".into());
-    let dirty = git(&["status", "--porcelain", "--", "../../kernels", "../rdna-compute", "../railgun-cert", "../railgun-corpus", "."])
+    // The receipts depend on the certifier (railgun-cert over peacemaker's lift and ISA tables).
+    let dirty = git(&["status", "--porcelain", "--", "../../kernels", "../rdna-compute", "../railgun-cert", "../railgun-corpus",
+        "../peacemaker-ir", "../peacemaker-lift", "."])
         .is_some_and(|s| !s.is_empty());
     if dirty { format!("{head}-dirty") } else { head }
 }
@@ -378,7 +451,8 @@ fn write_json(path: &Path, value: &impl Serialize) -> Result<Vec<u8>> {
 }
 
 /// Compile, certify and index every module the inventory's node sets use
-/// on `opts.archs`. Returns the corpus directory.
+/// on `opts.archs`, plus the embedded pm_decode twin images the product
+/// default loads in their place. Returns the corpus directory.
 pub fn build(inventory: &Inventory, opts: &BuildOptions) -> Result<PathBuf> {
     install_product_defaults()?;
     let build_dir = std::fs::canonicalize(&opts.build_dir).or_else(|_| {
@@ -417,7 +491,10 @@ pub fn build(inventory: &Inventory, opts: &BuildOptions) -> Result<PathBuf> {
             let artifact = sha256_hex(&compiled.object);
             let symbols: Vec<String> = entry.symbols.iter().map(|s| (*s).to_owned()).collect();
             let object_src = dir.join(format!("{}.hsaco", entry.module));
-            compiler.publish_package(entry.module, entry.source(), &symbols, &object_src, &staging.join("pack").join(arch))?;
+            let pack_dir = staging.join("pack").join(arch);
+            compiler.publish_package(entry.module, entry.source(), &symbols, &object_src, &pack_dir)?;
+            std::fs::write(pack_dir.join(format!("{}.radiowave.json", entry.module)), &compiled.radiowave_json)
+                .map_err(|e| e.to_string())?;
             let source_rel = staging.join("sources").join(arch).join(format!("{}.hip", entry.module));
             std::fs::create_dir_all(source_rel.parent().unwrap()).map_err(|e| e.to_string())?;
             std::fs::write(&source_rel, entry.source()).map_err(|e| e.to_string())?;
@@ -427,7 +504,7 @@ pub fn build(inventory: &Inventory, opts: &BuildOptions) -> Result<PathBuf> {
                 Err(reason) => {
                     eprintln!("{arch}: {} rejected by railgun-cert: {reason}", entry.module);
                     rejected.push(RejectedObject {
-                        arch: arch.clone(), artifact_sha256: artifact, module: entry.module.to_owned(), symbols,
+                        arch: arch.clone(), artifact_sha256: artifact, module: entry.module.to_owned(), origin: ObjectOrigin::Hipcc, symbols,
                         source_sha256: sha256_hex(entry.source().as_bytes()),
                         packaging_key: compiler.packaging_hash(entry.module, entry.source()),
                         object: format!("pack/{arch}/{}.hsaco", entry.module), reason,
@@ -441,6 +518,7 @@ pub fn build(inventory: &Inventory, opts: &BuildOptions) -> Result<PathBuf> {
                 arch: arch.clone(),
                 artifact_sha256: artifact,
                 module: entry.module.to_owned(),
+                origin: ObjectOrigin::Hipcc,
                 symbols,
                 source_sha256: sha256_hex(entry.source().as_bytes()),
                 extra_flags: plan.extra_flags.clone(),
@@ -450,6 +528,60 @@ pub fn build(inventory: &Inventory, opts: &BuildOptions) -> Result<PathBuf> {
                 jit_cache_key: compiler.jit_cache_key(entry.module, entry.source()),
                 argv: compiler.jit_argv(entry.module, entry.source(), &dir.join(format!("{}.hip", entry.module)), &object_src),
                 object: format!("pack/{arch}/{}.hsaco", entry.module),
+                receipt: receipt_rel,
+                receipt_sha256: sha256_hex(&receipt_bytes),
+                kernels: receipt.railgun.kernels.iter()
+                    .map(|k| KernelVerdict { symbol: k.symbol.clone(), status: k.status.clone(), differential: k.differential.status.clone() })
+                    .collect(),
+            });
+        }
+        if !plan.twins.is_empty() {
+            eprintln!("{arch}: {} embedded pm_decode twin(s)", plan.twins.len());
+        }
+        let certified = run_parallel(&plan.twins, opts.jobs, |twin| railgun_cert::certify(twin.image, Some(twin.radiowave_json)).map_err(|e| e.to_string()));
+        for (twin, receipt) in plan.twins.iter().zip(certified) {
+            let artifact = hex(&twin.image_sha256);
+            let symbols: Vec<String> = twin.symbols.iter().map(|s| (*s).to_owned()).collect();
+            let object_rel = format!("native/{arch}/{}.hxaco", twin.module);
+            let radiowave_rel = format!("native/{arch}/{}.radiowave.json", twin.module);
+            let write_native = |rel: &str, bytes: &[u8]| -> Result<()> {
+                let path = staging.join(rel);
+                std::fs::create_dir_all(path.parent().unwrap()).map_err(|e| format!("{}: {e}", path.display()))?;
+                std::fs::write(&path, bytes).map_err(|e| format!("{}: {e}", path.display()))
+            };
+            write_native(&object_rel, twin.image)?;
+            write_native(&radiowave_rel, twin.radiowave_json.as_bytes())?;
+            let receipt = match receipt {
+                Ok(receipt) => receipt,
+                Err(reason) => {
+                    eprintln!("{arch}: pm_native twin {} rejected by railgun-cert: {reason}", twin.module);
+                    rejected.push(RejectedObject {
+                        arch: arch.clone(), artifact_sha256: artifact, module: twin.module.to_owned(), origin: ObjectOrigin::PmNative, symbols,
+                        source_sha256: hex(&twin.source_sha256), packaging_key: String::new(), object: object_rel, reason,
+                    });
+                    continue;
+                }
+            };
+            let missing: Vec<&str> = twin.symbols.iter().copied().filter(|s| !receipt.railgun.kernels.iter().any(|k| k.symbol == *s)).collect();
+            if !missing.is_empty() {
+                return Err(format!("{arch}: pm_native twin {}: receipt has no kernel for symbol(s) {}", twin.module, missing.join(", ")));
+            }
+            let receipt_rel = format!("receipts/{arch}/{artifact}.receipt.json");
+            let receipt_bytes = write_json(&staging.join(&receipt_rel), &receipt)?;
+            records.push(CorpusRecord {
+                arch: arch.clone(),
+                artifact_sha256: artifact,
+                module: twin.module.to_owned(),
+                origin: ObjectOrigin::PmNative,
+                symbols,
+                source_sha256: hex(&twin.source_sha256),
+                extra_flags: String::new(),
+                flags: Vec::new(),
+                scheduler_profile: String::new(),
+                packaging_key: String::new(),
+                jit_cache_key: String::new(),
+                argv: Vec::new(),
+                object: object_rel,
                 receipt: receipt_rel,
                 receipt_sha256: sha256_hex(&receipt_bytes),
                 kernels: receipt.railgun.kernels.iter()
@@ -479,11 +611,14 @@ pub fn build(inventory: &Inventory, opts: &BuildOptions) -> Result<PathBuf> {
 
     let programs = inventory.node_sets().iter().filter(|s| opts.archs.iter().any(|a| a == s.arch)).map(|p| ProgramRecord {
         id: p.id.clone(), arch: p.arch.to_owned(),
-        nodes: p.nodes.iter().map(|(symbol, module)| NodeRecord {
-            symbol: symbol.clone(), module: module.clone(),
-            artifact_sha256: records.iter().find(|r| r.arch == p.arch && &r.module == module).map(|r| &r.artifact_sha256)
-                .or_else(|| rejected.iter().find(|r| r.arch == p.arch && &r.module == module).map(|r| &r.artifact_sha256))
-                .expect("planned module built").clone(),
+        nodes: p.nodes.iter().map(|(symbol, module)| {
+            // The product default loads the twin where the module has one, else the hipcc object.
+            let of = |origin: ObjectOrigin| records.iter().find(|r| r.origin == origin && r.arch == p.arch && &r.module == module).map(|r| &r.artifact_sha256)
+                .or_else(|| rejected.iter().find(|r| r.origin == origin && r.arch == p.arch && &r.module == module).map(|r| &r.artifact_sha256));
+            NodeRecord {
+                symbol: symbol.clone(), module: module.clone(),
+                artifact_sha256: of(ObjectOrigin::PmNative).or_else(|| of(ObjectOrigin::Hipcc)).expect("planned module built").clone(),
+            }
         }).collect(),
     }).collect();
     let index = CorpusIndex {
@@ -599,7 +734,7 @@ pub fn repro(corpus: &JitCorpus, work: &Path, archs: &[String], jobs: usize) -> 
     std::fs::create_dir_all(work).map_err(|e| format!("{}: {e}", work.display()))?;
     let mut out = Vec::new();
     for arch in archs {
-        let records: Vec<&CorpusRecord> = corpus.index().records.iter().filter(|r| &r.arch == arch).collect();
+        let records: Vec<&CorpusRecord> = corpus.index().records.iter().filter(|r| r.origin == ObjectOrigin::Hipcc && &r.arch == arch).collect();
         let Some(first) = records.first() else { continue };
         let compiler = KernelCompiler::new(arch, first.extra_flags.clone()).map_err(|e| e.to_string())?;
         if sha256_hex(compiler.toolchain_id().as_bytes()) != corpus.toolchain_pin() {
@@ -684,5 +819,41 @@ mod tests {
             let plan = plan(&inventory, &arch).unwrap_or_else(|e| panic!("{e}"));
             assert!(!plan.entries.is_empty(), "{arch}");
         }
+    }
+
+    const GFX1201_TWIN_MODULES: [&str; 5] = [
+        "fused_qkvza_hfq4g256_mq4v2",
+        "fused_qkv_hfq4g256_mq4v2",
+        "fused_gate_up_hfq4g256_mq4v2",
+        "gemv_hfq4g256_multirow_default_mq4v2",
+        "gemv_hfq4g256_residual_mq4v2",
+    ];
+
+    #[test]
+    fn gfx1201_product_defaults_plan_the_five_pm_decode_twins_and_key_their_nodes_by_image_digest() {
+        install_product_defaults().unwrap();
+        let inventory = inventory().unwrap();
+        let plan = plan(&inventory, "gfx1201").unwrap_or_else(|e| panic!("{e}"));
+        let mut modules: Vec<&str> = plan.twins.iter().map(|t| t.module).collect();
+        modules.sort_unstable();
+        let mut expected = GFX1201_TWIN_MODULES.to_vec();
+        expected.sort_unstable();
+        assert_eq!(modules, expected);
+
+        let programs = current_program_keys(&inventory).unwrap();
+        let program = programs.iter().find(|p| p.id == "qwen35-dense-h2-gfx1201").expect("program qwen35-dense-h2-gfx1201");
+        let mut native: Vec<&str> = Vec::new();
+        for (_, module, key) in &program.nodes {
+            match plan.twins.iter().find(|t| t.module == module) {
+                Some(twin) => {
+                    assert_eq!(key, &NodeKey::Native { artifact_sha256: hex(&twin.image_sha256) }, "{module}");
+                    native.push(module.as_str());
+                }
+                None => assert!(matches!(key, NodeKey::Hipcc(_)), "{module}"),
+            }
+        }
+        native.sort_unstable();
+        native.dedup();
+        assert_eq!(native, expected);
     }
 }

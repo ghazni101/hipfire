@@ -181,6 +181,7 @@ pub fn fused_qkv_variant_for_key(key: KernelKey) -> Option<FusedQkvVariant> {
         // 3-way Fused QKV (incl. Q4K, Q8_0/HFQ3/HFP4 prefill, and the Paro 4G128T QKV synthesis)
         FusedQkvHfq4G256
         | FusedQkvMq4G256V2
+        | FusedQkvMq4G256V2VerifyExact
         | FusedQkvMq4G256V2Lloyd
         | FusedQkvMq6G256V2
         | FusedQkvMq5G256V2
@@ -198,6 +199,7 @@ pub fn fused_qkv_variant_for_key(key: KernelKey) -> Option<FusedQkvVariant> {
         // 4-way Fused QKVZA (DeltaNet linear attention, incl. Q8_0/HFQ3/HFP4 prefill and Paro 4G128T)
         FusedQkvzaHfq4G256
         | FusedQkvzaMq4G256V2
+        | FusedQkvzaMq4G256V2VerifyExact
         | FusedQkvzaMq4G256V2Lloyd
         | FusedQkvzaMq6G256V2
         | FusedQkvzaMq5G256V2
@@ -214,6 +216,7 @@ pub fn fused_qkv_variant_for_key(key: KernelKey) -> Option<FusedQkvVariant> {
         | FusedQkvzaParo4G128T => Some(FusedQkvVariant::Qkvza),
         FusedGateUpHfq4G256
         | FusedGateUpMq4G256V2
+        | FusedGateUpMq4G256V2VerifyExact
         | FusedGateUpMq4G256V2Lloyd
         | FusedGateUpMq6G256V2
         | FusedGateUpMq5G256V2
@@ -347,12 +350,16 @@ pub enum KernelKey {
     GemmMq3G256V2,
     GemmMq2G256V2,
     GemmMq4G256V2Residual,
+    /// Explicit exact verify GEMM (1..=128 rows, singleton F16-WMMA chain), only for `DenseBatchMath::SingletonWmma`; never selected by dtype.
+    GemmMq4G256V2ResidualVerifyExact,
     GemmMq4CG256Residual,
     GemmMq5G256V2Residual,
     GemmMq6G256V2Residual,
     GemmMq3G256V2Residual,
     GemmMq2G256V2Residual,
     GemmMq4G256V2BatchedLmhead,
+    /// Explicit exact verify GEMM (1..=128 rows, singleton F16-WMMA chain), only for `DenseBatchMath::SingletonWmma`; never selected by dtype.
+    GemmMq4G256V2LmheadVerifyExact,
     GemmMq4CG256BatchedLmhead,
     GemmMq5G256V2BatchedLmhead,
     GemmMq6G256V2BatchedLmhead,
@@ -423,6 +430,8 @@ pub enum KernelKey {
     // Fused QKV
     FusedQkvHfq4G256,
     FusedQkvMq4G256V2,
+    /// Explicit exact verify GEMM (1..=128 rows, singleton F16-WMMA chain), only for `DenseBatchMath::SingletonWmma`; never selected by dtype.
+    FusedQkvMq4G256V2VerifyExact,
     /// qt=52 (MQ4G256V2-Lloyd) decode twin: same wire layout, per-tensor f16 codebook LUT.
     FusedQkvMq4G256V2Lloyd,
     FusedQkvMq4CG256,
@@ -440,6 +449,8 @@ pub enum KernelKey {
     FusedQkvHfp4G32,
     FusedQkvzaHfq4G256,
     FusedQkvzaMq4G256V2,
+    /// Explicit exact verify GEMM (1..=128 rows, singleton F16-WMMA chain), only for `DenseBatchMath::SingletonWmma`; never selected by dtype.
+    FusedQkvzaMq4G256V2VerifyExact,
     /// qt=52 (MQ4G256V2-Lloyd) decode twin: same wire layout, per-tensor f16 codebook LUT.
     FusedQkvzaMq4G256V2Lloyd,
     FusedQkvzaMq4CG256,
@@ -458,6 +469,8 @@ pub enum KernelKey {
     FusedQkvzaMfp4G32E8,
     FusedGateUpHfq4G256,
     FusedGateUpMq4G256V2,
+    /// Explicit exact verify GEMM (1..=128 rows, singleton F16-WMMA chain), only for `DenseBatchMath::SingletonWmma`; never selected by dtype.
+    FusedGateUpMq4G256V2VerifyExact,
     /// qt=52 (MQ4G256V2-Lloyd) decode twin: same wire layout, per-tensor f16 codebook LUT.
     FusedGateUpMq4G256V2Lloyd,
     FusedGateUpMq4CG256,

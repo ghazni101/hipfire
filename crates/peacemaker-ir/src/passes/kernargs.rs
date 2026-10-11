@@ -47,7 +47,7 @@ use smallvec::SmallVec;
 
 use crate::cfg::{Body, InstId};
 use crate::effects::ImplicitSet;
-use crate::inst::{Abi, Arch, Form, FormFields, Inst, Kernel, UserSgprRole, VmemForm, Wave};
+use crate::inst::{Abi, Arch, EntryCell, EntryValue, Form, FormFields, Inst, Kernel, RawAbi, VmemForm, Wave};
 use crate::isa::OpRow;
 use crate::kernarg::{
     AccessClass, AccessMode, ArgAccess, ArgFacts, ArgRole, CacheBits, DwordFacts, ImplicitUse, KernargFacts,
@@ -562,43 +562,65 @@ fn cyclic_blocks(body: &Body) -> Vec<bool> {
     out
 }
 
+/// HSA user-SGPR roles in `KERNEL_CODE_PROPERTIES` bit order.
+#[derive(Clone, Copy)]
+enum HsaUserSgpr { PrivateSegmentBuffer, DispatchPtr, QueuePtr, KernargSegmentPtr, DispatchId, FlatScratchInit, PrivateSegmentSize }
+
+/// Entry values of a raw kernel: exactly its declared facts. A workgroup id or packed local
+/// id keeps its influence flag, an exact value its constant, an unconstrained defined value an
+/// opaque non-argument source; nothing is a kernarg pointer.
+fn raw_entry_state(raw: &RawAbi) -> (State, DwSet) {
+    let mut st = State::empty();
+    // Malformed facts were rejected by `Program::validate`; analysis of an unvalidated
+    // program sees an empty entry state, which is the conservative reading.
+    let Ok(cells) = raw.entry_cells() else { return (st, DwSet::default()) };
+    for (cell, fact) in cells {
+        let val = match &fact.value {
+            EntryValue::Defined => Val::src(OPAQUE),
+            EntryValue::WorkgroupId(_) => Val::flags(WG),
+            EntryValue::Exact(value) => Val::konst(*value),
+            EntryValue::Bounded { .. } => Val::default(),
+            EntryValue::LocalId(_) => Val::flags(WI),
+        };
+        match cell {
+            EntryCell::Vgpr(n) => if let Some(slot) = st.v.get_mut(usize::from(n)) { *slot = val },
+            EntryCell::Sgpr(n) => if let Some(slot) = st.s.get_mut(usize::from(n)) { *slot = val },
+            EntryCell::Ttmp(n) => if let Some(slot) = st.t.get_mut(usize::from(n)) { *slot = val },
+            _ => {}
+        }
+    }
+    (st, DwSet::default())
+}
+
 /// ABI entry values: user SGPRs by role, preloaded kernargs, workgroup ids
 /// (gfx11 system SGPRs, gfx12 TTMP7/TTMP9), work-item ids in v0.
 fn entry_state(kernel: &Kernel, arch: Arch) -> (State, DwSet) {
+    let descriptor = match &kernel.abi {
+        Abi::Hsa { descriptor, .. } => descriptor,
+        Abi::Raw(raw) => return raw_entry_state(raw),
+    };
     let mut st = State::empty();
     let mut loaded = DwSet::default();
-    let mut roles: Vec<(UserSgprRole, usize)> = Vec::new();
-    let (user_count, preload, rsrc2) = match &kernel.abi {
-        Abi::Hsa { descriptor, .. } => {
-            let props = descriptor.kernel_code_properties.0;
-            let table = [
-                (UserSgprRole::PrivateSegmentBuffer, 4), (UserSgprRole::DispatchPtr, 2), (UserSgprRole::QueuePtr, 2),
-                (UserSgprRole::KernargSegmentPtr, 2), (UserSgprRole::DispatchId, 2), (UserSgprRole::FlatScratchInit, 2),
-                (UserSgprRole::PrivateSegmentSize, 1),
-            ];
-            for (bit, (role, n)) in table.into_iter().enumerate() {
-                if props >> bit & 1 != 0 { roles.push((role, n)); }
-            }
-            let pre = u32::from(descriptor.kernarg_preload.0);
-            let rsrc2 = descriptor.compute_pgm_rsrc2.0;
-            ((rsrc2 >> 1 & 0x1f) as usize, (pre & 0x7f, pre >> 7), rsrc2)
-        }
-        Abi::Raw { user_sgprs, .. } => {
-            for role in user_sgprs {
-                let n = match role { UserSgprRole::PrivateSegmentBuffer => 4, UserSgprRole::PrivateSegmentSize => 1, _ => 2 };
-                roles.push((role.clone(), n));
-            }
-            // Raw kernels get workgroup ids X/Y/Z after the user SGPRs.
-            (roles.iter().map(|(_, n)| n).sum(), (0, 0), 0x380)
-        }
-    };
+    let mut roles: Vec<(HsaUserSgpr, usize)> = Vec::new();
+    let props = descriptor.kernel_code_properties.0;
+    let table = [
+        (HsaUserSgpr::PrivateSegmentBuffer, 4), (HsaUserSgpr::DispatchPtr, 2), (HsaUserSgpr::QueuePtr, 2),
+        (HsaUserSgpr::KernargSegmentPtr, 2), (HsaUserSgpr::DispatchId, 2), (HsaUserSgpr::FlatScratchInit, 2),
+        (HsaUserSgpr::PrivateSegmentSize, 1),
+    ];
+    for (bit, (role, n)) in table.into_iter().enumerate() {
+        if props >> bit & 1 != 0 { roles.push((role, n)); }
+    }
+    let pre = u32::from(descriptor.kernarg_preload.0);
+    let rsrc2 = descriptor.compute_pgm_rsrc2.0;
+    let (user_count, preload) = ((rsrc2 >> 1 & 0x1f) as usize, (pre & 0x7f, pre >> 7));
     let mut next = 0usize;
     for (role, n) in &roles {
         let val = match role {
-            UserSgprRole::PrivateSegmentBuffer => Val::src(SCRATCH),
-            UserSgprRole::DispatchPtr | UserSgprRole::QueuePtr => Val::src(PACKET),
-            UserSgprRole::KernargSegmentPtr => Val { koff: Some(0), ..Val::src(KSEG) },
-            UserSgprRole::FlatScratchInit => Val::src(SCRATCH),
+            HsaUserSgpr::PrivateSegmentBuffer => Val::src(SCRATCH),
+            HsaUserSgpr::DispatchPtr | HsaUserSgpr::QueuePtr => Val::src(PACKET),
+            HsaUserSgpr::KernargSegmentPtr => Val { koff: Some(0), ..Val::src(KSEG) },
+            HsaUserSgpr::FlatScratchInit => Val::src(SCRATCH),
             _ => Val::default(),
         };
         for i in 0..*n { if next + i < NS { st.s[next + i] = val; } }

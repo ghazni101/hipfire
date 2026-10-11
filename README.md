@@ -12,7 +12,7 @@
 <p align="center">
   <a href="https://github.com/warpfront/hipfire/releases"><img alt="Stable release v0.4.1" src="https://img.shields.io/badge/stable-v0.4.1-24292f?style=flat-square" /></a>
   <a href="CHANGELOG.md"><img alt="Changelog" src="https://img.shields.io/badge/changelog-v0.4.1-f04b24?style=flat-square" /></a>
-  <a href="docs/MODELS.md"><img alt="82 curated model entries" src="https://img.shields.io/badge/registry-82%20curated%20models-ff8a1f?style=flat-square" /></a>
+  <a href="docs/MODELS.md"><img alt="89 curated registry entries" src="https://img.shields.io/badge/registry-89%20curated%20entries-ff8a1f?style=flat-square" /></a>
   <a href="https://discord.gg/F3BaywB8Rs"><img alt="Join Discord" src="https://img.shields.io/badge/chat-Discord-5865F2?style=flat-square" /></a>
 </p>
 
@@ -54,7 +54,24 @@ hipfire img flux.schnell:1 "a red cube on a wooden table" --out x.png
 ```
 
 The daemon exposes an OpenAI-compatible API on `127.0.0.1:11435` (loopback
-only by default; set `serve.host` to listen on other interfaces).
+only by default; set `serve.host` to listen on other interfaces):
+
+```bash
+curl -s http://127.0.0.1:11435/v1/chat/completions \
+  -H "Content-Type: application/json" \
+  -d '{"model": "qwen3.8:27b-mq4-xts",
+       "messages": [{"role": "user", "content": "What is 2+2?"}],
+       "max_tokens": 256,
+       "chat_template_kwargs": {"enable_thinking": false}}'
+```
+
+Qwen models think by default, and `max_tokens` covers the `<think>` span as
+well as the answer: with a small cap and thinking on, `content` can come back
+empty (`finish_reason: "length"`). Turn thinking off as above, or raise
+`max_tokens`. See [docs/SERVE.md](docs/SERVE.md).
+
+Not sure which model fits your card? See
+[Pick a model for your GPU](docs/PICK-A-MODEL.md).
 
 Current stable release: **[v0.4.1](https://github.com/warpfront/hipfire/releases/tag/v0.4.1)**.
 
@@ -163,7 +180,8 @@ OpenAI-compatible client.
 
 ## Curated model registry
 
-The registry currently contains 80 curated model entries. Run
+The registry currently contains 89 curated entries (models, quant variants and
+draft sidecars) plus 82 aliases. Run
 `hipfire list -r` to see the authoritative live list.
 
 | Registry family | Pull tags and variants |

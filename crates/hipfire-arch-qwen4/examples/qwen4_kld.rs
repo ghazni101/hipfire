@@ -22,16 +22,22 @@
 //!   qwen4_kld import --logits TEACHER.logits --ref TEMPLATE.kldref \
 //!                    --teacher ID_FILE --output REF.kldref [--top-k 256]
 //!   qwen4_kld eval   --model CANDIDATE.hfq --ref REF.kldref --output OUT.kldseq \
-//!                    [--max-chunks N] [--decode]
+//!                    [--max-chunks N] [--decode] [--ple-hot BYTES]
 //! `--decode` scores the autoregressive route instead: each chunk prefills the
 //! unscored prefix, then runs one `forward_token` per scored position.
+//! `--ple-hot BYTES` attaches the PLE hot-row store (`<model>.plehot` sidecar
+//! and `<model>.plehotrows` pack), verified and with BYTES of the pack
+//! prewarmed, before scoring, so the identity gate covers rows read from the
+//! pack.
 //! Reduce with `saddle-quant reduce DIR`.
 
 use hipfire_arch_qwen4::admit_hfqm_artifact;
-use hipfire_arch_qwen4::bundle::Qwen4Bundle;
+use hipfire_arch_qwen4::bundle::{ple_hot_plan, PleHotPlan, PleHotWorker, Qwen4Bundle};
 use hipfire_runtime::device_mesh::DeviceMesh;
 use hipfire_runtime::hfq::{HfqFile, HfqModelSource};
 use hipfire_runtime::model_source::SourcePayload;
+use hipfire_runtime::ple_hot_store::{HotRowStore, PleHotRank};
+use hipfire_runtime::ple_sidecar::{resolve_and_attach_ple_rows, PleRowsOrigin, ResolvePolicy};
 use hipfire_runtime::tokenizer::Tokenizer;
 use hipfire_runtime::weight_store::{fulfill_manifest_from_payloads, WeightOrigin};
 use rdna_compute::{DType, Gpu, GpuTensor};
@@ -44,7 +50,52 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 use std::time::Instant;
 
-const USAGE: &str = "usage:\n  qwen4_kld ref    --model TEACHER.hfq --slice TEXT --output REF.kldref [--n-ctx 512] [--top-k 256] [--max-chunks N]\n  qwen4_kld import --logits TEACHER.logits --ref TEMPLATE.kldref --teacher ID_FILE --output REF.kldref [--top-k 256]\n  qwen4_kld eval   --model CANDIDATE.hfq --ref REF.kldref --output OUT.kldseq [--max-chunks N] [--decode]";
+/// Open the PLE hot-row store from `<model>.plehot` and the
+/// `<rows source>.plehotrows` pack (`plan.source_path` is the model file or
+/// its PLE sidecar), wait until its worker verified the pack, prewarm
+/// `prewarm` bytes of it, and return it ready to attach.
+fn verified_hot_store(
+    model: &Path,
+    plan: PleHotPlan,
+    prewarm: u64,
+) -> Result<PleHotWorker, String> {
+    let sidecar = PathBuf::from(format!("{}.plehot", model.display()));
+    let pack = PathBuf::from(format!("{}.plehotrows", plan.source_path.display()));
+    let rank = PleHotRank::open(&sidecar, plan.padded_rows, &plan.fingerprint_hex)
+        .map_err(|e| format!("--ple-hot: sidecar {}: {e}", sidecar.display()))?;
+    let store = HotRowStore::open(
+        rank,
+        &pack,
+        plan.rows_per_shard,
+        plan.row_encoding,
+        plan.encoded_row_bytes,
+        &plan.shard_offsets,
+        plan.source_file_bytes,
+    )?;
+    let started = Instant::now();
+    let handle = store.spawn_worker(&plan.source_path, plan.shard_offsets);
+    let hot = PleHotWorker::new(store.clone(), handle);
+    store.set_prewarm_budget(prewarm);
+    loop {
+        match store.verified() {
+            Some(true) if store.prewarm_complete() => break,
+            Some(false) => return Err("--ple-hot: the pack failed verification".into()),
+            _ if started.elapsed().as_secs() > 900 => {
+                return Err("--ple-hot: verification and prewarm did not finish in 900 s".into())
+            }
+            _ => std::thread::sleep(std::time::Duration::from_millis(100)),
+        }
+    }
+    eprintln!(
+        "qwen4_kld: ple hot store verified, {:.2} of {:.2} GiB of the pack prewarmed, {:.1} s",
+        store.prewarmed_bytes() as f64 / (1u64 << 30) as f64,
+        store.data_bytes() as f64 / (1u64 << 30) as f64,
+        started.elapsed().as_secs_f64()
+    );
+    Ok(hot)
+}
+
+const USAGE: &str = "usage:\n  qwen4_kld ref    --model TEACHER.hfq --slice TEXT --output REF.kldref [--n-ctx 512] [--top-k 256] [--max-chunks N]\n  qwen4_kld import --logits TEACHER.logits --ref TEMPLATE.kldref --teacher ID_FILE --output REF.kldref [--top-k 256]\n  qwen4_kld eval   --model CANDIDATE.hfq --ref REF.kldref --output OUT.kldseq [--max-chunks N] [--decode] [--ple-hot BYTES]";
 
 struct Model {
     gpu: Gpu,
@@ -57,19 +108,97 @@ struct Model {
 
 impl Model {
     /// Same range-loaded path as the serve loader (`hipfire-loader` carriers).
-    fn load(path: &Path, n_ctx: usize) -> Result<Self, String> {
+    /// `ple_hot`: bytes of the PLE hot-row pack to prewarm; the store is
+    /// attached verified before the first forward.
+    fn load(path: &Path, n_ctx: usize, ple_hot: Option<u64>) -> Result<Self, String> {
         let mut hfq =
             HfqFile::open(path).map_err(|e| format!("open HFQM {}: {e}", path.display()))?;
         let tokenizer = Tokenizer::from_hfq_metadata(&hfq.metadata_json)
             .map_err(|e| format!("tokenizer: {e}"))?;
         let arch_id = hfq.arch_id;
-        let receipt = admit_hfqm_artifact(&hfq).map_err(|e| format!("qwen4 admission: {e}"))?;
+        // The GPU arch drives `memory.ple_format = auto`; initialising it
+        // allocates no model memory, so admission still precedes every upload.
         let mut gpu = Gpu::init().map_err(|e| e.to_string())?;
+        // The evaluator never derives a missing q4: derive it with
+        // `hipfire ple derive` (or a serve load) first.
+        let choice = resolve_and_attach_ple_rows(
+            &mut hfq,
+            path,
+            hipfire_config::memory::ple_format(),
+            &gpu.arch,
+            ResolvePolicy {
+                derive_missing_q4: false,
+                progress: None,
+            },
+        )
+        .map_err(|e| format!("qwen4 PLE rows: {e}"))?;
+        let receipt = admit_hfqm_artifact(&hfq).map_err(|e| format!("qwen4 admission: {e}"))?;
+        // A rank-order table is served through its store (no shard
+        // descriptors); every other source reads through 128 descriptors.
+        let rank_table = receipt.ple_rows.rank_table().is_some();
+        let ple_descriptors = if rank_table {
+            None
+        } else {
+            Some(
+                receipt
+                    .ple_row_descriptors(&hfq)
+                    .map_err(|e| format!("qwen4 PLE rows: {e}"))?,
+            )
+        };
+        let (ple_rows_path, ple_rows_bytes) = receipt
+            .ple_rows_source(&hfq)
+            .map_err(|e| format!("qwen4 PLE rows: {e}"))?;
+        let (rows_encoding, rows_total) = match (&receipt.ple_rows, hfq.ple_rows()) {
+            (hipfire_arch_qwen4::Qwen4PleRows::Sidecar { encoding, .. }, Some(rows)) => {
+                (encoding.dtype_name().to_string(), rows.header().data_bytes)
+            }
+            _ => {
+                let descriptors = ple_descriptors.as_deref().unwrap_or_default();
+                (
+                    descriptors
+                        .first()
+                        .map_or_else(String::new, |descriptor| descriptor.dtype.clone()),
+                    descriptors.iter().map(|descriptor| descriptor.length).sum(),
+                )
+            }
+        };
+        eprintln!(
+            "qwen4_kld: ple rows: {} from {} ({rows_encoding}, {} order, {:.1} GB)",
+            choice.format.name(),
+            match &choice.origin {
+                PleRowsOrigin::Embedded => "embedded model file".to_string(),
+                PleRowsOrigin::Sidecar(sidecar) => sidecar.display().to_string(),
+            },
+            if rank_table { "rank" } else { "row" },
+            rows_total as f64 / 1e9
+        );
+        if let Some(note) = &choice.note {
+            eprintln!("qwen4_kld: ple rows: {note}");
+        }
         if gpu.is_uma() {
             hfq.drop_mmap();
         }
         let mesh = DeviceMesh::single().map_err(|e| format!("qwen4 mesh: {e}"))?;
         let expected = WeightOrigin::for_single(&mesh, &gpu);
+        let hot_plan =
+            match (ple_hot, ple_descriptors.as_deref()) {
+                (Some(_), Some(descriptors)) => Some(
+                    ple_hot_plan(
+                        receipt.ple.as_ref().ok_or(
+                            "--ple-hot requires PLE hash metadata; this profile has no PLE",
+                        )?,
+                        descriptors,
+                        &ple_rows_path,
+                        ple_rows_bytes,
+                    )?
+                        .ok_or("--ple-hot: the PLE rows are neither Q8F16 nor Q4LM")?,
+                ),
+                (Some(_), None) => return Err(
+                    "--ple-hot: the PLE rows are a rank-order table, which is its own hot-row pack"
+                        .into(),
+                ),
+                (None, _) => None,
+            };
         let source = HfqModelSource::from_hfq(hfq);
         let transaction = fulfill_manifest_from_payloads(
             &receipt.manifest.weights,
@@ -95,13 +224,15 @@ impl Model {
             &receipt.config,
         )?;
         let backend = hipfire_arch_qwen4::Qwen4KvBackend::automatic(&gpu);
-        let mut bundle = Qwen4Bundle::assemble_with_metadata(
+        let mut bundle = Qwen4Bundle::assemble_with_ple_rows(
             receipt.config,
+            &receipt.manifest.identity.recipe,
             transaction,
             &receipt.placements,
             &mut gpu,
             n_ctx,
             receipt.ple,
+            receipt.ple_rows,
             state_format,
             backend,
         )
@@ -109,6 +240,11 @@ impl Model {
         bundle
             .attach_forward(&mut gpu, n_ctx)
             .map_err(|e| format!("qwen4 forward setup: {e}"))?;
+        if let (Some(prewarm), Some(plan)) = (ple_hot, hot_plan) {
+            bundle
+                .attach_ple_hot_store(verified_hot_store(path, plan, prewarm)?)
+                .map_err(|e| format!("qwen4 PLE hot store: {e}"))?;
+        }
         let logits = gpu
             .zeros(&[n_ctx * vocab], DType::F32)
             .map_err(|e| e.to_string())?;
@@ -296,7 +432,7 @@ fn build_ref(
     top_k: usize,
     max_chunks: Option<usize>,
 ) -> Result<(), String> {
-    let mut m = Model::load(model, n_ctx)?;
+    let mut m = Model::load(model, n_ctx, None)?;
     let text =
         std::fs::read_to_string(slice).map_err(|e| format!("read {}: {e}", slice.display()))?;
     // Qwen tokenizers add no BOS: chunks are plain n_ctx windows of the stream.
@@ -409,6 +545,7 @@ fn score(
     output: &Path,
     max_chunks: Option<usize>,
     decode: bool,
+    ple_hot: Option<u64>,
 ) -> Result<(), String> {
     let reference = KldRef::open(ref_path).map_err(|e| e.to_string())?;
     let file = std::fs::File::open(ref_path).map_err(|e| e.to_string())?;
@@ -418,7 +555,7 @@ fn score(
     let (n_ctx, window) = (h.n_ctx, h.window);
     let n_chunk = h.n_chunk.min(max_chunks.unwrap_or(usize::MAX));
     let tokens = reference.tokens(&mmap).map_err(|e| e.to_string())?;
-    let mut m = Model::load(model, n_ctx)?;
+    let mut m = Model::load(model, n_ctx, ple_hot)?;
     if m.vocab != h.n_vocab {
         return Err(format!(
             "candidate vocab {} != reference vocab {}",
@@ -498,6 +635,14 @@ fn score(
         digest.finalize(),
         output.display()
     );
+    if let Some(store) = m.bundle.ple_hot_store() {
+        eprintln!(
+            "qwen4_kld eval: ple hot store served {} rows ({} pages, {} pack reads)",
+            store.hot_rows(),
+            store.hot_pages(),
+            store.hot_reads()
+        );
+    }
     Ok(())
 }
 
@@ -507,6 +652,7 @@ fn run() -> Result<(), String> {
     let (mut model, mut slice, mut ref_path, mut output) = (None, None, None, None);
     let (mut logits, mut teacher) = (None, None);
     let (mut n_ctx, mut top_k, mut max_chunks, mut decode) = (512usize, 256usize, None, false);
+    let mut ple_hot = None;
     while let Some(flag) = args.next() {
         let mut value = || args.next().ok_or_else(|| format!("{flag} needs a value"));
         let number = |v: String| v.parse::<usize>().map_err(|e| format!("{flag}: {e}"));
@@ -521,6 +667,7 @@ fn run() -> Result<(), String> {
             "--top-k" => top_k = number(value()?)?,
             "--max-chunks" => max_chunks = Some(number(value()?)?),
             "--decode" => decode = true,
+            "--ple-hot" => ple_hot = Some(number(value()?)? as u64),
             _ => return Err(format!("unknown argument {flag}\n{USAGE}")),
         }
     }
@@ -529,7 +676,7 @@ fn run() -> Result<(), String> {
             build_ref(&model, &slice, &output, n_ctx, top_k, max_chunks)
         }
         ("eval", Some(model), None, Some(ref_path), Some(output)) => {
-            score(&model, &ref_path, &output, max_chunks, decode)
+            score(&model, &ref_path, &output, max_chunks, decode, ple_hot)
         }
         ("import", None, None, Some(template), Some(output)) => match (logits, teacher) {
             (Some(logits), Some(teacher)) => {

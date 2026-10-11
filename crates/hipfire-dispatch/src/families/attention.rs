@@ -2307,7 +2307,9 @@ fn dispatch_attend(
                 } else {
                     8192
                 };
-                if io.max_ctx_len <= crossover {
+                // DFlash ChainVerify blocks always take the tile + reduce
+                // (`DispatchCtx::verify_tile_attend`).
+                if io.max_ctx_len <= crossover && !ctx.verify_tile_attend {
                     // Fast path: single-launch batched kernel, LDS-backed attention tile.
                     let positions = io.positions.unwrap();
                     hip!(gpu.attention_q8_0_kv_batched_masked(
@@ -2534,7 +2536,8 @@ fn dispatch_attend(
                     } else {
                         8192
                     };
-                if io.max_ctx_len <= crossover {
+                // DFlash ChainVerify blocks: always the tile + reduce.
+                if io.max_ctx_len <= crossover && !ctx.verify_tile_attend {
                     let positions = io.positions.unwrap();
                     hip!(gpu.attention_fp8_e4m3_kv_batched(
                         io.q,

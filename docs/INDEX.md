@@ -128,6 +128,7 @@ Every current top-level page, exactly once.
 | [`VALIDATION.md`](VALIDATION.md) | shipped / ref-pinned | Validation route selector. |
 | [`admissions.yml`](admissions.yml) | shipped / ref-pinned | Admission registry (schema v2; exactly one record). |
 | [`GETTING_STARTED.md`](GETTING_STARTED.md) | shipped / ref-pinned | Onboarding. |
+| [`PICK-A-MODEL.md`](PICK-A-MODEL.md) | shipped / ref-pinned | VRAM tier → tag → speculation setting; tok/s copied from historical BENCHMARKS.md fixtures. |
 | [`CLI.md`](CLI.md) | shipped / ref-pinned | CLI. |
 | [`CONFIG.md`](CONFIG.md) | shipped / ref-pinned | Config keys. |
 | [`env-vars.md`](env-vars.md) | shipped / ref-pinned | Environment variables. |

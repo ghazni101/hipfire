@@ -73,6 +73,36 @@
 //!   still has expected < 5 it is merged into the smallest kept cell. A test
 //!   with no remaining degree of freedom reports chi2 = 0, p = 1. A non-finite
 //!   or out-of-range p is itself a failure.
+//! - Degeneracy guard: a statistical test (every position and the joint)
+//!   FAILS if it has df = 0 (one kept cell, e.g. every trial emitted the same
+//!   token) or an effective sample size below
+//!   `max(MIN_EFFECTIVE_SAMPLE_ABS, MIN_EFFECTIVE_SAMPLE_FRAC * min(n_ar, n_mtp))`
+//!   (10 and 0.05: 100 at the certification size of 2000). The effective
+//!   sample size is `min(n_ar, n_mtp) * (1 - sum_k q_k^2)` over the kept cells
+//!   with pooled proportions `q_k` (the Gini-Simpson diversity times the
+//!   sample): the expected number of trials that would disagree with an
+//!   independent draw. A test that cannot distinguish two laws proves nothing,
+//!   so it must never pass.
+//!
+//! # Render (the Qwen3.8 preamble trap)
+//!
+//! The prompt is `<|im_start|>user\n{user}<|im_end|>\n<|im_start|>assistant\n`,
+//! optionally followed by the closed think block `<think>\n\n</think>\n\n`.
+//! Qwen3.8's chat template opens a think block in the generation prompt
+//! (`'<think>\n'` when thinking is on, `'<think>\n\n</think>\n\n'` when
+//! `enable_thinking is false`). Rendered open (no think text), the model
+//! writes that preamble itself, deterministically: the first real-model run
+//! (2026-10-10, qwen3.8-27b, 2000 trials per arm) emitted
+//! `[<think>, "\n", 760, 1156]` in EVERY trial of both arms and both cases,
+//! so every test had df = 0, p = 1 and the oracle passed vacuously. The
+//! render is therefore per model: `HIPFIRE_SAMPLED_MTP_RENDER` = `auto`
+//! (default), `open` or `think_closed`. `auto` reads the trunk's embedded
+//! chat template and picks `think_closed` only when the template's
+//! generation prompt itself opens a think block (it contains both the
+//! `'<think>\n'` open literal and the `'<think>\n\n</think>\n\n'` closed
+//! literal); otherwise (Qwen3.5/3.6 as tested before, or no template) it
+//! keeps the open render. The chosen render and the reason are recorded in
+//! `config.json`, and the degeneracy guard catches a wrong choice.
 //!
 //! # Environment
 //!
@@ -80,8 +110,8 @@
 //! (`none` = absent), `_MIN_P` 0, `_TOKENS` 4 (>= 4), `_REPEAT_PENALTY` 1.0,
 //! `_REPEAT_WINDOW` 128, `_PRESENCE_PENALTY` 0, `_FREQUENCY_PENALTY` 0, all
 //! parsed strictly (a typo panics rather than running the neutral config).
-//! `HIPFIRE_SAMPLED_MTP_PROMPT`: `both` (default: a prose case and a
-//! repetition-heavy case), `prose`, `repetition`, or any other text, used as
+//! `HIPFIRE_SAMPLED_MTP_PROMPT`: `both` (default: an `animals` list case and
+//! an `integers` list case), `animals`, `integers`, or any other text, used as
 //! the user message of a single `custom` case. `_REPEAT_WINDOW` may be 0 or
 //! above the 2048-cell buffer: AR normalizes it, MTP receives it raw.
 //!
@@ -150,20 +180,36 @@ const PRESENCE_ENV: &str = "HIPFIRE_SAMPLED_MTP_PRESENCE_PENALTY";
 const FREQUENCY_ENV: &str = "HIPFIRE_SAMPLED_MTP_FREQUENCY_PENALTY";
 const PROMPT_ENV: &str = "HIPFIRE_SAMPLED_MTP_PROMPT";
 const GREEDY_TOKENS_ENV: &str = "HIPFIRE_SAMPLED_MTP_GREEDY_TOKENS";
+/// `auto` (default) | `open` | `think_closed`; see "Render" above.
+const RENDER_ENV: &str = "HIPFIRE_SAMPLED_MTP_RENDER";
+/// The closed think block appended after `assistant\n` by `think_closed`.
+const THINK_CLOSED: &str = "<think>\n\n</think>\n\n";
+/// Jinja-source literals (escaped `\n`) that mark a template whose
+/// generation prompt opens a think block.
+const TEMPLATE_THINK_OPEN: &str = r"'<think>\n'";
+const TEMPLATE_THINK_CLOSED: &str = r"'<think>\n\n</think>\n\n'";
 /// Internal: child arm selector (`ar` | `mtp`).
 const ARM_ENV: &str = "HIPFIRE_SAMPLED_MTP_ARM";
 /// Internal: path of the frozen `config.json` the child reads.
 const CONFIG_ENV: &str = "HIPFIRE_SAMPLED_MTP_CONFIG";
 const ARM_TEST: &str = "sampled_mtp_penalty_arm";
 
-const PROSE: &str = "Write a four-sentence story about a lighthouse keeper who finds something unexpected washed up on the rocks.";
-const REPETITION: &str = "Repeat the following line exactly twelve times, one copy per line, with no other words: the tide comes in and the tide goes out.";
+// Open-ended list prompts: every early position has real diversity under the
+// certification sampling (a TRIALS=40 pilot on qwen3.8-27b kept 2-4 cells per
+// position, n_eff ~0.5-0.75 n). A fixed story or a "repeat this line" prompt
+// is near-deterministic for the first tokens and fails the degeneracy guard.
+const ANIMALS: &str = "Name ten random animals, one per line, and nothing else.";
+const INTEGERS: &str = "Write twenty random integers between 1 and 1000, separated by spaces, with no other text.";
 
 const MAX_SEQ: usize = 4096;
 /// `ModelSlotConfig::repeat_window`: sizes `scratch.repeat_buf` (F32 cells).
 const SLOT_REPEAT_WINDOW: usize = 2048;
 const MTP_K: usize = 3;
 const ALPHA: f64 = 1e-3;
+/// Degeneracy guard: minimum effective sample size of a statistical test is
+/// `max(MIN_EFFECTIVE_SAMPLE_ABS, MIN_EFFECTIVE_SAMPLE_FRAC * min(n_ar, n_mtp))`.
+const MIN_EFFECTIVE_SAMPLE_ABS: f64 = 10.0;
+const MIN_EFFECTIVE_SAMPLE_FRAC: f64 = 0.05;
 const MIN_TRIAL_SAMPLES_DEFAULT: usize = 2000;
 const MIN_TOKENS: usize = 4;
 const MIN_GREEDY_TOKENS: usize = 256;
@@ -201,6 +247,10 @@ struct Config {
     presence_penalty: f32,
     frequency_penalty: f32,
     cases: Vec<Case>,
+    /// `open` | `think_closed` (see "Render").
+    render: String,
+    /// Why `render` was chosen (env override or template detection).
+    render_reason: String,
     ar_salt: u64,
     mtp_salt: u64,
     max_seq: usize,
@@ -265,6 +315,11 @@ struct StatLine {
     kept_cells: usize,
     pooled_cells: usize,
     merged_residual: bool,
+    /// `min(n_ar, n_mtp) * (1 - sum q_k^2)` over the kept cells.
+    effective_sample: f64,
+    min_effective_sample: f64,
+    /// df = 0 or `effective_sample < min_effective_sample` (always a failure).
+    degenerate: bool,
     pass: bool,
 }
 
@@ -317,20 +372,20 @@ fn strict_top_k() -> Result<Option<u32>, String> {
 }
 
 fn cases_from_env() -> Result<Vec<Case>, String> {
-    let prose = Case {
-        name: "prose".into(),
-        user: PROSE.into(),
+    let animals = Case {
+        name: "animals".into(),
+        user: ANIMALS.into(),
     };
-    let repetition = Case {
-        name: "repetition".into(),
-        user: REPETITION.into(),
+    let integers = Case {
+        name: "integers".into(),
+        user: INTEGERS.into(),
     };
     match std::env::var(PROMPT_ENV) {
-        Err(_) => Ok(vec![prose, repetition]),
+        Err(_) => Ok(vec![animals, integers]),
         Ok(v) => match v.as_str() {
-            "both" => Ok(vec![prose, repetition]),
-            "prose" => Ok(vec![prose]),
-            "repetition" => Ok(vec![repetition]),
+            "both" => Ok(vec![animals, integers]),
+            "animals" => Ok(vec![animals]),
+            "integers" => Ok(vec![integers]),
             "" => Err(format!("{PROMPT_ENV} is set but empty")),
             text => Ok(vec![Case {
                 name: "custom".into(),
@@ -350,6 +405,31 @@ fn model_and_head() -> Result<Option<(PathBuf, PathBuf)>, String> {
         .unwrap_or_else(|| model.with_extension("mtp"));
     let head = fs::canonicalize(&head).map_err(|e| format!("MTP head {}: {e}", head.display()))?;
     Ok(Some((model, head)))
+}
+
+/// `(render, reason)` from `HIPFIRE_SAMPLED_MTP_RENDER`; `auto` inspects the
+/// trunk's embedded chat template (see "Render" in the module docs).
+fn render_from_env(model: &Path) -> Result<(String, String), String> {
+    let mode = std::env::var(RENDER_ENV).unwrap_or_else(|_| "auto".into());
+    match mode.as_str() {
+        "open" | "think_closed" => Ok((mode.clone(), format!("{RENDER_ENV}={mode}"))),
+        "auto" => {
+            let hfq = hipfire_runtime::hfq::HfqFile::open(model)
+                .map_err(|e| format!("open {} for its chat template: {e}", model.display()))?;
+            Ok(match hfq.chat_template() {
+                None => ("open".into(), "auto: no embedded chat template".into()),
+                Some(t) if t.contains(TEMPLATE_THINK_OPEN) && t.contains(TEMPLATE_THINK_CLOSED) => (
+                    "think_closed".into(),
+                    "auto: the chat template's generation prompt opens a think block".into(),
+                ),
+                Some(_) => (
+                    "open".into(),
+                    "auto: the chat template does not open a think block".into(),
+                ),
+            })
+        }
+        other => Err(format!("{RENDER_ENV}={other:?}: expected auto | open | think_closed")),
+    }
 }
 
 /// `Ok(None)` = model env absent (skip). `greedy` fixes the sampling to the
@@ -418,6 +498,7 @@ fn build_config(greedy: bool) -> Result<Option<Config>, String> {
         .collect();
     let mut mtp_child_flags = BTreeMap::new();
     mtp_child_flags.insert("HIPFIRE_MTP_SAMPLED".to_string(), "1".to_string());
+    let (render, render_reason) = render_from_env(&model)?;
     Ok(Some(Config {
         mode: if greedy { "greedy" } else { "sampled" }.into(),
         model: model.display().to_string(),
@@ -435,6 +516,8 @@ fn build_config(greedy: bool) -> Result<Option<Config>, String> {
         presence_penalty: presence,
         frequency_penalty: frequency,
         cases: cases_from_env()?,
+        render,
+        render_reason,
         ar_salt: AR_SALT,
         mtp_salt: MTP_SALT,
         max_seq: MAX_SEQ,
@@ -580,6 +663,8 @@ struct Chi {
     kept: usize,
     pooled_cells: usize,
     merged_residual: bool,
+    /// `nmin * (1 - sum q_k^2)` over the kept cells (pooled proportions).
+    effective_sample: f64,
 }
 
 /// Two-sample chi-square homogeneity test of category counts `a` vs `b`.
@@ -606,6 +691,7 @@ fn homogeneity<K: Ord + Clone>(a: &BTreeMap<K, u64>, b: &BTreeMap<K, u64>) -> Ch
             kept: 0,
             pooled_cells: 0,
             merged_residual: false,
+            effective_sample: 0.0,
         };
     }
     let (na, nb) = (n_a as f64, n_b as f64);
@@ -640,6 +726,8 @@ fn homogeneity<K: Ord + Clone>(a: &BTreeMap<K, u64>, b: &BTreeMap<K, u64>) -> Ch
         }
     }
     let df = kept.len().saturating_sub(1);
+    let simpson: f64 = kept.iter().map(|&(x, y)| ((x + y) / n).powi(2)).sum();
+    let effective_sample = nmin * (1.0 - simpson);
     let (stat, p) = if df == 0 {
         (0.0, 1.0)
     } else {
@@ -660,11 +748,15 @@ fn homogeneity<K: Ord + Clone>(a: &BTreeMap<K, u64>, b: &BTreeMap<K, u64>) -> Ch
         kept: kept.len(),
         pooled_cells,
         merged_residual,
+        effective_sample,
     }
 }
 
 fn stat_line(case: &str, test: String, chi: Chi) -> StatLine {
     let valid = chi.p.is_finite() && (0.0..=1.0).contains(&chi.p) && chi.stat.is_finite();
+    let min_effective_sample =
+        MIN_EFFECTIVE_SAMPLE_ABS.max(MIN_EFFECTIVE_SAMPLE_FRAC * chi.n_a.min(chi.n_b) as f64);
+    let degenerate = chi.df == 0 || !(chi.effective_sample >= min_effective_sample);
     StatLine {
         case: case.to_string(),
         test,
@@ -676,13 +768,17 @@ fn stat_line(case: &str, test: String, chi: Chi) -> StatLine {
         kept_cells: chi.kept,
         pooled_cells: chi.pooled_cells,
         merged_residual: chi.merged_residual,
-        pass: valid && chi.p >= ALPHA,
+        effective_sample: chi.effective_sample,
+        min_effective_sample,
+        degenerate,
+        pass: valid && !degenerate && chi.p >= ALPHA,
     }
 }
 
 // ─── child arm ──────────────────────────────────────────────────────────────
 
-fn chat_prompt(tok: &Tokenizer, user: &str) -> Vec<u32> {
+/// `render` is `open` or `think_closed` (see "Render" in the module docs).
+fn chat_prompt(tok: &Tokenizer, user: &str, render: &str) -> Vec<u32> {
     let mut t = Vec::new();
     t.extend(tok.encode("<|im_start|>"));
     t.extend(tok.encode("user"));
@@ -693,6 +789,9 @@ fn chat_prompt(tok: &Tokenizer, user: &str) -> Vec<u32> {
     t.extend(tok.encode("<|im_start|>"));
     t.extend(tok.encode("assistant"));
     t.extend(tok.encode("\n"));
+    if render == "think_closed" {
+        t.extend(tok.encode(THINK_CLOSED));
+    }
     t
 }
 
@@ -987,7 +1086,7 @@ fn run_arm(cfg: &Config, arm: &str) -> Result<ArmOutput, String> {
     let prompts: Vec<Vec<u32>> = cfg
         .cases
         .iter()
-        .map(|c| chat_prompt(&tokenizer, &c.user))
+        .map(|c| chat_prompt(&tokenizer, &c.user, &cfg.render))
         .collect();
     let vocab_size = slot.config.vocab_size;
     let repeat_buf_capacity = slot.scratch.repeat_buf.buf.size() / 4;
@@ -1168,8 +1267,20 @@ fn sampled_mtp_penalties_match_ar_distribution() {
     let mut failures: Vec<String> = Vec::new();
     for s in &stats {
         let line = format!(
-            "{} {}: chi2={:.2} df={} p={:.4} (n={}+{}, kept={}, pooled={}, merged={})\n",
-            s.case, s.test, s.chi2, s.df, s.p, s.n_ar, s.n_mtp, s.kept_cells, s.pooled_cells, s.merged_residual
+            "{} {}: chi2={:.2} df={} p={:.4} (n={}+{}, kept={}, pooled={}, merged={}, n_eff={:.1} min {:.1}{})\n",
+            s.case,
+            s.test,
+            s.chi2,
+            s.df,
+            s.p,
+            s.n_ar,
+            s.n_mtp,
+            s.kept_cells,
+            s.pooled_cells,
+            s.merged_residual,
+            s.effective_sample,
+            s.min_effective_sample,
+            if s.degenerate { ", DEGENERATE" } else { "" }
         );
         eprint!("{line}");
         if !s.pass {
@@ -1243,6 +1354,9 @@ fn greedy_presence_penalty_matches_ar_ids() {
             kept_cells: 0,
             pooled_cells: 0,
             merged_residual: false,
+            effective_sample: 0.0,
+            min_effective_sample: 0.0,
+            degenerate: false,
             pass: line.is_none(),
         });
         if let Some(line) = line {
@@ -1257,4 +1371,27 @@ fn greedy_presence_penalty_matches_ar_ids() {
         dir.display(),
         failures.concat()
     );
+}
+
+#[test]
+fn degeneracy_guard_fails_single_cell_and_low_diversity() {
+    let one: BTreeMap<u32, u64> = [(7, 2000)].into_iter().collect();
+    let s = stat_line("c", "t".into(), homogeneity(&one, &one));
+    assert!(s.degenerate && !s.pass, "df=0 must fail");
+    // 99% one token: n_eff ~ 2000 * (1 - 0.9801 - 0.0001) = 39.6 < 100.
+    let skew: BTreeMap<u32, u64> = [(1, 1980), (2, 20)].into_iter().collect();
+    let s = stat_line("c", "t".into(), homogeneity(&skew, &skew));
+    assert_eq!(s.df, 1);
+    assert!(s.degenerate && !s.pass, "low effective sample must fail");
+    let even: BTreeMap<u32, u64> = [(1, 1000), (2, 600), (3, 400)].into_iter().collect();
+    let s = stat_line("c", "t".into(), homogeneity(&even, &even));
+    assert!(!s.degenerate && s.pass, "diverse identical counts must pass");
+}
+
+#[test]
+fn think_template_literals_match_qwen38_generation_prompt() {
+    let t = r"{%- if add_generation_prompt %}{{- '<|im_start|>assistant\n' }}{%- if enable_thinking is defined and enable_thinking is false %}{{- '<think>\n\n</think>\n\n' }}{%- else %}{{- '<think>\n' }}{%- endif %}{%- endif %}";
+    assert!(t.contains(TEMPLATE_THINK_OPEN) && t.contains(TEMPLATE_THINK_CLOSED));
+    let qwen3 = r"{%- if enable_thinking is defined and enable_thinking is false %}{{- '<think>\n\n</think>\n\n' }}{%- endif %}";
+    assert!(!qwen3.contains(TEMPLATE_THINK_OPEN));
 }

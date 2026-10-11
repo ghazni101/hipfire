@@ -2,17 +2,19 @@
 // Copyright (c) 2026 Kaden Schutt
 // hipfire — see LICENSE and NOTICE in the project root.
 
-//! OpenAI HTTP gateway.
+//! HTTP gateway: OpenAI chat completions, plus the Anthropic Messages and
+//! OpenAI Responses adapters onto the same pipeline.
 //!
 //! Concern: request routing, JSON body limits, streaming vs non-streaming
 //! framing, SSE acknowledgement, CORS/health endpoints. Isolates Hyper
 //! I/O from business logic.
 
 use crate::serve::complete::{
-    complete_request_cancellable, completion_json, gate_chat_completions_tools,
-    openai_stream_delta_for_event, openai_stream_terminal_chunks, Completion,
+    complete_request_cancellable, completion_json, gate_endpoint_tools,
+    openai_stream_delta_for_event, openai_stream_terminal_chunks, Completion, EndpointAdapterKind,
 };
 use crate::serve::metrics::Metrics;
+use crate::serve::{anthropic, responses};
 use crate::serve::{is_batch_eligible_request, ServeShared};
 use crate::serve::{AdmissionError, AdmissionGuard, LoadedInfo};
 use crate::{is_standalone_model, list_local_models, unix_timestamp};
@@ -26,7 +28,7 @@ use hyper::{
 };
 use hyper_util::rt::{TokioIo, TokioTimer};
 use std::{
-    cell::Cell,
+    cell::{Cell, RefCell},
     collections::VecDeque,
     convert::Infallible,
     future::Future,
@@ -119,15 +121,216 @@ pub(crate) fn openai_error(message: &str, status: u16) -> Response<BoxBody> {
 }
 
 pub(crate) fn admission_error_response(
+    api: WireApi,
     metrics: &Metrics,
     error: &AdmissionError,
 ) -> Response<BoxBody> {
     metrics.record_admission_rejected();
-    let mut resp = openai_error(&error.message, 503);
+    let mut resp = api.error_response(&error.message, 503);
     if let Ok(retry_after) = header::HeaderValue::from_str(&error.retry_after_seconds.to_string()) {
         resp.headers_mut().insert(header::RETRY_AFTER, retry_after);
     }
     resp
+}
+
+// ---------------------------------------------------------------------------
+// Generation APIs — every one lowers onto the chat-completions pipeline
+// ---------------------------------------------------------------------------
+
+/// The HTTP API a generation request arrived on. Each lowers onto the
+/// chat-completions body and then shares that route's admission, tool gate
+/// and worker; only request lowering and response rendering differ.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WireApi {
+    /// `POST /v1/chat/completions`.
+    ChatCompletions,
+    /// `POST /v1/messages` ([`anthropic`]).
+    AnthropicMessages,
+    /// `POST /v1/responses` ([`responses`]).
+    OpenAiResponses,
+}
+
+impl WireApi {
+    fn adapter_kind(self) -> EndpointAdapterKind {
+        match self {
+            Self::ChatCompletions => EndpointAdapterKind::OpenAiChatCompletions,
+            Self::AnthropicMessages => EndpointAdapterKind::AnthropicMessages,
+            Self::OpenAiResponses => EndpointAdapterKind::OpenAiResponses,
+        }
+    }
+
+    /// An error response in this API's shape: Anthropic's
+    /// `{"type": "error", "error": {...}}`, else OpenAI's `{"error": {...}}`.
+    pub(crate) fn error_response(self, message: &str, status: u16) -> Response<BoxBody> {
+        match self {
+            Self::AnthropicMessages => {
+                json_response_result(&anthropic::error_body(message, status), status)
+                    .unwrap_or_else(|_| static_server_error())
+            }
+            Self::ChatCompletions | Self::OpenAiResponses => openai_error(message, status),
+        }
+    }
+
+    /// Lower a request body onto the chat-completions body. A chat request
+    /// passes through untouched. `Err` is a client error (400).
+    fn lower(self, body: serde_json::Value) -> Result<GenerationRequest, String> {
+        match self {
+            Self::ChatCompletions => {
+                let stream = body.get("stream").and_then(|v| v.as_bool()) == Some(true);
+                let include_usage = body
+                    .pointer("/stream_options/include_usage")
+                    .and_then(|v| v.as_bool())
+                    == Some(true);
+                Ok(GenerationRequest {
+                    chat: body,
+                    stream,
+                    encoding: ResponseEncoding::Chat { include_usage },
+                })
+            }
+            Self::AnthropicMessages => {
+                let lowered = anthropic::lower_request(&body)?;
+                Ok(GenerationRequest {
+                    chat: lowered.chat,
+                    stream: lowered.stream,
+                    encoding: ResponseEncoding::Anthropic,
+                })
+            }
+            Self::OpenAiResponses => {
+                let lowered = responses::lower_request(&body)?;
+                Ok(GenerationRequest {
+                    chat: lowered.chat,
+                    stream: lowered.stream,
+                    encoding: ResponseEncoding::Responses(lowered.echo),
+                })
+            }
+        }
+    }
+}
+
+/// A generation request lowered onto the chat-completions body.
+struct GenerationRequest {
+    chat: serde_json::Value,
+    stream: bool,
+    encoding: ResponseEncoding,
+}
+
+/// How a completion (and its stream) is rendered for the client's API.
+enum ResponseEncoding {
+    Chat { include_usage: bool },
+    Anthropic,
+    Responses(responses::ResponseEcho),
+}
+
+impl ResponseEncoding {
+    fn api(&self) -> WireApi {
+        match self {
+            Self::Chat { .. } => WireApi::ChatCompletions,
+            Self::Anthropic => WireApi::AnthropicMessages,
+            Self::Responses(_) => WireApi::OpenAiResponses,
+        }
+    }
+
+    /// The non-streaming response body.
+    fn completion_body(&self, completion: &Completion) -> serde_json::Value {
+        match self {
+            Self::Chat { .. } => completion_json(completion),
+            Self::Anthropic => anthropic::message_json(completion),
+            Self::Responses(echo) => responses::response_json(completion, echo),
+        }
+    }
+
+    fn stream(self, id: &str, created: u64, model: &str) -> StreamEncoder {
+        match self {
+            Self::Chat { include_usage } => StreamEncoder::Chat {
+                id: id.to_owned(),
+                created,
+                model: model.to_owned(),
+                include_usage,
+            },
+            Self::Anthropic => StreamEncoder::Anthropic(anthropic::MessageStream::new(id, model)),
+            Self::Responses(echo) => {
+                StreamEncoder::Responses(responses::ResponseStream::new(echo, id, created, model))
+            }
+        }
+    }
+}
+
+/// SSE framing of one streamed response in the client's API.
+enum StreamEncoder {
+    /// OpenAI `data: {chat.completion.chunk}` frames ending in `data: [DONE]`.
+    Chat {
+        id: String,
+        created: u64,
+        model: String,
+        include_usage: bool,
+    },
+    Anthropic(anthropic::MessageStream),
+    Responses(responses::ResponseStream),
+}
+
+impl StreamEncoder {
+    /// The frame the 200 commits with (chat role chunk, `message_start`,
+    /// `response.created`).
+    fn preamble(&mut self) -> Vec<u8> {
+        match self {
+            Self::Chat {
+                id, created, model, ..
+            } => sse_data(&serde_json::json!({
+                "id": id,
+                "object": "chat.completion.chunk",
+                "created": created,
+                "model": model,
+                "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": null }],
+            })),
+            Self::Anthropic(stream) => stream.preamble(),
+            Self::Responses(stream) => stream.preamble(),
+        }
+    }
+
+    /// One folded pipeline event; `None` when it has nothing to send.
+    fn event(&mut self, event: &serde_json::Value) -> Option<Vec<u8>> {
+        match self {
+            Self::Chat {
+                id, created, model, ..
+            } => {
+                let delta = openai_stream_delta_for_event(event)?;
+                Some(sse_data(&serde_json::json!({
+                    "id": id,
+                    "object": "chat.completion.chunk",
+                    "created": created,
+                    "model": model,
+                    "choices": [{ "index": 0, "delta": delta, "finish_reason": null }],
+                })))
+            }
+            Self::Anthropic(stream) => stream.event(event),
+            Self::Responses(stream) => stream.event(event),
+        }
+    }
+
+    /// The terminal frame: released tool calls, finish and usage.
+    fn terminal(&mut self, completion: &Completion) -> Vec<u8> {
+        match self {
+            Self::Chat { include_usage, .. } => {
+                let mut bytes = Vec::new();
+                for chunk in openai_stream_terminal_chunks(completion, *include_usage) {
+                    bytes.extend_from_slice(&sse_data(&chunk));
+                }
+                bytes.extend_from_slice(b"data: [DONE]\n\n");
+                bytes
+            }
+            Self::Anthropic(stream) => stream.terminal(completion),
+            Self::Responses(stream) => stream.terminal(completion),
+        }
+    }
+
+    /// The frame ending a stream that fails after it committed.
+    fn failure(&mut self, failure: &RequestFailure) -> Vec<u8> {
+        match self {
+            Self::Chat { .. } => failure.sse_event(),
+            Self::Anthropic(stream) => stream.failure(&failure.message, failure.status),
+            Self::Responses(stream) => stream.failure(&failure.message, failure.status),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -288,7 +491,7 @@ pub(crate) struct ResponseChunk {
     bytes: Vec<u8>,
     ack: Option<AckSender>,
     fail: bool,
-    /// Ends with `data: [DONE]`: nothing, not even a keepalive, may follow.
+    /// The response's final frame: nothing, not even a keepalive, may follow.
     last: bool,
 }
 
@@ -301,7 +504,7 @@ impl ResponseChunk {
             last: false,
         }
     }
-    /// The final frame of a response (its bytes end with `data: [DONE]`).
+    /// The final frame of a response (chat: ends with `data: [DONE]`).
     fn last(bytes: Vec<u8>, ack: Option<AckSender>) -> Self {
         Self {
             bytes,
@@ -665,8 +868,7 @@ fn model_entry(
                 "output_modalities": ["text"],
             });
             if !loaded.reasoning_contract.is_empty() {
-                architecture["reasoning_contract"] =
-                    serde_json::json!(loaded.reasoning_contract);
+                architecture["reasoning_contract"] = serde_json::json!(loaded.reasoning_contract);
                 architecture["reasoning_effort_native"] =
                     serde_json::json!(loaded.reasoning_effort_native);
                 architecture["reasoning_efforts"] = serde_json::json!(loaded.reasoning_efforts);
@@ -848,7 +1050,7 @@ async fn handle_request(
                 .header(header::ACCESS_CONTROL_ALLOW_ORIGIN, "*")
                 .header(
                     header::ACCESS_CONTROL_ALLOW_HEADERS,
-                    "Content-Type, Authorization",
+                    "Content-Type, Authorization, x-api-key, anthropic-version, anthropic-beta",
                 )
                 .header(header::ACCESS_CONTROL_ALLOW_METHODS, "GET, POST, OPTIONS")
                 .body(boxed_empty())
@@ -856,83 +1058,13 @@ async fn handle_request(
             resp
         }
         (Method::POST, "/v1/chat/completions") => {
-            let max_bytes = shared.max_request_bytes;
-            if req
-                .headers()
-                .get(header::CONTENT_LENGTH)
-                .and_then(|value| value.to_str().ok())
-                .and_then(|value| value.parse::<u64>().ok())
-                .is_some_and(|length| length > max_bytes)
-            {
-                return openai_error(&format!("request body exceeds {max_bytes} bytes"), 413);
-            }
-            let body_val = match read_json_body(req.into_body(), max_bytes).await {
-                Ok(v) => v,
-                Err(err) => {
-                    let msg = err.to_string();
-                    let status = if msg.contains("exceeds") { 413 } else { 400 };
-                    return openai_error(&msg, status);
-                }
-            };
-
-            let (is_eligible, model_for_lease) = {
-                let runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
-                let tp = runtime.tp;
-                let arch = runtime.current_arch.clone();
-                let batch_capable = runtime.continuous_batch_capable;
-                let batch_vmm = runtime.continuous_batch_vmm;
-                let multi_slot = runtime.multi_slot_enabled;
-                drop(runtime);
-                // The admission gate is transport concurrency, not a batch-mode
-                // selector. Experimental slots overlap independent requests
-                // while remaining separate from ContinuousBatchScheduler.
-                let eligible = multi_slot
-                    || is_batch_eligible_request(
-                        &body_val,
-                        tp,
-                        arch.as_deref(),
-                        batch_capable,
-                        batch_vmm,
-                    );
-                let model = body_val
-                    .get("model")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_owned());
-                (eligible, model)
-            };
-
-            let mut cancel_guard = CancelOnDrop::new();
-            let cancel = cancel_guard.token();
-            let cancelled = cancel_guard.cancelled();
-
-            let guard = if is_eligible {
-                match shared
-                    .admission
-                    .acquire_for_async(true, model_for_lease.as_deref(), cancel.clone())
-                    .await
-                {
-                    Ok(g) => g,
-                    Err(e) => return admission_error_response(&shared.metrics, &e),
-                }
-            } else {
-                match shared.admission.acquire_async(cancel.clone()).await {
-                    Ok(g) => g,
-                    Err(e) => return admission_error_response(&shared.metrics, &e),
-                }
-            };
-
-            if let Err(error) = gate_chat_completions_tools(&body_val) {
-                return RequestFailure::new(error.to_string(), 400).respond(&shared.metrics);
-            }
-
-            let is_stream = body_val.get("stream").and_then(|v| v.as_bool()) == Some(true);
-            let response = if is_stream {
-                handle_streaming(shared, body_val, guard, cancelled, acks).await
-            } else {
-                handle_nonstreaming(shared, body_val, guard, cancelled, acks).await
-            };
-            cancel_guard.disarm();
-            response
+            handle_generation(req, shared, acks, WireApi::ChatCompletions).await
+        }
+        (Method::POST, "/v1/messages") => {
+            handle_generation(req, shared, acks, WireApi::AnthropicMessages).await
+        }
+        (Method::POST, "/v1/responses") => {
+            handle_generation(req, shared, acks, WireApi::OpenAiResponses).await
         }
         (Method::POST, "/v1/images/generations") => {
             let max_bytes = shared.max_request_bytes;
@@ -957,7 +1089,8 @@ async fn handle_request(
                 Ok(resp) => resp,
                 Err(message) => {
                     let status = images_error_status(&message);
-                    RequestFailure::new(message, status).respond(&shared.metrics)
+                    RequestFailure::new(message, status)
+                        .respond(WireApi::ChatCompletions, &shared.metrics)
                 }
             }
         }
@@ -1006,12 +1139,109 @@ async fn handle_request(
                 Ok(resp) => resp,
                 Err(message) => {
                     let status = images_error_status(&message);
-                    RequestFailure::new(message, status).respond(&shared.metrics)
+                    RequestFailure::new(message, status)
+                        .respond(WireApi::ChatCompletions, &shared.metrics)
                 }
             }
         }
         _ => openai_error("not found", 404),
     }
+}
+
+/// One generation request on any [`WireApi`]: body limit, lowering onto the
+/// chat-completions body, then the chat route's admission (same batching
+/// eligibility, same model lease), tool gate and worker. A Messages or
+/// Responses request is admitted exactly as its lowered chat twin.
+async fn handle_generation(
+    req: Request<Incoming>,
+    shared: Arc<ServeShared>,
+    acks: FlushAcks,
+    api: WireApi,
+) -> Response<BoxBody> {
+    let max_bytes = shared.max_request_bytes;
+    if req
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+        .is_some_and(|length| length > max_bytes)
+    {
+        return api.error_response(&format!("request body exceeds {max_bytes} bytes"), 413);
+    }
+    let raw_body = match read_json_body(req.into_body(), max_bytes).await {
+        Ok(v) => v,
+        Err(err) => {
+            let msg = err.to_string();
+            let status = if msg.contains("exceeds") { 413 } else { 400 };
+            return api.error_response(&msg, status);
+        }
+    };
+    let GenerationRequest {
+        chat: body_val,
+        stream: is_stream,
+        encoding,
+    } = match api.lower(raw_body) {
+        Ok(request) => request,
+        Err(message) => return api.error_response(&message, 400),
+    };
+
+    let (is_eligible, model_for_lease) = {
+        let runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
+        let tp = runtime.tp;
+        let arch = runtime.current_arch.clone();
+        let batch_capable = runtime.continuous_batch_capable;
+        let batch_history = runtime.continuous_batch_history;
+        let multi_slot = runtime.multi_slot_enabled;
+        drop(runtime);
+        // The admission gate is transport concurrency, not a batch-mode
+        // selector. Experimental slots overlap independent requests
+        // while remaining separate from ContinuousBatchScheduler.
+        let eligible = multi_slot
+            || is_batch_eligible_request(
+                &body_val,
+                tp,
+                arch.as_deref(),
+                batch_capable,
+                batch_history,
+            );
+        let model = body_val
+            .get("model")
+            .and_then(|v| v.as_str())
+            .map(|s| s.to_owned());
+        (eligible, model)
+    };
+
+    let mut cancel_guard = CancelOnDrop::new();
+    let cancel = cancel_guard.token();
+    let cancelled = cancel_guard.cancelled();
+
+    let guard = if is_eligible {
+        match shared
+            .admission
+            .acquire_for_async(true, model_for_lease.as_deref(), cancel.clone())
+            .await
+        {
+            Ok(g) => g,
+            Err(e) => return admission_error_response(api, &shared.metrics, &e),
+        }
+    } else {
+        match shared.admission.acquire_async(cancel.clone()).await {
+            Ok(g) => g,
+            Err(e) => return admission_error_response(api, &shared.metrics, &e),
+        }
+    };
+
+    if let Err(error) = gate_endpoint_tools(&body_val, api.adapter_kind()) {
+        return RequestFailure::new(error.to_string(), 400).respond(api, &shared.metrics);
+    }
+
+    let response = if is_stream {
+        handle_streaming(shared, body_val, encoding, guard, cancelled, acks).await
+    } else {
+        handle_nonstreaming(shared, body_val, encoding, guard, cancelled, acks).await
+    };
+    cancel_guard.disarm();
+    response
 }
 
 // ---------------------------------------------------------------------------
@@ -1097,7 +1327,13 @@ async fn handle_images_generations(
         .await
     {
         Ok(guard) => guard,
-        Err(error) => return Ok(admission_error_response(&shared.metrics, &error)),
+        Err(error) => {
+            return Ok(admission_error_response(
+                WireApi::ChatCompletions,
+                &shared.metrics,
+                &error,
+            ))
+        }
     };
 
     let (engine, loaded_model) = {
@@ -1399,38 +1635,33 @@ const SSE_SILENCE_LIMIT: Duration = Duration::from_secs(15);
 async fn handle_streaming(
     shared: Arc<ServeShared>,
     body: serde_json::Value,
+    encoding: ResponseEncoding,
     guard: AdmissionGuard,
     cancelled: Arc<AtomicBool>,
     acks: FlushAcks,
 ) -> Response<BoxBody> {
+    let api = encoding.api();
     let (tx, mut rx) = tokio::sync::mpsc::channel::<ResponseChunk>(32);
     let commit = Arc::new(Mutex::new(StreamCommit::Pending));
+    let id = request_id();
+    let created = unix_timestamp();
+    let model = body
+        .get("model")
+        .and_then(|v| v.as_str())
+        .unwrap_or("unknown")
+        .to_owned();
+    let mut encoder = encoding.stream(&id, created, &model);
+    let mut first = VecDeque::from([ResponseChunk::plain(encoder.preamble())]);
     let sink = SseSink {
         tx,
         commit: Arc::clone(&commit),
         committed: Cell::new(false),
         terminal_sent: Cell::new(false),
-        id: request_id(),
-        created: unix_timestamp(),
-        model: body
-            .get("model")
-            .and_then(|v| v.as_str())
-            .unwrap_or("unknown")
-            .to_owned(),
-        include_usage: body
-            .pointer("/stream_options/include_usage")
-            .and_then(|v| v.as_bool())
-            == Some(true),
+        id,
+        created,
+        encoder: RefCell::new(encoder),
         stall_timeout: shared.stream_stall_timeout,
     };
-    let role = serde_json::json!({
-        "id": sink.id,
-        "object": "chat.completion.chunk",
-        "created": sink.created,
-        "model": sink.model,
-        "choices": [{ "index": 0, "delta": { "role": "assistant" }, "finish_reason": null }],
-    });
-    let mut first = VecDeque::from([ResponseChunk::plain(sse_data(&role))]);
 
     let body_cancelled = Arc::clone(&cancelled);
     let worker_shared = Arc::clone(&shared);
@@ -1464,15 +1695,15 @@ async fn handle_streaming(
             Some(chunk) => first.push_back(chunk),
             None => {
                 return match commit_stream(&commit) {
-                    Err(failure) => failure.respond(&shared.metrics),
+                    Err(failure) => failure.respond(api, &shared.metrics),
                     Ok(()) => RequestFailure::new("generation ended without a response", 500)
-                        .respond(&shared.metrics),
+                        .respond(api, &shared.metrics),
                 };
             }
         },
         _ = tokio::time::sleep(SSE_SILENCE_LIMIT) => {
             if let Err(failure) = commit_stream(&commit) {
-                return failure.respond(&shared.metrics);
+                return failure.respond(api, &shared.metrics);
             }
         }
     }
@@ -1490,10 +1721,12 @@ async fn handle_streaming(
 async fn handle_nonstreaming(
     shared: Arc<ServeShared>,
     body: serde_json::Value,
+    encoding: ResponseEncoding,
     guard: AdmissionGuard,
     cancelled: Arc<AtomicBool>,
     acks: FlushAcks,
 ) -> Response<BoxBody> {
+    let api = encoding.api();
     // Staged terminal channel: Ok((bytes, ack_tx)) for success, Err(failure) for preterminal.
     let (staged_tx, staged_rx) = tokio::sync::oneshot::channel::<
         Result<(Vec<u8>, std::sync::mpsc::Sender<Result<(), ()>>), RequestFailure>,
@@ -1509,11 +1742,12 @@ async fn handle_nonstreaming(
         let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             let staged_for_terminal = Arc::clone(&staged_tx_for_worker);
             let terminal = |completion: &Completion| {
-                let bytes = serde_json::to_vec(&completion_json(completion)).map_err(|err| {
-                    hipfire_client::ClientError::Protocol(format!(
-                        "completion json serialize failed: {err}"
-                    ))
-                })?;
+                let bytes =
+                    serde_json::to_vec(&encoding.completion_body(completion)).map_err(|err| {
+                        hipfire_client::ClientError::Protocol(format!(
+                            "completion json serialize failed: {err}"
+                        ))
+                    })?;
                 if bytes.is_empty() {
                     return Err(hipfire_client::ClientError::Protocol(
                         "nonstream terminal body must be non-empty".into(),
@@ -1583,9 +1817,9 @@ async fn handle_nonstreaming(
                 .unwrap();
             resp
         }
-        Ok(Err(failure)) => failure.respond(&shared.metrics),
+        Ok(Err(failure)) => failure.respond(api, &shared.metrics),
         Err(_) => {
-            RequestFailure::new("generation worker disconnected", 500).respond(&shared.metrics)
+            RequestFailure::new("generation worker disconnected", 500).respond(api, &shared.metrics)
         }
     }
 }
@@ -1597,8 +1831,8 @@ async fn handle_nonstreaming(
 /// Retry-After for a typed `transient` daemon failure (HTTP 503).
 const TRANSIENT_RETRY_AFTER_SECS: u64 = 1;
 
-/// A failed chat completion. Before a stream commits it is an OpenAI JSON
-/// error with `status`; after, the same body goes out as an SSE error event.
+/// A failed completion. Before a stream commits it is a JSON error in the
+/// request's API shape with `status`; after, the stream's error frame.
 #[derive(Debug)]
 pub(crate) struct RequestFailure {
     message: String,
@@ -1618,9 +1852,9 @@ impl RequestFailure {
     }
 
     /// The JSON error response ending this request; counts it as failed.
-    fn respond(&self, metrics: &Metrics) -> Response<BoxBody> {
+    fn respond(&self, api: WireApi, metrics: &Metrics) -> Response<BoxBody> {
         metrics.record_failure();
-        let mut resp = openai_error(&self.message, self.status);
+        let mut resp = api.error_response(&self.message, self.status);
         if self.status == 503 {
             resp.headers_mut().insert(
                 header::RETRY_AFTER,
@@ -1630,7 +1864,7 @@ impl RequestFailure {
         resp
     }
 
-    /// The error event and `[DONE]` that end a stream failing after commit.
+    /// The error event and `[DONE]` that end a chat stream failing after commit.
     fn sse_event(&self) -> Vec<u8> {
         let mut bytes = sse_data(&openai_error_body(&self.message, self.status));
         bytes.extend_from_slice(b"data: [DONE]\n\n");
@@ -1658,9 +1892,15 @@ pub(crate) fn request_error_status(error: &anyhow::Error) -> u16 {
             _ => 500,
         };
     }
-    if error.chain().any(|cause| cause.is::<crate::serve::InvalidRequest>()) {
+    if error
+        .chain()
+        .any(|cause| cause.is::<crate::serve::InvalidRequest>())
+    {
         400
-    } else if error.chain().any(|cause| cause.is::<crate::serve::ModelNotFound>()) {
+    } else if error
+        .chain()
+        .any(|cause| cause.is::<crate::serve::ModelNotFound>())
+    {
         404
     } else {
         500
@@ -1693,6 +1933,24 @@ pub(crate) fn sse_data(value: &serde_json::Value) -> Vec<u8> {
     bytes
 }
 
+/// One named SSE event (`event:` and `data:` lines), the framing of the
+/// Anthropic Messages and OpenAI Responses streams.
+pub(crate) fn sse_event(name: &str, value: &serde_json::Value) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(160);
+    bytes.extend_from_slice(b"event: ");
+    bytes.extend_from_slice(name.as_bytes());
+    bytes.extend_from_slice(b"\ndata: ");
+    serde_json::to_writer(&mut bytes, value).expect("serializing a JSON value cannot fail");
+    bytes.extend_from_slice(b"\n\n");
+    bytes
+}
+
+/// The per-process part of a [`request_id`] (`chatcmpl-PID-N` → `PID-N`),
+/// from which the Anthropic `msg_…` and Responses `resp_…` ids derive.
+pub(crate) fn id_suffix(request_id: &str) -> &str {
+    request_id.strip_prefix("chatcmpl-").unwrap_or(request_id)
+}
+
 /// Commit point of one SSE response, shared by the handler and its worker.
 enum StreamCommit {
     /// Nothing sent yet: a failure can still be an ordinary JSON error.
@@ -1713,7 +1971,7 @@ fn commit_stream(commit: &Mutex<StreamCommit>) -> Result<(), RequestFailure> {
     }
 }
 
-/// Worker end of one OpenAI SSE response.
+/// Worker end of one SSE response, in the request's API framing.
 struct SseSink {
     tx: tokio::sync::mpsc::Sender<ResponseChunk>,
     commit: Arc<Mutex<StreamCommit>>,
@@ -1723,8 +1981,8 @@ struct SseSink {
     terminal_sent: Cell<bool>,
     id: String,
     created: u64,
-    model: String,
-    include_usage: bool,
+    /// Frames the stream for the client's API; only the worker touches it.
+    encoder: RefCell<StreamEncoder>,
     /// Multi-slot route only (`serve.stream_stall_timeout_ms`): how long a
     /// consumer may leave the response channel full, or the terminal frame
     /// unflushed, before the request is aborted and its permit released.
@@ -1800,27 +2058,16 @@ impl SseSink {
     /// plain (no-ack) SSE bytes. No-delta mid-stream events are silent —
     /// terminal ack handles pure-tool delivery.
     fn forward_event(&self, event: &serde_json::Value) -> Result<(), hipfire_client::ClientError> {
-        let Some(delta) = openai_stream_delta_for_event(event) else {
+        let Some(bytes) = self.encoder.borrow_mut().event(event) else {
             return Ok(());
         };
-        let chunk = serde_json::json!({
-            "id": self.id,
-            "object": "chat.completion.chunk",
-            "created": self.created,
-            "model": self.model,
-            "choices": [{ "index": 0, "delta": delta, "finish_reason": null }],
-        });
-        self.send(ResponseChunk::plain(sse_data(&chunk)))
+        self.send(ResponseChunk::plain(bytes))
     }
 
-    /// Serialize terminal tool_calls (if safe), finish, optional usage, and
-    /// `[DONE]` into one acknowledged chunk; wait until the socket flushed it.
+    /// Serialize the terminal (released tool calls, finish, usage; chat adds
+    /// `[DONE]`) into one acknowledged chunk; wait until the socket flushed it.
     fn deliver_terminal(&self, completion: &Completion) -> Result<(), hipfire_client::ClientError> {
-        let mut bytes = Vec::new();
-        for chunk in openai_stream_terminal_chunks(completion, self.include_usage) {
-            bytes.extend_from_slice(&sse_data(&chunk));
-        }
-        bytes.extend_from_slice(b"data: [DONE]\n\n");
+        let bytes = self.encoder.borrow_mut().terminal(completion);
         let (ack_tx, ack_rx) = std::sync::mpsc::channel();
         self.terminal_sent.set(true);
         self.send(ResponseChunk::last(bytes, Some(ack_tx)))?;
@@ -1832,8 +2079,9 @@ impl SseSink {
     /// - Success or cancel: nothing more to send.
     /// - Failure before the first frame: hand it to the handler, which answers
     ///   with its status instead of a 200.
-    /// - Failure after commit: an SSE error event, then `[DONE]`.
-    /// - Failure after the acknowledged `[DONE]` (e.g. the daemon commit):
+    /// - Failure after commit: the API's error frame (chat: an SSE error
+    ///   event, then `[DONE]`).
+    /// - Failure after the acknowledged terminal (e.g. the daemon commit):
     ///   nothing may follow it, so the body fails and the reader sees it torn.
     fn finish(self, result: Result<Completion>, metrics: &Metrics) {
         let Err(error) = result else {
@@ -1864,9 +2112,8 @@ impl SseSink {
             // The handler committed on its deadline while the worker was silent.
         }
         metrics.record_failure();
-        let _ = self
-            .tx
-            .blocking_send(ResponseChunk::last(failure.sse_event(), None));
+        let bytes = self.encoder.borrow_mut().failure(&failure);
+        let _ = self.tx.blocking_send(ResponseChunk::last(bytes, None));
     }
 }
 
@@ -2211,7 +2458,11 @@ mod tests {
             "model not found: x",
             "invalid state: required",
         ] {
-            assert_eq!(request_error_status(&anyhow!("{message}")), 500, "{message}");
+            assert_eq!(
+                request_error_status(&anyhow!("{message}")),
+                500,
+                "{message}"
+            );
         }
         assert_eq!(
             request_error_status(&anyhow::Error::new(hipfire_client::ClientError::Protocol(

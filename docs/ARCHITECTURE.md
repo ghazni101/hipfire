@@ -489,9 +489,15 @@ hipGraph route (Qwen4 replays prepared PM4, below).
   turn. Snapshots never depend on live state, so a reset does not drop them.
 - **Eviction and budget.** LRU over leaves; a snapshot with children is
   pinned. The budget is `memory.session_cache_bytes` /
-  `HIPFIRE_SESSION_CACHE_BYTES` (default 8 GiB, `0` = cache off). Copies live
-  in system RAM on unified memory and in VRAM on discrete cards, behind a
-  free-memory guard.
+  `HIPFIRE_SESSION_CACHE_BYTES` (default 8 GiB, `0` = cache off), a ceiling,
+  not a reservation. Snapshots live in device memory (VRAM, or a unified-memory
+  APU's GTT or carve-out) and yield to context growth. A capture is skipped,
+  or older snapshots are evicted, unless free device memory
+  (`Gpu::device_mem_info`: `hipMemGetInfo`, on a GTT-backed APU clamped to
+  `MemAvailable` plus TTM's page pool) still holds the live state's growth
+  through the prompt in flight plus headroom.
+  When a forward crosses a VMM growth boundary, snapshots are freed (LRU
+  leaves first, then the turn's pending captures) until that growth fits.
 - **Live continuation.** Inside one conversation, a turn whose canonical
   tokens strictly extend the previous turn's committed consumed history
   (same route; for native MTP the head is at the same position) prefills

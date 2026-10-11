@@ -11,14 +11,17 @@
 //! build  [--out DIR] [--build-dir DIR] [--arch A]... [--jobs N]
 //!     Compile every runtime-JIT module of the admitted default programs and
 //!     of railgun's own kernels (`programs.json`) with the runtime's recipe,
-//!     certify each object with railgun-cert, write `DIR/v1/<build host key>/`.
+//!     certify each object with railgun-cert, write `DIR/v2/<build host key>/`.
+//!     Also certifies the arch's embedded pm_decode twin images (the objects
+//!     the product default loads in place of some hipcc modules) and records
+//!     them as `pm_native` under `native/<arch>/`.
 //!     Sources compile in the fixed `--build-dir` (default `DIR/build`) so
 //!     rebuilds repeat the bytes.
 //! check  --corpus DIR
 //!     CI gate: every node of every admitted default program and of
 //!     railgun's own kernels must resolve, under the runtime's current JIT
-//!     key, to a verified record. Exit 1 and name every missing node
-//!     otherwise.
+//!     key (twin nodes: by embedded image digest), to a verified record.
+//!     Exit 1 and name every missing node otherwise.
 //! repro  --corpus DIR [--arch A]... [--jobs N] [--json FILE]
 //!     Recompile every corpus module: at the build paths, through runtime-style
 //!     unique temporaries twice, with the include order permuted, and with

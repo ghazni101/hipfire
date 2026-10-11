@@ -63,6 +63,96 @@ pub(crate) fn sample_top_p_parallel_fast_src(top_k_width: usize, suffix: &str) -
         .replace("sample_topk_finalize", &fn_finalize)
 }
 
+/// Workgroup count of the parallel sampler's partial pass (both reducers).
+const SAMPLE_N_BLOCKS: u32 = 128;
+
+/// Which compiled variant of the exact (legacy parallel) reducer a request
+/// selects. The gather budget is request-selected: `top_k_req <= 20` (incl.
+/// the `None` default) uses the 20-wide / 256-block variant, anything larger
+/// the 64-wide / 128-block variant (LDS = block*TOP_K*8 must stay <= 64 KiB,
+/// so width and block move together). The penalty prepass shares the variant's
+/// module and block size.
+#[derive(Clone, Copy)]
+struct ParallelExactVariant {
+    wide: bool,
+    top_k: usize,
+    block: u32,
+    shared_mem: u32,
+    module: &'static str,
+    fn_penalty: &'static str,
+    fn_partial: &'static str,
+    fn_finalize: &'static str,
+}
+
+impl ParallelExactVariant {
+    fn for_top_k(top_k_req: i32) -> Self {
+        // ARCHBLEED FIX (was d3472d9e): the gather budget is REQUEST-SELECTED,
+        // not a global hardcode. W7 P2b widened TOP_K 20→64 (so minimax top_k=40
+        // is honored) and dropped the block 256→128 to fit LDS — but did so
+        // UNCONDITIONALLY, costing ~6.5% AR decode on every non-minimax model
+        // (gfx1100 qwen3.6-27b). Here the common case (top_k<=20, incl. None)
+        // uses a 20-wide / 256-block variant that is byte-identical to 43c3129c;
+        // only top_k>20 compiles+uses the 64-wide / 128-block variant. LDS =
+        // block*TOP_K*8 must stay <= 64 KiB: 256*20*8=40K and 128*64*8=64K both
+        // fit; 256*64*8=128K would fail to launch — so width and block move
+        // together. minimax keeps its full top_k=40 support via the wide path.
+        let wide = top_k_req > 20;
+        let top_k: usize = if wide { 64 } else { 20 };
+        let block: u32 = if wide { 128 } else { 256 };
+        // smem: topk_val[block*TOP_K] + topk_idx[block*TOP_K], 4 bytes each.
+        let shared_mem = block * top_k as u32 * 4 * 2;
+        // One templated source → two compiled variants. `self.functions` is
+        // keyed by function name and skips reload once a name is present (see
+        // compile_and_load_kernel), so the wide variant SUFFIXES its entry
+        // points to coexist with the default without clobbering it.
+        let (module, fn_penalty, fn_partial, fn_finalize) = if wide {
+            (
+                "sample_top_p_parallel_w64",
+                "sample_apply_repeat_penalty_w64",
+                "sample_topk_partial_w64",
+                "sample_topk_finalize_w64",
+            )
+        } else {
+            (
+                "sample_top_p_parallel",
+                "sample_apply_repeat_penalty",
+                "sample_topk_partial",
+                "sample_topk_finalize",
+            )
+        };
+        Self {
+            wide,
+            top_k,
+            block,
+            shared_mem,
+            module,
+            fn_penalty,
+            fn_partial,
+            fn_finalize,
+        }
+    }
+}
+
+/// Whether the fast-stable reducer is used for a request (width 21 covers
+/// top_k<=20, width 65 covers 21..=64; vocab-guarded).
+fn sample_fast_stable_eligible(top_k_req: i32, vocab_size: usize) -> bool {
+    sample_fast_stable_enabled()
+        && top_k_req > 0
+        && top_k_req <= 64
+        && vocab_size <= SAMPLE_N_BLOCKS as usize * 256 * 16
+}
+
+/// What [`Gpu::sample_top_p_pf_enqueue`] enqueued, i.e. how the caller must
+/// interpret the `{token_id, rng}` pair it later reads from `result_buf`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SampleEnqueued {
+    /// Fast-stable reducer enqueued: a `token_id == u32::MAX` result (tie
+    /// sentinel) needs `sample_top_p_pf_exact_enqueue` with the ORIGINAL rng.
+    Fast,
+    /// Exact (legacy parallel) reducer enqueued: the result is final.
+    Exact,
+}
+
 impl Gpu {
     /// Compute max softmax probability on GPU. Downloads 4 bytes instead of vocab×4.
     pub fn max_prob(
@@ -294,13 +384,15 @@ impl Gpu {
         Ok((token_id, new_rng))
     }
 
-    /// Multi-workgroup parallel implementation of [`sample_top_p_pf`]. Three
-    /// stream-ordered launches: an in-place penalty prepass (only when a
-    /// penalty is active), `sample_topk_partial` (vocab top-K split across
-    /// `N_BLOCKS` workgroups → partials scratch), and `sample_topk_finalize`
-    /// (merge partials → global top-K + the verbatim softmax/sort/top-p/RNG
-    /// tail). Byte-identical token to the single-block kernel for distinct
-    /// logits.
+    /// Multi-workgroup parallel implementation of [`sample_top_p_pf`]. Up to
+    /// four stream-ordered launches, each followed by the singleton's 8-byte
+    /// readback where noted: an in-place penalty prepass (only when a penalty
+    /// is active and `repeat_window > 0`), then either the fast-stable
+    /// partial+finalize pair (readback; a `u32::MAX` sentinel falls through)
+    /// or the exact `sample_topk_partial` + `sample_topk_finalize` pair
+    /// (readback). Byte-identical token to the single-block kernel for
+    /// distinct logits. All launch sequences live in the shared
+    /// `enqueue_sample_*` helpers, which [`sample_top_p_pf_enqueue`] reuses.
     #[allow(clippy::too_many_arguments)]
     fn sample_top_p_parallel_impl(
         &mut self,
@@ -318,62 +410,258 @@ impl Gpu {
         top_k_req: i32,
         min_p_val: f32,
     ) -> HipResult<(u32, u32)> {
-        const N_BLOCKS: u32 = 128;
-        let any_penalty = repeat_penalty > 1.0 || presence_penalty > 0.0 || frequency_penalty > 0.0;
-        // ARCHBLEED FIX (was d3472d9e): the gather budget is REQUEST-SELECTED,
-        // not a global hardcode. W7 P2b widened TOP_K 20→64 (so minimax top_k=40
-        // is honored) and dropped the block 256→128 to fit LDS — but did so
-        // UNCONDITIONALLY, costing ~6.5% AR decode on every non-minimax model
-        // (gfx1100 qwen3.6-27b). Here the common case (top_k<=20, incl. None)
-        // uses a 20-wide / 256-block variant that is byte-identical to 43c3129c;
-        // only top_k>20 compiles+uses the 64-wide / 128-block variant. LDS =
-        // block*TOP_K*8 must stay <= 64 KiB: 256*20*8=40K and 128*64*8=64K both
-        // fit; 256*64*8=128K would fail to launch — so width and block move
-        // together. minimax keeps its full top_k=40 support via the wide path.
-        let wide = top_k_req > 20;
-        let top_k: usize = if wide { 64 } else { 20 };
-        let block: u32 = if wide { 128 } else { 256 };
-        // smem: topk_val[block*TOP_K] + topk_idx[block*TOP_K], 4 bytes each.
-        let shared_mem = block * top_k as u32 * 4 * 2;
+        let variant = self.sample_parallel_prepare(top_k_req)?;
 
-        // One templated source → two compiled variants. `self.functions` is
-        // keyed by function name and skips reload once a name is present (see
-        // compile_and_load_kernel), so the wide variant SUFFIXES its entry
-        // points to coexist with the default without clobbering it.
-        let (m, fn_penalty, fn_partial, fn_finalize) = if wide {
-            (
-                "sample_top_p_parallel_w64",
-                "sample_apply_repeat_penalty_w64",
-                "sample_topk_partial_w64",
-                "sample_topk_finalize_w64",
-            )
-        } else {
-            (
-                "sample_top_p_parallel",
-                "sample_apply_repeat_penalty",
-                "sample_topk_partial",
-                "sample_topk_finalize",
-            )
-        };
+        // 1) Penalty prepass (in-place on logits), only when active. It runs
+        // before the fast attempt so an ambiguity fallback can reuse the
+        // adjusted logits without applying the penalty twice.
+        self.enqueue_sample_penalty(
+            &variant,
+            logits,
+            repeat_buf,
+            vocab_size,
+            repeat_window,
+            repeat_penalty,
+            presence_penalty,
+            frequency_penalty,
+        )?;
+
+        // Fast-stable reducer: TOP_K is request_cap+1 so the last slot is the
+        // tie-boundary sentinel. Different internal order is accepted only when
+        // ordering is provably unambiguous; token_id==u32::MAX falls through to
+        // the exact reducer below. Penalty already ran exactly once for both.
+        if sample_fast_stable_eligible(top_k_req, vocab_size) {
+            self.enqueue_sample_fast_stable(
+                logits,
+                result_buf,
+                vocab_size,
+                temperature,
+                top_p,
+                rng_state,
+                top_k_req,
+                min_p_val,
+            )?;
+            let result = self.read_sample_result(result_buf)?;
+            if result.0 != u32::MAX {
+                return Ok(result);
+            }
+        }
+
+        self.enqueue_sample_exact(
+            &variant,
+            logits,
+            result_buf,
+            vocab_size,
+            temperature,
+            top_p,
+            rng_state,
+            top_k_req,
+            min_p_val,
+        )?;
+        self.read_sample_result(result_buf)
+    }
+
+    /// Enqueue-only twin of the parallel [`sample_top_p_pf`] path, for batched
+    /// callers that sample several lanes before one host sync.
+    ///
+    /// Identity contract: same top_k/min_p defaulting (`None` → 20 / 0.0), same
+    /// penalty prepass (only when a penalty is active and `repeat_window > 0`),
+    /// same reducer choice (fast-stable when enabled+eligible, else the exact
+    /// parallel reducer), same kernels/grids/args as `sample_top_p_pf`'s
+    /// parallel path. The `{token_id, rng}` pair (two u32, 8 bytes) lands in
+    /// `result_buf`, which may be a 2-element sub-view
+    /// ([`GpuTensor::sub_offset`]); NO host readback or sync is performed.
+    ///
+    /// Returns `Ok(None)` (nothing enqueued) when the parallel sampler is
+    /// disabled (`HIPFIRE_SAMPLE_PARALLEL=0`); the caller must then use the
+    /// singleton `sample_top_p_pf`. [`SampleEnqueued::Fast`] means a
+    /// `token_id == u32::MAX` result must be re-run via
+    /// [`Self::sample_top_p_pf_exact_enqueue`] with the ORIGINAL `rng_state`
+    /// (the penalty prepass already ran in place and must not be repeated).
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_top_p_pf_enqueue(
+        &mut self,
+        logits: &GpuTensor,
+        result_buf: &GpuTensor,
+        repeat_buf: &GpuTensor,
+        vocab_size: usize,
+        temperature: f32,
+        top_p: f32,
+        rng_state: u32,
+        repeat_window: usize,
+        repeat_penalty: f32,
+        presence_penalty: f32,
+        frequency_penalty: f32,
+        top_k: Option<u32>,
+        min_p: Option<f32>,
+    ) -> HipResult<Option<SampleEnqueued>> {
+        self.bind_thread()?;
+        if !sample_parallel_enabled() {
+            return Ok(None);
+        }
+        let top_k_req = top_k.map(|k| k as i32).unwrap_or(20);
+        let min_p_val = min_p.unwrap_or(0.0);
+        let variant = self.sample_parallel_prepare(top_k_req)?;
+        self.enqueue_sample_penalty(
+            &variant,
+            logits,
+            repeat_buf,
+            vocab_size,
+            repeat_window,
+            repeat_penalty,
+            presence_penalty,
+            frequency_penalty,
+        )?;
+        if sample_fast_stable_eligible(top_k_req, vocab_size) {
+            self.enqueue_sample_fast_stable(
+                logits,
+                result_buf,
+                vocab_size,
+                temperature,
+                top_p,
+                rng_state,
+                top_k_req,
+                min_p_val,
+            )?;
+            return Ok(Some(SampleEnqueued::Fast));
+        }
+        self.enqueue_sample_exact(
+            &variant,
+            logits,
+            result_buf,
+            vocab_size,
+            temperature,
+            top_p,
+            rng_state,
+            top_k_req,
+            min_p_val,
+        )?;
+        Ok(Some(SampleEnqueued::Exact))
+    }
+
+    /// Enqueue the exact parallel reducer (partial + finalize) WITHOUT the
+    /// penalty prepass, on logits already penalized by a prior
+    /// [`Self::sample_top_p_pf_enqueue`] — the singleton's tie-sentinel
+    /// fallback. Same top_k/min_p defaulting as `sample_top_p_pf`; pass the
+    /// ORIGINAL `rng_state`. Writes `{token_id, rng}` into `result_buf` (may be
+    /// a 2-element [`GpuTensor::sub_offset`] view); NO host readback or sync.
+    #[allow(clippy::too_many_arguments)]
+    pub fn sample_top_p_pf_exact_enqueue(
+        &mut self,
+        logits: &GpuTensor,
+        result_buf: &GpuTensor,
+        vocab_size: usize,
+        temperature: f32,
+        top_p: f32,
+        rng_state: u32,
+        top_k: Option<u32>,
+        min_p: Option<f32>,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        let top_k_req = top_k.map(|k| k as i32).unwrap_or(20);
+        let min_p_val = min_p.unwrap_or(0.0);
+        let variant = self.sample_parallel_prepare(top_k_req)?;
+        self.enqueue_sample_exact(
+            &variant,
+            logits,
+            result_buf,
+            vocab_size,
+            temperature,
+            top_p,
+            rng_state,
+            top_k_req,
+            min_p_val,
+        )
+    }
+
+    /// Load the request's exact-variant kernels (penalty/partial/finalize).
+    /// Runs identically at the start of the singleton and enqueue paths; each
+    /// reducer invalidates for its own partials-scratch growth.
+    fn sample_parallel_prepare(&mut self, top_k_req: i32) -> HipResult<ParallelExactVariant> {
+        let v = ParallelExactVariant::for_top_k(top_k_req);
         // `ensure_kernel` caches compiled functions, but constructing/replacing
         // the full HIP source used to happen before that cache check on every
         // generated token. Only materialize source when a function is missing.
-        if !self.functions.contains_key(fn_penalty)
-            || !self.functions.contains_key(fn_partial)
-            || !self.functions.contains_key(fn_finalize)
+        if !self.functions.contains_key(v.fn_penalty)
+            || !self.functions.contains_key(v.fn_partial)
+            || !self.functions.contains_key(v.fn_finalize)
         {
-            let src: String = if wide {
+            let src: String = if v.wide {
                 sample_top_p_parallel_w64_src()
             } else {
                 sample_top_p_parallel_src()
             };
-            self.ensure_kernel(m, &src, fn_penalty)?;
-            self.ensure_kernel(m, &src, fn_partial)?;
-            self.ensure_kernel(m, &src, fn_finalize)?;
+            self.ensure_kernel(v.module, &src, v.fn_penalty)?;
+            self.ensure_kernel(v.module, &src, v.fn_partial)?;
+            self.ensure_kernel(v.module, &src, v.fn_finalize)?;
         }
+        Ok(v)
+    }
 
-        // Partials scratch: [N_BLOCKS*TOP_K] f32 vals then [N_BLOCKS*TOP_K] i32 idx.
-        let n_cand = N_BLOCKS as usize * top_k;
+    /// Enqueue the in-place penalty prepass, only when a penalty is active and
+    /// `repeat_window > 0`. Grid `[1]` × `[variant.block]`, no LDS.
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_sample_penalty(
+        &mut self,
+        v: &ParallelExactVariant,
+        logits: &GpuTensor,
+        repeat_buf: &GpuTensor,
+        vocab_size: usize,
+        repeat_window: usize,
+        repeat_penalty: f32,
+        presence_penalty: f32,
+        frequency_penalty: f32,
+    ) -> HipResult<()> {
+        let any_penalty = repeat_penalty > 1.0 || presence_penalty > 0.0 || frequency_penalty > 0.0;
+        if !(any_penalty && repeat_window > 0) {
+            return Ok(());
+        }
+        let mut logits_ptr = logits.buf.as_ptr();
+        let mut repeat_ptr = repeat_buf.buf.as_ptr();
+        let mut vs = vocab_size as i32;
+        let mut rw = repeat_window as i32;
+        let mut rp = repeat_penalty;
+        let mut pp = presence_penalty;
+        let mut fp = frequency_penalty;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut logits_ptr as *mut _ as *mut c_void,
+            &mut repeat_ptr as *mut _ as *mut c_void,
+            &mut vs as *mut _ as *mut c_void,
+            &mut rw as *mut _ as *mut c_void,
+            &mut rp as *mut _ as *mut c_void,
+            &mut pp as *mut _ as *mut c_void,
+            &mut fp as *mut _ as *mut c_void,
+        ];
+        let func = &self.functions[v.fn_penalty];
+        unsafe {
+            self.hip.launch_kernel(
+                func,
+                [1, 1, 1],
+                [v.block, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        }
+    }
+
+    /// Enqueue the exact parallel reducer: `sample_topk_partial`
+    /// (`N_BLOCKS` × `[block]`, LDS `shared_mem`) then `sample_topk_finalize`
+    /// (`[1]` × `[block]`) into `result_buf`. No readback.
+    #[allow(clippy::too_many_arguments)]
+    fn enqueue_sample_exact(
+        &mut self,
+        v: &ParallelExactVariant,
+        logits: &GpuTensor,
+        result_buf: &GpuTensor,
+        vocab_size: usize,
+        temperature: f32,
+        top_p: f32,
+        rng_state: u32,
+        top_k_req: i32,
+        min_p_val: f32,
+    ) -> HipResult<()> {
+        let n_cand = SAMPLE_N_BLOCKS as usize * v.top_k;
         let val_bytes = n_cand * 4;
         // Growth under a captured graph would free a pointer the graph embeds:
         // invalidate first (no-op unless captured).
@@ -384,64 +672,6 @@ impl Gpu {
         ) {
             self.invalidate_for_scratch_growth();
         }
-        let mut logits_ptr = logits.buf.as_ptr();
-        let mut repeat_ptr = repeat_buf.buf.as_ptr();
-        let mut vs = vocab_size as i32;
-        let mut rw = repeat_window as i32;
-        let mut rp = repeat_penalty;
-        let mut pp = presence_penalty;
-        let mut fp = frequency_penalty;
-
-        // 1) Penalty prepass (in-place on logits), only when active. It runs
-        // before the fast attempt so an ambiguity fallback can reuse the
-        // adjusted logits without applying the penalty twice.
-        if any_penalty && repeat_window > 0 {
-            let mut params: Vec<*mut c_void> = vec![
-                &mut logits_ptr as *mut _ as *mut c_void,
-                &mut repeat_ptr as *mut _ as *mut c_void,
-                &mut vs as *mut _ as *mut c_void,
-                &mut rw as *mut _ as *mut c_void,
-                &mut rp as *mut _ as *mut c_void,
-                &mut pp as *mut _ as *mut c_void,
-                &mut fp as *mut _ as *mut c_void,
-            ];
-            let func = &self.functions[fn_penalty];
-            unsafe {
-                self.hip.launch_kernel(
-                    func,
-                    [1, 1, 1],
-                    [block, 1, 1],
-                    0,
-                    self.stream_ref(),
-                    &mut params,
-                )?;
-            }
-        }
-
-        // Fast-stable reducer: TOP_K is request_cap+1 so the last slot is the
-        // tie-boundary sentinel. Different internal order is accepted only when
-        // ordering is provably unambiguous; token_id==u32::MAX falls through to
-        // the exact reducer below. Penalty already ran exactly once for both.
-        // width 21 covers top_k<=20; width 65 covers 21..=64 (vocab-guarded).
-        if sample_fast_stable_enabled()
-            && top_k_req > 0
-            && top_k_req <= 64
-            && vocab_size <= N_BLOCKS as usize * 256 * 16
-        {
-            if let Some(result) = self.sample_top_p_fast_stable_impl(
-                logits,
-                result_buf,
-                vocab_size,
-                temperature,
-                top_p,
-                rng_state,
-                top_k_req,
-                min_p_val,
-            )? {
-                return Ok(result);
-            }
-        }
-
         let partial_base = self
             .scratch
             .ensure_sample_partials(&self.hip, val_bytes * 2)?;
@@ -449,8 +679,10 @@ impl Gpu {
         let partial_idx_ptr =
             unsafe { (partial_base as *mut u8).add(val_bytes) as *mut std::ffi::c_void };
 
+        let mut logits_ptr = logits.buf.as_ptr();
         let mut result_ptr = result_buf.buf.as_ptr();
-        let mut nb = N_BLOCKS as i32;
+        let mut vs = vocab_size as i32;
+        let mut nb = SAMPLE_N_BLOCKS as i32;
         let mut ncand = n_cand as i32;
         let mut temp = temperature;
         let mut tp = top_p;
@@ -460,7 +692,7 @@ impl Gpu {
         let mut tk = top_k_req;
         let mut mp = min_p_val;
 
-        // 2) Per-block partial top-K over vocab strips.
+        // Per-block partial top-K over vocab strips.
         {
             let mut params: Vec<*mut c_void> = vec![
                 &mut logits_ptr as *mut _ as *mut c_void,
@@ -469,20 +701,20 @@ impl Gpu {
                 &mut pval as *mut _ as *mut c_void,
                 &mut pidx as *mut _ as *mut c_void,
             ];
-            let func = &self.functions[fn_partial];
+            let func = &self.functions[v.fn_partial];
             unsafe {
                 self.hip.launch_kernel(
                     func,
-                    [N_BLOCKS, 1, 1],
-                    [block, 1, 1],
-                    shared_mem,
+                    [SAMPLE_N_BLOCKS, 1, 1],
+                    [v.block, 1, 1],
+                    v.shared_mem,
                     self.stream_ref(),
                     &mut params,
                 )?;
             }
         }
 
-        // 3) Merge partials → global top-K, then softmax/top-p/RNG sample.
+        // Merge partials → global top-K, then softmax/top-p/RNG sample.
         {
             let mut params: Vec<*mut c_void> = vec![
                 &mut pval as *mut _ as *mut c_void,
@@ -495,34 +727,30 @@ impl Gpu {
                 &mut tk as *mut _ as *mut c_void,
                 &mut mp as *mut _ as *mut c_void,
             ];
-            let func = &self.functions[fn_finalize];
+            let func = &self.functions[v.fn_finalize];
             unsafe {
                 self.hip.launch_kernel(
                     func,
                     [1, 1, 1],
-                    [block, 1, 1],
-                    shared_mem,
+                    [v.block, 1, 1],
+                    v.shared_mem,
                     self.stream_ref(),
                     &mut params,
                 )?;
             }
         }
-
-        let mut out = [0u8; 8];
-        self.hip.memcpy_dtoh(&mut out, &result_buf.buf)?;
-        let token_id = u32::from_ne_bytes([out[0], out[1], out[2], out[3]]);
-        let new_rng = u32::from_ne_bytes([out[4], out[5], out[6], out[7]]);
-        Ok((token_id, new_rng))
+        Ok(())
     }
 
-    /// Fast-stable top-k+1 reducer. Selects width 21 for top_k_req<=20 and
-    /// width 65 for 21..=64; the extra candidate is the tie-boundary sentinel.
-    /// Any requested penalty is applied by the caller before entry. Returns
-    /// `None` when the kernel detects a probability tie whose stable ordering
-    /// could differ from the legacy reduction; the caller then runs legacy on
-    /// the same adjusted logits.
+    /// Enqueue the fast-stable top-k+1 reducer. Selects width 21 for
+    /// top_k_req<=20 and width 65 for 21..=64; the extra candidate is the
+    /// tie-boundary sentinel. Any requested penalty is applied by the caller
+    /// before entry. The kernel writes `token_id == u32::MAX` into `result_buf`
+    /// when it detects a probability tie whose stable ordering could differ
+    /// from the legacy reduction; the caller then runs the exact reducer on
+    /// the same adjusted logits. No readback.
     #[allow(clippy::too_many_arguments)]
-    fn sample_top_p_fast_stable_impl(
+    fn enqueue_sample_fast_stable(
         &mut self,
         logits: &GpuTensor,
         result_buf: &GpuTensor,
@@ -532,8 +760,7 @@ impl Gpu {
         rng_state: u32,
         top_k_req: i32,
         min_p_val: f32,
-    ) -> HipResult<Option<(u32, u32)>> {
-        const N_BLOCKS: u32 = 128;
+    ) -> HipResult<()> {
         const PARTIAL_BLOCK: u32 = 256;
         const FINALIZE_BLOCK: u32 = 128;
         // TOP_K = request_cap + 1 (boundary sentinel). Narrow path stays at 21
@@ -566,9 +793,9 @@ impl Gpu {
             self.ensure_kernel(module, &src, fn_finalize)?;
         }
 
-        let n_cand = N_BLOCKS as usize * top_k_width;
+        let n_cand = SAMPLE_N_BLOCKS as usize * top_k_width;
         let val_bytes = n_cand * 4;
-        // Same pre-growth invalidation contract as above.
+        // Same pre-growth invalidation contract as `sample_parallel_prepare`.
         if crate::scratch::scratch_will_grow(
             self.scratch.sample_partials_bytes,
             self.scratch.sample_partials.is_some(),
@@ -586,7 +813,7 @@ impl Gpu {
         let mut logits_ptr = logits.buf.as_ptr();
         let mut result_ptr = result_buf.buf.as_ptr();
         let mut vs = vocab_size as i32;
-        let mut nb = N_BLOCKS as i32;
+        let mut nb = SAMPLE_N_BLOCKS as i32;
         let mut ncand = n_cand as i32;
         let mut temp = temperature;
         let mut tp = top_p;
@@ -608,7 +835,7 @@ impl Gpu {
             unsafe {
                 self.hip.launch_kernel(
                     func,
-                    [N_BLOCKS, 1, 1],
+                    [SAMPLE_N_BLOCKS, 1, 1],
                     [PARTIAL_BLOCK, 1, 1],
                     // 2048B LDS: PARTIAL_BLOCK * 4 * 2
                     PARTIAL_BLOCK * 4 * 2,
@@ -642,16 +869,16 @@ impl Gpu {
                 )?;
             }
         }
+        Ok(())
+    }
 
+    /// Synchronous 8-byte `{token_id, rng}` readback of a sampler result.
+    fn read_sample_result(&self, result_buf: &GpuTensor) -> HipResult<(u32, u32)> {
         let mut out = [0u8; 8];
         self.hip.memcpy_dtoh(&mut out, &result_buf.buf)?;
         let token_id = u32::from_ne_bytes([out[0], out[1], out[2], out[3]]);
         let new_rng = u32::from_ne_bytes([out[4], out[5], out[6], out[7]]);
-        if token_id == u32::MAX {
-            Ok(None)
-        } else {
-            Ok(Some((token_id, new_rng)))
-        }
+        Ok((token_id, new_rng))
     }
 
     /// Launch sampling kernel only (no readback). For use during graph capture.
@@ -1382,9 +1609,10 @@ impl Gpu {
     /// C8 Kernel 0: batched categorical sampler over already-softmax'd probs.
     ///
     /// For each of `batch` rows in `probs[batch * vocab]`, applies the
-    /// top-p truncation `(p >= tau_cut[r]) ? p / z[r] : 0`, draws one
-    /// categorical sample (LCG seeded per-row from `seed ^ row | 1`), and
-    /// writes the sampled token id and its effective probability.
+    /// truncation `(p >= tau_cut[r]) ? p / z[r] : 0`, draws one categorical
+    /// sample with an LCG started from `seeds[r]` (u32 bits, from
+    /// [`spec_draft_row_seed`]), and writes the sampled token id and its
+    /// effective probability.
     ///
     /// D2H after this call: `batch * 8 bytes` (token + prob per row),
     /// replacing the `batch * vocab * 4` download that the FAST_SAMPLE path
@@ -1394,18 +1622,18 @@ impl Gpu {
     /// `chain_accept_spec_f32` as the draft prob buffer.
     ///
     /// `tau_cut` and `z` come from `softmax_temp_topp_batched_into_f32`.
-    /// Pass zero-filled buffers (tau=0, z=1) when top-p is disabled.
+    /// Pass zero-filled buffers (tau=0, z=1) for no truncation.
     #[allow(clippy::too_many_arguments)]
     pub fn batched_categorical_sample_f32(
         &mut self,
         probs: &GpuTensor,      // [batch * vocab] f32 — softmax output
-        tau_cut: &GpuTensor,    // [batch] f32 — top-p threshold per row
+        tau_cut: &GpuTensor,    // [batch] f32 — truncation threshold per row
         z: &GpuTensor,          // [batch] f32 — kept mass per row
+        seeds: &GpuTensor,      // [batch] u32 — per-row LCG seed
         out_tokens: &GpuTensor, // [batch] i32 — sampled token ids
         out_probs: &GpuTensor,  // [batch] f32 — prob at sampled token
         vocab: usize,
         batch: usize,
-        seed: u32,
     ) -> HipResult<()> {
         self.bind_thread()?;
         self.ensure_kernel(
@@ -1418,7 +1646,7 @@ impl Gpu {
         let tp = tau_cut.buf.as_ptr();
         let zp = z.buf.as_ptr();
         let vs = vocab as i32;
-        let mut sd = seed;
+        let sp = seeds.buf.as_ptr();
         let ot = out_tokens.buf.as_ptr();
         let op = out_probs.buf.as_ptr();
 
@@ -1427,7 +1655,7 @@ impl Gpu {
             &tp as *const _ as *mut c_void,
             &zp as *const _ as *mut c_void,
             &vs as *const _ as *mut c_void,
-            &mut sd as *mut _ as *mut c_void,
+            &sp as *const _ as *mut c_void,
             &ot as *const _ as *mut c_void,
             &op as *const _ as *mut c_void,
         ];
@@ -1445,7 +1673,7 @@ impl Gpu {
                 b.push_ptr(tp);
                 b.push_ptr(zp);
                 b.push_i32(vs);
-                b.push_u32(sd);
+                b.push_ptr(sp);
                 b.push_ptr(ot);
                 b.push_ptr(op);
                 b
@@ -1983,6 +2211,51 @@ pub fn all_greedy(params: &[SlotSampleParams]) -> bool {
 /// the bare-argmax path and the batch needs no repeat-window uploads.
 pub fn any_penalized(params: &[SlotSampleParams]) -> bool {
     params.iter().any(|p| p.penalized())
+}
+
+fn fmix64(mut x: u64) -> u64 {
+    x ^= x >> 30;
+    x = x.wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x ^= x >> 27;
+    x = x.wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^ (x >> 31)
+}
+
+/// Seed of draft row `row` for [`Gpu::batched_categorical_sample_f32`]: a
+/// hash of the request's sampler `stream` state at the start of the window
+/// (before the window's draws), the window's absolute start `position`, and
+/// the row within the lane's block. Rows of one block, the same row across
+/// windows, and co-scheduled lanes therefore draw independent uniforms. A
+/// lane's draws depend only on its own (stream, position, row), so a batched
+/// launch reproduces the singleton's.
+pub fn spec_draft_row_seed(stream: u64, position: u64, row: u32) -> u32 {
+    const GOLDEN: u64 = 0x9E37_79B9_7F4A_7C15;
+    fmix64(stream ^ fmix64(position.wrapping_add(fmix64((row as u64).wrapping_add(GOLDEN))))) as u32
+}
+
+#[cfg(test)]
+mod spec_draft_seed_tests {
+    use super::spec_draft_row_seed;
+    use std::collections::HashSet;
+
+    #[test]
+    fn row_seeds_are_deterministic_and_distinct() {
+        let stream = 0x1357_9BDF_2468_ACE0u64;
+        assert_eq!(
+            spec_draft_row_seed(stream, 100, 3),
+            spec_draft_row_seed(stream, 100, 3)
+        );
+        // Rows 2k / 2k+1 (the pre-fix collision), every row of 64 windows, and
+        // two request streams: no repeats.
+        let mut seen = HashSet::new();
+        for s in [stream, stream ^ 1] {
+            for position in 0..64u64 {
+                for row in 0..16u32 {
+                    assert!(seen.insert(spec_draft_row_seed(s, position, row)));
+                }
+            }
+        }
+    }
 }
 
 #[cfg(test)]

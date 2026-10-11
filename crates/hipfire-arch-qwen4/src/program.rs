@@ -39,6 +39,25 @@ fn checked_mul(a: usize, b: usize, label: &'static str) -> Result<usize, Dispatc
         .ok_or_else(|| DispatchError::Hip(format!("Qwen4 {label} scratch overflows")))
 }
 
+/// FFN extents of a program: dense gated MLP or the shared-expert MoE.
+#[derive(Clone, Copy, Debug)]
+pub enum Qwen4FfnDims {
+    Dense {
+        intermediate: usize,
+    },
+    Moe {
+        num_experts: usize,
+        experts_per_token: usize,
+        intermediate: usize,
+        shared_intermediate: usize,
+    },
+}
+
+/// RoPE base theta hard-coded by the QSA RoPE kernels
+/// (`kernels/src/tensor_ops.hip:2830,3126,3445` use 10,000,000).  A profile
+/// whose `rope_theta` differs cannot run full-attention layers on them.
+pub const QWEN4_QSA_KERNEL_ROPE_THETA: f64 = 10_000_000.0;
+
 /// Dimensions used by all Qwen4 layer-major operations.  The architecture
 /// binds these from its validated config; no family-specific config type
 /// crosses the dispatch boundary.
@@ -60,10 +79,9 @@ pub struct Qwen4ProgramDims {
     pub linear_key_head_dim: usize,
     pub linear_value_head_dim: usize,
     pub linear_conv_kernel_dim: usize,
-    pub moe_intermediate: usize,
-    pub shared_intermediate: usize,
-    pub num_experts: usize,
-    pub experts_per_token: usize,
+    pub ffn: Qwen4FfnDims,
+    /// PLE short-convolution taps; 0 for a profile without PLE (the PLE
+    /// operation validates its own extent when it runs).
     pub ple_conv_kernel_dim: usize,
     pub norm_eps: f32,
 }
@@ -115,6 +133,8 @@ pub struct Qwen4ScratchLayout {
     pub grouped_rows: usize,
     pub shared_rows: usize,
     pub routed_rows: usize,
+    /// `rows * intermediate` of a dense FFN (zero for MoE).
+    pub dense_rows: usize,
     pub expanded_rows: usize,
 }
 
@@ -125,7 +145,27 @@ impl Qwen4ScratchLayout {
             return Err(DispatchError::Hip("Qwen4 scratch rows are zero".into()));
         }
         let wide = checked_mul(dims.hc_count, dims.hidden, "wide")?;
-        let slots = checked_mul(rows, dims.experts_per_token, "MoE slots")?;
+        // MoE extents are zero for a dense FFN; `dense_rows` is zero for MoE.
+        let (slots, grouped_rows, shared_rows, routed_rows, dense_rows) = match dims.ffn {
+            Qwen4FfnDims::Moe {
+                num_experts,
+                experts_per_token,
+                intermediate,
+                shared_intermediate,
+            } => {
+                let slots = checked_mul(rows, experts_per_token, "MoE slots")?;
+                (
+                    slots,
+                    grouped_m_total_bound(slots, num_experts)?,
+                    checked_mul(rows, shared_intermediate, "shared rows")?,
+                    checked_mul(slots, intermediate, "routed rows")?,
+                    0,
+                )
+            }
+            Qwen4FfnDims::Dense { intermediate } => {
+                (0, 0, 0, 0, checked_mul(rows, intermediate, "dense rows")?)
+            }
+        };
         Ok(Self {
             rows,
             hidden: dims.hidden,
@@ -137,9 +177,10 @@ impl Qwen4ScratchLayout {
             gdn_qkv: dims.gdn_qkv(),
             gdn_value: dims.gdn_value(),
             slots,
-            grouped_rows: grouped_m_total_bound(slots, dims.num_experts)?,
-            shared_rows: checked_mul(rows, dims.shared_intermediate, "shared rows")?,
-            routed_rows: checked_mul(slots, dims.moe_intermediate, "routed rows")?,
+            grouped_rows,
+            shared_rows,
+            routed_rows,
+            dense_rows,
             expanded_rows: checked_mul(slots, dims.hidden, "expanded route")?,
         })
     }
@@ -200,7 +241,24 @@ pub struct Qwen4LayerDescription<'a> {
     pub attn_hyper: Qwen4HyperWeights<'a>,
     pub mlp_hyper: Qwen4HyperWeights<'a>,
     pub attention: Qwen4AttentionWeights<'a>,
-    pub moe: Qwen4MoeBinding<'a>,
+    pub ffn: Qwen4FfnBinding<'a>,
+}
+
+/// Dense FFN projections, source-bound once by the family and consumed by
+/// `Step::DenseFfn`.
+#[derive(Clone, Copy)]
+pub struct Qwen4DenseBinding<'a> {
+    pub gate: WeightRef<'a>,
+    pub up: WeightRef<'a>,
+    pub down: WeightRef<'a>,
+    pub intermediate: usize,
+}
+
+/// The FFN binding of one layer.
+#[derive(Clone, Copy)]
+pub enum Qwen4FfnBinding<'a> {
+    Dense(Qwen4DenseBinding<'a>),
+    Moe(Qwen4MoeBinding<'a>),
 }
 
 /// MoE resources are source-bound once by the family and consumed by the
@@ -252,7 +310,7 @@ pub struct Qwen4LayerScratch<'a> {
     pub qsa_v: &'a GpuTensor,
     pub qsa_output: &'a GpuTensor,
     pub attention_output: &'a GpuTensor,
-    pub moe_output: &'a GpuTensor,
+    pub ffn_output: &'a GpuTensor,
     pub moe_shared_output: &'a GpuTensor,
     pub moe_router_logits: &'a GpuTensor,
     pub moe_x_rot: &'a GpuTensor,
@@ -437,7 +495,10 @@ pub fn execute_lm_head(
     rotation: Option<&GpuTensor>,
 ) -> Result<(), DispatchError> {
     validate_lm_head(weight, hidden_batch, logits, rows, requested_rows)?;
-    if requested_rows == rows {
+    // Under the batch-invariant prefill profile a one-row head is the final-row
+    // head (the GEMV, never the routed GEMM), so a one-row forward and a longer
+    // forward's final row produce the same bytes.
+    if requested_rows == rows && (rows > 1 || !gpu.prefill_invariant_scope) {
         if weight.dtype == DType::F32 {
             return hip(gpu.gemm_f32_batched(
                 weight.buf,
@@ -497,21 +558,41 @@ fn validate_dims(dims: Qwen4ProgramDims) -> Result<(), DispatchError> {
         || dims.hc_lowrank == 0
         || dims.indexer_compress_ratio == 0
         || dims.indexer_budget == 0
-        || dims.moe_intermediate == 0
-        || dims.shared_intermediate == 0
-        || dims.ple_conv_kernel_dim == 0
-        || dims.num_experts == 0
-        || dims.experts_per_token == 0
         || dims.norm_eps <= 0.0
     {
         return Err(DispatchError::Hip(
             "Qwen4 layer descriptor has invalid geometry".into(),
         ));
     }
-    if dims.experts_per_token > dims.num_experts {
-        return Err(DispatchError::Hip(
-            "Qwen4 top-k exceeds expert capacity".into(),
-        ));
+    match dims.ffn {
+        Qwen4FfnDims::Moe {
+            num_experts,
+            experts_per_token,
+            intermediate,
+            shared_intermediate,
+        } => {
+            if intermediate == 0
+                || shared_intermediate == 0
+                || num_experts == 0
+                || experts_per_token == 0
+            {
+                return Err(DispatchError::Hip(
+                    "Qwen4 layer descriptor has invalid geometry".into(),
+                ));
+            }
+            if experts_per_token > num_experts {
+                return Err(DispatchError::Hip(
+                    "Qwen4 top-k exceeds expert capacity".into(),
+                ));
+            }
+        }
+        Qwen4FfnDims::Dense { intermediate } => {
+            if intermediate == 0 {
+                return Err(DispatchError::Hip(
+                    "Qwen4 layer descriptor has invalid geometry".into(),
+                ));
+            }
+        }
     }
     Ok(())
 }
@@ -624,24 +705,56 @@ fn require_dense_weight(
 /// Seal the architecture-bound MoE call before any operation in the layer
 /// step list can launch.  The returned call retains the shared sealed-MoE
 /// ownership/lifecycle contract; the architecture owns the surrounding
-/// operation order.
+/// operation order.  The decode-vs-prefill route is decided on `route_rows`
+/// (`Gpu::route_rows(rows)`: the canonical chunk under the invariant prefill
+/// profile, so a one-row prefill still seals the grouped prefill call);
+/// `rows` sizes the call.
 pub fn seal_moe_for_layer<'a>(
     ctx: &'a hipfire_dispatch::context::DispatchCtx,
     dims: Qwen4ProgramDims,
-    layer: &Qwen4LayerDescription<'a>,
+    moe: Qwen4MoeBinding<'a>,
     scratch: &'a Qwen4LayerScratch<'a>,
     rows: usize,
+    route_rows: usize,
 ) -> Result<hipfire_dispatch::pipeline::sealed_moe::SealedMoeCall<'a>, DispatchError> {
-    let bound = BoundMoeExperts::from_cache(layer.moe.table, layer.moe.cache)
+    let bound = BoundMoeExperts::from_cache(moe.table, moe.cache)
         .map_err(|error| DispatchError::Hip(format!("bound Qwen4 experts: {error:?}")))?;
-    if rows == 1 {
-        let params = build_moe_decode(dims, layer.moe, scratch.hc_mixed, scratch)?;
+    if route_rows == 1 {
+        let params = build_moe_decode(dims, moe, scratch.hc_mixed, scratch)?;
         seal_decode(bound, ctx, params)
             .map_err(|error| DispatchError::Hip(format!("seal Qwen4 decode MoE: {error:?}")))
     } else {
-        let params = build_moe_prefill(dims, layer.moe, scratch, scratch.moe_router_logits, rows)?;
+        let params = build_moe_prefill(dims, moe, scratch, scratch.moe_router_logits, rows)?;
         seal_prefill(bound, ctx, params)
             .map_err(|error| DispatchError::Hip(format!("seal Qwen4 prefill MoE: {error:?}")))
+    }
+}
+
+/// MoE extents of a program whose FFN is MoE; a dense program has no MoE
+/// route to seal or lower.
+struct MoeDims {
+    num_experts: usize,
+    experts_per_token: usize,
+    intermediate: usize,
+    shared_intermediate: usize,
+}
+
+fn moe_dims(dims: Qwen4ProgramDims) -> Result<MoeDims, DispatchError> {
+    match dims.ffn {
+        Qwen4FfnDims::Moe {
+            num_experts,
+            experts_per_token,
+            intermediate,
+            shared_intermediate,
+        } => Ok(MoeDims {
+            num_experts,
+            experts_per_token,
+            intermediate,
+            shared_intermediate,
+        }),
+        Qwen4FfnDims::Dense { .. } => Err(DispatchError::Hip(
+            "Qwen4 dense FFN program has no MoE route to seal".into(),
+        )),
     }
 }
 
@@ -657,6 +770,7 @@ fn build_moe_decode<'a>(
     input: &'a GpuTensor,
     scratch: &'a Qwen4LayerScratch<'a>,
 ) -> Result<MoeParams<'a>, DispatchError> {
+    let moe_dims = moe_dims(dims)?;
     let (first_gate_up, first_down) = moe
         .routed_experts
         .get(0)
@@ -688,16 +802,16 @@ fn build_moe_decode<'a>(
         normalization: MoeNormalization::Provided,
         batch_size: 1,
         hidden: dims.hidden,
-        mi: dims.moe_intermediate,
-        k: dims.experts_per_token,
-        n_exp: dims.num_experts,
+        mi: moe_dims.intermediate,
+        k: moe_dims.experts_per_token,
+        n_exp: moe_dims.num_experts,
         norm_topk_prob: moe.norm_topk_prob,
         x_rot_prerotated: false,
         defer_routed_combine: false,
         ep_mode: MoeEpMode::None,
         layer_idx: moe.layer_idx,
         x_norm: input,
-        x_residual: scratch.moe_output,
+        x_residual: scratch.ffn_output,
         routed_out: None,
         skip_shared: false,
         router: moe.router,
@@ -708,7 +822,7 @@ fn build_moe_decode<'a>(
                 up: moe.shared.up,
                 down: moe.shared.down,
             },
-            intermediate: dims.shared_intermediate,
+            intermediate: moe_dims.shared_intermediate,
             scalar: scratch.moe_scalar,
             gate_out: scratch.moe_gate,
             up_out: scratch.moe_up,
@@ -723,7 +837,7 @@ fn build_moe_decode<'a>(
         expert_dtype_tags: None,
         routed_gate_up_k: dims.hidden,
         routed_down_m: dims.hidden,
-        routed_down_k: dims.moe_intermediate,
+        routed_down_k: moe_dims.intermediate,
         routed_experts: moe.routed_experts,
         routed_gate_up_paro: None,
         routed_down_paro: None,
@@ -752,8 +866,9 @@ fn build_moe_prefill<'a>(
         .routed_experts
         .get(0)
         .ok_or_else(|| DispatchError::Hip("Qwen4 routed expert table is empty".into()))?;
-    let slots = checked_mul(rows, dims.experts_per_token, "MoE slots")?;
-    let m_total_max = grouped_m_total_bound(slots, dims.num_experts)?;
+    let moe_dims = moe_dims(dims)?;
+    let slots = checked_mul(rows, moe_dims.experts_per_token, "MoE slots")?;
+    let m_total_max = grouped_m_total_bound(slots, moe_dims.num_experts)?;
     let shared = MoeSharedPrefill {
         weights: MoeSharedWeights {
             selector: moe.shared.selector,
@@ -802,17 +917,17 @@ fn build_moe_prefill<'a>(
         route_policy: Some(moe.route_policy),
         prelude,
         batch_size: rows,
-        mi: dims.moe_intermediate,
+        mi: moe_dims.intermediate,
         down_m: dims.hidden,
-        down_k: dims.moe_intermediate,
+        down_k: moe_dims.intermediate,
         gate_up_k: dims.hidden,
-        k_top: dims.experts_per_token,
-        n_exp: dims.num_experts,
+        k_top: moe_dims.experts_per_token,
+        n_exp: moe_dims.num_experts,
         m_total_max,
         force_mq4_grouped_fp16: false,
         topk_indices: scratch.moe_topk_indices,
         topk_weights: scratch.moe_topk_weights,
-        x_batch: scratch.moe_output,
+        x_batch: scratch.ffn_output,
         x_norm_batch: scratch.hc_mixed,
         x_rot_batch: scratch.moe_x_rot,
         expert_gate_up_ptrs: moe.expert_gate_up_ptrs,

@@ -807,3 +807,87 @@ def mtp_embedding_projection(
         "projected_hidden": projected_hidden.reshape(len(token_ids), hc_count * hidden_size),
         "residual_input": tensor((len(token_ids), hc_count * hidden_size), result, "float32"),
     }
+
+
+# ---------------------------------------------------------------------------
+# NON-UPSTREAM dense FFN (developer-only ``tiny-dense-dev`` profile)
+# ---------------------------------------------------------------------------
+#
+# The pinned Transformers 93c8b7b4 decoder constructs its MLP slot as
+# ``Qwen4ExpTextSparseMoeBlock`` unconditionally and its configuration rejects
+# ``num_experts <= 0``: there is NO upstream dense decoder.  The function below
+# is hipfire's own labelled equation for the dense-FFN hypothesis.  It uses the
+# arithmetic of ``Qwen4ExpTextMLP.forward`` (``down(act(gate(x)) * up(x))``,
+# activation SiLU) at a declared ``intermediate_size`` and BF16 rounding after
+# every projection / activation / product, but it is evidence for nothing
+# upstream: manifests label every dump produced through it
+# ``equation_source = "non-upstream-dense"``.
+
+DENSE_FFN_EQUATION_SOURCE = "non-upstream-dense"
+
+
+def bf16_round(value: float) -> float:
+    """Round one scalar to the nearest BF16-representable float (RNE)."""
+
+    return bf16_value(bf16_word(value))
+
+
+def dense_ffn_non_upstream(
+    hidden: Tensor,
+    gate_weight: Tensor,
+    up_weight: Tensor,
+    down_weight: Tensor,
+    intermediate_size: int,
+    *,
+    round_bf16: bool = True,
+) -> dict[str, Tensor]:
+    """NON-UPSTREAM dense gated FFN: ``down(silu(gate(x)) * up(x))``.
+
+    ``hidden`` is ``[tokens, H]``; ``gate_weight`` / ``up_weight`` are
+    ``[intermediate_size, H]`` and ``down_weight`` is ``[H, intermediate_size]``
+    (``nn.Linear`` layout).  All values are float64-accumulated products of
+    BF16-representable operands.  With ``round_bf16`` every intermediate is
+    rounded to BF16 exactly where a BF16 PyTorch module would store one
+    (projection outputs, ``silu(gate)``, the product, the final output); with
+    ``round_bf16=False`` the same graph is rounded to F32 only.  Returns the
+    named intermediates so a fixture can dump every op.
+    """
+
+    if intermediate_size <= 0:
+        raise FixtureError(f"dense intermediate_size must be positive, got {intermediate_size}")
+    if hidden.ndim != 2:
+        raise FixtureError(f"dense FFN hidden must be [tokens, H], got {hidden.shape}")
+    tokens, width = hidden.shape
+    if gate_weight.shape != (intermediate_size, width) or up_weight.shape != (intermediate_size, width):
+        raise FixtureError(
+            f"dense gate/up weights must be [{intermediate_size}, {width}], got {gate_weight.shape} / {up_weight.shape}"
+        )
+    if down_weight.shape != (width, intermediate_size):
+        raise FixtureError(f"dense down weight must be [{width}, {intermediate_size}], got {down_weight.shape}")
+    store = bf16_round if round_bf16 else f32
+
+    def project(rows: Sequence[float], weight: Tensor, out_features: int, in_features: int) -> list[float]:
+        result: list[float] = []
+        for row in range(len(rows) // in_features):
+            x = rows[row * in_features : (row + 1) * in_features]
+            for out in range(out_features):
+                w = weight.data[out * in_features : (out + 1) * in_features]
+                total = 0.0
+                for a, b in zip(x, w):
+                    total += float(a) * float(b)
+                result.append(store(total))
+        return result
+
+    flat = [float(v) for v in hidden.data]
+    gate = project(flat, gate_weight, intermediate_size, width)
+    up = project(flat, up_weight, intermediate_size, width)
+    act = [store(silu_scalar(v)) for v in gate]
+    product = [store(a * u) for a, u in zip(act, up)]
+    output = project(product, down_weight, width, intermediate_size)
+    return {
+        "gate": tensor((tokens, intermediate_size), gate, "float32"),
+        "up": tensor((tokens, intermediate_size), up, "float32"),
+        "activation": tensor((tokens, intermediate_size), act, "float32"),
+        "product": tensor((tokens, intermediate_size), product, "float32"),
+        "output": tensor((tokens, width), output, "float32"),
+    }

@@ -57,6 +57,260 @@ fn discover_vl_path(model_path: &str) -> Option<std::path::PathBuf> {
     hipfire_runtime::sidecar::resolve_vl_sidecar(model_path)
 }
 
+/// `MemAvailable` the automatic prewarm of the PLE hot-row pack leaves at
+/// ready (`memory.ple_hot_store_bytes = auto`: budget = `MemAvailable` - this,
+/// capped at the pack). The pack's pages are clean page cache, counted in
+/// `MemAvailable` and dropped (never swapped) under pressure; the reserve
+/// covers what a request allocates without first reclaiming prewarmed pages.
+const PLE_HOT_PREWARM_RESERVE_BYTES: u64 = 4 << 30;
+
+/// Open the PLE hot-row store before the weight sweep: the `<model>.plehot`
+/// rank sidecar and the `<rows source>.plehotrows` hot-row pack cut from it
+/// (`hipfire-quantize ple-hot-pack`).  The rows source is the model file
+/// (monolithic artifact) or the PLE rows sidecar (`.ple-q4` / `.ple-q8`): the
+/// pack holds those rows verbatim, is bound to that file's length, and its
+/// worker verifies it against that file during the load; the row store reads
+/// the pack's rows from the pack once verified. The caller attaches the result
+/// to the bundle after assembly and sets the prewarm budget once the model is
+/// ready; dropping it stops and joins the worker, so every load error path
+/// quiesces it.
+///
+/// `None` = off: the kill switch (`0`, the default), a non-unified-memory
+/// GPU, an HFQ overlay, PLE rows that are neither Q8F16 nor Q4LM, or a missing
+/// or unusable sidecar or pack. `auto` is silent when it does not apply; an
+/// explicit budget says why not.
+fn start_ple_hot_store(
+    uma: bool,
+    hfq: &hipfire_runtime::hfq::HfqFile,
+    metadata: &hipfire_arch_qwen4::ple::PleHashMetadata,
+    descriptors: &[hipfire_runtime::model_source::SourceRangeDescriptor],
+    rows_path: &std::path::Path,
+    rows_file_bytes: u64,
+    model_path: &str,
+) -> Option<hipfire_arch_qwen4::bundle::PleHotWorker> {
+    use hipfire_config::memory::PleHotStoreBudget;
+    let started = std::time::Instant::now();
+    let explicit = match hipfire_config::memory::ple_hot_store_bytes() {
+        PleHotStoreBudget::Bytes(0) => return None,
+        PleHotStoreBudget::Bytes(bytes) => Some(bytes),
+        PleHotStoreBudget::Auto => None,
+    };
+    let skip = |why: &str| {
+        if explicit.is_some() {
+            eprintln!("  qwen4 ple hot store: off ({why})");
+        }
+    };
+    if !uma {
+        skip("needs a unified-memory GPU");
+        return None;
+    }
+    if hfq.has_overlay() {
+        skip("an HFQ overlay is attached; shard offsets would not match the model file");
+        return None;
+    }
+    let plan = match hipfire_arch_qwen4::bundle::ple_hot_plan(
+        metadata,
+        descriptors,
+        rows_path,
+        rows_file_bytes,
+    ) {
+        Ok(Some(plan)) => plan,
+        Ok(None) => {
+            skip("PLE rows are neither Q8F16 nor Q4LM");
+            return None;
+        }
+        Err(error) => {
+            eprintln!("  qwen4 ple hot store: off (PLE plan: {error})");
+            return None;
+        }
+    };
+    let sidecar = hipfire_config::memory::ple_hot_rank_file()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| std::path::PathBuf::from(format!("{model_path}.plehot")));
+    let pack = hipfire_config::memory::ple_hot_pack_file()
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            std::path::PathBuf::from(format!("{}.plehotrows", plan.source_path.display()))
+        });
+    if !sidecar.is_file() {
+        skip(&format!("no sidecar at {}", sidecar.display()));
+        return None;
+    }
+    if !pack.is_file() {
+        skip(&format!("no hot-row pack at {}", pack.display()));
+        return None;
+    }
+    let rank = match hipfire_runtime::ple_hot_store::PleHotRank::open(
+        &sidecar,
+        plan.padded_rows,
+        &plan.fingerprint_hex,
+    ) {
+        Ok(rank) => rank,
+        Err(error) => {
+            eprintln!(
+                "  qwen4 ple hot store: off (sidecar {}: {error})",
+                sidecar.display()
+            );
+            return None;
+        }
+    };
+    let store = match hipfire_runtime::ple_hot_store::HotRowStore::open(
+        rank,
+        &pack,
+        plan.rows_per_shard,
+        plan.row_encoding,
+        plan.encoded_row_bytes,
+        &plan.shard_offsets,
+        plan.source_file_bytes,
+    ) {
+        Ok(store) => store,
+        Err(error) => {
+            eprintln!("  qwen4 ple hot store: off ({error})");
+            return None;
+        }
+    };
+    eprintln!(
+        "  qwen4 ple hot store: sidecar {}, pack {}, setup {} ms",
+        sidecar.display(),
+        pack.display(),
+        started.elapsed().as_millis()
+    );
+    let handle = store.spawn_worker(&plan.source_path, plan.shard_offsets);
+    Some(hipfire_arch_qwen4::bundle::PleHotWorker::new(store, handle))
+}
+
+/// Bytes of the PLE hot-row pack to prewarm now that the model is ready: an
+/// explicit `memory.ple_hot_store_bytes`, or (`auto`) `MemAvailable` minus
+/// [`PLE_HOT_PREWARM_RESERVE_BYTES`]; the store caps it at the pack's size.
+fn ple_hot_prewarm_budget() -> (u64, Option<u64>) {
+    let available = hipfire_runtime::ple_hot_store::mem_available_bytes();
+    let budget = match hipfire_config::memory::ple_hot_store_bytes() {
+        hipfire_config::memory::PleHotStoreBudget::Bytes(bytes) => bytes,
+        hipfire_config::memory::PleHotStoreBudget::Auto => available.map_or(0, |available| {
+            available.saturating_sub(PLE_HOT_PREWARM_RESERVE_BYTES)
+        }),
+    };
+    (budget, available)
+}
+
+/// Why [`ple_prewarm_budget`] came out zero, for the load log.
+fn ple_prewarm_off_reason(available: Option<u64>, explicit_zero: bool) -> String {
+    if explicit_zero {
+        "memory.ple_prewarm_bytes = 0".to_string()
+    } else {
+        format!(
+            "MemAvailable {} MiB leaves no headroom over the {} MiB reserve",
+            available.map_or(0, |bytes| bytes / (1 << 20)),
+            PLE_PREWARM_RESERVE_BYTES / (1 << 20)
+        )
+    }
+}
+
+/// Default (`auto`) q4 PLE table prewarm: the hottest 15 GiB of rows (about
+/// as many rows as 28 GB of Q8), the knee of the warm-rows value curve.
+const PLE_PREWARM_AUTO_BYTES: u64 = 15 << 30;
+
+/// Host RAM an `auto` PLE table prewarm leaves free. Larger than the hot-row
+/// store's reserve: on Halo (MemAvailable ~24 GiB at ready) prewarming the
+/// whole 26.8 GiB q4 table pushed reclaim into the request, and Ciru 8K fell
+/// to 1,734 tok/s from 1,828 at 15 GiB.
+const PLE_PREWARM_RESERVE_BYTES: u64 = 8 << 30;
+
+/// Bytes of the q4 PLE table to prewarm now that the model is ready: an
+/// explicit `memory.ple_prewarm_bytes`, or (`auto`) [`PLE_PREWARM_AUTO_BYTES`]
+/// capped at `MemAvailable` minus [`PLE_PREWARM_RESERVE_BYTES`]; the
+/// prewarm caps it at the table's data.  The flag is whether the budget was
+/// set to zero.
+fn ple_prewarm_budget() -> (u64, Option<u64>, bool) {
+    let available = hipfire_runtime::ple_hot_store::mem_available_bytes();
+    match hipfire_config::memory::ple_prewarm_bytes() {
+        hipfire_config::memory::PleHotStoreBudget::Bytes(bytes) => (bytes, available, bytes == 0),
+        hipfire_config::memory::PleHotStoreBudget::Auto => (
+            available.map_or(0, |available| {
+                available
+                    .saturating_sub(PLE_PREWARM_RESERVE_BYTES)
+                    .min(PLE_PREWARM_AUTO_BYTES)
+            }),
+            available,
+            false,
+        ),
+    }
+}
+
+/// `auto` in-load fill of a rank-ordered q4 PLE table: the hottest 14 GiB.
+/// That is B* of the offline row-hit curve of the shipped rank (2026-10-11,
+/// `plehot/hcurve_q4.py`): the smallest prefix whose modelled held-out prose
+/// and agentic 8K prefill (TTFT = 4,177 + (1 − h) × 1,135 ms) is within 1% of
+/// the 15 GiB prewarm's (prose h 0.923 vs 0.937, agentic 0.809 vs 0.836).
+const PLE_LOAD_FILL_AUTO_BYTES: u64 = 14 << 30;
+
+/// Read rate cap of the in-load fill: a small share of the NVMe's sequential
+/// bandwidth, so the weight upload keeps the drive.
+const PLE_LOAD_FILL_BYTES_PER_SEC: u64 = 200_000_000;
+
+/// Bytes of a rank-ordered q4 PLE table to read while the model loads: the
+/// `requested` `memory.ple_load_fill_bytes` (`auto` = [`PLE_LOAD_FILL_AUTO_BYTES`])
+/// capped at an explicit `memory.ple_prewarm_bytes`, at the table, and at the
+/// host RAM available now (`MemAvailable` plus TTM's page pool, which the
+/// weights' GTT allocations take first) minus the weights still to load into
+/// host RAM minus [`PLE_PREWARM_RESERVE_BYTES`] (0 when unknown).
+fn ple_load_fill_bytes(
+    requested: hipfire_config::memory::PleHotStoreBudget,
+    prewarm: hipfire_config::memory::PleHotStoreBudget,
+    host_available: Option<u64>,
+    host_weight_bytes: u64,
+    table_bytes: u64,
+) -> u64 {
+    use hipfire_config::memory::PleHotStoreBudget;
+    let requested = match requested {
+        PleHotStoreBudget::Bytes(bytes) => bytes,
+        PleHotStoreBudget::Auto => PLE_LOAD_FILL_AUTO_BYTES,
+    };
+    let prewarm = match prewarm {
+        PleHotStoreBudget::Bytes(bytes) => bytes,
+        PleHotStoreBudget::Auto => u64::MAX,
+    };
+    let host = host_available.map_or(0, |available| {
+        available
+            .saturating_sub(host_weight_bytes)
+            .saturating_sub(PLE_PREWARM_RESERVE_BYTES)
+    });
+    requested.min(prewarm).min(host).min(table_bytes)
+}
+
+/// Start the worker of a rank-ordered q4 PLE table before the weight sweep,
+/// with an in-load fill of its hottest prefix when
+/// [`ple_load_fill_bytes`] allows one. The worker prewarms on from there
+/// once the model is ready; dropping it stops and joins it.
+fn start_ple_table_worker(
+    store: &std::sync::Arc<hipfire_runtime::ple_hot_store::HotRowStore>,
+    host_weight_bytes: u64,
+) -> hipfire_arch_qwen4::bundle::PleHotWorker {
+    const MIB: u64 = 1 << 20;
+    let host_available = rdna_compute::uma_memory::host_available_bytes();
+    let bytes = ple_load_fill_bytes(
+        hipfire_config::memory::ple_load_fill_bytes(),
+        hipfire_config::memory::ple_prewarm_bytes(),
+        host_available,
+        host_weight_bytes,
+        store.data_bytes(),
+    );
+    eprintln!(
+        "  qwen4 ple load fill: {} MiB of a {} MiB q4 table while loading, at most {} MB/s \
+         (host available {} MiB incl. TTM pool, weights to host RAM {} MiB)",
+        bytes / MIB,
+        store.data_bytes() / MIB,
+        PLE_LOAD_FILL_BYTES_PER_SEC / 1_000_000,
+        host_available.map_or(0, |bytes| bytes / MIB),
+        host_weight_bytes / MIB,
+    );
+    let fill = (bytes > 0).then_some(hipfire_runtime::ple_hot_store::LoadFill {
+        bytes,
+        bytes_per_sec: PLE_LOAD_FILL_BYTES_PER_SEC,
+    });
+    hipfire_arch_qwen4::bundle::PleHotWorker::new(store.clone(), store.spawn_table_worker(fill))
+}
+
 fn resolve_source_meta(src: &ModelSource, path: &str) -> Result<SourceMeta, String> {
     match src {
         ModelSource::Hfq(hfq) => Ok(SourceMeta {
@@ -231,7 +485,10 @@ pub fn prepare_host_memory_for(model: &std::path::Path) {
     let Some(devices) = hipfire_config::devices::startup_devices() else {
         return;
     };
-    let archs = devices.iter().map(|device| device.arch.as_str()).collect::<Vec<_>>();
+    let archs = devices
+        .iter()
+        .map(|device| device.arch.as_str())
+        .collect::<Vec<_>>();
     if hipfire_arch_qwen4::expert_residency::keeps_host_memory_out_of_reclaim(arch_id, &archs) {
         hip_bridge::keep_host_memory_out_of_reclaim(&format!("Qwen4 model on {}", archs.join(",")));
     }
@@ -339,7 +596,10 @@ impl Carrier for Qwen4Carrier {
 
     fn caps(&self) -> saddle_core::caps::ArchCaps {
         saddle_core::caps::ArchCaps {
-            supports_continuous_batch: false,
+            // The only qwen4 batch route is the exact fn-lanes route, staged
+            // under `serve.vmm_batch` (`batch_staging::stage_qwen4_lanes`);
+            // there is no fixed-lane qwen4 batch state.
+            supports_continuous_batch: true,
             supports_ep_batch: false,
             dflash: None,
             supports_mtp: true,
@@ -420,20 +680,166 @@ impl Carrier for Qwen4Carrier {
                 "qwen4: safetensors is a conversion input, not an executable HFQ artifact".into(),
             );
         };
+        // The PLE rows source (`memory.ple_format`).  Admission already
+        // resolved and attached a sidecar on this source; resolving again is
+        // idempotent and yields the choice for the load log (and covers a
+        // source that reaches the carrier without admission).  A developer
+        // profile's embedded rows (or a profile without PLE) have no sidecar
+        // to resolve: `None`.
+        let choice =
+            crate::admission::resolve_qwen4_ple_rows_hfq(&mut hfq, ctx.path, &ctx.gpu.arch)?;
         let receipt =
             hipfire_arch_qwen4::admit_hfqm_artifact(&hfq).map_err(|error| error.to_string())?;
+        // Refused before any allocation (source admission applies the same
+        // check): an inventory-valid developer profile the executor cannot
+        // run would otherwise fail after the weights were fulfilled.
+        hipfire_arch_qwen4::bundle::admit_executable_profile(&receipt.config)
+            .map_err(|error| format!("qwen4: {error}"))?;
+        // The profile is known: the head-free MTP and developer-PLE refusals
+        // happen here, before any allocation (source admission applies the
+        // same checks).
+        let requested_native_mtp = native_mtp;
+        native_mtp = crate::admission::qwen4_native_mtp_for_head(
+            native_mtp,
+            ctx.spec.mtp,
+            receipt.config.mtp.is_some(),
+            receipt.config.profile.id(),
+        )?;
+        if requested_native_mtp && !native_mtp {
+            eprintln!(
+                "  qwen4 native MTP: off (profile {} has no MTP head)",
+                receipt.config.profile.id()
+            );
+        }
+        if let Some(note) = crate::admission::qwen4_developer_ple_policy(
+            receipt.config.profile.is_flash_next(),
+            receipt.config.profile.id(),
+            hipfire_config::memory::ple_format(),
+            hipfire_config::memory::ple_hot_store_bytes(),
+        )? {
+            eprintln!("  qwen4 {note}");
+        }
+        // A rank-order table is its own hot-row pack and is served through
+        // its store; every other source reads through 128 shard descriptors.
+        let rank_table = receipt.ple_rows.rank_table().cloned();
+        let ple_descriptors = match rank_table {
+            Some(_) => None,
+            None => Some(
+                receipt
+                    .ple_row_descriptors(&hfq)
+                    .map_err(|error| error.to_string())?,
+            ),
+        };
+        let (ple_rows_path, ple_rows_bytes) = match &receipt.ple_rows {
+            hipfire_arch_qwen4::Qwen4PleRows::Absent => (std::path::PathBuf::new(), 0),
+            _ => receipt
+                .ple_rows_source(&hfq)
+                .map_err(|error| error.to_string())?,
+        };
+        let (rows_encoding, rows_total) = match &receipt.ple_rows {
+            hipfire_arch_qwen4::Qwen4PleRows::Absent => (String::new(), 0),
+            hipfire_arch_qwen4::Qwen4PleRows::Sidecar { encoding, .. } => (
+                encoding.dtype_name().to_string(),
+                hfq.ple_rows().map_or(0, |rows| rows.header().data_bytes),
+            ),
+            hipfire_arch_qwen4::Qwen4PleRows::Embedded => {
+                let descriptors = ple_descriptors.as_deref().unwrap_or_default();
+                (
+                    descriptors
+                        .first()
+                        .map_or_else(String::new, |descriptor| descriptor.dtype.clone()),
+                    descriptors.iter().map(|descriptor| descriptor.length).sum(),
+                )
+            }
+        };
+        match &choice {
+            Some(choice) => {
+                eprintln!(
+                    "  qwen4 ple rows: {} from {} ({rows_encoding}, {} order, {:.1} GB)",
+                    choice.format.name(),
+                    match &choice.origin {
+                        hipfire_runtime::ple_sidecar::PleRowsOrigin::Embedded => {
+                            "embedded model file".to_string()
+                        }
+                        hipfire_runtime::ple_sidecar::PleRowsOrigin::Sidecar(path) => {
+                            path.display().to_string()
+                        }
+                    },
+                    if rank_table.is_some() { "rank" } else { "row" },
+                    rows_total as f64 / 1e9
+                );
+                if let Some(note) = &choice.note {
+                    eprintln!("  qwen4 ple rows: {note}");
+                }
+            }
+            None => match &receipt.ple_rows {
+                hipfire_arch_qwen4::Qwen4PleRows::Absent => eprintln!(
+                    "  qwen4 ple rows: none (profile {} declares no PLE)",
+                    receipt.config.profile.id()
+                ),
+                _ => eprintln!(
+                    "  qwen4 ple rows: embedded developer rows ({rows_encoding}, {:.3} MB)",
+                    rows_total as f64 / 1e6
+                ),
+            },
+        }
+        // The row-order q4 sidecar's data section, for the post-ready
+        // page-cache prewarm (when no hot store attaches).
+        let q4_prewarm = hfq
+            .ple_rows()
+            .filter(|rows| {
+                rows.encoding() == hipfire_runtime::external_rows::RowEncoding::Q4Lm
+                    && rows.order() == hipfire_runtime::ple_hot_pack::PackOrder::Row
+            })
+            .map(|rows| {
+                (
+                    rows.path().to_path_buf(),
+                    rows.header().data_offset,
+                    rows.header().data_bytes,
+                )
+            });
+        // The PLE rows source is part of what the forward pass computes with:
+        // a different encoding, order or file is a different cache domain.
+        let ple_identity = hfq.ple_rows().map_or_else(
+            || "embedded".to_string(),
+            |rows| {
+                format!(
+                    "{}:{:?}:{}",
+                    rows.encoding().dtype_name(),
+                    rows.order(),
+                    rows.header()
+                        .table
+                        .as_ref()
+                        .map_or("", |table| table.data_sha256.as_str())
+                )
+            },
+        );
+        let recipe = receipt.recipe().clone();
         let config = receipt.config;
         let mut manifest = receipt.manifest;
         let metadata = receipt.ple;
+        // A dense FFN has no routed experts: its gate/up/down are ordinary
+        // resident weights and the host-expert placement does not apply.
+        let routed_experts = !config.ffn.is_dense();
         let placements = receipt.placements;
-        let session_domain = hipfire_runtime::serve_contract::CacheDomain::for_model(
+        let ple_rows = receipt.ple_rows;
+        let mut session_domain = hipfire_runtime::serve_contract::CacheDomain::for_model(
             &hfq,
             &meta.tokenizer,
             meta.chat_template.as_deref(),
             "qwen4",
             ctx.gpu.device_id,
         );
+        session_domain
+            .sidecar_digests
+            .push(hipfire_runtime::serve_contract::sha256_len_prefixed(&[
+                b"qwen4-ple-rows",
+                ple_identity.as_bytes(),
+            ]));
         let session_budget = hipfire_config::memory::session_cache_bytes();
+        // An automatic context (omitted max_seq; unified memory only) is
+        // sized after load from what is left (card_cap).
+        let automatic = ctx.sequence.is_some_and(|sequence| sequence.automatic);
         let use_ranges = ctx.gpu.is_uma();
         if use_ranges {
             hfq.drop_mmap();
@@ -459,8 +865,15 @@ impl Carrier for Qwen4Carrier {
         );
         use hipfire_arch_qwen4::expert_residency as residency;
         const MIB: u64 = 1 << 20;
+        // Unified memory dropped the mapping above: size from the index.
         let bytes_of = |entry: &hipfire_runtime::weight_manifest::WeightEntry| {
-            hfq.tensor_data(&entry.name).map(|(_, bytes)| bytes.len() as u64)
+            if use_ranges {
+                hfq.find_tensor_info(&entry.name)
+                    .map(|info| info.data_size as u64)
+            } else {
+                hfq.tensor_data(&entry.name)
+                    .map(|(_, bytes)| bytes.len() as u64)
+            }
         };
         // What `auto` sizes its placement from: free VRAM, the non-expert and
         // per-layer expert bytes, and the reserve (with its native MTP and
@@ -472,13 +885,15 @@ impl Carrier for Qwen4Carrier {
         let auto_inputs = || -> Result<(u64, u64, u64, u64, Option<u64>, Option<u64>), String> {
             let (free, _) = ctx
                 .gpu
-                .hip
-                .get_vram_info()
-                .map_err(|error| format!("qwen4: VRAM query: {error}"))?;
-            let (non_expert, layer_experts) = residency::resident_split(&manifest.weights, bytes_of)
-                .map_err(|error| format!("qwen4: {error}"))?;
-            let chunk_rows =
-                hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(&ctx.gpu.arch, ctx.max_seq);
+                .device_mem_info()
+                .map_err(|error| format!("qwen4: device memory query: {error}"))?;
+            let (non_expert, layer_experts) =
+                residency::resident_split(&manifest.weights, bytes_of)
+                    .map_err(|error| format!("qwen4: {error}"))?;
+            let chunk_rows = hipfire_arch_qwen4::gpu_forward::qwen4_prefill_chunk_requested(
+                &ctx.gpu.arch,
+                ctx.max_seq,
+            );
             let context = hipfire_arch_qwen4::Qwen4ContextCommit::for_expert_reserve(
                 backend,
                 use_ranges,
@@ -491,12 +906,17 @@ impl Carrier for Qwen4Carrier {
             // host-mapped policy keeps it (exact gfx1201, or an explicit
             // `--spec mtp`); only then does it need VRAM.
             let mtp_kept = native_mtp
-                && crate::admission::qwen4_mtp_with_host_mapped_experts(ctx.spec, &ctx.gpu.arch, 1);
+                && crate::admission::qwen4_mtp_with_host_mapped_experts(
+                    ctx.spec,
+                    &ctx.gpu.arch,
+                    usize::from(routed_experts),
+                );
             let mtp_bytes = if mtp_kept {
                 let head = residency::language_head_dtype(&manifest.weights)
                     .ok_or("qwen4: manifest has no language head")?;
-                let row_capture = hipfire_arch_qwen4::mtp_spec::native_mtp_row_capture(ctx.gpu, &config)
-                    .then_some(state_format.gdn);
+                let row_capture =
+                    hipfire_arch_qwen4::mtp_spec::native_mtp_row_capture(ctx.gpu, &config)
+                        .then_some(state_format.gdn);
                 Some(
                     hipfire_arch_qwen4::mtp_spec::native_mtp_device_bytes(
                         &config,
@@ -516,30 +936,76 @@ impl Carrier for Qwen4Carrier {
             // the context is (none when the route is off: the reserve is then
             // unchanged). Bytes already committed by an earlier load in this
             // process are out of `free` and only growth past them is charged.
-            let gather_bytes = rdna_compute::tensor_ops::qsa_gathered_wmma_enabled(ctx.gpu, qsa_format)
-                .then(|| {
-                    rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(
-                        config.num_key_value_heads,
-                        context.tokens,
-                    )
-                    .map(|bytes| (bytes as u64).saturating_sub(ctx.gpu.qsa_gather_scratch_bytes() as u64))
-                    .ok_or("qwen4: QSA gather scratch size overflows")
-                })
-                .transpose()?;
-            let reserve =
-                residency::auto_vram_reserve(&config, &context, chunk_rows, qsa_format, mtp_bytes, gather_bytes)
-                    .map_err(|error| format!("qwen4: {error}"))?;
-            Ok((free as u64, non_expert, layer_experts, reserve, mtp_bytes, gather_bytes))
+            let gather_bytes =
+                rdna_compute::tensor_ops::qsa_gathered_wmma_enabled(ctx.gpu, qsa_format)
+                    .then(|| {
+                        rdna_compute::tensor_ops::qsa_gathered_wmma_scratch_bytes(
+                            config.num_key_value_heads,
+                            context.tokens,
+                        )
+                        .map(|bytes| {
+                            (bytes as u64).saturating_sub(ctx.gpu.qsa_gather_scratch_bytes() as u64)
+                        })
+                        .ok_or("qwen4: QSA gather scratch size overflows")
+                    })
+                    .transpose()?;
+            let reserve = residency::auto_vram_reserve(
+                &config,
+                &context,
+                chunk_rows,
+                qsa_format,
+                mtp_bytes,
+                gather_bytes,
+            )
+            .map_err(|error| format!("qwen4: {error}"))?;
+            Ok((
+                free as u64,
+                non_expert,
+                layer_experts,
+                reserve,
+                mtp_bytes,
+                gather_bytes,
+            ))
         };
         let explicit =
             residency::expert_vram_layers_from_env().map_err(|error| format!("qwen4: {error}"))?;
+        if !routed_experts {
+            residency::refuse_host_expert_request(explicit, config.profile.id())
+                .map_err(|error| format!("qwen4: {error}"))?;
+        }
         // Unset on a discrete card: fully resident only where every routed
         // expert, the non-expert weights and the `auto` reserve fit in free
         // VRAM; otherwise `auto` (an unconditional resident load would fail
-        // `hipMalloc` part-way). Unified memory keeps the resident load.
+        // `hipMalloc` part-way). Unified memory keeps the resident load, but
+        // refuses it up front (with `memory.oom_guard`) when it does not fit
+        // the free device memory, GTT clamped to host RAM: an overshoot there
+        // reaches the global OOM killer.
         let mut measured = None;
         let mut unset_note = String::new();
         let placement = if use_ranges {
+            if explicit.is_none() {
+                let (free, non_expert, _, reserve, ..) = auto_inputs()?;
+                let experts = residency::routed_expert_bytes(&manifest.weights, bytes_of)
+                    .map_err(|error| format!("qwen4: {error}"))?;
+                let fits = residency::fits_fully_resident(free, non_expert, experts, reserve);
+                let detail = format!(
+                    "{} MiB routed experts + {} MiB non-expert weights + {} MiB reserve {} {} MiB free device memory",
+                    experts / MIB,
+                    non_expert / MIB,
+                    reserve / MIB,
+                    if fits { "fit in" } else { "exceed" },
+                    free / MIB
+                );
+                if !fits {
+                    if hipfire_config::oom_guard_effective(Some(&ctx.gpu.arch)) {
+                        return Err(format!(
+                            "qwen4: unified memory cannot hold the resident load ({detail}); free host memory"
+                        ));
+                    }
+                    eprintln!("  qwen4: {detail} (memory.oom_guard off: loading anyway)");
+                }
+                unset_note = format!(" ({detail})");
+            }
             explicit
         } else {
             residency::resolve_expert_vram_layers(explicit, || {
@@ -560,16 +1026,23 @@ impl Carrier for Qwen4Carrier {
                 Ok(fits)
             })?
         };
+        if !routed_experts && placement.is_some() {
+            return Err(format!(
+                "qwen4: profile {} has a dense FFN (no routed experts to move to host RAM) and its resident weights do not fit device memory{unset_note}; free VRAM or lower memory.max_seq",
+                config.profile.id()
+            ));
+        }
         eprintln!(
             "  qwen4 expert placement: {}{unset_note}",
             match (explicit, placement) {
-                (Some(residency::ExpertVramLayers::Layers(layers)), _) => format!(
-                    "{}={layers}",
-                    residency::EXPERT_VRAM_LAYERS_ENV
-                ),
+                (Some(residency::ExpertVramLayers::Layers(layers)), _) =>
+                    format!("{}={layers}", residency::EXPERT_VRAM_LAYERS_ENV),
                 (Some(residency::ExpertVramLayers::Auto), _) =>
                     format!("{}=auto", residency::EXPERT_VRAM_LAYERS_ENV),
-                (None, None) => format!("{} unset, fully resident", residency::EXPERT_VRAM_LAYERS_ENV),
+                (None, None) => format!(
+                    "{} unset, fully resident",
+                    residency::EXPERT_VRAM_LAYERS_ENV
+                ),
                 (None, Some(_)) => format!("{} unset, auto", residency::EXPERT_VRAM_LAYERS_ENV),
             }
         );
@@ -649,7 +1122,11 @@ impl Carrier for Qwen4Carrier {
                 gib(ttm_pool)
             );
             if native_mtp
-                && !crate::admission::qwen4_mtp_with_host_mapped_experts(ctx.spec, &ctx.gpu.arch, moved)
+                && !crate::admission::qwen4_mtp_with_host_mapped_experts(
+                    ctx.spec,
+                    &ctx.gpu.arch,
+                    moved,
+                )
             {
                 native_mtp = false;
                 eprintln!(
@@ -674,10 +1151,48 @@ impl Carrier for Qwen4Carrier {
             .map_or(usize::MAX, |bytes| bytes >> 20);
         let mesh = DeviceMesh::single().map_err(|error| format!("qwen4: mesh: {error}"))?;
         let expected = WeightOrigin::for_single(&mesh, ctx.gpu);
+        // A rank-order PLE table's worker starts now: it reads the table's
+        // hottest prefix at a capped rate while the weights load, and
+        // prewarms on from there once the model is ready. The PLE hot-row
+        // store also opens before the weight sweep (while the source index is
+        // in hand); its worker verifies the pack meanwhile and prewarms it
+        // once the model is ready. Dropping either on an error path stops and
+        // joins its worker.
+        let ple_table_worker = rank_table.as_ref().map(|store| {
+            // What the sweep puts in host RAM: on unified memory every
+            // uploaded weight (external PLE rows stay on disk), on a discrete
+            // card the host-mapped experts.
+            let host_weight_bytes = if use_ranges {
+                manifest
+                    .weights
+                    .iter()
+                    .filter(|entry| !entry.residency.is_external())
+                    .filter_map(|entry| bytes_of(entry))
+                    .sum()
+            } else {
+                residency::host_mapped_bytes(&manifest.weights, bytes_of).unwrap_or(0)
+            };
+            start_ple_table_worker(store, host_weight_bytes)
+        });
+        let ple_hot = match (&metadata, ple_descriptors.as_deref()) {
+            (Some(metadata), Some(descriptors)) if config.profile.is_flash_next() => {
+                start_ple_hot_store(
+                    use_ranges,
+                    &hfq,
+                    metadata,
+                    descriptors,
+                    &ple_rows_path,
+                    ple_rows_bytes,
+                    ctx.path,
+                )
+            }
+            _ => None,
+        };
         let source = HfqModelSource::from_hfq(hfq);
         // Every allocation of the weight sweep is immutable model data: railgun
         // check mode verifies it unchanged instead of snapshotting it (§2.4).
-        let weights_role = hip_bridge::registry::role_scope(hip_bridge::registry::AllocationRole::Weights);
+        let weights_role =
+            hip_bridge::registry::role_scope(hip_bridge::registry::AllocationRole::Weights);
         let transaction = fulfill_manifest_from_payloads(
             &manifest.weights,
             &mesh,
@@ -706,13 +1221,15 @@ impl Carrier for Qwen4Carrier {
         )
         .map_err(|error| format!("qwen4: manifest fulfillment failed: {error}"))?;
         drop(weights_role);
-        let mut bundle = hipfire_arch_qwen4::bundle::Qwen4Bundle::assemble_with_metadata(
+        let mut bundle = hipfire_arch_qwen4::bundle::Qwen4Bundle::assemble_with_ple_rows(
             config,
+            &recipe,
             transaction,
             &placements,
             ctx.gpu,
             ctx.max_seq,
             metadata,
+            ple_rows,
             state_format,
             backend,
         )
@@ -726,17 +1243,98 @@ impl Carrier for Qwen4Carrier {
                 ctx.max_seq
             ),
         })?;
+        // The row store reads the pack's rows from the pack once the worker
+        // has verified it.
+        if let Some(hot) = ple_hot {
+            if let Err(error) = bundle.attach_ple_hot_store(hot) {
+                let detail = error.to_string();
+                let _ = bundle.free_gpu(ctx.gpu);
+                return Err(format!("qwen4: PLE hot store setup failed: {detail}"));
+            }
+        }
         if let Err(error) = bundle.attach_forward(ctx.gpu, ctx.max_seq) {
             let detail = error.to_string();
             let _ = bundle.free_gpu(ctx.gpu);
             return Err(format!("qwen4: forward setup failed: {detail}"));
         }
-        let speculator = if native_mtp {
+        if native_mtp {
             if let Err(error) = bundle.attach_mtp(ctx.gpu, ctx.max_seq) {
                 let detail = error.to_string();
                 let _ = bundle.free_gpu(ctx.gpu);
                 return Err(format!("qwen4: MTP setup failed: {detail}"));
             }
+        }
+        // Unified memory (the only place admission resolves a sequence):
+        // admit what requests commit after load (VMM context and gather
+        // pages, native MTP request buffers) against the device memory the
+        // load left free (`device_mem_info`: GTT clamped to host RAM): an
+        // automatic context is the model's, capped by what fits (card_cap);
+        // an explicit one must fit whole. The session cache is not charged:
+        // its snapshots yield to context growth. A discrete GPU keeps its
+        // requested context unchecked, as before.
+        let admission = ctx.sequence.is_some().then(
+            || -> Result<crate::admission::Qwen4MemoryAdmission, String> {
+                let mtp_request = if native_mtp {
+                    let config = &bundle.config;
+                    hipfire_arch_qwen4::mtp_spec::native_mtp_request_bytes(
+                        config,
+                        ctx.max_seq,
+                        bundle.spec_chunk_rows().unwrap_or(1).max(1),
+                        max_k,
+                        hipfire_arch_qwen4::mtp_spec::native_mtp_row_capture(ctx.gpu, config)
+                            .then_some(state_format.gdn),
+                        hipfire_arch_qwen4::mtp_spec::native_mtp_batched_fill(ctx.gpu),
+                    )
+                    .ok_or("qwen4: native MTP request bytes overflow")?
+                } else {
+                    0
+                };
+                let (free, _) = ctx
+                    .gpu
+                    .device_mem_info()
+                    .map_err(|error| format!("qwen4: device memory query: {error}"))?;
+                let gpu = &*ctx.gpu;
+                crate::admission::qwen4_memory_admission(
+                    ctx.max_seq,
+                    (!automatic).then_some(ctx.max_seq),
+                    free as u64,
+                    mtp_request,
+                    crate::admission::QWEN4_MEMORY_HEADROOM_BYTES,
+                    |tokens| bundle.context_growth_bytes(gpu, tokens),
+                )
+            },
+        );
+        let max_seq = match admission {
+            None => ctx.max_seq,
+            Some(Ok(admission)) => {
+                eprintln!(
+                    "  qwen4 memory admission: {} MiB free after load; a {}-token context commits {} MiB more ({} MiB QSA context + {} MiB gather workspace + {} MiB MTP request) + {} MiB headroom; card_cap {} tokens",
+                    admission.free / MIB,
+                    admission.max_seq,
+                    admission.growth() / MIB,
+                    admission.context_growth / MIB,
+                    admission.gather_growth / MIB,
+                    admission.mtp_request / MIB,
+                    admission.headroom / MIB,
+                    admission.card_cap
+                );
+                if let Some(sequence) = ctx.sequence.as_mut() {
+                    sequence.card_cap = admission.card_cap;
+                }
+                admission.max_seq
+            }
+            Some(Err(error))
+                if automatic || hipfire_config::oom_guard_effective(Some(&ctx.gpu.arch)) =>
+            {
+                let _ = bundle.free_gpu(ctx.gpu);
+                return Err(error);
+            }
+            Some(Err(error)) => {
+                eprintln!("  {error} (memory.oom_guard off: loading anyway)");
+                ctx.max_seq
+            }
+        };
+        let speculator = if native_mtp {
             eprintln!("  qwen4 native MTP speculator enabled (K={max_k})");
             let arch = hipfire_arch_qwen4::ARCH_ID;
             let ngram = match hipfire_arch_qwen4::mtp_spec::qwen4_ngram_mod_config(
@@ -763,7 +1361,7 @@ impl Carrier for Qwen4Carrier {
             };
             Some(hipfire_arch_qwen4::mtp_spec::build_qwen4_mtp_speculator(
                 max_k,
-                ctx.max_seq,
+                max_seq,
                 meta.tokenizer.special_token_id("<|im_end|>"),
                 ngram,
             ))
@@ -784,7 +1382,7 @@ impl Carrier for Qwen4Carrier {
                 session_budget,
             ));
             eprintln!(
-                "  qwen4 session cache: {} MiB budget, {} MiB per {chunk}-token snapshot",
+                "  qwen4 session cache: {} MiB budget, {} MiB per {chunk}-token snapshot; snapshots yield to context growth",
                 session_budget >> 20,
                 one >> 20
             );
@@ -793,6 +1391,82 @@ impl Carrier for Qwen4Carrier {
                 eprintln!(
                     "  qwen4 session cache: message-end snapshots on (HIPFIRE_QWEN4_TURN_SNAPSHOTS)"
                 );
+            }
+        }
+        // The model is loaded and admitted: a rank-order PLE table's worker
+        // (it serves from the start; the worker only reads ahead) ends its
+        // in-load fill and prewarms on from there, or the PLE hot-row store's
+        // worker prewarms the hottest rows into the page cache, while no
+        // request is served (every PLE fetch pauses it).
+        if let Some(worker) = ple_table_worker {
+            let store = worker.store().clone();
+            let (budget, available, explicit_zero) = ple_prewarm_budget();
+            store.set_prewarm_budget(budget);
+            // The fill's own `load fill stopped at ready` line reports what it
+            // left resident; the prewarm continues from there.
+            if budget == 0 {
+                eprintln!(
+                    "  qwen4 ple prewarm: off ({})",
+                    ple_prewarm_off_reason(available, explicit_zero),
+                );
+            } else {
+                eprintln!(
+                    "  qwen4 ple prewarm: budget {} MiB of a {} MiB q4 sidecar (MemAvailable {} MiB)",
+                    budget.min(store.data_bytes()) / MIB,
+                    store.data_bytes() / MIB,
+                    available.map_or(0, |bytes| bytes / MIB),
+                );
+            }
+            if let Err(error) = bundle.attach_ple_table_worker(worker) {
+                let detail = error.to_string();
+                let _ = bundle.free_gpu(ctx.gpu);
+                return Err(format!("qwen4: PLE table worker setup failed: {detail}"));
+            }
+        } else if let Some(store) = bundle.ple_hot_store() {
+            let (budget, available) = ple_hot_prewarm_budget();
+            store.set_prewarm_budget(budget);
+            eprintln!(
+                "  qwen4 ple hot store: prewarm budget {} MiB of a {} MiB pack (MemAvailable {} MiB)",
+                budget.min(store.data_bytes()) / MIB,
+                store.data_bytes() / MIB,
+                available.map_or(0, |bytes| bytes / MIB),
+            );
+        } else if let Some((sidecar, data_offset, data_bytes)) = &q4_prewarm {
+            // No hot store: the rows come from the q4 sidecar, whose pages a
+            // request would otherwise fault in cold.  An idle-only sequential
+            // read warms the page cache (clean pages, reclaimable).
+            let (budget, available, explicit_zero) = ple_prewarm_budget();
+            if budget == 0 {
+                eprintln!(
+                    "  qwen4 ple prewarm: off ({})",
+                    ple_prewarm_off_reason(available, explicit_zero)
+                );
+            } else {
+                match bundle
+                    .ple_rows()
+                    .ok_or_else(|| std::io::Error::other("the bundle has no PLE row store"))
+                    .and_then(|rows| {
+                        hipfire_runtime::ple_prewarm::PleRowsPrewarm::spawn(
+                            sidecar,
+                            *data_offset,
+                            *data_bytes,
+                            rows.activity(),
+                        )
+                    }) {
+                    Ok(prewarm) => {
+                        prewarm.set_budget(budget);
+                        eprintln!(
+                            "  qwen4 ple prewarm: budget {} MiB of a {} MiB q4 sidecar (MemAvailable {} MiB)",
+                            budget.min(*data_bytes) / MIB,
+                            data_bytes / MIB,
+                            available.map_or(0, |bytes| bytes / MIB),
+                        );
+                        if let Err(error) = bundle.attach_ple_prewarm(prewarm) {
+                            eprintln!("  qwen4 ple prewarm: off ({error})");
+                        }
+                    }
+                    Err(error) => eprintln!("  qwen4 ple prewarm: off ({error})"),
+                }
             }
         }
         match bundle.qsa_context_committed_bytes(ctx.gpu) {
@@ -815,8 +1489,8 @@ impl Carrier for Qwen4Carrier {
             ..LoadedModel::skeleton(
                 meta.arch_id,
                 meta.tokenizer,
-                ctx.max_seq,
-                ctx.max_seq,
+                max_seq,
+                max_seq,
                 ctx.path.to_string(),
                 meta.chat_template,
             )
@@ -1086,6 +1760,7 @@ fn load_qwen35_pp(
         vision_weights: None,
         qwen35_decode_batch: None,
         vmm_store: None,
+        weight_lease: None,
     };
     Ok(LoadedModel {
         state: Some(Box::new(bundle)),
@@ -1643,6 +2318,7 @@ impl Carrier for Qwen35Carrier {
                     vision_weights: None,
                     qwen35_decode_batch: None,
                     vmm_store: None,
+                    weight_lease: None,
                 };
                 Ok(LoadedModel {
                     state: Some(Box::new(bundle)),
@@ -1690,7 +2366,6 @@ impl Carrier for Qwen35Carrier {
         .map_err(|e| format!("SlotEngine spawn: {e}"))?;
         Ok(Box::new(engine))
     }
-
 }
 
 // ─── LlamaCarrier ────────────────────────────────────────────────────
@@ -3913,5 +4588,53 @@ mod qwen4_admission_tests {
         assert!(Qwen4Carrier
             .admit_options(Some("draft.hfq"), defaults)
             .is_err());
+    }
+}
+
+#[cfg(test)]
+mod qwen4_ple_load_fill_tests {
+    use super::{ple_load_fill_bytes, PLE_LOAD_FILL_AUTO_BYTES, PLE_PREWARM_RESERVE_BYTES};
+    use hipfire_config::memory::PleHotStoreBudget::{Auto, Bytes};
+
+    const GIB: u64 = 1 << 30;
+
+    #[test]
+    fn auto_reads_b_star_when_the_host_has_room() {
+        // Halo at load start: ~112 GiB available, ~66 GiB of weights to load.
+        assert_eq!(
+            ple_load_fill_bytes(Auto, Auto, Some(112 * GIB), 66 * GIB, 27 * GIB),
+            PLE_LOAD_FILL_AUTO_BYTES
+        );
+    }
+
+    #[test]
+    fn caps_apply_in_every_mode() {
+        // The memory left after the weights and the reserve.
+        assert_eq!(
+            ple_load_fill_bytes(Auto, Auto, Some(80 * GIB), 66 * GIB, 27 * GIB),
+            80 * GIB - 66 * GIB - PLE_PREWARM_RESERVE_BYTES
+        );
+        assert_eq!(
+            ple_load_fill_bytes(Bytes(20 * GIB), Auto, Some(60 * GIB), 66 * GIB, 27 * GIB),
+            0
+        );
+        assert_eq!(ple_load_fill_bytes(Auto, Auto, None, 0, 27 * GIB), 0);
+        // An explicit prewarm budget, and the table.
+        assert_eq!(
+            ple_load_fill_bytes(Auto, Bytes(2 * GIB), Some(112 * GIB), 66 * GIB, 27 * GIB),
+            2 * GIB
+        );
+        assert_eq!(
+            ple_load_fill_bytes(Auto, Bytes(0), Some(112 * GIB), 66 * GIB, 27 * GIB),
+            0
+        );
+        assert_eq!(
+            ple_load_fill_bytes(Bytes(u64::MAX), Auto, Some(u64::MAX), 0, 27 * GIB),
+            27 * GIB
+        );
+        assert_eq!(
+            ple_load_fill_bytes(Bytes(0), Auto, Some(112 * GIB), 66 * GIB, 27 * GIB),
+            0
+        );
     }
 }

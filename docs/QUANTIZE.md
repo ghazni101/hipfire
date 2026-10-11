@@ -290,6 +290,43 @@ target/release/examples/hfq_dump ~/.hipfire/models/qwen3.8-27b-vision.hfq \
 Graded MoE and E8 recipes are intentionally outside the thin `hipfire quantize`
 help surface so accidental low-quality artifacts are harder to produce.
 
+### Qwen4 developer tiny checkpoints (`--qwen4-dev-tiny`, developer build only)
+
+`hipfire-quantize --qwen4-dev-tiny source-exact|packed --input <dir> --output <file>`
+converts a **local** safetensors directory (never `hf://`) into one complete HFQM
+artifact of a synthetic Qwen4 developer profile. The route exists only in a build
+with the explicit Cargo feature `qwen4-dev-profiles` (off by default, never part of
+a release build): `cargo build -p hipfire-quantize --features qwen4-dev-profiles`.
+It is exclusive with `--qwen4-flash-next`, `--qwen4-component-mode` and every legacy
+recipe flag, and reads only `--input` and `--output`. The input `config.json` must
+carry the explicit `hipfire_profile` marker (the S0 tiny-MoE / tiny-dense fixtures
+in `crates/hipfire-arch-qwen4/reference_oracle/QWEN4_PROFILES.md`); the pinned
+Flash-Next profile is refused here and is produced only by `--qwen4-flash-next`.
+
+- `source-exact` stores every tensor, the PLE tables included, as its BF16 source
+  bytes (recipe id `synthetic-source-bf16`).
+- `packed` (recipe id `synthetic-packed`) stores each role in the Flash-Next format
+  its own reduction width `K` tiles, and BF16 otherwise: token embedding Q8F16
+  (`K % 32`), language head MQ6G256V2 (`K % 256`, else Q8F16 if `K % 32`), trunk
+  attention/GDN projections Q8F16 (`K % 128`), dense FFN gate/up/down Q8F16
+  (`K % 32`), PLE rows Q8F16 (row width `% 32`), routed experts gate/up MQ4G256V2 +
+  down MQ4G128V2 **together** (hidden `% 256` and expert width `% 128`, else both
+  BF16). Router, shared expert, hyper-connection mixers, PLE projections, MTP
+  connectors, norms and convolutions stay BF16 exactly as in Flash-Next. A profile
+  in which no role tiles any format (the width-16 tiny profiles) is refused with the
+  unsupported roles named; it is never written as a "packed" artifact, so use
+  `source-exact` there. The width-5120 profiles do pack.
+
+The transaction is the Flash-Next one: the index is planned from the typed manifest
+and the safetensors headers, a temporary file is written with bounded chunks,
+fsynced, source-identity checked, reopened, admitted through
+`hipfire_arch_qwen4::admit_hfqm_artifact` (which must accept exactly the planned
+tags and byte extents; the predicted and actual file length must be equal), and only
+then published without replacing an existing file. The recipe is recorded in the
+metadata as `qwen4_recipe.id`; the runtime selects the packed manifest by that id
+and by nothing else. Synthetic artifacts are developer evidence only: they do not
+establish Qwen4-27B compatibility or GPU execution support.
+
 ## Runtime cost
 
 CPU- and memory-bandwidth bound. Rough desktop wall times (order-of-magnitude,

@@ -13,6 +13,9 @@ pub type HipErrorCode = u32;
 /// HIP operation result.
 pub type HipResult<T> = Result<T, HipError>;
 
+/// `hipErrorOutOfMemory` — the device allocator could not satisfy the request.
+pub const HIP_ERROR_OUT_OF_MEMORY: HipErrorCode = 2;
+
 /// `hipErrorInvalidImage` — the device code object handed to `hipModuleLoad`
 /// is not valid for this GPU (wrong ISA, or a stale cross-build/cross-toolchain
 /// `.hsaco` left in a shared kernel cache). Recoverable by recompiling from source.

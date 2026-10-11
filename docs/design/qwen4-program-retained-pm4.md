@@ -453,6 +453,13 @@ must fix.
   count as `PositionDivU32 { addend: rows, divisor: compress }`; the wrapper
   verifies the caller's count *equals* the declared formula, so the declaration
   cannot drift from the launch.
+- The incremental pool (every decode/prefill lowering) does not use the
+  capacity grid: its `grid.x` is `ceil(rows / compress)`, the most blocks a
+  launch of `rows` rows can complete, and the kernel offsets `blockIdx.x` by
+  `first_block` (`PositionDivU32 { addend: 0, divisor: compress }`). The grid is
+  still constant per launch shape, so retained programs stay valid. At the
+  automatic `max_seq` 262144 the capacity grid was 65,536 workgroups of which
+  1–2 worked, ~4% of Flash-Next C1 decode on gfx1151.
 - `IndexedAttentionSelectBatch` takes a declared `shape_blocks` (LDS + symbol come
   from the bound, not the active count) and declares both its active count and
   `position_start`. `IndexedAttentionAttentionBatch` takes a declared
@@ -708,6 +715,14 @@ Two fresh processes, `.mq4r` artifact, greedy, two different prompt lengths:
 
 `launched` is an independent count from `hip_bridge::launch_counters` (every
 launch, funnel or raw), so the comparison is not the recorder grading itself.
+
+The finalization hook treats an unequal census as a typed capture refusal:
+it poisons the retained route before closing or preparing the tape, logs the
+launched and recorded counts plus the HIP fallback, and leaves the completed
+warmup output intact. Later forwards use ordinary HIP. A matching census is
+necessary, not sufficient: effect and binding validation still gate preparation.
+Shared launchers, including `Gpu::silu_f32`, use `launch_maybe_blob` so graph
+capture and retained recording own their kernarg bytes rather than stack pointers.
 
 **What the census found.** Three things, only one of which was expected:
 
@@ -1158,6 +1173,12 @@ Append-only. One line per landed change with the commit hash once it exists.
   `qwen3.8-flash-next.mq4`: gates 1–6 and 8 collected, gate 7 at context 128
   only (0.994); model swap no longer blocked. No promotion rule, no admission
   (see "Certification re-run").
+- 2026-10-11 — **Forced PM4 pre-replay staging-stream sync (forced/dev route only).**
+  Evidence `54ba6c5a6` isolated a race between HIP PLE staging and the independent
+  PM4 queue. Before each Qwen4 PM4 replay (forced PM4 or shadow plan route) the
+  forward synchronizes the active stream, or the default stream when none is set
+  (`stream_synchronize_default`); never the device. Failure poisons the route and
+  returns the typed forward error. Default HIP decode and Qwen3.5 are untouched.
 
 ### Next
 

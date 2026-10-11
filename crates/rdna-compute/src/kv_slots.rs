@@ -392,16 +392,26 @@ pub(crate) fn preflight_checks(
         return Ok(());
     }
 
-    match mem_available_bytes() {
+    // A unified-memory APU allocates GTT, which also takes freed GTT pages
+    // TTM parked in its page pool (outside MemAvailable).
+    let uma =
+        crate::arch_caps::process_gpu_arch().is_some_and(hipfire_config::is_unified_memory_arch);
+    let available = if uma {
+        crate::uma_memory::host_available_bytes()
+    } else {
+        mem_available_bytes()
+    };
+    match available {
         Some(avail) => {
             if planned_bytes.saturating_add(HEADROOM_BYTES) > avail {
                 return Err(format!(
-                    "{what}: needs {:.2} GiB but MemAvailable is only {:.2} GiB \
+                    "{what}: needs {:.2} GiB but MemAvailable{} is only {:.2} GiB \
                      (keeping {:.2} GiB headroom). This box has NO SWAP and GPU \
                      memory comes from system RAM, so proceeding risks a GLOBAL \
                      OOM that kills the user's applications, not this process. \
                      Skipping.",
                     gib(planned_bytes),
+                    if uma { " + TTM pool" } else { "" },
                     gib(avail),
                     gib(HEADROOM_BYTES)
                 ));

@@ -5,6 +5,26 @@
 //! module's single code-object source and proof with the shared
 //! [`super::iu4_gemm::module`] combiner (one target header, one metadata document);
 //! the native writer (`crate::native`) then links and bundles that text.
+//!
+//! FP-contract hazard: hipcc builds the HIP incumbents with
+//! `-ffp-contract=fast`. For each 8-term group dot the backend always forms
+//! `t_i = fma(sc, q_i, zp)`, but it then chooses between `fma(t1,x1, t0*x0)`
+//! ("element 0 first") and `fma(t0,x0, t1*x1)` ("element 1 first"), and the
+//! choice depends on the surrounding code, not on the expression. The two
+//! round differently. Equal source therefore does not give equal bytes: a
+//! twin, a layout change or an unrelated edit to the header loads can flip the
+//! order and change about a third of the output rows. With the gfx1201
+//! toolchain that shipped these twins, hipcc emits element 1 first everywhere
+//! in the single-row kernels (`fused_qkvza`/`fused_qkv`/`fused_gate_up`) and,
+//! in the dual-row kernels (`gemv_mq4g256v2_residual`,
+//! `gemv_mq4g256v2_multirow_r2`), element 0 first on row 0 and element 1 first
+//! on row 1, in the main loop and in the tails. These twins write every product
+//! chain out explicitly (the per-row `order` arrays), so their DAG is pinned. A
+//! new twin, or a HIP port meant to match them, has to pin the DAG in the same
+//! way: an explicit `fmaf` chain under `#pragma clang fp contract(off)`. A
+//! matching source expression is not an exactness argument. Pinning the HIP
+//! incumbents themselves this way is byte-identical and throughput-neutral on
+//! R9700 (branch `lab/gemv-dag-pin`).
 pub mod fused_gate_up_hfq4g256_mq4v2;
 pub mod fused_qkv_hfq4g256_mq4v2;
 pub mod fused_qkvza_hfq4g256_mq4v2;

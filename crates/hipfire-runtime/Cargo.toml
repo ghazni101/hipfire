@@ -147,6 +147,8 @@ hipfire-detect = { path = "../hipfire-detect" }
 hipfire-atlas = { path = "../hipfire-atlas" }
 # In-test minimal HFQ writer (overlay resolution tests in src/hfq.rs).
 tempfile = "3"
+# Property tests (`ple_q4::tests::props`).
+proptest.workspace = true
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 
 # Each example below carries `required-features` when it needs a
@@ -202,6 +204,14 @@ required-features = []
 [[example]]
 name = "c8_sampler_validate"
 required-features = []
+
+# Exactness/cost oracle for batch_sampler::sample_batch vs serial
+# sampler::sample (token, rng, logits bytes, transfer counts, penalty cost).
+# No model load; synthetic adversarial logits. Requires a live GPU. Gated
+# (`--features lab`) to keep the ungated-example ratchet flat.
+[[example]]
+name = "sample_batch_exact_oracle"
+required-features = ["lab"]
 
 # Gate F1: FA2 N=1024 vs two N=512 bit-identity oracle (throwaway; repaired positions).
 [[example]]

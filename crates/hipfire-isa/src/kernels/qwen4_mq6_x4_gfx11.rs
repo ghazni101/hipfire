@@ -11,14 +11,20 @@
 //! Exactness (byte-identical outputs): every 16x16 output tile runs the same
 //! chain of `v_wmma_f32_16x16x16_f16` over ascending 16-K steps, C chained
 //! from +0.0, with the same A and B operands as hipcc, so no output depends
-//! on the tiling. A is dequantized op for op as hipcc does it: 6-bit field
-//! extract, `v_cvt_f32_ubyte0`, `v_cvt_f16_f32`, one `v_fma_f16` (sc*q+zp,
-//! single rounding) with the group header's f16 scale / zero point (hA for
-//! K-steps 0..7 of a 256-group, hB for 8..15); lane `l` and `l+16` hold the
-//! same weight row (own eight values, `v_permlanex16` for the other half's,
-//! `v_cndmask` into the 8-VGPR fragment, hipcc's construction). The epilogue
-//! swaps accumulator halves exactly as hipcc (pure bit moves) and stores
-//! `0.0f + acc` (`v_add_f32 0, acc`).
+//! on the tiling. A has the same f16 values as hipcc's dequantization, element
+//! for element (`sc*q + zp`, one RNE rounding, with the group header's f16
+//! scale / zero point: hA for K-steps 0..7 of a 256-group, hB for 8..15), but
+//! two codes at a time: the 6-bit codes of a pair are placed in the mantissas
+//! of two f16 with a constant exponent (`1024 + q`, `64 + q` or `256 + q`,
+//! all exact for q < 64), `v_pk_add_f16` of the bias recovers `q` exactly
+//! (the same f16 as `v_cvt_f32_ubyte0` + `v_cvt_f16_f32`), and one
+//! `v_pk_fma_f16` (operands sc, q, zp; sc and zp read from the header halves
+//! with `op_sel`) is the same fused expression as hipcc's `v_fma_f16`. Lane
+//! `l` and `l+16` hold the same weight row (own eight values,
+//! `v_permlanex16` for the other half's, `v_cndmask` into the 8-VGPR
+//! fragment, hipcc's construction), so every fragment element has hipcc's
+//! bits and lane placement. The epilogue swaps accumulator halves exactly as
+//! hipcc (pure bit moves) and stores `0.0f + acc` (`v_add_f32 0, acc`).
 //!
 //! Freedom used (tiling, layout and scheduling only):
 //!  * a wave owns 16 rows x 256 tokens (16 accumulator tiles, 128 VGPRs), so
@@ -30,7 +36,7 @@
 //!    four loaded four WMMAs ahead; the next K-step's A dequant is
 //!    interleaved with the current WMMAs;
 //!  * each lane loads only its own 48 code bits per K-step (a b64 at
-//!    `12j + 4*lane_half`) and selects them with `v_perm_b32`;
+//!    `12j + 4*lane_half`) and gathers them with `v_perm_b32` (MQ6: four, one per code pair);
 //!  * X loads go through a descriptor bounded at `N*K*2` bytes, so tokens
 //!    past N read zeros (their outputs are never stored).
 //!
@@ -43,6 +49,18 @@
 //! Launch: block `32*wr`, grid `[ceil(M/(16*wr)), ceil(N/256), 1]` (regions:
 //! x = sum of the regions' row blocks), static LDS 40960 bytes. K is a
 //! multiple of 256 (a ragged K tail is ignored, as in hipcc).
+//!
+//! MQ4 (`Fmt::Mq4`, `qwen4_mq4_x4_gfx11`): the MQ4G256V2 entries are exact
+//! twins of the current hipcc MQ4 route (`gemm_mq4g256v2_residual_wmma_gfx11_bt4`,
+//! contract C reference): the same A operands (`v_cvt_f32_ubyte0`,
+//! `v_cvt_f16_f32`, one `v_fma_f16` with the group's f16 scale / zero point:
+//! single rounding), the same B operands (F16 rotated X) and the same WMMA
+//! chain. They differ from MQ6 only in the weight format: 136-byte groups
+//! (8 header bytes, then 128 nibble bytes), one `buffer_load_b32` of eight
+//! nibbles per lane per 16-K step at group byte `8 + 8*kt + 4*lh` and a
+//! 4-bit `v_bfe_u32` per value (no `v_perm_b32`). The module
+//! `qwen4_mq4_x4_pm_gfx1151` exports `qwen4_mq4_x4_pm_gfx1151_{w8, w4,
+//! w8_bf16out, w4_bf16out, w8_regions, w8_hcw}` with the ABIs of the MQ6 entries.
 use crate::{Arch, Builder, Emitted, KernelSpec, KernargLayout, RegPlan};
 use crate::insn::{Instruction, MemoryClass, Sop};
 use crate::kernels::common::{lit, op, s, smem, sop, sr, v, vr};
@@ -57,19 +75,57 @@ type R = Result<(), String>;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind { Plain, Bf16, Regions, Hcw }
 
-/// `wr` waves (16 rows each) per workgroup, of one entry kind.
+/// Weight format of the A operand.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Fmt { Mq6, Mq4 }
+impl Fmt {
+    /// Lower-case format tag used in symbols, modules and labels.
+    fn tag(self) -> &'static str { match self { Fmt::Mq6 => "mq6", Fmt::Mq4 => "mq4" } }
+    fn kernel_id(self) -> &'static str { match self { Fmt::Mq6 => "qwen4_mq6_x4", Fmt::Mq4 => "qwen4_mq4_x4" } }
+    fn builder(self) -> &'static str { match self { Fmt::Mq6 => "qwen4_mq6_x4_gfx11", Fmt::Mq4 => "qwen4_mq4_x4_gfx11" } }
+}
+
+/// `wr` waves (16 rows each) per workgroup, of one MQ6 entry kind (the public
+/// MQ6 API; the MQ4 twin is `qwen4_mq4_x4_gfx11::Spec`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub struct Spec { pub arch: Arch, pub wr: u8, pub kind: Kind }
 impl Spec {
     /// The six PM entries.
+    pub const ALL: [(u8, Kind); 6] = Cfg::ALL;
+    pub fn cfg(self) -> Cfg { Cfg { arch: self.arch, wr: self.wr, kind: self.kind, fmt: Fmt::Mq6 } }
+    pub fn symbol(&self) -> String { self.cfg().symbol() }
+    pub fn module(arch: Arch) -> String { Cfg::module(Fmt::Mq6, arch) }
+    pub fn validate(&self) -> R { self.cfg().validate() }
+    /// Rows per workgroup.
+    pub fn rows(&self) -> u32 { self.cfg().rows() }
+}
+
+/// One entry of one weight format: `Spec` plus the format. Every
+/// format-dependent decision (group byte stride, code load, dequant) reads
+/// `fmt`; `Fmt::Mq6` selects the original code everywhere.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Cfg { pub arch: Arch, pub wr: u8, pub kind: Kind, pub fmt: Fmt }
+impl Cfg {
+    /// The six PM entries of either format.
     pub const ALL: [(u8, Kind); 6] = [(8, Kind::Plain), (4, Kind::Plain), (8, Kind::Bf16), (4, Kind::Bf16), (8, Kind::Regions), (8, Kind::Hcw)];
     fn suffix(&self) -> &'static str { match self.kind { Kind::Plain => "", Kind::Bf16 => "_bf16out", Kind::Regions => "_regions", Kind::Hcw => "_hcw" } }
-    pub fn symbol(&self) -> String { format!("qwen4_mq6_x4_pm_{}_w{}{}", self.arch.name(), self.wr, self.suffix()) }
-    pub fn module(arch: Arch) -> String { format!("qwen4_mq6_x4_pm_{}", arch.name()) }
+    pub fn symbol(&self) -> String { format!("qwen4_{}_x4_pm_{}_w{}{}", self.fmt.tag(), self.arch.name(), self.wr, self.suffix()) }
+    pub fn module(fmt: Fmt, arch: Arch) -> String { format!("qwen4_{}_x4_pm_{}", fmt.tag(), arch.name()) }
     pub fn validate(&self) -> R {
-        if self.arch != Arch::Gfx1151 { return Err("qwen4_mq6_x4_gfx11 builder is exact-gfx1151 only".into()) }
-        if !Self::ALL.contains(&(self.wr, self.kind)) { return Err(format!("qwen4_mq6_x4_gfx11: no entry w{} {:?}", self.wr, self.kind)) }
+        if self.arch != Arch::Gfx1151 { return Err(format!("{} builder is exact-gfx1151 only", self.fmt.builder())) }
+        if !Self::ALL.contains(&(self.wr, self.kind)) { return Err(format!("{}: no entry w{} {:?}", self.fmt.builder(), self.wr, self.kind)) }
         Ok(())
+    }
+    /// Bytes of one 256-K weight group of the row: MQ6 200 (8 header + 192
+    /// code), MQ4 136 (8 header + 128 code).
+    fn stride(&self) -> u32 { match self.fmt { Fmt::Mq6 => 200, Fmt::Mq4 => 136 } }
+    /// Dwords of codes a lane loads per 16-K step (the register slot keeps two).
+    fn code_dwords(&self) -> u8 { match self.fmt { Fmt::Mq6 => 2, Fmt::Mq4 => 1 } }
+    /// Group byte offset (plus the lane-half term in ACODE) of the codes of
+    /// K-step `j` of chunk `cc`: MQ6 a b64 of the 12-byte step, MQ4 the b32 at
+    /// `8 + 8 * kt` with `kt = 2 * cc + j`.
+    fn code_offset(&self, cc: u8, j: u8) -> u32 {
+        match self.fmt { Fmt::Mq6 => 8 + u32::from(cc) * 24 + u32::from(j) * 12, Fmt::Mq4 => 8 + u32::from(cc) * 16 + u32::from(j) * 8 }
     }
     /// Rows per workgroup.
     pub fn rows(&self) -> u32 { 16 * u32::from(self.wr) }
@@ -99,6 +155,11 @@ impl Spec {
     fn lo(&self) -> u8 { self.q() + 8 }
     fn d1(&self) -> u8 { self.q() + 9 }
     fn xr(&self) -> u8 { self.q() + 10 }
+    /// MQ6 packed dequant: the `v_perm_b32` selector VGPR of code pair `p`.
+    /// Pairs 0 and 1 take the lane-constant slots the scalar dequant's
+    /// selectors used; pairs 2 and 3 take its `lo` / `d1` temporaries (live
+    /// over the main loop only, which is where the selectors are read).
+    fn pair_sel(&self, p: u8) -> u8 { match p { 0 => SELLO, 1 => SELD1, 2 => self.lo(), _ => self.d1() } }
     fn park(&self) -> u8 { self.xr() + 4 * self.xpt() }
     /// Highest VGPR used, plus one.
     fn vgprs_used(&self) -> u16 { u16::from(self.xr()) + 4 * u16::from(self.xpt()) + u16::from(self.hcw()) }
@@ -127,9 +188,9 @@ const PARK_BYTES: u32 = 128 * PARK_ROW;
 const PARK_MASK: u32 = 0x7ff0;
 
 /// Local labels, qualified by variant so every entry shares one module.
-fn lbl(spec: &Spec, name: &str) -> String {
+fn lbl(spec: &Cfg, name: &str) -> String {
     let k = match spec.kind { Kind::Plain => "p", Kind::Bf16 => "b", Kind::Regions => "r", Kind::Hcw => "h" };
-    format!(".Lmq6g11w{}{k}_{name}", spec.wr)
+    format!(".L{}g11w{}{k}_{name}", spec.fmt.tag(), spec.wr)
 }
 
 // ----------------------------------------------------------------------- SGPRs
@@ -156,12 +217,16 @@ const HS: u8 = 56; const HG: u8 = 58; const HBF: u8 = 60;
 const SM4: u8 = 61; const SBR1: u8 = 62; const SBR2: u8 = 63; const SBR3: u8 = 64; const SSTEPS: u8 = 65;
 const SIT: u8 = 66; const STOK: u8 = 67; const SROWB: u8 = 68;
 const SRD_S: u8 = 72; const SRD_G: u8 = 76;
+/// MQ6 packed-dequant constants (live from the prologue to the end): field
+/// masks of the even / odd code pairs and the `v_pk_add_f16` constants that
+/// remove the exponent bias (`-1024` / `-64` and `-256` per half).
+const PK_MASKE: u8 = 80; const PK_MASKO: u8 = 81; const PK_CE: u8 = 82; const PK_CO: u8 = 83;
 
 /// Epilogue VGPRs (live only from `epi`): they alias the dead main loop's ring
 /// and everything after it.
 #[derive(Clone, Copy)]
 struct Ep { tmp: u8, offs: u8, pset: u8, strm: u8, mq: u8, g: u8, h: u8, vt: u8, voffs: u8, voffg: u8, vla: u8, vlb: u8, vc: u8 }
-fn ep(spec: &Spec) -> Ep {
+fn ep(spec: &Cfg) -> Ep {
     let e = spec.ringb();
     Ep { tmp: e, offs: e + 6, pset: e + 14, strm: e + 30, mq: e + 62, g: e + 66, h: e + 70, vt: e + 79, voffs: e + 80, voffg: e + 81, vla: e + 82, vlb: e + 83, vc: e + 84 }
 }
@@ -171,7 +236,7 @@ const SELLO: u8 = 1; const SELD1: u8 = 2; const ACODE: u8 = 3; const AHDR: u8 = 
 const LDST: u8 = 5; const LDRD: u8 = 6; const VTOK: u8 = 7; const VYOFF: u8 = 8; const VROW0: u8 = 9;
 const XOFF: u8 = 10;
 
-fn plan(spec: &Spec) -> Result<RegPlan, String> {
+fn plan(spec: &Cfg) -> Result<RegPlan, String> {
     let mut p = RegPlan::new(spec.vgprs(), 104)?;
     let w = || Live::Whole;
     let dead = || Live::Between("entry".into(), lbl(spec, "epi"));
@@ -185,8 +250,13 @@ fn plan(spec: &Spec) -> Result<RegPlan, String> {
     for c in 0..4u8 { for j in 0..2u8 { p.v::<2>("codes", spec.code(c) + 2 * j, dead())?; } }
     for h in 0..2 { p.v::<2>("header", spec.hdr(h), dead())?; }
     p.v::<8>("dequant_q", spec.q(), dead())?;
-    p.v::<1>("dequant_temp", spec.lo(), dead())?;
-    p.v::<1>("dequant_temp", spec.d1(), dead())?;
+    if spec.fmt == Fmt::Mq6 {
+        p.v::<1>("pair_sel", spec.lo(), dead())?;
+        p.v::<1>("pair_sel", spec.d1(), dead())?;
+    } else {
+        p.v::<1>("dequant_temp", spec.lo(), dead())?;
+        p.v::<1>("dequant_temp", spec.d1(), dead())?;
+    }
     for i in 0..spec.xpt() { p.v::<4>("x_stage", spec.xr() + 4 * i, dead())?; }
     if spec.hcw() { p.v::<1>("park_addr", spec.park(), w())?; }
     if spec.vgprs() > spec.vgprs_used() { p.v::<1>("granule_pad", (spec.vgprs() - 1) as u8, w())?; }
@@ -212,6 +282,9 @@ fn plan(spec: &Spec) -> Result<RegPlan, String> {
     for n in YSTEP..=SK2 { p.s::<1>("scalar", n, w())?; }
     for m in [MASK0, MASK1, MASKB, LHM] { p.s::<2>("lane_mask", m, w())?; }
     p.s::<1>("permlane_sel", PSEL, w())?;
+    if spec.fmt == Fmt::Mq6 {
+        for n in PK_MASKE..=PK_CO { p.s::<1>("pk_const", n, w())?; }
+    }
     match spec.kind {
         Kind::Regions => {
             p.s::<8>("raw_a", R_A0, w())?;
@@ -245,7 +318,7 @@ fn bstore(b: &mut Builder, dwords: u8, data: u8, voff: u8, srd: u8, soff: u8, im
     b.push(Instruction::new(format!("buffer_store_{w} {}, v{voff}, s[{srd}:{}], s{soff} offen{}", rs(data, n), srd + 3, off(imm)),
         vec![], vec![vr(data, n), v(voff), sr(srd, 4), s(soff)]).memory(MemoryClass::VmemStore))
 }
-fn wmma(b: &mut Builder, spec: &Spec, t: u8, a: u8, bb: u8) -> R {
+fn wmma(b: &mut Builder, spec: &Cfg, t: u8, a: u8, bb: u8) -> R {
     let acc = spec.acc() + 8 * t;
     op(b, format!("v_wmma_f32_16x16x16_f16 {}, {}, {}, {}", rs(acc, 8), rs(a, 8), rs(bb, 8), rs(acc, 8)),
         &[vr(acc, 8)], &[vr(a, 8), vr(bb, 8), vr(acc, 8)])
@@ -265,7 +338,7 @@ enum Fill {
     HdrLoad { dst: u8, soff: u8 },
     Valu { text: String, defs: Vec<RegRef>, uses: Vec<RegRef> },
 }
-fn emit_fill(b: &mut Builder, spec: &Spec, f: &Fill) -> R {
+fn emit_fill(b: &mut Builder, spec: &Cfg, f: &Fill) -> R {
     match f {
         Fill::BLoad { slot, k } => {
             let (j, t) = (u32::from(k / BT), u32::from(k % BT));
@@ -283,37 +356,84 @@ fn emit_fill(b: &mut Builder, spec: &Spec, f: &Fill) -> R {
             b.ds_store(*slot, Instruction::new(format!("ds_store_b128 v{LDST}, {}{}", rs(data, 4), off(slot_base(*slot) + imm)), vec![], vec![v(LDST), vr(data, 4)])
                 .memory(MemoryClass::DsStore))
         }
-        Fill::CodeLoad { dst, soff, cc, j } => bload(b, 2, *dst, ACODE, SRD_A, *soff, 8 + u32::from(*cc) * 24 + u32::from(*j) * 12),
+        Fill::CodeLoad { dst, soff, cc, j } => bload(b, spec.code_dwords(), *dst, ACODE, SRD_A, *soff, spec.code_offset(*cc, *j)),
         Fill::HdrLoad { dst, soff } => bload(b, 2, *dst, AHDR, SRD_A, *soff, 0),
         Fill::Valu { text, defs, uses } => op(b, text.clone(), defs, uses),
     }
 }
-fn xstore(spec: &Spec, slot: usize, i: u8) -> Fill { Fill::XStore { slot, i, imm: u32::from(i) * spec.xrow_step() * PITCH } }
+fn xstore(spec: &Cfg, slot: usize, i: u8) -> Fill { Fill::XStore { slot, i, imm: u32::from(i) * spec.xrow_step() * PITCH } }
 
-/// Dequantize one K-step: codes at `w` (two dwords: this lane half's 48 bits
-/// at bit 0 for lane half 0, bit 16 for lane half 1), header dword `h`
-/// (sc in .l, zp in .h) into A fragment `a` (8 VGPRs, both lane halves hold
-/// the full row). Breadth-first order: eight independent per-value chains
-/// into the packed values m[0..3] (q0..q3), their `permlanex16` o[0..3]
-/// (q4..q7), then hipcc's selects `A[k] = lh ? o[k] : m[k]`,
-/// `A[k+4] = lh ? m[k] : o[k]`.
-fn dequant(spec: &Spec, w: u8, h: u8, a: u8) -> Vec<Fill> {
-    let (q, lo, d1) = (spec.q(), spec.lo(), spec.d1());
+/// MQ6 `v_perm_b32` selectors (lane half 0, lane half 1) of the four code
+/// pairs: the lane's 48-bit window is bytes `2*lh ..` of its 8 loaded bytes.
+/// Pair `p` (codes 2p and 2p+1, window bits 12p..12p+11) is gathered into a
+/// dword whose two 16-bit halves each hold one six-bit field within the low
+/// five bits of the half (the other bytes are zeroed or ignored by the mask):
+///  * pairs 0 and 2 (byte-aligned codes 2p at offset 0, 2p+1 at offset 6):
+///    `u = [b0, b1, 0, 0]` of the pair's two bytes; `(u << 10) | u` moves
+///    code 2p+1 to bit 16 (code 2p stays at bit 0);
+///  * pairs 1 and 3 (code 2p at byte offset 4, code 2p+1 at offset 2 of the
+///    next byte): `[b0, b1, b1, 0]` already puts code 2p at bit 4 of the low
+///    half and code 2p+1 at bit 18 of the high half.
+const PAIR_SEL: [(u32, u32); 4] = [
+    (0x0c0c_0100, 0x0c0c_0302), (0x0c02_0201, 0x0c04_0403),
+    (0x0c0c_0403, 0x0c0c_0605), (0x0c05_0504, 0x0c07_0706),
+];
+
+/// Dequantize one K-step into A fragment `a` (8 VGPRs, both lane halves hold
+/// the full row) from header dword `h` (sc in .l, zp in .h) and the codes at
+/// `w`. MQ6: two dwords, this lane half's 48 bits at bit 0 for lane half 0,
+/// bit 16 for lane half 1. MQ4: one dword, this lane half's eight nibbles.
+///
+/// MQ6 runs packed pairs (exact: the same f16 values as `sc*q + zp` per code
+/// with one `v_fma_f16` rounding): the code pair is placed in the mantissas
+/// of two f16 with a constant exponent (`v_and_or_b32` against the pair's
+/// field mask and exponent bits: `0x6400 | q` is `1024 + q` for a field at
+/// bit 0, `0x5400 | q << 4` is `64 + q` for a field at bit 4,
+/// `0x5c00 | q << 2` is `256 + q` for a field at bit 2), `v_pk_add_f16` of
+/// the bias recovers `q` exactly, and `v_pk_fma_f16` (sc and zp straight from
+/// the header halves through `op_sel`, operand order sc, q, zp) gives the
+/// packed values m[k] (codes 2k, 2k+1) in q0..q3. MQ4 runs eight per-value
+/// chains (`v_bfe_u32`, `v_cvt_f32_ubyte0`, `v_cvt_f16_f32`, `v_fma_f16`)
+/// into m[0..3]. Then, breadth-first, their `permlanex16` o[0..3] (q4..q7)
+/// and hipcc's selects `A[k] = lh ? o[k] : m[k]`, `A[k+4] = lh ? m[k] : o[k]`.
+fn dequant(spec: &Cfg, w: u8, h: u8, a: u8) -> Vec<Fill> {
+    let q = spec.q();
     let mut out = Vec::new();
     let mut f = |text: String, defs: Vec<RegRef>, uses: Vec<RegRef>| out.push(Fill::Valu { text, defs, uses });
-    // lo = codes 0..4 (+ low bits of 5); d1 = bits 24..47 (codes 4..7 at 0,6,12,18).
-    f(format!("v_perm_b32 v{lo}, v{}, v{w}, v{SELLO}", w + 1), vec![v(lo)], vec![v(w), v(w + 1), v(SELLO)]);
-    f(format!("v_perm_b32 v{d1}, v{}, v{w}, v{SELD1}", w + 1), vec![v(d1)], vec![v(w), v(w + 1), v(SELD1)]);
-    for i in 0..8u8 {
-        let src = if i < 4 { lo } else { d1 };
-        f(format!("v_bfe_u32 v{}, v{src}, {}, 6", q + i, 6 * (i % 4)), vec![v(q + i)], vec![v(src)]);
-    }
-    for i in 0..8u8 { f(format!("v_cvt_f32_ubyte0_e32 v{0}, v{0}", q + i), vec![v(q + i)], vec![v(q + i)]); }
-    for i in 0..8u8 { f(format!("v_cvt_f16_f32_e64 v{0}.l, v{0}", q + i), vec![v(q + i)], vec![v(q + i)]); }
-    for i in 0..8u8 {
-        let d = q + i / 2;
-        let (half, sel) = if i % 2 == 0 { ("l", "op_sel:[0,0,1,0]") } else { ("h", "op_sel:[0,0,1,1]") };
-        f(format!("v_fma_f16 v{d}.{half}, v{h}.l, v{}.l, v{h}.h {sel}", q + i), vec![v(d)], vec![v(d), v(h), v(q + i)]);
+    match spec.fmt {
+        Fmt::Mq6 => {
+            for p in 0..4u8 {
+                let sel = spec.pair_sel(p);
+                f(format!("v_perm_b32 v{}, v{}, v{w}, v{sel}", q + p, w + 1), vec![v(q + p)], vec![v(w), v(w + 1), v(sel)]);
+            }
+            for p in [0u8, 2] {
+                f(format!("v_lshl_or_b32 v{0}, v{0}, 10, v{0}", q + p), vec![v(q + p)], vec![v(q + p)]);
+            }
+            for p in 0..4u8 {
+                let (mask, exp) = if p % 2 == 0 { (PK_MASKE, 0x6400_6400u32) } else { (PK_MASKO, 0x5c00_5400) };
+                f(format!("v_and_or_b32 v{0}, v{0}, s{mask}, {1}", q + p, lit(exp)), vec![v(q + p)], vec![v(q + p), s(mask)]);
+            }
+            for p in 0..4u8 {
+                let bias = if p % 2 == 0 { PK_CE } else { PK_CO };
+                f(format!("v_pk_add_f16 v{0}, v{0}, s{bias}", q + p), vec![v(q + p)], vec![v(q + p), s(bias)]);
+            }
+            for p in 0..4u8 {
+                f(format!("v_pk_fma_f16 v{0}, v{h}, v{0}, v{h} op_sel:[0,0,1] op_sel_hi:[0,1,1]", q + p), vec![v(q + p)], vec![v(h), v(q + p)]);
+            }
+        }
+        Fmt::Mq4 => {
+            // Code i of the lane half's dword sits at bits 4i..4i+3.
+            for i in 0..8u8 {
+                f(format!("v_bfe_u32 v{}, v{w}, {}, 4", q + i, 4 * i), vec![v(q + i)], vec![v(w)]);
+            }
+            for i in 0..8u8 { f(format!("v_cvt_f32_ubyte0_e32 v{0}, v{0}", q + i), vec![v(q + i)], vec![v(q + i)]); }
+            for i in 0..8u8 { f(format!("v_cvt_f16_f32_e64 v{0}.l, v{0}", q + i), vec![v(q + i)], vec![v(q + i)]); }
+            for i in 0..8u8 {
+                let d = q + i / 2;
+                let (half, sel) = if i % 2 == 0 { ("l", "op_sel:[0,0,1,0]") } else { ("h", "op_sel:[0,0,1,1]") };
+                f(format!("v_fma_f16 v{d}.{half}, v{h}.l, v{}.l, v{h}.h {sel}", q + i), vec![v(d)], vec![v(d), v(h), v(q + i)]);
+            }
+        }
     }
     for k in 0..4u8 {
         f(format!("v_permlanex16_b32 v{}, v{}, s{PSEL}, 0xfedcba98", q + 4 + k, q + k), vec![v(q + 4 + k)], vec![v(q + k), s(PSEL)]);
@@ -332,10 +452,10 @@ fn spread(slots: &mut [Vec<Fill>], fills: Vec<Fill>, from: usize, to: usize) {
 }
 
 /// Header dword of chunk `cc` of a group: hA for K-steps 0..7, hB for 8..15.
-fn hdr_dword(spec: &Spec, cc: u8) -> u8 { spec.hdr(0) + u8::from(cc >= CHUNKS / 2) }
+fn hdr_dword(spec: &Cfg, cc: u8) -> u8 { spec.hdr(0) + u8::from(cc >= CHUNKS / 2) }
 
 /// One 32-K chunk `cc` (0..7) of the group loop body: 32 WMMAs.
-fn chunk(b: &mut Builder, spec: &Spec, cc: u8) -> R {
+fn chunk(b: &mut Builder, spec: &Cfg, cc: u8) -> R {
     let slot = usize::from(cc % 2);
     let other = 1 - slot;
     let cb = spec.code(cc);
@@ -381,7 +501,7 @@ fn chunk(b: &mut Builder, spec: &Spec, cc: u8) -> R {
 
 /// Canonical scalar kernargs (A, X, Y, M, K, N), the workgroup row block and
 /// the early exits; per-kind kernarg loads and region selection first.
-fn kernargs(b: &mut Builder, spec: &Spec) -> R {
+fn kernargs(b: &mut Builder, spec: &Cfg) -> R {
     match spec.kind {
         Kind::Regions => {
             smem(b, R_A0, 8, KARG, 0)?;
@@ -401,7 +521,7 @@ fn kernargs(b: &mut Builder, spec: &Spec) -> R {
     Ok(())
 }
 
-fn select_region(b: &mut Builder, spec: &Spec) -> R {
+fn select_region(b: &mut Builder, spec: &Cfg) -> R {
     let rows_m1 = spec.rows() - 1;
     let shift = spec.rows().trailing_zeros();
     // N, K > 0 else return.
@@ -440,7 +560,7 @@ fn select_region(b: &mut Builder, spec: &Spec) -> R {
     op(b, format!("s_cbranch_scc1 {}", lbl(spec, "end")), &[], &[])
 }
 
-fn prologue(b: &mut Builder, spec: &Spec) -> R {
+fn prologue(b: &mut Builder, spec: &Cfg) -> R {
     let t = |n: u8| spec.ringb() + n; // prologue temporaries alias the (not yet loaded) ring
     let (t0, t1, t2, t3, t4, t5) = (t(0), t(1), t(2), t(3), t(4), t(5));
     kernargs(b, spec)?;
@@ -458,11 +578,23 @@ fn prologue(b: &mut Builder, spec: &Spec) -> R {
         op(b, format!("v_mad_u32_u24 v{}, v{t0}, {}, v{t5}", spec.park(), lit(PARK_ROW)), &[v(spec.park())], &[v(t0), v(t5)])?;
     }
     op(b, format!("v_cmp_ne_u32_e64 s{LHM}, 0, v{t1}"), &[s(LHM)], &[v(t1)])?;
-    op(b, format!("v_mov_b32_e32 v{t5}, {}", lit(0x0302_0100)), &[v(t5)], &[])?;
-    op(b, format!("v_cndmask_b32_e64 v{SELLO}, v{t5}, {}, s{LHM}", lit(0x0504_0302)), &[v(SELLO)], &[v(t5), s(LHM)])?;
-    op(b, format!("v_mov_b32_e32 v{t5}, {}", lit(0x0c05_0403)), &[v(t5)], &[])?;
-    op(b, format!("v_cndmask_b32_e64 v{SELD1}, v{t5}, {}, s{LHM}", lit(0x0c07_0605)), &[v(SELD1)], &[v(t5), s(LHM)])?;
-    sop(b, format!("s_mov_b32 s{PSEL}, 0x76543210"), &[PSEL], &[])?;
+    if spec.fmt == Fmt::Mq6 {
+        for (p, (l0, l1)) in PAIR_SEL.into_iter().enumerate() {
+            let sel = spec.pair_sel(p as u8);
+            op(b, format!("v_mov_b32_e32 v{t5}, {}", lit(l0)), &[v(t5)], &[])?;
+            op(b, format!("v_cndmask_b32_e64 v{sel}, v{t5}, {}, s{LHM}", lit(l1)), &[v(sel)], &[v(t5), s(LHM)])?;
+        }
+        sop(b, format!("s_mov_b32 s{PSEL}, 0x76543210"), &[PSEL], &[])?;
+        for (n, c) in [(PK_MASKE, 0x003f_003fu32), (PK_MASKO, 0x00fc_03f0), (PK_CE, 0xe400_e400), (PK_CO, 0xdc00_d400)] {
+            sop(b, format!("s_mov_b32 s{n}, {}", lit(c)), &[n], &[])?;
+        }
+    } else {
+        op(b, format!("v_mov_b32_e32 v{t5}, {}", lit(0x0302_0100)), &[v(t5)], &[])?;
+        op(b, format!("v_cndmask_b32_e64 v{SELLO}, v{t5}, {}, s{LHM}", lit(0x0504_0302)), &[v(SELLO)], &[v(t5), s(LHM)])?;
+        op(b, format!("v_mov_b32_e32 v{t5}, {}", lit(0x0c05_0403)), &[v(t5)], &[])?;
+        op(b, format!("v_cndmask_b32_e64 v{SELD1}, v{t5}, {}, s{LHM}", lit(0x0c07_0605)), &[v(SELD1)], &[v(t5), s(LHM)])?;
+        sop(b, format!("s_mov_b32 s{PSEL}, 0x76543210"), &[PSEL], &[])?;
+    }
     for n in 0..8 * BT { op(b, format!("v_mov_b32_e32 v{}, 0", spec.acc() + n), &[v(spec.acc() + n)], &[])?; }
     b.wait(Counter::Lgkm, 0)?;
     if spec.kind == Kind::Regions {
@@ -500,7 +632,7 @@ fn prologue(b: &mut Builder, spec: &Spec) -> R {
     op(b, format!("v_lshl_or_b32 v{VROW0}, v{t1}, 3, v{t3}"), &[v(VROW0)], &[v(t1), v(t3)])?;              // row_start + 8*lh
     op(b, format!("v_or_b32_e32 v{t3}, v{t3}, v{t0}"), &[v(t3)], &[v(t3), v(t0)])?;                         // row
     sop(b, format!("s_add_i32 s{ST0}, s{SM}, -1"), &[ST0], &[SM])?;
-    sop(b, format!("s_mul_i32 s{ST1}, s{GPR}, 0xc8"), &[ST1], &[GPR])?;
+    sop(b, format!("s_mul_i32 s{ST1}, s{GPR}, {:#x}", spec.stride()), &[ST1], &[GPR])?;
     op(b, format!("v_min_i32_e32 v{t3}, s{ST0}, v{t3}"), &[v(t3)], &[s(ST0), v(t3)])?;                       // safe_row
     op(b, format!("v_mul_lo_u32 v{AHDR}, v{t3}, s{ST1}"), &[v(AHDR)], &[v(t3), s(ST1)])?;
     op(b, format!("v_lshl_add_u32 v{ACODE}, v{t1}, 2, v{AHDR}"), &[v(ACODE)], &[v(t1), v(AHDR)])?;
@@ -542,17 +674,17 @@ fn prologue(b: &mut Builder, spec: &Spec) -> R {
     Ok(())
 }
 
-fn body(b: &mut Builder, spec: &Spec) -> R {
-    // ngoff = min(g+1, gpr-1)*200 (the last group re-reads itself).
+fn body(b: &mut Builder, spec: &Cfg) -> R {
+    // ngoff = min(g+1, gpr-1)*group bytes (the last group re-reads itself).
     sop(b, format!("s_add_i32 s{NGOFF}, s{G}, 1"), &[NGOFF], &[G])?;
     sop(b, format!("s_min_u32 s{NGOFF}, s{NGOFF}, s{GPRM1}"), &[NGOFF], &[NGOFF, GPRM1])?;
-    sop(b, format!("s_mul_i32 s{NGOFF}, s{NGOFF}, 0xc8"), &[NGOFF], &[NGOFF])?;
+    sop(b, format!("s_mul_i32 s{NGOFF}, s{NGOFF}, {:#x}", spec.stride()), &[NGOFF], &[NGOFF])?;
     for cc in 0..CHUNKS { chunk(b, spec, cc)?; }
     let (h0, h1) = (spec.hdr(0), spec.hdr(1));
     op(b, format!("v_mov_b32_e32 v{h0}, v{h1}"), &[v(h0)], &[v(h1)])?;
     op(b, format!("v_mov_b32_e32 v{}, v{}", h0 + 1, h1 + 1), &[v(h0 + 1)], &[v(h1 + 1)])?;
     sop(b, format!("s_add_i32 s{G}, s{G}, 1"), &[G], &[G])?;
-    sop(b, format!("s_add_i32 s{GOFF}, s{GOFF}, 0xc8"), &[GOFF], &[GOFF])?;
+    sop(b, format!("s_add_i32 s{GOFF}, s{GOFF}, {:#x}", spec.stride()), &[GOFF], &[GOFF])?;
     sop(b, format!("s_add_i32 s{C8}, s{C8}, 8"), &[C8], &[C8])?;
     sop(b, format!("s_cmp_lt_u32 s{G}, s{GPR}"), &[], &[G, GPR])?;
     op(b, format!("s_cbranch_scc1 {}", lbl(spec, "loop")), &[], &[])
@@ -561,7 +693,7 @@ fn body(b: &mut Builder, spec: &Spec) -> R {
 // ------------------------------------------------------------------- epilogue
 
 /// `v_add_f32 0, acc` over `tiles` accumulator tiles from `first`.
-fn add_zero(b: &mut Builder, spec: &Spec, first: u8, tiles: u8) -> R {
+fn add_zero(b: &mut Builder, spec: &Cfg, first: u8, tiles: u8) -> R {
     for n in 8 * first..8 * (first + tiles) {
         let a = spec.acc() + n;
         op(b, format!("v_add_f32_e32 v{a}, 0, v{a}"), &[v(a)], &[v(a)])?;
@@ -575,7 +707,7 @@ fn add_zero(b: &mut Builder, spec: &Spec, first: u8, tiles: u8) -> R {
 /// `r[2i] = lh ? got_i : acc[i]`, `r[2i+1] = lh ? acc[4+i] : got_i`. The
 /// outputs permute the inputs in two 3-cycles (positions 1,2,4 and 3,5,6),
 /// each broken by one saved input.
-fn swap_tile(b: &mut Builder, spec: &Spec, e: &Ep, t: u8) -> R {
+fn swap_tile(b: &mut Builder, spec: &Cfg, e: &Ep, t: u8) -> R {
     let a = spec.acc() + 8 * t;
     let g = e.tmp;
     let (c1, c3) = (e.tmp + 4, e.tmp + 5);
@@ -595,7 +727,7 @@ fn swap_tile(b: &mut Builder, spec: &Spec, e: &Ep, t: u8) -> R {
 /// BF16 of every value of tile `t` (RNE, non-finite truncated: hipcc lines
 /// 944-946) in place: afterwards the BF16 bits are the HIGH half of each
 /// register (low half dirty).
-fn round_tile(b: &mut Builder, spec: &Spec, e: &Ep, t: u8) -> R {
+fn round_tile(b: &mut Builder, spec: &Cfg, e: &Ep, t: u8) -> R {
     let (a, c) = (e.tmp + 4, e.tmp + 5);
     for n in 0..8u8 {
         let x = spec.acc() + 8 * t + n;
@@ -617,7 +749,7 @@ fn tile_offsets(b: &mut Builder, offs: u8, n: u8, base: u8, ystep: u8) -> R {
     Ok(())
 }
 
-fn plain_epilogue(b: &mut Builder, spec: &Spec) -> R {
+fn plain_epilogue(b: &mut Builder, spec: &Cfg) -> R {
     let e = ep(spec);
     let bf16 = spec.bf16();
     add_zero(b, spec, 0, BT)?;
@@ -678,7 +810,7 @@ fn plain_epilogue(b: &mut Builder, spec: &Spec) -> R {
 
 /// HC-write stage 2 of one 128-token half over the parked BF16 values: a
 /// runtime loop of 8 items (token t, 8 channels c0..c0+7) per thread.
-fn hcw_stage2(b: &mut Builder, spec: &Spec, h: u8, bf16: bool) -> R {
+fn hcw_stage2(b: &mut Builder, spec: &Cfg, h: u8, bf16: bool) -> R {
     let e = ep(spec);
     let es_shift = if bf16 { 1 } else { 2 };
     // Per-branch stream strides, the per-iteration stream step (16 tokens x 4
@@ -740,7 +872,7 @@ fn hcw_stage2(b: &mut Builder, spec: &Spec, h: u8, bf16: bool) -> R {
 
 /// HC-write epilogue: per 128-token half, stage 1 (swap, mirror, park) then
 /// stage 2 (apply to the streams).
-fn hcw_epilogue(b: &mut Builder, spec: &Spec) -> R {
+fn hcw_epilogue(b: &mut Builder, spec: &Cfg) -> R {
     let e = ep(spec);
     sop(b, format!("s_mov_b32 s{SZERO}, 0"), &[SZERO], &[])?;
     // The mirror is off when Y is null: MASKY is all ones iff Y != 0.
@@ -806,7 +938,7 @@ fn hcw_epilogue(b: &mut Builder, spec: &Spec) -> R {
     Ok(())
 }
 
-fn epilogue(b: &mut Builder, spec: &Spec) -> R {
+fn epilogue(b: &mut Builder, spec: &Cfg) -> R {
     b.wait_all()?;
     b.label(&lbl(spec, "epi"))?;
     if spec.hcw() { hcw_epilogue(b, spec)?; } else { plain_epilogue(b, spec)?; }
@@ -814,7 +946,11 @@ fn epilogue(b: &mut Builder, spec: &Spec) -> R {
     b.control(Sop::End.encode(Arch::Gfx1151)?)
 }
 
-pub fn emit(spec: Spec) -> Result<Emitted, String> {
+/// One MQ6 entry (`Cfg` with `Fmt::Mq6`).
+pub fn emit(spec: Spec) -> Result<Emitted, String> { emit_cfg(spec.cfg()) }
+
+/// One entry of either weight format.
+pub fn emit_cfg(spec: Cfg) -> Result<Emitted, String> {
     spec.validate()?;
     let by_value = |k: KernargLayout, names: &[(&str, u32)]| names.iter().fold(k, |k, (n, o)| k.hidden(n, *o, 4, "by_value"));
     let kernargs = match spec.kind {
@@ -828,7 +964,7 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
             &[("hc_bf16", 56)]),
     };
     let variant = format!("w{}{}", spec.wr, spec.suffix());
-    let kspec = KernelSpec { kernel_id: "qwen4_mq6_x4".into(), variant, arch: spec.arch, symbol: spec.symbol(),
+    let kspec = KernelSpec { kernel_id: spec.fmt.kernel_id().into(), variant, arch: spec.arch, symbol: spec.symbol(),
         kernargs, user_sgpr_count: 2, system_sgpr_workgroup_id_y: true, workgroup_size: spec.threads(),
         group_segment_fixed_size: GROUP_BYTES, wave32: true, cu_mode: false };
     let mut b = Builder::new(kspec, plan(&spec)?);
@@ -842,9 +978,14 @@ pub fn emit(spec: Spec) -> Result<Emitted, String> {
     b.finish()
 }
 
-/// Every entry as one code object (`Spec::module`).
+/// Every MQ6 entry as one code object (`Spec::module`).
 pub fn emit_module(arch: Arch) -> Result<(Vec<Emitted>, String, super::iu4_gemm::ModuleProof), String> {
-    let emitted = Spec::ALL.into_iter().map(|(wr, kind)| emit(Spec { arch, wr, kind })).collect::<Result<Vec<_>, _>>()?;
-    let (text, proof) = super::iu4_gemm::module(&emitted, &Spec::module(arch))?;
+    emit_module_fmt(Fmt::Mq6, arch)
+}
+
+/// Every entry of weight format `fmt` as one code object (`Cfg::module`).
+pub fn emit_module_fmt(fmt: Fmt, arch: Arch) -> Result<(Vec<Emitted>, String, super::iu4_gemm::ModuleProof), String> {
+    let emitted = Cfg::ALL.into_iter().map(|(wr, kind)| emit_cfg(Cfg { arch, wr, kind, fmt })).collect::<Result<Vec<_>, _>>()?;
+    let (text, proof) = super::iu4_gemm::module(&emitted, &Cfg::module(fmt, arch))?;
     Ok((emitted, text, proof))
 }

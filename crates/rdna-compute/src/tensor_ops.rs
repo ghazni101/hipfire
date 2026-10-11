@@ -11,6 +11,7 @@
 use hip_bridge::{HipError, HipResult, KernargBlob};
 
 use crate::{DType, Gpu, GpuTensor};
+use crate::prefill_invariant::{qwen4_gdn_prefill, Qwen4GdnPrefill};
 
 pub(crate) const TENSOR_OPS_SRC: &str = concat!(
     include_str!("../../../kernels/src/mq_fwht256.h"),
@@ -519,14 +520,25 @@ pub fn gated_delta_step_batched(gpu: &mut Gpu, p: &GatedDeltaStepBatched<'_>) ->
     let key_dim = checked_i32(p.key_dim, "GDN batched key width")?;
     let value_dim = checked_i32(p.value_dim, "GDN batched value width")?;
     let value_heads_grid = checked_u32(p.value_heads, "GDN batched value-head grid")?;
+    // `HIPFIRE_QWEN4_GDN_PREFILL=canon` (lab): a Q8 state inside the Qwen4
+    // forward (`Gpu::qwen4_scope`, so the arm also works with the invariant
+    // profile off) runs the token-canonical persistent recurrence, which
+    // requantizes every row at its own position and stores to `state`: the
+    // result no longer depends on how rows are split into launches.  An F32
+    // state keeps the persistent kernel (already token-exact).
+    let canon = p.row_states.is_none()
+        && format == GdnStateFormat::Q8
+        && gpu.qwen4_scope
+        && qwen4_gdn_prefill() == Qwen4GdnPrefill::Canon;
     // gfx1201 non-capture: the register-resident one-thread-per-column
     // recurrence (bitwise the persistent256 kernel's result), 128 threads.
-    let pipe128 = p.row_states.is_none() && gpu.arch == "gfx1201" && *QWEN4_GDN_PIPE;
+    let pipe128 = !canon && p.row_states.is_none() && gpu.arch == "gfx1201" && *QWEN4_GDN_PIPE;
     let kernel = match (p.row_states.is_some(), format) {
         (true, GdnStateFormat::F32) => "gated_delta_step_halves_state128_persistent256_capture_f32",
         (false, GdnStateFormat::F32) if pipe128 => "gated_delta_step_pipe128_f32",
         (false, GdnStateFormat::F32) => "gated_delta_step_halves_state128_persistent256_f32",
         (true, GdnStateFormat::Q8) => "gated_delta_step_halves_state128_persistent256_capture_q8",
+        (false, GdnStateFormat::Q8) if canon => "gated_delta_step_halves_state128_persistent256_canon_q8",
         (false, GdnStateFormat::Q8) if pipe128 => "gated_delta_step_pipe128_q8",
         (false, GdnStateFormat::Q8) => "gated_delta_step_halves_state128_persistent256_q8",
     };
@@ -640,7 +652,8 @@ pub fn gated_delta_rollback_layers(
 /// then stores its output as packed BF16 for that kernel.
 pub fn gated_delta_chunk_route(gpu: &Gpu, p: &GatedDeltaStepBatched<'_>) -> bool {
     gpu.arch_caps.has_wmma_w32()
-        && p.rows >= crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
+        && gpu.route_rows(p.rows) >= crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
+        && qwen4_gdn_prefill() == Qwen4GdnPrefill::Wy
         && *crate::gemm::QWEN4_F16_WMMA
         && !gpu.replay.is_recording()
         && !gpu.graphs.capture_mode
@@ -2084,6 +2097,19 @@ fn gated_delta_conv_batched_impl(
     }
     args.pad_to(16);
     let param_grid = checked_u32(param_elements.div_ceil(256), "GDN batched parameter grid")?;
+    // Compact 1-D grid: `conv_blocks * row_grid` convolution tiles (block `i`
+    // is channel block `i % conv_blocks`, row block `i / conv_blocks`), then the
+    // parameter blocks.  The kernel re-derives the split from rows / channels,
+    // so the grid depends only on those and the heads, fixed at capture.
+    let conv_tiles = checked_product(
+        grid as usize,
+        row_grid as usize,
+        "GDN batched convolution tile grid",
+    )?;
+    let total_grid = checked_u32(
+        checked_add(conv_tiles, param_grid as usize, "GDN batched convolution launch grid")?,
+        "GDN batched convolution launch grid",
+    )?;
     // `start_cursor` is `start_position % history_rows` for the chunk (the
     // kernel advances the ring per row from there), so the declared binding
     // re-derives it at the replay position.
@@ -2095,7 +2121,7 @@ fn gated_delta_conv_batched_impl(
     }];
     gpu.launch_blob_recorded(
         kernel,
-        [grid + param_grid, row_grid, 1],
+        [total_grid, 1, 1],
         [256, 1, 1],
         0,
         args.as_mut_slice(),
@@ -3626,7 +3652,9 @@ const QSA_SELECT_PM_MIN_ROWS: usize = 512;
 /// offsets below the out-of-range offset (pooled extents use its element size).
 fn qsa_select_pm_fits(gpu: &Gpu, p: &IndexedAttentionSelectBatch<'_>) -> bool {
     qsa_select_pm_shape_fits(
-        gpu.arch_caps.is_gfx1151(), p.pooled.dtype, p.rows, p.index_heads,
+        // Threshold input under the invariant profile; never below the real
+        // rows, which the shape's raw-offset bounds are checked against.
+        gpu.arch_caps.is_gfx1151(), p.pooled.dtype, gpu.route_rows(p.rows).max(p.rows), p.index_heads,
         p.index_dim, p.block_count, p.query_row_stride, p.capacity,
     )
 }
@@ -3689,7 +3717,7 @@ pub fn indexed_attention_select_batch_pm_arm(
         && p.index_dim.is_multiple_of(4)
         && p.index_dim <= 128
         && p.block_count > 0
-        && p.rows > 8
+        && gpu.route_rows(p.rows) > 8
         && p.budget_blocks <= QSA_SELECT_FROM_SCORES_MAX_BUDGET;
     if !live || (arm != QsaSelectPmArm::Hipcc && !qsa_select_pm_fits(gpu, p)) {
         return Err(HipError::new(0, "QSA select PM arm: call not covered"));
@@ -3726,7 +3754,7 @@ fn indexed_attention_select_rows8(
         ("indexed_attention_select_scores_rows16_bf16_pm_gfx1151", 16)
     } else if pm.score() {
         ("indexed_attention_select_scores_rows16_f32_pm_gfx1151", 16)
-    } else if p.rows > 8 {
+    } else if gpu.route_rows(p.rows) > 8 {
         ("indexed_attention_select_scores_rows16_f32", 16)
     } else {
         ("indexed_attention_select_scores_rows8_f32", 8)
@@ -3916,10 +3944,12 @@ pub struct IndexedAttentionPoolRope<'a> {
     /// Declared source of `block_count`, or `None` for a synthetic caller whose
     /// count is not position-derived (which then declares nothing).
     pub position: Option<QsaPositionBinding>,
-    /// Declared `grid.x` for this launch. A retained tape needs the grid to be
-    /// position-independent, so callers pass the capacity the kernel masks
-    /// against (`>= block_count`); a caller without a capacity passes the active
-    /// count. Must be `>= block_count`.
+    /// `grid.x` bound for a full (non-incremental) launch. A retained tape needs
+    /// the grid to be position-independent, so callers pass the capacity the
+    /// kernel masks against (`>= block_count`); a caller without a capacity
+    /// passes the active count. Must be `>= block_count`. An incremental launch
+    /// instead uses `ceil(rows / compress)` (capped by this bound), which is
+    /// also position-independent.
     pub grid_bound: usize,
 }
 
@@ -4007,7 +4037,15 @@ fn indexed_attention_pool_rope_impl(
             ),
         ));
     }
-    let block_grid = checked_u32(p.grid_bound, "QSA pool/RoPE block grid")?;
+    // An incremental launch completes `(start + rows) / c - start / c <=
+    // ceil(rows / c)` blocks from `first_block` (the kernel offsets
+    // `blockIdx.x` by it), so its grid depends on `rows` only: constant across
+    // replayed positions, with `first_block` arriving as a declared kernarg.
+    let grid_x = match (incremental, p.position) {
+        (true, Some(position)) => position.rows.div_ceil(p.compress).max(1).min(p.grid_bound),
+        _ => p.grid_bound,
+    };
+    let block_grid = checked_u32(grid_x, "QSA pool/RoPE block grid")?;
     let dim_grid = blocks(p.index_dim)?;
     if p.raw_keys.numel() < raw_elements || p.pooled.numel() < pooled_elements {
         return Err(HipError::new(0, &ComputeError::WrongShape.to_string()));
@@ -4314,7 +4352,7 @@ fn qsa_attention_hg4_lds_bytes(
     if !gpu.arch_caps.has_gfx11_plus_simt()
         || p.head_dim != 256
         || group % QSA_ATTENTION_HG4_HEADS != 0
-        || p.rows < QSA_ATTENTION_HG4_MIN_ROWS
+        || gpu.route_rows(p.rows) < QSA_ATTENTION_HG4_MIN_ROWS
     {
         return None;
     }
@@ -4466,7 +4504,7 @@ fn indexed_attention_attention_batch_impl(
         && gpu.arch_caps.has_gfx11_plus_simt()
         && p.head_dim == 256
         && p.n_heads == p.n_kv_heads * QSA_ATTENTION_HG12_HEADS
-        && p.rows >= QSA_ATTENTION_HG12_MIN_ROWS
+        && gpu.route_rows(p.rows) >= QSA_ATTENTION_HG12_MIN_ROWS
         && shape_selected <= QSA_ATTENTION_HG12_MAX_SELECTED;
     let hg4_bytes = (allow_fast && !hg12)
         .then(|| qsa_attention_hg4_lds_bytes(gpu, p, shape_selected))
@@ -4589,7 +4627,7 @@ fn qsa_dense_wmma_applies(
     end_position: usize,
 ) -> bool {
     gpu.arch_caps.has_wmma_w32()
-        && p.rows >= crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
+        && gpu.route_rows(p.rows) >= crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
         && *crate::gemm::QWEN4_F16_WMMA
         && !gpu.replay.is_recording()
         && !gpu.graphs.capture_mode
@@ -4785,7 +4823,7 @@ pub fn reserve_qsa_gathered_wmma_scratch(
 /// `HIPFIRE_QWEN4_QSA_WMMA_GATHER=0` every launch is the incumbent's.
 fn qsa_gathered_wmma_applies(gpu: &Gpu, p: &IndexedAttentionAttentionBatch<'_>) -> bool {
     qsa_gathered_wmma_enabled(gpu, p.format)
-        && p.rows >= crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
+        && gpu.route_rows(p.rows) >= crate::gemm::QWEN4_F16_WMMA_MIN_TOKENS
         && !gpu.replay.is_recording()
         && !gpu.graphs.capture_mode
         && p.head_dim == 256
@@ -5267,6 +5305,136 @@ mod tests {
             }
         }
         gpu.free_tensor(kernel).expect("free");
+    }
+
+    /// The compact 1-D grid of the conv + parameter launch: the convolution
+    /// output and ring must equal the convolution-only launch, and gate / beta
+    /// the stand-alone batched parameter kernel's, with a ragged channel block
+    /// (300 channels), rows that are not multiples of 16, several row blocks
+    /// (3 .. 512) and several parameter blocks (the 48-head Flash-Next shape).
+    #[test]
+    fn gdn_conv_params_compact_grid_is_bit_identical_to_split_launches() {
+        let Some(mut gpu) = try_gpu() else {
+            eprintln!("skip: no GPU");
+            return;
+        };
+        let (channels, heads) = (300usize, 48usize);
+        let mut kernel = gpu
+            .upload_raw(&bf16_le_bytes(&test_wave(1, channels * 4, 1.0)), &[channels * 4 * 2])
+            .expect("kernel");
+        kernel.dtype = DType::BF16;
+        kernel.shape = vec![channels * 4];
+        let mut a_log = gpu
+            .upload_raw(&bf16_le_bytes(&test_wave(11, heads, 1.0)), &[heads * 2])
+            .expect("a_log");
+        a_log.dtype = DType::BF16;
+        a_log.shape = vec![heads];
+        let mut dt_bias = gpu
+            .upload_raw(&bf16_le_bytes(&test_wave(12, heads, 1.0)), &[heads * 2])
+            .expect("dt_bias");
+        dt_bias.dtype = DType::BF16;
+        dt_bias.shape = vec![heads];
+        let history = test_wave(2, channels * 3, 2.0);
+        let bits = |gpu: &Gpu, t: &GpuTensor| -> Vec<u32> {
+            gpu.download_f32(t)
+                .expect("download")
+                .iter()
+                .map(|v| v.to_bits())
+                .collect()
+        };
+        for (rows, start_cursor) in [(37usize, 2usize), (513, 1), (8192, 0)] {
+            let input = gpu
+                .upload_f32(&test_wave(3 + rows, rows * channels, 3.0), &[rows * channels])
+                .expect("input");
+            let a = gpu
+                .upload_f32(&test_wave(9, rows * heads, 2.0), &[rows * heads])
+                .expect("a");
+            let b = gpu
+                .upload_f32(&test_wave(10, rows * heads, 2.0), &[rows * heads])
+                .expect("b");
+            // Split launches: convolution only, then the stand-alone parameters.
+            let hist_a = gpu.upload_f32(&history, &[history.len()]).expect("hist");
+            let out_a = gpu.zeros(&[rows * channels], DType::F32).expect("out");
+            let gate_a = gpu.zeros(&[rows * heads], DType::F32).expect("gate");
+            let beta_a = gpu.zeros(&[rows * heads], DType::F32).expect("beta");
+            gated_delta_conv_batched(
+                &mut gpu,
+                &GatedDeltaConvBatched {
+                    input: &input,
+                    kernel: &kernel,
+                    history: &hist_a,
+                    output: &out_a,
+                    next_history: &hist_a,
+                    rows,
+                    channels,
+                    history_rows: 3,
+                    kernel_size: 4,
+                    start_cursor,
+                },
+            )
+            .expect("conv");
+            gated_delta_params_batched(
+                &mut gpu,
+                &GatedDeltaParamsBatched {
+                    a: &a,
+                    b: &b,
+                    a_log: &a_log,
+                    dt_bias: &dt_bias,
+                    gate: &gate_a,
+                    beta: &beta_a,
+                    rows,
+                    heads,
+                },
+            )
+            .expect("params");
+            // One launch over the compact grid.
+            let hist_b = gpu.upload_f32(&history, &[history.len()]).expect("hist");
+            let out_b = gpu.zeros(&[rows * channels], DType::F32).expect("out");
+            let gate_b = gpu.zeros(&[rows * heads], DType::F32).expect("gate");
+            let beta_b = gpu.zeros(&[rows * heads], DType::F32).expect("beta");
+            gated_delta_conv_params_batched(
+                &mut gpu,
+                &GatedDeltaConvBatched {
+                    input: &input,
+                    kernel: &kernel,
+                    history: &hist_b,
+                    output: &out_b,
+                    next_history: &hist_b,
+                    rows,
+                    channels,
+                    history_rows: 3,
+                    kernel_size: 4,
+                    start_cursor,
+                },
+                &GatedDeltaParamsBatched {
+                    a: &a,
+                    b: &b,
+                    a_log: &a_log,
+                    dt_bias: &dt_bias,
+                    gate: &gate_b,
+                    beta: &beta_b,
+                    rows,
+                    heads,
+                },
+            )
+            .expect("conv + params");
+            assert!(
+                bits(&gpu, &gate_a).iter().any(|v| *v != 0),
+                "rows {rows}: gate reference is all zero"
+            );
+            assert_eq!(bits(&gpu, &out_a), bits(&gpu, &out_b), "rows {rows}: output");
+            assert_eq!(bits(&gpu, &hist_a), bits(&gpu, &hist_b), "rows {rows}: history");
+            assert_eq!(bits(&gpu, &gate_a), bits(&gpu, &gate_b), "rows {rows}: gate");
+            assert_eq!(bits(&gpu, &beta_a), bits(&gpu, &beta_b), "rows {rows}: beta");
+            for tensor in [
+                input, a, b, hist_a, out_a, gate_a, beta_a, hist_b, out_b, gate_b, beta_b,
+            ] {
+                gpu.free_tensor(tensor).expect("free");
+            }
+        }
+        for tensor in [kernel, a_log, dt_bias] {
+            gpu.free_tensor(tensor).expect("free");
+        }
     }
 
     /// The fused HC norm + BF16 gate projection must equal hyper_norm followed
@@ -6945,7 +7113,16 @@ mod tests {
             eprintln!("skip: needs gfx1151 and the F16 WMMA route");
             return;
         }
-        let (key_heads, value_heads, dim, rows) = (16usize, 16usize, 128usize, 530usize);
+        // 530: ragged last row tile (34 row blocks); 8192: the Flash-Next
+        // prefill chunk (512 row blocks), where the compact 1-D conv grid is
+        // 24 channel blocks x 512 row blocks + 512 parameter blocks.
+        for rows in [530usize, 8192] {
+            gdn_conv_qknorm_hookup_case(&mut gpu, rows);
+        }
+    }
+
+    fn gdn_conv_qknorm_hookup_case(gpu: &mut Gpu, rows: usize) {
+        let (key_heads, value_heads, dim) = (16usize, 16usize, 128usize);
         let qk = key_heads * dim;
         let value = value_heads * dim;
         let qkv = 2 * qk + value;
@@ -7071,14 +7248,38 @@ mod tests {
             }
             values
         };
-        let plain = run(&mut gpu, false, false);
-        let fused = run(&mut gpu, true, false);
-        let kept = run(&mut gpu, true, true);
+        let plain = run(gpu, false, false);
+        let fused = run(gpu, true, false);
+        let kept = run(gpu, true, true);
         for (i, label) in ["gated output", "state", "conv ring", "gate", "beta"].iter().enumerate() {
             assert!(plain[i] == fused[i], "{label} differs (qk columns dropped)");
             assert!(plain[i] == kept[i], "{label} differs (qk columns kept)");
         }
         assert!(plain[5] == kept[5], "convolution output differs with keep_qk_conv");
+        // Gate / beta against the stand-alone parameter kernel (a separate
+        // grid), so the compact conv + parameter grid is not only compared to
+        // itself: `rows * value_heads` spans several parameter blocks.
+        let ref_gate = gpu.zeros(&[rows * value_heads], DType::F32).expect("ref gate");
+        let ref_beta = gpu.zeros(&[rows * value_heads], DType::F32).expect("ref beta");
+        gated_delta_params_batched(
+            gpu,
+            &GatedDeltaParamsBatched {
+                a: &a,
+                b: &b,
+                a_log: &a_log,
+                dt_bias: &dt_bias,
+                gate: &ref_gate,
+                beta: &ref_beta,
+                rows,
+                heads: value_heads,
+            },
+        )
+        .expect("stand-alone params");
+        assert!(bytes(gpu, &ref_gate) == plain[3], "rows {rows}: gate vs stand-alone params");
+        assert!(bytes(gpu, &ref_beta) == plain[4], "rows {rows}: beta vs stand-alone params");
+        for tensor in [ref_gate, ref_beta] {
+            gpu.free_tensor(tensor).expect("free");
+        }
         let (row_bytes, v_from) = (qkv * 2, 2 * qk * 2);
         for r in 0..rows {
             assert!(
@@ -7622,8 +7823,30 @@ mod tests {
         )
         .expect("index-key write");
 
+        // The incremental pool at a large capacity: `first_block` is declared
+        // and the grid is `ceil(rows / compress)`, not the capacity.
+        let inc_rows = 3usize;
+        let inc_start = blocks * compress - inc_rows;
+        indexed_attention_pool_rope_incremental(
+            &mut gpu,
+            &IndexedAttentionPoolRope {
+                raw_keys: &raw_gpu,
+                pooled: &pooled_gpu,
+                norm: None,
+                block_count: blocks,
+                compress,
+                index_dim,
+                position: Some(QsaPositionBinding {
+                    position_start: inc_start,
+                    rows: inc_rows,
+                }),
+                grid_bound: 65_536,
+            },
+        )
+        .expect("incremental QSA pool/RoPE");
+
         let launches = gpu.replay.recorded_launches();
-        assert_eq!(launches.len(), 4, "the recorded QSA sequence changed");
+        assert_eq!(launches.len(), 5, "the recorded QSA sequence changed");
 
         // The declared slot must hold the value this very launch used.
         let check = |launch: &crate::replay::RecordedHipLaunch,
@@ -7732,6 +7955,37 @@ mod tests {
             "index-key write must declare `position * index_kv_width`"
         );
         check(&launches[3], copy_mul, dco as u32, "index-key row offset");
+
+        let inc = &launches[4];
+        assert_eq!(
+            inc.grid[0],
+            inc_rows.div_ceil(compress) as u32,
+            "incremental pool grid must be ceil(rows / compress), not the capacity"
+        );
+        assert!(
+            inc.grid_binding.is_none(),
+            "incremental pool grid must be constant"
+        );
+        check(
+            inc,
+            crate::replay::ReplayKernargBinding::PositionDivU32 {
+                offset: 24,
+                addend: inc_rows as u32,
+                divisor: compress as u32,
+            },
+            blocks as u32,
+            "incremental pool block count",
+        );
+        check(
+            inc,
+            crate::replay::ReplayKernargBinding::PositionDivU32 {
+                offset: 36,
+                addend: 0,
+                divisor: compress as u32,
+            },
+            (inc_start / compress) as u32,
+            "incremental pool first block",
+        );
 
         gpu.free_tensor(raw_gpu).expect("free raw");
         gpu.free_tensor(pooled_gpu).expect("free pooled");
@@ -8304,6 +8558,75 @@ mod tests {
             pooled_pinned, pooled_derived,
             "a masked pool grid above the active block count changed the result"
         );
+
+        // ── incremental pool: `first_block > 0` at a large capacity ──
+        // The grid is `ceil(rows / compress)` offset by `first_block`, not the
+        // capacity: every block the rows complete must equal the full pool,
+        // and every block below `first_block` must stay untouched.
+        let inc_blocks = 40usize;
+        let inc_capacity = 65_536usize;
+        let inc_cells = inc_blocks * compress * index_dim;
+        let inc_raw: Vec<f32> = (0..inc_cells)
+            .map(|i| ((i * 37 % 251) as f32 - 125.0) / 37.0)
+            .collect();
+        let inc_raw_gpu = gpu.upload_f32(&inc_raw, &[inc_cells]).expect("raw upload");
+        let inc_pool = |gpu: &mut Gpu, position: Option<QsaPositionBinding>| {
+            let sentinel = vec![-7.5f32; inc_blocks * index_dim];
+            let pooled = gpu
+                .upload_f32(&sentinel, &[sentinel.len()])
+                .expect("pooled upload");
+            let p = IndexedAttentionPoolRope {
+                raw_keys: &inc_raw_gpu,
+                pooled: &pooled,
+                norm: None,
+                block_count: inc_blocks,
+                compress,
+                index_dim,
+                position,
+                grid_bound: inc_capacity,
+            };
+            match position {
+                Some(_) => indexed_attention_pool_rope_incremental(gpu, &p),
+                None => indexed_attention_pool_rope(gpu, &p),
+            }
+            .expect("QSA pool/RoPE");
+            let values = gpu.download_f32(&pooled).expect("pooled download");
+            gpu.free_tensor(pooled).expect("free pooled");
+            values
+        };
+        let full = inc_pool(&mut gpu, None);
+        assert!(full.iter().all(|v| *v != -7.5), "full pool left a block unwritten");
+        // `(position_start + rows) / compress == inc_blocks`, aligned and
+        // unaligned, completing zero to three blocks.
+        for (position_start, rows) in [
+            (150, 10),
+            (153, 7),
+            (155, 5),
+            (156, 4),
+            (157, 3),
+            (158, 2),
+            (159, 1),
+            (160, 3),
+        ] {
+            let inc = inc_pool(
+                &mut gpu,
+                Some(QsaPositionBinding {
+                    position_start,
+                    rows,
+                }),
+            );
+            let split = position_start / compress * index_dim;
+            assert!(
+                inc[..split].iter().all(|v| *v == -7.5),
+                "incremental pool at {position_start}+{rows} wrote below first_block"
+            );
+            assert_eq!(
+                inc[split..],
+                full[split..],
+                "incremental pool at {position_start}+{rows} diverged from the full pool"
+            );
+        }
+        gpu.free_tensor(inc_raw_gpu).expect("free raw");
 
         // ── select: a larger LDS reservation, at an active count and at zero ──
         let index_heads = 2usize;

@@ -77,6 +77,10 @@ impl ArchModel for Qwen35Bundle {
             vision_weights,
             qwen35_decode_batch,
             vmm_store,
+            // Infallible free cannot prove a clean teardown: drop the lease
+            // unacknowledged (the loader's unload_model takes it out first
+            // and releases it after a verified clean unload).
+            weight_lease: _,
         } = *self;
         debug_assert!(
             pp_scratch_set.is_none(),

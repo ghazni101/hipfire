@@ -741,6 +741,65 @@ static __device__ __forceinline__ void hcw_apply8(const uint4 mq, int t, int c0,
 }
 #endif  // HCW_EPILOGUE_BLOCK
 
+// hcw_apply8 with the four gates already evaluated (hcw_gate of the token's four logits,
+// computed once per token per workgroup and read back from LDS).  Same operands, operation
+// order and rounding points as hcw_apply8 above; kept outside HCW_EPILOGUE_BLOCK so the
+// block stays byte-identical across the files carrying it.
+static __device__ __forceinline__ void hcw_apply8_g(const uint4 mq, int t, int c0, int H,
+                                                    void* streams, const float4 gv,
+                                                    int bf16_state) {
+    uint4 sw[4];
+    float4 sf[4][2];
+    if (bf16_state) {
+        const unsigned short* base = (const unsigned short*)streams + (long long)t * 4 * H + c0;
+#pragma unroll
+        for (int br = 0; br < 4; br++) sw[br] = *(const uint4*)(base + (long long)br * H);
+    } else {
+        const float* base = (const float*)streams + (long long)t * 4 * H + c0;
+#pragma unroll
+        for (int br = 0; br < 4; br++) {
+            sf[br][0] = *(const float4*)(base + (long long)br * H);
+            sf[br][1] = *(const float4*)(base + (long long)br * H + 4);
+        }
+    }
+    const unsigned int mw[4] = {mq.x, mq.y, mq.z, mq.w};
+    float mr[8];
+#pragma unroll
+    for (int p = 0; p < 4; p++) {
+        mr[2 * p] = __uint_as_float(mw[p] << 16);
+        mr[2 * p + 1] = __uint_as_float(mw[p] & 0xFFFF0000u);
+    }
+    const float g[4] = {gv.x, gv.y, gv.z, gv.w};
+    if (bf16_state) {
+        unsigned short* base = (unsigned short*)streams + (long long)t * 4 * H + c0;
+#pragma unroll
+        for (int br = 0; br < 4; br++) {
+            const unsigned int in[4] = {sw[br].x, sw[br].y, sw[br].z, sw[br].w};
+            unsigned int out[4];
+#pragma unroll
+            for (int p = 0; p < 4; p++) {
+                const float lo = hcw_add(__uint_as_float(in[p] << 16), hcw_bf16f(hcw_mul(g[br], mr[2 * p])));
+                const float hi = hcw_add(__uint_as_float(in[p] & 0xFFFF0000u), hcw_bf16f(hcw_mul(g[br], mr[2 * p + 1])));
+                out[p] = hcw_bf16bits(lo) | (hcw_bf16bits(hi) << 16);
+            }
+            *(uint4*)(base + (long long)br * H) = make_uint4(out[0], out[1], out[2], out[3]);
+        }
+    } else {
+        float* base = (float*)streams + (long long)t * 4 * H + c0;
+#pragma unroll
+        for (int br = 0; br < 4; br++) {
+            const float v[8] = {sf[br][0].x, sf[br][0].y, sf[br][0].z, sf[br][0].w,
+                                sf[br][1].x, sf[br][1].y, sf[br][1].z, sf[br][1].w};
+            float o[8];
+#pragma unroll
+            for (int i = 0; i < 8; i++)
+                o[i] = hcw_bf16f(hcw_add(hcw_bf16f(hcw_mul(g[br], mr[i])), hcw_bf16f(v[i])));
+            *(float4*)(base + (long long)br * H) = make_float4(o[0], o[1], o[2], o[3]);
+            *(float4*)(base + (long long)br * H + 4) = make_float4(o[4], o[5], o[6], o[7]);
+        }
+    }
+}
+
 
 // ---------------------------------------------------------------------------
 // Residual += BT with the X tile shared through LDS by RW row tiles.
@@ -967,6 +1026,30 @@ __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
         }
     }
     if (HC) {
+        // RW8: the 16 lanes of a row own one token's 16 eight-channel items in every stage-2
+        // iteration, so its BV (iteration) x 4 (branch) gates are evaluated once per row, GPL
+        // per lane, and shared with ds_bpermute instead of every lane evaluating its own 4 per
+        // iteration.  Same hcw_gate on the same logits, moved as raw bits; ragged tokens
+        // (t >= N) load nothing (stage 2 skips them).  No LDS (a gate array in LDS moves the
+        // kernel into the next LDS-occupancy bucket and the K loop then spills).
+        constexpr bool GATE_ROW = HC && (RW == 8);
+        constexpr int GPL = BV / 4;
+        static_assert(!GATE_ROW || (BV % 4 == 0 && TOK == 16 * BV && NT == 256));
+        float gp[GPL > 0 ? GPL : 1];
+        if constexpr (GATE_ROW) {
+            // Opaque tid: the gate loads' address arithmetic stays here instead of being
+            // hoisted above the K loop, where it would stay live through it.
+            int gtid = tid;
+            asm volatile("" : "+v"(gtid));
+#pragma unroll
+            for (int k = 0; k < GPL; k++) {
+                const int q = (gtid & 15) + 16 * k;  // pair: iteration q >> 2, branch q & 3
+                const int t = batch_start + (q >> 2) * 16 + (gtid >> 4);
+                float gk = 0.0f;
+                if (t < N) gk = hcw_gate(hc_gates[(long long)t * 4 + (q & 3)]);
+                gp[k] = gk;
+            }
+        }
         XL_BARRIER();
         // Stage 2: TOK tokens x (16 * RW) channels of this block, 8 channels per item.
         constexpr int CPT = 2 * RW;  // 8-channel chunks per token
@@ -977,9 +1060,25 @@ __device__ __forceinline__ void resid_bt_xlds(const char* __restrict__ A,
             const int c8 = item % CPT;
             const int t = batch_start + tl;
             const int c0 = (row_block < 0 ? (int)blockIdx.x : row_block) * RW * 16 + c8 * 8;
-            if (t >= N || c0 >= M) continue;
-            hcw_apply8(*(const uint4*)(xs + tl * PARK_STRIDE + c8 * 8), t, c0, M, hc_streams, hc_gates,
-                       hc_bf16);
+            if constexpr (GATE_ROW) {
+                // All lanes take part (before any lane skips): pair (it, br) sits in lane
+                // (4 * it + br) & 15 of the row, slot it >> 2.
+                float sv = gp[0];
+#pragma unroll
+                for (int k = 1; k < GPL; k++) sv = ((it >> 2) == k) ? gp[k] : sv;
+                const int rowaddr = (tid & 16) + ((it & 3) * 4);  // wave lane of the row's pair 0
+                float gb[4];
+#pragma unroll
+                for (int br = 0; br < 4; br++)
+                    gb[br] = __int_as_float(__builtin_amdgcn_ds_bpermute((rowaddr + br) * 4, __float_as_int(sv)));
+                if (t >= N || c0 >= M) continue;
+                hcw_apply8_g(*(const uint4*)(xs + tl * PARK_STRIDE + c8 * 8), t, c0, M, hc_streams,
+                             make_float4(gb[0], gb[1], gb[2], gb[3]), hc_bf16);
+            } else {
+                if (t >= N || c0 >= M) continue;
+                hcw_apply8(*(const uint4*)(xs + tl * PARK_STRIDE + c8 * 8), t, c0, M, hc_streams,
+                           hc_gates, hc_bf16);
+            }
         }
     }
 #undef XL_STORE

@@ -75,6 +75,24 @@
      ]
     },
     {
+     "module": "attention_flash_fp8_e4m3_tile_gqa_gfx1201_vmm",
+     "kind": "hip",
+     "sha256": "8379b4c6a5a82ca11d05dedfb4544c9669e669773d1963cb5ee83df8fbe82393",
+     "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "-DIU4_A4_CANDIDATES=2"
+     ],
+     "scheduler_profile": "default",
+     "symbols": [
+      "attention_flash_fp8_e4m3_tile_gqa_gfx1201_vmm"
+     ]
+    },
+    {
      "module": "attention_flash_reduce_dsplit_gfx1201",
      "kind": "hip",
      "sha256": "7e05ca38bd71b5a3857c5ca84447c2c1939935df85cd9ab9271f82f14892211a",
@@ -90,6 +108,24 @@
      "scheduler_profile": "default",
      "symbols": [
       "attention_flash_reduce_dsplit_gfx1201"
+     ]
+    },
+    {
+     "module": "attention_flash_reduce_dsplit_gfx1201_vmm",
+     "kind": "hip",
+     "sha256": "f6c4058a72409d9733cf0e865045264fb1a6b94e7a78083198ae51e258fd5ed8",
+     "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "-DIU4_A4_CANDIDATES=2"
+     ],
+     "scheduler_profile": "default",
+     "symbols": [
+      "attention_flash_reduce_dsplit_gfx1201_vmm"
      ]
     },
     {
@@ -181,6 +217,24 @@
      "scheduler_profile": "default",
      "symbols": [
       "conv1d_silu_split_qknorm_b256"
+     ]
+    },
+    {
+     "module": "conv1d_silu_split_qknorm_b256_rows",
+     "kind": "hip",
+     "sha256": "1b134c1ab4c8abe5d3a3d1088c8e030ca97e59feebc83ed86949c40b9ded0764",
+     "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "-DIU4_A4_CANDIDATES=2"
+     ],
+     "scheduler_profile": "default",
+     "symbols": [
+      "conv1d_silu_split_qknorm_b256_rows"
      ]
     },
     {
@@ -436,6 +490,24 @@
      ]
     },
     {
+     "module": "gated_delta_net_q8_compact3_b2_rows",
+     "kind": "hip",
+     "sha256": "5bdeacc50fe54e19ea91fda28756f915fc0bdabd383960ca37309c9df73708ec",
+     "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "-DIU4_A4_CANDIDATES=2"
+     ],
+     "scheduler_profile": "default",
+     "symbols": [
+      "gated_delta_net_q8_compact3_b2_rows"
+     ]
+    },
+    {
      "module": "gated_delta_net_q8_fast",
      "kind": "hip",
      "sha256": "0cbfc2d3cc51bd4b74441caf3e0a6286983ff172a40f1c3b9614c267888bbe94",
@@ -523,6 +595,24 @@
      "scheduler_profile": "default",
      "symbols": [
       "gated_norm_mq_rotate_awq_k6144_gfx1201"
+     ]
+    },
+    {
+     "module": "gated_norm_mq_rotate_awq_k6144_gfx1201_rows",
+     "kind": "hip",
+     "sha256": "37b495e58b2b595f8d5d2b5942387ca851701a2dec75c3b528407b45679d0ca3",
+     "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "-DIU4_A4_CANDIDATES=2"
+     ],
+     "scheduler_profile": "default",
+     "symbols": [
+      "gated_norm_mq_rotate_awq_k6144_gfx1201_rows"
      ]
     },
     {
@@ -678,6 +768,33 @@
      ]
     },
     {
+     "module": "gemm_gate_up_mq4g256v2_wmma_gfx12_vt",
+     "kind": "hip",
+     "sha256": "a016e4de75c2cf60a6e301d16f4a58c7c07e62e7eee47853a844708627e9876c",
+     "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "-DIU4_A4_CANDIDATES=2"
+     ],
+     "scheduler_profile": "default",
+     "symbols": [
+      "gemm_gate_up_mq4g256v2_wmma_gfx12_vt2w4",
+      "gemm_gate_up_mq4g256v2_wmma_gfx12_vt2w8",
+      "gemm_gate_up_mq4g256v2_wmma_gfx12_vt3w4",
+      "gemm_gate_up_mq4g256v2_wmma_gfx12_vt3w8",
+      "gemm_gate_up_mq4g256v2_wmma_gfx12_vt4w4",
+      "gemm_gate_up_mq4g256v2_wmma_gfx12_vt4w4_k32",
+      "gemm_gate_up_mq4g256v2_wmma_gfx12_vt4w8",
+      "gemm_gate_up_mq4g256v2_wmma_gfx12_vt4w8_k32",
+      "gemm_gate_up_mq4g256v2_wmma_gfx12_vt8w4_k32",
+      "gemm_gate_up_mq4g256v2_wmma_gfx12_vt8w8_k32"
+     ]
+    },
+    {
      "module": "gemm_hfq4g256_residual_wmma_gfx12_mq4v2",
      "kind": "hip",
      "sha256": "c2aa34eb38445fac8934d656844e9df457b57e423fb8ebe20ef7c5dc54f33739",
@@ -693,6 +810,33 @@
      "scheduler_profile": "default",
      "symbols": [
       "gemm_mq4g256v2_residual_wmma_gfx12"
+     ]
+    },
+    {
+     "module": "gemm_mq4g256v2_residual_wmma_gfx12_vt",
+     "kind": "hip",
+     "sha256": "a0fb40a36c4a08912bafe1465ad63a4c7e65af302ef7774c384a690a1f68ca78",
+     "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "-DIU4_A4_CANDIDATES=2"
+     ],
+     "scheduler_profile": "default",
+     "symbols": [
+      "gemm_mq4g256v2_residual_wmma_gfx12_vt2w4",
+      "gemm_mq4g256v2_residual_wmma_gfx12_vt2w8",
+      "gemm_mq4g256v2_residual_wmma_gfx12_vt3w4",
+      "gemm_mq4g256v2_residual_wmma_gfx12_vt3w8",
+      "gemm_mq4g256v2_residual_wmma_gfx12_vt4w4",
+      "gemm_mq4g256v2_residual_wmma_gfx12_vt4w4_k32",
+      "gemm_mq4g256v2_residual_wmma_gfx12_vt4w8",
+      "gemm_mq4g256v2_residual_wmma_gfx12_vt4w8_k32",
+      "gemm_mq4g256v2_residual_wmma_gfx12_vt8w4_k32",
+      "gemm_mq4g256v2_residual_wmma_gfx12_vt8w8_k32"
      ]
     },
     {
@@ -714,6 +858,33 @@
      ]
     },
     {
+     "module": "gemm_qkv_mq4g256v2_wmma_gfx12_vt",
+     "kind": "hip",
+     "sha256": "551cad82e8d129e28e0fdf9ae18e3e584a5e4899ad62ed0a7741f9bc71ca139d",
+     "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "-DIU4_A4_CANDIDATES=2"
+     ],
+     "scheduler_profile": "default",
+     "symbols": [
+      "gemm_qkv_mq4g256v2_wmma_gfx12_vt2w4",
+      "gemm_qkv_mq4g256v2_wmma_gfx12_vt2w8",
+      "gemm_qkv_mq4g256v2_wmma_gfx12_vt3w4",
+      "gemm_qkv_mq4g256v2_wmma_gfx12_vt3w8",
+      "gemm_qkv_mq4g256v2_wmma_gfx12_vt4w4",
+      "gemm_qkv_mq4g256v2_wmma_gfx12_vt4w4_k32",
+      "gemm_qkv_mq4g256v2_wmma_gfx12_vt4w8",
+      "gemm_qkv_mq4g256v2_wmma_gfx12_vt4w8_k32",
+      "gemm_qkv_mq4g256v2_wmma_gfx12_vt8w4_k32",
+      "gemm_qkv_mq4g256v2_wmma_gfx12_vt8w8_k32"
+     ]
+    },
+    {
      "module": "gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2",
      "kind": "hip",
      "sha256": "3c4776dd62c5925d7724f70e865c8ef75c9aade594eec9652364e322f462b055",
@@ -729,6 +900,33 @@
      "scheduler_profile": "default",
      "symbols": [
       "gemm_qkvza_mq4g256v2_wmma_gfx12"
+     ]
+    },
+    {
+     "module": "gemm_qkvza_mq4g256v2_wmma_gfx12_vt",
+     "kind": "hip",
+     "sha256": "63bc79436026b3aad83c8140a913fffa8ce8ae75a012c53626510e10bb1d7bbc",
+     "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "-DIU4_A4_CANDIDATES=2"
+     ],
+     "scheduler_profile": "default",
+     "symbols": [
+      "gemm_qkvza_mq4g256v2_wmma_gfx12_vt2w4",
+      "gemm_qkvza_mq4g256v2_wmma_gfx12_vt2w8",
+      "gemm_qkvza_mq4g256v2_wmma_gfx12_vt3w4",
+      "gemm_qkvza_mq4g256v2_wmma_gfx12_vt3w8",
+      "gemm_qkvza_mq4g256v2_wmma_gfx12_vt4w4",
+      "gemm_qkvza_mq4g256v2_wmma_gfx12_vt4w4_k32",
+      "gemm_qkvza_mq4g256v2_wmma_gfx12_vt4w8",
+      "gemm_qkvza_mq4g256v2_wmma_gfx12_vt4w8_k32",
+      "gemm_qkvza_mq4g256v2_wmma_gfx12_vt8w4_k32",
+      "gemm_qkvza_mq4g256v2_wmma_gfx12_vt8w8_k32"
      ]
     },
     {
@@ -786,6 +984,24 @@
      ]
     },
     {
+     "module": "gemv_mq4g256v2_xbatch",
+     "kind": "hip",
+     "sha256": "388272ecee32843d6f8fd052f86eb1a695c25dc903eef091cdf09f6e08972d44",
+     "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "-DIU4_A4_CANDIDATES=2"
+     ],
+     "scheduler_profile": "default",
+     "symbols": [
+      "gemv_mq4g256v2_xbatch"
+     ]
+    },
+    {
      "module": "kv_cache_write_fp8_e4m3",
      "kind": "hip",
      "sha256": "cba5a9e7facb67c85a847fc9c5b7aa9d33a7a4f258ef18dbdcdf1ecb83562fb6",
@@ -819,6 +1035,24 @@
      "scheduler_profile": "default",
      "symbols": [
       "kv_cache_write_fp8_e4m3_batched"
+     ]
+    },
+    {
+     "module": "kv_cache_write_fp8_e4m3_batched_vmm",
+     "kind": "hip",
+     "sha256": "f543bede259a39a143980465b8ff4c1c77324d5f34577fe11cc07ec317fd206e",
+     "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "-DIU4_A4_CANDIDATES=2"
+     ],
+     "scheduler_profile": "default",
+     "symbols": [
+      "kv_cache_write_fp8_e4m3_batched_vmm"
      ]
     },
     {
@@ -894,6 +1128,24 @@
      ]
     },
     {
+     "module": "qwen36_27b_fa_prep_gfx1201_rows",
+     "kind": "hip",
+     "sha256": "f6707cf305ba33ec1b935556aa1de5f0fb08b13b336959466714964ed7b98e25",
+     "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "-DIU4_A4_CANDIDATES=2"
+     ],
+     "scheduler_profile": "default",
+     "symbols": [
+      "qwen36_27b_fa_prep_gfx1201_rows"
+     ]
+    },
+    {
      "module": "rmsnorm_f32_rowsplit",
      "kind": "hip",
      "sha256": "2923d5361f5e68971f0124d1a16dd8f78ea4fe00aba02fe6ffee3649982d19a9",
@@ -932,7 +1184,7 @@
     {
      "module": "sample_top_p_parallel",
      "kind": "hip",
-     "sha256": "b17f74bb84d6cda8e1946228a20e174d1e38294efeef59d64dea40b0027e1df7",
+     "sha256": "1f599929fa7dee4dd1397db22ffb3d7262d103d247de6e39a246a9f7ba8d3b94",
      "flags": [
       "--genco",
       "--offload-arch=gfx1201",
@@ -952,7 +1204,7 @@
     {
      "module": "sample_top_p_parallel_fast21",
      "kind": "hip",
-     "sha256": "af11d3c9fcf4513f59533efd7769b006387b9f0de642988a587f20092a0c509f",
+     "sha256": "c8c96a20da1c638382f5ae1144193618b5b16b120d9c809d08681d636bd6f6c8",
      "flags": [
       "--genco",
       "--offload-arch=gfx1201",
@@ -971,7 +1223,7 @@
     {
      "module": "sample_top_p_parallel_fast65",
      "kind": "hip",
-     "sha256": "2fe31c09772af9f349e592674043abd1a582091f13333ed355acae5d22121328",
+     "sha256": "c11602685ff0268c3733e70486315737f15e757d2da4cc6bb30fc249ea71e888",
      "flags": [
       "--genco",
       "--offload-arch=gfx1201",
@@ -990,7 +1242,7 @@
     {
      "module": "sample_top_p_parallel_w64",
      "kind": "hip",
-     "sha256": "ed056855f74b119aaa93c4d76611df7e2906c9d9ad06f941f9262c04de549052",
+     "sha256": "8d520570e0398a28a94722fdab876f6c29178b50b1ed3d30e223b9940ce490e8",
      "flags": [
       "--genco",
       "--offload-arch=gfx1201",
@@ -1057,7 +1309,7 @@
      ]
     }
    ],
-   "symbol_count": 67
+   "symbol_count": 115
   },
   "native_mtp": {
    "entries": [
@@ -1152,6 +1404,24 @@
      ]
     },
     {
+     "module": "attention_flash_fp8_e4m3_tile_gqa_gfx1201_vmm",
+     "kind": "hip",
+     "sha256": "8379b4c6a5a82ca11d05dedfb4544c9669e669773d1963cb5ee83df8fbe82393",
+     "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "-DIU4_A4_CANDIDATES=2"
+     ],
+     "scheduler_profile": "default",
+     "symbols": [
+      "attention_flash_fp8_e4m3_tile_gqa_gfx1201_vmm"
+     ]
+    },
+    {
      "module": "attention_flash_q8_0_reduce",
      "kind": "hip",
      "sha256": "a67f131323361b80c649e88fa6db50750f20be09a7a13bccaadc96587dd36aa8",
@@ -1203,6 +1473,24 @@
      "scheduler_profile": "default",
      "symbols": [
       "attention_flash_reduce_dsplit_gfx1201"
+     ]
+    },
+    {
+     "module": "attention_flash_reduce_dsplit_gfx1201_vmm",
+     "kind": "hip",
+     "sha256": "f6c4058a72409d9733cf0e865045264fb1a6b94e7a78083198ae51e258fd5ed8",
+     "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "-DIU4_A4_CANDIDATES=2"
+     ],
+     "scheduler_profile": "default",
+     "symbols": [
+      "attention_flash_reduce_dsplit_gfx1201_vmm"
      ]
     },
     {
@@ -1260,6 +1548,24 @@
      ]
     },
     {
+     "module": "attention_fp8_e4m3_kv_batched_segs",
+     "kind": "hip",
+     "sha256": "86408565a0e4e26ca689e7dc5fc700d6c7748ecde339337701053cb9a0d9901f",
+     "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "-DIU4_A4_CANDIDATES=2"
+     ],
+     "scheduler_profile": "default",
+     "symbols": [
+      "attention_fp8_e4m3_kv_batched_segs"
+     ]
+    },
+    {
      "module": "attention_verify_gqa_gfx1201",
      "kind": "hip",
      "sha256": "8b3cfa276db5dcf0ccdc87bf8825a4fa9b7f688dfa31889dd1fbd8a261b9a06a",
@@ -1312,6 +1618,24 @@
      "scheduler_profile": "default",
      "symbols": [
       "conv1d_silu_split_qknorm_b256"
+     ]
+    },
+    {
+     "module": "conv1d_silu_split_qknorm_b256_rows",
+     "kind": "hip",
+     "sha256": "1b134c1ab4c8abe5d3a3d1088c8e030ca97e59feebc83ed86949c40b9ded0764",
+     "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "-DIU4_A4_CANDIDATES=2"
+     ],
+     "scheduler_profile": "default",
+     "symbols": [
+      "conv1d_silu_split_qknorm_b256_rows"
      ]
     },
     {
@@ -1639,6 +1963,24 @@
      ]
     },
     {
+     "module": "gated_delta_net_q8_compact3_b2_rows",
+     "kind": "hip",
+     "sha256": "5bdeacc50fe54e19ea91fda28756f915fc0bdabd383960ca37309c9df73708ec",
+     "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "-DIU4_A4_CANDIDATES=2"
+     ],
+     "scheduler_profile": "default",
+     "symbols": [
+      "gated_delta_net_q8_compact3_b2_rows"
+     ]
+    },
+    {
      "module": "gated_delta_net_q8_fast",
      "kind": "hip",
      "sha256": "0cbfc2d3cc51bd4b74441caf3e0a6286983ff172a40f1c3b9614c267888bbe94",
@@ -1744,6 +2086,24 @@
      "scheduler_profile": "default",
      "symbols": [
       "gated_norm_mq_rotate_awq_k6144_gfx1201"
+     ]
+    },
+    {
+     "module": "gated_norm_mq_rotate_awq_k6144_gfx1201_rows",
+     "kind": "hip",
+     "sha256": "37b495e58b2b595f8d5d2b5942387ca851701a2dec75c3b528407b45679d0ca3",
+     "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "-DIU4_A4_CANDIDATES=2"
+     ],
+     "scheduler_profile": "default",
+     "symbols": [
+      "gated_norm_mq_rotate_awq_k6144_gfx1201_rows"
      ]
     },
     {
@@ -1899,6 +2259,33 @@
      ]
     },
     {
+     "module": "gemm_gate_up_mq4g256v2_wmma_gfx12_vt",
+     "kind": "hip",
+     "sha256": "a016e4de75c2cf60a6e301d16f4a58c7c07e62e7eee47853a844708627e9876c",
+     "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "-DIU4_A4_CANDIDATES=2"
+     ],
+     "scheduler_profile": "default",
+     "symbols": [
+      "gemm_gate_up_mq4g256v2_wmma_gfx12_vt2w4",
+      "gemm_gate_up_mq4g256v2_wmma_gfx12_vt2w8",
+      "gemm_gate_up_mq4g256v2_wmma_gfx12_vt3w4",
+      "gemm_gate_up_mq4g256v2_wmma_gfx12_vt3w8",
+      "gemm_gate_up_mq4g256v2_wmma_gfx12_vt4w4",
+      "gemm_gate_up_mq4g256v2_wmma_gfx12_vt4w4_k32",
+      "gemm_gate_up_mq4g256v2_wmma_gfx12_vt4w8",
+      "gemm_gate_up_mq4g256v2_wmma_gfx12_vt4w8_k32",
+      "gemm_gate_up_mq4g256v2_wmma_gfx12_vt8w4_k32",
+      "gemm_gate_up_mq4g256v2_wmma_gfx12_vt8w8_k32"
+     ]
+    },
+    {
      "module": "gemm_hfq4g256",
      "kind": "hip",
      "sha256": "10c7cb3d5c3e77546693efd9942c818d771fb6c5f88f7b9d607c3a8bb17b30ff",
@@ -1935,6 +2322,33 @@
      ]
     },
     {
+     "module": "gemm_mq4g256v2_residual_wmma_gfx12_vt",
+     "kind": "hip",
+     "sha256": "a0fb40a36c4a08912bafe1465ad63a4c7e65af302ef7774c384a690a1f68ca78",
+     "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "-DIU4_A4_CANDIDATES=2"
+     ],
+     "scheduler_profile": "default",
+     "symbols": [
+      "gemm_mq4g256v2_residual_wmma_gfx12_vt2w4",
+      "gemm_mq4g256v2_residual_wmma_gfx12_vt2w8",
+      "gemm_mq4g256v2_residual_wmma_gfx12_vt3w4",
+      "gemm_mq4g256v2_residual_wmma_gfx12_vt3w8",
+      "gemm_mq4g256v2_residual_wmma_gfx12_vt4w4",
+      "gemm_mq4g256v2_residual_wmma_gfx12_vt4w4_k32",
+      "gemm_mq4g256v2_residual_wmma_gfx12_vt4w8",
+      "gemm_mq4g256v2_residual_wmma_gfx12_vt4w8_k32",
+      "gemm_mq4g256v2_residual_wmma_gfx12_vt8w4_k32",
+      "gemm_mq4g256v2_residual_wmma_gfx12_vt8w8_k32"
+     ]
+    },
+    {
      "module": "gemm_qkv_hfq4g256_wmma_gfx12_mq4v2",
      "kind": "hip",
      "sha256": "48c6935adaeef6852f9fba0bda3fdd4ce71487db3a2af18d832c3d3fa099e6dd",
@@ -1953,6 +2367,33 @@
      ]
     },
     {
+     "module": "gemm_qkv_mq4g256v2_wmma_gfx12_vt",
+     "kind": "hip",
+     "sha256": "551cad82e8d129e28e0fdf9ae18e3e584a5e4899ad62ed0a7741f9bc71ca139d",
+     "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "-DIU4_A4_CANDIDATES=2"
+     ],
+     "scheduler_profile": "default",
+     "symbols": [
+      "gemm_qkv_mq4g256v2_wmma_gfx12_vt2w4",
+      "gemm_qkv_mq4g256v2_wmma_gfx12_vt2w8",
+      "gemm_qkv_mq4g256v2_wmma_gfx12_vt3w4",
+      "gemm_qkv_mq4g256v2_wmma_gfx12_vt3w8",
+      "gemm_qkv_mq4g256v2_wmma_gfx12_vt4w4",
+      "gemm_qkv_mq4g256v2_wmma_gfx12_vt4w4_k32",
+      "gemm_qkv_mq4g256v2_wmma_gfx12_vt4w8",
+      "gemm_qkv_mq4g256v2_wmma_gfx12_vt4w8_k32",
+      "gemm_qkv_mq4g256v2_wmma_gfx12_vt8w4_k32",
+      "gemm_qkv_mq4g256v2_wmma_gfx12_vt8w8_k32"
+     ]
+    },
+    {
      "module": "gemm_qkvza_hfq4g256_wmma_gfx12_mq4v2",
      "kind": "hip",
      "sha256": "3c4776dd62c5925d7724f70e865c8ef75c9aade594eec9652364e322f462b055",
@@ -1968,6 +2409,33 @@
      "scheduler_profile": "default",
      "symbols": [
       "gemm_qkvza_mq4g256v2_wmma_gfx12"
+     ]
+    },
+    {
+     "module": "gemm_qkvza_mq4g256v2_wmma_gfx12_vt",
+     "kind": "hip",
+     "sha256": "63bc79436026b3aad83c8140a913fffa8ce8ae75a012c53626510e10bb1d7bbc",
+     "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "-DIU4_A4_CANDIDATES=2"
+     ],
+     "scheduler_profile": "default",
+     "symbols": [
+      "gemm_qkvza_mq4g256v2_wmma_gfx12_vt2w4",
+      "gemm_qkvza_mq4g256v2_wmma_gfx12_vt2w8",
+      "gemm_qkvza_mq4g256v2_wmma_gfx12_vt3w4",
+      "gemm_qkvza_mq4g256v2_wmma_gfx12_vt3w8",
+      "gemm_qkvza_mq4g256v2_wmma_gfx12_vt4w4",
+      "gemm_qkvza_mq4g256v2_wmma_gfx12_vt4w4_k32",
+      "gemm_qkvza_mq4g256v2_wmma_gfx12_vt4w8",
+      "gemm_qkvza_mq4g256v2_wmma_gfx12_vt4w8_k32",
+      "gemm_qkvza_mq4g256v2_wmma_gfx12_vt8w4_k32",
+      "gemm_qkvza_mq4g256v2_wmma_gfx12_vt8w8_k32"
      ]
     },
     {
@@ -2061,6 +2529,24 @@
      ]
     },
     {
+     "module": "gemv_mq4g256v2_xbatch",
+     "kind": "hip",
+     "sha256": "388272ecee32843d6f8fd052f86eb1a695c25dc903eef091cdf09f6e08972d44",
+     "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "-DIU4_A4_CANDIDATES=2"
+     ],
+     "scheduler_profile": "default",
+     "symbols": [
+      "gemv_mq4g256v2_xbatch"
+     ]
+    },
+    {
      "module": "greedy_accept",
      "kind": "hip",
      "sha256": "09c3a20cd11d1e330087448d7d7ccae643717a15ac3ff6b2d6e3144fe6cd53b1",
@@ -2112,6 +2598,24 @@
      "scheduler_profile": "default",
      "symbols": [
       "kv_cache_write_fp8_e4m3_batched"
+     ]
+    },
+    {
+     "module": "kv_cache_write_fp8_e4m3_batched_vmm",
+     "kind": "hip",
+     "sha256": "f543bede259a39a143980465b8ff4c1c77324d5f34577fe11cc07ec317fd206e",
+     "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "-DIU4_A4_CANDIDATES=2"
+     ],
+     "scheduler_profile": "default",
+     "symbols": [
+      "kv_cache_write_fp8_e4m3_batched_vmm"
      ]
     },
     {
@@ -2223,6 +2727,24 @@
      ]
     },
     {
+     "module": "qwen36_27b_fa_prep_gfx1201_rows",
+     "kind": "hip",
+     "sha256": "f6707cf305ba33ec1b935556aa1de5f0fb08b13b336959466714964ed7b98e25",
+     "flags": [
+      "--genco",
+      "--offload-arch=gfx1201",
+      "-O3",
+      "--no-offload-compress",
+      "-fuse-cuid=none",
+      "-mcode-object-version=6",
+      "-DIU4_A4_CANDIDATES=2"
+     ],
+     "scheduler_profile": "default",
+     "symbols": [
+      "qwen36_27b_fa_prep_gfx1201_rows"
+     ]
+    },
+    {
      "module": "rmsnorm",
      "kind": "hip",
      "sha256": "4cac09faa9d0883e6ca9d100bb13455ae88cfb8984e2ea68250ee2e3f64777f1",
@@ -2315,7 +2837,7 @@
     {
      "module": "sample_top_p_parallel",
      "kind": "hip",
-     "sha256": "b17f74bb84d6cda8e1946228a20e174d1e38294efeef59d64dea40b0027e1df7",
+     "sha256": "1f599929fa7dee4dd1397db22ffb3d7262d103d247de6e39a246a9f7ba8d3b94",
      "flags": [
       "--genco",
       "--offload-arch=gfx1201",
@@ -2335,7 +2857,7 @@
     {
      "module": "sample_top_p_parallel_fast21",
      "kind": "hip",
-     "sha256": "af11d3c9fcf4513f59533efd7769b006387b9f0de642988a587f20092a0c509f",
+     "sha256": "c8c96a20da1c638382f5ae1144193618b5b16b120d9c809d08681d636bd6f6c8",
      "flags": [
       "--genco",
       "--offload-arch=gfx1201",
@@ -2354,7 +2876,7 @@
     {
      "module": "sample_top_p_parallel_fast65",
      "kind": "hip",
-     "sha256": "2fe31c09772af9f349e592674043abd1a582091f13333ed355acae5d22121328",
+     "sha256": "c11602685ff0268c3733e70486315737f15e757d2da4cc6bb30fc249ea71e888",
      "flags": [
       "--genco",
       "--offload-arch=gfx1201",
@@ -2373,7 +2895,7 @@
     {
      "module": "sample_top_p_parallel_w64",
      "kind": "hip",
-     "sha256": "ed056855f74b119aaa93c4d76611df7e2906c9d9ad06f941f9262c04de549052",
+     "sha256": "8d520570e0398a28a94722fdab876f6c29178b50b1ed3d30e223b9940ce490e8",
      "flags": [
       "--genco",
       "--offload-arch=gfx1201",
@@ -2465,7 +2987,7 @@
     {
      "module": "softmax_temp_topp_batched",
      "kind": "hip",
-     "sha256": "e5caeb67c552bdd34cd03a448c4200824143f282d407a53b210e1fed065998d2",
+     "sha256": "b8f2c67796574a5d1e4e4bfd147244a6e931869557ecd2e9f4d34a352dfd2e21",
      "flags": [
       "--genco",
       "--offload-arch=gfx1201",
@@ -2494,12 +3016,13 @@
      ]
     }
    ],
-   "symbol_count": 89,
+   "symbol_count": 138,
    "mtp_only_modules": [
     "add_inplace",
     "argmax_token_chain",
     "attention_flash_q8_0_reduce",
     "attention_flash_q8_0_tile",
+    "attention_fp8_e4m3_kv_batched_segs",
     "conv1d_silu_split",
     "deinterleave",
     "deinterleave_batched",
@@ -3351,7 +3874,7 @@
     "module": "sample_top_p_parallel",
     "symbol": "sample_apply_repeat_penalty",
     "kind": "hip",
-    "sha256": "b17f74bb84d6cda8e1946228a20e174d1e38294efeef59d64dea40b0027e1df7",
+    "sha256": "1f599929fa7dee4dd1397db22ffb3d7262d103d247de6e39a246a9f7ba8d3b94",
     "flags": [
      "--genco",
      "--offload-arch=gfx1201",
@@ -3367,7 +3890,7 @@
     "module": "sample_top_p_parallel",
     "symbol": "sample_topk_finalize",
     "kind": "hip",
-    "sha256": "b17f74bb84d6cda8e1946228a20e174d1e38294efeef59d64dea40b0027e1df7",
+    "sha256": "1f599929fa7dee4dd1397db22ffb3d7262d103d247de6e39a246a9f7ba8d3b94",
     "flags": [
      "--genco",
      "--offload-arch=gfx1201",
@@ -3383,7 +3906,7 @@
     "module": "sample_top_p_parallel",
     "symbol": "sample_topk_partial",
     "kind": "hip",
-    "sha256": "b17f74bb84d6cda8e1946228a20e174d1e38294efeef59d64dea40b0027e1df7",
+    "sha256": "1f599929fa7dee4dd1397db22ffb3d7262d103d247de6e39a246a9f7ba8d3b94",
     "flags": [
      "--genco",
      "--offload-arch=gfx1201",
@@ -3399,7 +3922,7 @@
     "module": "sample_top_p_parallel_fast21",
     "symbol": "sample_topk_finalize_fast21",
     "kind": "hip",
-    "sha256": "af11d3c9fcf4513f59533efd7769b006387b9f0de642988a587f20092a0c509f",
+    "sha256": "c8c96a20da1c638382f5ae1144193618b5b16b120d9c809d08681d636bd6f6c8",
     "flags": [
      "--genco",
      "--offload-arch=gfx1201",
@@ -3415,7 +3938,7 @@
     "module": "sample_top_p_parallel_fast21",
     "symbol": "sample_topk_partial_fast21",
     "kind": "hip",
-    "sha256": "af11d3c9fcf4513f59533efd7769b006387b9f0de642988a587f20092a0c509f",
+    "sha256": "c8c96a20da1c638382f5ae1144193618b5b16b120d9c809d08681d636bd6f6c8",
     "flags": [
      "--genco",
      "--offload-arch=gfx1201",
@@ -3431,7 +3954,7 @@
     "module": "sample_top_p_parallel_fast65",
     "symbol": "sample_topk_finalize_fast65",
     "kind": "hip",
-    "sha256": "2fe31c09772af9f349e592674043abd1a582091f13333ed355acae5d22121328",
+    "sha256": "c11602685ff0268c3733e70486315737f15e757d2da4cc6bb30fc249ea71e888",
     "flags": [
      "--genco",
      "--offload-arch=gfx1201",
@@ -3447,7 +3970,7 @@
     "module": "sample_top_p_parallel_fast65",
     "symbol": "sample_topk_partial_fast65",
     "kind": "hip",
-    "sha256": "2fe31c09772af9f349e592674043abd1a582091f13333ed355acae5d22121328",
+    "sha256": "c11602685ff0268c3733e70486315737f15e757d2da4cc6bb30fc249ea71e888",
     "flags": [
      "--genco",
      "--offload-arch=gfx1201",
@@ -3463,7 +3986,7 @@
     "module": "sample_top_p_parallel_w64",
     "symbol": "sample_apply_repeat_penalty_w64",
     "kind": "hip",
-    "sha256": "ed056855f74b119aaa93c4d76611df7e2906c9d9ad06f941f9262c04de549052",
+    "sha256": "8d520570e0398a28a94722fdab876f6c29178b50b1ed3d30e223b9940ce490e8",
     "flags": [
      "--genco",
      "--offload-arch=gfx1201",
@@ -3479,7 +4002,7 @@
     "module": "sample_top_p_parallel_w64",
     "symbol": "sample_topk_finalize_w64",
     "kind": "hip",
-    "sha256": "ed056855f74b119aaa93c4d76611df7e2906c9d9ad06f941f9262c04de549052",
+    "sha256": "8d520570e0398a28a94722fdab876f6c29178b50b1ed3d30e223b9940ce490e8",
     "flags": [
      "--genco",
      "--offload-arch=gfx1201",
@@ -3495,7 +4018,7 @@
     "module": "sample_top_p_parallel_w64",
     "symbol": "sample_topk_partial_w64",
     "kind": "hip",
-    "sha256": "ed056855f74b119aaa93c4d76611df7e2906c9d9ad06f941f9262c04de549052",
+    "sha256": "8d520570e0398a28a94722fdab876f6c29178b50b1ed3d30e223b9940ce490e8",
     "flags": [
      "--genco",
      "--offload-arch=gfx1201",
@@ -4673,7 +5196,7 @@
     "module": "sample_top_p_parallel",
     "symbol": "sample_apply_repeat_penalty",
     "kind": "hip",
-    "sha256": "b17f74bb84d6cda8e1946228a20e174d1e38294efeef59d64dea40b0027e1df7",
+    "sha256": "1f599929fa7dee4dd1397db22ffb3d7262d103d247de6e39a246a9f7ba8d3b94",
     "flags": [
      "--genco",
      "--offload-arch=gfx1201",
@@ -4753,7 +5276,7 @@
     "module": "softmax_temp_topp_batched",
     "symbol": "softmax_temp_topp_batched_f32",
     "kind": "hip",
-    "sha256": "e5caeb67c552bdd34cd03a448c4200824143f282d407a53b210e1fed065998d2",
+    "sha256": "b8f2c67796574a5d1e4e4bfd147244a6e931869557ecd2e9f4d34a352dfd2e21",
     "flags": [
      "--genco",
      "--offload-arch=gfx1201",

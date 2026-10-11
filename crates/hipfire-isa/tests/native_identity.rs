@@ -14,7 +14,7 @@
 //! shared with `hipfire-rip`'s `qsa` test; the strict whole-file comparison is
 //! kept there as `strict_whole_file_difference`.
 #![cfg(feature = "toolchain")]
-use hipfire_isa::kernels::{fp8_gemm, gdn_scan, iu4_gemm, iu4_v2b, iu4_v2b_a4, iu4_v2c, qsa_gather, qwen4_mq6_x4, qwen4_mq6_x4_gfx11, qwen4_moe_sym};
+use hipfire_isa::kernels::{fp8_gemm, gdn_scan, iu4_gemm, iu4_v2b, iu4_v2b_a4, iu4_v2c, mq4_rows_x4, qsa_gather, qwen4_mq4_x4_gfx11, qwen4_mq6_x4, qwen4_mq6_x4_gfx11, qwen4_moe_sym};
 use hipfire_isa::kernels::gemm_uk::{Chain, Iu8, MmaKind};
 use hipfire_isa::toolchain::{oracle_assemble_link_bundle, Toolchain};
 use hipfire_isa::{native, Arch, Builder, Emitted, KernargLayout, KernelSpec, RegPlan, V, reg::Live};
@@ -99,6 +99,12 @@ fn corpus() -> Vec<Unit> {
         // Qwen4 MQ6 trunk GEMM U3 twin (gfx1151 only): the six entries and their module.
         for (wr, kind) in qwen4_mq6_x4_gfx11::Spec::ALL { if let Ok(e) = qwen4_mq6_x4_gfx11::emit(qwen4_mq6_x4_gfx11::Spec { arch, wr, kind }) { single(&mut units, e) } }
         if let Ok((_, text, proof)) = qwen4_mq6_x4_gfx11::emit_module(arch) { module(&mut units, proof.module, arch, text) }
+        // Qwen4 MQ4 trunk GEMM twin (gfx1151 only): the same six entries over the MQ4G256V2 group, and their module.
+        for (wr, kind) in qwen4_mq4_x4_gfx11::Spec::ALL { if let Ok(e) = qwen4_mq4_x4_gfx11::emit(qwen4_mq4_x4_gfx11::Spec { arch, wr, kind }) { single(&mut units, e) } }
+        if let Ok((_, text, proof)) = qwen4_mq4_x4_gfx11::emit_module(arch) { module(&mut units, proof.module, arch, text) }
+        // Qwen4 MQ4 few-row exact GEMV (gfx1151 and gfx1201): the entry and its module.
+        if let Ok(e) = mq4_rows_x4::emit(mq4_rows_x4::Spec { arch }) { single(&mut units, e) }
+        if let Ok((_, text, proof)) = mq4_rows_x4::emit_module(arch) { module(&mut units, proof.module, arch, text) }
         // F2 FP8 GEMM: every symbol, the per-scale modules and the
         // `--scale both --epi all` product module.
         let epis = [fp8_gemm::Epi::Set, fp8_gemm::Epi::Add, fp8_gemm::Epi::GateUpSilu, fp8_gemm::Epi::Qkv, fp8_gemm::Epi::Qkvza];

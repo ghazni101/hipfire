@@ -16,6 +16,9 @@ from contextlib import nullcontext
 import copy
 import hashlib
 import importlib
+import array
+import difflib
+import functools
 import json
 import random
 import math
@@ -186,6 +189,33 @@ MAX_TENSOR_SLICE_BYTES = 128 << 10
 RANGE_MAX_RETRIES = 4
 RANGE_RETRY_BACKOFF_SECONDS = 0.25
 RANGE_RETRY_BACKOFF_MAX_SECONDS = 1.0
+
+# Quality-stream limits (opt-in via PinnedCheckpoint raw readers; the legacy
+# fixture reads above keep the 128 KiB bound).  One teacher traversal reads
+# about 242 GB of routed experts; the default guard allows exactly one.
+RAW_STREAM_RANGE_BYTES = 8 << 20
+DEFAULT_REMOTE_BYTE_BUDGET = 260 * 10**9
+DEFAULT_STREAM_DISK_BUDGET_BYTES = 12 * 10**9
+DEFAULT_MAX_LIVE_GROUPS = 2
+RAW_DTYPE_ITEMSIZE = {"BF16": 2, "F32": 4, "I64": 8, "I32": 4}
+
+
+class _ByteBudget:
+    """Shared cap on *new* remote bytes (cache hits and local reads are free)."""
+
+    def __init__(self, limit: int | None):
+        self.limit = None if limit is None else int(limit)
+        self.used = 0
+
+    def check(self, additional: int, label: str) -> None:
+        if self.limit is not None and self.used + additional > self.limit:
+            raise FixtureError(
+                f"remote read budget {self.limit} bytes would be exceeded by {additional} bytes for {label} "
+                f"(already {self.used})"
+            )
+
+    def charge(self, amount: int) -> None:
+        self.used += int(amount)
 
 # Names are intentionally explicit instead of selecting the first lexical
 # match.  This prevents a model-index reorder from changing the fixture.
@@ -544,11 +574,113 @@ class _RangeClient:
     from combining slices from different checkpoint revisions.
     """
 
-    def __init__(self, cache_dir: Path):
-        self.cache_dir = cache_dir / "checkpoint_ranges"
+    def __init__(
+        self,
+        cache_dir: Path,
+        *,
+        subdir: str = "checkpoint_ranges",
+        network_budget: "_ByteBudget | None" = None,
+        disk_budget_bytes: int | None = None,
+    ):
+        self.cache_dir = cache_dir / subdir
         self.cache_dir.mkdir(parents=True, exist_ok=True)
         self.seals: dict[str, dict[str, object]] = {}
         self.read_bytes = 0
+        self.network_budget = network_budget
+        self.network_bytes = 0
+        self.network_seconds = 0.0
+        self.network_requests = 0
+        self.cache_hit_bytes = 0
+        self.cache_hit_requests = 0
+        # Disk accounting is enabled only for the bounded stream cache; the
+        # legacy sparse range cache keeps its original unbounded behaviour.
+        self.disk_budget_bytes = disk_budget_bytes
+        self.cache_group: str | None = None
+        self.live_groups: list[str] = []
+        self.group_files: dict[str, list[tuple[Path, Path, int]]] = {}
+        self.group_stats: dict[str, dict[str, float]] = {}
+        self.released_groups: dict[str, dict[str, int]] = {}
+        self.cache_bytes = 0
+        self.peak_cache_bytes = 0
+        if disk_budget_bytes is not None:
+            adopted: list[tuple[Path, Path, int]] = []
+            for body in sorted(self.cache_dir.glob("*.bin")):
+                meta = body.with_suffix(".json")
+                size = body.stat().st_size
+                adopted.append((body, meta, size))
+            if adopted:
+                self.group_files["_preexisting"] = adopted
+                self.cache_bytes = sum(item[2] for item in adopted)
+                self.peak_cache_bytes = self.cache_bytes
+
+    def _group_stat(self, key: str, amount: float) -> None:
+        stats = self.group_stats.setdefault(self.cache_group or "_ungrouped", {})
+        stats[key] = stats.get(key, 0) + amount
+
+    def _track_file(self, body: Path, meta: Path, size: int) -> None:
+        group = self.cache_group or "_ungrouped"
+        self.group_files.setdefault(group, []).append((body, meta, size))
+        self.cache_bytes += size
+        self.peak_cache_bytes = max(self.peak_cache_bytes, self.cache_bytes)
+
+    def begin_group(self, label: str, *, max_live_groups: int = DEFAULT_MAX_LIVE_GROUPS) -> list[str]:
+        """Start a cache group (e.g. one decoder layer); evict the oldest groups beyond `max_live_groups`."""
+        if max_live_groups < 1:
+            raise FixtureError("max_live_groups must be at least 1")
+        self.cache_group = label
+        if label in self.live_groups:
+            self.live_groups.remove(label)
+        self.live_groups.append(label)
+        self.group_files.setdefault(label, [])
+        evicted: list[str] = []
+        while len(self.live_groups) > max_live_groups:
+            oldest = self.live_groups[0]
+            self.release_group(oldest)
+            evicted.append(oldest)
+        return evicted
+
+    def release_group(self, label: str) -> int:
+        """Delete every cached range of `label`; returns freed bytes."""
+        freed = 0
+        files = self.group_files.pop(label, [])
+        for body, meta, size in files:
+            body.unlink(missing_ok=True)
+            meta.unlink(missing_ok=True)
+            freed += size
+        self.cache_bytes -= freed
+        if label in self.live_groups:
+            self.live_groups.remove(label)
+        if self.cache_group == label:
+            self.cache_group = None
+        if files:
+            previous = self.released_groups.get(label, {"bytes": 0, "files": 0})
+            self.released_groups[label] = {"bytes": previous["bytes"] + freed, "files": previous["files"] + len(files)}
+        return freed
+
+    def release_all(self) -> int:
+        return sum(self.release_group(label) for label in list(self.group_files))
+
+    def cleanup(self) -> int:
+        """Release every tracked range and remove the (stream-only) cache directory."""
+        freed = self.release_all()
+        if self.disk_budget_bytes is not None and self.cache_dir.is_dir():
+            shutil.rmtree(self.cache_dir, ignore_errors=True)
+        return freed
+
+    def transfer_stats(self) -> dict[str, object]:
+        return {
+            "network_bytes": self.network_bytes,
+            "network_seconds": self.network_seconds,
+            "network_requests": self.network_requests,
+            "cache_hit_bytes": self.cache_hit_bytes,
+            "cache_hit_requests": self.cache_hit_requests,
+            "disk_budget_bytes": self.disk_budget_bytes,
+            "disk_cache_bytes": self.cache_bytes,
+            "disk_peak_cache_bytes": self.peak_cache_bytes,
+            "live_groups": list(self.live_groups),
+            "released_groups": {key: dict(value) for key, value in self.released_groups.items()},
+            "group_stats": {key: dict(value) for key, value in self.group_stats.items()},
+        }
 
     def _seal(self, url: str, metadata: Mapping[str, object]) -> None:
         revision = metadata.get("repo_commit")
@@ -634,8 +766,20 @@ class _RangeClient:
                 raise FixtureError(f"cached range digest mismatch {key}")
             self._seal(url, metadata)
             self.read_bytes += len(body)
+            self.cache_hit_bytes += len(body)
+            self.cache_hit_requests += 1
+            self._group_stat("cache_hit_bytes", len(body))
+            self._group_stat("cache_hit_requests", 1)
             return body, metadata
 
+        if self.network_budget is not None:
+            self.network_budget.check(requested_length, f"{url} bytes {start}-{end}")
+        if self.disk_budget_bytes is not None and self.cache_bytes + requested_length > self.disk_budget_bytes:
+            raise FixtureError(
+                f"stream cache disk budget {self.disk_budget_bytes} would be exceeded by {requested_length} more bytes "
+                f"(currently {self.cache_bytes}); release a layer group first"
+            )
+        network_started = time.monotonic()
         retry_index = 0
         while True:
             request = urllib.request.Request(
@@ -699,9 +843,21 @@ class _RangeClient:
                     retry_index += 1
                     continue
                 raise FixtureError(f"unable to range-read {url} bytes {start}-{end}: {exc}") from exc
+        elapsed = time.monotonic() - network_started
         body_path.write_bytes(body)
-        meta_path.write_text(json.dumps(metadata, sort_keys=True, separators=(",", ":")) + "\n", encoding="utf-8")
+        meta_text = json.dumps(metadata, sort_keys=True, separators=(",", ":")) + "\n"
+        meta_path.write_text(meta_text, encoding="utf-8")
         self.read_bytes += len(body)
+        if self.network_budget is not None:
+            self.network_budget.charge(len(body))
+        self.network_bytes += len(body)
+        self.network_seconds += elapsed
+        self.network_requests += 1
+        self._group_stat("network_bytes", len(body))
+        self._group_stat("network_seconds", elapsed)
+        self._group_stat("network_requests", 1)
+        if self.disk_budget_bytes is not None:
+            self._track_file(body_path, meta_path, len(body))
         return body, metadata
 
 
@@ -738,6 +894,17 @@ def _tensor_descriptor(
         raise FixtureError(f"pinned model index is missing required tensor {tensor_name}")
     url = f"https://huggingface.co/{HF_MODEL}/resolve/{HF_CONFIG_COMMIT}/{shard}"
     header, header_meta = _safetensor_header(client, url)
+    return _descriptor_from_header(tensor_name, shard, url, header, header_meta)
+
+
+def _descriptor_from_header(
+    tensor_name: str,
+    shard: str,
+    url: str,
+    header: Mapping[str, object],
+    header_meta: Mapping[str, object],
+) -> dict[str, object]:
+    """Validate one tensor entry of an already-read safetensors header."""
     descriptor = header.get(tensor_name)
     if not isinstance(descriptor, dict):
         raise FixtureError(f"safetensors header is missing required tensor {tensor_name}")
@@ -911,8 +1078,165 @@ def _read_tensor_expert_rows(
     return result
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    """Return the 3xx response itself so its headers (X-Linked-Etag) can be read."""
+
+    def redirect_request(self, *_args: Any, **_kwargs: Any) -> None:
+        return None
+
+
+def _tensor_role(name: str) -> str:
+    if name.startswith("mtp."):
+        return "mtp"
+    if ".ngram_embedding." in name:
+        return "ple_embedding"
+    if ".mlp.experts." in name:
+        return "routed_experts"
+    if name.endswith("embed_tokens.weight"):
+        return "embedding"
+    if name.startswith("lm_head."):
+        return "lm_head"
+    return "trunk"
+
+
+def _local_safetensor_header(path: Path) -> tuple[dict[str, object], dict[str, object]]:
+    size = path.stat().st_size
+    with path.open("rb") as handle:
+        prefix = handle.read(8)
+        if len(prefix) != 8:
+            raise FixtureError(f"local safetensors shard {path} is shorter than its length prefix")
+        header_length = struct.unpack("<Q", prefix)[0]
+        if header_length <= 2 or header_length > MAX_HEADER_BYTES or 8 + header_length > size:
+            raise FixtureError(f"local safetensors header length {header_length} is invalid for {path}")
+        header_raw = handle.read(header_length)
+    if len(header_raw) != header_length:
+        raise FixtureError(f"local safetensors shard {path} has a truncated header")
+    try:
+        header = json.loads(header_raw.decode("utf-8"))
+    except (UnicodeDecodeError, ValueError) as exc:
+        raise FixtureError(f"invalid local safetensors header {path}: {exc}") from exc
+    if not isinstance(header, dict) or "__metadata__" not in header:
+        raise FixtureError(f"local safetensors header {path} has no __metadata__")
+    return header, {
+        "header_length": header_length,
+        "header_sha256": _sha256_bytes(header_raw),
+        "header_etag": None,
+        "header_repo_commit": None,
+        "total": size,
+    }
+
+
+def _validate_header_layout(header: Mapping[str, object], meta: Mapping[str, object], label: str) -> None:
+    """Safetensors tensors tile the data region exactly; a short or padded shard is rejected."""
+    extents: list[tuple[int, int, str]] = []
+    for name, entry in header.items():
+        if name == "__metadata__":
+            continue
+        offsets = entry.get("data_offsets") if isinstance(entry, dict) else None
+        if not isinstance(offsets, list) or len(offsets) != 2:
+            raise FixtureError(f"{label}: tensor {name} has no data_offsets")
+        extents.append((int(offsets[0]), int(offsets[1]), name))
+    extents.sort()
+    cursor = 0
+    for begin, finish, name in extents:
+        if begin != cursor or finish < begin:
+            raise FixtureError(f"{label}: tensor {name} extent {begin}-{finish} does not continue at {cursor}")
+        cursor = finish
+    total = meta.get("total")
+    if isinstance(total, int) and 8 + int(meta["header_length"]) + cursor != total:
+        raise FixtureError(
+            f"{label}: header describes {8 + int(meta['header_length']) + cursor} bytes but the shard has {total}"
+        )
+
+
+class _StagedRowStore:
+    """Append-only local copy of verified source rows (selective PLE/embedding staging).
+
+    `rows.bin` holds raw rows; each `batches.jsonl` line records the staged row
+    ids, byte offset and SHA-256 of one appended batch, bound to the tensor name
+    and shard-header hash it was read under.  Batches are re-hashed on open.
+    """
+
+    def __init__(self, directory: Path, *, tensor_name: str, row_bytes: int, header_sha256: str):
+        self.directory = directory
+        self.tensor_name = tensor_name
+        self.row_bytes = row_bytes
+        self.header_sha256 = header_sha256
+        self.data_path = directory / "rows.bin"
+        self.batch_path = directory / "batches.jsonl"
+        self.index: dict[int, int] = {}
+        self._fd: int | None = None
+        directory.mkdir(parents=True, exist_ok=True)
+        if self.batch_path.exists():
+            self._load()
+
+    def _load(self) -> None:
+        with self.data_path.open("rb") as data:
+            for line in self.batch_path.read_text(encoding="utf-8").splitlines():
+                batch = json.loads(line)
+                if (
+                    batch.get("tensor") != self.tensor_name
+                    or batch.get("header_sha256") != self.header_sha256
+                    or batch.get("row_bytes") != self.row_bytes
+                    or batch.get("revision") != HF_CONFIG_COMMIT
+                ):
+                    raise FixtureError(f"staged rows for {self.tensor_name} do not match the pinned source identity")
+                rows = batch["rows"]
+                data.seek(int(batch["offset"]))
+                payload = data.read(len(rows) * self.row_bytes)
+                if len(payload) != len(rows) * self.row_bytes or _sha256_bytes(payload) != batch["sha256"]:
+                    raise FixtureError(f"staged rows for {self.tensor_name} fail their batch digest")
+                for position, row in enumerate(rows):
+                    self.index[int(row)] = int(batch["offset"]) + position * self.row_bytes
+
+    def has(self, row: int) -> bool:
+        return row in self.index
+
+    def get(self, row: int) -> bytes:
+        if self._fd is None:
+            self._fd = os.open(self.data_path, os.O_RDONLY)
+        data = os.pread(self._fd, self.row_bytes, self.index[row])
+        if len(data) != self.row_bytes:
+            raise FixtureError(f"staged row {row} of {self.tensor_name} is truncated")
+        return data
+
+    def append(self, rows: Sequence[int], payload: bytes | bytearray) -> None:
+        if len(payload) != len(rows) * self.row_bytes:
+            raise FixtureError("staged batch payload does not match its row count")
+        offset = self.data_path.stat().st_size if self.data_path.exists() else 0
+        with self.data_path.open("ab") as handle:
+            handle.write(payload)
+        batch = {
+            "tensor": self.tensor_name,
+            "header_sha256": self.header_sha256,
+            "revision": HF_CONFIG_COMMIT,
+            "row_bytes": self.row_bytes,
+            "rows": [int(row) for row in rows],
+            "offset": offset,
+            "sha256": _sha256_bytes(payload),
+        }
+        with self.batch_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(batch, sort_keys=True, separators=(",", ":")) + "\n")
+        for position, row in enumerate(rows):
+            self.index[int(row)] = offset + position * self.row_bytes
+
+    def close(self) -> None:
+        if self._fd is not None:
+            os.close(self._fd)
+            self._fd = None
+
+
 class PinnedCheckpoint:
-    """Metadata/index view whose tensor reads remain bounded and independently sealed."""
+    """Metadata/index view whose tensor reads remain bounded and independently sealed.
+
+    Legacy `tensor_rows`/`tensor_expert_rows` keep the 128 KiB sealed-range
+    behaviour.  The raw readers (`tensor_rows_raw`, `expert_rows_raw`,
+    `gather_rows_raw`) return little-endian source bytes without Python-int
+    conversion and read, in order of preference, staged rows, verified local
+    safetensors shards (`local_dir`), then sealed HTTP ranges (large reads are
+    coalesced to `RAW_STREAM_RANGE_BYTES` and cached in a disk-bounded,
+    per-group-evictable stream cache).  Not thread-safe.
+    """
 
     def __init__(
         self,
@@ -924,11 +1248,17 @@ class PinnedCheckpoint:
         config_meta: Mapping[str, object],
         index_sha256: str,
         config_sha256: str,
+        stream_client: _RangeClient | None = None,
+        local_dir: Path | None = None,
+        local_shards: Mapping[str, Path] | None = None,
+        network_budget: _ByteBudget | None = None,
+        staging_root: Path | None = None,
     ):
         weight_map = index.get("weight_map")
         if not isinstance(weight_map, dict) or any(not isinstance(k, str) or not isinstance(v, str) for k, v in weight_map.items()):
             raise FixtureError("pinned model index has no valid weight_map")
         self.client = client
+        self.stream_client = stream_client
         self.index = index
         self.config = config
         self.weight_map: dict[str, str] = dict(weight_map)
@@ -936,16 +1266,524 @@ class PinnedCheckpoint:
         self.config_meta = dict(config_meta)
         self.index_sha256 = index_sha256
         self.config_sha256 = config_sha256
+        self.local_dir = local_dir
+        self.local_shards: dict[str, Path] = dict(local_shards or {})
+        self.network_budget = network_budget
+        self.staging_root = staging_root
+        self.local_read_bytes = 0
+        self.staged_read_bytes = 0
+        self._fds: dict[str, int] = {}
+        self._headers: dict[str, tuple[dict[str, object], dict[str, object]]] = {}
+        self._descriptors: dict[str, dict[str, object]] = {}
+        self._staged: dict[str, _StagedRowStore] = {}
+        self._ledger: list[dict[str, object]] = []
+        self._coverage: dict[str, dict[str, object]] = {}
+        self._lfs: dict[str, dict[str, object]] = {}
 
+    # -- accounting ---------------------------------------------------------
     @property
     def read_bytes(self) -> int:
-        return self.client.read_bytes
+        total = self.client.read_bytes + self.local_read_bytes + self.staged_read_bytes
+        if self.stream_client is not None:
+            total += self.stream_client.read_bytes
+        return total
 
     @property
     def seals(self) -> dict[str, dict[str, object]]:
         return {url: dict(seal) for url, seal in self.client.seals.items()}
 
+    def transfer_stats(self) -> dict[str, object]:
+        """New-network bytes/seconds are kept apart from cache hits, local and staged reads."""
+        stats: dict[str, object] = {
+            "remote_budget_bytes": None if self.network_budget is None else self.network_budget.limit,
+            "remote_budget_used": None if self.network_budget is None else self.network_budget.used,
+            "sparse_range_client": self.client.transfer_stats(),
+            "stream_client": None if self.stream_client is None else self.stream_client.transfer_stats(),
+            "local_read_bytes": self.local_read_bytes,
+            "staged_read_bytes": self.staged_read_bytes,
+        }
+        clients = [self.client] + ([self.stream_client] if self.stream_client is not None else [])
+        stats["network_bytes"] = sum(item.network_bytes for item in clients)
+        stats["network_seconds"] = sum(item.network_seconds for item in clients)
+        stats["network_requests"] = sum(item.network_requests for item in clients)
+        return stats
+
+    def read_ledger(self) -> list[dict[str, object]]:
+        """One entry per raw read: tensor, kind, absolute byte range, SHA-256 and source."""
+        return [dict(item) for item in self._ledger]
+
+    def ledger_digest(self) -> str:
+        digest = hashlib.sha256()
+        for item in self._ledger:
+            digest.update(json.dumps(item, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+            digest.update(b"\n")
+        return digest.hexdigest()
+
+    def coverage_report(self) -> dict[str, object]:
+        """Which routed-expert slices were actually read; a partial pilot is reported as incomplete."""
+        text = self.config.get("text_config", self.config)
+        experts = int(text["num_experts"])  # type: ignore[index]
+        layers = int(text["num_hidden_layers"])  # type: ignore[index]
+        per_layer: dict[int, dict[str, int]] = {}
+        for layer in range(layers):
+            row: dict[str, int] = {}
+            for suffix in ("gate_up_proj", "down_proj"):
+                entry = self._coverage.get(f"model.language_model.layers.{layer}.mlp.experts.{suffix}")
+                row[suffix] = len(entry["experts"]) if entry else 0  # type: ignore[arg-type]
+            per_layer[layer] = row
+        complete = [layer for layer, row in per_layer.items() if all(count == experts for count in row.values())]
+        started = [layer for layer, row in per_layer.items() if any(row.values())]
+        return {
+            "expected_layers": layers,
+            "experts_per_layer": experts,
+            "experts_read_per_layer": per_layer,
+            "layers_started": started,
+            "layers_complete": complete,
+            "layers_partial": [layer for layer in started if layer not in complete],
+            "complete_expert_traversal": len(complete) == layers,
+            "bytes_read_by_tensor": {name: int(entry["bytes"]) for name, entry in sorted(self._coverage.items())},  # type: ignore[call-overload]
+        }
+
+    # -- shard / descriptor access -----------------------------------------
+    @staticmethod
+    def _shard_url(shard: str) -> str:
+        return f"https://huggingface.co/{HF_MODEL}/resolve/{HF_CONFIG_COMMIT}/{shard}"
+
+    def _shard_header(self, shard: str) -> tuple[dict[str, object], dict[str, object]]:
+        cached = self._headers.get(shard)
+        if cached is not None:
+            return cached
+        local = self.local_shards.get(shard)
+        if local is not None:
+            header, meta = _local_safetensor_header(local)
+        else:
+            header, meta = _safetensor_header(self.client, self._shard_url(shard))
+        _validate_header_layout(header, meta, shard)
+        self._headers[shard] = (header, meta)
+        return header, meta
+
+    def tensor_descriptor(self, name: str) -> dict[str, object]:
+        cached = self._descriptors.get(name)
+        if cached is not None:
+            return cached
+        shard = self.weight_map.get(name)
+        if shard is None:
+            raise FixtureError(f"pinned model index is missing required tensor {name}")
+        header, meta = self._shard_header(shard)
+        local = self.local_shards.get(shard)
+        url = local.as_uri() if local is not None else self._shard_url(shard)
+        descriptor = _descriptor_from_header(name, shard, url, header, meta)
+        descriptor["source"] = "local" if local is not None else "remote"
+        if local is not None:
+            descriptor["local_path"] = str(local)
+        self._descriptors[name] = descriptor
+        return descriptor
+
+    def source_manifest(self, *, lfs: bool = False) -> dict[str, object]:
+        """Exact tensor table of the pinned source (headers only; no tensor payload is read).
+
+        Tensors are cross-checked against the pinned index.  With `lfs=True` each shard's
+        HF LFS SHA-256/size is recorded; full-shard hashing is deliberately not performed.
+        """
+        shards = sorted(set(self.weight_map.values()))
+        shard_rows: dict[str, dict[str, object]] = {}
+        tensors: dict[str, dict[str, object]] = {}
+        for shard in shards:
+            header, meta = self._shard_header(shard)
+            names = sorted(name for name in header if name != "__metadata__")
+            expected = sorted(name for name, owner in self.weight_map.items() if owner == shard)
+            if names != expected:
+                raise FixtureError(f"shard {shard} tensors do not match the pinned index")
+            row: dict[str, object] = {
+                "header_length": meta["header_length"],
+                "header_sha256": meta["header_sha256"],
+                "size": meta.get("total"),
+                "local": shard in self.local_shards,
+                "tensor_count": len(names),
+            }
+            if lfs:
+                row["lfs"] = self.shard_lfs_identity(shard)
+            shard_rows[shard] = row
+            for name in names:
+                descriptor = self.tensor_descriptor(name)
+                itemsize, _ = _dtype_info(str(descriptor["dtype"]))
+                tensors[name] = {
+                    "shard": shard,
+                    "dtype": descriptor["dtype"],
+                    "shape": descriptor["shape"],
+                    "data_offsets": descriptor["data_offsets"],
+                    "bytes": math.prod(descriptor["shape"]) * itemsize,  # type: ignore[arg-type]
+                    "role": _tensor_role(name),
+                }
+        by_dtype: dict[str, int] = {}
+        by_role: dict[str, dict[str, int]] = {}
+        for entry in tensors.values():
+            by_dtype[str(entry["dtype"])] = by_dtype.get(str(entry["dtype"]), 0) + int(entry["bytes"])  # type: ignore[arg-type]
+            role = by_role.setdefault(str(entry["role"]), {})
+            role[str(entry["dtype"])] = role.get(str(entry["dtype"]), 0) + int(entry["bytes"])  # type: ignore[arg-type]
+        table = json.dumps(tensors, sort_keys=True, separators=(",", ":")).encode("utf-8")
+        index_total = (self.index.get("metadata") or {}).get("total_size") if isinstance(self.index.get("metadata"), dict) else None  # type: ignore[union-attr]
+        manifest: dict[str, object] = {
+            "schema": "hipfire.qwen4.source_manifest.v1",
+            "model": HF_MODEL,
+            "revision": HF_CONFIG_COMMIT,
+            "index_sha256": self.index_sha256,
+            "config_sha256": self.config_sha256,
+            "shards": shard_rows,
+            "tensors": tensors,
+            "tensor_count": len(tensors),
+            "tensor_table_sha256": _sha256_bytes(table),
+            "bytes_by_dtype": by_dtype,
+            "bytes_by_role_dtype": by_role,
+            "index_total_size": index_total,
+            "index_total_size_matches": None if index_total is None else int(index_total) == sum(by_dtype.values()),
+            "integrity": (
+                "pinned revision + index/config SHA-256 + per-shard header SHA-256 + per-range SHA-256 in the read "
+                "ledger; full-shard SHA-256 is not computed (partial reads cannot establish it)"
+            ),
+        }
+        manifest["sha256"] = _sha256_bytes(json.dumps(manifest, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+        return manifest
+
+    def shard_lfs_identity(self, shard: str) -> dict[str, object]:
+        """HF LFS SHA-256 (X-Linked-Etag) and size of one shard from a redirect-less HEAD."""
+        cached = self._lfs.get(shard)
+        if cached is not None:
+            return cached
+        url = self._shard_url(shard)
+        request = urllib.request.Request(url, method="HEAD", headers={"Accept-Encoding": "identity"})
+        opener = urllib.request.build_opener(_NoRedirect)
+        try:
+            response = opener.open(request, timeout=60)
+            headers = response.headers
+        except urllib.error.HTTPError as exc:
+            if exc.code not in (301, 302, 303, 307, 308):
+                raise FixtureError(f"LFS identity request for {shard} returned HTTP {exc.code}") from exc
+            headers = exc.headers
+        except (OSError, urllib.error.URLError, ValueError) as exc:
+            raise FixtureError(f"unable to read LFS identity for {shard}: {exc}") from exc
+        revision = headers.get("X-Repo-Commit")
+        if revision not in (None, HF_CONFIG_COMMIT):
+            raise FixtureError(f"LFS identity revision mismatch for {shard}: {revision!r}")
+        etag = (headers.get("X-Linked-Etag") or headers.get("ETag") or "").strip()
+        if etag.startswith("W/"):
+            etag = etag[2:]
+        etag = etag.strip('"') or None
+        size_text = headers.get("X-Linked-Size") or headers.get("Content-Length")
+        size = int(size_text) if size_text and size_text.isdigit() else None
+        _, meta = self._shard_header(shard)
+        if size is not None and isinstance(meta.get("total"), int) and size != meta["total"]:
+            raise FixtureError(f"LFS size {size} for {shard} does not match shard length {meta['total']}")
+        seal = self.client.seals.get(self._shard_url(shard), {})
+        result = {
+            "lfs_sha256": etag,
+            "lfs_size": size,
+            "repo_commit": revision,
+            "range_etag": seal.get("etag"),
+            "range_etag_matches": None
+            if not seal.get("etag") or etag is None
+            else str(seal["etag"]).strip('"').removeprefix("W/").strip('"') == etag,
+        }
+        self._lfs[shard] = result
+        return result
+
+    # -- raw readers ----------------------------------------------------------
+    def _raw_descriptor(self, name: str, expect_dtype: str | None) -> dict[str, object]:
+        descriptor = self.tensor_descriptor(name)
+        dtype = str(descriptor["dtype"])
+        if dtype not in RAW_DTYPE_ITEMSIZE:
+            raise FixtureError(f"raw reads support only BF16/F32/I64/I32 source tensors; {name} is {dtype}")
+        if expect_dtype is not None and dtype != expect_dtype:
+            raise FixtureError(f"source tensor {name} has dtype {dtype}, expected {expect_dtype}")
+        return descriptor
+
+    def _fd(self, shard: str) -> int:
+        fd = self._fds.get(shard)
+        if fd is None:
+            fd = os.open(self.local_shards[shard], os.O_RDONLY)
+            self._fds[shard] = fd
+        return fd
+
+    def _read_span(
+        self,
+        descriptor: Mapping[str, object],
+        start: int,
+        length: int,
+    ) -> tuple[bytearray, str, list[dict[str, object]]]:
+        """Read `length` source bytes at absolute shard offset `start`."""
+        buffer = bytearray(length)
+        if length == 0:
+            return buffer, str(descriptor["source"]), []
+        if descriptor["source"] == "local":
+            fd = self._fd(str(descriptor["shard"]))
+            view = memoryview(buffer)
+            done = 0
+            while done < length:
+                count = os.preadv(fd, [view[done:]], start + done)
+                if count <= 0:
+                    raise FixtureError(f"short local read of {descriptor['tensor']} at {start + done}")
+                done += count
+            self.local_read_bytes += length
+            return buffer, "local", [
+                {"start": start, "end": start + length - 1, "length": length, "sha256": _sha256_bytes(buffer), "source": "local"}
+            ]
+        if length <= MAX_TENSOR_SLICE_BYTES:
+            client, chunk = self.client, length
+        elif self.stream_client is not None:
+            client, chunk = self.stream_client, RAW_STREAM_RANGE_BYTES
+        else:
+            client, chunk = self.client, MAX_TENSOR_SLICE_BYTES
+        ranges: list[dict[str, object]] = []
+        cursor = 0
+        while cursor < length:
+            count = min(chunk, length - cursor)
+            raw, metadata = client.read(str(descriptor["url"]), start + cursor, start + cursor + count - 1, maximum=count)
+            if len(raw) != count:
+                raise FixtureError(f"tensor {descriptor['tensor']} range returned {len(raw)} bytes, expected {count}")
+            buffer[cursor : cursor + count] = raw
+            ranges.append(
+                {
+                    "start": start + cursor,
+                    "end": start + cursor + count - 1,
+                    "length": count,
+                    "sha256": metadata["sha256"],
+                    "etag": metadata.get("etag"),
+                    "repo_commit": metadata.get("repo_commit"),
+                    "source": "remote",
+                }
+            )
+            cursor += count
+        return buffer, "remote", ranges
+
+    def _record(
+        self,
+        descriptor: Mapping[str, object],
+        raw: bytearray,
+        slice_shape: Sequence[int],
+        start: int,
+        ranges: list[dict[str, object]],
+        source: str,
+        kind: str,
+    ) -> dict[str, object]:
+        digest = str(ranges[0]["sha256"]) if len(ranges) == 1 else _sha256_bytes(raw)
+        range_digest = hashlib.sha256("".join(str(item["sha256"]) for item in ranges).encode("ascii")).hexdigest()
+        self._ledger.append(
+            {
+                "tensor": descriptor["tensor"],
+                "kind": kind,
+                "byte_start": start,
+                "byte_length": len(raw),
+                "sha256": digest,
+                "range_count": len(ranges),
+                "source": source,
+            }
+        )
+        entry = self._coverage.setdefault(str(descriptor["tensor"]), {"bytes": 0, "experts": set()})
+        entry["bytes"] = int(entry["bytes"]) + len(raw)  # type: ignore[arg-type]
+        return {
+            "tensor": descriptor["tensor"],
+            "shard": descriptor["shard"],
+            "dtype": descriptor["dtype"],
+            "shape": list(descriptor["shape"]),  # type: ignore[arg-type]
+            "slice_shape": [int(item) for item in slice_shape],
+            "raw": raw,
+            "byte_start": start,
+            "byte_length": len(raw),
+            "sha256": digest,
+            "source": source,
+            "header_sha256": descriptor["header_sha256"],
+            "range_count": len(ranges),
+            "range_digest": range_digest,
+            "ranges": ranges if len(ranges) <= 64 else [],
+        }
+
+    def _staged_store(self, name: str, *, create: bool) -> _StagedRowStore | None:
+        store = self._staged.get(name)
+        if store is not None or self.staging_root is None:
+            return store
+        descriptor = self._raw_descriptor(name, None)
+        shape = descriptor["shape"]
+        row_bytes = (math.prod(shape[1:]) if len(shape) > 1 else 1) * RAW_DTYPE_ITEMSIZE[str(descriptor["dtype"])]  # type: ignore[index,arg-type]
+        key = _sha256_bytes(f"{name}\0{descriptor['header_sha256']}".encode("utf-8"))[:24]
+        directory = self.staging_root / key
+        if not create and not (directory / "batches.jsonl").exists():
+            return None
+        store = _StagedRowStore(
+            directory, tensor_name=name, row_bytes=row_bytes, header_sha256=str(descriptor["header_sha256"])
+        )
+        self._staged[name] = store
+        return store
+
+    def tensor_rows_raw(
+        self,
+        name: str,
+        row_start: int,
+        row_count: int | None = None,
+        *,
+        expect_dtype: str | None = None,
+    ) -> dict[str, object]:
+        descriptor = self._raw_descriptor(name, expect_dtype)
+        shape = tuple(int(item) for item in descriptor["shape"])  # type: ignore[arg-type]
+        if row_count is None:
+            row_count = shape[0] - row_start
+        if row_start < 0 or row_count < 0 or row_start + row_count > shape[0]:
+            raise FixtureError(f"tensor row slice {name} {row_start}+{row_count} exceeds {shape}")
+        if 0 < row_count <= 4096:
+            store = self._staged_store(name, create=False)
+            if store is not None and all(store.has(row) for row in range(row_start, row_start + row_count)):
+                return self.gather_rows_raw(name, list(range(row_start, row_start + row_count)), expect_dtype=expect_dtype)
+        itemsize = RAW_DTYPE_ITEMSIZE[str(descriptor["dtype"])]
+        row_bytes = (math.prod(shape[1:]) if len(shape) > 1 else 1) * itemsize
+        start = int(descriptor["data_start"]) + row_start * row_bytes  # type: ignore[arg-type]
+        raw, source, ranges = self._read_span(descriptor, start, row_count * row_bytes)
+        return self._record(descriptor, raw, (row_count,) + shape[1:], start, ranges, source, "rows")
+
+    def expert_rows_raw(
+        self,
+        name: str,
+        expert: int,
+        row_start: int,
+        row_count: int,
+        *,
+        expect_dtype: str | None = None,
+    ) -> dict[str, object]:
+        descriptor = self._raw_descriptor(name, expect_dtype)
+        shape = tuple(int(item) for item in descriptor["shape"])  # type: ignore[arg-type]
+        if len(shape) != 3:
+            raise FixtureError(f"expert tensor {name} is not rank three: {shape}")
+        experts, rows, cols = shape
+        if expert < 0 or expert >= experts or row_start < 0 or row_count < 0 or row_start + row_count > rows:
+            raise FixtureError(f"expert row slice {name}[{expert}] {row_start}+{row_count} exceeds {shape}")
+        itemsize = RAW_DTYPE_ITEMSIZE[str(descriptor["dtype"])]
+        start = int(descriptor["data_start"]) + ((expert * rows + row_start) * cols) * itemsize  # type: ignore[arg-type]
+        raw, source, ranges = self._read_span(descriptor, start, row_count * cols * itemsize)
+        record = self._record(descriptor, raw, (row_count, cols), start, ranges, source, "expert_rows")
+        record["expert"] = expert
+        record["row_start"] = row_start
+        if row_start == 0 and row_count == rows:
+            self._coverage[name]["experts"].add(expert)  # type: ignore[attr-defined]
+        return record
+
+    def gather_rows_raw(
+        self,
+        name: str,
+        rows: Sequence[int],
+        *,
+        expect_dtype: str | None = None,
+        use_staged: bool = True,
+    ) -> dict[str, object]:
+        """Arbitrary rows (order and duplicates kept), e.g. PLE/embedding lookups."""
+        descriptor = self._raw_descriptor(name, expect_dtype)
+        shape = tuple(int(item) for item in descriptor["shape"])  # type: ignore[arg-type]
+        itemsize = RAW_DTYPE_ITEMSIZE[str(descriptor["dtype"])]
+        row_bytes = (math.prod(shape[1:]) if len(shape) > 1 else 1) * itemsize
+        wanted = [int(row) for row in rows]
+        for row in wanted:
+            if row < 0 or row >= shape[0]:
+                raise FixtureError(f"gathered row {row} of {name} is outside {shape}")
+        positions: dict[int, list[int]] = {}
+        for position, row in enumerate(wanted):
+            positions.setdefault(row, []).append(position)
+        output = bytearray(len(wanted) * row_bytes)
+        store = self._staged_store(name, create=False) if use_staged else None
+        remote_rows: list[int] = []
+        staged_hits = 0
+        for row in sorted(positions):
+            if store is not None and store.has(row):
+                data = store.get(row)
+                staged_hits += 1
+                for position in positions[row]:
+                    output[position * row_bytes : (position + 1) * row_bytes] = data
+            else:
+                remote_rows.append(row)
+        self.staged_read_bytes += staged_hits * row_bytes
+        max_run = max(1, (RAW_STREAM_RANGE_BYTES if self.stream_client is not None else MAX_TENSOR_SLICE_BYTES) // row_bytes)
+        ranges: list[dict[str, object]] = []
+        sources: set[str] = {"staged"} if staged_hits else set()
+        index = 0
+        while index < len(remote_rows):
+            run_end = index + 1
+            while (
+                run_end < len(remote_rows)
+                and remote_rows[run_end] == remote_rows[run_end - 1] + 1
+                and run_end - index < max_run
+            ):
+                run_end += 1
+            first, count = remote_rows[index], run_end - index
+            start = int(descriptor["data_start"]) + first * row_bytes  # type: ignore[arg-type]
+            buffer, source, run_ranges = self._read_span(descriptor, start, count * row_bytes)
+            sources.add(source)
+            ranges.extend(run_ranges)
+            for offset in range(count):
+                data = buffer[offset * row_bytes : (offset + 1) * row_bytes]
+                for position in positions[first + offset]:
+                    output[position * row_bytes : (position + 1) * row_bytes] = data
+            index = run_end
+        source_label = next(iter(sources)) if len(sources) == 1 else ("mixed" if sources else "empty")
+        row_digest = _sha256_bytes(array.array("q", wanted).tobytes())
+        digest = _sha256_bytes(output)
+        self._ledger.append(
+            {
+                "tensor": descriptor["tensor"],
+                "kind": "gather_rows",
+                "rows": len(wanted),
+                "row_ids_sha256": row_digest,
+                "byte_length": len(output),
+                "sha256": digest,
+                "range_count": len(ranges),
+                "source": source_label,
+            }
+        )
+        entry = self._coverage.setdefault(str(descriptor["tensor"]), {"bytes": 0, "experts": set()})
+        entry["bytes"] = int(entry["bytes"]) + len(output)  # type: ignore[arg-type]
+        return {
+            "tensor": descriptor["tensor"],
+            "shard": descriptor["shard"],
+            "dtype": descriptor["dtype"],
+            "shape": list(shape),
+            "slice_shape": [len(wanted)] + list(shape[1:]),
+            "raw": output,
+            "byte_length": len(output),
+            "sha256": digest,
+            "row_ids_sha256": row_digest,
+            "source": source_label,
+            "header_sha256": descriptor["header_sha256"],
+            "range_count": len(ranges),
+            "range_digest": hashlib.sha256("".join(str(item["sha256"]) for item in ranges).encode("ascii")).hexdigest(),
+            "ranges": ranges if len(ranges) <= 64 else [],
+        }
+
+    def stage_rows(self, name: str, rows: Sequence[int]) -> dict[str, object]:
+        """Copy the not-yet-staged `rows` of a source tensor into the local staged-row store."""
+        if self.staging_root is None:
+            raise FixtureError("this checkpoint has no staging root")
+        store = self._staged_store(name, create=True)
+        assert store is not None
+        missing = sorted({int(row) for row in rows if not store.has(int(row))})
+        before = self.read_bytes
+        if missing:
+            record = self.gather_rows_raw(name, missing, use_staged=False)
+            store.append(missing, record["raw"])  # type: ignore[arg-type]
+        return {
+            "tensor": name,
+            "requested_rows": len(set(int(row) for row in rows)),
+            "newly_staged_rows": len(missing),
+            "staged_rows": len(store.index),
+            "source_bytes_read": self.read_bytes - before,
+        }
+
+    # -- legacy record API ----------------------------------------------------
+    def _legacy_record(self, raw_record: Mapping[str, object]) -> dict[str, object]:
+        slice_shape = [int(item) for item in raw_record["slice_shape"]]  # type: ignore[union-attr]
+        record = {key: value for key, value in raw_record.items() if key != "raw"}
+        record["values"] = _decode_storage(bytes(raw_record["raw"]), str(raw_record["dtype"]), slice_shape)  # type: ignore[arg-type]
+        return record
+
     def tensor_rows(self, name: str, row_start: int, row_count: int) -> dict[str, object]:
+        if self.local_shards:
+            descriptor = self.tensor_descriptor(name)
+            if descriptor["source"] == "local":
+                return self._legacy_record(self.tensor_rows_raw(name, row_start, row_count))
         return _read_tensor_rows(self.client, self.weight_map, name, row_start, row_count)
 
     def tensor_expert_rows(
@@ -955,7 +1793,39 @@ class PinnedCheckpoint:
         row_start: int,
         row_count: int,
     ) -> dict[str, object]:
+        if self.local_shards:
+            descriptor = self.tensor_descriptor(name)
+            if descriptor["source"] == "local":
+                return self._legacy_record(self.expert_rows_raw(name, expert, row_start, row_count))
         return _read_tensor_expert_rows(self.client, self.weight_map, name, expert, row_start, row_count)
+
+    # -- lifecycle ------------------------------------------------------------
+    def begin_group(self, label: str, *, max_live_groups: int = DEFAULT_MAX_LIVE_GROUPS) -> list[str]:
+        """Start a stream-cache group (e.g. `layer07`); the oldest groups beyond the limit are deleted."""
+        if self.stream_client is None:
+            return []
+        return self.stream_client.begin_group(label, max_live_groups=max_live_groups)
+
+    def release_group(self, label: str) -> int:
+        return 0 if self.stream_client is None else self.stream_client.release_group(label)
+
+    def release_all(self) -> int:
+        return 0 if self.stream_client is None else self.stream_client.release_all()
+
+    def close(self, *, cleanup_stream: bool = True) -> None:
+        for fd in self._fds.values():
+            os.close(fd)
+        self._fds.clear()
+        for store in self._staged.values():
+            store.close()
+        if cleanup_stream and self.stream_client is not None:
+            self.stream_client.cleanup()
+
+    def __enter__(self) -> "PinnedCheckpoint":
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self.close()
 
     def provenance(self) -> dict[str, object]:
         return {
@@ -967,17 +1837,68 @@ class PinnedCheckpoint:
             "config_etag": self.config_meta.get("etag"),
             "range_seals": self.seals,
             "read_bytes": self.read_bytes,
+            "local_dir": None if self.local_dir is None else str(self.local_dir),
+            "local_shards": sorted(self.local_shards),
+            "local_read_bytes": self.local_read_bytes,
+            "staged_read_bytes": self.staged_read_bytes,
+            "read_ledger_entries": len(self._ledger),
+            "read_ledger_sha256": self.ledger_digest(),
         }
 
 
-def open_pinned_checkpoint(cache_dir: str | Path | None = None) -> PinnedCheckpoint:
-    """Open the pinned index/config; tensor payloads are fetched only on demand."""
+def _local_small_object(path: Path, expected_sha256: str, *, label: str) -> tuple[bytes, dict[str, object]]:
+    raw = _read_bounded(path, MAX_HEADER_BYTES)
+    digest = _sha256_bytes(raw)
+    if digest != expected_sha256:
+        raise FixtureError(f"local {label} {path} hash mismatch: expected {expected_sha256}, got {digest}")
+    return raw, {"etag": None, "repo_commit": None, "source": "local", "path": str(path)}
+
+
+def open_pinned_checkpoint(
+    cache_dir: str | Path | None = None,
+    *,
+    local_dir: str | Path | None = None,
+    remote_byte_budget: int | None = DEFAULT_REMOTE_BYTE_BUDGET,
+    stream_disk_budget_bytes: int | None = DEFAULT_STREAM_DISK_BUDGET_BYTES,
+) -> PinnedCheckpoint:
+    """Open the pinned index/config; tensor payloads are fetched only on demand.
+
+    `local_dir` may hold a (possibly partial) copy of the pinned repository
+    layout: `model.safetensors.index.json`/`config.json` must hash to the
+    pinned values, shards present are read locally after their header layout
+    is validated, absent shards fall back to sealed HTTP ranges.  New remote
+    bytes across all clients are capped by `remote_byte_budget`; the stream
+    cache by `stream_disk_budget_bytes`.
+    """
     root = _validated_cache_dir(cache_dir)
-    client = _RangeClient(root)
+    budget = _ByteBudget(remote_byte_budget)
+    client = _RangeClient(root, network_budget=budget)
+    stream: _RangeClient | None = None
+    if stream_disk_budget_bytes is not None:
+        stream = _RangeClient(
+            root,
+            subdir="stream_ranges",
+            network_budget=budget,
+            disk_budget_bytes=int(stream_disk_budget_bytes),
+        )
+        stream.seals = client.seals
+    local_root: Path | None = None
+    if local_dir is not None:
+        local_root = Path(local_dir).expanduser().resolve()
+        if not local_root.is_dir():
+            raise FixtureError(f"local checkpoint directory {local_root} does not exist")
     index_url = f"https://huggingface.co/{HF_MODEL}/resolve/{HF_CONFIG_COMMIT}/model.safetensors.index.json"
     config_url = f"https://huggingface.co/{HF_MODEL}/resolve/{HF_CONFIG_COMMIT}/config.json"
-    index_raw, index_meta = _read_small_object(client, index_url, MODEL_INDEX_SHA256, label="safetensors index")
-    config_raw, config_meta = _read_small_object(client, config_url, MODEL_CONFIG_SHA256, label="model config")
+    local_index = local_root / "model.safetensors.index.json" if local_root is not None else None
+    local_config = local_root / "config.json" if local_root is not None else None
+    if local_index is not None and local_index.is_file():
+        index_raw, index_meta = _local_small_object(local_index, MODEL_INDEX_SHA256, label="safetensors index")
+    else:
+        index_raw, index_meta = _read_small_object(client, index_url, MODEL_INDEX_SHA256, label="safetensors index")
+    if local_config is not None and local_config.is_file():
+        config_raw, config_meta = _local_small_object(local_config, MODEL_CONFIG_SHA256, label="model config")
+    else:
+        config_raw, config_meta = _read_small_object(client, config_url, MODEL_CONFIG_SHA256, label="model config")
     try:
         index = json.loads(index_raw.decode("utf-8"))
         config = json.loads(config_raw.decode("utf-8"))
@@ -988,6 +1909,15 @@ def open_pinned_checkpoint(cache_dir: str | Path | None = None) -> PinnedCheckpo
     text_config = config.get("text_config", config)
     if not isinstance(text_config, dict) or text_config.get("model_type") not in ("qwen4_exp_text", "qwen4_exp"):
         raise FixtureError(f"pinned model config has unexpected model_type {text_config!r}")
+    local_shards: dict[str, Path] = {}
+    if local_root is not None:
+        weight_map = index.get("weight_map")
+        for shard in sorted(set(weight_map.values())) if isinstance(weight_map, dict) else ():
+            if not isinstance(shard, str) or Path(shard).name != shard:
+                raise FixtureError(f"pinned index shard name {shard!r} is not a plain file name")
+            candidate = local_root / shard
+            if candidate.is_file():
+                local_shards[shard] = candidate
     return PinnedCheckpoint(
         client,
         index=index,
@@ -996,7 +1926,32 @@ def open_pinned_checkpoint(cache_dir: str | Path | None = None) -> PinnedCheckpo
         config_meta=config_meta,
         index_sha256=_sha256_bytes(index_raw),
         config_sha256=_sha256_bytes(config_raw),
+        stream_client=stream,
+        local_dir=local_root,
+        local_shards=local_shards,
+        network_budget=budget,
+        staging_root=root / "staged_rows",
     )
+
+
+_RAW_TORCH_DTYPES = {"BF16": "bfloat16", "F32": "float32", "I64": "int64", "I32": "int32"}
+
+
+def raw_record_to_torch(record: Mapping[str, object], torch: Any) -> Any:
+    """View a raw reader record as a torch tensor of its exact source dtype (no copy, no cast)."""
+    if sys.byteorder != "little":
+        raise FixtureError("raw safetensors payloads are little-endian; this host is not")
+    dtype = str(record["dtype"])
+    if dtype not in _RAW_TORCH_DTYPES:
+        raise FixtureError(f"unsupported raw dtype {dtype}")
+    shape = tuple(int(item) for item in record["slice_shape"])  # type: ignore[union-attr]
+    raw = record["raw"]
+    if len(raw) != math.prod(shape) * RAW_DTYPE_ITEMSIZE[dtype]:  # type: ignore[arg-type]
+        raise FixtureError(f"raw record for {record.get('tensor')} has {len(raw)} bytes for shape {shape}")  # type: ignore[arg-type]
+    torch_dtype = getattr(torch, _RAW_TORCH_DTYPES[dtype])
+    if not len(raw):  # type: ignore[arg-type]
+        return torch.empty(shape, dtype=torch_dtype)
+    return torch.frombuffer(raw, dtype=torch_dtype).reshape(shape)
 
 
 
@@ -1186,7 +2141,12 @@ def _top_level_nodes(tree: ast.Module, wanted: set[str]) -> list[ast.AST]:
     return found
 
 
-def _compile_source(source: str, names: Sequence[str], globals_extra: Mapping[str, object]) -> dict[str, object]:
+def _compile_source(
+    source: str,
+    names: Sequence[str],
+    globals_extra: Mapping[str, object],
+    transform: Any = None,
+) -> dict[str, object]:
     try:
         tree = ast.parse(source)
     except SyntaxError as exc:
@@ -1200,6 +2160,8 @@ def _compile_source(source: str, names: Sequence[str], globals_extra: Mapping[st
         type_ignores=[],
     )
     ast.fix_missing_locations(module)
+    if transform is not None:
+        transform(module)
     namespace: dict[str, object] = {"__name__": "qwen4_pinned_reference", "__builtins__": __builtins__}
     namespace.update(globals_extra)
     try:
@@ -1235,6 +2197,115 @@ def _compile_method(source: str, class_name: str, method_name: str, globals_extr
     except Exception as exc:
         raise FixtureError(f"unable to compile pinned {class_name}.{method_name}: {exc}") from exc
     return namespace[method_name]
+
+
+REDUCTION_ORDERS = ("native", "reverse-experts")
+
+
+def _experts_class_and_forward(module: ast.Module) -> tuple[ast.ClassDef, ast.FunctionDef]:
+    class_node = next(
+        (node for node in module.body if isinstance(node, ast.ClassDef) and node.name == "Qwen4ExpTextExperts"),
+        None,
+    )
+    if class_node is None:
+        raise FixtureError("pinned source is missing class Qwen4ExpTextExperts")
+    forward = next(
+        (node for node in class_node.body if isinstance(node, ast.FunctionDef) and node.name == "forward"),
+        None,
+    )
+    if forward is None:
+        raise FixtureError("pinned source is missing Qwen4ExpTextExperts.forward")
+    return class_node, forward
+
+
+def _reverse_expert_loop_transform(module: ast.Module) -> None:
+    """Reverse the expert visiting order of `Qwen4ExpTextExperts.forward` in place.
+
+    The pinned loop adds each expert's BF16 (hidden dtype) contribution into
+    `final_hidden_states` with `index_add_`, visiting `expert_hit` in ascending
+    expert id.  Iterating `expert_hit.flip(0)` visits the same experts in
+    descending order, so every per-expert product is bit-identical and only the
+    order of the accumulation additions (and hence their roundings) changes.
+    """
+    _, forward = _experts_class_and_forward(module)
+    loops = [
+        node
+        for node in ast.walk(forward)
+        if isinstance(node, ast.For)
+        and isinstance(node.target, ast.Name)
+        and node.target.id == "expert_idx"
+        and isinstance(node.iter, ast.Name)
+        and node.iter.id == "expert_hit"
+    ]
+    if len(loops) != 1:
+        raise FixtureError(
+            f"pinned Qwen4ExpTextExperts.forward must contain exactly one `for expert_idx in expert_hit` loop, found {len(loops)}"
+        )
+    flipped = ast.Call(
+        func=ast.Attribute(value=ast.Name(id="expert_hit", ctx=ast.Load()), attr="flip", ctx=ast.Load()),
+        args=[ast.Constant(value=0)],
+        keywords=[],
+    )
+    loops[0].iter = ast.copy_location(flipped, loops[0].iter)
+    ast.fix_missing_locations(module)
+
+
+def _experts_reduction_identity(source: str, reduction_order: str, original_ast_sha256: str) -> dict[str, object]:
+    """Identity of the expert accumulation order; the trusted source hash is never altered."""
+    semantics = (
+        "per-expert gate/up/down products and top-k weight multiplies are unchanged; contributions are "
+        "index_add_-ed into zeros_like(hidden_states) in hidden dtype"
+    )
+    if reduction_order == "native":
+        return {
+            "reduction_order": "native",
+            "transformed": False,
+            "experts_forward_ast_sha256": original_ast_sha256,
+            "accumulation": f"expert id ascending; {semantics}",
+        }
+    if reduction_order != "reverse-experts":
+        raise FixtureError(f"unknown reduction_order {reduction_order!r}")
+    try:
+        tree = ast.parse(source)
+    except SyntaxError as exc:
+        raise FixtureError(f"pinned source cannot be parsed: {exc}") from exc
+    original_class, original_forward = _experts_class_and_forward(tree)
+    module = ast.Module(body=[copy.deepcopy(original_class)], type_ignores=[])
+    recomputed = _sha256_bytes(ast.dump(original_forward, annotate_fields=True, include_attributes=False).encode("utf-8"))
+    if recomputed != original_ast_sha256:
+        raise FixtureError("pinned Qwen4ExpTextExperts.forward AST digest changed before reduction transform")
+    before = ast.unparse(original_forward)
+    _reverse_expert_loop_transform(module)
+    _, variant_forward = _experts_class_and_forward(module)
+    after = ast.unparse(variant_forward)
+    if before == after:
+        raise FixtureError("reverse-experts transform did not change Qwen4ExpTextExperts.forward")
+    diff = "\n".join(
+        difflib.unified_diff(
+            before.splitlines(),
+            after.splitlines(),
+            "pinned:Qwen4ExpTextExperts.forward",
+            "variant:Qwen4ExpTextExperts.forward",
+            lineterm="",
+            n=2,
+        )
+    )
+    identity: dict[str, object] = {
+        "reduction_order": "reverse-experts",
+        "transformed": True,
+        "transform": "Qwen4ExpTextExperts.forward: `for expert_idx in expert_hit` -> `for expert_idx in expert_hit.flip(0)`",
+        "trusted_source_sha256": _sha256_bytes(source.encode("utf-8")),
+        "experts_forward_ast_sha256": original_ast_sha256,
+        "variant_forward_ast_sha256": _sha256_bytes(
+            ast.dump(variant_forward, annotate_fields=True, include_attributes=False).encode("utf-8")
+        ),
+        "variant_forward_source_sha256": _sha256_bytes(after.encode("utf-8")),
+        "variant_diff": diff,
+        "variant_diff_sha256": _sha256_bytes(diff.encode("utf-8")),
+        "accumulation": f"expert id descending; {semantics}",
+    }
+    identity["variant_sha256"] = _sha256_bytes(json.dumps(identity, sort_keys=True, separators=(",", ":")).encode("utf-8"))
+    return identity
 
 
 
@@ -1589,8 +2660,26 @@ class _StreamingEmbedding:
 class PinnedQwen4Operators:
     """Adapters whose arithmetic is executed by the pinned upstream source."""
 
-    def __init__(self, torch: Any, source_text: Mapping[str, str], source_provenance: Sequence[Mapping[str, object]]):
+    def __init__(
+        self,
+        torch: Any,
+        source_text: Mapping[str, str],
+        source_provenance: Sequence[Mapping[str, object]],
+        *,
+        route_sink: Any = None,
+        reduction_order: str = "native",
+        inference: bool = False,
+    ):
         del source_provenance
+        if reduction_order not in REDUCTION_ORDERS:
+            raise FixtureError(f"unknown reduction_order {reduction_order!r}; expected one of {REDUCTION_ORDERS}")
+        if route_sink is not None and not callable(route_sink):
+            raise FixtureError("route_sink must be callable(layer, logits, scores, indices)")
+        self._route_sink = route_sink
+        self._reduction_order = reduction_order
+        self._inference = bool(inference)
+        self._moe_calls = 0
+        self._moe_dtypes: set[str] = set()
         trusted = _trusted_operator_provenance(source_text)
         _validate_pinned_operator_signatures(source_text)
         self._ast_digests = _pinned_operator_ast_digests(source_text)
@@ -1654,6 +2743,20 @@ class PinnedQwen4Operators:
             "Qwen4ExpTextPLELayer",
         )
         self._hf = _compile_source(source_text["transformers_modeling"], names, hf_globals)
+        self._experts_forward = self._hf["Qwen4ExpTextExperts"].forward
+        self._reduction_identity = _experts_reduction_identity(
+            source_text["transformers_modeling"],
+            reduction_order,
+            self._ast_digests["Qwen4ExpTextExperts.forward"],
+        )
+        if reduction_order != "native":
+            variant = _compile_source(
+                source_text["transformers_modeling"],
+                ("Qwen4ExpTextExperts",),
+                hf_globals,
+                transform=_reverse_expert_loop_transform,
+            )
+            self._experts_forward = variant["Qwen4ExpTextExperts"].forward
         self._decoder_forward = _compile_method(
             source_text["transformers_modeling"],
             "Qwen4ExpTextDecoderLayer",
@@ -1719,6 +2822,31 @@ class PinnedQwen4Operators:
                 ("transformers_modeling", "Qwen4ExpTextRMSNorm.forward"),
             ),
         }
+        if inference:
+            for name in ("hyperconnection", "inject", "gdn", "qsa", "moe", "ple"):
+                setattr(self, name, self._without_grad(getattr(self, name)))
+
+    def _without_grad(self, function: Any) -> Any:
+        torch = self.torch
+
+        @functools.wraps(function)
+        def wrapped(*args: Any, **kwargs: Any) -> Any:
+            with torch.no_grad():
+                return function(*args, **kwargs)
+
+        return wrapped
+
+    def variant_provenance(self) -> dict[str, object]:
+        """Identity of the non-pinned-default execution choices of this adapter."""
+        return {
+            "reduction_order": self._reduction_order,
+            "reduction": dict(self._reduction_identity),
+            "grad_mode": "no_grad" if self._inference else "default",
+            "route_capture": self._route_sink is not None,
+            "moe_calls": self._moe_calls,
+            "moe_hidden_dtypes": sorted(self._moe_dtypes),
+        }
+
     def provenance(self) -> dict[str, list[dict[str, object]]]:
         result: dict[str, list[dict[str, object]]] = {}
         for operation, entries in self._op_specs.items():
@@ -1733,8 +2861,13 @@ class PinnedQwen4Operators:
                 row = dict(identity)
                 row["callable"] = callable_name
                 row["ast_sha256"] = digest
+                if callable_name == "Qwen4ExpTextExperts.forward" and self._reduction_order != "native":
+                    row["variant_ast_sha256"] = self._reduction_identity["variant_forward_ast_sha256"]
+                    row["variant_diff_sha256"] = self._reduction_identity["variant_diff_sha256"]
                 operation_rows.append(row)
             result[operation] = operation_rows
+        if self._reduction_order != "native" or self._inference or self._route_sink is not None:
+            result["variant"] = [self.variant_provenance()]
         return result
 
     def _config(self, raw: Mapping[str, object]) -> Any:
@@ -1862,6 +2995,21 @@ class PinnedQwen4Operators:
         config = self._config(cfg)
         router = self._module(self._hf["Qwen4ExpTextTopKRouter"](config), hidden)
         self._copy(router.weight, load_full(f"model.language_model.layers.{layer}.mlp.gate.weight"))
+        route_calls: list[int] | None = None
+        if self._route_sink is not None:
+            route_calls = [0]
+            sink = self._route_sink
+            router_forward = router.forward
+
+            def capture_route(hidden_states: Any) -> Any:
+                # The sink observes the exact tensors the experts consume; the
+                # router is not executed a second time.
+                router_logits, router_scores, router_indices = router_forward(hidden_states)
+                route_calls[0] += 1
+                sink(int(layer), router_logits.detach(), router_scores.detach(), router_indices.detach())
+                return router_logits, router_scores, router_indices
+
+            router.forward = capture_route
         shared = self._module(
             self._hf["Qwen4ExpTextMLP"](config, intermediate_size=int(cfg["shared_expert_intermediate_size"])),
             hidden,
@@ -1874,7 +3022,7 @@ class PinnedQwen4Operators:
             device=hidden.device, dtype=hidden.dtype
         )
         self._copy(shared_gate.weight, load_full(f"{prefix}.shared_expert_gate.weight"))
-        expert_forward = self._hf["Qwen4ExpTextExperts"].forward
+        expert_forward = self._experts_forward
         experts = _StreamingExperts(
             expert_forward,
             int(cfg["num_experts"]),
@@ -1885,13 +3033,13 @@ class PinnedQwen4Operators:
                 expert,
                 0,
                 2 * int(cfg["moe_intermediate_size"]),
-            ),
+            ).to(device=hidden.device),
             lambda expert: load_expert(
                 f"{prefix}.experts.down_proj",
                 expert,
                 0,
                 int(cfg["hidden_size"]),
-            ),
+            ).to(device=hidden.device),
             self.torch.nn.functional.silu,
         )
         sparse = types.SimpleNamespace(
@@ -1900,7 +3048,14 @@ class PinnedQwen4Operators:
             experts=experts,
             shared_expert_gate=shared_gate,
         )
-        return self._hf["Qwen4ExpTextSparseMoeBlock"].forward(sparse, hidden.unsqueeze(0)).squeeze(0)
+        output = self._hf["Qwen4ExpTextSparseMoeBlock"].forward(sparse, hidden.unsqueeze(0)).squeeze(0)
+        if route_calls is not None and route_calls[0] != 1:
+            raise FixtureError(
+                f"layer {layer} routed forward invoked the router {route_calls[0]} times; expected exactly one"
+            )
+        self._moe_calls += 1
+        self._moe_dtypes.add(str(hidden.dtype))
+        return output
 
     def ple(
         self,
@@ -1999,9 +3154,29 @@ def load_pinned_operators(
     source_text: Mapping[str, str],
     source_provenance: Sequence[Mapping[str, object]],
     torch: Any,
+    *,
+    route_sink: Any = None,
+    reduction_order: str = "native",
+    inference: bool = False,
 ) -> PinnedQwen4Operators:
+    """Build the pinned operators.
+
+    `route_sink(layer, logits, scores, indices)` is called once per `moe()` call
+    with the router tensors the actual forward consumed.  `reduction_order`
+    selects the routed-expert accumulation order (`native` is the pinned source
+    untouched).  `inference=True` runs every adapter under `torch.no_grad()`.
+    """
+    if reduction_order not in REDUCTION_ORDERS:
+        raise FixtureError(f"unknown reduction_order {reduction_order!r}; expected one of {REDUCTION_ORDERS}")
     _trusted_operator_provenance(source_text)
-    return PinnedQwen4Operators(torch, source_text, source_provenance)
+    return PinnedQwen4Operators(
+        torch,
+        source_text,
+        source_provenance,
+        route_sink=route_sink,
+        reduction_order=reduction_order,
+        inference=inference,
+    )
 
 def _from_torch(value: Any, torch: Any) -> Tensor:
     value = value.detach().cpu().contiguous()

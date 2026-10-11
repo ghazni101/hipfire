@@ -25,6 +25,36 @@ pub(crate) fn fit_max_tokens(
     hipfire_generate::common::FitMaxTokensGuard::set(fit == Some(true))
 }
 
+/// DFlash2 proposal width of a load (`params.dflash_block`,
+/// `speculation.dflash_block`): one width per serving configuration, resolved
+/// from the staged route (`vmm_batch`, `lanes` = `continuous_batch_size`) and
+/// never from the live batch, so batched lanes stay byte-identical to the
+/// singleton. An invalid value is answered as a validation error (`None`).
+pub(crate) fn dflash_block(
+    stdout: &mut impl Write,
+    msg: &serde_json::Value,
+    vmm_batch: bool,
+    lanes: usize,
+) -> Option<usize> {
+    match hipfire_runtime::dflash::DflashBlockPolicy::from_param(
+        msg.get("params").and_then(|p| p.get("dflash_block")),
+    ) {
+        Ok(policy) => Some(policy.resolve(vmm_batch, lanes)),
+        Err(e) => {
+            hipfire_generate::batch::emit_uncorrelated_error(
+                stdout,
+                None,
+                &e,
+                "validation",
+                false,
+                false,
+            );
+            let _ = stdout.flush();
+            None
+        }
+    }
+}
+
 /// A sticky GPU fault (HipError 700/719) leaves the HIP context dead; only a
 /// new process gets a live one. The request that hit it has already been
 /// answered, so exit 75 (EX_TEMPFAIL): `hipfire serve` respawns the daemon
