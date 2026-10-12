@@ -25,11 +25,19 @@ Validation result (2026-10-12, gfx1101, f16 weights vs this f32 oracle):
     "What is the capital of France?" (query, 8 tokens): rel-L2 1.5e-4, max abs 5e-5
 — the expected f16-weight-vs-f32-reference precision.
 """
-import json, sys, numpy as np
+import json, os, sys, numpy as np
 from safetensors import safe_open
 from tokenizers import Tokenizer
 
-MODEL = sys.argv[1] if len(sys.argv) > 1 else "/home/ghazni/.hipfire/models/pplx-embed-v2-late-0.6b"
+# Resolvable three ways so the module works standalone AND as an import:
+#   $ORACLE_MODEL wins (what callers like scripts/check_embed_quant.py set),
+#   then a positional argument, then the default snapshot path.
+_DEFAULT_MODEL = os.path.expanduser("~/.hipfire/models/pplx-embed-v2-late-0.6b")
+_POSITIONAL = sys.argv[1] if len(sys.argv) > 1 and not sys.argv[1].startswith("-") else None
+MODEL = os.environ.get("ORACLE_MODEL") or _POSITIONAL or _DEFAULT_MODEL
+# `usage: ... [MODEL_DIR]` documents the positional form.
+if __name__ == "__main__":
+    print(f"# oracle model: {MODEL}", file=sys.stderr)
 cfg = json.load(open(f"{MODEL}/config.json"))
 tc, vc = cfg["text_config"], cfg["vision_config"]
 d = tc["hidden_size"]; L = tc["num_hidden_layers"]
