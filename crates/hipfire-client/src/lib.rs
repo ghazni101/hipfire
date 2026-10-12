@@ -738,10 +738,16 @@ impl Engine {
     }
 
     /// Embedding encode request: send `embed`, return the terminal
-    /// `embedded` value (token embeddings matrix). Same control-channel
-    /// discipline as [`Engine::img_generate`] — one persistent channel, with
-    /// the `(id, 0)` pending registration so daemon validation `error`
-    /// events reach this transaction instead of quarantine.
+    /// `embedded` value (token embeddings matrix).
+    ///
+    /// The reply is keyed `(id, 0)` and routed through the `pending` map —
+    /// the reader classifies `embedded`/`error` as lifecycle events. This
+    /// function deliberately does NOT claim the shared `control` slot:
+    /// several embeds can be in flight at once (the multi-slot daemon
+    /// batches them), and a registered control sender would both steal an
+    /// id-less reply from a concurrent control verb and be clobbered by the
+    /// next one. Pending-keyed delivery alone covers every reply shape this
+    /// verb emits.
     pub fn embed(&self, request: &Value) -> Result<Value> {
         let request_id = request
             .get("id")
@@ -760,9 +766,7 @@ impl Engine {
             }
             map.insert(key.clone(), tx.clone());
         }
-        *self.inner.dispatch.control.lock().unwrap() = Some(tx);
         let cleanup = |inner: &EngineInner| {
-            *inner.dispatch.control.lock().unwrap() = None;
             inner.dispatch.pending.lock().unwrap().remove(&key);
         };
         let send_res = self.send(request);

@@ -44,19 +44,40 @@ fn to_f32(t: &TensorBytes<'_>, name: &str) -> Result<Vec<f32>, String> {
         return Ok(v);
     }
     let b = &t.bytes;
+    // Shared byte-length guard: a declared shape exceeding the stored bytes
+    // is a malformed-artifact error, not a panic on an unchecked slice.
+    let need_bytes = |w: usize| -> Result<(), String> {
+        if b.len() < n * w {
+            return Err(format!(
+                "qwen35-embed: vision tensor `{name}`: {} bytes < {}",
+                b.len(),
+                n * w
+            ));
+        }
+        Ok(())
+    };
     match t.dtype.as_str() {
-        "F32" => Ok(b[..n * 4]
-            .chunks_exact(4)
-            .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
-            .collect()),
-        "F16" => Ok(b[..n * 2]
-            .chunks_exact(2)
-            .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
-            .collect()),
-        "BF16" => Ok(b[..n * 2]
-            .chunks_exact(2)
-            .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
-            .collect()),
+        "F32" => {
+            need_bytes(4)?;
+            Ok(b[..n * 4]
+                .chunks_exact(4)
+                .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
+                .collect())
+        }
+        "F16" => {
+            need_bytes(2)?;
+            Ok(b[..n * 2]
+                .chunks_exact(2)
+                .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect())
+        }
+        "BF16" => {
+            need_bytes(2)?;
+            Ok(b[..n * 2]
+                .chunks_exact(2)
+                .map(|c| f32::from_bits((u16::from_le_bytes([c[0], c[1]]) as u32) << 16))
+                .collect())
+        }
         other => Err(format!(
             "qwen35-embed: vision tensor `{name}` dtype {other} (F16/F32/BF16 only)"
         )),
@@ -172,7 +193,7 @@ fn up_lin(
         1
     };
     debug_assert_eq!(words.len(), n);
-    drop(t);
+    names::release(src, name, true);
     put_f16(gpu, cfg, &words, &[rows, cols])
         .map_err(|e| format!("qwen35-embed: upload vision `{name}`: {e:?}"))
 }
@@ -193,12 +214,15 @@ fn up_vec(
         ));
     }
     drop(t);
+    names::release(src, name, true);
     put_f32(gpu, cfg, &v, &[n]).map_err(|e| format!("qwen35-embed: upload vision `{name}`: {e:?}"))
 }
 
 fn host_vec(src: &ModelSource, name: &str, n: usize) -> Result<Vec<f32>, String> {
     let t = names::read(src, name, true)?;
     let v = to_f32(&t, name)?;
+    drop(t);
+    names::release(src, name, true);
     if v.len() != n {
         return Err(format!(
             "qwen35-embed: vision `{name}` is {} elems, expected {n}",
@@ -280,6 +304,12 @@ pub fn merged_grid(cfg: &EmbedConfig, grid_h: usize, grid_w: usize) -> (usize, u
 /// out_hidden]` host embeds. `patch_size`/`merge` come from the vision
 /// config; preprocessing (smart-resize, `/127.5 − 1` normalize, 2×2-grouped
 /// patch extraction) is `hipfire-arch-qwen35-vl::image`.
+///
+/// Returns `(merged_embeds, grid_h, grid_w)` where the grid is the
+/// **pre-merge patch grid** (`img / patch_size`) — the contract
+/// `hipfire_arch_qwen35_vl::mrope::build_mrope_positions` divides by
+/// `spatial_merge_size` itself. The merged token count is
+/// `merged.len() / out_hidden_size`.
 pub fn encode_image(
     gpu: &mut Gpu,
     weights: &VisionWeights,
@@ -331,7 +361,7 @@ pub fn encode_image(
             vis.out_hidden_size
         ));
     }
-    Ok((merged, mh, mw))
+    Ok((merged, grid_h, grid_w))
 }
 
 #[cfg(test)]

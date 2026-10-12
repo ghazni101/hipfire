@@ -121,28 +121,41 @@ fn decode_f32(t: &TensorBytes<'_>, name: &str) -> Result<Vec<f32>, String> {
         return Ok(v);
     }
     let bytes = &t.bytes;
+    // Byte-length guard shared by every raw-dtype arm: a declared shape that
+    // exceeds the stored bytes is a malformed artifact's error, not a panic
+    // from an unchecked slice.
+    let need_bytes = |w: usize| -> Result<(), String> {
+        if bytes.len() < n * w {
+            return Err(format!(
+                "tensor `{name}`: {} bytes < {}",
+                bytes.len(),
+                n * w
+            ));
+        }
+        Ok(())
+    };
     match t.dtype.as_str() {
         "F32" => {
-            if bytes.len() < n * 4 {
-                return Err(format!(
-                    "tensor `{name}`: {} bytes < {}",
-                    bytes.len(),
-                    n * 4
-                ));
-            }
+            need_bytes(4)?;
             Ok(bytes[..n * 4]
                 .chunks_exact(4)
                 .map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]]))
                 .collect())
         }
-        "F16" => Ok(bytes[..n * 2]
-            .chunks_exact(2)
-            .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
-            .collect()),
-        "BF16" => Ok(bytes[..n * 2]
-            .chunks_exact(2)
-            .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
-            .collect()),
+        "F16" => {
+            need_bytes(2)?;
+            Ok(bytes[..n * 2]
+                .chunks_exact(2)
+                .map(|c| f16::from_le_bytes([c[0], c[1]]).to_f32())
+                .collect())
+        }
+        "BF16" => {
+            need_bytes(2)?;
+            Ok(bytes[..n * 2]
+                .chunks_exact(2)
+                .map(|c| bf16_to_f32(u16::from_le_bytes([c[0], c[1]])))
+                .collect())
+        }
         other => Err(format!(
             "tensor `{name}` has dtype {other} — expected F32/BF16/F16"
         )),
@@ -197,6 +210,7 @@ fn upload_lin_f16(
 ) -> Result<GpuTensor, String> {
     let t = names::read(src, name, false)?;
     let words = decode_f16(&t, name)?;
+    names::release(src, name, false);
     if words.len() != rows * cols {
         return Err(format!(
             "qwen35-embed: tensor `{name}` has {} elems, expected {rows}×{cols}",
@@ -216,6 +230,7 @@ fn upload_vec_f32(
 ) -> Result<GpuTensor, String> {
     let t = names::read(src, name, false)?;
     let mut v = decode_f32(&t, name)?;
+    names::release(src, name, false);
     if v.len() != n {
         return Err(format!(
             "qwen35-embed: tensor `{name}` has {} elems, expected {n}",
@@ -240,6 +255,7 @@ fn upload_conv_f32(
 ) -> Result<GpuTensor, String> {
     let t = names::read(src, name, false)?;
     let v = decode_f32(&t, name)?;
+    names::release(src, name, false);
     if v.len() != channels * kernel {
         return Err(format!(
             "qwen35-embed: conv `{name}` has {} elems, expected {channels}×{kernel}",
@@ -267,6 +283,7 @@ fn upload_q_gate_split(
 ) -> Result<(GpuTensor, GpuTensor), String> {
     let t = names::read(src, name, false)?;
     let words = decode_f16(&t, name)?;
+    names::release(src, name, false);
     let fused = heads * head_dim * 2;
     if words.len() != fused * hidden {
         return Err(format!(
@@ -309,6 +326,18 @@ fn read_sidecar_tensor(path: &std::path::Path, want: &str) -> Result<Vec<f32>, S
     f.read_exact(&mut len_bytes)
         .map_err(|e| format!("{}: header length: {e}", path.display()))?;
     let header_len = u64::from_le_bytes(len_bytes) as usize;
+    // Bound before trusting the length: a corrupt or adversarial file can
+    // declare an absurd header and take the loader down in an allocation.
+    let file_len = f
+        .metadata()
+        .map_err(|e| format!("{}: metadata: {e}", path.display()))?
+        .len() as usize;
+    if header_len == 0 || header_len > file_len.saturating_sub(8) || header_len > (1 << 24) {
+        return Err(format!(
+            "{}: implausible safetensors header length {header_len} (file is {file_len} B)",
+            path.display()
+        ));
+    }
     let mut header = vec![0u8; header_len];
     f.read_exact(&mut header)
         .map_err(|e| format!("{}: header: {e}", path.display()))?;
@@ -335,8 +364,25 @@ fn read_sidecar_tensor(path: &std::path::Path, want: &str) -> Result<Vec<f32>, S
         .get("data_offsets")
         .and_then(|v| v.as_array())
         .ok_or_else(|| format!("{}: `{want}` has no data_offsets", path.display()))?;
-    let start = offsets[0].as_u64().unwrap_or(0) as usize;
-    let end = offsets[1].as_u64().unwrap_or(0) as usize;
+    let (start, end) = match offsets.as_slice() {
+        [a, b, ..] => {
+            let a = a.as_u64().unwrap_or(0) as usize;
+            let b = b.as_u64().unwrap_or(0) as usize;
+            if b < a {
+                return Err(format!(
+                    "{}: `{want}` data_offsets end {b} < start {a}",
+                    path.display()
+                ));
+            }
+            (a, b)
+        }
+        _ => {
+            return Err(format!(
+                "{}: `{want}` data_offsets is not a [start, end] pair",
+                path.display()
+            ))
+        }
+    };
     let mut raw = vec![0u8; end - start];
     // safetensors data begins after the 8-byte length + header (8-aligned).
     let data_base = 8 + header_len;
@@ -360,6 +406,8 @@ fn load_dense(gpu: &mut Gpu, src: &ModelSource, cfg: &EmbedConfig) -> Result<Gpu
     let (words, cols): (Vec<u16>, usize) = match names::read(src, names::DENSE_TENSOR, false) {
         Ok(t) => {
             let w = decode_f16(&t, names::DENSE_TENSOR)?;
+            drop(t);
+            names::release(src, names::DENSE_TENSOR, false);
             let cols = w.len() / cfg.hidden_size;
             (w, cols)
         }
@@ -412,6 +460,7 @@ fn stream_weights(
     // Embedding table → host f32 (gather source; see module docs).
     let t = names::read(src, "embed_tokens.weight", false)?;
     let embed_table = decode_f32(&t, "embed_tokens.weight")?;
+    names::release(src, "embed_tokens.weight", false);
     if embed_table.len() != cfg.vocab_size * h {
         return Err(format!(
             "qwen35-embed: embed_tokens is {} elems, expected {}×{h}",
@@ -679,16 +728,21 @@ impl EmbedWeights {
     }
 }
 
-/// One contiguous run of image-token positions in the token stream and
-/// where its merged embeds start inside the image-embeds buffer.
+/// One contiguous run of `<|image_pad|>` positions in the token stream and
+/// which rows of the merged image-embeds matrix fill it. `grid_h`/`grid_w`
+/// are the **pre-merge patch grid** (`img_px / patch_size`) — the mRoPE
+/// builder divides by `spatial_merge_size` itself, so callers must not hand
+/// it the already-merged counts.
 #[derive(Clone, Copy, Debug)]
 pub struct ImageSpan {
     pub start: usize,
+    /// Merged-token count (the run's length in `ids`).
     pub len: usize,
     /// Row offset into the merged image-embeds matrix.
     pub embed_offset: usize,
-    /// Merged-token grid (post 2×2 merge), for mRoPE.
+    /// Pre-merge patch grid height, for mRoPE.
     pub grid_h: usize,
+    /// Pre-merge patch grid width.
     pub grid_w: usize,
 }
 

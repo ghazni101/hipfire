@@ -3083,7 +3083,11 @@ impl Gpu {
             &mut ve as *mut _ as *mut c_void,
             &mut ni as *mut _ as *mut c_void,
         ];
-        let block = 256u32.min(n as u32);
+        // The kernel's max/sum reductions are bit-halving trees, correct
+        // only for a power-of-two block; round the length up instead of
+        // sizing the block to it. (Today every caller passes n >= 256 so the
+        // min caps at 256; keep the shape right for future callers.)
+        let block = 256u32.min((n as u32).max(1).next_power_of_two());
         let shared_mem = block * 4;
         let bytes = crate::profile::elementwise1_bytes(rows * n);
         let timer =
@@ -3118,6 +3122,11 @@ impl Gpu {
     /// `out` is `[n, n_heads*hd]`; `n_heads % n_kv_heads == 0`,
     /// `hd % 16 == 0` and `hd <= 256`. `scale` is folded by the caller as
     /// `1/sqrt(hd)`, matching `attention_text_f32`.
+    /// `n` is the row count of all four tensors; `n_valid` is the real key
+    /// count — K/V rows in `[n_valid, n)` are sequence padding (zeroed by
+    /// the batch layout) and are excluded from every softmax. Pass
+    /// `n_valid == n` when there is no padding.
+
     pub fn attention_encoder_qtiled_f32(
         &mut self,
         q: &GpuTensor,
@@ -3125,6 +3134,7 @@ impl Gpu {
         v: &GpuTensor,
         out: &GpuTensor,
         n: usize,
+        n_valid: usize,
         n_heads: usize,
         n_kv_heads: usize,
         head_dim: usize,
@@ -3170,6 +3180,11 @@ impl Gpu {
         let mut vp = v.buf.as_ptr();
         let mut op = out.buf.as_ptr();
         let mut ni = n as i32;
+        // Keys/values in [n_valid, n) are sequence padding (zeroed rows):
+        // bounding the score loop by n_valid keeps them out of the softmax.
+        // Clamped (not asserted) so a no-padding caller passing n pays
+        // nothing extra.
+        let mut nv = (n_valid.min(n)) as i32;
         let mut nh = n_heads as i32;
         let mut nkv = n_kv_heads as i32;
         let mut hd = head_dim as i32;
@@ -3181,6 +3196,7 @@ impl Gpu {
             &mut vp as *mut _ as *mut c_void,
             &mut op as *mut _ as *mut c_void,
             &mut ni as *mut _ as *mut c_void,
+            &mut nv as *mut _ as *mut c_void,
             &mut nh as *mut _ as *mut c_void,
             &mut nkv as *mut _ as *mut c_void,
             &mut hd as *mut _ as *mut c_void,

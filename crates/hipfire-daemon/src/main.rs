@@ -2756,33 +2756,8 @@ fn main() {
                 }
                 let _ = stdout.flush();
             }
-
             "generate" => {
-                // An embedding checkpoint has no generation route: its carrier
-                // answers only `embed`. Refuse here, before any generation state
-                // is entered — the mirror of `embed`'s refusal above and of
-                // `img_generate`'s non-diffusion refusal. Reaching the generic
-                // body instead downcasts the wrong bundle and panics the daemon.
-                if model
-                    .as_ref()
-                    .is_some_and(|m| !hipfire_loader::wire_verb(m.arch_id).is_generate())
-                {
-                    let id = msg
-                        .get("id")
-                        .and_then(|v| v.as_str())
-                        .unwrap_or("0")
-                        .to_string();
-                    emit_uncorrelated_error(
-                        &mut stdout,
-                        Some(id.as_str()),
-                        "generate refused: the loaded model is a qwen3.5 embedding checkpoint — use the `embed` verb",
-                        "validation",
-                        false,
-                        false,
-                    );
-                    let _ = stdout.flush();
-                    continue;
-                }
+
                 let gen_attempt_id = match require_wire_attempt_id(msg.get("attempt_id")) {
                     Ok(id) => id,
                     Err(reason) => {
@@ -2821,6 +2796,32 @@ fn main() {
                         continue;
                     }
                 };
+                // An embedding checkpoint has no generation route: its carrier
+                // answers only `embed`. Refuse here — AFTER attempt_id and the
+                // admission token are bound, so the refusal is a keyed
+                // `emit_batch_admission_error` the caller's pending entry
+                // routes (an attempt-0 uncorrelated error would land on a
+                // channel no generate caller waits on and the request would
+                // hang). The mirror of `embed`'s refusal and of
+                // `img_generate`'s non-diffusion refusal below; reaching the
+                // generic body instead downcasts the wrong bundle and panics.
+                if model
+                    .as_ref()
+                    .is_some_and(|m| !hipfire_loader::wire_verb(m.arch_id).is_generate())
+                {
+                    emit_batch_admission_error(
+                        &mut stdout,
+                        id,
+                        gen_attempt_id,
+                        admission,
+                        "generate refused: the loaded model is a qwen3.5 embedding checkpoint — use the `embed` verb",
+                        "validation",
+                        false,
+                        false,
+                    );
+                    continue;
+                }
+
                 #[cfg(feature = "serve-fault-inject")]
                 let _fault_guard =
                     hipfire_generate::common::RequestFaultGuard::arm_from_request(&msg);
@@ -4379,6 +4380,41 @@ fn main() {
                     .and_then(|v| v.as_str())
                     .unwrap_or("0")
                     .to_string();
+                // Multi-slot backend dispatches before the ordinary model
+                // path, for the same reason the generate arm does: in slot mode
+                // the daemon's `model` slot is empty by design and the engine
+                // owns the one weight copy. A worker per request keeps the read
+                // loop free, so concurrent embeds reach the engine together and
+                // it can merge them into one forward.
+                if let Some(slot) = slot_backend.clone() {
+                    // Bound thread creation BEFORE spawning, same reason the
+                    // generate arm does: a guard inside an already-spawned
+                    // thread does not bound thread creation. The worker's
+                    // acquire_guard in handle_embed remains the hard bound.
+                    // Embed replies correlate by (id, 0), so the uncorrelated
+                    // emitter is the right channel here (attempt TLS is 0).
+                    if slot.active_count() >= 32 {
+                        emit_uncorrelated_error(
+                            &mut stdout,
+                            Some(id.as_str()),
+                            "too many concurrent slot requests (bounded worker limit hit)",
+                            "overload",
+                            true,
+                            false,
+                        );
+                        let _ = stdout.flush();
+                        continue;
+                    }
+                    let msg_clone = msg.clone();
+                    let id_owned = id.clone();
+                    let slot_clone = slot.clone();
+                    std::thread::spawn(move || {
+                        let mut worker_stdout = std::io::stdout();
+                        slot_clone.handle_embed(&msg_clone, &mut worker_stdout, &id_owned);
+                        let _ = worker_stdout.flush();
+                    });
+                    continue;
+                }
                 let m = match model.as_mut() {
                     Some(m) => m,
                     None => {

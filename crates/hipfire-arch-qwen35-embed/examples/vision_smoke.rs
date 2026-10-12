@@ -66,13 +66,17 @@ fn main() -> Result<(), String> {
     );
 
     let bytes = std::fs::read(image).map_err(|e| format!("{image}: {e}"))?;
-    let (merged, mh, mw) = encode_image(&mut gpu, &weights, &cfg, &bytes)?;
+    let (merged, grid_h, grid_w) = encode_image(&mut gpu, &weights, &cfg, &bytes)?;
     let out_h = v.out_hidden_size;
     let n = merged.len() / out_h;
     let absmax = merged.iter().fold(0f32, |a, x| a.max(x.abs()));
     let bad = merged.iter().filter(|x| !x.is_finite()).count();
+    // `encode_image` returns the PRE-merge patch grid; the merged token
+    // count is `grid / spatial_merge_size` per side.
+    let sms = v.spatial_merge_size.max(1);
     println!(
-        "image -> {n} merged tokens ({mw}x{mh} grid), out_hidden {out_h}, absmax {absmax:.4}, nonfinite {bad}"
+        "image -> {n} merged tokens ({}x{} patch grid, {}x{} merged), out_hidden {out_h}, absmax {absmax:.4}, nonfinite {bad}",
+        grid_w, grid_h, grid_w / sms, grid_h / sms
     );
     weights.free_gpu(&mut gpu);
     if n == 0 || bad > 0 {

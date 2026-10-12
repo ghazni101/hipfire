@@ -644,6 +644,57 @@ impl SlotBackend {
         self.engine.shutdown()
     }
 
+    /// Embedding handler for experimental slot mode: parse the `embed` wire
+    /// body, hold an activity guard for the duration (so an unload or model
+    /// swap cannot tear the engine down mid-encode), run it on the engine, and
+    /// write the same `embedded` envelope the sequential route writes — the
+    /// CLI, the HTTP layer and the container client need no change to reach
+    /// the slot path.
+    ///
+    /// One wire request is one encode request. Concurrency comes from the
+    /// daemon spawning a worker per request (as the generate route does) and
+    /// from the engine merging the requests that arrive together into one
+    /// batched forward.
+    pub fn handle_embed<W: std::io::Write>(
+        &self,
+        msg: &serde_json::Value,
+        stdout: &mut W,
+        id: &str,
+    ) {
+        // Bound thread creation before spawning, same shape and reason as the
+        // generate route: a burst must not spawn a thread per rejected
+        // request, and the worker's own guard remains the hard bound.
+        //
+        // Embed replies are correlated by (id, attempt_id=0) — the worker
+        // never enters a BatchAttemptScope, so `emit_active_attempt_error`
+        // would write NOTHING (TLS 0 is the reserved uncorrelated channel)
+        // and the caller would wait forever. The uncorrelated emitter is the
+        // one whose envelope matches the pending key the caller registered.
+        if self.active_count() >= 32 {
+            hipfire_engine::emit::emit_uncorrelated_error(
+                stdout,
+                Some(id),
+                "too many concurrent slot requests (bounded worker limit hit)",
+                "overload",
+                true,
+                false,
+            );
+            return;
+        }
+        let Some(_guard) = self.acquire_guard() else {
+            hipfire_engine::emit::emit_uncorrelated_error(
+                stdout,
+                Some(id),
+                "too many concurrent slot requests (bounded worker limit hit)",
+                "overload",
+                true,
+                false,
+            );
+            return;
+        };
+        hipfire_generate::embed::generate_embed_slot(&*self.engine, stdout, id, msg);
+    }
+
     /// Generate handler for experimental slot mode.
     ///
     /// Requires `experimental_multi_slot=true` on the wire, validates
