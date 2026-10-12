@@ -269,6 +269,16 @@ Read only by the Qwen4 carrier and its kernels; no other model reads them.
 | `HIPFIRE_VL_FILE` | explicit `.vl` tower file for the multi-slot engine | Checked before the `<stem>.vl` sibling probe in `hipfire-runtime` `sidecar::resolve_vl_sidecar`; a set-but-missing path is reported, not silently ignored. |
 | `HIPFIRE_VIT_ATTN` | `naive` forces the per-(head, query) ViT attention kernel | Rollback/A-B switch for the Q-tiled ViT attention kernel. Head dims outside the Q-tiled contract (`head_dim % 16 != 0` or `> 128`) use the naive kernel regardless. |
 
+### Embedding (arch 17)
+
+| Variable | Default / sense | Notes |
+|---|---|---|
+| `HIPFIRE_EMBED_VISION_OFFLOAD` | `1`/`on`/`true` forces the qwen3.5 embedding model's SigLIP tower into host RAM (GPU-addressable, read over PCIe); `0`/`off`/`false` forces it device-resident; unset auto-decides | The tower is ~250 MB of the arch's ~740 MB and is only touched by an image request, so it is the component to spill when the card is busy. **Auto (the default)** keeps it resident only when it fits in the VRAM free at load plus a 64 MB margin, and spills otherwise — a machine whose desktop already holds most of the card then loads the model and serves text instead of OOMing, at the cost of PCIe reads on image requests. Same tradeoff `HIPFIRE_OFFLOAD_EXEC=pcie` makes for spilled text layers; applied per-model here because the embedding arch can offload the tower whole. Read via `developer_var` in `hipfire-arch-qwen35-embed`. |
+| `HIPFIRE_EMBED_GEMM` | `f32` (or `mb8`) forces the f32-activation `gemm_f16_wmma_mb8` on every projection | A/B and bit-fidelity switch for the LDS-tiled macro-tile GEMM (`gemm_f16_x_f16_wmma_lds_auto`) the encoder uses for large shapes. Measured on gfx1101 at n=4096: mb8 runs the trunk's GEMMs at ~1.6 TFLOP/s (2% of the f16 peak) because it is a register-blocked 32-thread block with no LDS staging — right for the small batches it was written for (the vision tower), wrong here; the tiled kernel reaches ~25 TFLOP/s and took the GEMM from 1227 ms to ~80 ms. Its X operand is f16, so activations narrow: ~1e-3 relative, two orders below what 4-bit weights already cost, and the embedding error is unchanged to four digits on the validation fixture. Small shapes (`out < 256`, the GQA `a`/`b` projections) and any `k % 64 != 0` keep mb8 either way. |
+| `HIPFIRE_EMBED_ATTN` | `naive` = masked reference per-(query, head) kernel; `no-gemm` (or `tiled`) = the Q-tiled SIMT kernel everywhere | Attention has three paths, selected by shape and this knob. Default: the **eager decomposition** (`S = Q·Kᵀ` as a WMMA GEMM, a row softmax, then `P·V` as a second GEMM) on a wave32-WMMA arch when `n % 64 == 0` and `n >= 256` — the tiled GEMM asserts `k % 64 == 0` and the second GEMM contracts over `n` — and `head_dim % 64 == 0`. Otherwise the Q-tiled SIMT kernel, which handles any `n` and is cheap at small `n` (its cost is O(n²)). To put inputs of any length on the eager path, sequences of 256+ tokens are **padded up to a multiple of 64** (`padded_rows`); padding goes at the end, which the architecture tolerates because GDN is causal (a padded row cannot influence a real row's state), the eager full-attention layers mask the padded keys in a masked f16 row-softmax, and the Q-tiled kernel bounds its score loop by `n_valid` so the padded keys never enter the softmax — and `naive` masks them with an f32 key vector (an unmasked path would let the zeroed pad rows take a softmax share and dilute every output row). Inputs below 256 tokens are not padded and stay on the tiled kernel. Measured: `embed_medium` (2209 tokens) 390.8 -> **165.3 ms** once padded onto the eager path. `naive` reaches the masked reference kernel for A/B. Measured on gfx1101 at 4096 tokens: tiled 1056 ms -> eager 342 ms (**3.09x**), because the tiled kernel's scalar f32 FMA runs at ~2.05 TFLOP/s (6.9% of f32 peak) while the trunk's WMMA GEMM holds 5.5-6.25 TFLOP/s at exactly this shape. Costs f16 Q/K/P for the attention operands; the embedding error is unchanged to four digits (1.51e-4 eager vs 1.40e-4 tiled against the NumPy oracle). |
+| `HIPFIRE_EMBED_PHASE` | `1` prints the per-phase timing of one `embed` request | `assemble \| encode \| mask+normalize \| serialize+write`, on stderr. **Its own knob, deliberately not `HIPFIRE_EMBED_DEBUG`**: that one also arms the encoder's per-layer finite `trace()`, which syncs the GPU every layer and inflated the same measurement from 334 ms to 678 ms — the first reading of it was wrong for exactly that reason. |
+| `HIPFIRE_EMBED_DEBUG` | `1` traces the embedding encoder | Prints a per-layer finite-value trace of the residual stream (absmax + non-finite count) and the VRAM free/total after load. Downloads one tensor per call, so it is strictly a debugging path — it is what localized a weight-format bug that NaN'd the last rows of every projection. |
+
 ### Graph / MMQ / prefill
 
 | Variable | Notes |
@@ -623,7 +633,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1550
+**Count:** 1557
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -1006,6 +1016,13 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_E8_ROW_GATE` | crates/saddle-lab/examples/collect_e8_hessian_native.rs | harness |
 | `HIPFIRE_E8_SOA_EXPERTS` | crates/hipfire-arch-qwen35/src/qwen35/load.rs, crates/rdna-compute/src/gemv.rs | developer |
 | `HIPFIRE_E8_STRIP` | crates/rdna-compute/src/gemv.rs, crates/rdna-compute/src/kernels.rs | developer |
+| `HIPFIRE_EMBED_ATTN` | crates/hipfire-arch-qwen35-embed/src/forward.rs | developer |
+| `HIPFIRE_EMBED_BATCH_WINDOW_US` | crates/hipfire-arch-qwen35-embed/src/slot_engine.rs | developer |
+| `HIPFIRE_EMBED_DEBUG` | crates/hipfire-arch-qwen35-embed/src/carrier.rs, crates/hipfire-arch-qwen35-embed/src/forward.rs | developer |
+| `HIPFIRE_EMBED_ENGINE_TRACE` | crates/hipfire-arch-qwen35-embed/src/slot_engine.rs | developer |
+| `HIPFIRE_EMBED_GEMM` | crates/hipfire-arch-qwen35-embed/src/forward.rs | developer |
+| `HIPFIRE_EMBED_PHASE` | crates/hipfire-arch-qwen35-embed/examples/batch_parity.rs, crates/hipfire-generate/src/embed.rs | developer |
+| `HIPFIRE_EMBED_VISION_OFFLOAD` | crates/hipfire-arch-qwen35-embed/src/lib.rs, crates/hipfire-arch-qwen35-embed/src/vision.rs | developer |
 | `HIPFIRE_EMIT_TOKEN_IDS` | autoresearch/ar/certify/serve_runner.py, crates/hipfire-arch-cohere2moe/src/spec_emit.rs | developer |
 | `HIPFIRE_EMULATE_GPUS` | crates/hipfire-arch-qwen35/tests/route_oracle_mesh.rs, crates/hipfire-runtime/src/config.rs | developer |
 | `HIPFIRE_EMU_BF16_H` | crates/rdna-compute/src/gemv.rs | developer |
