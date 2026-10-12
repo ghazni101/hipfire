@@ -102,8 +102,10 @@ fn to_f32(t: &TensorBytes<'_>, name: &str) -> Result<Vec<f32>, String> {
 /// readable memory to the kernels) but a placement nobody chose and nobody can
 /// reproduce from the config.
 ///
-/// `HIPFIRE_EMBED_VISION_OFFLOAD=1` opts in. Default off: a fully-resident
-/// tower is faster and is the right default when the card has room.
+/// Unset, the decision is automatic: the tower stays device-resident only
+/// when it fits in the VRAM free at load (plus a 64 MB margin), and is
+/// host-mapped otherwise. `HIPFIRE_EMBED_VISION_OFFLOAD=1` forces the
+/// host-mapped tower, `=0` forces it resident.
 fn vision_offload(gpu: &Gpu, cfg: &EmbedConfig) -> bool {
     // Explicit override wins.
     if let Ok(v) = hipfire_config::developer_var("HIPFIRE_EMBED_VISION_OFFLOAD") {
