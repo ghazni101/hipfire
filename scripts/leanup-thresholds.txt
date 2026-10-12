@@ -63,7 +63,13 @@ required_features_daemon    == 0
 # through `hipfire_loader::wire_verb`, so the daemon still carries no arch_id
 # literal (`daemon_arch_id` stays 0). Paid down when the message loop's
 # per-verb refusal boilerplate is factored out, as noted at the 5392 raise.
-daemon_lines                <= 5460
+# RATCHET-RAISE 5460 -> 5495: the arch-17 embedding arms in the daemon message
+# loop (#855, beta-base replay) — the generate refusal that is keyed after the
+# attempt id and admission token are bound (its attempt-0 twin hung requests),
+# the embed arm's thread-creation bound, the multi-slot engine spawn and its
+# carrier-delegated slot preflight, and the request-named-model reload policy.
+# Same paydown as the 5392 raise: factor the per-verb refusal boilerplate out.
+daemon_lines                <= 5495
 
 # Examples compile on every `cargo build --all-targets`. Archived research
 # probes are gated behind `--features lab`; this is the count still ungated.
