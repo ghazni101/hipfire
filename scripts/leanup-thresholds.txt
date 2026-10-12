@@ -156,4 +156,8 @@ bypass_slack                == 0
 # all. The regex is now whitespace-tolerant, every row is re-measured, and the
 # ledger header records the per-crate correction. The holster objective's
 # descent starts from 363, not 307.
-bypass_total                <= 363
+# RATCHET-RAISE 363 -> 365: +2 for hipfire-arch-qwen35-embed's eager-attention
+# decomposition (its `S = Q*K^T` and `O = P*V` WMMA GEMMs). This is the first
+# genuine growth the corrected regex has caught — at the old adjacent-only
+# regex it would have been invisible, which is the whole reason it was fixed.
+bypass_total                <= 365
