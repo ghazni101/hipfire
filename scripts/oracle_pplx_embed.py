@@ -84,7 +84,14 @@ def rope_partial(x, pos, n_rot=NROT, theta=THETA):
 
 def softplus(x): return np.log1p(np.exp(-np.abs(x))) + np.maximum(x, 0)
 
-def encode(ids):
+def encode(ids, hidden_only=False):
+    """Final 128-d token embeddings, or the trunk's last hidden state.
+
+    `hidden_only=True` returns the post-final-RMSNorm trunk output
+    (`[n, hidden]`) before the Dense head — what HF calls
+    `last_hidden_state`. Comparing trunks localizes a mismatch to the trunk or
+    the head instead of only saying the two ends disagree.
+    """
     n = len(ids)
     x = t["language_model.embed_tokens.weight"][ids].astype(np.float64)
     pos = np.arange(n, dtype=np.int64)
@@ -155,6 +162,8 @@ def encode(ids):
         uu = h @ t[f"{p}.mlp.up_proj.weight"].astype(np.float64).T
         x = res + ((gg/(1+np.exp(-gg)))*uu) @ t[f"{p}.mlp.down_proj.weight"].astype(np.float64).T
     x = rmsnorm(x, t["language_model.norm.weight"].astype(np.float64))
+    if hidden_only:
+        return x
     return x @ t["dense.linear.weight"].astype(np.float64).T   # [n, 128]
 
 if __name__ == "__main__":
