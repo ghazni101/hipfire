@@ -1333,18 +1333,40 @@ async fn handle_embeddings(
         .and_then(|v| v.as_str())
         .map(str::to_owned);
 
-    let _guard = match shared
-        .admission
-        .acquire_async(CancellationToken::new())
-        .await
-    {
-        Ok(guard) => guard,
-        Err(error) => {
-            return Ok(admission_error_response(
-                WireApi::ChatCompletions,
-                &shared.metrics,
-                &error,
-            ))
+    // Exclusive admission serialized exactly the requests a multi-slot serve
+    // exists to batch; admit the sharing (batch-eligible) class whenever the
+    // serve advertises multi_slot, the same gate the chat route applies. The
+    // request names the resident model (enforced below), so the admission
+    // lease keys on it like a chat request's.
+    let is_eligible = {
+        let runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
+        runtime.multi_slot_enabled
+    };
+    let _guard = if is_eligible {
+        match shared
+            .admission
+            .acquire_for_async(true, request_model.as_deref(), CancellationToken::new())
+            .await
+        {
+            Ok(guard) => guard,
+            Err(error) => {
+                return Ok(admission_error_response(
+                    WireApi::ChatCompletions,
+                    &shared.metrics,
+                    &error,
+                ))
+            }
+        }
+    } else {
+        match shared.admission.acquire_async(CancellationToken::new()).await {
+            Ok(guard) => guard,
+            Err(error) => {
+                return Ok(admission_error_response(
+                    WireApi::ChatCompletions,
+                    &shared.metrics,
+                    &error,
+                ))
+            }
         }
     };
 
