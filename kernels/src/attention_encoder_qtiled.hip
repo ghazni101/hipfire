@@ -27,9 +27,15 @@
 //      `K_TILE` is a launch argument; the host sizes it (and the LDS) from
 //      `head_dim`.
 //
-// V is NOT staged in LDS: in the P@V accumulation each (j, d) element is read
-// by exactly one lane (d = lane + a*LANES), so there is no intra-block reuse
-// to pay LDS for. K IS staged, because every query in the block reads it.
+// K AND V are both staged in LDS. K was always; V is the newer fix, and the
+// reason is latency rather than bandwidth. The P@V pass reads A (16) V values
+// per key per lane, all independent, so the compiler can issue them back to
+// back — but each one was an L2/DRAM read of ~500 cycles against a block with
+// two warps per SIMD, and that latency was the measured bottleneck: the kernel
+// ran at 1.5% of its FMA issue rate while moving only 33 GB/s (rocprofv3,
+// gfx1101, N=4096). Through LDS the same reads are ~30 cycles. Staging V costs
+// LDS, so K_TILE drops to 16 (K_TILE/LANES = 1 score per lane, twice the
+// tiles) — a trade this kernel makes deliberately, and the host sizes both.
 //
 // LATENCY, NOT BANDWIDTH (rocprofv3, gfx1101, N=4096): the first version of
 // this kernel land measured 531 GFLOP/s — 1.8% of the card's f32 peak — while
@@ -48,9 +54,9 @@
 //
 // Grid:  [n_heads, ceil(N / QB)]
 // Block: [QB * LANES]  — each LANES-lane subgroup owns one query row.
-// LDS:   K_TILE*(head_dim+4) + QB*head_dim + QB*K_TILE + 2*QB*LANES + 2*QB floats
-// (the running output is register-resident, so it costs no LDS; the K stride
-//  carries 4 floats of padding against LDS bank conflicts)
+// LDS:   2*K_TILE*(head_dim+4) + QB*head_dim + QB*K_TILE + 2*QB*LANES + 2*QB
+// floats (the running output is register-resident, so it costs no LDS; the K
+// and V strides each carry 4 floats of padding against LDS bank conflicts)
 
 // K-tile row stride padding. With stride == head_dim (256) two different key
 // rows sit exactly 8 LDS rows (1024 B) apart, so the 16 lanes of a subgroup —
@@ -90,7 +96,8 @@ extern "C" __global__ __launch_bounds__(QB* LANES, 1) void attention_encoder_qti
     const int K_STRIDE = head_dim + K_PAD;
     extern __shared__ float smem[];
     float* k_tile = smem;                              // [K_TILE * K_STRIDE]
-    float* q_tile = k_tile + K_TILE * K_STRIDE;        // [QB * head_dim]
+    float* v_tile = k_tile + K_TILE * K_STRIDE;        // [K_TILE * K_STRIDE]
+    float* q_tile = v_tile + K_TILE * K_STRIDE;        // [QB * head_dim]
     float* s_tile = q_tile + QB * head_dim;            // [QB * K_TILE]
     float* ws_max = s_tile + QB * K_TILE;              // [QB * LANES]
     float* ws_sum = ws_max + QB * LANES;               // [QB * LANES]
@@ -124,6 +131,7 @@ extern "C" __global__ __launch_bounds__(QB* LANES, 1) void attention_encoder_qti
         for (int i = tid; i < tlen * head_dim; i += nthreads) {
             int j = i / head_dim, d = i % head_dim;
             k_tile[j * K_STRIDE + d] = k[(size_t)(t0 + j) * d_kv + kv_off + d];
+            v_tile[j * K_STRIDE + d] = v[(size_t)(t0 + j) * d_kv + kv_off + d];
         }
         __syncthreads();
 
@@ -195,16 +203,16 @@ extern "C" __global__ __launch_bounds__(QB* LANES, 1) void attention_encoder_qti
 
             // Rescale the running output and fold in this tile's P@V.
             const float* prow = s_tile + qid * K_TILE;
-            const float* vbase = v + kv_off;
             // Rescale this lane's running output first ...
             #pragma unroll
             for (int a = 0; a < A; a++) out_reg[a] *= r;
-            // ... then fold in P@V with `p` hoisted into a register: reading
-            // it inside the `a` loop re-read it from LDS A (16) times per key
-            // for one multiply, which made the pass memory-op bound.
+            // ... then fold in P@V with `p` hoisted into a register and V read
+            // from LDS: reading `p` inside the `a` loop re-read it A (16) times
+            // per key for one multiply, and reading V from global put a
+            // full-memory-latency load under every one of those multiplies.
             for (int j = 0; j < tlen; j++) {
                 const float p = prow[j];
-                const float* vrow = vbase + (size_t)(t0 + j) * d_kv;
+                const float* vrow = v_tile + j * K_STRIDE;
                 #pragma unroll
                 for (int a = 0; a < A; a++)
                     out_reg[a] = fmaf(p, vrow[lane + a * LANES], out_reg[a]);
