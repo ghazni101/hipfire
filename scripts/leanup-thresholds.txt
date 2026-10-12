@@ -153,4 +153,9 @@ bypass_slack                == 0
 # became visible (deepseek4 +20, muse-glimmer +11, minimax +7, diffusion +7,
 # qwen35 +5, gemma4 +1). No arch reached for the Gpu handle newly; the holster
 # objective's descent starts from 357.
-bypass_total                <= 357
+# RATCHET-RAISE 357 -> 364: hipfire-arch-qwen35-embed (new, #855) records its
+# 7 existing-style debt sites: the trunk's f16 WMMA GEMM projections and the
+# encoder attention's eager decomposition (Q*K^T and P*V WMMA GEMMs), the same
+# registry-key debt the other arch crates carry. Migration target: the shared
+# encoder-attention op and project_weights family (staged follow-up).
+bypass_total                <= 364
