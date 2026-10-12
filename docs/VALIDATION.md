@@ -239,6 +239,38 @@ claim-specific oracles named below, or replace the approving review.
 | Dispatch `bind_thread` invariant | [`scripts/verify-bind-thread.sh`](../scripts/verify-bind-thread.sh) (via pre-commit on matching paths) | **Automatic** when hooked: every public `dispatch.rs` entry must bind the HIP thread. Not a kernel numeric test. |
 | Env/docs drift check | [`scripts/check-env-docs.py`](../scripts/check-env-docs.py) | **Automatic** through `scripts/no-gpu-ci.sh`; checks that referenced `HIPFIRE_*` names are documented and production reads are config-owned. |
 
+### GPU lib tests are not concurrency-safe (run them with `--test-threads=1`)
+
+`cargo test -p rdna-compute --lib` flake on **4 tests** (`gdn_q8_verify_matches_
+single_row`, `gdn_q8_state_tracks_f32_on_every_route`, `gdn_q8_state_tracks_f32_
+on_every_route`'s siblings in the same module, and
+`batched_select_ranking_matches_the_serial_selection_sort`) is a **harness
+property, not a regression**, and the mechanism is worth knowing before
+chasing it:
+
+`gdn_q8_verify_matches_single_row` captures a hipGraph on the device's active
+(default) stream — `gpu.graphs.begin_graph_capture(&gpu.hip, gpu.device_id,
+&stream)` after `gpu.active_stream.take()`. Capture state is per-stream and
+global to it, so while that capture is open, **another test's kernel launch on
+the same stream is absorbed into the capture** and fails with
+`hipModuleLaunchKernel(extra blob): operation failed due to a previous error
+during capture`. Only one test in the module captures; the others fail as
+collateral, and which ones fail varies run to run.
+
+Evidence it is the harness: the same suite is **542 passed / 0 failed** with
+`--test-threads=1`, and each failing test passes in isolation.
+
+Two real fixes, neither taken yet — capture on a **dedicated stream** so
+concurrent default-stream launches are not absorbed (the correct one, and it
+also hardens the product path if two slots ever capture concurrently), or
+serialize every GPU test in the module on a `static Mutex<()>`, the idiom
+`hipfire-arch-qwen35`'s `EP_TEST_LOCK` already uses. Until one lands, run GPU
+lib suites serial:
+
+```bash
+cargo test -p rdna-compute --lib -- --test-threads=1
+```
+
 ### Manual local equivalents (not automatic)
 
 | Route | Path | Role |
