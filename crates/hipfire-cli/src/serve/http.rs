@@ -1346,8 +1346,33 @@ async fn handle_embeddings(
         }
     };
 
+    // Ensure a model is resident before asking the daemon. Unlike the chat
+    // path, an embeddings request carries no model in the general case, so the
+    // fallback is the operator's pre-warm model — which survives
+    // `clear_resident` on the request policy precisely so an evicted serve can
+    // reload. Without this, the first request after the idle timeout failed
+    // with "no model loaded" while chat (which always names a model) kept
+    // working.
     let (engine, loaded_model) = {
-        let runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
+        let mut runtime = shared
+            .runtime
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if runtime.current_path.is_none() {
+            let name = request_model
+                .clone()
+                .or_else(|| runtime.request_policy.operator_model.clone());
+            let Some(name) = name else {
+                return Err(
+                    "no model resident and this serve has no default model; name one with \
+                     \"model\" or start serve with --model"
+                        .to_string(),
+                );
+            };
+            runtime
+                .ensure_model(&name, &shared.meta, crate::serve::ModelOrigin::Operator)
+                .map_err(|e| format!("loading {name}: {e}"))?;
+        }
         (runtime.engine.clone(), runtime.current_path.clone())
     };
     let model_echo = loaded_model
