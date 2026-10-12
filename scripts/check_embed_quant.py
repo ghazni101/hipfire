@@ -41,8 +41,6 @@ def artifact_format(path):
     """
     if os.path.isdir(path):
         return "dir"
-    if not path.lower().endswith(".hfq"):
-        return None
     try:
         import astrea
         summary, _tensor_map = astrea.read_hfq_index(path, max_tensors=0)
@@ -66,6 +64,7 @@ FORMAT_BANDS = {
     "MQ3G256_LLOYD": ("mq3 (3-bit Lloyd)", 2.5e-1),
     "MQ8G256": ("q8/mq8 (8-bit)", 3.0e-2),
     "MQ6G256": ("mq6 (6-bit MQ6G256)", 8.0e-2),
+    "MQ6G256V2": ("mq6 (6-bit MQ6G256V2)", 8.0e-2),
     "HFQ4G256": ("hf4 (4-bit HFQ4G256)", 2.5e-1),
     "HFQ4G128": ("hf4 (4-bit HFQ4G128)", 2.5e-1),
     "HFQ6G256": ("hf6 (6-bit HFQ6G256)", 8.0e-2),
