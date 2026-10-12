@@ -723,6 +723,43 @@ fn batched_tile_head_dim_envelope(tile_func_name: &str) -> (usize, usize) {
     }
 }
 
+/// Tile + LDS sizing for `attention_encoder_qtiled_f32`, mirroring the
+/// kernel's `extern __shared__` carve-up exactly.
+///
+/// Returns `(k_tile, shared_floats)`. Split out and unit-tested because a
+/// mismatch here does not fail loudly: the kernel writes past its LDS carve-up
+/// and reads another region's data, so a wrong size is silently-wrong
+/// attention, and `k_tile` below `LANES` makes the score pass compute *no*
+/// scores at all (`K_TILE / LANES == 0` in integer arithmetic).
+///
+/// The kernel's constants are QB=16, LANES=16, K_PAD=4 floats of stride
+/// padding on the K and V tiles (bank conflicts — see the kernel header).
+fn encoder_qtiled_tile(head_dim: usize) -> Result<(usize, usize), String> {
+    const QB: usize = 16;
+    const LANES: usize = 16;
+    const K_PAD: usize = 4;
+    const LDS_BYTES: usize = 64 * 1024;
+    if head_dim == 0 || head_dim % LANES != 0 || head_dim > 256 {
+        return Err(format!(
+            "attention_encoder_qtiled_f32: head_dim {head_dim} is outside the \
+             Q-tiled contract (non-zero multiple of {LANES}, <= 256)"
+        ));
+    }
+    let lds_floats =
+        |kt: usize| 2 * kt * (head_dim + K_PAD) + QB * head_dim + QB * kt + 2 * QB * LANES + 2 * QB;
+    let mut kt = 64usize;
+    while kt > LANES && lds_floats(kt) * 4 > LDS_BYTES {
+        kt >>= 1;
+    }
+    if kt < LANES || kt % LANES != 0 || lds_floats(kt) * 4 > LDS_BYTES {
+        return Err(format!(
+            "attention_encoder_qtiled_f32: no legal k_tile for head_dim {head_dim} \
+             (picked {kt}; needs >= {LANES}, a multiple of it, and <= {LDS_BYTES} B of LDS)"
+        ));
+    }
+    Ok((kt, lds_floats(kt)))
+}
+
 impl Gpu {
     /// DSpark bidirectional staging assembly (on-GPU; replaces a host
     /// d2h+assemble+h2d that forced ~2 stream syncs per stage).
@@ -3066,26 +3103,8 @@ impl Gpu {
         // LDS = k_tile + q_tile + s_tile + ws_max + ws_sum + m_l. The running
         // output is register-resident in the kernel, so it is NOT budgeted
         // here — the two must stay in step.
-        // K AND V rows are padded by 4 floats (K_PAD) to break LDS bank
-        // conflicts; the sizing here must match the kernel's carve-up exactly.
-        const K_PAD: usize = 4;
-        let lds_floats = |kt: usize| {
-            2 * kt * (head_dim + K_PAD) + QB * head_dim + QB * kt + 2 * QB * LANES + 2 * QB
-        };
-        // `kt` must stay a multiple of LANES: the score pass computes
-        // `K_TILE / LANES` scores per lane, so kt < LANES would silently
-        // compute none (and a non-multiple would drop the tail keys). The
-        // floor is LANES, not the LDS minimum — at head_dim 256 the LDS
-        // budget only ever pulls kt down to 32.
-        let k_tile: usize = {
-            let mut kt = 64usize;
-            while kt > LANES && lds_floats(kt) * 4 > 64 * 1024 {
-                kt >>= 1;
-            }
-            debug_assert!(kt >= LANES && kt % LANES == 0, "k_tile {kt} breaks the score pass");
-            kt
-        };
-        let shared_floats = lds_floats(k_tile);
+        let (k_tile, shared_floats) = encoder_qtiled_tile(head_dim)
+            .map_err(|why| hip_bridge::HipError::new(0, &why))?;
         let shared_mem = (shared_floats * 4) as u32;
         let mut qp = q.buf.as_ptr();
         let mut kp = k.buf.as_ptr();
@@ -23347,6 +23366,30 @@ fn kv_slot_paged_symbol(func: &str) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
+
+    #[test]
+    fn encoder_qtiled_tile_matches_the_kernel_carve_up() {
+        use super::encoder_qtiled_tile;
+        // head_dim 256 (this arch) stages both K and V, which forces the only
+        // legal tile: 16. Anything larger overflows the 64 KB budget.
+        let (kt, floats) = encoder_qtiled_tile(256).unwrap();
+        assert_eq!(kt, 16);
+        assert!(floats * 4 <= 64 * 1024, "{floats} floats overflows LDS");
+        // The score pass needs K_TILE / LANES >= 1.
+        assert!(kt >= 16 && kt % 16 == 0);
+        // Smaller heads get a larger tile, and the invariant holds at each.
+        for hd in [16usize, 32, 64, 128, 192, 256] {
+            let (kt, floats) = encoder_qtiled_tile(hd).unwrap();
+            assert!(kt >= 16 && kt % 16 == 0, "head_dim {hd}: k_tile {kt}");
+            assert!(floats * 4 <= 64 * 1024, "head_dim {hd}: {floats} floats");
+        }
+        assert!(encoder_qtiled_tile(64).unwrap().0 >= encoder_qtiled_tile(256).unwrap().0);
+        // Out-of-contract shapes refuse rather than sizing a wrong carve-up.
+        for bad in [0usize, 8, 272, 512] {
+            assert!(encoder_qtiled_tile(bad).is_err(), "head_dim {bad} must refuse");
+        }
+    }
+
     use super::{
         flux_attn_dtype_error, flux_attn_dtype_suffix, flux_attn_route_dtypes,
         flux_attn_route_name, pack_attention_q8_0_fa2_gqa_gfx11_kernarg,
