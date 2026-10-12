@@ -312,12 +312,18 @@ def main():
             if slot_out[i] is None:
                 continue
             ids = [markers[kind]] + tok.encode(text).ids
-            if len(ids) != slot_out[i].get("n_input_tokens"):
-                print(
-                    f"  [{i}] skipped: oracle tokenizes to {len(ids)} vs the daemon's "
-                    f"{slot_out[i].get('n_input_tokens')} (truncation or marker split)"
-                )
+            n_in = slot_out[i].get("n_input_tokens")
+            if n_in is None or n_in > len(ids):
+                # Missing or larger than the prompt's tokenization is a
+                # protocol/encode break, not a truncation.
+                print(f"  [{i}] DIFF: daemon n_input_tokens={n_in} vs oracle {len(ids)}")
+                ok = False
+                oracle_pass = False
                 continue
+            if n_in < len(ids):
+                # The daemon truncated at the kind limit; compare the kept
+                # prefix, which is exactly what the oracle must reproduce.
+                ids = ids[:n_in]
             e = oracle_encode(np.array(ids))
             e = e / np.linalg.norm(e, axis=1, keepdims=True)
             mask = kept(kind, ids)
