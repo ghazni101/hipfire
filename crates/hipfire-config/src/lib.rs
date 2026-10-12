@@ -822,7 +822,11 @@ pub static FIELDS: &[ConfigField] = &[
         false,
         false,
         "HIPFIRE_SERVE_MULTI_SLOT",
-        "Serve requests concurrently on the multi-slot engine instead of one at a time."
+        "Serve requests concurrently on the multi-slot engine instead of one at a time. \
+         Concurrency is per arch: the qwen3.5 generation engine needs memory.kv_cache=q8 \
+         (it refuses every other value, including the default auto), while the arch-17 \
+         embedding encoder has no KV cache at all and merges concurrent encodes into one \
+         batched forward."
     ),
     field!(
         "serve.multi_slot_slots",
@@ -3760,8 +3764,7 @@ impl ConfigLayer {
     }
 
     pub fn remove(&mut self, key: &str) -> Result<Option<ConfigValue>> {
-        let key =
-            canonical_config_key(key).ok_or_else(|| unknown_key(key))?;
+        let key = canonical_config_key(key).ok_or_else(|| unknown_key(key))?;
         Ok(self.values.remove(&key))
     }
 
@@ -6047,7 +6050,13 @@ mod tests {
             let err = ConfigLayer::default()
                 .set_cli("kernel.mw16", "true")
                 .unwrap_err();
-            assert!(matches!(err, ConfigError::RetiredKey { key: "kernel.mw16", .. }));
+            assert!(matches!(
+                err,
+                ConfigError::RetiredKey {
+                    key: "kernel.mw16",
+                    ..
+                }
+            ));
             assert!(err.to_string().contains("removed in 0.4.1"), "{err}");
             assert!(matches!(
                 ConfigLayer::default().set_cli("mw16", "true"),

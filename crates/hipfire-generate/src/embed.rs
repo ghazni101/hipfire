@@ -36,7 +36,11 @@ use hipfire_loader::LoadedModel;
 use std::io::Write;
 
 fn parse_kind(req: &serde_json::Value) -> Result<InputKind, String> {
-    match req.get("kind").and_then(|v| v.as_str()).unwrap_or("document") {
+    match req
+        .get("kind")
+        .and_then(|v| v.as_str())
+        .unwrap_or("document")
+    {
         "query" => Ok(InputKind::Query),
         "document" | "doc" => Ok(InputKind::Document),
         other => Err(format!(
@@ -143,8 +147,13 @@ pub fn generate_embed(
         pos3: &assembled.pos3,
     };
     let t_encode = std::time::Instant::now();
-    let raw = match encode_embeddings(gpu, &bundle.weights, &mut bundle.state, &bundle.config, &input)
-    {
+    let raw = match encode_embeddings(
+        gpu,
+        &bundle.weights,
+        &mut bundle.state,
+        &bundle.config,
+        &input,
+    ) {
         Ok(v) => v,
         Err(e) => return fail(stdout, id, e),
     };
@@ -154,7 +163,10 @@ pub fn generate_embed(
         return fail(
             stdout,
             id,
-            format!("embed: encoder returned {} floats for {n_input}×{dim}", raw.len()),
+            format!(
+                "embed: encoder returned {} floats for {n_input}×{dim}",
+                raw.len()
+            ),
         );
     }
 
@@ -183,6 +195,9 @@ pub fn generate_embed(
     let payload = serde_json::json!({
         "type": "embedded",
         "id": id,
+        // See `generate_embed_slot`: the reply is correlated by `(id, 0)`, the
+        // key a synchronous verb's caller registers.
+        "attempt_id": 0,
         "kind": if kind == InputKind::Query { "query" } else { "document" },
         "n_tokens": n_tokens,
         "n_input_tokens": n_input,
@@ -207,6 +222,89 @@ pub fn generate_embed(
 /// Late-interaction score between two already-encoded inputs (the CLI's
 /// `--score` path; the values are the `embeddings` arrays of an `embedded`
 /// event each).
-pub fn score_maxsim(query: &[f32], q_tokens: usize, doc: &[f32], d_tokens: usize, dim: usize) -> f32 {
+pub fn score_maxsim(
+    query: &[f32],
+    q_tokens: usize,
+    doc: &[f32],
+    d_tokens: usize,
+    dim: usize,
+) -> f32 {
     maxsim(query, q_tokens, doc, d_tokens, dim)
+}
+
+/// Serve one `embed` request through a multi-slot engine instead of the
+/// ordinary resident model (slot mode owns the encoder and leaves the daemon's
+/// `model` slot empty, so the sequential body cannot run).
+///
+/// Same wire body in, same `embedded` envelope out: the request is parsed
+/// here, the engine tokenizes and encodes on its own thread, and the reply
+/// carries the fields the sequential route writes. A per-request failure — a
+/// bad kind, an undecodable image, an input the encoder refuses — becomes the
+/// same `error` envelope [`generate_embed`] emits.
+pub fn generate_embed_slot(
+    engine: &dyn hipfire_runtime::serve::SlotEngineHandle,
+    stdout: &mut impl Write,
+    id: &str,
+    req: &serde_json::Value,
+) {
+    use hipfire_runtime::serve::{EmbedKind, EmbedRequest};
+
+    fn fail(stdout: &mut impl Write, id: &str, msg: String) {
+        emit_uncorrelated_error(stdout, Some(id), &msg, "validation", false, false);
+        let _ = stdout.flush();
+    }
+
+    let kind = match parse_kind(req) {
+        Ok(k) => k,
+        Err(e) => return fail(stdout, id, e),
+    };
+    let (text, image) = match parse_input(req) {
+        Ok(x) => x,
+        Err(e) => return fail(stdout, id, e),
+    };
+    let wire_kind = match kind {
+        InputKind::Query => EmbedKind::Query,
+        InputKind::Document => EmbedKind::Document,
+    };
+    let mut out = match engine.encode(vec![EmbedRequest {
+        kind: wire_kind,
+        text,
+        image,
+        request_tag: id.to_string(),
+    }]) {
+        Ok(out) => out,
+        Err(e) => return fail(stdout, id, e),
+    };
+    let response = match out.pop() {
+        Some(Ok(r)) => r,
+        Some(Err(e)) => return fail(stdout, id, e),
+        None => {
+            return fail(
+                stdout,
+                id,
+                "embed: engine returned no response for the request".into(),
+            )
+        }
+    };
+    let payload = serde_json::json!({
+        "type": "embedded",
+        "id": id,
+        // Correlates the reply with the transaction that sent the request:
+        // the client registers `(id, 0)` for a synchronous verb, and an
+        // attempt-less reply would be routed to the shared control slot
+        // instead — which holds one transaction, so concurrent embeds would
+        // drop each other's replies.
+        "attempt_id": 0,
+        "kind": if response.kind == EmbedKind::Query {
+            "query"
+        } else {
+            "document"
+        },
+        "n_tokens": response.n_tokens,
+        "n_input_tokens": response.n_input_tokens,
+        "dim": response.dim,
+        "embeddings": response.embeddings,
+    });
+    let _ = writeln!(stdout, "{payload}");
+    let _ = stdout.flush();
 }

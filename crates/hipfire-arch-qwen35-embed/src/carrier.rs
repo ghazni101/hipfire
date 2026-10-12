@@ -81,6 +81,17 @@ pub fn load_qwen35_embed_bundle(
     src: ModelSource,
     ctx: &mut LoadCtx<'_>,
 ) -> Result<EmbedBundle, String> {
+    load_qwen35_embed_from_source(ctx.gpu, src)
+}
+
+/// The loader body without [`LoadCtx`]. This arch reads nothing else off the
+/// context — no KV mode, no sequence hint, no sidecar paths (the tower is
+/// either in the trunk or nowhere) — so the slot engine, which owns its own
+/// GPU and has no load context to hand over, calls this directly.
+pub fn load_qwen35_embed_from_source(
+    gpu: &mut rdna_compute::Gpu,
+    src: ModelSource,
+) -> Result<EmbedBundle, String> {
     let st: &dyn ModelSourceTrait = match &src {
         ModelSource::Hfq(h) => h,
         ModelSource::Dir(d) => d,
@@ -123,8 +134,8 @@ pub fn load_qwen35_embed_bundle(
 
     let skiplist_ids = skiplist_token_ids(&BundleVocab(&tokenizer), &config.skiplist_words);
 
-    let weights = load_weights(ctx.gpu, &src, &config)?;
-    let state = GdnEncodeState::new(ctx.gpu, &config)?;
+    let weights = load_weights(gpu, &src, &config)?;
+    let state = GdnEncodeState::new(gpu, &config)?;
 
     eprintln!(
         "  qwen35-embed: {} layers ({} GDN / {} full-attn, bidirectional), dense {}→{}, \
@@ -152,7 +163,7 @@ pub fn load_qwen35_embed_bundle(
     );
 
     if std::env::var("HIPFIRE_EMBED_DEBUG").ok().as_deref() == Some("1") {
-        let (f, t) = ctx.gpu.hip.get_vram_info().unwrap_or((0, 0));
+        let (f, t) = gpu.hip.get_vram_info().unwrap_or((0, 0));
         eprintln!(
             "  [embed-debug] after load: VRAM {} MB free / {} MB",
             f / (1024 * 1024),
@@ -269,4 +280,65 @@ pub fn build_positions(n_tokens: usize, spans: &[crate::weights::ImageSpan]) -> 
         .collect();
     let merge = 2;
     hipfire_arch_qwen35_vl::mrope::build_mrope_positions(n_tokens, &sp, merge).positions
+}
+
+/// Slot-mode admission preflight for an arch-17 checkpoint: geometry, arch and
+/// tokenizer, read without touching the GPU (a tokenizer parse is the whole
+/// cost). The daemon's slot path calls this through
+/// `hipfire_loader::slot_preflight` before it tears down the resident model.
+///
+/// `Ok(None)` = this path is not an arch-17 source, so the caller falls
+/// through to the qwen35 HFQ preflight (which owns the refusal for everything
+/// else). An unreadable path is *not* reported here either — the ordinary
+/// loader owns those messages, and a preflight that guesses would replace
+/// them.
+pub fn preflight_slot(
+    model_path: &std::path::Path,
+) -> Result<Option<hipfire_runtime::serve::SlotModelPreflight>, String> {
+    use hipfire_runtime::serve::SlotModelPreflight;
+
+    let Some(path) = model_path.to_str() else {
+        return Ok(None);
+    };
+    let src = match ModelSource::from_path(path) {
+        Ok(s) => s,
+        // A path neither source kind can open is the ordinary path's error to
+        // report, not ours.
+        Err(_) => return Ok(None),
+    };
+    let st: &dyn ModelSourceTrait = match &src {
+        ModelSource::Hfq(h) => h,
+        ModelSource::Dir(d) => d,
+    };
+    if st.arch_id() != crate::ARCH_ID {
+        return Ok(None);
+    }
+    let meta: serde_json::Value = serde_json::from_str(st.metadata_json())
+        .map_err(|e| format!("qwen35-embed: config JSON: {e}"))?;
+    let mut config = parse_config(crate::config::config_from_metadata(&meta))?;
+    if src.is_dir() {
+        overlay_sidecars(&mut config, st.path());
+    }
+    let tokenizer = match st.tokenizer_json_path() {
+        Some(p) => hipfire_runtime::tokenizer::Tokenizer::from_tokenizer_json(&p)
+            .map_err(|e| format!("qwen35-embed: tokenizer: {e}"))?
+            .ok_or("qwen35-embed: tokenizer.json present but unparseable")?,
+        None => hipfire_runtime::tokenizer::Tokenizer::from_hfq_metadata(st.metadata_json())
+            .map_err(|e| format!("qwen35-embed: tokenizer from metadata: {e}"))?,
+    };
+    // The tower is in the trunk when the checkpoint declares a vision config
+    // and the patch-embed tensor resolves — the same two conditions
+    // `load_weights` uses to decide whether to build it.
+    let is_vl = config.vision.is_some()
+        && crate::names::read(&src, "patch_embed.proj.weight", true).is_ok();
+    Ok(Some(SlotModelPreflight {
+        arch_id: crate::ARCH_ID,
+        arch_str: "qwen3_5_embed".to_string(),
+        dim: config.hidden_size,
+        layers: config.num_layers,
+        vocab: config.vocab_size,
+        tokenizer,
+        is_vl,
+        vl_path: None,
+    }))
 }

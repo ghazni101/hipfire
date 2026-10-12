@@ -486,6 +486,15 @@ impl Engine {
                         | "aborted"
                         | "done"
                         | "error"
+                        // One-shot synchronous verbs (`embed`) reply with `id`
+                        // and `attempt_id: 0` — the key their caller registers
+                        // — so their result belongs to that transaction, not to
+                        // the single control slot below. Classifying it here is
+                        // what lets several embeds be in flight at once: the
+                        // control slot holds exactly one transaction, so an
+                        // unclassified reply goes to whichever request
+                        // registered last and every other one waits forever.
+                        | "embedded"
                 );
                 if is_lifecycle {
                     match route_lifecycle_event(ty, &value) {
@@ -2182,6 +2191,35 @@ mod tests {
         assert_eq!(
             route_lifecycle_event("error", &missing_attempt),
             LifecycleRoute::Control
+        );
+    }
+
+    #[test]
+    fn route_lifecycle_embed_reply_is_keyed_at_attempt_zero() {
+        // `embed` is a synchronous, attempt-less verb: its caller registers
+        // `(id, 0)`. An unclassified reply falls through to the single control
+        // slot, which holds ONE transaction — so two concurrent embeds would
+        // both deliver into whichever registered last and every other waiter
+        // would block forever. The classification is what makes the multi-slot
+        // embedding route able to have several requests in flight.
+        let reply = serde_json::json!({
+            "type": "embedded",
+            "id": "embed-7",
+            "attempt_id": 0,
+            "kind": "document",
+            "n_tokens": 3,
+            "dim": 128,
+            "embeddings": [0.0],
+        });
+        assert_eq!(
+            route_lifecycle_event("embedded", &reply),
+            LifecycleRoute::Pending(("embed-7".into(), 0))
+        );
+        // A reply that lost its id is quarantined, never fanned into peers.
+        let unkeyed = serde_json::json!({"type": "embedded", "attempt_id": 0});
+        assert_eq!(
+            route_lifecycle_event("embedded", &unkeyed),
+            LifecycleRoute::Drop
         );
     }
 

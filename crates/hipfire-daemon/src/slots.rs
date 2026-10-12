@@ -74,7 +74,6 @@ fn emit_qwen_ar_slot_error<W: std::io::Write>(
     );
 }
 
-
 /// The per-arch multi-slot engine behind the four-method surface
 /// `handle_generate` drives (`submit` / `close` / `reset` / `shutdown`).
 ///
@@ -106,16 +105,13 @@ type AnySlotEngine = Box<dyn hipfire_runtime::serve::SlotEngineHandle>;
 /// family-neutral `SlotEngineConfig` carries every serve.* knob; the carrier
 /// maps it onto its own engine config. `Err` names the arch when no carrier
 /// provides a slot engine.
-fn spawn_slot_engine(
-    arch_id: u32,
-    cfg: SlotEngineConfig,
-) -> Result<AnySlotEngine, String> {
+fn spawn_slot_engine(arch_id: u32, cfg: SlotEngineConfig) -> Result<AnySlotEngine, String> {
     let carrier = hipfire_loader::carrier_for(arch_id).ok_or_else(|| {
         format!("no carrier claims arch_id {arch_id} — slot mode cannot dispatch")
     })?;
-    carrier.spawn_slot_engine(cfg).map_err(|e| {
-        format!("no multi-slot engine for arch_id {arch_id}: {e}")
-    })
+    carrier
+        .spawn_slot_engine(cfg)
+        .map_err(|e| format!("no multi-slot engine for arch_id {arch_id}: {e}"))
 }
 
 /// Slot-engine load parameters parsed from a `load` message. The daemon's
@@ -633,6 +629,51 @@ impl SlotBackend {
             return Err("unload refused: slot requests active".to_string());
         }
         self.engine.shutdown()
+    }
+
+    /// Embedding handler for experimental slot mode: parse the `embed` wire
+    /// body, hold an activity guard for the duration (so an unload or model
+    /// swap cannot tear the engine down mid-encode), run it on the engine, and
+    /// write the same `embedded` envelope the sequential route writes — the
+    /// CLI, the HTTP layer and the container client need no change to reach
+    /// the slot path.
+    ///
+    /// One wire request is one encode request. Concurrency comes from the
+    /// daemon spawning a worker per request (as the generate route does) and
+    /// from the engine merging the requests that arrive together into one
+    /// batched forward.
+    pub fn handle_embed<W: std::io::Write>(
+        &self,
+        msg: &serde_json::Value,
+        stdout: &mut W,
+        id: &str,
+    ) {
+        // Bound thread creation before spawning, same shape and reason as the
+        // generate route: a burst must not spawn a thread per rejected
+        // request, and the worker's own guard remains the hard bound.
+        if self.active_count() >= 32 {
+            hipfire_engine::emit::emit_active_attempt_error(
+                stdout,
+                Some(id),
+                "too many concurrent slot requests (bounded worker limit hit)",
+                "overload",
+                true,
+                false,
+            );
+            return;
+        }
+        let Some(_guard) = self.acquire_guard() else {
+            hipfire_engine::emit::emit_active_attempt_error(
+                stdout,
+                Some(id),
+                "too many concurrent slot requests (bounded worker limit hit)",
+                "overload",
+                true,
+                false,
+            );
+            return;
+        };
+        hipfire_generate::embed::generate_embed_slot(&*self.engine, stdout, id, msg);
     }
 
     /// Generate handler for experimental slot mode.
@@ -1729,6 +1770,32 @@ fn cpu_preflight(
     vision_mode: &str,
     vision: Option<&str>,
 ) -> Result<Preflight, String> {
+    // A carrier that owns the shape of its own slot checkpoint answers first.
+    // arch 17's encoder is why this exists: its checkpoint may be a
+    // safetensors directory (`HfqFile::open` cannot read one) and its geometry
+    // lives in HF config metadata, not the qwen35 HFQ layout. `None` = no
+    // carrier claims the path, so the HFQ preflight below owns both the
+    // reading and the refusals.
+    if let Some(over) = hipfire_loader::slot_preflight(std::path::Path::new(model_path)) {
+        let p = over?;
+        return Ok(Preflight {
+            arch_id: p.arch_id,
+            arch_str: p.arch_str,
+            dim: p.dim,
+            layers: p.layers,
+            vocab: p.vocab,
+            tokenizer: p.tokenizer,
+            // Generate-only fields, and this route has no generate verb: no
+            // chat template, no sampling recommendation, no VL splice. The
+            // tower is loaded and driven by the arch crate itself.
+            chat_template: None,
+            is_vl: p.is_vl,
+            vision_config: None,
+            vl_path: p.vl_path,
+            rec_temperature: None,
+            rec_top_p: None,
+        });
+    }
     let hfq =
         HfqFile::open(std::path::Path::new(model_path)).map_err(|e| format!("open model: {e}"))?;
     validate_arch_id(hfq.arch_id)?;
@@ -1821,12 +1888,17 @@ fn cpu_preflight(
 
 // ── Validation helpers (pure) ────────────────────────────────────────────────
 
+/// Refuse an arch the daemon's own (qwen35-HFQ-shaped) slot preflight cannot
+/// describe. Only reached for a path no carrier claimed through
+/// `Carrier::preflight_slot_model` — arch 17's encoder answers there, so its
+/// `validate_arch_id` refusal never fires.
 pub fn validate_arch_id(arch_id: u32) -> Result<(), String> {
     if matches!(arch_id, 5 | 6) {
         Ok(())
     } else {
         Err(format!(
-            "experimental multi-slot only supports arch_id 5|6 (qwen3_5), got {arch_id}"
+            "experimental multi-slot supports arch_id 5|6 (qwen3_5) plus any arch whose \
+             carrier provides a slot engine, got {arch_id}"
         ))
     }
 }
@@ -1938,9 +2010,13 @@ pub fn validate_load_caps(msg: &serde_json::Value, gpu_arch: &str) -> Option<Str
     }
     // The multi-slot DFlash2 path runs the default proposal width only
     // (`auto` resolves to it: this route never stages VMM batching).
-    match hipfire_runtime::dflash::DflashBlockPolicy::from_param(params.and_then(|p| p.get("dflash_block"))) {
+    match hipfire_runtime::dflash::DflashBlockPolicy::from_param(
+        params.and_then(|p| p.get("dflash_block")),
+    ) {
         Err(e) => return Some(e),
-        Ok(policy) if policy.resolve(false, 1) != hipfire_runtime::dflash::DFLASH_BLOCK_UNBATCHED => {
+        Ok(policy)
+            if policy.resolve(false, 1) != hipfire_runtime::dflash::DFLASH_BLOCK_UNBATCHED =>
+        {
             return Some(format!(
                 "speculation.dflash_block other than {} not supported in experimental multi-slot",
                 hipfire_runtime::dflash::DFLASH_BLOCK_UNBATCHED
@@ -2181,8 +2257,7 @@ pub fn validate_generate_caps(msg: &serde_json::Value) -> Option<String> {
                     );
                 }
             };
-            if let Err(e) =
-                saddle_core::grammar::json::json_schema::CompiledSchema::compile(schema)
+            if let Err(e) = saddle_core::grammar::json::json_schema::CompiledSchema::compile(schema)
             {
                 return Some(format!("response_format json_schema: {e}"));
             }
@@ -3009,7 +3084,10 @@ mod tests {
         // reject (that failure belongs to the render, as validation).
         assert_eq!(slot_jinja_effort(None, Some("high"), None), Some("high"));
         assert_eq!(slot_jinja_effort(None, Some("xhigh"), None), Some("xhigh"));
-        assert_eq!(slot_jinja_effort(Some(true), Some("low"), None), Some("low"));
+        assert_eq!(
+            slot_jinja_effort(Some(true), Some("low"), None),
+            Some("low")
+        );
         // `auto` and absent mean "no preference": leave it undefined so the
         // template's own default applies.
         assert_eq!(slot_jinja_effort(None, Some("auto"), None), None);
@@ -3022,7 +3100,10 @@ mod tests {
         assert_eq!(slot_jinja_effort(None, Some("chat"), None), None);
         assert_eq!(slot_jinja_effort(Some(true), Some("high"), Some(1)), None);
         // A finite budget is not a disable: the rung survives it.
-        assert_eq!(slot_jinja_effort(Some(true), Some("high"), Some(64)), Some("high"));
+        assert_eq!(
+            slot_jinja_effort(Some(true), Some("high"), Some(64)),
+            Some("high")
+        );
     }
 
     #[test]
@@ -3154,11 +3235,24 @@ mod tests {
 
     #[test]
     fn load_caps_admit_only_the_default_dflash_block() {
-        for ok in [json!({"params": {}}), json!({"params": {"dflash_block": 16}}), json!({"params": {"dflash_block": "auto"}})] {
-            assert!(validate_load_caps(&ok, "gfx1100").is_none(), "{ok} must be admitted");
+        for ok in [
+            json!({"params": {}}),
+            json!({"params": {"dflash_block": 16}}),
+            json!({"params": {"dflash_block": "auto"}}),
+        ] {
+            assert!(
+                validate_load_caps(&ok, "gfx1100").is_none(),
+                "{ok} must be admitted"
+            );
         }
-        for bad in [json!({"params": {"dflash_block": 8}}), json!({"params": {"dflash_block": 99}})] {
-            assert!(validate_load_caps(&bad, "gfx1100").is_some(), "{bad} must be refused");
+        for bad in [
+            json!({"params": {"dflash_block": 8}}),
+            json!({"params": {"dflash_block": 99}}),
+        ] {
+            assert!(
+                validate_load_caps(&bad, "gfx1100").is_some(),
+                "{bad} must be refused"
+            );
         }
     }
 

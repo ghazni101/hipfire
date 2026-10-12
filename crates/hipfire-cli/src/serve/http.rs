@@ -1331,11 +1331,30 @@ async fn handle_embeddings(
         .and_then(|v| v.as_str())
         .map(str::to_owned);
 
-    let _guard = match shared
-        .admission
-        .acquire_async(CancellationToken::new())
-        .await
-    {
+    // Admission class. On the standard route a non-streaming request takes the
+    // exclusive class — exactly one in flight, nothing sharing the GPU with it.
+    // A multi-slot backend exists to run several requests at once, and an
+    // embedding request is exactly the kind of work that shares the engine:
+    // taking the exclusive class there would serialize the batches the engine
+    // forms, one round trip per request, and leave every one of them a batch of
+    // one. So on a multi-slot serve the sharing class is the honest one.
+    let multi_slot = shared
+        .capabilities
+        .get("multi_slot")
+        .and_then(|v| v.as_bool())
+        == Some(true);
+    let admitted = if multi_slot {
+        shared
+            .admission
+            .acquire_for_async(true, None, CancellationToken::new())
+            .await
+    } else {
+        shared
+            .admission
+            .acquire_async(CancellationToken::new())
+            .await
+    };
+    let _guard = match admitted {
         Ok(guard) => guard,
         Err(error) => {
             return Ok(admission_error_response(
@@ -1354,10 +1373,7 @@ async fn handle_embeddings(
     // with "no model loaded" while chat (which always names a model) kept
     // working.
     let (engine, loaded_model) = {
-        let mut runtime = shared
-            .runtime
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
         if runtime.current_path.is_none() {
             let name = request_model
                 .clone()
