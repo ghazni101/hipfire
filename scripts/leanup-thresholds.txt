@@ -147,4 +147,13 @@ bypass_slack                == 0
 # RATCHET-RAISE 300 -> 307: the +7 row-exact gfx1151 batched native-MTP prompt
 # fill calls (a5b0cc14f) recorded on the hipfire-arch-qwen4 ledger row; follow-up:
 # migrate row-exact kernels into a dispatch-registry row family (0.4.2).
-bypass_total                <= 307
+# RATCHET-RAISE 307 -> 363: NOT new debt — a measurement correction. The
+# dispatch-bypass regex required `gpu.` immediately before the method name, so
+# it could only see calls short enough for rustfmt to keep on one line and was
+# blind to a wrapped `gpu\n    .gemm_*` chain (which is what every match arm
+# returning one compiles to). Measured 2026-10-12: 56 call sites across seven
+# crates were uncounted, and hipfire-arch-qwen35-embed (arch 17) had no row at
+# all. The regex is now whitespace-tolerant, every row is re-measured, and the
+# ledger header records the per-crate correction. The holster objective's
+# descent starts from 363, not 307.
+bypass_total                <= 363

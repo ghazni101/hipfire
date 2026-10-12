@@ -44,7 +44,16 @@ TABLE = "docs/governance/debt-dispatch-bypass.txt"
 
 # Direct kernel entry points on the Gpu handle -- the thing the registry exists
 # to replace. `gpu.` prefixed so a method definition in rdna-compute is not a hit.
-BYPASS = re.compile(r"\bgpu\.(?:gemv|gemm|fused)_[a-z0-9_]+")
+#
+# Whitespace-tolerant between `gpu` and the method name, and that is load
+# bearing: rustfmt breaks a long method chain onto its own line, so the
+# adjacent form `gpu.gemv_...` only matches the calls short enough for the
+# formatter to keep on one line. Measured 2026-10-12: the adjacent form
+# undercounted the tree by 56 calls (307 vs 363), every one a genuine
+# `gpu\n    .gemm_*` inside a match arm, across seven crates. `\s*` cannot skip
+# intervening non-whitespace, so `gpu.alloc_tensor(..)` followed later by
+# `.gemm_x()` still does not match.
+BYPASS = re.compile(r"\bgpu\s*\.\s*(?:gemv|gemm|fused)_[a-z0-9_]+", re.S)
 REGISTRY = re.compile(r"KernelKey|KernelRegistry")
 
 
