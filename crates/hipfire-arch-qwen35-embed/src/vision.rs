@@ -95,6 +95,13 @@ fn to_f32(t: &TensorBytes<'_>, name: &str) -> Result<Vec<f32>, String> {
 /// make for the text arches (`docs/plans/partial-gpu-offload-design.md`), scoped
 /// to the one component this arch can offload whole.
 ///
+/// Evaluated ONCE per load, by [`load_vision_weights`] before any tower tensor
+/// uploads: deciding per upload would flip mid-tower as the earlier resident
+/// tensors consume the very headroom being measured, and land the tower half
+/// resident, half host-mapped. Correct either way (both placements are plain
+/// readable memory to the kernels) but a placement nobody chose and nobody can
+/// reproduce from the config.
+///
 /// `HIPFIRE_EMBED_VISION_OFFLOAD=1` opts in. Default off: a fully-resident
 /// tower is faster and is the right default when the card has room.
 fn vision_offload(gpu: &Gpu, cfg: &EmbedConfig) -> bool {
@@ -138,14 +145,15 @@ fn tower_resident_bytes(cfg: &EmbedConfig) -> usize {
     weights * 2 + vectors
 }
 
-/// Upload f16 weight words either device-resident or host-mapped.
+/// Upload f16 weight words either device-resident or host-mapped (`offload`
+/// is the load-time placement decision — see [`vision_offload`]).
 fn put_f16(
     gpu: &mut Gpu,
-    cfg: &EmbedConfig,
+    offload: bool,
     words: &[u16],
     shape: &[usize],
 ) -> Result<rdna_compute::GpuTensor, String> {
-    if vision_offload(gpu, cfg) {
+    if offload {
         let bytes: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
         gpu.upload_raw_host_mapped(&bytes, shape)
             .map_err(|e| format!("qwen35-embed: host-mapped f16 upload: {e:?}"))
@@ -158,11 +166,11 @@ fn put_f16(
 /// Upload an f32 vector either device-resident or host-mapped.
 fn put_f32(
     gpu: &mut Gpu,
-    cfg: &EmbedConfig,
+    offload: bool,
     v: &[f32],
     shape: &[usize],
 ) -> Result<rdna_compute::GpuTensor, String> {
-    if vision_offload(gpu, cfg) {
+    if offload {
         gpu.upload_f32_host(v, shape)
             .map_err(|e| format!("qwen35-embed: host-mapped f32 upload: {e:?}"))
     } else {
@@ -174,7 +182,7 @@ fn put_f32(
 fn up_lin(
     gpu: &mut Gpu,
     src: &ModelSource,
-    cfg: &EmbedConfig,
+    offload: bool,
     name: &str,
 ) -> Result<rdna_compute::GpuTensor, String> {
     let t = names::read(src, name, true)?;
@@ -194,14 +202,14 @@ fn up_lin(
     };
     debug_assert_eq!(words.len(), n);
     names::release(src, name, true);
-    put_f16(gpu, cfg, &words, &[rows, cols])
+    put_f16(gpu, offload, &words, &[rows, cols])
         .map_err(|e| format!("qwen35-embed: upload vision `{name}`: {e:?}"))
 }
 
 fn up_vec(
     gpu: &mut Gpu,
     src: &ModelSource,
-    cfg: &EmbedConfig,
+    offload: bool,
     name: &str,
     n: usize,
 ) -> Result<rdna_compute::GpuTensor, String> {
@@ -215,7 +223,8 @@ fn up_vec(
     }
     drop(t);
     names::release(src, name, true);
-    put_f32(gpu, cfg, &v, &[n]).map_err(|e| format!("qwen35-embed: upload vision `{name}`: {e:?}"))
+    put_f32(gpu, offload, &v, &[n])
+        .map_err(|e| format!("qwen35-embed: upload vision `{name}`: {e:?}"))
 }
 
 fn host_vec(src: &ModelSource, name: &str, n: usize) -> Result<Vec<f32>, String> {
@@ -243,6 +252,10 @@ pub fn load_vision_weights(
         .vision
         .as_ref()
         .ok_or("qwen35-embed: vision weights present but no vision_config")?;
+    // One placement decision for the whole tower, taken with the trunk
+    // already resident and none of the tower up yet — the only moment the
+    // free-VRAM reading answers the question being asked.
+    let offload = vision_offload(gpu, cfg);
     let side = (vis.num_position_embeddings as f64).sqrt().round() as usize;
     if side == 0 || side * side != vis.num_position_embeddings {
         return Err(format!(
@@ -255,38 +268,44 @@ pub fn load_vision_weights(
     for i in 0..vis.num_layers {
         let p = format!("blocks.{i}");
         layers.push(VisionLayerWeights {
-            norm1_w: up_vec(gpu, src, cfg, &format!("{p}.norm1.weight"), h)?,
-            norm1_b: up_vec(gpu, src, cfg, &format!("{p}.norm1.bias"), h)?,
-            qkv_w: up_lin(gpu, src, cfg, &format!("{p}.attn.qkv.weight"))?,
-            qkv_b: up_vec(gpu, src, cfg, &format!("{p}.attn.qkv.bias"), 3 * h)?,
-            proj_w: up_lin(gpu, src, cfg, &format!("{p}.attn.proj.weight"))?,
-            proj_b: up_vec(gpu, src, cfg, &format!("{p}.attn.proj.bias"), h)?,
-            norm2_w: up_vec(gpu, src, cfg, &format!("{p}.norm2.weight"), h)?,
-            norm2_b: up_vec(gpu, src, cfg, &format!("{p}.norm2.bias"), h)?,
-            fc1_w: up_lin(gpu, src, cfg, &format!("{p}.mlp.linear_fc1.weight"))?,
+            norm1_w: up_vec(gpu, src, offload, &format!("{p}.norm1.weight"), h)?,
+            norm1_b: up_vec(gpu, src, offload, &format!("{p}.norm1.bias"), h)?,
+            qkv_w: up_lin(gpu, src, offload, &format!("{p}.attn.qkv.weight"))?,
+            qkv_b: up_vec(gpu, src, offload, &format!("{p}.attn.qkv.bias"), 3 * h)?,
+            proj_w: up_lin(gpu, src, offload, &format!("{p}.attn.proj.weight"))?,
+            proj_b: up_vec(gpu, src, offload, &format!("{p}.attn.proj.bias"), h)?,
+            norm2_w: up_vec(gpu, src, offload, &format!("{p}.norm2.weight"), h)?,
+            norm2_b: up_vec(gpu, src, offload, &format!("{p}.norm2.bias"), h)?,
+            fc1_w: up_lin(gpu, src, offload, &format!("{p}.mlp.linear_fc1.weight"))?,
             fc1_b: up_vec(
                 gpu,
                 src,
-                cfg,
+                offload,
                 &format!("{p}.mlp.linear_fc1.bias"),
                 vis.mlp_dim,
             )?,
-            fc2_w: up_lin(gpu, src, cfg, &format!("{p}.mlp.linear_fc2.weight"))?,
-            fc2_b: up_vec(gpu, src, cfg, &format!("{p}.mlp.linear_fc2.bias"), h)?,
+            fc2_w: up_lin(gpu, src, offload, &format!("{p}.mlp.linear_fc2.weight"))?,
+            fc2_b: up_vec(gpu, src, offload, &format!("{p}.mlp.linear_fc2.bias"), h)?,
         });
     }
     let merge_dim = h * vis.spatial_merge_size * vis.spatial_merge_size;
     Ok(VisionWeights {
-        patch_embed_w: up_lin(gpu, src, cfg, "patch_embed.proj.weight")?,
-        patch_embed_b: up_vec(gpu, src, cfg, "patch_embed.proj.bias", h)?,
+        patch_embed_w: up_lin(gpu, src, offload, "patch_embed.proj.weight")?,
+        patch_embed_b: up_vec(gpu, src, offload, "patch_embed.proj.bias", h)?,
         pos_embed: host_vec(src, "pos_embed.weight", vis.num_position_embeddings * h)?,
         layers,
-        merger_norm_w: up_vec(gpu, src, cfg, "merger.norm.weight", h)?,
-        merger_norm_b: up_vec(gpu, src, cfg, "merger.norm.bias", h)?,
-        merger_fc1_w: up_lin(gpu, src, cfg, "merger.linear_fc1.weight")?,
-        merger_fc1_b: up_vec(gpu, src, cfg, "merger.linear_fc1.bias", merge_dim)?,
-        merger_fc2_w: up_lin(gpu, src, cfg, "merger.linear_fc2.weight")?,
-        merger_fc2_b: up_vec(gpu, src, cfg, "merger.linear_fc2.bias", vis.out_hidden_size)?,
+        merger_norm_w: up_vec(gpu, src, offload, "merger.norm.weight", h)?,
+        merger_norm_b: up_vec(gpu, src, offload, "merger.norm.bias", h)?,
+        merger_fc1_w: up_lin(gpu, src, offload, "merger.linear_fc1.weight")?,
+        merger_fc1_b: up_vec(gpu, src, offload, "merger.linear_fc1.bias", merge_dim)?,
+        merger_fc2_w: up_lin(gpu, src, offload, "merger.linear_fc2.weight")?,
+        merger_fc2_b: up_vec(
+            gpu,
+            src,
+            offload,
+            "merger.linear_fc2.bias",
+            vis.out_hidden_size,
+        )?,
     })
 }
 

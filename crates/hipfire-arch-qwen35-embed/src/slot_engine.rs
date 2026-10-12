@@ -51,7 +51,8 @@ const BATCH_WINDOW: Duration = Duration::from_micros(2000);
 
 /// Row budget for one forward when the caller configured none. Rows are what
 /// the encoder's compute scales with, and the checkpoint's own kind limits
-/// (512 query / 2048 document) already cap a single request.
+/// (1024 query / 4096 document on the pplx release, read from
+/// `sentence_bert_config.json`) already cap a single request.
 const DEFAULT_BATCH_ROWS: usize = 4096;
 
 /// `EngineConfig` analogue for the encoder: the subset of
@@ -239,10 +240,17 @@ fn run_loop(
 ) -> Result<(), String> {
     while let Ok(first) = rx.recv() {
         let mut cmds = vec![first];
+        // `max_batch_requests` bounds REQUESTS per forward, not commands:
+        // `encode` accepts a command carrying a whole batch, so counting
+        // commands would let one such caller bypass the bound entirely.
+        let mut reqs: usize = cmds.iter().map(|c| c.reqs.len()).sum();
         let deadline = Instant::now() + cfg.batch_window;
-        while cmds.len() < cfg.max_batch_requests {
+        while reqs < cfg.max_batch_requests {
             match rx.try_recv() {
-                Ok(c) => cmds.push(c),
+                Ok(c) => {
+                    reqs += c.reqs.len();
+                    cmds.push(c);
+                }
                 Err(TryRecvError::Empty) => {
                     if cfg.batch_window.is_zero() || Instant::now() >= deadline {
                         break;
@@ -380,8 +388,7 @@ fn serve_batch(
             Err(e) => {
                 for &i in group {
                     let p = &prepared[i];
-                    results[p.cmd][p.slot] =
-                        Some(Err(format!("qwen35-embed: encode: {e}")));
+                    results[p.cmd][p.slot] = Some(Err(format!("qwen35-embed: encode: {e}")));
                 }
                 continue;
             }
