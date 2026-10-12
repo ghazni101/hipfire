@@ -3086,6 +3086,65 @@ impl Gpu {
         )
     }
 
+    /// Masked row softmax with an f16 output over `[rows, n]` scores.
+    ///
+    /// Every row attends only to columns in `[valid_start, valid_end)`; every
+    /// other column is exactly 0. An empty range writes zeros (no NaN), and
+    /// the bounds are clamped to `[0, n]`.
+    ///
+    /// Replaces `softmax_f32` + `cast_f32_to_f16` for the encoder's eager
+    /// attention: one pass instead of two over the n x n matrix, and the mask
+    /// is what lets a padded sequence be softmaxed correctly (see the kernel
+    /// header).
+    pub fn attention_rows_softmax_f16(
+        &mut self,
+        scores: &GpuTensor,
+        out_f16: &GpuTensor,
+        rows: usize,
+        n: usize,
+        valid_start: usize,
+        valid_end: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "attention_rows_softmax_f16",
+            kernels::ATTENTION_ROWS_SOFTMAX_SRC,
+            "attention_rows_softmax_f16",
+        )?;
+        let func = &self.functions["attention_rows_softmax_f16"];
+        let mut sp = scores.buf.as_ptr();
+        let mut op = out_f16.buf.as_ptr();
+        let mut vs = valid_start as i32;
+        let mut ve = valid_end as i32;
+        let mut ni = n as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut sp as *mut _ as *mut c_void,
+            &mut op as *mut _ as *mut c_void,
+            &mut vs as *mut _ as *mut c_void,
+            &mut ve as *mut _ as *mut c_void,
+            &mut ni as *mut _ as *mut c_void,
+        ];
+        let block = 256u32.min(n as u32);
+        let shared_mem = block * 4;
+        let bytes = crate::profile::elementwise1_bytes(rows * n);
+        let timer =
+            crate::profile::begin_timer(&self.hip, "attention", "attention_rows_softmax_f16", bytes);
+        let result = unsafe {
+            self.hip.launch_kernel(
+                func,
+                [rows as u32, 1, 1],
+                [block, 1, 1],
+                shared_mem,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        if let Some(t) = timer {
+            t.finish(&self.hip);
+        }
+        result
+    }
+
     /// Q-tiled **bidirectional** attention with separate Q/K/V and GQA —
     /// the arch-17 embedding encoder's full-attention layer.
     ///

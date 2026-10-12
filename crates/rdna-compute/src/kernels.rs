@@ -9057,6 +9057,13 @@ pub const VIT_ATTENTION_QTILED_SRC: &str =
 pub const ATTENTION_ENCODER_QTILED_SRC: &str =
     include_str!("../../../kernels/src/attention_encoder_qtiled.hip");
 
+/// Masked row softmax with an f16 output, for the encoder's eager attention:
+/// per-row key ranges plus a direct f16 store (replaces a separate
+/// `softmax_f32` + `cast_f32_to_f16` pass over the n x n score matrix).
+/// See `kernels/src/attention_rows_softmax.hip`.
+pub const ATTENTION_ROWS_SOFTMAX_SRC: &str =
+    include_str!("../../../kernels/src/attention_rows_softmax.hip");
+
 /// 2D rotary positional embedding for the Qwen3.5-VL vision tower. Rotates Q
 /// and K halves of the packed QKV buffer in-place using per-token cos/sin of
 /// size `head_dim/2`. See `kernels/src/apply_rope_2d_vision.hip`.

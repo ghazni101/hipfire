@@ -125,7 +125,10 @@ pub fn generate_embed(
     // long document the GPU kernel sum is a small fraction of wall-clock, and
     // this is what shows where the rest goes (gather, JSON of a wide output,
     // the download).
-    let timed = std::env::var("HIPFIRE_EMBED_DEBUG").ok().as_deref() == Some("1");
+    // Its own knob, NOT HIPFIRE_EMBED_DEBUG: that one also arms the encoder's
+    // per-layer finite `trace()`, which syncs the GPU every layer and inflates
+    // every number here (measured 678 ms vs 334 ms on the same request).
+    let timed = std::env::var("HIPFIRE_EMBED_PHASE").ok().as_deref() == Some("1");
     let t_phase = std::time::Instant::now();
     let assembled = match assemble_input(bundle, gpu, kind, &text, image_bytes) {
         Ok(a) => a,
