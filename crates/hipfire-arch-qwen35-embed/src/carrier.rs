@@ -40,6 +40,14 @@ fn overlay_sidecars(cfg: &mut EmbedConfig, dir: &std::path::Path) {
         let s = std::fs::read_to_string(p).ok()?;
         serde_json::from_str(&s).ok()
     };
+    // `sentence_bert_config.json` first: it is where the pplx release's
+    // query/document length limits actually live
+    // (`config_sentence_transformers.json` carries only the prompts), so a
+    // checkpoint with different limits truncates at its own. The newer
+    // `config_sentence_transformers.json` runs after and wins per key.
+    if let Some(sb) = read_json("sentence_bert_config.json") {
+        cfg.apply_sbert_config(&sb);
+    }
     if let Some(st) = read_json("config_sentence_transformers.json") {
         cfg.apply_st_config(&st);
     }
@@ -49,6 +57,17 @@ fn overlay_sidecars(cfg: &mut EmbedConfig, dir: &std::path::Path) {
     if let Some(dense) = read_json("1_Dense/config.json") {
         cfg.apply_dense_config(&dense);
     }
+}
+
+/// Apply the `sentence_transformers` object the quantizer folds into an
+/// `.hfq`'s metadata (see `hipfire-quantize`'s arch-17 sidecar fold): a
+/// container load has no model dir to overlay from, so the artifact is the
+/// only place the sidecar values can ride. Same key schema
+/// [`overlay_sidecars`] reads, applied with the same precedence the fold was
+/// built with.
+fn apply_folded_sidecars(cfg: &mut EmbedConfig, folded: &serde_json::Value) {
+    cfg.apply_st_config(folded);
+    cfg.apply_mask_config(folded);
 }
 
 /// Resolve one marker prompt to a single token id.
@@ -100,10 +119,12 @@ pub fn load_qwen35_embed_from_source(
         .map_err(|e| format!("qwen35-embed: config JSON: {e}"))?;
     let mut config = parse_config(crate::config::config_from_metadata(&meta))?;
 
-    // Sidecar overlays live next to the checkpoint (dir sources; HFQ
-    // re-saves fold them in via the defaults).
+    // Sidecar overlays live next to the checkpoint (dir sources); a folded
+    // `.hfq` carries them in its metadata instead.
     if src.is_dir() {
         overlay_sidecars(&mut config, st.path());
+    } else if let Some(folded) = meta.get("sentence_transformers") {
+        apply_folded_sidecars(&mut config, folded);
     }
 
     // Tokenizer: dir file, else HFQ metadata.
@@ -337,6 +358,8 @@ pub fn preflight_slot(
     let mut config = parse_config(crate::config::config_from_metadata(&meta))?;
     if src.is_dir() {
         overlay_sidecars(&mut config, st.path());
+    } else if let Some(folded) = meta.get("sentence_transformers") {
+        apply_folded_sidecars(&mut config, folded);
     }
     let tokenizer = match st.tokenizer_json_path() {
         Some(p) => hipfire_runtime::tokenizer::Tokenizer::from_tokenizer_json(&p)

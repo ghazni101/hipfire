@@ -2250,6 +2250,44 @@ pub(crate) fn run() {
         None
     };
 
+    // Fold the sentence-transformers sidecars (arch 17, the qwen3.5 embedding
+    // encoder) into the artifact: a .hfq load has no model dir to overlay
+    // from, and the encoder's query/document truncation limits live in these
+    // files (`sentence_bert_config.json` on the pplx release), not in
+    // config.json. Same key schema the loader's `apply_st_config` /
+    // `apply_mask_config` read, so the loader consumes the fold with no
+    // second parser.
+    let st_sidecar: Option<serde_json::Value> = if arch_id == 17 {
+        let read = |rel: &str| -> Option<serde_json::Value> {
+            std::fs::read_to_string(input_dir.join(rel))
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+        };
+        let mut folded = serde_json::Map::new();
+        // The ST ≤ v3 file first; the newer config_sentence_transformers.json
+        // wins per key where both define one — the same precedence the dir
+        // loader's overlay order gives.
+        for rel in ["sentence_bert_config.json", "config_sentence_transformers.json"] {
+            if let Some(v) = read(rel) {
+                for k in ["prompts", "query_length", "document_length"] {
+                    if let Some(val) = v.get(k) {
+                        folded.insert(k.to_string(), val.clone());
+                    }
+                }
+            }
+        }
+        if let Some(v) = read("2_MultiVectorMask/config.json") {
+            for k in ["skiplist_words", "skiplist_tasks"] {
+                if let Some(val) = v.get(k) {
+                    folded.insert(k.to_string(), val.clone());
+                }
+            }
+        }
+        (!folded.is_empty()).then(|| serde_json::Value::Object(folded))
+    } else {
+        None
+    };
+
     // Build metadata JSON for .hfq
     let mut metadata = serde_json::json!({
         "architecture": arch_str,
@@ -2258,6 +2296,9 @@ pub(crate) fn run() {
         "tokenizer_config": tokenizer_config,
         "generation_config": generation_config,
     });
+    if let Some(st) = st_sidecar {
+        metadata["sentence_transformers"] = st;
+    }
     if args.mq4v2_symmetric {
         metadata["mq4v2.symmetric"] = serde_json::json!(1);
     }

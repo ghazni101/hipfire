@@ -4,15 +4,17 @@
 
 //! Composite config for the Qwen3.5 embedding architecture.
 //!
-//! One `EmbedConfig` is parsed from up to four files in the model dir:
+//! One `EmbedConfig` is parsed from up to five files in the model dir:
 //!
 //! - `config.json` — the composite HF config: `text_config` (the Qwen3.5
 //!   hybrid backbone), `vision_config` (the SigLIP-style tower), and the
 //!   `image_token_id` / `vision_start_token_id` / `vision_end_token_id`
 //!   placeholder ids.
+//! - `sentence_bert_config.json` — the ST ≤ v3 sidecar; on the pplx release
+//!   this is the file that carries `query_length` / `document_length`.
 //! - `config_sentence_transformers.json` — `prompts` (the `"[Q] "` /
 //!   `"[D] "` marker strings by kind) and `query_length` / `document_length`
-//!   truncation limits.
+//!   truncation limits (wins per key where both sidecars define one).
 //! - `2_MultiVectorMask/config.json` — the ColBERT skiplist words and which
 //!   kinds they apply to (`skiplist_tasks`).
 //! - `1_Dense/config.json` — `in_features` / `out_features` of the Dense
@@ -250,9 +252,7 @@ pub fn parse_config(config: &serde_json::Value) -> Result<EmbedConfig, String> {
     // that declares causal attention would produce wrong vectors without an
     // error, so refuse instead of silently flipping the mask.
     if text.get("is_causal").and_then(|v| v.as_bool()) == Some(true) {
-        return Err(
-            "is_causal=true is not the bidirectional encoder this arch implements".into(),
-        );
+        return Err("is_causal=true is not the bidirectional encoder this arch implements".into());
     }
 
     let image_token_id =
@@ -328,6 +328,30 @@ fn parse_vision_config(vc: &serde_json::Value) -> Option<VisionConfig> {
 }
 
 impl EmbedConfig {
+    /// Overlay `sentence_bert_config.json` (the ST ≤ v3 sidecar). The
+    /// pplx-embed-v2 release carries its `query_length` / `document_length`
+    /// HERE — `config_sentence_transformers.json` has only the prompts — so
+    /// reading this file is what makes a checkpoint with different limits
+    /// truncate at its own lengths instead of this crate's defaults. Applied
+    /// before [`Self::apply_st_config`], whose keys win where both define
+    /// one.
+    pub fn apply_sbert_config(&mut self, sb: &serde_json::Value) {
+        if let Some(prompts) = sb.get("prompts").and_then(|v| v.as_object()) {
+            if let Some(q) = prompts.get("query").and_then(|v| v.as_str()) {
+                self.query_prompt = q.to_string();
+            }
+            if let Some(d) = prompts.get("document").and_then(|v| v.as_str()) {
+                self.document_prompt = d.to_string();
+            }
+        }
+        if let Some(q) = u64_of(sb, "query_length") {
+            self.query_length = q as usize;
+        }
+        if let Some(d) = u64_of(sb, "document_length") {
+            self.document_length = d as usize;
+        }
+    }
+
     /// Overlay the sentence-transformers sidecar values
     /// (`config_sentence_transformers.json` contents) when present.
     pub fn apply_st_config(&mut self, st: &serde_json::Value) {
@@ -534,6 +558,43 @@ mod tests {
             serde_json::from_str(r#"{"in_features":1024,"out_features":128}"#).unwrap();
         cfg.apply_dense_config(&dense);
         assert_eq!(cfg.dense_out_features, 128);
+    }
+
+    #[test]
+    fn sbert_sidecar_carries_the_pplx_length_limits() {
+        // The pplx-embed-v2 release's `sentence_bert_config.json`, verbatim
+        // in the fields this reads: `config_sentence_transformers.json` has
+        // NO length keys, so this file is the only place the limits come
+        // from — and they are 1024/4096, not this crate's pre-overlay
+        // defaults' neighbours (512/2048) nor anything else.
+        let v: serde_json::Value = serde_json::from_str(PPLX_CONFIG).unwrap();
+        let mut cfg = parse_config(&v).unwrap();
+        let sbert: serde_json::Value = serde_json::from_str(
+            r#"{"modality_config":{},"module_output_name":"token_embeddings",
+                "query_length":1024,"document_length":4096,"query_expansion":null}"#,
+        )
+        .unwrap();
+        cfg.apply_sbert_config(&sbert);
+        assert_eq!(cfg.query_length, 1024);
+        assert_eq!(cfg.document_length, 4096);
+
+        // A different export with different limits truncates at ITS limits,
+        // not ours — the reason the file is read at all.
+        let mut cfg2 = parse_config(&v).unwrap();
+        let other: serde_json::Value =
+            serde_json::from_str(r#"{"query_length":512,"document_length":2048}"#).unwrap();
+        cfg2.apply_sbert_config(&other);
+        assert_eq!(cfg2.query_length, 512);
+        assert_eq!(cfg2.document_length, 2048);
+
+        // ST precedence: where both sidecars define a key, the newer
+        // config_sentence_transformers.json wins (applied after).
+        let mut cfg3 = parse_config(&v).unwrap();
+        cfg3.apply_sbert_config(&other);
+        let st: serde_json::Value = serde_json::from_str(r#"{"query_length":8}"#).unwrap();
+        cfg3.apply_st_config(&st);
+        assert_eq!(cfg3.query_length, 8);
+        assert_eq!(cfg3.document_length, 2048);
     }
 
     #[test]

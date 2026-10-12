@@ -6,7 +6,6 @@
 //! and what the embed request path downcasts back to.
 
 use crate::config::{EmbedConfig, InputKind};
-use crate::post::VocabPieces;
 use crate::state::GdnEncodeState;
 use crate::weights::EmbedWeights;
 use hipfire_runtime::arch_model::ArchModel;
@@ -31,20 +30,6 @@ pub struct EmbedBundle {
     pub markers: MarkerIds,
     /// Token ids whose piece is a skiplist word (see [`crate::post`]).
     pub skiplist_ids: std::collections::HashSet<u32>,
-}
-
-/// `Tokenizer` vocab access for [`crate::post::skiplist_token_ids`].
-struct TokVocab<'a>(&'a Tokenizer);
-
-impl VocabPieces for TokVocab<'_> {
-    fn pieces(&self) -> Vec<(u32, String)> {
-        self.0
-            .vocab()
-            .iter()
-            .enumerate()
-            .map(|(i, p)| (i as u32, p.clone()))
-            .collect()
-    }
 }
 
 impl EmbedBundle {
