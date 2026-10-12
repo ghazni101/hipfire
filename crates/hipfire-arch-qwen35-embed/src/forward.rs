@@ -138,6 +138,18 @@ impl<'a> Enc<'a> {
         Ok(y)
     }
 
+    fn alloc_shaped(&mut self, shape: &[usize], dtype: DType) -> Result<GpuTensor, String> {
+        self.gpu
+            .alloc_tensor(shape, dtype)
+            .map_err(|e| format!("qwen35-embed: alloc: {e:?}"))
+    }
+
+    fn alloc_f16(&mut self, n: usize) -> Result<GpuTensor, String> {
+        self.gpu
+            .alloc_tensor(&[n], DType::F16)
+            .map_err(|e| format!("qwen35-embed: alloc f16: {e:?}"))
+    }
+
     /// f32 `[n]` → f16 `[n]` scratch (the LDS-tiled GEMM's activation operand).
     fn cast_f16(&mut self, x: &GpuTensor, n: usize) -> Result<GpuTensor, String> {
         let dst = self
@@ -213,9 +225,124 @@ impl<'a> Enc<'a> {
         )
     }
 
+    /// Bidirectional attention as two batched GEMMs plus a row softmax, per
+    /// head — the "eager attention" decomposition, using the primitives that
+    /// already exist rather than a hand-written kernel.
+    ///
+    /// Why: the tiled SIMT kernel runs the attention arithmetic at ~2.05
+    /// TFLOP/s (6.9% of f32 peak) because it is scalar f32 FMA. The trunk's
+    /// WMMA GEMM measured **5.5-6.25 TFLOP/s at exactly this shape**
+    /// (`[M=n_k, K=head_dim, B=n_q]`, see `examples/bench_gemm_tiles`), so
+    /// decomposing attention into `S = Q·Kᵀ`, a row softmax, and `O = P·V`
+    /// buys ~2.6x on the same math with a kernel path that is already tuned
+    /// and measured.
+    ///
+    /// Layout trick that avoids any gather: the q/gate weight split at load
+    /// puts each head's columns contiguously (`upload_q_gate_split`), so head
+    /// `h` is a `sub_offset` view with an explicit row pitch — which is what
+    /// the `_ld` GEMM variants take. Only V needs a real transpose (its `[n,
+    /// hd]` must become `[hd, n]` for the second GEMM's A operand), and that
+    /// is a strided copy + `transpose_f32` + cast.
+    ///
+    /// Constraint: the tiled GEMM asserts `k % 64 == 0`, and the second GEMM's
+    /// contraction is `n`, so this path needs `n % 64 == 0`. Shorter inputs
+    /// keep the tiled kernel (cheap at small n) — see `attention`.
+    fn attention_gemm(
+        &mut self,
+        q: &mut GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        ctx: &GpuTensor,
+        n: usize,
+        cfg: &EmbedConfig,
+    ) -> Result<(), String> {
+        let hd = cfg.head_dim;
+        let qd = cfg.q_dim();
+        let kvd = cfg.kv_dim();
+        let heads = cfg.n_heads;
+        let rep = cfg.n_heads / cfg.n_kv_heads;
+
+        // The softmax needs QK^T / sqrt(head_dim). The GEMM has no scale, so
+        // the factor is folded into Q once per layer (n * q_heads * head_dim
+        // elements) rather than into the n x n scores (16x more work at
+        // n = 4096) — and in f32 before the f16 cast, so it costs no
+        // precision. The tiled kernel applies its own scale, which is why this
+        // lives here and not in the caller.
+        self.gpu
+            .scale_f32(q, 1.0 / (hd as f32).sqrt())
+            .map_err(|e| format!("qwen35-embed: attn Q scale: {e:?}"))?;
+        let q16 = self.cast_f16(q, n * qd)?;
+        let k16 = self.cast_f16(k, n * kvd)?;
+        // Scores are [n_q, n_k]; both are n here (one sequence, self-attention).
+        // NOTE the shape must be 2-D: `softmax_f32` takes its row count from
+        // `shape[0]` and its width from `shape.last()`, so a flat [n*n]
+        // allocation makes it softmax the whole matrix as one row of n^2
+        // elements (measured: O(1) wrong embeddings).
+        let s = self.alloc_shaped(&[n, n], DType::F32)?;
+        let p16 = self.alloc_f16(n * n)?;
+        let vh = self.alloc(n * hd)?;
+        let vht = self.alloc(hd * n)?;
+        let vht16 = self.alloc_f16(hd * n)?;
+        let o = self.alloc(n * hd)?;
+
+        let mut result = Ok(());
+        for h in 0..heads {
+            let kh = h / rep;
+            // `sub_offset` views: head `h` of a [n, qd] buffer, first `hd`
+            // columns of each row, row pitch qd. Length is exactly what the
+            // GEMM's bounds assert wants: (rows - 1) * pitch + k.
+            let q_h = q16.sub_offset(h * hd, (n - 1) * qd + hd);
+            let k_h = k16.sub_offset(kh * hd, (n - 1) * kvd + hd);
+            let step = (|| -> Result<(), String> {
+                // S = Q_h · K_hᵀ   ([n, hd] · [hd, n] -> [n, n])
+                self.gpu
+                    .gemm_f16_x_f16_wmma_lds_auto_ld(&k_h, &q_h, &s, None, n, hd, n, kvd, qd)
+                    .map_err(|e| format!("qwen35-embed: attn QK^T (head {h}): {e:?}"))?;
+                self.gpu
+                    .softmax_f32(&s)
+                    .map_err(|e| format!("qwen35-embed: attn softmax (head {h}): {e:?}"))?;
+                self.gpu
+                    .cast_f32_to_f16(&s, &p16)
+                    .map_err(|e| format!("qwen35-embed: attn P cast (head {h}): {e:?}"))?;
+                // V_h -> [hd, n] f16 for the second GEMM's A operand. The
+                // head's column offset goes on the SOURCE view: this helper
+                // has a dst column offset but no src one, so shifting the
+                // source is how a strided column slice is expressed.
+                let v_h = v.sub_offset(kh * hd, (n - 1) * kvd + hd);
+                self.gpu
+                    .copy_rows_strided_f32(&v_h, &vh, n, hd, kvd, hd, 0, None)
+                    .map_err(|e| format!("qwen35-embed: attn V gather (head {h}): {e:?}"))?;
+                self.gpu
+                    .transpose_f32(&vh, &vht, n, hd)
+                    .map_err(|e| format!("qwen35-embed: attn V transpose (head {h}): {e:?}"))?;
+                self.gpu
+                    .cast_f32_to_f16(&vht, &vht16)
+                    .map_err(|e| format!("qwen35-embed: attn V cast (head {h}): {e:?}"))?;
+                // O_h = P · V_h
+                self.gpu
+                    .gemm_f16_x_f16_wmma_lds_auto_ld(&vht16, &p16, &o, None, hd, n, n, n, n)
+                    .map_err(|e| format!("qwen35-embed: attn PV (head {h}): {e:?}"))?;
+                // Scatter the head back into the head-interleaved ctx columns.
+                self.gpu
+                    .copy_rows_strided_f32(&o, ctx, n, hd, hd, qd, h * hd, None)
+                    .map_err(|e| format!("qwen35-embed: attn O scatter (head {h}): {e:?}"))?;
+                Ok(())
+            })();
+            if step.is_err() {
+                result = step;
+                break;
+            }
+        }
+
+        for t in [q16, k16, s, p16, vh, vht, vht16, o] {
+            self.free(t)?;
+        }
+        result
+    }
+
     fn attention(
         &mut self,
-        q: &GpuTensor,
+        q: &mut GpuTensor,
         k: &GpuTensor,
         v: &GpuTensor,
         ctx: &GpuTensor,
@@ -241,6 +368,15 @@ impl<'a> Enc<'a> {
                 1.0 / (cfg.head_dim as f32).sqrt(),
                 false,
             );
+        }
+        // The eager-attention decomposition needs n % 64 == 0 (the PV GEMM
+        // contracts over n). Short inputs, and anything the knob turns off,
+        // take the tiled SIMT kernel — which handles any n and is cheap at
+        // small n precisely because its cost is O(n^2).
+        if !embed_attn_no_gemm() && n % 64 == 0 && n >= 256 {
+            return self
+                .attention_gemm(q, k, v, ctx, n, cfg)
+                .map_err(|e| rdna_compute::HipError::new(0, &e));
         }
         self.gpu.attention_encoder_qtiled_f32(
             q,
@@ -412,6 +548,19 @@ fn embed_gemm_f32() -> bool {
     })
 }
 
+/// `HIPFIRE_EMBED_ATTN=no-gemm` keeps the tiled SIMT attention even where the
+/// eager-attention decomposition applies. Read once.
+fn embed_attn_no_gemm() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            hipfire_config::developer_var("HIPFIRE_EMBED_ATTN").ok().as_deref(),
+            Some("no-gemm") | Some("tiled")
+        )
+    })
+}
+
 /// `HIPFIRE_EMBED_ATTN=naive` selects the reference per-(query, head)
 /// attention kernel instead of the Q-tiled one. Read once; the tiled kernel is
 /// the production path.
@@ -540,7 +689,7 @@ pub fn encode_hidden(
             } => {
                 let qd = cfg.q_dim();
                 let kvd = cfg.kv_dim();
-                let q = e.gemm(q_proj, &normed, qd, h, n)?;
+                let mut q = e.gemm(q_proj, &normed, qd, h, n)?;
                 let gate = e.gemm(gate_proj, &normed, qd, h, n)?;
                 let k = e.gemm(k_proj, &normed, kvd, h, n)?;
                 let v = e.gemm(v_proj, &normed, kvd, h, n)?;
@@ -558,7 +707,7 @@ pub fn encode_hidden(
                 // architecture. One sequence per encode: no bias, no
                 // key-padding mask, causal = false.
                 let ctx = e.alloc(n * qd)?;
-                e.attention(&q, &k, &v, &ctx, n, cfg)
+                e.attention(&mut q, &k, &v, &ctx, n, cfg)
                     .map_err(|err| format!("qwen35-embed: attention (layer {li}): {err:?}"))?;
                 e.free(q)?;
                 e.free(k)?;

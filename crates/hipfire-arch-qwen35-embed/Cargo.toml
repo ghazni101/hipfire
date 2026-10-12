@@ -39,3 +39,15 @@ required-features = ["lab"]
 [[example]]
 name = "compare_tensor"
 required-features = ["lab"]
+
+[[example]]
+name = "bench_attn_gemm"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_gemm_tiles"
+required-features = ["lab"]
+
+[[example]]
+name = "attn_eager_parity"
+required-features = ["lab"]
