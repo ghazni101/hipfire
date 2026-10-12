@@ -3107,11 +3107,11 @@ impl Gpu {
         // LDS = k_tile + q_tile + s_tile + ws_max + ws_sum + m_l. The running
         // output is register-resident in the kernel, so it is NOT budgeted
         // here — the two must stay in step.
-        // K rows are padded by 4 floats (K_PAD) to break LDS bank conflicts;
-        // the sizing here must match the kernel's carve-up exactly.
+        // K AND V rows are padded by 4 floats (K_PAD) to break LDS bank
+        // conflicts; the sizing here must match the kernel's carve-up exactly.
         const K_PAD: usize = 4;
         let lds_floats = |kt: usize| {
-            kt * (head_dim + K_PAD) + QB * head_dim + QB * kt + 2 * QB * LANES + 2 * QB
+            2 * kt * (head_dim + K_PAD) + QB * head_dim + QB * kt + 2 * QB * LANES + 2 * QB
         };
         // `kt` must stay a multiple of LANES: the score pass computes
         // `K_TILE / LANES` scores per lane, so kt < LANES would silently
