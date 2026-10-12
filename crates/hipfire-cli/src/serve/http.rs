@@ -1092,8 +1092,7 @@ async fn handle_request(
                 Ok(resp) => resp,
                 Err(message) => {
                     let status = embeddings_error_status(&message);
-                    RequestFailure::new(message, status)
-                        .respond(WireApi::ChatCompletions, &shared.metrics)
+                    RequestFailure::new(message, status).respond(&shared.metrics)
                 }
             }
         }
@@ -1339,11 +1338,7 @@ async fn handle_embeddings(
     {
         Ok(guard) => guard,
         Err(error) => {
-            return Ok(admission_error_response(
-                WireApi::ChatCompletions,
-                &shared.metrics,
-                &error,
-            ))
+            return Ok(admission_error_response(&shared.metrics, &error))
         }
     };
 

@@ -39,3 +39,21 @@ required-features = ["lab"]
 [[example]]
 name = "compare_tensor"
 required-features = ["lab"]
+
+[[example]]
+name = "bench_attn_gemm"
+required-features = ["lab"]
+
+[[example]]
+name = "bench_gemm_tiles"
+required-features = ["lab"]
+
+[[example]]
+name = "attn_eager_parity"
+required-features = ["lab"]
+
+# Batch parity probe: one forward over several sequences vs encoding them one at
+# a time — the acceptance test for the batched forward the slot engine uses.
+[[example]]
+name = "batch_parity"
+required-features = ["lab"]

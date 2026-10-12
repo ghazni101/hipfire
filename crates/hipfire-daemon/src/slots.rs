@@ -1789,6 +1789,33 @@ fn cpu_preflight(
     vision_mode: &str,
     vision: Option<&str>,
 ) -> Result<Preflight, String> {
+    // A carrier that owns the shape of its own slot checkpoint answers first.
+    // arch 17's encoder is why this exists: its checkpoint may be a
+    // safetensors directory (`HfqFile::open` cannot read one) and its geometry
+    // lives in HF config metadata, not the qwen35 HFQ layout. `None` = no
+    // carrier claims the path, so the HFQ preflight below owns both the
+    // reading and the refusals.
+    if let Some(over) = hipfire_loader::slot_preflight(std::path::Path::new(model_path)) {
+        let p = over?;
+        return Ok(Preflight {
+            arch_id: p.arch_id,
+            arch_str: p.arch_str,
+            dim: p.dim,
+            layers: p.layers,
+            vocab: p.vocab,
+            tokenizer: p.tokenizer,
+            // Generate-only fields, and this route has no generate verb: no
+            // chat template, no sampling recommendation, no VL splice. The
+            // tower is loaded and driven by the arch crate itself.
+            chat_template: None,
+            is_vl: p.is_vl,
+            vision_config: None,
+            vl_path: p.vl_path,
+            rec_temperature: None,
+            rec_top_p: None,
+        });
+    }
+
     let hfq =
         HfqFile::open(std::path::Path::new(model_path)).map_err(|e| format!("open model: {e}"))?;
     validate_arch_id(hfq.arch_id)?;

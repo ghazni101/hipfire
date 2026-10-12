@@ -210,6 +210,25 @@ pub trait Carrier: Send + Sync {
     ) -> Result<Box<dyn hipfire_runtime::serve::SlotEngineHandle>, String> {
         Err(format!("{}: no multi-slot engine", self.name()))
     }
+
+    /// Slot-mode admission preflight for one of this carrier's checkpoints
+    /// that the daemon's own (qwen35-HFQ-shaped) preflight cannot open — arch
+    /// 17's encoder reads its geometry and tokenizer from HF/dir metadata, and
+    /// its checkpoint may be a safetensors directory rather than a container.
+    ///
+    /// `None` = not this carrier's model, so the daemon falls through to its
+    /// own preflight; `Some(Err)` = ours and refused. Called before any GPU
+    /// work, on the same path that already refuses a bad load without
+    /// disturbing the resident model.
+    ///
+    /// Default: `None` — a carrier whose checkpoints are all qwen35-shaped
+    /// HFQ leaves the daemon's preflight to do its job.
+    fn preflight_slot_model(
+        &self,
+        _path: &std::path::Path,
+    ) -> Option<Result<hipfire_runtime::serve::SlotModelPreflight, String>> {
+        None
+    }
 }
 
 /// The single registry lookup the daemon's spec path routes through: resolve the
@@ -363,6 +382,18 @@ pub fn img_route(arch_id: u32) -> ImgRoute {
     }
 }
 
+/// Slot-mode admission preflight for `path`, asked of every carrier that
+/// provides one. The first carrier that recognizes the checkpoint answers;
+/// `None` from all of them means the daemon's own preflight owns the path
+/// (and its refusals).
+pub fn slot_preflight(
+    path: &std::path::Path,
+) -> Option<Result<hipfire_runtime::serve::SlotModelPreflight, String>> {
+    REGISTRY
+        .iter()
+        .copied()
+        .find_map(|c| c.preflight_slot_model(path))
+}
 /// Which non-chat wire verb an arch serves.
 ///
 /// The daemon gates `generate` / `img_generate` / `embed` on these predicates

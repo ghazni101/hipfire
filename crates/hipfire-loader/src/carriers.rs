@@ -5110,6 +5110,20 @@ impl Carrier for Qwen35EmbedCarrier {
             )
         })
     }
+    /// The daemon's slot preflight reads the qwen35 HFQ layout; this arch's
+    /// checkpoint is often a safetensors directory, and its geometry lives in
+    /// `config.json` either way. Both facts are the arch crate's, so it reads
+    /// them (see `qwen35_embed::carrier::preflight_slot`).
+    fn preflight_slot_model(
+        &self,
+        path: &std::path::Path,
+    ) -> Option<Result<hipfire_runtime::serve::SlotModelPreflight, String>> {
+        match hipfire_arch_qwen35_embed::carrier::preflight_slot(path) {
+            Ok(Some(p)) => Some(Ok(p)),
+            Ok(None) => None,
+            Err(e) => Some(Err(e)),
+        }
+    }
 }
 
 #[cfg(test)]

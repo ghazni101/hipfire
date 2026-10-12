@@ -76,14 +76,18 @@ pub mod config;
 pub mod forward;
 pub mod names;
 pub mod post;
+pub mod slot_engine;
 pub mod state;
 pub mod vision;
 pub mod weights;
 
 pub use bundle::{EmbedBundle, MarkerIds};
-pub use carrier::{assemble_input, build_positions, load_qwen35_embed_bundle, AssembledInput};
+pub use carrier::{
+    assemble_input, build_positions, load_qwen35_embed_bundle, load_qwen35_embed_from_source,
+    preflight_slot, AssembledInput,
+};
 pub use config::{EmbedConfig, InputKind};
-pub use forward::{encode_embeddings, encode_hidden};
+pub use forward::{encode_embeddings, encode_embeddings_batch, encode_hidden, EncodeSegment};
 pub use post::{l2_normalize_rows, maxsim, skiplist_mask, DEFAULT_SKIPLIST_WORDS};
 
 /// `arch_id` this crate claims — see `docs/architecture-ids.md`.
