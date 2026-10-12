@@ -5124,6 +5124,16 @@ impl Carrier for Qwen35EmbedCarrier {
             Err(e) => Some(Err(e)),
         }
     }
+    fn spawn_slot_engine(
+        &self,
+        cfg: hipfire_runtime::serve::SlotEngineConfig,
+    ) -> Result<Box<dyn hipfire_runtime::serve::SlotEngineHandle>, String> {
+        use hipfire_arch_qwen35_embed::slot_engine::{EmbedEngineConfig, EmbedSlotEngine};
+        let engine = EmbedSlotEngine::spawn(EmbedEngineConfig::from_slot_config(&cfg))
+            .map_err(|e| format!("EmbedSlotEngine spawn: {e}"))?;
+        Ok(Box::new(engine))
+    }
+
 }
 
 #[cfg(test)]
