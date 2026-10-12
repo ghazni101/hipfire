@@ -242,6 +242,7 @@ Read only by the Qwen4 carrier and its kernels; no other model reads them.
 | Variable | Default / sense | Notes |
 |---|---|---|
 | `HIPFIRE_EMBED_VISION_OFFLOAD` | `1`/`on`/`true` forces the qwen3.5 embedding model's SigLIP tower into host RAM (GPU-addressable, read over PCIe); `0`/`off`/`false` forces it device-resident; unset auto-decides | The tower is ~250 MB of the arch's ~740 MB and is only touched by an image request, so it is the component to spill when the card is busy. **Auto (the default)** keeps it resident only when it fits in the VRAM free at load plus a 64 MB margin, and spills otherwise — a machine whose desktop already holds most of the card then loads the model and serves text instead of OOMing, at the cost of PCIe reads on image requests. Same tradeoff `HIPFIRE_OFFLOAD_EXEC=pcie` makes for spilled text layers; applied per-model here because the embedding arch can offload the tower whole. Read via `developer_var` in `hipfire-arch-qwen35-embed`. |
+| `HIPFIRE_EMBED_GEMM` | `f32` (or `mb8`) forces the f32-activation `gemm_f16_wmma_mb8` on every projection | A/B and bit-fidelity switch for the LDS-tiled macro-tile GEMM (`gemm_f16_x_f16_wmma_lds_auto`) the encoder uses for large shapes. Measured on gfx1101 at n=4096: mb8 runs the trunk's GEMMs at ~1.6 TFLOP/s (2% of the f16 peak) because it is a register-blocked 32-thread block with no LDS staging — right for the small batches it was written for (the vision tower), wrong here; the tiled kernel reaches ~25 TFLOP/s and took the GEMM from 1227 ms to ~80 ms. Its X operand is f16, so activations narrow: ~1e-3 relative, two orders below what 4-bit weights already cost, and the embedding error is unchanged to four digits on the validation fixture. Small shapes (`out < 256`, the GQA `a`/`b` projections) and any `k % 64 != 0` keep mb8 either way. |
 | `HIPFIRE_EMBED_ATTN` | `naive` selects the reference per-(query, head) attention kernel | Rollback/A-B switch for the Q-tiled bidirectional kernel (`attention_encoder_qtiled_f32`, `kernels/src/attention_encoder_qtiled.hip`). The reference (`attention_t5_bias_f32`) is correct for any shape but re-reads all of K and V once per query row, which was 82% of the encode at 4096 tokens (486 ms/layer on gfx1101); the tiled kernel shares K across `QB` query rows and is 3.0x faster on that kernel, 2.1x on the encode. Ignored for shapes outside the tiled contract. Read once via `developer_var` in `hipfire-arch-qwen35-embed`. |
 | `HIPFIRE_EMBED_DEBUG` | `1` traces the embedding encoder | Prints a per-layer finite-value trace of the residual stream (absmax + non-finite count) and the VRAM free/total after load. Downloads one tensor per call, so it is strictly a debugging path — it is what localized a weight-format bug that NaN'd the last rows of every projection. |
 
@@ -597,7 +598,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 
 **Generation method:** token scan over tracked `*.rs`, `*.py`, and `*.sh` (`scripts/check-lifecycle.py --write`).
 **Columns:** variable; up to two lexical source paths; lifecycle status (see [Lifecycle status](#lifecycle-status)).
-**Count:** 1506
+**Count:** 1507
 
 | Variable | Example source path(s) | Lifecycle |
 |---|---|---|
@@ -966,6 +967,7 @@ Presence in the inventory means the token appears in source; it does **not** mea
 | `HIPFIRE_E8_STRIP` | crates/rdna-compute/src/gemv.rs, crates/rdna-compute/src/kernels.rs | developer |
 | `HIPFIRE_EMBED_ATTN` | crates/hipfire-arch-qwen35-embed/src/forward.rs | developer |
 | `HIPFIRE_EMBED_DEBUG` | crates/hipfire-arch-qwen35-embed/src/carrier.rs, crates/hipfire-arch-qwen35-embed/src/forward.rs | developer |
+| `HIPFIRE_EMBED_GEMM` | crates/hipfire-arch-qwen35-embed/src/forward.rs | developer |
 | `HIPFIRE_EMBED_VISION_OFFLOAD` | crates/hipfire-arch-qwen35-embed/src/lib.rs, crates/hipfire-arch-qwen35-embed/src/vision.rs | developer |
 | `HIPFIRE_EMIT_TOKEN_IDS` | autoresearch/ar/certify/serve_runner.py, crates/hipfire-arch-cohere2moe/src/spec_emit.rs | developer |
 | `HIPFIRE_EMULATE_GPUS` | crates/hipfire-arch-qwen35/tests/route_oracle_mesh.rs, crates/hipfire-runtime/src/config.rs | developer |

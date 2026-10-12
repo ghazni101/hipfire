@@ -121,10 +121,17 @@ pub fn generate_embed(
         );
     };
 
+    // Phase timing under the same knob the encoder's own trace uses. For a
+    // long document the GPU kernel sum is a small fraction of wall-clock, and
+    // this is what shows where the rest goes (gather, JSON of a wide output,
+    // the download).
+    let timed = std::env::var("HIPFIRE_EMBED_DEBUG").ok().as_deref() == Some("1");
+    let t_phase = std::time::Instant::now();
     let assembled = match assemble_input(bundle, gpu, kind, &text, image_bytes) {
         Ok(a) => a,
         Err(e) => return fail(stdout, id, e),
     };
+    let t_assemble = t_phase.elapsed();
     let n_input = assembled.ids.len();
     let input = EncodeInput {
         ids: &assembled.ids,
@@ -132,11 +139,13 @@ pub fn generate_embed(
         spans: &assembled.spans,
         pos3: &assembled.pos3,
     };
+    let t_encode = std::time::Instant::now();
     let raw = match encode_embeddings(gpu, &bundle.weights, &mut bundle.state, &bundle.config, &input)
     {
         Ok(v) => v,
         Err(e) => return fail(stdout, id, e),
     };
+    let d_encode = t_encode.elapsed();
     let dim = bundle.config.dense_out_features;
     if raw.len() != n_input * dim {
         return fail(
@@ -166,6 +175,7 @@ pub fn generate_embed(
         .collect();
     let n_tokens = embeddings.len() / dim;
     l2_normalize_rows(&mut embeddings, dim);
+    let d_post = t_encode.elapsed() - d_encode;
 
     let payload = serde_json::json!({
         "type": "embedded",
@@ -176,8 +186,19 @@ pub fn generate_embed(
         "dim": dim,
         "embeddings": embeddings,
     });
+    let t_write = std::time::Instant::now();
     let _ = writeln!(stdout, "{payload}");
     let _ = stdout.flush();
+    if timed {
+        eprintln!(
+            "  [embed-phase] n={n_input} kept={n_tokens}: assemble {:?} | encode {:?} | \
+             mask+normalize {:?} | serialize+write {:?}",
+            t_assemble,
+            d_encode,
+            d_post,
+            t_write.elapsed()
+        );
+    }
 }
 
 /// Late-interaction score between two already-encoded inputs (the CLI's

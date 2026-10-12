@@ -96,11 +96,8 @@ impl<'a> Enc<'a> {
             return Err(format!("qwen35-embed: GEMM k={k} is not a multiple of 16"));
         }
         let y = self.alloc(n * out)?;
-        if self.gpu.arch_caps.has_wmma_w32() || self.gpu.arch_caps.has_wmma_w32_gfx12() {
-            self.gpu
-                .gemm_f16_wmma_mb8(w, x, &y, out, k, n)
-                .map_err(|e| format!("qwen35-embed: gemm: {e:?}"))?;
-        } else {
+        let wmma = self.gpu.arch_caps.has_wmma_w32() || self.gpu.arch_caps.has_wmma_w32_gfx12();
+        if !wmma {
             let yt = self.alloc(out * n)?;
             self.gpu
                 .gemm_f16(w, x, &yt, out, k, n)
@@ -109,8 +106,48 @@ impl<'a> Enc<'a> {
                 .transpose_f32(&yt, &y, out, n)
                 .map_err(|e| format!("qwen35-embed: transpose: {e:?}"))?;
             self.free(yt)?;
+            return Ok(y);
+        }
+        // Large shapes take the LDS-tiled macro-tile kernel; small ones keep
+        // `gemm_f16_wmma_mb8`. Measured on gfx1101 at n=4096: mb8 runs the
+        // trunk's GEMMs at ~1.6 TFLOP/s (2% of the f16 peak) because it is a
+        // register-blocked 32-thread block with no LDS staging, which is the
+        // right choice for the small batches it was written for (the vision
+        // tower) and the wrong one here. The tiled kernel is the same one the
+        // FLUX text encoders use for their prefill.
+        //
+        // Cost of the switch: the tiled kernel's X operand is f16 (mb8's is
+        // f32), so activations narrow. That is ~1e-3 relative against the f32
+        // reference — two orders below what 4-bit weights already cost
+        // (6e-2, see scripts/check_embed_quant.py) and validated by the same
+        // oracle. `HIPFIRE_EMBED_GEMM=f32` forces mb8 to A/B it or to keep
+        // activations full precision.
+        let use_tiled = k % 64 == 0 && out >= 256 && !embed_gemm_f32();
+        if use_tiled {
+            let x16 = self.cast_f16(x, n * k)?;
+            let r = self
+                .gpu
+                .gemm_f16_x_f16_wmma_lds_auto(w, &x16, &y, None, out, k, n);
+            self.free(x16)?;
+            r.map_err(|e| format!("qwen35-embed: gemm (lds-tiled): {e:?}"))?;
+        } else {
+            self.gpu
+                .gemm_f16_wmma_mb8(w, x, &y, out, k, n)
+                .map_err(|e| format!("qwen35-embed: gemm: {e:?}"))?;
         }
         Ok(y)
+    }
+
+    /// f32 `[n]` → f16 `[n]` scratch (the LDS-tiled GEMM's activation operand).
+    fn cast_f16(&mut self, x: &GpuTensor, n: usize) -> Result<GpuTensor, String> {
+        let dst = self
+            .gpu
+            .alloc_tensor(&[n], DType::F16)
+            .map_err(|e| format!("qwen35-embed: alloc f16: {e:?}"))?;
+        self.gpu
+            .cast_f32_to_f16(x, &dst)
+            .map_err(|e| format!("qwen35-embed: cast f16: {e:?}"))?;
+        Ok(dst)
     }
 
     fn rmsnorm(
@@ -359,6 +396,20 @@ fn trace(
         v.len()
     );
     Ok(())
+}
+
+/// `HIPFIRE_EMBED_GEMM=f32` forces the f32-activation `gemm_f16_wmma_mb8` on
+/// every projection instead of the LDS-tiled f16-activation kernel used for
+/// the large shapes. Read once; the tiled kernel is the production path.
+fn embed_gemm_f32() -> bool {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| {
+        matches!(
+            hipfire_config::developer_var("HIPFIRE_EMBED_GEMM").ok().as_deref(),
+            Some("f32") | Some("mb8")
+        )
+    })
 }
 
 /// `HIPFIRE_EMBED_ATTN=naive` selects the reference per-(query, head)

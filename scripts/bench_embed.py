@@ -84,6 +84,25 @@ def main():
             text=True,
             bufsize=1,
         )
+
+        def send(obj):
+            proc.stdin.write(json.dumps(obj) + "\n")
+            proc.stdin.flush()
+
+        def recv_until(want):
+            while True:
+                line = proc.stdout.readline()
+                if not line:
+                    raise SystemExit("daemon closed the pipe")
+                try:
+                    d = json.loads(line)
+                except json.JSONDecodeError:
+                    continue
+                if d.get("type") == "error":
+                    raise SystemExit(f"daemon error: {d.get('message')}")
+                if d.get("type") == want:
+                    return d
+
         send({"type": "load", "model": args.model, "params": {}})
         recv_until("loaded")
 
