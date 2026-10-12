@@ -30,6 +30,7 @@
 use crate::config::EmbedConfig;
 use crate::state::GdnEncodeState;
 use crate::weights::{EmbedWeights, ImageSpan};
+use rdna_compute::gemm::LdsTile;
 use rdna_compute::{DType, Gpu, GpuTensor};
 
 /// Input assembled by the caller (bundle / generate body): token ids, the
@@ -176,6 +177,122 @@ impl<'a> Enc<'a> {
         )
     }
 
+    /// Bidirectional attention as two batched GEMMs plus a row softmax, per
+    /// head — the "eager attention" decomposition, using the primitives that
+    /// already exist rather than a hand-written kernel.
+    ///
+    /// Why: the tiled SIMT kernel runs the attention arithmetic at ~2.05
+    /// TFLOP/s (6.9% of f32 peak) because it is scalar f32 FMA. The trunk's
+    /// WMMA GEMM measured **5.5-6.25 TFLOP/s at exactly this shape**
+    /// (`[M=n_k, K=head_dim, B=n_q]`, see `examples/bench_gemm_tiles`), so
+    /// decomposing attention into `S = Q·Kᵀ`, a row softmax, and `O = P·V`
+    /// buys ~2.6x on the same math with a kernel path that is already tuned
+    /// and measured.
+    ///
+    /// Layout trick that avoids any gather: the q/gate weight split at load
+    /// puts each head's columns contiguously (`upload_q_gate_split`), so head
+    /// `h` is a `sub_offset` view with an explicit row pitch — which is what
+    /// the `_ld` GEMM variants take. Only V needs a real transpose (its `[n,
+    /// hd]` must become `[hd, n]` for the second GEMM's A operand), and that
+    /// is a strided copy + `transpose_f32` + cast.
+    ///
+    /// Constraint: the tiled GEMM asserts `k % 64 == 0`, and the second GEMM's
+    /// contraction is `n`, so this path needs `n % 64 == 0`. Shorter inputs
+    /// keep the tiled kernel (cheap at small n) — see `attention`.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_gemm(
+        &mut self,
+        q: &mut GpuTensor,
+        k: &GpuTensor,
+        v: &GpuTensor,
+        ctx: &GpuTensor,
+        n: usize,
+        n_valid: usize,
+        cfg: &EmbedConfig,
+    ) -> Result<(), String> {
+        let hd = cfg.head_dim;
+        let qd = cfg.q_dim();
+        let kvd = cfg.kv_dim();
+        let heads = cfg.n_heads;
+        let rep = cfg.n_heads / cfg.n_kv_heads;
+
+        // The softmax needs QK^T / sqrt(head_dim). The GEMM has no scale, so
+        // the factor is folded into Q once per layer (n * q_heads * head_dim
+        // elements) rather than into the n x n scores (16x more work at
+        // n = 4096) — and in f32 before the f16 cast, so it costs no
+        // precision. The tiled kernel applies its own scale, which is why this
+        // lives here and not in the caller.
+        self.gpu
+            .scale_f32(q, 1.0 / (hd as f32).sqrt())
+            .map_err(|e| format!("qwen35-embed: attn Q scale: {e:?}"))?;
+        let q16 = self.cast_f16(q, n * qd)?;
+        let k16 = self.cast_f16(k, n * kvd)?;
+        // Scores are [n_q, n_k]; both are n here (one sequence, self-attention).
+        // NOTE the shape must be 2-D: `softmax_f32` takes its row count from
+        // `shape[0]` and its width from `shape.last()`, so a flat [n*n]
+        // allocation makes it softmax the whole matrix as one row of n^2
+        // elements (measured: O(1) wrong embeddings).
+        let s = self.alloc_shaped(&[n, n], DType::F32)?;
+        let p16 = self.alloc_f16(n * n)?;
+        let vh = self.alloc(n * hd)?;
+        let vht = self.alloc(hd * n)?;
+        let vht16 = self.alloc_f16(hd * n)?;
+        let o = self.alloc(n * hd)?;
+
+        let mut result = Ok(());
+        for h in 0..heads {
+            let kh = h / rep;
+            // `sub_offset` views: head `h` of a [n, qd] buffer, first `hd`
+            // columns of each row, row pitch qd. Length is exactly what the
+            // GEMM's bounds assert wants: (rows - 1) * pitch + k.
+            let q_h = q16.sub_offset(h * hd, (n - 1) * qd + hd);
+            let k_h = k16.sub_offset(kh * hd, (n - 1) * kvd + hd);
+            let step = (|| -> Result<(), String> {
+                // S = Q_h · K_hᵀ   ([n, hd] · [hd, n] -> [n, n])
+                self.gemm_ld(&k_h, &q_h, &s, n, hd, n, kvd, qd, true)
+                    .map_err(|e| format!("qwen35-embed: attn QK^T (head {h}): {e:?}"))?;
+                // Masked softmax writing f16 in one pass. Columns past
+                // `n_valid` are the sequence padding: their K rows are zeros,
+                // so an unmasked softmax would hand them a real share of every
+                // row and dilute the attention.
+                self.gpu
+                    .attention_rows_softmax_f16(&s, &p16, n, n, 0, n_valid)
+                    .map_err(|e| format!("qwen35-embed: attn softmax (head {h}): {e:?}"))?;
+                // V_h -> [hd, n] f16 for the second GEMM's A operand. The
+                // head's column offset goes on the SOURCE view: this helper
+                // has a dst column offset but no src one, so shifting the
+                // source is how a strided column slice is expressed.
+                let v_h = v.sub_offset(kh * hd, (n - 1) * kvd + hd);
+                self.gpu
+                    .copy_rows_strided_f32(&v_h, &vh, n, hd, kvd, hd, 0, None)
+                    .map_err(|e| format!("qwen35-embed: attn V gather (head {h}): {e:?}"))?;
+                self.gpu
+                    .transpose_f32(&vh, &vht, n, hd)
+                    .map_err(|e| format!("qwen35-embed: attn V transpose (head {h}): {e:?}"))?;
+                self.gpu
+                    .cast_f32_to_f16(&vht, &vht16)
+                    .map_err(|e| format!("qwen35-embed: attn V cast (head {h}): {e:?}"))?;
+                // O_h = P · V_h
+                self.gemm_ld(&vht16, &p16, &o, hd, n, n, n, n, false)
+                    .map_err(|e| format!("qwen35-embed: attn PV (head {h}): {e:?}"))?;
+                // Scatter the head back into the head-interleaved ctx columns.
+                self.gpu
+                    .copy_rows_strided_f32(&o, ctx, n, hd, hd, qd, h * hd, None)
+                    .map_err(|e| format!("qwen35-embed: attn O scatter (head {h}): {e:?}"))?;
+                Ok(())
+            })();
+            if step.is_err() {
+                result = step;
+                break;
+            }
+        }
+
+        for t in [q16, k16, s, p16, vh, vht, vht16, o] {
+            self.free(t)?;
+        }
+        result
+    }
+
     fn attention(
         &mut self,
         q: &GpuTensor,
@@ -183,6 +300,7 @@ impl<'a> Enc<'a> {
         v: &GpuTensor,
         ctx: &GpuTensor,
         n: usize,
+        n_valid: usize,
         cfg: &EmbedConfig,
     ) -> Result<(), rdna_compute::HipError> {
         // The Q-tiled bidirectional kernel (K shared across QB query rows)
@@ -409,26 +527,32 @@ pub fn encode_embeddings(
     }
     state.reset(gpu)?;
 
-    let hidden = encode_hidden(gpu, w, state, cfg, input)?;
-    // Dense head: norm → f16 → [n, dense_out].
+    // The encoder runs `n_pad` rows; the caller gets the first `n` back. See
+    // `padded_rows` for why padding is safe and when it is skipped.
+    let n_pad = padded_rows(n);
+    let hidden = encode_hidden_padded(gpu, w, state, cfg, input, n_pad)?;
+    // Dense head: norm → f16 → [n_pad, dense_out].
     let mut e = Enc::new(gpu);
     let dense = {
-        let fin = e.alloc(n * cfg.hidden_size)?;
+        let fin = e.alloc(n_pad * cfg.hidden_size)?;
         e.rmsnorm(
             &hidden,
             &w.final_norm,
             &fin,
-            n,
+            n_pad,
             cfg.hidden_size,
             cfg.rms_norm_eps,
         )?;
-        let emb = e.gemm(&w.dense, &fin, cfg.dense_out_features, cfg.hidden_size, n)?;
+        let emb = e.gemm(&w.dense, &fin, cfg.dense_out_features, cfg.hidden_size, n_pad)?;
         e.free(fin)?;
         emb
     };
-    let out = e.download(&dense)?;
+    let mut out = e.download(&dense)?;
     e.free(dense)?;
     e.free(hidden)?;
+    // Drop the padding rows: the caller's mask/normalize expects one row per
+    // real token.
+    out.truncate(n * cfg.dense_out_features);
     Ok(out)
 }
 
@@ -442,7 +566,38 @@ pub fn encode_hidden(
     cfg: &EmbedConfig,
     input: &EncodeInput<'_>,
 ) -> Result<GpuTensor, String> {
+    encode_hidden_padded(gpu, w, state, cfg, input, input.ids.len())
+}
+
+/// Rows the encoder actually runs, after padding the sequence up to a multiple
+/// of 64 so the eager attention's PV GEMM meets its `k % 64 == 0` contract.
+///
+/// Padding is at the END, which the architecture tolerates: GDN is causal, so
+/// the padded rows cannot influence a real row's state, and the full-attention
+/// layers mask the padded keys in the softmax. The padded rows' own outputs are
+/// garbage and are dropped by the caller. Below 256 tokens no padding is taken
+/// and the Q-tiled kernel runs instead — its cost is O(n^2), so it is cheap
+/// there and it needs no mask.
+fn padded_rows(n: usize) -> usize {
+    if n < 256 {
+        n
+    } else {
+        n.div_ceil(64) * 64
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn encode_hidden_padded(
+    gpu: &mut Gpu,
+    w: &EmbedWeights,
+    state: &mut GdnEncodeState,
+    cfg: &EmbedConfig,
+    input: &EncodeInput<'_>,
+    n_pad: usize,
+) -> Result<GpuTensor, String> {
     let n = input.ids.len();
+    let n_valid = n;
+    let n = n_pad;
     let h = cfg.hidden_size;
     let eps = cfg.rms_norm_eps;
     let inter = cfg.intermediate_size;
@@ -456,14 +611,20 @@ pub fn encode_hidden(
         h,
         &mut host_hidden,
     )?;
+    if n > n_valid {
+        host_hidden.resize(n * h, 0.0);
+    }
     let mut e = Enc::new(gpu);
     let hidden = e.upload(&host_hidden, n * h)?;
 
     // mRoPE positions: [n][3] i32 uploaded as raw bits into an F32-typed
     // buffer (the rope kernel's DeviceBuffer contract — see
     // forward_slots.rs' pos3 upload).
-    let pos_bytes: Vec<u8> = input
-        .pos3
+    // Padded rows get position 0: their rope phase is never read (their keys
+    // are masked and their queries are discarded).
+    let mut pos3_host: Vec<[i32; 3]> = input.pos3.to_vec();
+    pos3_host.resize(n, [0, 0, 0]);
+    let pos_bytes: Vec<u8> = pos3_host
         .iter()
         .flat_map(|t| t.iter().flat_map(|v| v.to_ne_bytes()))
         .collect();
@@ -507,7 +668,7 @@ pub fn encode_hidden(
                 // architecture. One sequence per encode: no bias, no
                 // key-padding mask, causal = false.
                 let ctx = e.alloc(n * qd)?;
-                e.attention(&q, &k, &v, &ctx, n, cfg)
+                e.attention(&mut q, &k, &v, &ctx, n, n_valid, cfg)
                     .map_err(|err| format!("qwen35-embed: attention (layer {li}): {err:?}"))?;
                 e.free(q)?;
                 e.free(k)?;
