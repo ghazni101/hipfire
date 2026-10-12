@@ -97,7 +97,7 @@ impl EmbedEngineConfig {
 /// which is the right setting for a latency-sensitive single-request
 /// deployment; a large value batches harder at the cost of a fixed delay.
 fn batch_window_from_env() -> Duration {
-    match std::env::var("HIPFIRE_EMBED_BATCH_WINDOW_US") {
+    match hipfire_config::developer_var("HIPFIRE_EMBED_BATCH_WINDOW_US") {
         Ok(v) => match v.trim().parse::<u64>() {
             Ok(us) => Duration::from_micros(us),
             Err(_) => BATCH_WINDOW,
@@ -345,7 +345,7 @@ fn serve_batch(
         .map(|errs| errs.into_iter().map(|e| e.map(Err)).collect())
         .collect();
 
-    let trace = std::env::var("HIPFIRE_EMBED_ENGINE_TRACE").ok().as_deref() == Some("1");
+    let trace = hipfire_config::developer_var("HIPFIRE_EMBED_ENGINE_TRACE").ok().as_deref() == Some("1");
     if trace {
         eprintln!(
             "[engine] batch: {} cmds -> {} requests -> {} groups {:?} (assemble {:.1} ms)",

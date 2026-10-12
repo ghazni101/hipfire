@@ -711,7 +711,7 @@ fn embed_attn_naive() -> bool {
 fn debug_enabled() -> bool {
     use std::sync::OnceLock;
     static ON: OnceLock<bool> = OnceLock::new();
-    *ON.get_or_init(|| std::env::var("HIPFIRE_EMBED_DEBUG").ok().as_deref() == Some("1"))
+    *ON.get_or_init(|| hipfire_config::developer_var("HIPFIRE_EMBED_DEBUG").ok().as_deref() == Some("1"))
 }
 
 /// Run the full encoder and the Dense head; returns `[n, dense_out]`

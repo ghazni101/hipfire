@@ -362,7 +362,7 @@ pub fn encode_image(
     );
     let grid_h = img_h / vis.patch_size;
     let grid_w = img_w / vis.patch_size;
-    if std::env::var("HIPFIRE_EMBED_DEBUG").ok().as_deref() == Some("1") {
+    if hipfire_config::developer_var("HIPFIRE_EMBED_DEBUG").ok().as_deref() == Some("1") {
         let (f, t) = gpu.hip.get_vram_info().unwrap_or((0, 0));
         eprintln!(
             "  [embed-debug] vision: {}x{} px -> {}x{} grid ({} patches), weights loaded; VRAM {} MB free / {} MB",
