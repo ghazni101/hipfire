@@ -651,8 +651,14 @@ impl SlotBackend {
         // Bound thread creation before spawning, same shape and reason as the
         // generate route: a burst must not spawn a thread per rejected
         // request, and the worker's own guard remains the hard bound.
+        //
+        // Embed replies are correlated by (id, attempt_id=0) — the worker
+        // never enters a BatchAttemptScope, so `emit_active_attempt_error`
+        // would write NOTHING (TLS 0 is the reserved uncorrelated channel)
+        // and the caller would wait forever. The uncorrelated emitter is the
+        // one whose envelope matches the pending key the caller registered.
         if self.active_count() >= 32 {
-            hipfire_engine::emit::emit_active_attempt_error(
+            hipfire_engine::emit::emit_uncorrelated_error(
                 stdout,
                 Some(id),
                 "too many concurrent slot requests (bounded worker limit hit)",
@@ -663,7 +669,7 @@ impl SlotBackend {
             return;
         }
         let Some(_guard) = self.acquire_guard() else {
-            hipfire_engine::emit::emit_active_attempt_error(
+            hipfire_engine::emit::emit_uncorrelated_error(
                 stdout,
                 Some(id),
                 "too many concurrent slot requests (bounded worker limit hit)",

@@ -161,6 +161,14 @@ pub fn parse_config(config: &serde_json::Value) -> Result<EmbedConfig, String> {
         u64_of(text, "num_hidden_layers").ok_or("text_config.num_hidden_layers")? as usize;
     let n_heads = u64_of(text, "num_attention_heads").ok_or("num_attention_heads")? as usize;
     let n_kv_heads = u64_of(text, "num_key_value_heads").ok_or("num_key_value_heads")? as usize;
+    // Validate before the first divide: a hand-edited config with 0 heads
+    // would panic here (or in preflight_slot, which the daemon calls on the
+    // slot path before any GPU work).
+    if n_heads == 0 || n_kv_heads == 0 {
+        return Err(format!(
+            "num_attention_heads={n_heads} / num_key_value_heads={n_kv_heads}: both must be > 0"
+        ));
+    }
     let head_dim = match u64_of(text, "head_dim") {
         Some(d) => d as usize,
         None => hidden_size / n_heads,
@@ -220,16 +228,31 @@ pub fn parse_config(config: &serde_json::Value) -> Result<EmbedConfig, String> {
             "{n_heads} heads not divisible by {n_kv_heads} kv heads"
         ));
     }
-    if linear_num_value_heads % linear_num_key_heads != 0 {
+    // The forward's GDN block reads k rows keyed by the VALUE-head count —
+    // no GQA repeat-interleave between key and value heads exists here. The
+    // whole family is 16/16; accept anything else only when a real interleave
+    // lands, not by silently serving corrupted output.
+    if linear_num_value_heads != linear_num_key_heads {
         return Err(format!(
-            "{linear_num_value_heads} value heads not divisible by {linear_num_key_heads} key heads"
+            "linear_num_value_heads {linear_num_value_heads} != linear_num_key_heads \
+             {linear_num_key_heads}: the encoder's delta-rule scan has no kv GQA interleave"
         ));
     }
     if hidden_act != "silu" {
         return Err(format!("hidden_act {hidden_act}: only silu is supported"));
     }
-    if u64_of(text, "attn_output_gate").unwrap_or(1) != 1 {
+    // `attn_output_gate` ships as a JSON bool — read it as one (u64_of would
+    // miss false and accept). Absent defaults to gated, matching HF.
+    if text.get("attn_output_gate").and_then(|v| v.as_bool()) == Some(false) {
         return Err("attn_output_gate=false is not supported (fused q+gate projection)".into());
+    }
+    // The encoder's full attention is bidirectional; serving a checkpoint
+    // that declares causal attention would produce wrong vectors without an
+    // error, so refuse instead of silently flipping the mask.
+    if text.get("is_causal").and_then(|v| v.as_bool()) == Some(true) {
+        return Err(
+            "is_causal=true is not the bidirectional encoder this arch implements".into(),
+        );
     }
 
     let image_token_id =
@@ -283,6 +306,11 @@ pub fn parse_config(config: &serde_json::Value) -> Result<EmbedConfig, String> {
 fn parse_vision_config(vc: &serde_json::Value) -> Option<VisionConfig> {
     let hidden_size = u64_of(vc, "hidden_size")? as usize;
     let num_heads = u64_of(vc, "num_heads").unwrap_or(16) as usize;
+    // A declared-but-zero head count would divide by zero below — treat it
+    // the same as a missing tower: no vision config rather than a panic.
+    if num_heads == 0 {
+        return None;
+    }
     Some(VisionConfig {
         hidden_size,
         num_heads,

@@ -1092,8 +1092,11 @@ async fn handle_request(
             };
             match handle_embeddings(Arc::clone(&shared), body_val).await {
                 Ok(resp) => resp,
-                Err(message) => RequestFailure::new(message, 400)
-                    .respond(WireApi::ChatCompletions, &shared.metrics),
+                Err(message) => {
+                    let status = embeddings_error_status(&message);
+                    RequestFailure::new(message, status)
+                        .respond(WireApi::ChatCompletions, &shared.metrics)
+                }
             }
         }
         (Method::POST, "/v1/images/generations") => {
@@ -1385,12 +1388,54 @@ async fn handle_embeddings(
                         .to_string(),
                 );
             };
+            // A name the REQUESTER supplied is a request load: honor the
+            // request policy (allow_request_paths / allow_pull). Only the
+            // operator's own configured default is an Operator load.
+            let origin = if request_model.as_deref() == Some(name.as_str()) {
+                crate::serve::ModelOrigin::Request
+            } else {
+                crate::serve::ModelOrigin::Operator
+            };
             runtime
-                .ensure_model(&name, &shared.meta, crate::serve::ModelOrigin::Operator)
+                .ensure_model(&name, &shared.meta, origin)
                 .map_err(|e| format!("loading {name}: {e}"))?;
         }
         (runtime.engine.clone(), runtime.current_path.clone())
     };
+    // A request that names a DIFFERENT model than the resident one would be
+    // silently answered by the resident checkpoint — the response looks like
+    // a 200 with embeddings from a model the caller didn't ask for. Refuse
+    // instead of swapping (embeddings are cheap and bursty; an implicit
+    // swap per request would thrash the GPU for every other caller).
+    if let Some(name) = request_model.as_deref() {
+        // Resolve the name to its on-disk path when it resolves at all; a
+        // registry tag, an alias and the literal path of the resident model
+        // must all compare equal. An unresolvable name is a mismatch too —
+        // refusing it here is cleaner than letting the daemon answer with
+        // the resident checkpoint.
+        let named_path = {
+            let runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
+            crate::resolve_model_path(&runtime.paths, &runtime.registry, name)
+                .ok()
+                .flatten()
+        };
+        let matches = match (&named_path, &loaded_model) {
+            (Some(named), Some(resident)) => named == resident,
+            // No resident model (shouldn't happen — the ensure above either
+            // loaded one or errored) or an unresolvable name: refuse.
+            _ => false,
+        };
+        if !matches {
+            return Err(format!(
+                "requested model {name:?} is not the resident model ({}); \
+                 this serve encodes with the resident model only",
+                loaded_model
+                    .as_ref()
+                    .map(|p| p.display().to_string())
+                    .unwrap_or_else(|| "none".to_string())
+            ));
+        }
+    }
     let model_echo = loaded_model
         .as_ref()
         .map(|p| p.display().to_string())
@@ -1792,6 +1837,27 @@ fn edits_form_to_body(
         .collect();
     body.insert("_reference_images".into(), serde_json::json!(refs));
     Ok(serde_json::Value::Object(body))
+}
+
+/// Status for `/v1/embeddings` failures. The daemon's overload refusal
+/// ("too many concurrent slot requests") is transient capacity → 429 so a
+/// client retries instead of treating it as a request bug; engine and
+/// worker failures are internal → 500; everything else is the caller's
+/// request → 400. Mirrors [`images_error_status`].
+fn embeddings_error_status(message: &str) -> u16 {
+    let lower = message.to_ascii_lowercase();
+    if lower.contains("too many concurrent") || lower.contains("overload") {
+        return 429;
+    }
+    if lower.contains("engine thread exited")
+        || lower.contains("engine is shut down")
+        || lower.contains("worker panicked")
+        || lower.contains("worker disconnected")
+        || lower.contains("daemon closed")
+    {
+        return 500;
+    }
+    400
 }
 
 fn images_error_status(message: &str) -> u16 {

@@ -75,6 +75,11 @@ pub fn vision_tensor_candidates(name: &str) -> Vec<String> {
 }
 
 /// Read a tensor by bare name from either source kind (see module docs).
+///
+/// The caller must decode/scale the returned bytes BEFORE calling
+/// [`release`] — the release madvise drops the mmap's resident pages, so a
+/// release inside this function (before the decode has touched them) would
+/// throw away nothing and force a re-fault of every byte the decode reads.
 pub fn read<'a>(src: &'a ModelSource, name: &str, vision: bool) -> Result<TensorBytes<'a>, String> {
     let candidates = if vision {
         vision_tensor_candidates(name)
@@ -85,15 +90,12 @@ pub fn read<'a>(src: &'a ModelSource, name: &str, vision: bool) -> Result<Tensor
         ModelSource::Dir(d) => {
             for cand in &candidates {
                 if let Some((info, bytes)) = d.tensor_data(cand) {
-                    let out = TensorBytes {
+                    return Ok(TensorBytes {
                         quant_type: info.quant_type,
                         dtype: info.dtype.clone(),
                         shape: info.shape.clone(),
                         bytes: Cow::Borrowed(bytes),
-                    };
-                    // Advisory streaming hint: the pages have been read.
-                    d.release_tensor_pages(cand);
-                    return Ok(out);
+                    });
                 }
             }
         }
@@ -123,6 +125,30 @@ pub fn read<'a>(src: &'a ModelSource, name: &str, vision: bool) -> Result<Tensor
     Err(format!(
         "qwen35-embed: missing tensor `{name}` (tried {candidates:?})"
     ))
+}
+
+/// Release the pages a [`read`] pulled in, once the caller has consumed the
+/// bytes. Mirrors `read`'s candidate order; the first name the source holds
+/// is released — the same one `read` would have returned. Best-effort and
+/// advisory: this is `MADV_DONTNEED` on a read-only file mapping.
+pub fn release(src: &ModelSource, name: &str, vision: bool) {
+    let candidates = if vision {
+        vision_tensor_candidates(name)
+    } else {
+        tensor_candidates(name)
+    };
+    let source: &dyn hipfire_runtime::model_source::ModelSource = match src {
+        ModelSource::Dir(d) => d,
+        // HfqSource's release is a no-op today (borrowed mmap / owned vec);
+        // routing it through the same call keeps a future impl effective.
+        ModelSource::Hfq(h) => h,
+    };
+    for cand in &candidates {
+        if source.tensor_info(cand).is_some() {
+            source.release_tensor_pages(cand);
+            return;
+        }
+    }
 }
 
 /// Bare backbone names every checkpoint must provide (layer index elided).

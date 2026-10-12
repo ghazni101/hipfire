@@ -32,22 +32,58 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
+def artifact_format(path):
+    """The artifact's real quant format, read from the file — not its name.
+
+    `.hfq`: the dominant (most common) non-raw tensor quant_type from the
+    HFQ tensor index, via astrea's parser. A safetensors dir is the f16
+    source path. Anything else (or an unreadable index) is None.
+    """
+    if os.path.isdir(path):
+        return "dir"
+    if not path.lower().endswith(".hfq"):
+        return None
+    try:
+        import astrea
+        summary, _tensor_map = astrea.read_hfq_index(path, max_tensors=0)
+        counts = summary.get("quant_type_counts", {})
+        # Drop raw formats (F16/F32) when compressed tensors dominate — the
+        # embed trunk is what matters.
+        compressed = {k: v for k, v in counts.items() if k not in ("F16", "F32")}
+        dom = compressed or counts
+        return max(dom, key=dom.get) if dom else None
+    except Exception:
+        return None
+
+
+# Quant-type → (label, rel-L2 band). Bands follow the format's measured
+# error against the f32 oracle (see the module docstring's ladder) and sit an
+# order below the O(1) error a broken dequant produces.
+FORMAT_BANDS = {
+    "MQ4G256": ("mq4 (4-bit MQ4G256V2)", 2.5e-1),
+    "MQ4G256V2": ("mq4 (4-bit MQ4G256V2)", 2.5e-1),
+    "MQ3G256": ("mq3 (3-bit MQ3G256)", 2.5e-1),
+    "MQ3G256_LLOYD": ("mq3 (3-bit Lloyd)", 2.5e-1),
+    "MQ8G256": ("q8/mq8 (8-bit)", 3.0e-2),
+    "MQ6G256": ("mq6 (6-bit MQ6G256)", 8.0e-2),
+    "HFQ4G256": ("hf4 (4-bit HFQ4G256)", 2.5e-1),
+    "HFQ4G128": ("hf4 (4-bit HFQ4G128)", 2.5e-1),
+    "HFQ6G256": ("hf6 (6-bit HFQ6G256)", 8.0e-2),
+    "Q8F16": ("q8 (8-bit Q8F16)", 3.0e-2),
+    "HFP4G32": ("hfp4 (4-bit FP)", 2.5e-1),
+    "MFP4G32": ("mfp4 (4-bit FP)", 2.5e-1),
+    "dir": ("raw / safetensors (f16 path, f32 source)", 2.0e-3),
+}
+
 
 def band_for(path):
-    """(name, max rel-L2) expected for this artifact."""
-    base = os.path.basename(path).lower()
-    if base.endswith(".mq4") or "mq4" in base:
-        return "mq4 (4-bit MQ4G256V2)", 2.5e-1
-    if base.endswith(".mq6") or "mq6" in base:
-        return "mq6 (6-bit MQ6G256)", 8.0e-2
-    if "hf4" in base:
-        return "hf4 (4-bit HFQ4G256)", 2.5e-1
-    if "hf6" in base:
-        return "hf6 (6-bit HFQ6G256)", 8.0e-2
-    if "q8" in base:
-        return "q8 (8-bit Q8F16)", 3.0e-2
-    return "raw / safetensors (f16 path, f32 source)", 2.0e-3
-
+    """(name, max rel-L2) expected for this artifact — from the artifact's
+    own format, never its filename (a renamed .hfq or an f16 dir whose name
+    happens to contain 'mq4' must not pick the wrong band)."""
+    fmt = artifact_format(path)
+    if fmt is None:
+        return None, None
+    return FORMAT_BANDS.get(fmt, (f"{fmt} (unbanded)", None))
 
 def run_daemon(daemon, model, prompts):
     """Load `model` once and return {name: (embeddings, n_tokens, dim)}."""
@@ -94,9 +130,17 @@ def main():
     # daemon prepends it from `kind`, so the oracle must build the same id
     # sequence by hand (`[marker] + encode(text)`) or the two would differ by a
     # token and the comparison would be meaningless.
+    # `dl` crosses the 256-token boundary so the eager attention path
+    # (attention_gemm: QK/PV WMMA GEMMs + masked row softmax + padding) is
+    # exercised, not only the small-n Q-tiled kernel — a numerically wrong
+    # fused op on that path is invisible on short fixtures.
     prompts = [
         ("d", "document", "Retrieval-augmented generation grounds a model's answer."),
         ("q", "query", "How does late interaction score a passage?"),
+        ("dl", "document", " ".join(
+            f"sentence {i} about dense retrieval and late interaction"
+            for i in range(40)
+        )),
     ]
     markers = {"query": tok.token_to_id("[Q] "), "document": tok.token_to_id("[D] ")}
     for k, v in markers.items():
@@ -137,6 +181,13 @@ def main():
     rows, failed = [], 0
     for art in args.artifacts:
         label, band = band_for(art)
+        if band is None:
+            rows.append({"artifact": art, "format": label or "unreadable",
+                         "rel_l2": None,
+                         "error": "no band for this format — unknown artifact or "
+                                  "unbanded quant_type; refusing to guess"})
+            failed += 1
+            continue
         try:
             got = run_daemon(args.daemon, os.path.abspath(art), prompts)
         except SystemExit as e:

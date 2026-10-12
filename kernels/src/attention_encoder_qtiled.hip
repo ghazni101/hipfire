@@ -74,7 +74,7 @@ extern "C" __global__ __launch_bounds__(QB* LANES, 1) void attention_encoder_qti
     const float* __restrict__ k,     // [N, n_kv_heads * head_dim]
     const float* __restrict__ v,     // [N, n_kv_heads * head_dim]
     float* __restrict__ out,         // [N, n_heads    * head_dim]
-    int N, int n_heads, int n_kv_heads, int head_dim, float scale, int k_tile_arg) {
+    int N, int n_valid, int n_heads, int n_kv_heads, int head_dim, float scale, int k_tile_arg) {
     const int head = (int)blockIdx.x;
     const int q0 = (int)blockIdx.y * QB;
     const int nq = min(QB, N - q0);
@@ -82,9 +82,22 @@ extern "C" __global__ __launch_bounds__(QB* LANES, 1) void attention_encoder_qti
     const int nthreads = (int)blockDim.x;
     const int K_TILE = k_tile_arg;
     // The score pass computes K_TILE/LANES scores per lane; a smaller tile
-    // would compute none, and a non-multiple would drop tail keys. Refuse
-    // rather than return silently-wrong attention.
-    if (K_TILE < LANES || (K_TILE % LANES) != 0) return;
+    // would compute none, and a non-multiple would drop tail keys. The host
+    // validates via encoder_qtiled_tile before launch, but if a future
+    // caller bypasses it, refuse loudly: write zeros rather than leave
+    // whatever the allocation contained.
+    if (K_TILE < LANES || (K_TILE % LANES) != 0) {
+        const int d_q0 = n_heads * head_dim;
+        for (int i = tid; i < nq * head_dim; i += nthreads) {
+            int qi = i / head_dim, d = i % head_dim;
+            out[(size_t)(q0 + qi) * d_q0 + head * head_dim + d] = 0.0f;
+        }
+        return;
+    }
+    // Keys in [n_valid, N) are sequence padding (zeroed rows): they must not
+    // take a softmax share. Queries there are also padding — computed harm-
+    // lessly and dropped by the caller.
+    const int kn = min(n_valid, N);
 
     const int d_q = n_heads * head_dim;
     const int d_kv = n_kv_heads * head_dim;
@@ -124,8 +137,8 @@ extern "C" __global__ __launch_bounds__(QB* LANES, 1) void attention_encoder_qti
     float s_reg[A_MAX];
     __syncthreads();
 
-    for (int t0 = 0; t0 < N; t0 += K_TILE) {
-        const int tlen = min(K_TILE, N - t0);
+    for (int t0 = 0; t0 < kn; t0 += K_TILE) {
+        const int tlen = min(K_TILE, kn - t0);
 
         // Cooperative K tile load (coalesced over head_dim).
         for (int i = tid; i < tlen * head_dim; i += nthreads) {
@@ -236,17 +249,3 @@ extern "C" __global__ __launch_bounds__(QB* LANES, 1) void attention_encoder_qti
     }
 }
 
-// ── Host-side sizing helper (kept next to the layout it mirrors) ──────────
-// K_TILE chosen so the LDS budget stays inside 64 KB at any head_dim.
-// Returning it here (rather than in Rust) keeps the two in one place.
-extern "C" int attention_encoder_qtiled_k_tile(int head_dim) {
-    // floats = K_TILE*hd + 2*QB*hd + QB*K_TILE + 2*QB*LANES + 2*QB
-    const int fixed = 2 * QB + 2 * QB * LANES + 2 * QB * (int)0;  // 2*QB + 2*QB*LANES
-    (void)fixed;
-    for (int kt = 64; kt >= 8; kt >>= 1) {
-        long floats = (long)kt * head_dim + 2L * QB * head_dim + (long)QB * kt
-                      + 2L * QB * LANES + 2L * QB;
-        if (floats * 4L <= 64L * 1024L) return kt;
-    }
-    return 8;
-}

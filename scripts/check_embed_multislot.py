@@ -59,6 +59,14 @@ class Daemon:
             text=True,
             bufsize=1,
         )
+        # Drain stderr concurrently: a daemon that logs during encodes would
+        # otherwise fill the pipe and block itself mid-request, and this
+        # check would hang for the wrong reason.
+        self._stderr_buf = []
+        def _drain_stderr():
+            for line in self.proc.stderr:
+                self._stderr_buf.append(line)
+        threading.Thread(target=_drain_stderr, daemon=True).start()
         self._wlock = threading.Lock()
         self._pending = {}
         self._plock = threading.Lock()
@@ -130,7 +138,7 @@ class Daemon:
             self.proc.wait(timeout=60)
         except subprocess.TimeoutExpired:
             self.proc.kill()
-        err = self.proc.stderr.read()
+        err = "".join(self._stderr_buf)
         return err
 
 
@@ -195,6 +203,13 @@ def main():
         },
     )
     print(f"slot daemon: arch {slot.arch} (experimental_multi_slot)")
+    # The whole point of this check is the batched forward — if a regression
+    # made the load silently fall back to the sequential path, "slot" embeds
+    # would run the same code as the reference leg and be trivially
+    # identical. Assert the daemon really is in slot mode.
+    if not slot.loaded.get("experimental_multi_slot"):
+        print("FAIL: daemon did not enter experimental_multi_slot")
+        return 1
     slot_out = [None] * n
     errors = [None] * n
     lats = [0.0] * n
@@ -218,7 +233,10 @@ def main():
     err = slot.stop()
 
     ok = True
-    report = []
+    # Keyed by case index — inputs that errored are skipped earlier, so a
+    # positional list would shift every later row and the oracle leg below
+    # would attach its metrics to the wrong input.
+    report = {}
     for i, (kind, text) in enumerate(cases):
         if errors[i]:
             ok = False
@@ -235,17 +253,15 @@ def main():
         mx, rel, why = compare(b["embeddings"], a["embeddings"])
         if why or mx != 0.0:
             ok = False
-        report.append(
-            {
-                "index": i,
-                "kind": kind,
-                "n_input_tokens": b.get("n_input_tokens"),
-                "n_tokens": b.get("n_tokens"),
-                "max_abs_diff": mx,
-                "rel_l2": rel,
-                "note": why,
-            }
-        )
+        report[i] = {
+            "index": i,
+            "kind": kind,
+            "n_input_tokens": b.get("n_input_tokens"),
+            "n_tokens": b.get("n_tokens"),
+            "max_abs_diff": mx,
+            "rel_l2": rel,
+            "note": why,
+        }
         flag = "ok " if (mx == 0.0 and not why) else "BAD"
         print(
             f"  [{i}] {flag} {kind:8s} in {b.get('n_input_tokens'):5d} kept "
@@ -287,6 +303,11 @@ def main():
                 out.append(i == 0 or t == markers[kind] or piece not in skiplist)
             return out
 
+        oracle_pass = True
+        # f64 NumPy vs the daemon's f16-weight GPU trunk: not bit equality —
+        # a band. This is the only leg independent of the daemon's own
+        # forward, so divergence here gates the run, not just prints.
+        ORACLE_REL_L2 = 1e-2
         for i, (kind, text) in enumerate(cases):
             if slot_out[i] is None:
                 continue
@@ -304,10 +325,15 @@ def main():
                 e = e[mask]
             flat = [float(v) for row in e for v in row]
             mx, rel, why = compare(slot_out[i]["embeddings"], flat)
-            print(f"  [{i}] oracle vs slot: max {mx:.3e} rel {rel:.3e} {why}")
-            if i < len(report):
+            flag = "ok " if rel <= ORACLE_REL_L2 and not why else "DIFF"
+            print(f"  [{i}] {flag} oracle vs slot: max {mx:.3e} rel {rel:.3e} {why}")
+            if rel > ORACLE_REL_L2 or why:
+                ok = False
+                oracle_pass = False
+            if i in report:
                 report[i]["oracle_max_abs_diff"] = mx
                 report[i]["oracle_rel_l2"] = rel
+        print(f"  oracle leg: {'PASS' if oracle_pass else 'FAIL'} (band rel_l2 <= {ORACLE_REL_L2})")
 
     if args.json:
         print(
@@ -315,7 +341,7 @@ def main():
                 {
                     "model": args.model,
                     "slots": args.slots,
-                    "inputs": report,
+                    "inputs": [report[i] for i in sorted(report)],
                     "serial_ms": round(t_seq * 1e3, 3),
                     "slot_wall_ms": round(t_slot * 1e3, 3),
                     "speedup": round(t_seq / t_slot, 3),

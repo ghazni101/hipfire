@@ -217,7 +217,9 @@ pub fn assemble_input(
             .vision
             .as_ref()
             .ok_or("qwen35-embed: image input but this checkpoint has no vision tower")?;
-        let (merged, mh, mw) = crate::vision::encode_image(gpu, vis_w, cfg, bytes)?;
+        // `grid` is the PRE-merge patch grid — the mRoPE span contract.
+        let (merged, grid_h, grid_w) = crate::vision::encode_image(gpu, vis_w, cfg, bytes)?;
+        let (mh, mw) = crate::vision::merged_grid(cfg, grid_h, grid_w);
         let n_merged = mh * mw;
         // Vision delimiters + pads.
         ids.push(cfg.vision_start_token_id);
@@ -230,14 +232,16 @@ pub fn assemble_input(
             start: span_start,
             len: n_merged,
             embed_offset: 0,
-            grid_h: mh,
-            grid_w: mw,
+            grid_h,
+            grid_w,
         });
         image_embeds = merged;
-        if ids.len() + 1 > limit {
+        // The vision block overflowing the kind's limit on its own is an
+        // error: truncating a spliced span would desync ids from embeds/pos3.
+        if ids.len() > limit {
             return Err(format!(
                 "qwen35-embed: image expands to {} tokens, over the {} limit for this kind",
-                ids.len() + 1,
+                ids.len(),
                 limit
             ));
         }
@@ -256,7 +260,7 @@ pub fn assemble_input(
         ));
     }
 
-    let pos3 = build_positions(ids.len(), &spans);
+    let pos3 = build_positions(ids.len(), &spans, merge_size(cfg));
     Ok(AssembledInput {
         ids,
         pos3,
@@ -265,10 +269,26 @@ pub fn assemble_input(
     })
 }
 
+fn merge_size(cfg: &EmbedConfig) -> usize {
+    cfg.vision
+        .as_ref()
+        .map(|v| v.spatial_merge_size)
+        .unwrap_or(2)
+}
+
 /// Build positions: text rows `[p,p,p]`; each image span gets HF
 /// `get_rope_index` phases (t fixed at the span's base, h/w the merged
-/// grid) and advances the cursor by `max(grid_h, grid_w)`.
-pub fn build_positions(n_tokens: usize, spans: &[crate::weights::ImageSpan]) -> Vec<[i32; 3]> {
+/// grid) and advances the cursor by `max(grid_h, grid_w) / merge`.
+///
+/// `ImageSpan::grid_*` are PRE-merge patch dims —
+/// `hipfire_arch_qwen35_vl::mrope::build_mrope_positions` does the
+/// `spatial_merge_size` division itself. `merge` is the checkpoint's real
+/// `vision.spatial_merge_size`, not a constant.
+pub fn build_positions(
+    n_tokens: usize,
+    spans: &[crate::weights::ImageSpan],
+    merge: usize,
+) -> Vec<[i32; 3]> {
     let sp: Vec<hipfire_arch_qwen35_vl::mrope::ImageSpan> = spans
         .iter()
         .map(|s| hipfire_arch_qwen35_vl::mrope::ImageSpan {
@@ -278,7 +298,6 @@ pub fn build_positions(n_tokens: usize, spans: &[crate::weights::ImageSpan]) -> 
             grid_w: s.grid_w,
         })
         .collect();
-    let merge = 2;
     hipfire_arch_qwen35_vl::mrope::build_mrope_positions(n_tokens, &sp, merge).positions
 }
 

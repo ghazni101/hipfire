@@ -129,17 +129,29 @@ def main():
 
     print()
     print(f"{'fixture':9s} {'HF vs oracle trunk':>19s} {'HF vs oracle final':>19s} {'HF vs hipfire final':>20s}")
-    worst_trunk = 0.0
+    worst_trunk = worst_final = worst_hip = 0.0
     for name, rt, rf, rh in rows:
         hip = "—" if rh is None else f"{rh:.3e}"
         print(f"{name:9s} {rt:19.3e} {rf:19.3e} {hip:>20s}")
         worst_trunk = max(worst_trunk, rt)
+        worst_final = max(worst_final, rf)
+        if rh is not None:
+            worst_hip = max(worst_hip, rh)
     print()
-    # The gate: an independently-run HF trunk must match the NumPy oracle at
-    # precision level. O(1) here means the oracle misread the architecture.
-    ok = worst_trunk < 1e-3
-    print(f"trunk agreement (worst {worst_trunk:.3e}) vs 1e-3 floor: "
-          f"{'PASS — the oracle reproduces HF' if ok else 'FAIL — the oracle misreads the architecture'}")
+    # Gates: the trunk comparison proves the oracle reproduces HF's trunk;
+    # the final comparison adds the Dense head (a misread head would pass
+    # every downstream gate, since they all compare through it); the hipfire
+    # comparison proves the daemon's post-processing matches HF end-to-end.
+    # Same tolerance class as the trunk gate — these are precision checks,
+    # not quality budgets.
+    ok_trunk = worst_trunk < 1e-3
+    ok_final = worst_final < 1e-3
+    ok_hip = worst_hip < 1e-2 if not args.skip_hipfire else True
+    ok = ok_trunk and ok_final and ok_hip
+    print(f"trunk agreement (worst {worst_trunk:.3e}) vs 1e-3: {'PASS' if ok_trunk else 'FAIL — oracle misreads the architecture'}")
+    print(f"final-head agreement (worst {worst_final:.3e}) vs 1e-3: {'PASS' if ok_final else 'FAIL — oracle misreads the Dense head'}")
+    if not args.skip_hipfire:
+        print(f"hipfire end-to-end (worst {worst_hip:.3e}) vs 1e-2: {'PASS' if ok_hip else 'FAIL — daemon diverges from HF'}")
     return 0 if ok else 1
 
 

@@ -18,9 +18,13 @@ use rdna_compute::{DType, Gpu};
 fn main() -> Result<(), String> {
     let mut gpu = Gpu::init().map_err(|e| format!("gpu: {e:?}"))?;
     let (n, heads, kvh, hd) = (128usize, 4usize, 2usize, 64usize);
+    // n_valid < n exercises the masked tail exactly as production's padded
+    // segments run it: rows [n_valid, n) are zeros in K/V and must not take
+    // a softmax share.
+    let n_valid = 96usize;
     let (qd, kvd) = (heads * hd, kvh * hd);
     let rep = heads / kvh;
-    println!("gpu {} | n={n} heads={heads} kv_heads={kvh} hd={hd}", gpu.arch);
+    println!("gpu {} | n={n} n_valid={n_valid} heads={heads} kv_heads={kvh} hd={hd}", gpu.arch);
 
     let mut s: u32 = 987654321;
     let mut frnd = || {
@@ -28,8 +32,13 @@ fn main() -> Result<(), String> {
         ((s >> 8) as f32 / (1u32 << 24) as f32) - 0.5
     };
     let qf: Vec<f32> = (0..n * qd).map(|_| frnd()).collect();
-    let kf: Vec<f32> = (0..n * kvd).map(|_| frnd()).collect();
-    let vf: Vec<f32> = (0..n * kvd).map(|_| frnd()).collect();
+    // Padding rows are zeros in K and V, as the batch layout zeroes them.
+    let kf: Vec<f32> = (0..n * kvd)
+        .map(|i| if i / kvd < n_valid { frnd() } else { 0.0 })
+        .collect();
+    let vf: Vec<f32> = (0..n * kvd)
+        .map(|i| if i / kvd < n_valid { frnd() } else { 0.0 })
+        .collect();
     // forward.rs folds the 1/sqrt(head_dim) into Q in f32 *before* the f16
     // cast (the GEMM has no scale operand). Mirror that exactly — the
     // reference below then takes the scores raw.
@@ -46,7 +55,7 @@ fn main() -> Result<(), String> {
         let khd = h / rep;
         let mut scores = vec![0f32; n * n];
         for i in 0..n {
-            for j in 0..n {
+            for j in 0..n_valid {
                 let mut acc = 0f32;
                 for d in 0..hd {
                     acc += qh[i * qd + h * hd + d] * kh[j * kvd + khd * hd + d];
@@ -54,24 +63,50 @@ fn main() -> Result<(), String> {
                 scores[i * n + j] = acc;
             }
         }
-        // softmax per row
+        // Masked softmax per row: keys [n_valid, n) get no share.
         for i in 0..n {
             let row = &mut scores[i * n..(i + 1) * n];
-            let m = row.iter().cloned().fold(f32::MIN, f32::max);
+            let m = row[..n_valid].iter().cloned().fold(f32::MIN, f32::max);
             let mut sum = 0f32;
-            for x in row.iter_mut() { *x = (*x - m).exp(); sum += *x; }
-            for x in row.iter_mut() { *x /= sum; }
+            for x in row[..n_valid].iter_mut() { *x = (*x - m).exp(); sum += *x; }
+            for x in row[..n_valid].iter_mut() { *x /= sum; }
+            for x in row[n_valid..].iter_mut() { *x = 0.0; }
         }
         for i in 0..n {
             for d in 0..hd {
                 let mut acc = 0f32;
-                for j in 0..n {
+                for j in 0..n_valid {
                     acc += scores[i * n + j] * vf[j * kvd + khd * hd + d];
                 }
                 ref_ctx[i * qd + h * hd + d] = acc;
             }
         }
     }
+
+    // ---- the production helpers: same tile dispatch as Enc::gemm_ld ----
+    let gemm_production = |a: &rdna_compute::GpuTensor,
+                           x: &rdna_compute::GpuTensor,
+                           y: &rdna_compute::GpuTensor,
+                           m: usize,
+                           k: usize,
+                           batch: usize,
+                           lda: usize,
+                           ldx: usize,
+                           qk: bool,
+                           gpu: &mut Gpu| {
+        let cands = if qk {
+            hipfire_arch_qwen35_embed::forward::attention_qk_tiles()
+        } else {
+            hipfire_arch_qwen35_embed::forward::attention_pv_tiles()
+        };
+        if let Some(tile) =
+            hipfire_arch_qwen35_embed::forward::attention_lds_tile(&cands, m, batch)
+        {
+            return gpu.gemm_f16_x_f16_wmma_lds_tiled_ld(a, x, y, None, m, k, batch, tile, lda, ldx);
+        }
+        gpu.gemm_f16_x_f16_wmma_lds_auto_ld(a, x, y, None, m, k, batch, lda, ldx)
+    };
+
 
     // ---- sanity: prove the GEMM's operand roles with an identity A ----
     // Y[b, m] = sum_k X[b, k] * A[m, k]. With A = I this must reproduce X, so
@@ -159,14 +194,14 @@ fn main() -> Result<(), String> {
         let khd = h / rep;
         let q_h = q_dev.sub_offset(h * hd, (n - 1) * qd + hd);
         let k_h = k_dev.sub_offset(khd * hd, (n - 1) * kvd + hd);
-        gpu.gemm_f16_x_f16_wmma_lds_auto_ld(&k_h, &q_h, &sc, None, n, hd, n, kvd, qd)
+        gemm_production(&k_h, &q_h, &sc, n, hd, n, kvd, qd, true, &mut gpu)
             .map_err(|e| format!("QK^T h{h}: {e:?}"))?;
         {
             // Localize: compare the raw QK^T scores before softmax.
             let gs = gpu.download_f32(&sc).map_err(|e| format!("{e:?}"))?;
             let (mut num, mut den) = (0f64, 0f64);
             for i in 0..n {
-                for j in 0..n {
+                for j in 0..n_valid {
                     let mut acc = 0f32;
                     for d in 0..hd {
                         acc += qh[i * qd + h * hd + d] * kh[j * kvd + (h / rep) * hd + d];
@@ -179,14 +214,16 @@ fn main() -> Result<(), String> {
             }
             println!("  head {h} scores (pre-softmax): rel_l2 = {:.3e}", (num / den).sqrt());
         }
-        gpu.softmax_f32(&sc).map_err(|e| format!("softmax h{h}: {e:?}"))?;
-        gpu.cast_f32_to_f16(&sc, &p16).map_err(|e| format!("cast P h{h}: {e:?}"))?;
+        // Masked row softmax, fused f32->f16 — the production op, not a
+        // softmax+cast pair (it is what actually runs over padded segments).
+        gpu.attention_rows_softmax_f16(&sc, &p16, n, n, 0, n_valid)
+            .map_err(|e| format!("softmax h{h}: {e:?}"))?;
         let v_h = v_dev.sub_offset(khd * hd, (n - 1) * kvd + hd);
         gpu.copy_rows_strided_f32(&v_h, &vh, n, hd, kvd, hd, 0, None)
             .map_err(|e| format!("V gather h{h}: {e:?}"))?;
         gpu.transpose_f32(&vh, &vht, n, hd).map_err(|e| format!("V transpose h{h}: {e:?}"))?;
         gpu.cast_f32_to_f16(&vht, &vht16).map_err(|e| format!("cast V h{h}: {e:?}"))?;
-        gpu.gemm_f16_x_f16_wmma_lds_auto_ld(&vht16, &p16, &o, None, hd, n, n, n, n)
+        gemm_production(&vht16, &p16, &o, hd, n, n, n, n, false, &mut gpu)
             .map_err(|e| format!("PV h{h}: {e:?}"))?;
         gpu.copy_rows_strided_f32(&o, &ctx, n, hd, hd, qd, h * hd, None)
             .map_err(|e| format!("O scatter h{h}: {e:?}"))?;

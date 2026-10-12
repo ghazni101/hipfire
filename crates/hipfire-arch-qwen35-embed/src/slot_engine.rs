@@ -365,14 +365,27 @@ fn serve_batch(
             })
             .collect();
         let t_g = Instant::now();
-        let raw = encode_embeddings_batch(
+        let raw = match encode_embeddings_batch(
             gpu,
             &bundle.weights,
             &mut bundle.state,
             &bundle.config,
             &inputs,
-        )
-        .map_err(|e| format!("qwen35-embed: encode: {e}"))?;
+        ) {
+            Ok(raw) => raw,
+            // A failed group must not take the batch down: earlier groups'
+            // results are already staged, and killing the engine would make
+            // every caller (in flight AND queued) wait for a reply that can
+            // never arrive. Error this group's requests and keep going.
+            Err(e) => {
+                for &i in group {
+                    let p = &prepared[i];
+                    results[p.cmd][p.slot] =
+                        Some(Err(format!("qwen35-embed: encode: {e}")));
+                }
+                continue;
+            }
+        };
         if trace {
             let rows: usize = group
                 .iter()
@@ -447,8 +460,9 @@ fn reply(cmds: Vec<Cmd>, early: Vec<Vec<Option<String>>>, stats: &Arc<Mutex<Engi
         .collect();
     if let Ok(mut s) = stats.lock() {
         for row in &out {
-            s.note_rejected();
-            let _ = row;
+            for _ in row {
+                s.note_rejected();
+            }
         }
     }
     finish(cmds, out);

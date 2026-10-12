@@ -28,8 +28,7 @@
 //! with Σ max dot — `hipfire_arch_qwen35_embed::maxsim`).
 
 use hipfire_arch_qwen35_embed::{
-    assemble_input, encode_embeddings, forward::EncodeInput, l2_normalize_rows, maxsim,
-    skiplist_mask, InputKind,
+    assemble_input, encode_embeddings, forward::EncodeInput, maxsim, InputKind,
 };
 use hipfire_engine::emit::emit_uncorrelated_error;
 use hipfire_loader::LoadedModel;
@@ -158,38 +157,15 @@ pub fn generate_embed(
         Err(e) => return fail(stdout, id, e),
     };
     let d_encode = t_encode.elapsed();
+    // MultiVectorMask + Normalize — via the shared `finalize_embeddings` so
+    // the sequential and slot routes cannot drift (the helper is exactly
+    // this mask/protect/normalize sequence; duplicating it here would make
+    // a future skiplist change silently diverge the two paths).
     let dim = bundle.config.dense_out_features;
-    if raw.len() != n_input * dim {
-        return fail(
-            stdout,
-            id,
-            format!(
-                "embed: encoder returned {} floats for {n_input}×{dim}",
-                raw.len()
-            ),
-        );
-    }
-
-    // MultiVectorMask + Normalize (host, pure math).
-    let protected = [
-        bundle.marker_id(kind),
-        bundle.config.vision_start_token_id,
-        bundle.config.image_token_id,
-        bundle.config.vision_end_token_id,
-    ];
-    let mask = if bundle.config.kind_skiplist(kind) {
-        skiplist_mask(&assembled.ids, bundle.skiplist_ids_of(), &protected)
-    } else {
-        vec![true; n_input]
+    let (embeddings, n_tokens) = match bundle.finalize_embeddings(kind, &assembled.ids, &raw) {
+        Ok(x) => x,
+        Err(e) => return fail(stdout, id, e),
     };
-    let mut embeddings: Vec<f32> = raw
-        .chunks_exact(dim)
-        .enumerate()
-        .filter(|(i, _)| mask[*i])
-        .flat_map(|(_, row)| row.iter().copied())
-        .collect();
-    let n_tokens = embeddings.len() / dim;
-    l2_normalize_rows(&mut embeddings, dim);
     let d_post = t_encode.elapsed() - d_encode;
 
     let payload = serde_json::json!({

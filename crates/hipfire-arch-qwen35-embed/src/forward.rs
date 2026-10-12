@@ -46,6 +46,37 @@ pub struct EncodeInput<'a> {
     pub pos3: &'a [[i32; 3]],
 }
 
+/// LDS-tile selection for the eager attention GEMMs, shared with
+/// `Enc::gemm_ld` — `cands` is the caller's preference order, `m`/`batch` the
+/// GEMM's M/N. Public so `examples/attn_eager_parity` can run the same
+/// dispatch production uses instead of a different kernel.
+pub fn attention_lds_tile(cands: &[LdsTile], m: usize, batch: usize) -> Option<LdsTile> {
+    cands
+        .iter()
+        .copied()
+        .find(|t| t.bm <= m && t.bn <= batch && Gpu::LDS_TILE_VARIANTS.contains(t))
+}
+
+/// The QK^T tile preference list (contract dim is small head_dim) —
+/// mirrors `Enc::gemm_ld(qk=true)`.
+pub fn attention_qk_tiles() -> [LdsTile; 3] {
+    [
+        LdsTile::new(128, 128, 32, 64, 64, false).pipelined(),
+        LdsTile::new(128, 128, 64, 64, 64, false),
+        LdsTile::new(64, 64, 32, 64, 64, false),
+    ]
+}
+
+/// The PV tile preference list (contract dim is the row count) —
+/// mirrors `Enc::gemm_ld(qk=false)`.
+pub fn attention_pv_tiles() -> [LdsTile; 3] {
+    [
+        LdsTile::new(128, 128, 64, 64, 64, false),
+        LdsTile::new(128, 128, 32, 64, 64, false),
+        LdsTile::new(64, 64, 32, 64, 64, false),
+    ]
+}
+
 /// Small scratch wrapper: alloc/upload/free + the f16 GEMM dispatch. A
 /// stripped `TextGpu` (that one is `pub(crate)` in hipfire-arch-diffusion),
 /// with the WMMA/naive split copied from qwen35-vl's `linear_f16`.
@@ -148,11 +179,9 @@ impl<'a> Enc<'a> {
     /// M-tiles). `examples/bench_gemm_tiles` measured both — auto is 1.7x off
     /// the best tile on the PV shape (0.535 -> 0.315 ms) and 8% off on QK^T.
     fn attn_tile(cands: &[LdsTile], m: usize, batch: usize) -> Option<LdsTile> {
-        cands
-            .iter()
-            .copied()
-            .find(|t| t.bm <= m && t.bn <= batch && Gpu::LDS_TILE_VARIANTS.contains(t))
+        attention_lds_tile(cands, m, batch)
     }
+
 
     /// One attention GEMM with a measured tile where the shape allows one.
     /// `qk` selects the candidate list: QK^T contracts over head_dim (small K),
@@ -171,17 +200,9 @@ impl<'a> Enc<'a> {
         qk: bool,
     ) -> Result<(), rdna_compute::HipError> {
         let cands = if qk {
-            [
-                LdsTile::new(128, 128, 32, 64, 64, false).pipelined(),
-                LdsTile::new(128, 128, 64, 64, 64, false),
-                LdsTile::new(64, 64, 32, 64, 64, false),
-            ]
+            attention_qk_tiles()
         } else {
-            [
-                LdsTile::new(128, 128, 64, 64, 64, false),
-                LdsTile::new(128, 128, 32, 64, 64, false),
-                LdsTile::new(64, 64, 32, 64, 64, false),
-            ]
+            attention_pv_tiles()
         };
         if let Some(tile) = Self::attn_tile(&cands, m, batch) {
             // `attn_tile` only returns tiles present in LDS_TILE_VARIANTS.
@@ -410,13 +431,36 @@ impl<'a> Enc<'a> {
         // unless `HIPFIRE_EMBED_ATTN=naive` asks for the one-block-per-row
         // reference — that kernel is correct for any shape but re-reads all of
         // K/V per query row, which is ~82% of the encode at N=4096.
+        //
+        // Padding: since the eager-path pad landed, a segment with
+        // `n_valid >= 256` has `rows` padded up to a 64 multiple and its
+        // K/V rows past `n_valid` are zeros. Any fallback kernel must still
+        // mask them — `attention_text_f32` gets an f32 key mask, the tiled
+        // kernel takes `n_valid` as its key bound.
         if embed_attn_naive() {
-            return self.gpu.attention_text_f32(
+            if n == n_valid {
+                return self.gpu.attention_text_f32(
+                    q,
+                    k,
+                    v,
+                    None,
+                    None,
+                    ctx,
+                    n,
+                    cfg.n_heads,
+                    cfg.n_kv_heads,
+                    cfg.head_dim,
+                    1.0 / (cfg.head_dim as f32).sqrt(),
+                    false,
+                );
+            }
+            let mask = self.key_mask(n, n_valid)?;
+            let r = self.gpu.attention_text_f32(
                 q,
                 k,
                 v,
                 None,
-                None,
+                Some(&mask),
                 ctx,
                 n,
                 cfg.n_heads,
@@ -425,12 +469,24 @@ impl<'a> Enc<'a> {
                 1.0 / (cfg.head_dim as f32).sqrt(),
                 false,
             );
+            self.free(mask)
+                .map_err(|e| rdna_compute::HipError::new(0, &e))?;
+            return r;
         }
         // The eager-attention decomposition needs n % 64 == 0 (the PV GEMM
-        // contracts over n). Short inputs, and anything the knob turns off,
-        // take the tiled SIMT kernel — which handles any n and is cheap at
-        // small n precisely because its cost is O(n^2).
-        if !embed_attn_no_gemm() && n % 64 == 0 && n >= 256 {
+        // contracts over n) and head_dim % 64 == 0 (the LDS-tiled WMMA GEMM's
+        // K), plus a wave32-WMMA-capable arch. Short inputs, shapes the GEMM
+        // cannot take, and arches without wave32 WMMA take the tiled SIMT
+        // kernel — which handles any n and is cheap at small n precisely
+        // because its cost is O(n^2).
+        let wmma =
+            self.gpu.arch_caps.has_wmma_w32() || self.gpu.arch_caps.has_wmma_w32_gfx12();
+        if !embed_attn_no_gemm()
+            && n % 64 == 0
+            && n >= 256
+            && cfg.head_dim % 64 == 0
+            && wmma
+        {
             return self
                 .attention_gemm(q, k, v, ctx, n, n_valid, cfg)
                 .map_err(|e| rdna_compute::HipError::new(0, &e));
@@ -441,10 +497,22 @@ impl<'a> Enc<'a> {
             v,
             ctx,
             n,
+            n_valid,
             cfg.n_heads,
             cfg.n_kv_heads,
             cfg.head_dim,
         )
+    }
+
+    /// f32 `[n]` key mask for the naive attention path: 1.0 over the real
+    /// tokens, 0.0 over the padding rows. Built on host and uploaded — the
+    /// knob it serves is a debug A/B path, not a hot one.
+    fn key_mask(&mut self, n: usize, n_valid: usize) -> Result<GpuTensor, rdna_compute::HipError> {
+        let mut host = vec![0f32; n];
+        for v in host.iter_mut().take(n_valid.min(n)) {
+            *v = 1.0;
+        }
+        self.gpu.upload_f32(&host, &[n])
     }
 
     fn sigmoid_mul(&mut self, out: &GpuTensor, gate: &GpuTensor) -> Result<(), String> {

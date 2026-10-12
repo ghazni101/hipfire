@@ -84,15 +84,21 @@ pub fn skiplist_mask(
 }
 
 /// L2-normalize each row of a `[n, dim]` row-major matrix in place.
-/// Zero rows pass through as zero (no NaN).
+///
+/// Zero rows pass through as zero. A row with a non-finite norm (NaN or an
+/// overflow to +inf) would otherwise flow to the wire raw or scaled to
+/// ~garbage — a kernel fault or a pathological input should surface as a
+/// zero row, not as a NaN vector a MaxSim consumer can rank.
 pub fn l2_normalize_rows(m: &mut [f32], dim: usize) {
     for row in m.chunks_exact_mut(dim) {
         let norm: f32 = row.iter().map(|x| x * x).sum();
-        if norm > 0.0 {
+        if norm > 0.0 && norm.is_finite() {
             let inv = 1.0 / norm.sqrt();
             for x in row.iter_mut() {
                 *x *= inv;
             }
+        } else if !norm.is_finite() {
+            row.iter_mut().for_each(|x| *x = 0.0);
         }
     }
 }
