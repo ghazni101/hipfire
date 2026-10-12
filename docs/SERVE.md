@@ -144,7 +144,20 @@ Config and env owners for bind, idle, queue, and body limits:
    can produce different greedy text than serial requests at ≥4 slots; output
    is deterministic for a fixed batch composition. 2 slots matched serial in
    earlier testing; on 35B-A3B MoE checkpoints they diverged from serial on
-   1–4 of 4 prompts. A waiter that is still queued after `serve.queue_timeout_ms`
+   1–4 of 4 prompts.
+
+   The **embedding** route (arch 17) uses the same switch with a different
+   engine behind it: `POST /v1/embeddings` requests arriving together are
+   served as **one batched forward** rather than one at a time, and because the
+   encoder is deterministic (no KV, GDN state reset per sequence) that batch is
+   **bit-identical** to encoding each input alone — batching is a throughput
+   choice there, never an output change (`scripts/check_embed_multislot.py`
+   checks it bit-for-bit). `serve.multi_slot_slots` is the number of requests
+   one forward may hold and `serve.max_batch_tokens` its row budget; an
+   isolated request pays only the collector's window
+   (`HIPFIRE_EMBED_BATCH_WINDOW_US`, default 2 ms). Measured on gfx1101, eight
+   concurrent 9-token queries: 96 ms serial (83 req/s) against a 16 ms
+   concurrent batch (501 req/s, **6.0x**) — all eight in one forward. A waiter that is still queued after `serve.queue_timeout_ms`
    (default 10 minutes, long enough for one full generation; `0` waits
    forever) gets
    **503** "server busy" with `Retry-After`. A failed `accept` (for example,
