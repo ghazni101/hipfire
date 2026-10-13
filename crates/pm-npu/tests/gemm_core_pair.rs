@@ -57,6 +57,9 @@ fn drain(core: &mut Core, epi: core::Epilogue, layout: &core::PairLayout) {
             } } } }
             core.outputs8.push(result);
         }
+        // The pair core refuses direct BF16 at program-assembly time
+        // ("direct BF16 is a G80-only epilogue"), so no run can get here.
+        core::Epilogue::Bf16 => unreachable!("direct BF16 is a G80-only epilogue"),
     }
     tile.release(core::C_EMPTY as usize, 1).unwrap();
 }
@@ -106,7 +109,7 @@ fn pair_exact(kc: usize, tiles: usize, epi: core::Epilogue, ctl: core::Control) 
     assert!(l_done && u_done, "{label}: did not finish");
     drain(&mut l, epi, &layout); drain(&mut u, epi, &layout);
     for (core, half) in [(&l, 0usize), (&u, 1)] {
-        let count = match epi { core::Epilogue::I32 => core.outputs.len(), core::Epilogue::Int8 { .. } => core.outputs8.len() };
+        let count = match epi { core::Epilogue::I32 => core.outputs.len(), core::Epilogue::Int8 { .. } => core.outputs8.len(), core::Epilogue::Bf16 => unreachable!("direct BF16 is a G80-only epilogue") };
         assert_eq!(count, tiles, "{label}: core {half} outputs");
         for (wave, reference) in expected.iter().enumerate() {
             for row in 0..M { for col in 0..64 {
@@ -115,6 +118,7 @@ fn pair_exact(kc: usize, tiles: usize, epi: core::Epilogue, ctl: core::Control) 
                     core::Epilogue::I32 => assert_eq!(core.outputs[wave][row * 64 + col], c, "{label}: core {half} wave {wave} ({row},{col})"),
                     core::Epilogue::Int8 { shift } => assert_eq!(core.outputs8[wave][row * 64 + col], (c >> shift).clamp(-128, 127) as i8,
                         "{label}: core {half} wave {wave} ({row},{col}) c={c}"),
+                    core::Epilogue::Bf16 => unreachable!("direct BF16 is a G80-only epilogue"),
                 }
             } }
         }
