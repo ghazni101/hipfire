@@ -1390,6 +1390,7 @@ fn pointer_effects(kernel: &str) -> Option<Vec<PointerEffect>> {
         ]),
         "sigmoid_mul_f32" => Some(vec![write(0), read(8)]),
         "gemma4_ple_gelu_mul_strided_f32" => Some(vec![read(0), read(8), write(16)]),
+        "attention_scores_band_mask_f32" => Some(vec![write(0)]),
         _ => None,
     }
 }
@@ -1741,6 +1742,7 @@ fn expected_kernarg_bytes(kernel: &str) -> Option<usize> {
         | "hc_input_map_4stream"
         | "sigmoid_mul_f32" => Some(32),
         "gemma4_ple_gelu_mul_strided_f32" => Some(48),
+        "attention_scores_band_mask_f32" => Some(24),
         "attention_flash_q8_0_reduce"
         | "attention_flash_reduce_dsplit_gfx1201"
         | "attention_flash_reduce_dsplit_gfx1151"

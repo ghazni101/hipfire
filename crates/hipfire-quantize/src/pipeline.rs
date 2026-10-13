@@ -2257,7 +2257,7 @@ pub(crate) fn run() {
     // config.json. Same key schema the loader's `apply_st_config` /
     // `apply_mask_config` read, so the loader consumes the fold with no
     // second parser.
-    let st_sidecar: Option<serde_json::Value> = if arch_id == 17 {
+    let st_sidecar: Option<serde_json::Value> = if arch_id == 17 || arch_id == 18 {
         let read = |rel: &str| -> Option<serde_json::Value> {
             std::fs::read_to_string(input_dir.join(rel))
                 .ok()
@@ -2786,6 +2786,17 @@ pub(crate) fn run() {
             .iter()
             .any(|(n, _)| n.starts_with("model.language_model."));
 
+    // EmbeddingGemma 2 (arch 18): same text-only bring-up — the checkpoint
+    // is a bare composite, so the trunk tensors start at `language_model.`
+    // and the vision/audio towers + projectors (`vision_tower.*`,
+    // `audio_tower.*`, `embed_vision.*`, `embed_audio.*`) are skipped: this
+    // implementation serves the text embedding path only and refuses
+    // multimodal input at assembly.
+    let eg2_skip_non_lm = arch_id == 18
+        && all_tensors
+            .iter()
+            .any(|(n, _)| n.starts_with("language_model."));
+
     if use_mq4v2_lloyd {
         lloyd_v2_stats_reset();
     }
@@ -2811,6 +2822,13 @@ pub(crate) fn run() {
         // is the fix (it used to land on the text-quantize tail).
         let vision_group = is_vision_group_tensor(name);
         if vision_group && !include_vision {
+            let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
+            let n: usize = meta.shape.iter().product();
+            skipped_params += n as u64;
+            continue;
+        }
+        // EmbeddingGemma 2 (arch 18): text-only — see `eg2_skip_non_lm`.
+        if eg2_skip_non_lm && !name.starts_with("language_model.") {
             let (meta, _) = st_files[*file_idx].tensor_data(name).unwrap();
             let n: usize = meta.shape.iter().product();
             skipped_params += n as u64;
@@ -6125,7 +6143,16 @@ fn handle_main_quant(
     // as f16 and refuses a compressed tier. Everything else quantizes as
     // usual; norms already fall out via should_quantize.
     let keep_dense_head = arch_id == 17 && name == "linear.weight";
-    if !keep_dense_head && should_quantize(name) && n_elements >= 32 {
+    // EmbeddingGemma 2's `embedding_projection` is the final pooled-vector
+    // head — kept raw like arch 17's Dense. (768×512 ≈ 0.4M params: no size
+    // win worth a retrieval-quality cost.)
+    let keep_eg2_head = arch_id == 18
+        && name.ends_with("embedding_projection.weight")
+        && !name.starts_with("embed_");
+    if keep_eg2_head {
+        // fall through to the raw path below unchanged
+    }
+    if !keep_dense_head && !keep_eg2_head && should_quantize(name) && n_elements >= 32 {
         let f32_data =
             tensor_to_f32_with_optional_fp8_scale(name, raw_data, meta, &fp8_scale_for, &st_files);
         *state.quantized_params += n_elements as u64;

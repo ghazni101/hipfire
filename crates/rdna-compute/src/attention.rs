@@ -3149,6 +3149,50 @@ impl Gpu {
         result
     }
 
+    /// Additive band mask for bidirectional sliding-window scores: sets
+    /// `S[row, col]` to a large finite negative where `|row - col| > window`
+    /// (embeddinggemma2's sliding layers; inclusive radius — see
+    /// `kernels/src/attention_band_mask.hip`). In-place on the `[rows, cols]`
+    /// f32 score matrix the eager attention materializes; composes with
+    /// `attention_rows_softmax_f16`'s padding column bound.
+    pub fn attention_scores_band_mask_f32(
+        &mut self,
+        scores: &GpuTensor,
+        rows: usize,
+        cols: usize,
+        window: usize,
+    ) -> HipResult<()> {
+        self.bind_thread()?;
+        self.ensure_kernel(
+            "attention_band_mask",
+            kernels::ATTENTION_BAND_MASK_SRC,
+            "attention_scores_band_mask_f32",
+        )?;
+        let mut sp = scores.buf.as_ptr();
+        let mut r = rows as i32;
+        let mut c = cols as i32;
+        let mut w = window as i32;
+        let mut params: Vec<*mut c_void> = vec![
+            &mut sp as *mut _ as *mut c_void,
+            &mut r as *mut _ as *mut c_void,
+            &mut c as *mut _ as *mut c_void,
+            &mut w as *mut _ as *mut c_void,
+        ];
+        let block = 256u32;
+        let grid = [(cols as u32 + block - 1) / block, rows as u32, 1];
+        let result = unsafe {
+            self.hip.launch_kernel(
+                &self.functions["attention_scores_band_mask_f32"],
+                grid,
+                [block, 1, 1],
+                0,
+                self.stream_ref(),
+                &mut params,
+            )
+        };
+        result
+    }
+
     /// Q-tiled **bidirectional** attention with separate Q/K/V and GQA —
     /// the arch-17 embedding encoder's full-attention layer.
     ///

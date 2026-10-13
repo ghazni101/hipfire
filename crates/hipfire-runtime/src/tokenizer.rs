@@ -553,6 +553,14 @@ pub struct Tokenizer {
     pub eot_id: Option<u32>,
     /// True for GPT-2 BPE (Qwen), false for SentencePiece (LLaMA).
     is_gpt2_bpe: bool,
+    /// Exact merge-rank BPE for ▁-style (SentencePiece-derived) HF BPE
+    /// vocabularies — the Gemma family shape: normalizer Replace(' '→'▁'),
+    /// character-identity base symbols, `<0xXX>` byte fallback, merges over
+    /// the whole normalized string. Off by default; enabled per-arch by the
+    /// loaders that need it via [`Self::enable_sp_bpe_merges`] because the
+    /// default SP path (greedy longest match) is what every existing arch's
+    /// token streams were built on.
+    sp_bpe: bool,
     /// HF BPE `ignore_merges`: try the entire byte-encoded pre-token in the
     /// model vocabulary before applying merges. `Some(max_raw_bytes)` enables
     /// the lookup and bounds it to tokens that could exist in that vocabulary.
@@ -863,6 +871,7 @@ impl Tokenizer {
             sp_dummy_prefix,
             hf_pretok: None,
             normalizer_nfc: false,
+            sp_bpe: false,
             token_bytes_cache: std::sync::OnceLock::new(),
         })
     }
@@ -1038,6 +1047,7 @@ impl Tokenizer {
             sp_dummy_prefix,
             hf_pretok,
             normalizer_nfc,
+            sp_bpe: false,
             token_bytes_cache: std::sync::OnceLock::new(),
         })
     }
@@ -1226,6 +1236,7 @@ impl Tokenizer {
             sp_dummy_prefix,
             hf_pretok: None,
             normalizer_nfc: false,
+            sp_bpe: false,
             token_bytes_cache: std::sync::OnceLock::new(),
         })
     }
@@ -1413,6 +1424,9 @@ impl Tokenizer {
 
     /// Encode without special token handling.
     fn encode_raw(&self, text: &str) -> Vec<u32> {
+        if self.sp_bpe {
+            return self.encode_sp_bpe(text);
+        }
         if !self.is_gpt2_bpe {
             return self.encode_sentencepiece(text);
         }
@@ -1516,6 +1530,88 @@ impl Tokenizer {
             }
         }
         tokens
+    }
+
+    /// Switch this tokenizer to the exact merge-rank BPE path for
+    /// ▁-style (SentencePiece-derived) HF BPE vocabularies — the Gemma
+    /// family shape, where the serialized `tokenizer.json` is a BPE model
+    /// over ▁-normalized text with character-identity base symbols and
+    /// `<0xXX>` byte fallback.
+    ///
+    /// Why an explicit opt-in: the default SentencePiece path is greedy
+    /// longest-match, which is what every existing arch's token streams and
+    /// pinned tests were built on — flipping it globally would silently
+    /// re-tokenize them. But greedy ≠ BPE on these vocabularies: measured on
+    /// `google/embeddinggemma-2`'s tokenizer, greedy diverges from HF
+    /// `tokenizers` on every one of 24 sampled prompts (benchmarks/prompts
+    /// + unicode/emoji/code), so an arch that needs HF-exact ids enables
+    /// this instead. No-op when there are no merge rules or the tokenizer is
+    /// GPT-2 byte-level (that path already runs merges).
+    pub fn enable_sp_bpe_merges(&mut self) {
+        if !self.is_gpt2_bpe && !self.merges.is_empty() {
+            self.sp_bpe = true;
+        }
+    }
+
+    /// ▁-style BPE over the whole normalized string (see
+    /// [`Self::enable_sp_bpe_merges`]): replace `' '`→`▁` (no prepend on
+    /// this family — the HF normalizer is a plain `Replace`), seed one
+    /// symbol per character (byte-fallback tokens for characters the
+    /// vocabulary lacks), then the shared rank-ordered merge. The HF
+    /// pre-tokenizer (`Split(' ', MergedWithPrevious)`) cannot fire after
+    /// the replacement, so the merge runs across the whole sequence —
+    /// multi-word `▁of▁the` pieces are real and only the merge ranks decide
+    /// whether they form.
+    fn encode_sp_bpe(&self, text: &str) -> Vec<u32> {
+        let mut normalized = String::with_capacity(text.len());
+        for ch in text.chars() {
+            normalized.push(if ch == ' ' { '\u{2581}' } else { ch });
+        }
+
+        // Seed symbols. A byte-fallback piece is looked up per UTF-8 byte of
+        // an out-of-vocabulary character (Gemma's `<0xE6>`-style tokens,
+        // uppercase hex per the SentencePiece convention). A vocabulary with
+        // neither the piece nor its bytes falls back to `<unk>` — and a
+        // vocabulary without even that drops the character (the same
+        /// contract as `encode_sentencepiece`'s single-char fallback).
+        let mut syms: Vec<u32> = Vec::with_capacity(normalized.chars().count());
+        let mut byte_piece = String::with_capacity(8);
+        for ch in normalized.chars() {
+            let mut buf = [0u8; 4];
+            let piece = ch.encode_utf8(&mut buf);
+            if let Some(&id) = self.token_to_id.get(piece) {
+                syms.push(id);
+                continue;
+            }
+            let mut resolved = 0usize;
+            for &b in piece.as_bytes() {
+                byte_piece.clear();
+                let _ = core::fmt::Write::write_fmt(&mut byte_piece, format_args!("<0x{b:02X}>"));
+                if let Some(&id) = self.token_to_id.get(byte_piece.as_str()) {
+                    syms.push(id);
+                    resolved += 1;
+                }
+            }
+            if resolved < piece.len() {
+                if let Some(&id) = self.token_to_id.get("<unk>") {
+                    // Replace this character's partial byte tokens with one
+                    // unknown token (fuse_unk=false keeps independent bytes,
+                    // but a half-resolvable character must not silently lose
+                    // its unresolved bytes).
+                    syms.truncate(syms.len() - resolved);
+                    syms.push(id);
+                } else if resolved == 0 {
+                    // No byte tokens, no <unk>: drop the character.
+                    continue;
+                } else {
+                    syms.truncate(syms.len() - resolved);
+                }
+            }
+        }
+
+        let mut out = Vec::with_capacity(syms.len());
+        self.bpe_merge_symbols(syms, &mut out);
+        out
     }
 
     /// GPT-2 BPE encoding (for Qwen3, etc.)
@@ -1635,9 +1731,26 @@ impl Tokenizer {
         // (was ~50ms per encode for Qwen3+ with ~150K merges; the daemon
         // makes 9+ encode calls per request for chat-template scaffolding,
         // so the per-call rebuild added ~450ms to TTFT for short prompts).
+        self.bpe_merge_symbols(syms, out);
+    }
+
+    /// The shared rank-ordered BPE merge (steps 3–7 of the PQ algorithm —
+    /// see `encode_gpt2_bpe`'s docs for the byte-identicality contract).
+    /// `syms` are the initial symbol ids; the merged sequence is appended to
+    /// `out` in order. Shared by the GPT-2 byte-level path (initial symbols
+    /// from `byte_to_id`) and the SP-BPE path (character-identity symbols —
+    /// see [`Self::enable_sp_bpe_merges`]).
+    fn bpe_merge_symbols(&self, mut syms: Vec<u32>, out: &mut Vec<u32>) {
+        let n = syms.len();
+        if n == 0 {
+            return;
+        }
+        if n == 1 {
+            out.push(syms[0]);
+            return;
+        }
         let merge_pair_rank = &self.merge_pair_rank;
         let merges = &self.merges;
-
         // 3. Doubly-linked-list state. `prev/next` are i32 with -1 sentinel.
         let mut prev: Vec<i32> = (0..n as i32).map(|i| i - 1).collect();
         let mut next: Vec<i32> = (0..n as i32)
@@ -1742,6 +1855,17 @@ impl Tokenizer {
 
     pub fn vocab_size(&self) -> usize {
         self.vocab.len()
+    }
+
+    /// The largest token id this tokenizer can emit (max id over the vocab
+    /// map and the added tokens), or `None` for an empty vocabulary.
+    ///
+    /// This is the bound a caller embedding rows must check — NOT
+    /// [`Self::vocab_size`], whose vector is pre-padded past the last real
+    /// id (from_hf_json reserves +100 slots for added tokens), so it
+    /// over-reports for every HF-JSON tokenizer.
+    pub fn max_token_id(&self) -> Option<u32> {
+        self.token_to_id.values().copied().max()
     }
 
     /// Read-only view of the full vocabulary by token id. Index `i` is the
@@ -2446,6 +2570,43 @@ impl TokenTextStream {
 mod token_text_stream_tests {
     use super::*;
 
+    #[test]
+    fn sp_bpe_merges_match_rank_bpe_with_byte_fallback() {
+        // Gemma-style ▁-BPE: character-identity symbols, space→▁ replacement
+        // (no prepend), rank-ordered merges across the whole string, and
+        // <0xXX> byte fallback for out-of-vocabulary characters.
+        let json = serde_json::json!({
+            "model": {"type": "BPE",
+                "vocab": {"a": 1, "b": 2, "\u{2581}": 3, "\u{2581}ab": 4, "ab": 5,
+                          "<unk>": 6, "<0xC3>": 9, "<0xA9>": 10},
+                "merges": ["a b", "\u{2581} ab"]},
+            "added_tokens": []
+        });
+        let mut tok = Tokenizer::from_hf_json(&json.to_string()).unwrap();
+        tok.enable_sp_bpe_merges();
+        // Without the ▁ prepend, "ab" starts bare; the a-b merge fires.
+        assert_eq!(tok.encode("ab"), vec![5]);
+        assert_eq!(tok.encode(" ab"), vec![4]);
+        // The ▁ between the letters blocks the a-b merge.
+        assert_eq!(tok.encode("a b"), vec![1, 3, 2]);
+        // é (U+00E9) is not in the vocabulary: its two UTF-8 bytes
+        // byte-fall back to the <0xC3> <0xA9> tokens.
+        assert_eq!(tok.encode("\u{e9}"), vec![9, 10]);
+        // One merge problem spans the whole string.
+        assert_eq!(tok.encode("ab ab"), vec![5, 4]);
+        // A vocab without merges (plain SentencePiece) must stay greedy —
+        // enabling is a no-op there.
+        let sp_only = serde_json::json!({
+            "model": {"type": "BPE",
+                "vocab": {"a": 1, "ab": 2}, "merges": []},
+            "added_tokens": []
+        });
+        let mut tok2 = Tokenizer::from_hf_json(&sp_only.to_string()).unwrap();
+        tok2.enable_sp_bpe_merges();
+        assert_eq!(tok2.encode("aa"), vec![1, 1]);
+    }
+
+
     const LITERALS: &[&str] = &["hello", "中", "🎉", " world", "∑", "!"];
 
     /// SentencePiece vocab with full byte fallback: ids 0..=255 are the
@@ -2471,6 +2632,7 @@ mod token_text_stream_tests {
             add_bos: false,
             eot_id: None,
             is_gpt2_bpe: false,
+            sp_bpe: false,
             ignore_merges_max_chunk_bytes: None,
             sp_dummy_prefix: false,
             hf_pretok: None,
@@ -2616,6 +2778,7 @@ mod bpe_tests {
             add_bos: false,
             eot_id: None,
             is_gpt2_bpe: true,
+            sp_bpe: false,
             ignore_merges_max_chunk_bytes: None,
             sp_dummy_prefix: true,
             hf_pretok: None,
@@ -3467,6 +3630,7 @@ mod sp_tests {
             add_bos: false,
             eot_id: None,
             is_gpt2_bpe: false,
+            sp_bpe: false,
             ignore_merges_max_chunk_bytes: None,
             // The pre-existing SP unit tests below were written against the
             // unconditional-prefix behavior; keep them on the LLaMA

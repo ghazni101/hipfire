@@ -247,6 +247,19 @@ pub fn retry_candidate_reset_inventory() -> &'static [ResetCoreCoverage] {
             reason: "qwen35-embed is one-shot per request — nothing to retry-reset",
         },
     };
+    const EMBEDDING_GEMMA2: ResetCoreCoverage = ResetCoreCoverage {
+        arch: "embeddinggemma2",
+        recurrent_or_conv: false,
+        s_ef_residual: false,
+        kv_or_aux_caches: false,
+        graphs: false,
+        drafter: false,
+        adaptive: false,
+        host_position_and_conversation: false,
+        eligibility: RetryResetEligibility::Ineligible {
+            reason: "embeddinggemma2 is one-shot per request — nothing to retry-reset",
+        },
+    };
     // Image-gen component (arch 40): never a text retry candidate.
     const FLUX: ResetCoreCoverage = ResetCoreCoverage {
         arch: "flux",
@@ -290,6 +303,7 @@ pub fn retry_candidate_reset_inventory() -> &'static [ResetCoreCoverage] {
         MUSE_GLIMMER,
         MAPLE,
         QWEN35_EMBED,
+        EMBEDDING_GEMMA2,
         FLUX,
         FLUX2,
     ]
@@ -588,6 +602,7 @@ mod tests {
                 14 => Some("muse_glimmer"),
                 15 => Some("maple"),
                 17 => Some("qwen35-embed"),
+                18 => Some("embeddinggemma2"),
                 40 => Some("flux"),
                 45 => Some("flux2"),
                 // Drafter sidecars (22, 23) are intentionally not retry

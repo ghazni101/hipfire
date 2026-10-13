@@ -9064,6 +9064,12 @@ pub const ATTENTION_ENCODER_QTILED_SRC: &str =
 pub const ATTENTION_ROWS_SOFTMAX_SRC: &str =
     include_str!("../../../kernels/src/attention_rows_softmax.hip");
 
+/// Additive band mask for bidirectional sliding-window attention scores
+/// (`Gpu::attention_scores_band_mask_f32`): S[i,j] := large-negative where
+/// |i-j| > window. See `kernels/src/attention_band_mask.hip`.
+pub const ATTENTION_BAND_MASK_SRC: &str =
+    include_str!("../../../kernels/src/attention_band_mask.hip");
+
 /// 2D rotary positional embedding for the Qwen3.5-VL vision tower. Rotates Q
 /// and K halves of the packed QKV buffer in-place using per-token cos/sin of
 /// size `head_dim/2`. See `kernels/src/apply_rope_2d_vision.hip`.

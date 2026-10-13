@@ -327,6 +327,7 @@ pub fn arch_label(arch_id: u32) -> &'static str {
         14 => "muse_glimmer",
         16 => "qwen4",
         17 => "qwen3_5_embed",
+        18 => "embedding_gemma2",
         40 => "flux_mmdit",
         45 => "flux2_mmdit",
         _ => "qwen3",
@@ -414,7 +415,7 @@ pub enum WireVerb {
 /// needs no change here; a new non-generating arch is added explicitly.
 pub fn wire_verb(arch_id: u32) -> WireVerb {
     match arch_id {
-        17 => WireVerb::Embed,
+        17 | 18 => WireVerb::Embed,
         _ => WireVerb::Generate,
     }
 }
@@ -491,6 +492,7 @@ const REGISTRY: &[&dyn Carrier] = &[
     &MuseGlimmerCarrier,
     &FluxDiffusionCarrier,
     &Qwen35EmbedCarrier,
+    &EmbeddingGemma2Carrier,
 ];
 
 // ─── Constants ────────────────────────────────────────────────────────
@@ -1254,6 +1256,16 @@ impl LoadedModel {
     pub fn qwen35_embed_mut(&mut self) -> Option<&mut hipfire_arch_qwen35_embed::EmbedBundle> {
         self.state.as_deref_mut().and_then(|s| {
             (s as &mut dyn Any).downcast_mut::<hipfire_arch_qwen35_embed::EmbedBundle>()
+        })
+    }
+
+    /// EmbeddingGemma-2 bundle if this model is arch_id=18, else `None`.
+    /// The daemon `embed` verb's typed handle.
+    pub fn embeddinggemma2_mut(
+        &mut self,
+    ) -> Option<&mut hipfire_arch_embeddinggemma2::EmbedGemmaBundle> {
+        self.state.as_deref_mut().and_then(|s| {
+            (s as &mut dyn Any).downcast_mut::<hipfire_arch_embeddinggemma2::EmbedGemmaBundle>()
         })
     }
 

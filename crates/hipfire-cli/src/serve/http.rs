@@ -1452,12 +1452,17 @@ async fn handle_embeddings(
         .unwrap_or_else(|| "unknown".to_string());
 
     let id = request_id();
-    let request = serde_json::json!({
+    // Optional Matryoshka width (embeddinggemma2): forwarded verbatim; arches
+    // without MRL support refuse it in the embed body.
+    let mut request = serde_json::json!({
         "type": "embed",
         "id": id,
         "kind": kind,
         "input": input,
     });
+    if let Some(d) = body.get("dims") {
+        request["dims"] = d.clone();
+    }
 
     let (tx, rx) = tokio::sync::oneshot::channel::<Result<serde_json::Value, String>>();
     tokio::task::spawn_blocking(move || {

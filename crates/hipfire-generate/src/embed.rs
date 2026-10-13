@@ -115,14 +115,86 @@ pub fn generate_embed(
     };
     let image_bytes = image.as_deref();
 
+    // Matryoshka width (embeddinggemma2): optional `dims` on the request.
+    let dims = match req.get("dims").and_then(|v| v.as_u64()) {
+        None | Some(0) => 0usize,
+        Some(d) => d as usize,
+    };
+
+    // Arch 18 (EmbeddingGemma 2): single-vector body.
+    if let Some(bundle) = m.embeddinggemma2_mut() {
+        if image_bytes.is_some() {
+            return fail(
+                stdout,
+                id,
+                "embed: embeddinggemma2 is served text-only on this route — image inputs                  are refused (the checkpoint's vision/audio towers are not part of this                  implementation)"
+                    .into(),
+            );
+        }
+        if dims != 0 && dims > bundle.config.embedding_dim {
+            return fail(
+                stdout,
+                id,
+                format!(
+                    "embed: dims {dims} exceeds this model's embedding width {}",
+                    bundle.config.embedding_dim
+                ),
+            );
+        }
+        let assembled = match crate::embed::assemble_input_eg2(bundle, kind, &text) {
+            Ok(a) => a,
+            Err(e) => return fail(stdout, id, e),
+        };
+        let n_input = assembled.ids.len();
+        let input = hipfire_arch_embeddinggemma2::EncodeInput {
+            ids: &assembled.ids,
+        };
+        let raw = match hipfire_arch_embeddinggemma2::encode_embeddings(
+            gpu,
+            &bundle.weights,
+            &bundle.config,
+            &input,
+        ) {
+            Ok(v) => v,
+            Err(e) => return fail(stdout, id, e),
+        };
+        let out_dim = if dims == 0 { bundle.config.embedding_dim } else { dims };
+        let embeddings =
+            match bundle.finalize_embedding(&raw, n_input, dims) {
+                Ok(v) => v,
+                Err(e) => return fail(stdout, id, e),
+            };
+        let payload = serde_json::json!({
+            "type": "embedded",
+            "id": id,
+            "attempt_id": 0,
+            "kind": if kind == InputKind::Query { "query" } else { "document" },
+            "n_tokens": 1, // single-vector: one pooled embedding
+            "n_input_tokens": n_input,
+            "dim": out_dim,
+            "embeddings": embeddings,
+        });
+        let _ = writeln!(stdout, "{payload}");
+        let _ = stdout.flush();
+        return;
+    }
+
     // Typed handle: the daemon already refused non-embed arches.
     let Some(bundle) = m.qwen35_embed_mut() else {
         return fail(
             stdout,
             id,
-            "embed: loaded model is not a qwen3.5 embedding checkpoint (arch 17)".into(),
+            "embed: loaded model is not an embedding checkpoint (arch 17/18)".into(),
         );
     };
+    if dims != 0 {
+        return fail(
+            stdout,
+            id,
+            "embed: `dims` (Matryoshka truncation) applies to embeddinggemma2 (arch 18)              only; the arch-17 encoder is multi-vector with a fixed 128-d head"
+                .into(),
+        );
+    }
 
     // Phase timing under the same knob the encoder's own trace uses. For a
     // long document the GPU kernel sum is a small fraction of wall-clock, and
@@ -195,6 +267,21 @@ pub fn generate_embed(
     }
 }
 
+
+/// The arch-18 kinds are isomorphic to the arch-17 ones; map rather than
+/// re-parse.
+pub(crate) fn assemble_input_eg2(
+    bundle: &hipfire_arch_embeddinggemma2::EmbedGemmaBundle,
+    kind: InputKind,
+    text: &str,
+) -> Result<hipfire_arch_embeddinggemma2::AssembledInput, String> {
+    let k = match kind {
+        InputKind::Query => hipfire_arch_embeddinggemma2::InputKind::Query,
+        InputKind::Document => hipfire_arch_embeddinggemma2::InputKind::Document,
+    };
+    hipfire_arch_embeddinggemma2::assemble_input(bundle, k, text)
+}
+
 /// Late-interaction score between two already-encoded inputs (the CLI's
 /// `--score` path; the values are the `embeddings` arrays of an `embedded`
 /// event each).
@@ -242,11 +329,17 @@ pub fn generate_embed_slot(
         InputKind::Query => EmbedKind::Query,
         InputKind::Document => EmbedKind::Document,
     };
+    let dims = req
+        .get("dims")
+        .and_then(|v| v.as_u64())
+        .filter(|d| *d > 0)
+        .map(|d| d as usize);
     let mut out = match engine.encode(vec![EmbedRequest {
         kind: wire_kind,
         text,
         image,
         request_tag: id.to_string(),
+        dims,
     }]) {
         Ok(out) => out,
         Err(e) => return fail(stdout, id, e),

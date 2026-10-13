@@ -363,6 +363,10 @@ pub struct EmbedRequest {
     pub image: Option<Vec<u8>>,
     /// The wire request id, for diagnostics only.
     pub request_tag: String,
+    /// Matryoshka output width (embeddinggemma2, arch 18): truncate the
+    /// pooled vector to this many components and re-normalize. `None`/0 =
+    /// the model's full width. Ignored by arches without MRL support.
+    pub dims: Option<usize>,
 }
 
 /// One encode's result: the post-skiplist, L2-normalized token matrix
