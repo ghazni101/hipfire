@@ -272,12 +272,15 @@ pub fn load_weights(gpu: &mut Gpu, src: &ModelSource, cfg: &EmbedConfig) -> Resu
                 h,
                 h,
             )?,
+            // HF: Linear(ple_dim -> hidden), i.e. [hidden, ple_dim]. Equal
+            // widths on this release (512/512); a future checkpoint with a
+            // narrower PLE must fail here rather than mis-read.
             ple_proj: upload_lin_f16(
                 gpu,
                 src,
                 &format!("{p}.ple_block.per_layer_projection.weight"),
                 h,
-                h,
+                cfg.ple_dim,
             )?,
             ple_post_norm: upload_vec_f32(
                 gpu,

@@ -1547,6 +1547,11 @@ impl Tokenizer {
     /// + unicode/emoji/code), so an arch that needs HF-exact ids enables
     /// this instead. No-op when there are no merge rules or the tokenizer is
     /// GPT-2 byte-level (that path already runs merges).
+    /// Whether [`Self::enable_sp_bpe_merges`] actually engaged.
+    pub fn sp_bpe_merges_enabled(&self) -> bool {
+        self.sp_bpe
+    }
+
     pub fn enable_sp_bpe_merges(&mut self) {
         if !self.is_gpt2_bpe && !self.merges.is_empty() {
             self.sp_bpe = true;

@@ -41,6 +41,9 @@ CASES = [
     ("emoji", "query", "fire rocket 🚀🔥 lol"),
     ("one_char", "document", "x"),
     ("medium_doc", "document", ("The quick brown fox jumps over the lazy dog. " * 40).strip()),
+    # Past the 512-radius window and NOT 64-aligned: the eager path runs with
+    # both the sliding band mask and padding rows in play.
+    ("window_pad_doc", "document", ("The quick brown fox jumps over the lazy dog. " * 90).strip()),
     ("long_doc", "document", ("The quick brown fox jumps over the lazy dog. Pack my box with five dozen liquor jugs. " * 1200).strip()),
 ]
 

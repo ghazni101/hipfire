@@ -56,6 +56,17 @@ fn load_tokenizer(st: &dyn ModelSourceTrait, cfg: &EmbedConfig) -> Result<Tokeni
     // path with byte fallback. No-op for a tokenizer already so configured
     // (HFQ metadata auto-enables it for this arch).
     tok.enable_sp_bpe_merges();
+    // A Gemma-shaped tokenizer.json with an EMPTY merge list would silently
+    // keep the greedy SentencePiece path — the exact HF divergence this arch
+    // exists to avoid — so fail the load instead.
+    if !tok.sp_bpe_merges_enabled() {
+        return Err(
+            "embeddinggemma2: this tokenizer did not engage the merge-rank SP-BPE \
+             path (no merge rules in tokenizer.json?) — the greedy fallback \
+             diverges from HF on this vocabulary, refusing to load"
+                .into(),
+        );
+    }
     // The generic bos/eos heuristics (`<|endoftext|>` / `<s>`) do not know
     // Gemma's <bos>=2 / <eos>=1; the model config's ids are authoritative.
     tok.bos_id = cfg.bos_token_id;
@@ -186,6 +197,20 @@ pub fn assemble_input(
     let eos = cfg.eos_token_id;
     // The frame (bos + eos) is never truncated away.
     let room = limit.saturating_sub(2);
+    // A prompt that alone overflows the limit is a configuration mismatch —
+    // the encode would be nothing but a truncated prompt. Checked on the
+    // prompt's OWN tokenization (the framed body check below cannot see it:
+    // truncation makes any body fit).
+    let prompt_ids = bundle.tokenizer.encode(cfg.kind_prompt(kind));
+    if prompt_ids.len() > room {
+        return Err(format!(
+            "embeddinggemma2: kind prompt tokenizes to {} tokens, leaving no room \
+             for text under the {} limit (check the checkpoint's prompt/length \
+             sidecars)",
+            prompt_ids.len(),
+            limit
+        ));
+    }
     let ids = if body.len() > room {
         let mut ids = Vec::with_capacity(limit);
         ids.push(bos);
@@ -199,12 +224,10 @@ pub fn assemble_input(
         ids.push(eos);
         ids
     };
-    // A prompt that alone overflows the limit is a configuration mismatch —
-    // the encode would be nothing but a truncated prompt.
     if ids.len() < 3 {
         return Err(format!(
-            "embeddinggemma2: kind prompt tokenizes to {} tokens, leaving no room \
-             for text under the {} limit",
+            "embeddinggemma2: input framed to {} tokens under the {} limit — \
+             nothing left to pool",
             ids.len(),
             limit
         ));

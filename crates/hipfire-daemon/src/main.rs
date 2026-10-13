@@ -4579,7 +4579,7 @@ fn main() {
                         &mut stdout,
                         Some(id.as_str()),
                         "embed refused: loaded model is not an embedding checkpoint \
-                         (qwen3.5 multi-vector encoder) — use generate",
+                         (arch 17/18) — use generate",
                         "validation",
                         false,
                         false,

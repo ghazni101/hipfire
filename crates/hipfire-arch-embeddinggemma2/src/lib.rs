@@ -44,8 +44,10 @@
 //! audio tower and their projectors (`vision_tower.*`, `audio_tower.*`,
 //! `embed_vision.*`, `embed_audio.*`). This implementation serves the text
 //! embedding path only: the towers are neither loaded nor quantized, and an
-//! image/video/audio input is refused with an explicit error at assembly —
-//! never silently embedded as placeholder text.
+//! image/video/audio ATTACHMENT is refused with an explicit error at
+//! assembly. (Text that literally contains a placeholder token like
+//! `<|image|>` embeds as that token's row — the same thing the HF tokenizer
+//! does, so prompt-paste parity is preserved.)
 //!
 //! Numerics: activations f32, GEMM weights f16 (WMMA f16×f16 f32-accumulate)
 //! — the same tradeoff the qwen35-embed encoder makes, ~1e-3 relative vs an

@@ -115,10 +115,22 @@ pub fn generate_embed(
     };
     let image_bytes = image.as_deref();
 
-    // Matryoshka width (embeddinggemma2): optional `dims` on the request.
-    let dims = match req.get("dims").and_then(|v| v.as_u64()) {
-        None | Some(0) => 0usize,
-        Some(d) => d as usize,
+    // Matryoshka width (embeddinggemma2): optional `dims` on the request,
+    // strictly an unsigned integer — a float or string dims silently meaning
+    // "full width" is a protocol trap, not a convenience.
+    let dims = match req.get("dims") {
+        None | Some(serde_json::Value::Null) => 0usize,
+        Some(v) => match v.as_u64() {
+            Some(0) => 0usize,
+            Some(d) => d as usize,
+            None => {
+                return fail(
+                    stdout,
+                    id,
+                    format!("embed: `dims` must be a non-negative integer, got {v}"),
+                )
+            }
+        },
     };
 
     // Arch 18 (EmbeddingGemma 2): single-vector body.
@@ -329,11 +341,20 @@ pub fn generate_embed_slot(
         InputKind::Query => EmbedKind::Query,
         InputKind::Document => EmbedKind::Document,
     };
-    let dims = req
-        .get("dims")
-        .and_then(|v| v.as_u64())
-        .filter(|d| *d > 0)
-        .map(|d| d as usize);
+    let dims = match req.get("dims") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(v) => match v.as_u64() {
+            Some(0) => None,
+            Some(d) => Some(d as usize),
+            None => {
+                return fail(
+                    stdout,
+                    id,
+                    format!("embed: `dims` must be a non-negative integer, got {v}"),
+                )
+            }
+        },
+    };
     let mut out = match engine.encode(vec![EmbedRequest {
         kind: wire_kind,
         text,

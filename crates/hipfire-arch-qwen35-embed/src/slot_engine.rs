@@ -296,6 +296,20 @@ fn serve_batch(
                 EmbedKind::Query => InputKind::Query,
                 EmbedKind::Document => InputKind::Document,
             };
+            // Mirror the sequential route's refusal: this encoder is
+            // multi-vector with a fixed 128-d head and no Matryoshka
+            // support, so a `dims` request must error rather than be
+            // silently ignored.
+            if let Some(d) = req.dims {
+                if d != 0 {
+                    errs.push(Some(format!(
+                        "{}: `dims` ({d}) is not supported on this encoder — it is \
+                         multi-vector with a fixed {}-d head",
+                        req.request_tag, bundle.config.dense_out_features
+                    )));
+                    continue;
+                }
+            }
             match assemble_input(bundle, gpu, kind, &req.text, req.image.as_deref()) {
                 Ok(assembled) => {
                     errs.push(None);
