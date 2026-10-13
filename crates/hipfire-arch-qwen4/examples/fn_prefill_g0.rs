@@ -372,7 +372,10 @@ fn capture(gpu: &Gpu, st: &Qwen4State) -> R<Vec<Item>> {
             le_u64s(&[q.full_len, q.raw_len, q.pooled_len, q.partial_len, q.selected_len, q.position]),
         );
     }
-    push("ple_conv".into(), read_prefix(gpu, &st.ple_conv, st.ple_conv.byte_size())?);
+    // The PLE conv state exists only on profiles that declare PLE.
+    if let Some(ple_conv) = &st.ple_conv {
+        push("ple_conv".into(), read_prefix(gpu, ple_conv, ple_conv.byte_size())?);
+    }
     push("hyper_feedback".into(), read_prefix(gpu, &st.hyper_feedback, st.hyper_feedback.byte_size())?);
     let prev = st.ple_history.previous();
     let mut hist = Vec::with_capacity(12);
@@ -511,6 +514,7 @@ fn load(path: &Path, max_seq: usize) -> R<(HfqModelSource, World, Tokenizer)> {
     let backend = hipfire_arch_qwen4::Qwen4KvBackend::automatic(&gpu);
     let mut bundle = Qwen4Bundle::assemble_with_metadata(
         receipt.config,
+        &receipt.manifest.identity.recipe,
         transaction,
         &receipt.placements,
         &mut gpu,
