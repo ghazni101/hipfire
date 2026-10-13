@@ -1532,6 +1532,13 @@ impl Tokenizer {
         tokens
     }
 
+    /// Whether [`Self::enable_sp_bpe_merges`] actually engaged: false when the
+    /// vocabulary carries no merge rules, or the tokenizer is GPT-2 byte-level
+    /// (that path already runs merges).
+    pub fn sp_bpe_merges_enabled(&self) -> bool {
+        self.sp_bpe
+    }
+
     /// Switch this tokenizer to the exact merge-rank BPE path for
     /// ▁-style (SentencePiece-derived) HF BPE vocabularies — the Gemma
     /// family shape, where the serialized `tokenizer.json` is a BPE model
@@ -1541,17 +1548,31 @@ impl Tokenizer {
     /// Why an explicit opt-in: the default SentencePiece path is greedy
     /// longest-match, which is what every existing arch's token streams and
     /// pinned tests were built on — flipping it globally would silently
-    /// re-tokenize them. But greedy ≠ BPE on these vocabularies: measured on
-    /// `google/embeddinggemma-2`'s tokenizer, greedy diverges from HF
-    /// `tokenizers` on every one of 24 sampled prompts (benchmarks/prompts
-    /// + unicode/emoji/code), so an arch that needs HF-exact ids enables
-    /// this instead. No-op when there are no merge rules or the tokenizer is
-    /// GPT-2 byte-level (that path already runs merges).
-    /// Whether [`Self::enable_sp_bpe_merges`] actually engaged.
-    pub fn sp_bpe_merges_enabled(&self) -> bool {
-        self.sp_bpe
-    }
-
+    /// re-tokenize them. But greedy ≠ BPE on these vocabularies, so an arch
+    /// that needs HF-exact ids enables this instead. No-op when there are no
+    /// merge rules or the tokenizer is GPT-2 byte-level (that path already
+    /// runs merges).
+    ///
+    /// Measured divergence on `google/embeddinggemma-2`'s tokenizer against
+    /// HF `tokenizers`, over 29 prompts (the 9
+    /// `scripts/check_embeddinggemma2_parity.py` fixtures plus 20 others
+    /// sampled from `benchmarks/prompts`):
+    ///
+    /// - greedy, no dummy prefix — what this tokenizer.json resolves to (its
+    ///   normalizer is a bare `Replace`; see `sp_dummy_prefix_from_hf_json`):
+    ///   diverges on **8/29**, and agrees on all 9 parity fixtures. The
+    ///   mechanism is greedy's longest-literal match taking a longer
+    ///   vocabulary piece than the merge ranks would form — e.g. `▁digit`
+    ///   where HF binds `▁dig`, or `]`` where HF emits `]`, because a
+    ///   lower-rank merge fires before the longer literal can be taken. It is
+    ///   not confined to whitespace: code, HTML and technical text diverge.
+    /// - greedy *with* a prepended `▁`: diverges on **29/29**. A divergence
+    ///   count is only meaningful next to the dummy-prefix setting it was
+    ///   measured under — a "24/24 sampled prompts" figure belongs to this
+    ///   arm, not to the shipped default.
+    ///
+    /// The exact path is unconditionally HF-correct, so arch 18 never depends
+    /// on which arm the greedy path would have produced.
     pub fn enable_sp_bpe_merges(&mut self) {
         if !self.is_gpt2_bpe && !self.merges.is_empty() {
             self.sp_bpe = true;
@@ -1559,16 +1580,22 @@ impl Tokenizer {
     }
 
     /// ▁-style BPE over the whole normalized string (see
-    /// [`Self::enable_sp_bpe_merges`]): replace `' '`→`▁` (no prepend on
-    /// this family — the HF normalizer is a plain `Replace`), seed one
-    /// symbol per character (byte-fallback tokens for characters the
-    /// vocabulary lacks), then the shared rank-ordered merge. The HF
-    /// pre-tokenizer (`Split(' ', MergedWithPrevious)`) cannot fire after
-    /// the replacement, so the merge runs across the whole sequence —
-    /// multi-word `▁of▁the` pieces are real and only the merge ranks decide
-    /// whether they form.
+    /// [`Self::enable_sp_bpe_merges`]): apply the same normalization
+    /// `encode_sentencepiece` does — prepend `▁` iff the config's normalizer
+    /// declares it (`sp_dummy_prefix`; false for embeddinggemma2's bare
+    /// `Replace`), then replace `' '`→`▁` — seed one symbol per character
+    /// (byte-fallback tokens for characters the vocabulary lacks), then the
+    /// shared rank-ordered merge. Only the merge algorithm differs from the
+    /// greedy path; the normalization is shared, so the two are coherent by
+    /// construction. The HF pre-tokenizer (`Split(' ', MergedWithPrevious)`)
+    /// cannot fire after the replacement, so the merge runs across the whole
+    /// sequence — multi-word `▁of▁the` pieces are real and only the merge
+    /// ranks decide whether they form.
     fn encode_sp_bpe(&self, text: &str) -> Vec<u32> {
-        let mut normalized = String::with_capacity(text.len());
+        let mut normalized = String::with_capacity(text.len() + 3);
+        if self.sp_dummy_prefix {
+            normalized.push('\u{2581}');
+        }
         for ch in text.chars() {
             normalized.push(if ch == ' ' { '\u{2581}' } else { ch });
         }
@@ -1578,7 +1605,7 @@ impl Tokenizer {
         // uppercase hex per the SentencePiece convention). A vocabulary with
         // neither the piece nor its bytes falls back to `<unk>` — and a
         // vocabulary without even that drops the character (the same
-        /// contract as `encode_sentencepiece`'s single-char fallback).
+        // contract as `encode_sentencepiece`'s single-char fallback).
         let mut syms: Vec<u32> = Vec::with_capacity(normalized.chars().count());
         let mut byte_piece = String::with_capacity(8);
         for ch in normalized.chars() {
@@ -2581,6 +2608,7 @@ mod token_text_stream_tests {
         // (no prepend), rank-ordered merges across the whole string, and
         // <0xXX> byte fallback for out-of-vocabulary characters.
         let json = serde_json::json!({
+            "normalizer": {"type": "Replace", "pattern": {"String": " "}, "content": "\u{2581}"},
             "model": {"type": "BPE",
                 "vocab": {"a": 1, "b": 2, "\u{2581}": 3, "\u{2581}ab": 4, "ab": 5,
                           "<unk>": 6, "<0xC3>": 9, "<0xA9>": 10},
@@ -2611,6 +2639,73 @@ mod token_text_stream_tests {
         assert_eq!(tok2.encode("aa"), vec![1, 1]);
     }
 
+    /// The default greedy SentencePiece path is *not* merge-rank BPE: it takes
+    /// the longest literal vocabulary piece, so it can pick a token the merge
+    /// ranks never form. Here `abc` is in the vocabulary but no merge builds
+    /// it, and the rank-0 merge binds `b`+`c` first — so greedy emits `abc`
+    /// while HF's BPE emits `a`+`bc`. This is the divergence
+    /// [`Tokenizer::enable_sp_bpe_merges`] exists to avoid; pinning it keeps
+    /// the mechanism from being re-described from memory.
+    #[test]
+    fn greedy_longest_match_diverges_from_merge_rank_bpe() {
+        let json = serde_json::json!({
+            "model": {"type": "BPE",
+                "vocab": {"a": 1, "b": 2, "c": 3, "bc": 4, "abc": 5},
+                "merges": ["b c"]},
+            "added_tokens": []
+        });
+        // Default (greedy): longest literal wins.
+        let greedy = Tokenizer::from_hf_json(&json.to_string()).unwrap();
+        assert!(!greedy.sp_bpe_merges_enabled());
+        assert_eq!(greedy.encode("abc"), vec![5]);
+        // Exact path: the rank-0 merge fires first.
+        let mut exact = Tokenizer::from_hf_json(&json.to_string()).unwrap();
+        exact.enable_sp_bpe_merges();
+        assert!(exact.sp_bpe_merges_enabled());
+        assert_eq!(exact.encode("abc"), vec![1, 4]);
+    }
+
+    /// Enabling the exact path changes **only** the merge algorithm: the
+    /// normalization (space→▁, and the config's dummy-prefix rule) is shared
+    /// with the greedy path, so on a vocabulary with no longest-literal trap
+    /// the two agree id for id. Asserted under both normalizer shapes, because
+    /// the dummy prefix is the config's — not the path's — decision.
+    #[test]
+    fn enabling_the_exact_path_changes_only_the_merge_algorithm() {
+        let vocab = serde_json::json!({"a": 1, "b": 2, "\u{2581}": 3, "ab": 4});
+        let bare = serde_json::json!({
+            "normalizer": {"type": "Replace", "pattern": {"String": " "}, "content": "\u{2581}"},
+            "model": {"type": "BPE", "vocab": vocab, "merges": ["a b"]},
+            "added_tokens": []
+        });
+        let prepend = serde_json::json!({
+            "normalizer": {"type": "Sequence", "normalizers": [
+                {"type": "Prepend", "prepend": "\u{2581}"},
+                {"type": "Replace", "pattern": {"String": " "}, "content": "\u{2581}"}]},
+            "model": {"type": "BPE", "vocab": vocab, "merges": ["a b"]},
+            "added_tokens": []
+        });
+        for json in [&bare, &prepend] {
+            let greedy = Tokenizer::from_hf_json(&json.to_string()).unwrap();
+            let mut exact = Tokenizer::from_hf_json(&json.to_string()).unwrap();
+            exact.enable_sp_bpe_merges();
+            for text in ["a", "ab", "ba", "a b", " ", "a b ab"] {
+                assert_eq!(
+                    greedy.encode(text),
+                    exact.encode(text),
+                    "the two paths must agree on {text:?}"
+                );
+            }
+        }
+        // Bare Replace → dummy prefix false (the embeddinggemma2 shape): no
+        // prepend, and a space is the bare ▁ token.
+        let bare_tok = Tokenizer::from_hf_json(&bare.to_string()).unwrap();
+        assert_eq!(bare_tok.encode(" "), vec![3]);
+        // Prepend normalizer → dummy prefix true: both paths prepend ▁.
+        let mut prepend_tok = Tokenizer::from_hf_json(&prepend.to_string()).unwrap();
+        prepend_tok.enable_sp_bpe_merges();
+        assert_eq!(prepend_tok.encode("a"), vec![3, 1]);
+    }
 
     const LITERALS: &[&str] = &["hello", "中", "🎉", " world", "∑", "!"];
 

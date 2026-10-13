@@ -139,7 +139,9 @@ pub fn generate_embed(
             return fail(
                 stdout,
                 id,
-                "embed: embeddinggemma2 is served text-only on this route — image inputs                  are refused (the checkpoint's vision/audio towers are not part of this                  implementation)"
+                "embed: embeddinggemma2 is served text-only on this route — image inputs \
+                 are refused (the checkpoint's vision/audio towers are not part of this \
+                 implementation)"
                     .into(),
             );
         }
@@ -203,7 +205,8 @@ pub fn generate_embed(
         return fail(
             stdout,
             id,
-            "embed: `dims` (Matryoshka truncation) applies to embeddinggemma2 (arch 18)              only; the arch-17 encoder is multi-vector with a fixed 128-d head"
+            "embed: `dims` (Matryoshka truncation) applies to embeddinggemma2 (arch 18) \
+             only; the arch-17 encoder is multi-vector with a fixed 128-d head"
                 .into(),
         );
     }

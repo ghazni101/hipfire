@@ -8,7 +8,8 @@ served 768-d embeddings (and their Matryoshka truncations) against a
 float32 CPU `transformers` reference produced by
 `make_reference.py` (google/embeddinggemma-2, `AutoModel` + mean pool +
 L2), plus the edge-case contract: image input refused, empty text refused,
-oversized `dims` refused, >8192-token input truncated to exactly 8192.
+oversized and non-integer `dims` refused, prompt-exceeds-limit refused, bad
+kind refused, and >8192-token input truncated to exactly 8192.
 
 Expect hipfire (f16 GEMM weights, f32 activations) at ~1e-3 relative-L2
 against the f32 reference; the band is 2e-2 (two orders of margin, still
@@ -22,9 +23,11 @@ Usage:
 """
 import argparse
 import json
+import os
 import queue
 import subprocess
 import sys
+import tempfile
 import threading
 
 import numpy as np
@@ -93,6 +96,14 @@ class Daemon:
             self._pending[rid] = q
         try:
             d = q.get(timeout=timeout)
+        except queue.Empty:
+            # A second daemon cannot load while another holds the GPU lock, so
+            # "no reply" usually means the child died — surface its stderr
+            # rather than a bare timeout.
+            tail = "".join(self._stderr_buf[-6:])
+            raise RuntimeError(
+                f"daemon gave no {want!r} reply in {timeout:.0f}s — stderr tail:\n{tail}"
+            )
         finally:
             with self._plock:
                 self._pending.pop(rid, None)
@@ -219,7 +230,43 @@ def main():
     print(f"{'ok  ' if ok else 'FAIL'} long doc truncated to {r['n_input_tokens']} (ref {len(ref['ids_long_doc'])})")
     failures += 0 if ok else 1
 
+    # dims must be a strictly non-negative integer: a float/string silently
+    # meaning "full width" is a protocol trap, not a convenience.
+    rid += 1
+    msg = d.embed(rid, "query", {"text": "hello"}, dims=12.5, expect_error=True)
+    ok = "non-negative integer" in msg
+    print(f"{'ok  ' if ok else 'FAIL'} non-integer dims refused: {msg[:90]}")
+    failures += 0 if ok else 1
+
     d.stop()
+
+    # Prompt-exceeds-limit: truncation makes any *body* fit, so the guard runs
+    # on the kind prompt's own tokenization. The shipped checkpoint declares no
+    # length keys, so the cheapest honest fixture is a symlink farm over the
+    # same weights with a 4-token query limit. (`d` is stopped first: a second
+    # daemon cannot load while another holds the GPU lock.)
+    with tempfile.TemporaryDirectory() as tiny:
+        for entry in os.listdir(args.model):
+            if entry == "config_sentence_transformers.json":
+                continue  # written fresh below (a symlink would write through)
+            os.symlink(os.path.join(args.model, entry), os.path.join(tiny, entry))
+        with open(os.path.join(tiny, "config_sentence_transformers.json"), "w") as fh:
+            json.dump(
+                {"prompts": {"query": Q, "document": D},
+                 "query_length": 4, "document_length": 8192},
+                fh,
+            )
+        tiny_d = Daemon(args.daemon, tiny)
+        msg = tiny_d.embed("tinyq", "query", {"text": "hello world"}, expect_error=True)
+        ok = "leaving no room" in msg
+        print(f"{'ok  ' if ok else 'FAIL'} prompt-exceeds-limit refused: {msg[:90]}")
+        failures += 0 if ok else 1
+        r = tiny_d.embed("tinyd", "document", {"text": "hello world"})
+        ok = r.get("type") == "embedded"
+        print(f"{'ok  ' if ok else 'FAIL'} document under its own 8192 limit still encodes")
+        failures += 0 if ok else 1
+        tiny_d.stop()
+
     if failures:
         print(f"\n{failures} FAILURES")
         return 1

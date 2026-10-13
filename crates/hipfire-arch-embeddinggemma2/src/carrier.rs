@@ -50,11 +50,14 @@ fn load_tokenizer(st: &dyn ModelSourceTrait, cfg: &EmbedConfig) -> Result<Tokeni
         None => Tokenizer::from_hfq_metadata(st.metadata_json())
             .map_err(|e| format!("embeddinggemma2: tokenizer from metadata: {e}"))?,
     };
-    // This vocabulary is a ▁-style BPE model: the generic SentencePiece
-    // greedy-longest path diverges from HF `tokenizers` on ordinary text
-    // (measured: every sampled prompt), so switch to the exact merge-rank
-    // path with byte fallback. No-op for a tokenizer already so configured
-    // (HFQ metadata auto-enables it for this arch).
+    // This vocabulary is a ▁-style BPE model, and the generic SentencePiece
+    // greedy-longest path is not merge-rank BPE: on ordinary text it takes a
+    // longer literal piece than the merge ranks form, so it diverges from HF
+    // `tokenizers` (measured 8/29 sampled prompts, and 0/9 of this arch's
+    // parity fixtures). Switch to the exact merge-rank path with byte
+    // fallback. Both source kinds (dir and `.hfq`) reach this through here —
+    // nothing else enables it — and the guard below fails the load outright
+    // rather than let an arch-18 encode fall back to greedy.
     tok.enable_sp_bpe_merges();
     // A Gemma-shaped tokenizer.json with an EMPTY merge list would silently
     // keep the greedy SentencePiece path — the exact HF divergence this arch

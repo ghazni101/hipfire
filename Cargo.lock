@@ -3207,6 +3207,7 @@ dependencies = [
 name = "rdna-compute"
 version = "0.4.2"
 dependencies = [
+ "half",
  "hip-bridge",
  "hipfire-config",
  "libloading",
