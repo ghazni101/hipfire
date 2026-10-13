@@ -1407,6 +1407,16 @@ async fn handle_embeddings(
         }
         (runtime.engine.clone(), runtime.current_path.clone())
     };
+    // The name a client knows the resident model by: the spelling it was
+    // served under (`meta.current_model` mirrors `served_name` from the load
+    // path), never the canonicalized on-disk path — path mounts leak into
+    // the wire name otherwise (`/pplx-embed-v2-late` instead of the name the
+    // client asked for).
+    let served_name = {
+        let meta = shared.meta.lock().unwrap_or_else(|e| e.into_inner());
+        meta.current_model.clone()
+    };
+
     // A request that names a DIFFERENT model than the resident one would be
     // silently answered by the resident checkpoint — the response looks like
     // a 200 with embeddings from a model the caller didn't ask for. Refuse
@@ -1434,17 +1444,16 @@ async fn handle_embeddings(
             return Err(format!(
                 "requested model {name:?} is not the resident model ({}); \
                  this serve encodes with the resident model only",
-                loaded_model
-                    .as_ref()
-                    .map(|p| p.display().to_string())
+                served_name
+                    .clone()
+                    .or_else(|| loaded_model.as_ref().map(|p| p.display().to_string()))
                     .unwrap_or_else(|| "none".to_string())
             ));
         }
     }
-    let model_echo = loaded_model
-        .as_ref()
-        .map(|p| p.display().to_string())
-        .or(request_model)
+    let model_echo = request_model
+        .or(served_name)
+        .or_else(|| loaded_model.as_ref().map(|p| p.display().to_string()))
         .unwrap_or_else(|| "unknown".to_string());
 
     let id = request_id();
@@ -1589,10 +1598,15 @@ async fn handle_images_generations(
         let runtime = shared.runtime.lock().unwrap_or_else(|e| e.into_inner());
         (runtime.engine.clone(), runtime.current_path.clone())
     };
-    let model_echo = loaded_model
-        .as_ref()
-        .map(|p| p.display().to_string())
-        .or(request_model)
+    // Same reporting rule as /v1/embeddings: echo the request spelling, then
+    // the served name, not the canonicalized resident path.
+    let served_name = {
+        let meta = shared.meta.lock().unwrap_or_else(|e| e.into_inner());
+        meta.current_model.clone()
+    };
+    let model_echo = request_model
+        .or(served_name)
+        .or_else(|| loaded_model.as_ref().map(|p| p.display().to_string()))
         .unwrap_or_else(|| "unknown".to_string());
 
     let id = request_id();
