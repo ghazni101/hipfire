@@ -78,7 +78,38 @@ bytes. Beta is deterministic run to run (two beta runs identical).
 | `lfm2.5-1.2b.mq4` | 72 | identical | bitwise | bitwise | bitwise |
 | `lfm2.5-8b-a1b.mq4` (MoE, sealed route) | 72 | identical | bitwise | bitwise | bitwise |
 
+The same parity holds on the hipGraph route (`HIPFIRE_LFM2_GRAPH=1`, beta vs
+head, and both equal to the default route) on `lfm2.5-350m.q8` and
+`lfm2.5-8b-a1b.mq4`.
+
+Serve (`serve_harness.py --thinking off --sampling greedy
+--compare-transcript`, beta daemon vs head daemon): `transcript_byte_identical=true`
+for battery and chain on `lfm2.5-1.2b.mq4` and `lfm2.5-8b-a1b.mq4`. The 8B-A1B
+text is degenerate on both beta and head (empty turns, whitespace attractors);
+that is a pre-existing defect tracked separately, not a change of this port.
+
+Redline (`redline_daemon_harness.py --pm4 --skip-prefill`, `lfm2.5-350m.mq4`):
+decode launch sequence unchanged (280 launches, 11 kernels, hash
+`de9b61e3ebd1de33` on both), PM4 shadow exact on both.
+
+Decode, A/B alternating under the halo lock, no other cargo/rustc running:
+
+| Model | Measure | beta | head | ratio |
+|---|---|---|---|---|
+| `lfm2.5-1.2b.mq4` | `hipfire bench --matrix` tg128 @ ctx 128, 2 runs | 232.5 / 231.6 | 231.2 / 231.5 | 0.997 |
+| `lfm2.5-1.2b.mq4` | same @ ctx 2048 | 125.78 / 125.77 | 125.73 / 125.70 | 0.9995 |
+| `lfm2.5-8b-a1b.mq4` | 256 greedy tokens through `decode_step`, 4 rounds | 166.6 / 166.6 / 167.7 / 167.5 | 166.8 / 166.0 / 166.9 / 167.3 | 0.999 |
+
+The sealed MoE first ran the 8B-A1B gate/up through the top-8 launcher
+(`gemv_hfq4g256_moe_gate_up_k8_indexed`): bitwise identical, but 1.2 % slower
+at k = 4 on gfx1151. Below top-8 (only the biased route reaches those arms)
+the executor now takes the batched HFQ4 and HFQ6 gate/up launchers the hand
+path used.
+
 Not covered on halo: LFM2-VL (`prefill_embed_step` runs the same program; no
-VL fixture on halo), the `.mq6e` MQ6-expert artifact (no fixture), and the
-gfx1201 retained-PM4 admission row in `docs/admissions.yml`, which was sealed
-on the hand loop and needs a re-screen on gfx1201.
+VL fixture on halo) and the `.mq6e` MQ6-expert artifact (no fixture; the
+sealed route calls the same MQ6 gate/up, activation, down and combine kernels
+with the same arguments as the hand path, but it was not run). The gfx1201
+retained-PM4 admission row in `docs/admissions.yml` was screened on gfx1201;
+the gfx1151 launch sequence is unchanged, but the gfx1201 sequence hash is not
+re-measured.
