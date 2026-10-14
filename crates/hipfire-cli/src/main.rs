@@ -3367,7 +3367,20 @@ fn embed_command(paths: &Paths, args: EmbedArgs) -> Result<()> {
         Some(&model_path),
     )?;
     engine.ping()?;
-    let _loaded = engine.load(&model_path, serde_json::json!({}))?;
+    // The vision ladder (and an authored `max_seq`) reaches the daemon through
+    // these params: without them `vision.mode` never left the client, so a
+    // configured `auto` still loaded text-only and refused every media input.
+    let (canonical, entry) = registry_entry_for_path(paths, registry, &args.model)
+        .map(|(tag, entry)| (Some(tag.to_owned()), Some(entry)))
+        .unwrap_or((None, None));
+    let params = embed_load_params(
+        &resolved,
+        entry,
+        &paths.models,
+        &model_path,
+        canonical.as_deref(),
+    )?;
+    let _loaded = engine.load(&model_path, params)?;
 
     let encode = |id: &str,
                   kind: &str,
@@ -4500,6 +4513,45 @@ pub(crate) fn load_params(
     }
     resolve_vision_sidecar(&mut params, entry, models_dir, model_path, tag)?;
     resolve_xdna_sidecar(&mut params, resolved, entry, models_dir, model_path, tag)?;
+    Ok(params)
+}
+
+/// Load params for the non-chat `embed` verb.
+///
+/// The encoder consumes the vision ladder and an authored sequence bound;
+/// generation-only policy (DFlash/MTP/KV tiers, speculation selectors) has no
+/// meaning for a checkpoint with no LM head, so it is deliberately not
+/// projected — forwarding it would make an encoder load depend on it.
+///
+/// This exists because `embed` used to load with `{}`, so `vision.mode` never
+/// reached the daemon: a configured `vision_mode=auto` was ignored and every
+/// image/audio/video input was refused with the tower-less error, while the
+/// same model served media through the daemon protocol.
+fn embed_load_params(
+    resolved: &hipfire_config::ResolvedConfig,
+    entry: Option<&ModelEntry>,
+    models_dir: &Path,
+    model_path: &Path,
+    tag: Option<&str>,
+) -> Result<serde_json::Value> {
+    let mut params = serde_json::json!({
+        "vision_mode": config_string(resolved, "vision.mode")?,
+    });
+    // Same rule as `load_params`: forward an authored `max_seq` (global, model
+    // overlay, one-shot flag or legacy env) and let the daemon derive one for
+    // built-in/registry provenance.
+    let max_seq_source = &resolved.get("memory.max_seq").expect("schema field").source;
+    if matches!(
+        max_seq_source,
+        ConfigSource::GlobalUser { .. }
+            | ConfigSource::ModelUser { .. }
+            | ConfigSource::OneShot { .. }
+            | ConfigSource::LegacyEnv { .. }
+    ) {
+        let max_seq = config_u64(resolved, "memory.max_seq")?;
+        params["max_seq"] = serde_json::json!(max_seq);
+    }
+    resolve_vision_sidecar(&mut params, entry, models_dir, model_path, tag)?;
     Ok(params)
 }
 
@@ -11516,6 +11568,66 @@ mod tests {
         assert_eq!(params["vision"], vision_path.display().to_string());
         fs::remove_dir_all(&paths.root).unwrap();
     }
+    #[test]
+    pub(crate) fn embed_load_params_projects_the_vision_ladder() {
+        // Regression: `embed` used to load with `{}`, so `vision.mode` never
+        // reached the daemon and every image/audio/video input was refused
+        // text-only even with `vision_mode=auto` configured. The image/audio
+        // harnesses passed because they set `params.vision_mode` themselves.
+        let paths = test_paths("embed-vision-ladder");
+        fs::create_dir_all(&paths.models).unwrap();
+        let model_path = paths.models.join("embeddinggemma-2");
+        fs::create_dir_all(&model_path).unwrap();
+        let pack = paths.models.join("embeddinggemma-2.vl");
+        fs::write(&pack, b"towers").unwrap();
+        let entry = vision_sidecar_entry("embeddinggemma-2.vl");
+        for mode in ["auto", "on"] {
+            let params = embed_load_params(
+                &resolved_with_vision_mode(mode),
+                Some(&entry),
+                &paths.models,
+                &model_path,
+                Some("embeddinggemma-2"),
+            )
+            .unwrap();
+            assert_eq!(params["vision_mode"], mode);
+            assert_eq!(
+                params["vision"],
+                pack.display().to_string(),
+                "{mode} must carry the resolved `.vl` pack"
+            );
+        }
+        // `off` forwards the mode and, per `resolve_vision_sidecar`'s contract,
+        // still carries the resolved path: the daemon's `vision_mode=off` gate
+        // is the hard override and the only place that decides, and it names
+        // the declined sidecar in a media refusal.
+        let off = embed_load_params(
+            &resolved_with_vision_mode("off"),
+            Some(&entry),
+            &paths.models,
+            &model_path,
+            Some("embeddinggemma-2"),
+        )
+        .unwrap();
+        assert_eq!(off["vision_mode"], "off");
+        // Generation-only policy must not leak into an encoder load: the
+        // projected key set is the encoder's own.
+        let keys: Vec<&str> = off
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert!(keys.contains(&"vision_mode"), "the ladder must always ride");
+        for key in &keys {
+            assert!(
+                matches!(*key, "vision_mode" | "vision" | "max_seq"),
+                "embed_load_params projected a non-encoder key: {key}"
+            );
+        }
+        fs::remove_dir_all(&paths.root).unwrap();
+    }
+
     #[test]
     pub(crate) fn load_params_xdna_off_by_default_projects_nothing() {
         // Default-off: even a declared AND pulled archive must not surface.
