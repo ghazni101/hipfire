@@ -240,6 +240,41 @@ fn upload_ones(gpu: &mut Gpu, n: usize) -> Result<GpuTensor, String> {
 
 // ─── main loader ────────────────────────────────────────────────────────────
 
+/// Screen every weight container in `src` against the host decoder before any
+/// GPU work.
+///
+/// The decoder behind [`decode_f32`] (`weight_backend::dequantize_to_f32`) has
+/// arms for the dense HFQ containers and the raw element ones. A GGUF/Maple-side
+/// Q4K (qt=4) or the typed-Qwen4 qt=53 has no arm: the decoder's response is a
+/// `panic!`, which would take the daemon — and any model resident beside it —
+/// down mid-load. The `hipfire-quantize --format q4k` flag will happily emit
+/// such an artifact for this arch (its kernels exist for other loaders, not for
+/// this host-decode one), so the refusal belongs here: fail closed, name the
+/// tensor, and say which containers this encoder takes.
+///
+/// `Dir` sources carry raw dtypes rather than HFQ quant types, so they pass.
+pub fn refuse_unsupported_quant_types(src: &ModelSource) -> Result<(), String> {
+    use hipfire_runtime::weight_backend::dequant_f32_supported;
+    let ModelSource::Hfq(h) = src else {
+        return Ok(());
+    };
+    for t in h.tensor_infos() {
+        // 0xFF is the raw element container: its dtype (f16/f32), not a quant
+        // type, decides how it decodes.
+        if t.quant_type == 0xFF || dequant_f32_supported(t.quant_type) {
+            continue;
+        }
+        return Err(format!(
+            "embeddinggemma2: tensor `{}` carries HFQ quant_type {}, which this \
+             encoder's host decoder does not implement (Q4K qt=4 is GGUF/Maple-side, \
+             qt=53 is typed-Qwen4-only); re-quantize the checkpoint with a loadable \
+             tier (`--format q8f16` or `mq4v2`, or `bf16` for a raw pack)",
+            t.name, t.quant_type
+        ));
+    }
+    Ok(())
+}
+
 /// Stream the text backbone to the GPU. The vision/audio towers are not
 /// addressed (see [`crate`]).
 pub fn load_weights(
@@ -454,6 +489,58 @@ mod tests {
     fn bf16_widen_is_exact() {
         assert_eq!(bf16_to_f32(0x3F80), 1.0);
         assert_eq!(bf16_to_f32(0x0000), 0.0);
+    }
+
+    /// Write a one-tensor HFQ container with the given quant type.
+    fn hfq_with_quant_type(qt: u8, data_len: usize) -> std::path::PathBuf {
+        use hipfire_runtime::hfq::{write_hfqm_package_streaming, HfqStreamEntry};
+        let path = std::env::temp_dir().join(format!(
+            "eg2-qt{qt}-{}-{:?}.hfq",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let entries = vec![HfqStreamEntry {
+            name: "layers.0.probe".to_string(),
+            quant_type: qt,
+            shape: vec![256],
+            group_size: 256,
+            data_len: data_len as u64,
+        }];
+        write_hfqm_package_streaming(&path, 18, "{}", &entries, |_i, w| {
+            use std::io::Write as _;
+            w.write_all(&vec![0u8; data_len])
+        })
+        .expect("write fixture");
+        path
+    }
+
+    #[test]
+    fn refuse_unsupported_quant_types_refuses_q4k_and_passes_dense_tiers() {
+        // A `hipfire-quantize --format q4k` artifact is loadable by the arches
+        // whose kernels decode Q4K, but not by this host-decode encoder: the
+        // screen must turn that into a named load error instead of the shared
+        // decoder's `panic!` (which would kill the daemon mid-load).
+        let q4k = hfq_with_quant_type(4, 144);
+        let src = ModelSource::from_path(&q4k.to_string_lossy()).expect("open fixture");
+        let err = refuse_unsupported_quant_types(&src).expect_err("qt=4 must be refused");
+        assert!(err.contains("layers.0.probe"), "{err}");
+        assert!(err.contains("quant_type 4"), "{err}");
+        assert!(
+            err.contains("q8f16"),
+            "the refusal must name a loadable tier: {err}"
+        );
+        std::fs::remove_file(&q4k).ok();
+
+        // F32 (qt=2) and the raw element container (qt=0xFF) keep loading.
+        for (qt, len) in [(2u8, 1024usize), (0xFF, 512)] {
+            let p = hfq_with_quant_type(qt, len);
+            let src = ModelSource::from_path(&p.to_string_lossy()).expect("open fixture");
+            assert!(
+                refuse_unsupported_quant_types(&src).is_ok(),
+                "qt={qt} must load"
+            );
+            std::fs::remove_file(&p).ok();
+        }
     }
 
     #[test]

@@ -1222,21 +1222,31 @@ fn dequantize_to_f32(quant_type: u8, data: &[u8], n: usize) -> Vec<f32> {
             let mut out = Vec::with_capacity(n_groups * 256);
             for g in 0..n_groups {
                 let off = g * bytes_per_group;
-                let h16 = |o: usize| f16_to_f32(u16::from_le_bytes([data[off + o], data[off + o + 1]]));
+                let h16 =
+                    |o: usize| f16_to_f32(u16::from_le_bytes([data[off + o], data[off + o + 1]]));
                 // qt45: [0..2) s, [2..4) z for BOTH halves. Others: per-half s/z.
                 let (s0, z0) = (h16(0), h16(2));
-                let (s1, z1) = if quant_type == 45 { (s0, z0) } else { (h16(4), h16(6)) };
+                let (s1, z1) = if quant_type == 45 {
+                    (s0, z0)
+                } else {
+                    (h16(4), h16(6))
+                };
                 let start = out.len();
                 for i in 0..256 {
                     let p = off + 8;
                     let code = match quant_type {
                         45 => {
                             let b = data[p + i / 2] as u32;
-                            if i % 2 == 0 { b & 0xF } else { b >> 4 }
+                            if i % 2 == 0 {
+                                b & 0xF
+                            } else {
+                                b >> 4
+                            }
                         }
                         47 => {
                             let bo = p + (i / 4) * 3;
-                            let (b0, b1, b2) = (data[bo] as u32, data[bo + 1] as u32, data[bo + 2] as u32);
+                            let (b0, b1, b2) =
+                                (data[bo] as u32, data[bo + 1] as u32, data[bo + 2] as u32);
                             [
                                 b0 & 0x3F,
                                 ((b0 >> 6) | (b1 << 2)) & 0x3F,
@@ -1266,7 +1276,8 @@ fn dequantize_to_f32(quant_type: u8, data: &[u8], n: usize) -> Vec<f32> {
                         }
                         49 => {
                             let bo = p + (i / 8) * 3;
-                            let (b0, b1, b2) = (data[bo] as u32, data[bo + 1] as u32, data[bo + 2] as u32);
+                            let (b0, b1, b2) =
+                                (data[bo] as u32, data[bo + 1] as u32, data[bo + 2] as u32);
                             [
                                 b0 & 7,
                                 (b0 >> 3) & 7,
@@ -1339,6 +1350,47 @@ pub fn dequant_f32(gpu: &mut Gpu, quant_type: u8, data: &[u8], n: usize) -> HipR
 /// per-quant byte layouts.
 pub fn dequantize_weight_to_f32(quant_type: u8, data: &[u8], n: usize) -> Vec<f32> {
     dequantize_to_f32(quant_type, data, n)
+}
+
+/// Whether [`dequantize_to_f32`] implements this HFQ quant type.
+///
+/// Host-dequant loaders (embed encoders, draft/MTP heads, the host-offload
+/// path) should screen an artifact with this instead of discovering a gap as
+/// the decoder's `panic!` mid-load — that panic takes the daemon and any
+/// resident model down with it. Formats outside the dense HFQ set (Q4K qt=4 is
+/// GGUF/Maple-side, qt=53 is typed-Qwen4-only) are deliberately absent.
+///
+/// `dequant_f32_supported_matches_the_decoder` sweeps every `u8` and ties this
+/// set to the decoder's actual behaviour, so a new arm without a matching entry
+/// (or the reverse) fails the test rather than a user's load.
+pub fn dequant_f32_supported(quant_type: u8) -> bool {
+    matches!(
+        quant_type,
+        1 | 2
+            | 3
+            | 6
+            | 7
+            | 8
+            | 11
+            | 12
+            | 13
+            | 14
+            | 15
+            | 16
+            | 17
+            | 18
+            | 19
+            | 20
+            | 30
+            | 40
+            | 41
+            | 44
+            | 45
+            | 47
+            | 48
+            | 49
+            | 50
+    )
 }
 
 // ── WeightBackend trait ─────────────────────────────────────────────────────
@@ -2202,5 +2254,27 @@ mod tests {
         assert_ne!(DType::MQ5G256V2, DType::MQ5G256);
         assert_ne!(DType::MQ3G256V2, DType::MQ3G256);
         assert_ne!(DType::MQ2G256V2, DType::MQ2G256);
+    }
+
+    /// The supported-set predicate must equal what the decoder actually does.
+    ///
+    /// Probes every `u8`: a type the decoder handles (no panic on a small
+    /// buffer) must be `true`, and one it panics on must be `false`. This is
+    /// what keeps a new decoder arm from being invisible to the host-dequant
+    /// loaders that screen artifacts with the predicate — the failure mode
+    /// otherwise is a false refusal, or a panic mid-load.
+    #[test]
+    fn dequant_f32_supported_matches_the_decoder() {
+        let data = vec![0u8; 1024];
+        for qt in 0..=u8::MAX {
+            let handled = std::panic::catch_unwind(|| dequantize_to_f32(qt, &data, 32)).is_ok();
+            assert_eq!(
+                dequant_f32_supported(qt),
+                handled,
+                "qt={qt}: predicate says {}, decoder {}",
+                dequant_f32_supported(qt),
+                if handled { "handles it" } else { "panics" }
+            );
+        }
     }
 }

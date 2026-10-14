@@ -219,6 +219,24 @@ pub fn load_embed_gemma_with_vision(
 
     let tokenizer = load_tokenizer(st, &config)?;
 
+    // Screen every container this load will decode, both sources, before any
+    // GPU work: the host decode path has no arm for the GGUF/Maple-side Q4K
+    // (qt=4) or the typed-Qwen4 qt=53, and the shared decoder's response to an
+    // unknown type is a `panic!` — which would take the daemon and any resident
+    // model down mid-load. See `refuse_unsupported_quant_types`.
+    crate::weights::refuse_unsupported_quant_types(&src)?;
+    if let Some(p) = sidecar_path {
+        match ModelSource::from_path(&p.to_string_lossy()) {
+            Ok(vsrc) => crate::weights::refuse_unsupported_quant_types(&vsrc)?,
+            Err(e) => {
+                return Err(format!(
+                    "embeddinggemma2: open sidecar {}: {e}",
+                    p.display()
+                ))
+            }
+        }
+    }
+
     // PLE tensors are required exactly when the config declares a PLE width
     // — a checkpoint/config mismatch is a load error, not a silent
     // zero-filled PLE.

@@ -53,10 +53,19 @@ def artifact_format(path):
 # O(1) a broken dequant arm produces.
 BANDS = {
     "MQ4G256": 5.0e-1, "MQ4G256V2": 5.0e-1, "HFQ4G256": 5.0e-1, "HFQ4G128": 5.0e-1,
-    "Q4_K": 5.0e-1,
     "MQ6G256": 1.5e-1, "MQ6G256V2": 1.5e-1, "HFQ6G256": 1.5e-1,
     "Q8_0": 3.0e-2, "Q8F16": 3.0e-2, "MQ8G256": 3.0e-2,
     "dir": 2.0e-3,
+}
+
+# Formats that are not in the dense HFQ decode set at all: an artifact built
+# with one cannot be loaded, so it has no band. `hipfire-quantize --format q4k`
+# will still emit them for this arch (`quantize_q4k` exists for the arches whose
+# kernels decode Q4K), and the arch-18 loader refuses such a checkpoint by name
+# — `weights::refuse_unsupported_quant_types` — instead of reaching the shared
+# host decoder's `panic!` for the missing arm.
+NON_LOADABLE = {
+    "Q4_K": "GGUF/Maple-side k-quant, not in the dense HFQ decode set",
 }
 
 
@@ -92,6 +101,9 @@ def main():
         fmt = artifact_format(path) if not os.path.isdir(path) else "dir"
         band = BANDS.get(fmt)
         name = os.path.basename(path)
+        if fmt in NON_LOADABLE:
+            print(f"SKIP {name}: [{fmt}] is not loadable — {NON_LOADABLE[fmt]}")
+            continue
         if band is None:
             print(f"SKIP {name}: unknown format {fmt}")
             continue
