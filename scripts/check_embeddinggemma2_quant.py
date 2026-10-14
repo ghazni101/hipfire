@@ -84,7 +84,7 @@ def main():
                 failures += 1
         d.stop()
         ok = worst <= band
-        print(f"{'ok  ' if ok else 'FAIL'} {name:14s} [{fmt:10s}] worst rel-L2 {worst:.2e} on {worst_key} (band {band:.0e})")
+        print(f"{'ok  ' if ok else 'FAIL'} {name:14s} [{fmt:10s}] worst rel-L2 {worst:.2e} on {worst_key} (band {band:.1e})")
         failures += 0 if ok else 1
 
     if failures:
